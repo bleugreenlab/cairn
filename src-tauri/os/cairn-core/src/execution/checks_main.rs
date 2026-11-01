@@ -32,10 +32,11 @@
 //!
 //! A lane that does not produce a complete verdict is announced louder than any
 //! red, with its cause class: **death** (the lane died: placement, capacity,
-//! infrastructure, a stalled or killed run) or **no-verdict** (the lane ran to
-//! an exit but its result is not a verdict: a test target that did not compile,
-//! zero tests, an incomplete enumeration, a run that selected nothing). Under a
-//! post-merge detection regime, a silent detector is the dangerous case.
+//! infrastructure, a stalled or killed run, a compile the host ended by signal
+//! or by a storage error) or **no-verdict** (the lane ran to an exit but its result
+//! is not a verdict: a test target that did not compile, zero tests, an
+//! incomplete enumeration, a run that selected nothing). Under a post-merge
+//! detection regime, a silent detector is the dangerous case.
 //!
 //! Store identity: cadence observations record `cadence = 'main'` and
 //! `job_id = 'main:{project_id}'`. A row is measured against the newest such
@@ -57,8 +58,8 @@ use crate::execution::check_parsers::is_test_runner_command;
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
     execute_check_contract, load_checks_contract_at_commit_detailed,
-    resolve_check_contract_at_commit, CheckRunProducer, CheckRunTarget, CommitChecksContract,
-    CommitChecksContractError, MAIN_CADENCE_STREAM_PREFIX,
+    resolve_check_contract_at_commit, terminating_signal, CheckRunProducer, CheckRunTarget,
+    CommitChecksContract, CommitChecksContractError, MAIN_CADENCE_STREAM_PREFIX,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -1137,7 +1138,7 @@ async fn attempt_lane(
     context: &PassContext<'_>,
     lane: &CadenceLane,
 ) -> LaneAttempt {
-    let death = |cause: String| LaneAttempt::Verdict(CadenceVerdict::Death { cause });
+    let death = |cause: String| LaneAttempt::Verdict(CadenceVerdict::Death { row: None, cause });
     let placement = match CheckPlacementOverride::new(
         ExecutorSelector {
             os: Some(lane.platform.clone()),
@@ -1451,7 +1452,7 @@ async fn announce_lane_death(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane,
         lane,
         Some(&tip.commit),
         cancelled_by_restart(
-            CadenceVerdict::Death { cause },
+            CadenceVerdict::Death { row: None, cause },
             orch.fleet.runner_stopping_since(),
         ),
     )
@@ -1496,6 +1497,7 @@ async fn announce_pass_failure(
             None,
             cancelled_by_restart(
                 CadenceVerdict::Death {
+                    row: None,
                     cause: format!("the cadence pass failed before this lane could run: {cause}"),
                 },
                 orch.fleet.runner_stopping_since(),
@@ -1625,8 +1627,14 @@ pub(crate) enum CadenceVerdict {
         row: Option<CadenceRow>,
         cause: String,
     },
-    /// The lane died before producing a result.
-    Death { cause: String },
+    /// The lane died before producing a verdict. `row` is the observation it
+    /// left when the death shows only in that row's output (a compile the host
+    /// ended: see [`host_ended_compile`]); a lane that died before recording an
+    /// observation has none.
+    Death {
+        row: Option<CadenceRow>,
+        cause: String,
+    },
     /// The runner began stopping while the lane ran, and the lane ended
     /// without a result: see [`cancelled_by_restart`].
     Cancelled {
@@ -1639,8 +1647,10 @@ impl CadenceVerdict {
     fn row(&self) -> Option<&CadenceRow> {
         match self {
             CadenceVerdict::Complete(row) => Some(row),
-            CadenceVerdict::NoVerdict { row, .. } => row.as_ref(),
-            CadenceVerdict::Death { .. } | CadenceVerdict::Cancelled { .. } => None,
+            CadenceVerdict::NoVerdict { row, .. } | CadenceVerdict::Death { row, .. } => {
+                row.as_ref()
+            }
+            CadenceVerdict::Cancelled { .. } => None,
         }
     }
     fn is_complete(&self) -> bool {
@@ -1652,6 +1662,12 @@ impl CadenceVerdict {
 /// zero tests is never one, whatever its exit code (rulings 695/706): an empty
 /// or unknown selection is the absence of a verdict, not a green.
 fn classify_row(row: CadenceRow) -> CadenceVerdict {
+    if let Some(cause) = host_ended_compile_cause(&row) {
+        return CadenceVerdict::Death {
+            row: Some(row),
+            cause,
+        };
+    }
     let cause = if row.ran() == 0 {
         Some(format!(
             "no test produced a result (exit {}): a test target that did not compile, or a runner that stopped before running any test",
@@ -1686,6 +1702,12 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
 /// before it finished measuring, is stored as incomplete, and a green beside it
 /// is not one.
 fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
+    if let Some(cause) = host_ended_compile_cause(&row) {
+        return CadenceVerdict::Death {
+            row: Some(row),
+            cause,
+        };
+    }
     let cause = if !row.complete {
         Some(format!(
             "the run exited {} but its own result says it did not run to completion, so it measured nothing a verdict can rest on",
@@ -1708,6 +1730,111 @@ fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
     }
 }
 
+/// A compile the tree did not fail: cargo reports a crate that could not
+/// compile, the same output says the host ended it, and no compiler error
+/// about the code appears anywhere. The host ends a compile by signalling its
+/// process from outside (a stall stop, a pressure reclaim, a cell operation)
+/// or by failing its storage (a full disk, an I/O error). Either way the row
+/// is a death on the execution side of the seam, and there is no rustc
+/// signature to match against a build break on main.
+#[derive(Debug, PartialEq, Eq)]
+struct HostEndedCompile {
+    by: HostEnding,
+    krate: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostEnding {
+    /// A compiler process ended by this terminating signal.
+    Signal(&'static str),
+    /// The operating system's storage error, as the OS words it.
+    Storage(&'static str),
+}
+
+fn host_ended_compile(tail: &str) -> Option<HostEndedCompile> {
+    let mut by = None;
+    let mut krate = None;
+    let mut compiling = false;
+    // Whether the lines being read belong to an uncoded `error:` diagnostic,
+    // which is about the code only when it points at a source location.
+    // Warnings carry locations too, and say nothing about the verdict.
+    let mut in_error = false;
+    for line in tail.lines().map(str::trim_start) {
+        if line.starts_with("error[E") || (in_error && line.starts_with("--> ")) {
+            return None;
+        }
+        if line.starts_with("error") || line.starts_with("warning") {
+            in_error = false;
+        }
+        let subject = line
+            .strip_prefix("error: could not compile ")
+            .or_else(|| line.strip_prefix("error: failed to run custom build command for "));
+        if let Some(subject) = subject {
+            compiling = true;
+            krate = krate.or_else(|| backticked(subject));
+        } else if let Some(storage) = storage_error(line) {
+            by = by.or(Some(HostEnding::Storage(storage)));
+        } else if let Some(signal) = process_signal(line) {
+            by = by.or(Some(HostEnding::Signal(signal)));
+        } else if line.starts_with("error: ") {
+            in_error = true;
+        }
+    }
+    let by = by?;
+    compiling.then_some(HostEndedCompile { by, krate })
+}
+
+/// The storage error an output line reports, in the operating system's words
+/// (Linux and macOS, then Windows). Matched by text: the same `os error` number
+/// means different things on different platforms.
+fn storage_error(line: &str) -> Option<&'static str> {
+    let line = line.to_ascii_lowercase();
+    [
+        ("no space left on device", "No space left on device"),
+        ("input/output error", "Input/output error"),
+        (
+            "there is not enough space on the disk",
+            "There is not enough space on the disk",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(needle, words)| line.contains(needle).then_some(words))
+}
+
+fn backticked(text: &str) -> Option<String> {
+    let (name, _) = text.strip_prefix('`')?.split_once('`')?;
+    Some(name.to_string())
+}
+
+/// The terminating signal a cargo process line reports, as in
+/// ``process didn't exit successfully: `rustc …` (signal: 15, SIGTERM: termination signal)``.
+/// The line is often cut at its head in a stored tail, so only its end is read.
+fn process_signal(line: &str) -> Option<&'static str> {
+    let (_, after) = line.rsplit_once("(signal: ")?;
+    let number = after.split(|c: char| !c.is_ascii_digit()).next()?;
+    terminating_signal(number.parse().ok()?)
+}
+
+fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
+    if row.verdict_passed || row.failed() > 0 {
+        return None;
+    }
+    let ended = host_ended_compile(&row.output_tail)?;
+    let krate = ended
+        .krate
+        .map(|krate| format!(" while compiling `{krate}`"))
+        .unwrap_or_default();
+    let exit = row.exit_code;
+    Some(match ended.by {
+        HostEnding::Signal(signal) => format!(
+            "infrastructure: a compiler process in the lane was killed ({signal}){krate}, so the run exited {exit} without a verdict on the tree. No compiler error about the code was printed, so the tree is not implicated: the signal came from outside the compile (a stall stop, a pressure reclaim, a cell operation), and there is no compile error to match against a break on main"
+        ),
+        HostEnding::Storage(error) => format!(
+            "infrastructure: the host's storage failed ({error}){krate}, so the run exited {exit} without a verdict on the tree. The error is the operating system's, not a compiler error about the code, so the tree is not implicated and there is no compile error to match against a break on main"
+        ),
+    })
+}
+
 /// A lane that ended without a result while this runner was stopping was
 /// ended by the restart, whatever shape the ending took on the way out: the
 /// fleet answers a claim the stop interrupted as cancelled, and a pass cut
@@ -1719,12 +1846,11 @@ fn cancelled_by_restart(verdict: CadenceVerdict, stopping_since: Option<u64>) ->
         return verdict;
     };
     match verdict {
-        CadenceVerdict::Death { cause } | CadenceVerdict::NoVerdict { row: None, cause } => {
-            CadenceVerdict::Cancelled {
-                cause,
-                stopped_at_unix_ms: i64::try_from(stopped_at).unwrap_or(i64::MAX),
-            }
-        }
+        CadenceVerdict::Death { row: None, cause }
+        | CadenceVerdict::NoVerdict { row: None, cause } => CadenceVerdict::Cancelled {
+            cause,
+            stopped_at_unix_ms: i64::try_from(stopped_at).unwrap_or(i64::MAX),
+        },
         other => other,
     }
 }
@@ -3261,7 +3387,7 @@ fn render_incomplete(
                 report.check, report.platform, report.check, report.platform
             ));
             if matches!(class, Unobserved::Death) {
-                out.push_str("- Cause class: **death** — the lane died before it produced a result (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run).\n");
+                out.push_str("- Cause class: **death** — the lane died before it produced a verdict (the execution side of the seam: no machine, capacity, infrastructure, a stalled or killed run or compile).\n");
             } else if report.kind == LaneVerdict::Exit {
                 out.push_str("- Cause class: **no-verdict** — the lane ran to an exit, but its result does not vouch for having measured anything (the testing side of the seam: it selected nothing, or stopped before it finished). It is not green.\n");
             } else {
@@ -3342,10 +3468,10 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
             &truncate(cause, MAX_CAUSE_CHARS),
             Unobserved::NoVerdict,
         ),
-        CadenceVerdict::Death { cause } => render_incomplete(
+        CadenceVerdict::Death { row, cause } => render_incomplete(
             &mut out,
             report,
-            None,
+            row.as_ref(),
             &truncate(cause, MAX_CAUSE_CHARS),
             Unobserved::Death,
         ),
@@ -3758,6 +3884,7 @@ mod tests {
         let stopped_at = 3 * HOUR;
         let ended = cancelled_by_restart(
             CadenceVerdict::Death {
+                row: None,
                 cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
             },
             Some(stopped_at as u64),
@@ -3842,6 +3969,7 @@ mod tests {
     #[test]
     fn a_lane_ended_by_the_restart_reads_as_cancelled_never_as_a_death() {
         let death = CadenceVerdict::Death {
+            row: None,
             cause: "infrastructure: Cairn cancelled this check before it produced a verdict: Cairn's runner is stopping.".into(),
         };
         assert!(
@@ -4428,6 +4556,7 @@ mod tests {
             &[("a", TestOutcome::Passed)],
         );
         let verdict = CadenceVerdict::Death {
+            row: None,
             cause: "infrastructure: the command stopped making progress".into(),
         };
         let comparison = Comparison::AnyExecutor { previous };
@@ -4710,6 +4839,7 @@ mod tests {
             "a complete row's merge list stays the window of its per-host diff"
         );
         let death = CadenceVerdict::Death {
+            row: None,
             cause: "no machine".into(),
         };
         assert_eq!(
@@ -5027,6 +5157,7 @@ mod tests {
         // The cadence dies on the tip: B's manual row is the newest tree any
         // complete whole-suite row observed, so the uncovered list starts at B.
         let death = CadenceVerdict::Death {
+            row: None,
             cause: "no machine".into(),
         };
         let covered = comparison(None, true).await;
@@ -5305,6 +5436,164 @@ mod tests {
         assert!(!text.contains("MAIN CADENCE DID NOT COMPLETE"), "{text}");
     }
 
+    /// Specimen a08e20f0's tail, shortened: rustc for `rmcp` ended by SIGTERM
+    /// mid-compile, its process line cut at the head by the stored tail.
+    const KILLED_RMCP_TAIL: &str = "error: could not compile `rmcp` (lib)\n\
+        …\n\
+        /build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libpin_project_lite-b547d44ab2a3e239.rmeta --extern tokio=/home/dev/.cairn-exec/build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libtokio-c4d896466688d916.rmeta --cap-lints allow` (signal: 15, SIGTERM: termination signal)\n\
+        warning: build failed, waiting for other jobs to finish...\n\
+        warning: field `job_id` is never read\n\
+        \x20 --> os/cairn-core/src/notifications/derive.rs:32:5\n\
+        warning: `cairn-core` (lib) generated 4 warnings (run `cargo fix --lib -p cairn-core` to apply 1 suggestion)\n\
+        error: command `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
+        error: script \"test:rust:full\" exited with code 101";
+
+    fn compile_row(id: &str, tail: &str) -> CadenceRow {
+        let mut row = row(id, "cccccccccccccccccccc", HOUR, &[]);
+        row.exit_code = 101;
+        row.verdict_passed = false;
+        row.output_tail = tail.to_string();
+        row
+    }
+
+    /// Specimen a08e20f0: on a tree that compiled on the same host fifteen
+    /// minutes earlier, a rust-tests row's compiler process was killed by
+    /// SIGTERM. It is a death that names the signal and the crate and still
+    /// cites its row and tail, never a testing-side "did not compile", and a
+    /// compile error about the code stays the testing side's no-verdict.
+    #[test]
+    fn a_compile_killed_by_a_signal_is_a_death_and_a_compile_error_stays_a_no_verdict() {
+        let verdict = classify_row(compile_row("killed", KILLED_RMCP_TAIL));
+        let CadenceVerdict::Death {
+            row: Some(row),
+            cause,
+        } = &verdict
+        else {
+            panic!("a killed compile is a death that keeps its row: {verdict:?}");
+        };
+        assert_eq!(row.id, "killed");
+        assert!(
+            cause.starts_with(
+                "infrastructure: a compiler process in the lane was killed (SIGTERM) while compiling `rmcp`"
+            ),
+            "{cause}"
+        );
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
+        assert!(
+            text.starts_with("🚨 **MAIN CADENCE DID NOT COMPLETE"),
+            "{text}"
+        );
+        assert!(text.contains("Cause class: **death**"), "{text}");
+        assert!(text.contains("the tree is not implicated"), "{text}");
+        assert!(!text.contains("no-verdict"), "{text}");
+        assert!(
+            !text.contains("a test target that did not compile"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cairn://p/cairn/check-observations/killed"),
+            "the row it left is cited: {text}"
+        );
+        assert!(
+            text.contains("(signal: 15, SIGTERM: termination signal)"),
+            "the tail is quoted: {text}"
+        );
+        assert!(
+            matches!(
+                cancelled_by_restart(verdict.clone(), Some(HOUR as u64)),
+                CadenceVerdict::Death { row: Some(_), .. }
+            ),
+            "a death that left a row is not re-read as the restart's"
+        );
+
+        // An exit lane compiling the same tree (workspace-compile) is not red.
+        let mut check = compile_row("check", KILLED_RMCP_TAIL);
+        check.selection = Some("unknown".to_string());
+        assert!(matches!(
+            LaneVerdict::Exit.classify(check),
+            CadenceVerdict::Death { row: Some(_), .. }
+        ));
+
+        let no_verdict = |tail: &str| {
+            matches!(
+                classify_row(compile_row("other", tail)),
+                CadenceVerdict::NoVerdict { row: Some(_), .. }
+            )
+        };
+        let compile_error = "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
+        assert!(no_verdict(compile_error), "a compile error is the tree's");
+        assert!(
+            no_verdict(&format!("{compile_error}\n{KILLED_RMCP_TAIL}")),
+            "a diagnostic beside a killed compile is still the tree's"
+        );
+        let uncoded = "error: expected one of `,` or `}`, found `turn`\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
+        assert!(
+            no_verdict(uncoded),
+            "an uncoded diagnostic is the tree's too"
+        );
+        assert!(
+            no_verdict(&format!("{uncoded}\n{DISK_FULL_TAIL}")),
+            "a diagnostic beside a full disk is still the tree's"
+        );
+        assert!(
+            no_verdict(&KILLED_RMCP_TAIL.replace(
+                "signal: 15, SIGTERM: termination signal",
+                "signal: 11, SIGSEGV: invalid memory reference"
+            )),
+            "a crash signal is the compiler's own outcome"
+        );
+        assert!(
+            no_verdict(
+                "error: test failed, to rerun pass `-p cairn-core --lib`\n\nCaused by:\n  process didn't exit successfully: `/target/debug/deps/cairn_core-0a1b` (signal: 9, SIGKILL: kill)"
+            ),
+            "a killed test binary is not a killed compile"
+        );
+        assert!(no_verdict(""), "a bare zero-test exit stays a no-verdict");
+    }
+
+    /// Specimen 6ebdcedb's tail, shortened: warnings that point at the source,
+    /// then rustc's write of an object file refused by a full disk.
+    const DISK_FULL_TAIL: &str = "warning: field `computed_at` is never read\n\
+        \x20  --> os/cairn-core/src/projects/codemap.rs:138:9\n\
+        \x20   |\n\
+        error: could not write output to /Users/dev/.cairn-exec/build-slots/cairn/slot-705/src-tauri/target/debug/deps/cairn_core-a2de4dd904051819.f391dbsmm5xj2b3xuwpopitus.1cihbaz.rcgu.o: No space left on device\n\
+        \n\
+        error: could not compile `cairn-core` (lib test) due to 1 previous error; 7 warnings emitted\n\
+        error: command `/Users/dev/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
+        error: script \"test:rust:full\" exited with code 101";
+
+    /// Specimen 6ebdcedb: a compile that failed because the host's disk was
+    /// full is the host's death, though rustc counts the OS error as its one
+    /// "previous error" and warnings beside it point at the source.
+    #[test]
+    fn a_compile_the_disk_refused_is_a_death_that_names_the_storage_error() {
+        let verdict = classify_row(compile_row("disk", DISK_FULL_TAIL));
+        let CadenceVerdict::Death {
+            row: Some(_),
+            cause,
+        } = &verdict
+        else {
+            panic!("a full disk is a death that keeps its row: {verdict:?}");
+        };
+        assert!(
+            cause.starts_with(
+                "infrastructure: the host's storage failed (No space left on device) while compiling `cairn-core`"
+            ),
+            "{cause}"
+        );
+        let text = report(&verdict, &Comparison::Baseline, &Bracket::default());
+        assert!(text.contains("Cause class: **death**"), "{text}");
+        assert!(text.contains("the tree is not implicated"), "{text}");
+        assert!(!text.contains("no-verdict"), "{text}");
+
+        let io =
+            DISK_FULL_TAIL.replace("No space left on device", "Input/output error (os error 5)");
+        assert!(matches!(
+            classify_row(compile_row("io", &io)),
+            CadenceVerdict::Death { cause, .. } if cause.contains("(Input/output error)")
+        ));
+    }
+
     #[test]
     fn an_exit_lane_posts_everything_but_a_green_after_a_green() {
         let green = || tsc_row("g", "c", HOUR, 0);
@@ -5326,6 +5615,7 @@ mod tests {
         assert!(exit(&complete(green()), &Comparison::Baseline), "baseline");
         assert!(exit(
             &CadenceVerdict::Death {
+                row: None,
                 cause: "no machine".into()
             },
             &same(&green())

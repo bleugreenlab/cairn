@@ -953,6 +953,7 @@ async fn merge_pr_for_job_past_barrier(
         }
     }
     let mut config_notice: Option<String> = None;
+    let mut dropped_detail: Option<String> = None;
     // Once the ceremony starts it journals the attempt's outcome itself; a
     // gated attempt refused before then is journaled here like any other.
     let mut ceremony_started = false;
@@ -1084,6 +1085,7 @@ async fn merge_pr_for_job_past_barrier(
                 .await?
             }
         };
+        dropped_detail = dropped_commits_detail(&landed.dropped);
         log::info!(
             "merge_pr_for_job[{job_id}]: merge gates and the default-branch landing took {:?}",
             gate_started.elapsed()
@@ -1264,8 +1266,12 @@ async fn merge_pr_for_job_past_barrier(
                 policy_json: &stored_policy,
             },
             &merge_result,
-            merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()])
-                .as_deref(),
+            merge_journal_detail(&[
+                pin_bump_detail.as_deref(),
+                config_notice.as_deref(),
+                dropped_detail.as_deref(),
+            ])
+            .as_deref(),
         )
         .await?;
     }
@@ -1290,10 +1296,22 @@ pub(super) async fn landing_record(db: &LocalDb, merge_request_id: &str) -> Opti
 }
 
 /// What the merge journal's outcome event records beyond an ordinary landing:
-/// a pin bump's evidence, a config notice.
+/// a pin bump's evidence, a config notice, the empty commits dropped.
 fn merge_journal_detail(details: &[Option<&str>]) -> Option<String> {
     let details: Vec<&str> = details.iter().flatten().copied().collect();
     (!details.is_empty()).then(|| details.join("; "))
+}
+
+/// The merge record's account of the empty commits dropped from the branch
+/// before it was published.
+fn dropped_commits_detail(dropped: &[String]) -> Option<String> {
+    (!dropped.is_empty()).then(|| {
+        format!(
+            "dropped {} emptied commit(s): {}",
+            dropped.len(),
+            dropped.join(", ")
+        )
+    })
 }
 
 /// A merge's reply with a notice the person who merged must read, set apart
@@ -1310,6 +1328,22 @@ mod tests {
     use super::super::context::MrContext;
     use super::*;
     use crate::storage::RowExt;
+
+    #[test]
+    fn the_merge_record_names_the_empty_commits_a_landing_dropped() {
+        assert_eq!(dropped_commits_detail(&[]), None);
+        let dropped =
+            dropped_commits_detail(
+                &["862031e36cc7 \"fix: apply write-check changes\"".to_string()],
+            );
+        assert_eq!(
+            merge_journal_detail(&[Some("config notice"), dropped.as_deref()]).as_deref(),
+            Some(
+                "config notice; dropped 1 emptied commit(s): 862031e36cc7 \"fix: apply \
+                 write-check changes\""
+            )
+        );
+    }
 
     async fn merge_journal_test_db() -> LocalDb {
         let dir = tempfile::tempdir().unwrap();

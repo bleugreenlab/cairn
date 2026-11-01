@@ -1192,15 +1192,28 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     // exactly this one rebase and no sibling's.
     let pre_op = operation_id(jj, store)?;
     let pre_tip = bookmark_commit(jj, store, branch);
+    let own_before = super::emptied::own_commits(jj, store, dest, branch);
 
     // One transaction: a rebase that loses `packed-refs.lock` commits nothing,
     // and `run_store_rewrite` checks the operation head before repeating it.
     // The `expected_pre_tip` check above runs once, before any waiting, and
     // stays valid throughout: the bookmark cannot move under the store lock.
+    //
+    // `--skip-emptied` drops each commit the advance leaves with no changes
+    // (a formatting fix or a structural merge `dest` now carries), moving its
+    // bookmarks to its parent. A commit that was already empty is kept.
     if let Err(error) = run_store_rewrite(
         jj,
         store,
-        &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
+        &[
+            "rebase",
+            "-b",
+            branch,
+            "-o",
+            dest,
+            "--skip-emptied",
+            "--ignore-working-copy",
+        ],
         "jj rebase",
     ) {
         return Err(explain_immutable_rebase_refusal(
@@ -1381,6 +1394,15 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     }
     if let Some(pre_tip) = pre_tip.as_deref() {
         hide_superseded_history_logged(jj, store, branch, pre_tip, dest);
+    }
+    let dropped = super::emptied::dropped_since(jj, store, dest, branch, &own_before);
+    if !dropped.is_empty() {
+        log::info!(
+            "jj rebase: `{branch}` onto `{dest}` dropped {} commit(s) the advance left with no \
+             changes: {}",
+            dropped.len(),
+            dropped.join(", ")
+        );
     }
 
     // A clean TIP is not a clean branch. Enumerate the whole rebased range: a

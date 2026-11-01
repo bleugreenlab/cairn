@@ -46,14 +46,14 @@ pub struct AncestryHeal {
     pub dropped: Vec<String>,
 }
 
-/// A commit the heal may rewrite, as it needs to see it.
-struct ScopeCommit {
-    commit_id: String,
-    change_id: String,
-    empty: bool,
+/// A commit a store rewrite may change, as it needs to see it.
+pub(super) struct ScopeCommit {
+    pub(super) commit_id: String,
+    pub(super) change_id: String,
+    pub(super) empty: bool,
     conflict: bool,
-    merge: bool,
-    subject: String,
+    pub(super) merge: bool,
+    pub(super) subject: String,
     /// The paths jj records as conflicted in this commit.
     files: Vec<String>,
 }
@@ -64,7 +64,11 @@ fn short(commit: &str) -> &str {
 
 /// The commits of `revset`, oldest first: every commit is listed after all of
 /// its ancestors in the set.
-fn scope_commits(jj: &JjEnv, store: &Path, revset: &str) -> Result<Vec<ScopeCommit>, String> {
+pub(super) fn scope_commits(
+    jj: &JjEnv,
+    store: &Path,
+    revset: &str,
+) -> Result<Vec<ScopeCommit>, String> {
     const TEMPLATE: &str = "commit_id ++ \"\\x1f\" ++ change_id ++ \"\\x1f\" ++ if(self.empty(), \"1\", \"0\") ++ \"\\x1f\" ++ if(self.conflict(), \"1\", \"0\") ++ \"\\x1f\" ++ if(parents.len() > 1, \"1\", \"0\") ++ \"\\x1f\" ++ self.conflicted_files().map(|f| f.path()).join(\"\\x1e\") ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"";
     let out = jj.run(
         store,
@@ -137,7 +141,7 @@ fn store_conflicted_changes(jj: &JjEnv, store: &Path) -> Result<BTreeSet<String>
         .collect())
 }
 
-fn same_tree(jj: &JjEnv, store: &Path, from: &str, to: &str) -> Result<bool, String> {
+pub(super) fn same_tree(jj: &JjEnv, store: &Path, from: &str, to: &str) -> Result<bool, String> {
     jj.run(
         store,
         &[
@@ -287,7 +291,7 @@ pub fn heal_conflicted_ancestry(
         conflicts_before: &conflicts_before,
     };
     plan.run(jj, store)
-        .map_err(|reason| undo_heal(jj, store, branch, &pre_op, reason))
+        .map_err(|reason| undo_branch_rewrite(jj, store, branch, &pre_op, "ancestry heal", reason))
 }
 
 /// Everything the heal pinned before its first rewrite.
@@ -471,8 +475,9 @@ impl HealPlan<'_> {
             .filter(|commit| commit.empty)
             .map(|commit| commit.change_id.as_str())
             .collect();
-        let emptied: Vec<ScopeCommit> = scope_commits(jj, store, self.scope)?
-            .into_iter()
+        let scope = scope_commits(jj, store, self.scope)?;
+        let emptied: Vec<&ScopeCommit> = scope
+            .iter()
             .filter(|commit| {
                 commit.empty
                     && !commit.merge
@@ -483,12 +488,10 @@ impl HealPlan<'_> {
         if emptied.is_empty() {
             return Ok(Vec::new());
         }
-        let mut args = vec!["abandon", "--retain-bookmarks", "--ignore-working-copy"];
-        args.extend(emptied.iter().map(|commit| commit.commit_id.as_str()));
-        run_store_rewrite(
+        let dropped = super::emptied::abandon_empty(
             jj,
             store,
-            &args,
+            &emptied,
             "jj abandon (ancestry heal emptied commits)",
         )?;
         healed.retain(|entry| {
@@ -496,10 +499,6 @@ impl HealPlan<'_> {
                 .iter()
                 .any(|commit| commit.change_id == entry.change_id)
         });
-        let dropped: Vec<String> = emptied
-            .iter()
-            .map(|commit| format!("{} \"{}\"", short(&commit.commit_id), commit.subject))
-            .collect();
         if healed.is_empty() {
             log::warn!(
                 "ancestry heal: every commit of `{}` the resolution touched ended up empty and was \
@@ -584,27 +583,35 @@ impl HealPlan<'_> {
     }
 }
 
-/// Put the store back where the heal found it and prove the branch's git ref
-/// followed. The reason still leads, so a guard refusal stays recognizable.
-fn undo_heal(jj: &JjEnv, store: &Path, branch: &str, pre_op: &str, reason: String) -> String {
+/// Put the store back where a refused `rewrite` of `branch` found it and prove
+/// the branch's git ref followed. The reason still leads, so a guard refusal
+/// stays recognizable.
+pub(super) fn undo_branch_rewrite(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    pre_op: &str,
+    rewrite: &str,
+    reason: String,
+) -> String {
     let undone = restore_operation(jj, store, pre_op).and_then(|()| {
         export_bookmark_advance(
             jj,
             store,
             true,
             branch,
-            "jj git export (refused ancestry heal undone)",
+            &format!("jj git export (refused {rewrite} undone)"),
         )
     });
     match undone {
         Ok(()) => reason,
         Err(error) => {
-            log::error!("ancestry heal: the refusal for {branch} could not be undone: {error}");
+            log::error!("{rewrite}: the refusal for {branch} could not be undone: {error}");
             format!(
                 "{reason}\n{}",
                 rollback_incomplete(&format!(
-                    "the refused heal of `{branch}` could not be undone to operation {pre_op}: \
-                     {error}"
+                    "the refused {rewrite} of `{branch}` could not be undone to operation \
+                     {pre_op}: {error}"
                 ))
             )
         }

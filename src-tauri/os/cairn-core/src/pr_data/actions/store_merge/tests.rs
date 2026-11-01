@@ -455,3 +455,118 @@ async fn test_trace(fx: &MergeFixture) -> crate::orchestrator::JjStoreOperationT
         .await
         .trace()
 }
+
+/// The newest child of the source tip described `message`, made empty from
+/// the store side, with the source bookmark moved onto it.
+fn empty_commit_on_source(fx: &MergeFixture, bin: &str, message: &str) -> String {
+    let cfg = fx.orch.config_dir.join("jj").join("config.toml");
+    let on = format!("bookmarks(exact:{:?})", fx.ctx.source_branch);
+    jj_raw(
+        bin,
+        &cfg,
+        &fx.store,
+        &[
+            "new",
+            "--no-edit",
+            &on,
+            "-m",
+            message,
+            "--ignore-working-copy",
+        ],
+    );
+    let commit = crate::jj::revset_commit(
+        &fx.jj,
+        &fx.store,
+        &format!("children({on}) & empty() & description(substring:{message:?})"),
+    )
+    .unwrap();
+    jj_raw(
+        bin,
+        &cfg,
+        &fx.store,
+        &[
+            "bookmark",
+            "set",
+            &fx.ctx.source_branch,
+            "-r",
+            &commit,
+            "--ignore-working-copy",
+        ],
+    );
+    commit
+}
+
+/// cairn/5551's refusal: the bound head's stack carried a write check's fix
+/// that a base advance had emptied, and publication refused it and told the
+/// operator to run jj. Publication now drops it, pushes the surviving tip, and
+/// names what it dropped for the merge record.
+#[tokio::test(flavor = "current_thread")]
+async fn publication_drops_an_emptied_write_check_commit_and_pushes_the_surviving_head() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let source = fx.ctx.source_branch.clone();
+    let work = crate::jj::bookmark_commit(&fx.jj, &fx.store, &source).unwrap();
+    let empty = empty_commit_on_source(&fx, &bin, "fix: apply write-check changes");
+
+    let published = publish_landing_source(&fx.jj, &fx.store, "main", &source)
+        .expect("an empty commit never refuses publication");
+    assert_eq!(
+        published,
+        SourcePublication {
+            head: work.clone(),
+            dropped: vec![format!(
+                "{} \"fix: apply write-check changes\"",
+                &empty[..12]
+            )],
+        },
+        "the empty tip is dropped and named, and the builder's commit is the head"
+    );
+    assert_eq!(
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, &source).as_deref(),
+        Some(work.as_str())
+    );
+    assert_eq!(
+        git_stdout(&fx.origin_path, &["rev-parse", &source]),
+        work,
+        "origin holds the surviving head, which the GitHub merge is bound to"
+    );
+}
+
+/// The one refusal left: a commit with changes and no description. No Cairn
+/// path writes one, so the refusal says it was made outside Cairn, and nothing
+/// is pushed.
+#[tokio::test(flavor = "current_thread")]
+async fn publication_refuses_an_undescribed_commit_made_outside_cairn() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = setup_clean_merge(&bin).await;
+    let source = fx.ctx.source_branch.clone();
+    let cfg = fx.orch.config_dir.join("jj").join("config.toml");
+    jj_raw(
+        &bin,
+        &cfg,
+        &fx.store,
+        &[
+            "describe",
+            &format!("bookmarks(exact:{source:?})"),
+            "-m",
+            "",
+            "--ignore-working-copy",
+        ],
+    );
+
+    let error = publish_landing_source(&fx.jj, &fx.store, "main", &source)
+        .expect_err("a commit with changes and no description is refused");
+    assert!(
+        error.contains("carry changes but no description") && error.contains("made outside Cairn"),
+        "{error}"
+    );
+    assert!(
+        !crate::env::git()
+            .args(["rev-parse", "--verify", "--quiet", &source])
+            .current_dir(&fx.origin_path)
+            .status()
+            .unwrap()
+            .success(),
+        "nothing was pushed"
+    );
+}

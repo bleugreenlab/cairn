@@ -12467,3 +12467,260 @@ fn a_foreign_commit_imported_into_the_tracking_ref_is_never_superseded() {
         "a commit the store never rewrote is foreign, whatever the tracking ref says"
     );
 }
+
+/// Put an empty commit described `message` on top of `bookmark`, from the store
+/// side, and move the bookmark onto it: the shape a write-check fix or a
+/// structural merge leaves once the base carries the same change.
+fn store_empty_commit_on(jj: &JjEnv, store: &Path, bookmark: &str, message: &str) -> String {
+    let on = format!("bookmarks(exact:{bookmark:?})");
+    jj.run(
+        store,
+        &[
+            "new",
+            "--no-edit",
+            &on,
+            "-m",
+            message,
+            "--ignore-working-copy",
+        ],
+        "new empty commit",
+    )
+    .unwrap();
+    let commit = revset_commit(
+        jj,
+        store,
+        &format!("children({on}) & empty() & description(substring:{message:?})"),
+    )
+    .unwrap();
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            bookmark,
+            "-r",
+            &commit,
+            "--ignore-working-copy",
+        ],
+        "move bookmark onto the empty commit",
+    )
+    .unwrap();
+    commit
+}
+
+/// cairn/5603: a write check's formatting fix that main later makes the same
+/// way goes empty when the branch is replayed onto main. The advance drops it
+/// instead of carrying it to the publish gate, and the bookmark moves onto the
+/// builder's own commit beneath it.
+#[test]
+#[serial_test::serial(jj)]
+fn a_base_advance_drops_the_formatting_commit_it_empties() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/cairn-5603-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("feature.rs"), "work\n").unwrap();
+    seal(&jj, &ws, "builder work", None).unwrap();
+    std::fs::write(ws.join("shared.rs"), "formatted\n").unwrap();
+    seal(&jj, &ws, "fix: apply write-check changes", None).unwrap();
+    forget_workspace(&jj, &store, branch).unwrap();
+    advance_main_shared(&jj, &store, wts.path(), "formatted\n");
+
+    assert_eq!(
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap(),
+        RebaseOutcome::Rebased
+    );
+    let main_tip = bookmark_commit(&jj, &store, "main").unwrap();
+    let own = commits_oldest_first(
+        &jj,
+        &store,
+        &format!("{main_tip}..bookmarks(exact:{branch:?})"),
+    );
+    assert_eq!(
+        own.iter()
+            .map(|(_, subject)| subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["builder work"],
+        "the emptied formatting commit is gone, and the builder's commit is kept"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(own[0].0.as_str()),
+        "the bookmark moved onto the surviving commit"
+    );
+    assert_eq!(commit_summary(&jj, &store, &own[0].0), "A feature.rs");
+    assert_eq!(
+        String::from_utf8_lossy(&file_show(&jj, &store, branch, "shared.rs").unwrap()),
+        "formatted\n"
+    );
+}
+
+/// Empty commits that got past the rewrites (one from a store older than the
+/// skip-emptied advance, or one jj made outside Cairn) are dropped before
+/// publication: the one in the middle and the one at the tip, with the bookmark
+/// left on the surviving stack, its tree unchanged, and each dropped commit
+/// named.
+#[test]
+#[serial_test::serial(jj)]
+fn publication_drops_empty_commits_and_keeps_the_branch_on_its_surviving_stack() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/cairn-5603-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("one.rs"), "one\n").unwrap();
+    seal(&jj, &ws, "first work", None).unwrap();
+    forget_workspace(&jj, &store, branch).unwrap();
+    let fix = store_empty_commit_on(&jj, &store, branch, "fix: apply write-check changes");
+    store_commit_on(&jj, &store, branch, "two.rs", "two\n", "second work");
+    let merge = store_empty_commit_on(
+        &jj,
+        &store,
+        branch,
+        "Merge declared registry lists element-wise after base advance",
+    );
+    let before = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_eq!(before, merge, "precondition: the tip is the empty commit");
+
+    let outcome = drop_empty_commits(&jj, &store, branch, "main").unwrap();
+    assert_eq!(
+        outcome.dropped,
+        vec![
+            format!("{} \"fix: apply write-check changes\"", &fix[..12]),
+            format!(
+                "{} \"Merge declared registry lists element-wise after base advance\"",
+                &merge[..12]
+            ),
+        ],
+        "both empty commits are dropped and named, oldest first"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(outcome.tip.as_str())
+    );
+    let main_tip = bookmark_commit(&jj, &store, "main").unwrap();
+    assert_eq!(
+        commits_oldest_first(
+            &jj,
+            &store,
+            &format!("{main_tip}..bookmarks(exact:{branch:?})")
+        )
+        .into_iter()
+        .map(|(_, subject)| subject)
+        .collect::<Vec<_>>(),
+        vec!["first work".to_string(), "second work".to_string()],
+        "every commit with changes keeps its place and message"
+    );
+    assert!(
+        jj.run(
+            &store,
+            &[
+                "diff",
+                "--from",
+                &before,
+                "--to",
+                &outcome.tip,
+                "--summary",
+                "--ignore-working-copy",
+            ],
+            "tip tree",
+        )
+        .unwrap()
+        .trim()
+        .is_empty(),
+        "the surviving tip holds exactly the tree the branch held"
+    );
+}
+
+/// A stack with no empty commit is not rewritten at all: the same tip, and no
+/// store operation recorded.
+#[test]
+#[serial_test::serial(jj)]
+fn publication_leaves_a_stack_without_empty_commits_untouched() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/cairn-5603-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("one.rs"), "one\n").unwrap();
+    seal(&jj, &ws, "first work", None).unwrap();
+    std::fs::write(ws.join("two.rs"), "two\n").unwrap();
+    seal(&jj, &ws, "second work", None).unwrap();
+    forget_workspace(&jj, &store, branch).unwrap();
+    let tip = bookmark_commit(&jj, &store, branch).unwrap();
+    let op = operation_id(&jj, &store).unwrap();
+
+    let outcome = drop_empty_commits(&jj, &store, branch, "main").unwrap();
+    assert_eq!(
+        outcome,
+        DroppedEmpty {
+            tip: tip.clone(),
+            dropped: Vec::new(),
+        }
+    );
+    assert_eq!(bookmark_commit(&jj, &store, branch), Some(tip));
+    assert_eq!(
+        operation_id(&jj, &store).unwrap(),
+        op,
+        "nothing was rewritten"
+    );
+}
+
+/// A branch on which every commit is empty has nothing to land. It is refused
+/// as such, and left where it was rather than moved onto its base.
+#[test]
+#[serial_test::serial(jj)]
+fn publication_refuses_a_branch_that_is_only_empty_commits() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/cairn-5603-builder-0";
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "create",
+            branch,
+            "-r",
+            "main",
+            "--ignore-working-copy",
+        ],
+        "create branch",
+    )
+    .unwrap();
+    let only = store_empty_commit_on(&jj, &store, branch, "fix: apply write-check changes");
+
+    let error = drop_empty_commits(&jj, &store, branch, "main").unwrap_err();
+    assert!(
+        error.contains("no changes beyond `main`") && error.contains("nothing to land"),
+        "{error}"
+    );
+    assert_eq!(bookmark_commit(&jj, &store, branch), Some(only));
+}

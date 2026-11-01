@@ -26,18 +26,22 @@ pub(super) async fn land_validated_default(
 }
 
 /// Push a landing's source branch to origin, so the pull request's head is the
-/// commit the landing judged. The caller holds the store lock.
+/// commit the landing judged. The head pushed is [`SourcePublication::head`]: the
+/// judged tree, possibly on a different commit once empty commits are dropped,
+/// and the head the GitHub merge must be bound to. The caller holds the store
+/// lock.
 pub(super) fn publish_landing_source(
     jj: &crate::jj::JjEnv,
     store: &Path,
     target_branch: &str,
     source_branch: &str,
-) -> Result<(), String> {
-    validate_source_publishability(jj, store, target_branch, source_branch)?;
+) -> Result<SourcePublication, String> {
+    let publication = prepare_source_for_publication(jj, store, target_branch, source_branch)?;
     if let Err(error) = crate::jj::track_bookmark(jj, store, source_branch) {
         log::debug!("landing: track {source_branch} (continuing): {error}");
     }
-    crate::jj::push_store_bookmark(jj, store, source_branch)
+    crate::jj::push_store_bookmark(jj, store, source_branch)?;
+    Ok(publication)
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +316,7 @@ fn publish_integration_merge(
     source_branch: &str,
     target_branch: &str,
 ) -> Result<(), String> {
-    validate_source_publishability(jj, store, target_branch, source_branch)?;
+    prepare_source_for_publication(jj, store, target_branch, source_branch)?;
     let _ = crate::jj::track_bookmark(jj, store, source_branch);
     crate::jj::push_store_bookmark(jj, store, source_branch)?;
     let _ = crate::jj::track_bookmark(jj, store, target_branch);
@@ -586,7 +590,7 @@ async fn store_merge_child_inner(
             // that would land the content but leave the PR unmerged. A retry is
             // idempotent (the source already sits on the fetched tip).
             if let Err(e) =
-                validate_source_publishability(&jj, &store, target_branch, source_branch)
+                prepare_source_for_publication(&jj, &store, target_branch, source_branch)
             {
                 return Err(rollback_merge(
                     orch,
@@ -899,7 +903,7 @@ async fn store_merge_child_inner(
             // Defensively track each bookmark, since its `@origin` ref may have been
             // created outside this store's jj (best-effort).
             if let Err(e) =
-                validate_source_publishability(&jj, &store, target_branch, source_branch)
+                prepare_source_for_publication(&jj, &store, target_branch, source_branch)
             {
                 return Err(rollback_merge(
                     orch,
@@ -963,14 +967,36 @@ async fn store_merge_child_inner(
         .ok_or_else(|| format!("target bookmark `{target_branch}` did not resolve after the fold"))
 }
 
-fn validate_source_publishability(
+/// What preparing a source branch for publication left it as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SourcePublication {
+    /// The source tip that is published. It holds the tree the source held
+    /// before; it is a different commit when an empty tip was dropped.
+    pub head: String,
+    /// The empty commits dropped from the source, as `<short id> "<subject>"`.
+    pub dropped: Vec<String>,
+}
+
+/// Make the source's stack above `target_branch` fit to publish, or say why it
+/// is not.
+///
+/// An empty commit is dropped ([`crate::jj::drop_empty_commits`]): it has no
+/// content to lose, and the commits Cairn writes on a branch (a write check's
+/// fix, a structural merge, a bind commit) are exactly the ones a later base
+/// advance can empty. A commit with changes and a blank description is
+/// refused. Every commit Cairn writes carries a message, so that commit was
+/// made outside Cairn, and only the person who made it can say what it is.
+/// The caller holds the store lock.
+fn prepare_source_for_publication(
     jj: &crate::jj::JjEnv,
     store: &Path,
     target_branch: &str,
     source_branch: &str,
-) -> Result<(), String> {
+) -> Result<SourcePublication, String> {
+    let dropped = crate::jj::drop_empty_commits(jj, store, source_branch, target_branch)
+        .map_err(|error| format!("Refusing to publish source `{source_branch}`: {error}"))?;
     let revset = format!("bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})");
-    let template = "commit_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\x1f\" ++ if(empty, \"1\", \"0\") ++ \"\\n\"";
+    let template = "commit_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"";
     let output = jj.run(
         store,
         &[
@@ -984,32 +1010,26 @@ fn validate_source_publishability(
         ],
         "jj log source publishability",
     )?;
-    let mut malformed = Vec::new();
-    for line in output.lines() {
-        let mut fields = line.split('\u{1f}');
-        let commit_id = fields.next().unwrap_or_default().trim();
-        let description = fields.next().unwrap_or_default().trim();
-        let empty = fields.next().unwrap_or_default().trim() == "1";
-        if !commit_id.is_empty() && (description.is_empty() || empty) {
-            malformed.push(format!(
-                "{commit_id} ({})",
-                if description.is_empty() && empty {
-                    "empty tree and blank description"
-                } else if description.is_empty() {
-                    "blank description"
-                } else {
-                    "empty tree"
-                }
-            ));
-        }
+    let undescribed: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.split_once('\u{1f}'))
+        .filter(|(commit, subject)| !commit.trim().is_empty() && subject.trim().is_empty())
+        .map(|(commit, _)| commit.trim())
+        .collect();
+    if !undescribed.is_empty() {
+        return Err(format!(
+            "Refusing to publish source `{source_branch}`: commit(s) {} carry changes but no \
+             description. Every commit Cairn writes has one (an agent's commit message, a write \
+             check's fix, a heal or bind commit), so these were made outside Cairn, and Cairn \
+             will not guess what they are. Describe or abandon them on `{source_branch}`, then \
+             merge again.",
+            undescribed.join(", ")
+        ));
     }
-    if malformed.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "Refusing to publish source `{source_branch}`: its final source stack contains malformed/debris commit(s): {}. Amend or abandon those commits, ensure `{source_branch}` points to the surviving stack, then retry the merge.",
-        malformed.join(", ")
-    ))
+    Ok(SourcePublication {
+        head: dropped.tip,
+        dropped: dropped.dropped,
+    })
 }
 
 /// The base branch the integration `target_branch` was itself cut from: the

@@ -64,6 +64,15 @@ pub(super) struct DefaultLanding {
     pub landed_commit: Option<String>,
     /// The identifiers the landing bound.
     pub plan: bind::BindPlan,
+    /// Empty commits dropped from the branch before it was published, as
+    /// `<short id> "<subject>"`.
+    pub dropped: Vec<String>,
+}
+
+/// What one landing attempt put on the default branch.
+struct Landed {
+    commit: Option<String>,
+    dropped: Vec<String>,
 }
 
 /// One merge result as it would land, and what it took to build it.
@@ -148,10 +157,11 @@ pub(super) async fn land_on_default(
             land_if_unchanged(orch, merge_context, method, via_github, &store, &prospect).await?
         };
         match landed {
-            Some(landed_commit) => {
+            Some(Landed { commit, dropped }) => {
                 return Ok(DefaultLanding {
-                    landed_commit,
+                    landed_commit: commit,
                     plan: prospect.plan,
+                    dropped,
                 })
             }
             None => log::info!(
@@ -248,6 +258,7 @@ async fn github_without_prospect(
     Ok(Some(DefaultLanding {
         landed_commit,
         plan: bind::BindPlan::default(),
+        dropped: Vec::new(),
     }))
 }
 
@@ -357,7 +368,7 @@ async fn land_if_unchanged(
     via_github: bool,
     store: &Store,
     prospect: &Prospect,
-) -> Result<Option<Option<String>>, String> {
+) -> Result<Option<Landed>, String> {
     let live = live_default_landing_tips(orch, merge_context).await?;
     if live
         != (
@@ -404,11 +415,17 @@ async fn land_if_unchanged(
         let commit = land_validated_default(orch, merge_context, method, &prospect.merge.tree_hash)
             .await
             .map_err(&rollback)?;
-        return Ok(Some(Some(commit)));
+        return Ok(Some(Landed {
+            commit: Some(commit),
+            dropped: Vec::new(),
+        }));
     }
 
-    if prospect.binds {
-        publish_landing_source(
+    let (head, dropped) = if prospect.binds {
+        // Publishing drops any empty commit the replay left, which can move the
+        // tip to another commit with the same tree. GitHub is bound to the
+        // head origin now holds.
+        let published = publish_landing_source(
             &store.jj,
             &store.path,
             &merge_context.target_branch,
@@ -421,13 +438,15 @@ async fn land_if_unchanged(
                 merge_context.source_branch
             ))
         })?;
-    }
+        (published.head, published.dropped)
+    } else {
+        (head, Vec::new())
+    };
     // From here origin holds the bound head. A refused GitHub merge leaves the
     // branch bound, and the next landing binds it again against the tip it
     // then finds: a no-op when nothing landed in between.
-    github_merge(orch, merge_context, method, &head)
-        .await
-        .map(Some)
+    let commit = github_merge(orch, merge_context, method, &head).await?;
+    Ok(Some(Landed { commit, dropped }))
 }
 
 /// Merge the pull request through GitHub, bound to `head`: GitHub refuses if
@@ -829,6 +848,7 @@ impl LandingWorld for GatedLanding<'_> {
                         landing: DefaultLanding {
                             landed_commit: Some(commit),
                             plan: prospect.plan,
+                            dropped: Vec::new(),
                         },
                     },
                     Err(error) => {
@@ -857,14 +877,22 @@ impl LandingWorld for GatedLanding<'_> {
             head
         };
         // ── GitHub: no lock held; GitHub's `sha` binds the head ──
-        if prospect.binds {
-            if let Err(error) = publish_landing_source(&store.jj, &store.path, target, source) {
-                return Execution::Refused(format!(
-                    "Refusing to merge `{source}`: its bound head could not be pushed to origin \
-                     ({error}). Nothing was merged; merge again."
-                ));
+        // Publishing drops any empty commit the replay left, which can move the
+        // tip to another commit with the approved tree; GitHub is bound to the
+        // head origin then holds.
+        let (head, dropped) = if prospect.binds {
+            match publish_landing_source(&store.jj, &store.path, target, source) {
+                Ok(published) => (published.head, published.dropped),
+                Err(error) => {
+                    return Execution::Refused(format!(
+                        "Refusing to merge `{source}`: its bound head could not be pushed to \
+                         origin ({error}). Nothing was merged; merge again."
+                    ))
+                }
             }
-        }
+        } else {
+            (head, Vec::new())
+        };
         match github_merge(self.orch, self.merge_context, self.method, &head).await {
             Ok(Some(commit)) => Execution::Landed {
                 commit: commit.clone(),
@@ -872,6 +900,7 @@ impl LandingWorld for GatedLanding<'_> {
                 landing: DefaultLanding {
                     landed_commit: Some(commit),
                     plan: prospect.plan,
+                    dropped,
                 },
             },
             Ok(None) => Execution::Unknown {

@@ -5777,11 +5777,18 @@ fn classify_check_failure(
 /// The termination signal a shell exit status of 128 + N reports, for the
 /// signals something outside the process sends to stop it.
 fn termination_signal(exit_code: i32) -> Option<&'static str> {
-    match exit_code {
-        129 => Some("SIGHUP"),
-        130 => Some("SIGINT"),
-        137 => Some("SIGKILL"),
-        143 => Some("SIGTERM"),
+    exit_code.checked_sub(128).and_then(terminating_signal)
+}
+
+/// The name of a signal that is sent from outside a process to end it (an OOM
+/// killer, a supervisor, a shutdown), by number. Crash signals (SIGSEGV,
+/// SIGABRT) have none: those are the process's own outcome.
+pub(crate) fn terminating_signal(signal: i32) -> Option<&'static str> {
+    match signal {
+        1 => Some("SIGHUP"),
+        2 => Some("SIGINT"),
+        9 => Some("SIGKILL"),
+        15 => Some("SIGTERM"),
         _ => None,
     }
 }

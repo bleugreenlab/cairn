@@ -57,6 +57,11 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         "fn apply_resolution_carry(",
     ),
     (
+        "empty-commit drop",
+        include_str!("../../../cairn-vcs/src/jj/emptied.rs"),
+        "fn abandon_empty(",
+    ),
+    (
         "flatten squash",
         include_str!("../../../cairn-vcs/src/jj/merge.rs"),
         "pub fn squash_branch_onto(",
