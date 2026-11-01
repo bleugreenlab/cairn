@@ -6,7 +6,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use sha2::{Digest, Sha256};
 
@@ -144,22 +144,69 @@ fn compose_identity(rustc: Option<String>, bun: Option<String>) -> String {
     )
 }
 
+/// The host identity [`toolchain_identity`] last probed. Each value is leaked so
+/// callers keep a `&'static str`; a new one is minted only when
+/// [`refresh_toolchain_identity`] runs, which is once per tool install, so the
+/// leak is bounded by how often a machine's tools actually change.
+static IDENTITY: RwLock<Option<&'static str>> = RwLock::new(None);
+
 /// The toolchains this process resolves from its own working directory and the
-/// agent shell's PATH, which is the machine's default unless the process happens
-/// to start beneath a `rust-toolchain` pin. It identifies the host, not any
-/// particular check: use [`toolchain_identity_in`] for what a command ran under.
+/// PATH it installed for itself at startup (the agent shell PATH for a runner,
+/// the executor's PATH led by its own home's `bin` for an executor), which is
+/// the machine's default unless the process happens to start beneath a
+/// `rust-toolchain` pin. It identifies the host, not any particular check: use
+/// [`toolchain_identity_in`] for what a command ran under.
+///
+/// Probed once and then held, because it keys every check verdict this process
+/// computes. A process that changes what its PATH resolves (an executor
+/// installing the published `bun` into its own bin) calls
+/// [`refresh_toolchain_identity`], or the held answer would keep naming the
+/// tool it replaced until the process restarted.
 pub fn toolchain_identity() -> &'static str {
-    static IDENTITY: OnceLock<String> = OnceLock::new();
-    IDENTITY.get_or_init(|| {
-        let path = cairn_common::toolchain_path::agent_shell_path();
-        let host = |program: &str, args: &[&str]| {
-            probe(Command::new(program).args(args).env("PATH", &path), program)
-        };
-        compose_identity(
-            host("rustc", RUSTC_VERSION_ARGS),
-            host("bun", &["--version"]),
-        )
-    })
+    if let Some(identity) = *IDENTITY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return identity;
+    }
+    let mut held = IDENTITY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *held.get_or_insert_with(|| Box::leak(probe_host_identity().into_boxed_str()))
+}
+
+/// Probe the host identity again and hold the new answer, returning it. Call
+/// after anything that changes which `rustc` or `bun` this process's PATH
+/// resolves.
+pub fn refresh_toolchain_identity() -> &'static str {
+    let identity: &'static str = Box::leak(probe_host_identity().into_boxed_str());
+    *IDENTITY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+    identity
+}
+
+fn probe_host_identity() -> String {
+    let path = host_probe_path();
+    let host = |program: &str, args: &[&str]| {
+        probe(Command::new(program).args(args).env("PATH", &path), program)
+    };
+    compose_identity(
+        host("rustc", RUSTC_VERSION_ARGS),
+        host("bun", &["--version"]),
+    )
+}
+
+/// The PATH the host identity is probed under: this process's own, which both
+/// the runner (`install_process_path`) and the executor
+/// (`install_executor_process_path`) set before anything else runs. Only a
+/// process that installed none falls back to the agent shell PATH. Probing the
+/// agent shell PATH from an executor would skip the executor's own bin and
+/// fingerprint whatever older install `~/.cairn/bin` happens to hold.
+fn host_probe_path() -> std::ffi::OsString {
+    std::env::var_os("PATH")
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| cairn_common::toolchain_path::agent_shell_path().into())
 }
 
 /// The toolchains a command launched in `dir` with `env` layered over this
@@ -306,6 +353,21 @@ mod tests {
             toolchain_identity_in(root.path(), [("PATH", empty.as_os_str())]),
             "rustc=unavailable;bun=unavailable"
         );
+    }
+
+    /// The held identity is what every verdict this process keys reads, so a
+    /// refresh has to replace it rather than leave the first probe standing.
+    #[test]
+    fn a_refresh_replaces_the_held_identity() {
+        let held = toolchain_identity();
+        assert_eq!(
+            toolchain_identity(),
+            held,
+            "the identity is held, not re-probed"
+        );
+        let refreshed = refresh_toolchain_identity();
+        assert_eq!(toolchain_identity(), refreshed);
+        assert!(refreshed.starts_with("rustc=") && refreshed.contains(";bun="));
     }
 
     #[test]

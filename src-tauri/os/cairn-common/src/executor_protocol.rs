@@ -76,6 +76,19 @@ pub const EXECUTOR_ARTIFACT_MANIFEST_PATH: &str = "/api/executor/artifact/manife
 /// to the runner, which serves the bytes itself.
 pub const EXECUTOR_CLI_SELECTION_PATH: &str = "/api/executor/artifact/cli";
 
+/// Where a runner serves the [`ExecutorToolSelection`] for a target (`?target=`),
+/// on its executor listener: the pinned `jj`, `bun`, and `uv` its publication
+/// names. A resident executor reads it after every Ready and on an interval, and
+/// replaces each tool in its own home's `bin` when the bytes it holds have a
+/// different sha256. Each tool's `url` is relative to the runner
+/// ([`executor_tool_artifact_path`]), which serves the bytes itself.
+pub const EXECUTOR_TOOL_SELECTION_PATH: &str = "/api/executor/artifact/tools";
+
+/// Where a runner serves the bytes of one selected tool.
+pub fn executor_tool_artifact_path(target: &str, name: &str) -> String {
+    format!("/api/executor/artifact/{target}/tool/{name}")
+}
+
 /// The response header on a runner object fetch that names the source
 /// repository's shallow boundary reached by the wanted commit's history, as
 /// space-separated commit IDs. The pack stops at those commits by design, so the
@@ -6043,6 +6056,18 @@ pub struct LearnedResourceEstimate {
 /// executor keeps sizing builds to cores until it runs a build carrying this.
 /// An older runner ignores the field.
 ///
+/// cairn/5693 does not move the number. A resident executor now keeps the
+/// pinned `jj`, `bun`, and `uv` in its own home's `bin` the way it keeps the
+/// `cairn` CLI: it reads [`ExecutorToolSelection`] from the runner's artifact
+/// plane at [`EXECUTOR_TOOL_SELECTION_PATH`] and installs any tool whose sha256
+/// differs. That is a new HTTP route an earlier executor never asks for, and an
+/// earlier runner answers it 404, which the executor reports as a host fallback
+/// on its `bun` probe rather than failing anything. No frame changes shape; the
+/// probe's provenance rides in the free-text `detail` it already carried. What
+/// a runner gets wrong talking to an older executor: nothing. New executor
+/// builds reach the fleet through the build-identity rollout, not a protocol
+/// mismatch, so the number need not move to deliver this.
+///
 /// Version 160 (cairn/5660) lets the runner act on inference deployments.
 /// [`ExecutorMessage::DeploymentCommand`] tells a deployment's head machine to
 /// start, stop or probe it ([`DeploymentOperation`]): the executor runs the
@@ -6216,6 +6241,20 @@ pub struct ToolArtifact {
     pub sha256: String,
     pub size: u64,
     pub version: String,
+}
+
+/// The tools a resident executor keeps in its own home's `bin`, by the name a
+/// [`ToolArtifact`] carries. The executor installs nothing else a selection
+/// names, so no selection can put an arbitrary program first on every cell's
+/// PATH. The same list as `PINNED_TOOLS` in `scripts/lib/pinned-tools.ts`.
+pub const EXECUTOR_MANAGED_TOOLS: &[&str] = &["jj", "bun", "uv"];
+
+/// What [`EXECUTOR_TOOL_SELECTION_PATH`] answers: the tools a runner's
+/// publication names for one target, each pointing at the runner itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorToolSelection {
+    pub tools: Vec<ToolArtifact>,
 }
 
 /// The target-independent resource tree a headless runner needs beside its
