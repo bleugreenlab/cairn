@@ -174,7 +174,7 @@ impl World {
     fn live_machine(&self, held: Arc<Mutex<ObjectChannelCredential>>) -> Machine {
         Machine {
             replicas: Replicas::new(self._temp.path().join("c/node-scratch")),
-            transport: ScratchTransport::live(reqwest::Client::new(), move || {
+            transport: ScratchTransport::live(cairn_tls::client().clone(), move || {
                 Some(held.lock().unwrap().clone())
             }),
             writer: "wc",
@@ -433,7 +433,7 @@ async fn a_call_refused_while_a_newer_credential_arrived_is_sent_once_more() {
     let reads = Arc::new(AtomicUsize::new(0));
     let c = Machine {
         replicas: Replicas::new(world._temp.path().join("c/node-scratch")),
-        transport: ScratchTransport::live(reqwest::Client::new(), {
+        transport: ScratchTransport::live(cairn_tls::client().clone(), {
             let reads = reads.clone();
             move || {
                 Some(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -482,6 +482,7 @@ async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
             toolchain_detection: None,
             build_prerequisites: None,
             containment: None,
+            page_call_programs: None,
         },
         current_load: 0,
         warm_roots: Vec::new(),
