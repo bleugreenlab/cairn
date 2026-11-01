@@ -41,6 +41,11 @@ use crate::security::broker::github::installation_authority;
 use crate::storage::LocalDb;
 
 use super::context::MergeMrContext;
+use super::human_approval::{
+    self, approval_strategy, gate_checks, Ceremony, Execution, LandedShape, LandingEvidence,
+    LandingWorld, Observation, SystemClock,
+};
+use super::merge::MergeAttemptJournal;
 use super::store_merge::{
     land_validated_default, live_default_landing_tips, prospective_default_landing,
     publish_landing_source, ProspectiveMerge,
@@ -129,25 +134,7 @@ pub(super) async fn land_on_default(
             }
         }
 
-        let validated = {
-            let (jj, path) = (store.jj.clone(), store.path.clone());
-            let (head, tip) = (
-                prospect.merge.commit_id.clone(),
-                prospect.merge.target_tip.clone(),
-            );
-            let (target, source) = (target.to_string(), source.to_string());
-            let rules = if prospect.binds {
-                prospect.rules.clone()
-            } else {
-                Vec::new()
-            };
-            tokio::task::spawn_blocking(move || {
-                bind::validate_landing(&jj, &path, &head, &tip, &target, &source, &rules)
-            })
-            .await
-            .map_err(|error| format!("landing validation did not finish: {error}"))?
-        };
-        validated?;
+        validate_prospect(&store, merge_context, &prospect).await?;
 
         let landed = {
             let guard = orch
@@ -179,6 +166,34 @@ pub(super) async fn land_on_default(
          the landing was validated, {MAX_LANDING_ATTEMPTS} times. `{target}` was not advanced; merge \
          again."
     ))
+}
+
+/// Validate a prospect off the store lock: every changed file parses, and
+/// every bound identifier holds its invariant.
+async fn validate_prospect(
+    store: &Store,
+    merge_context: &MergeMrContext,
+    prospect: &Prospect,
+) -> Result<(), String> {
+    let (jj, path) = (store.jj.clone(), store.path.clone());
+    let (head, tip) = (
+        prospect.merge.commit_id.clone(),
+        prospect.merge.target_tip.clone(),
+    );
+    let (target, source) = (
+        merge_context.target_branch.clone(),
+        merge_context.source_branch.clone(),
+    );
+    let rules = if prospect.binds {
+        prospect.rules.clone()
+    } else {
+        Vec::new()
+    };
+    tokio::task::spawn_blocking(move || {
+        bind::validate_landing(&jj, &path, &head, &tip, &target, &source, &rules)
+    })
+    .await
+    .map_err(|error| format!("landing validation did not finish: {error}"))?
 }
 
 /// A GitHub landing with nothing to bind needs no prospective merge result,
@@ -479,6 +494,529 @@ async fn github_merge_at(
     }
     log::info!("landing: GitHub merge_pr took {:?}", started.elapsed());
     Ok(merge_commit)
+}
+
+// ─── The approval-gated landing ────────────────────────────────────────────────────────
+
+/// What an approval-gated landing needs beyond an ordinary one.
+pub(super) struct ApprovalGate<'a> {
+    pub db: &'a LocalDb,
+    pub enrollment_id: &'a str,
+    pub description: Option<String>,
+    pub attempt: MergeAttemptJournal<'a>,
+}
+
+/// Land on the default branch only on the selected phone's approval of exactly
+/// this act. The full prospect loop always runs (never the unbound GitHub
+/// shortcut), but once: an approval binds one act, so a moved tip ends the
+/// attempt rather than retrying it. Returns a notice when the landing could
+/// not yet be proven to the approvals service.
+pub(super) async fn land_on_default_with_approval(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_context: &MergeMrContext,
+    method: &str,
+    via_github: bool,
+    gate: ApprovalGate<'_>,
+) -> Result<(DefaultLanding, Option<String>), String> {
+    let journal = human_approval::AttemptJournal::new(gate.db, gate.attempt, 1);
+    let credential = match crate::api::runner_credential() {
+        Ok(credential) => credential,
+        Err(error) => {
+            journal
+                .append(
+                    cairn_common::approvals::ApprovalOutcome::PolicyUnavailable,
+                    super::merge::JournalEntry {
+                        detail: Some(error.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            return Err(format!(
+                "Refusing to merge into the project base branch: the approval phone cannot be \
+                 asked because this runner has no approvals credential ({error})."
+            ));
+        }
+    };
+    let client = crate::approvals_client::ApprovalsClient::new(
+        &*orch.services.http,
+        orch.runtime_admission_api_config(),
+        credential,
+    );
+    let mut world = match GatedLanding::new(orch, job_id, merge_context, method, via_github) {
+        Ok(world) => world,
+        Err(refusal) => {
+            journal
+                .append(
+                    cairn_common::approvals::ApprovalOutcome::Failed,
+                    super::merge::JournalEntry {
+                        detail: Some(refusal.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            return Err(refusal);
+        }
+    };
+    let ceremony = Ceremony {
+        client: &client,
+        journal: &journal,
+        clock: &SystemClock,
+        enrollment_id: gate.enrollment_id,
+        project_id: &merge_context.project_id,
+        attempt_id: gate.attempt.attempt_id,
+        job_id,
+        title: Some(merge_context.title.clone()),
+        description: gate.description,
+    };
+    let approved = ceremony.run(&mut world).await?;
+    let notice = (!approved.proven).then(|| {
+        "The merge landed, but whether it is exactly the approved merge is not yet proven; the \
+         approval stays unsettled until Cairn reconciles it."
+            .to_string()
+    });
+    Ok((approved.landing, notice))
+}
+
+/// The default-branch landing as the approval ceremony drives it.
+struct GatedLanding<'a> {
+    orch: &'a Orchestrator,
+    job_id: &'a str,
+    merge_context: &'a MergeMrContext,
+    method: &'a str,
+    via_github: bool,
+    store: Store,
+    owner: String,
+    repo: String,
+    prospect: Option<Prospect>,
+}
+
+impl<'a> GatedLanding<'a> {
+    fn new(
+        orch: &'a Orchestrator,
+        job_id: &'a str,
+        merge_context: &'a MergeMrContext,
+        method: &'a str,
+        via_github: bool,
+    ) -> Result<Self, String> {
+        let (owner, repo) = get_owner_repo(&merge_context.mr.repo_path).map_err(|error| {
+            format!(
+                "Refusing to merge into the project base branch: approval needs the project's \
+                 GitHub repository, and it could not be resolved ({error})."
+            )
+        })?;
+        Ok(Self {
+            orch,
+            job_id,
+            merge_context,
+            method,
+            via_github,
+            store: store_of(orch, merge_context),
+            owner,
+            repo,
+            prospect: None,
+        })
+    }
+
+    fn target_revision(&self) -> String {
+        if self.merge_context.mr.is_local {
+            self.merge_context.target_branch.clone()
+        } else {
+            format!("{}@origin", self.merge_context.target_branch)
+        }
+    }
+}
+
+fn jj_log(store: &Store, revset: &str, template: &str, label: &str) -> Result<String, String> {
+    store.jj.run(
+        &store.path,
+        &[
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            template,
+            "--ignore-working-copy",
+        ],
+        label,
+    )
+}
+
+fn store_commit_shape(store: &Store, commit: &str) -> Result<LandedShape, String> {
+    let parents = jj_log(
+        store,
+        commit,
+        "parents.map(|c| c.commit_id()).join(\" \")",
+        "jj log parents",
+    )?;
+    Ok(LandedShape {
+        parents: parents.split_whitespace().map(str::to_string).collect(),
+        tree: crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, commit)?,
+    })
+}
+
+/// A GitHub merge error the provider answered definitively: it did not merge.
+fn github_refused_definitively(error: &str) -> bool {
+    error.contains("GitHub refused")
+        || (error.contains("Failed to merge PR: 4") && !error.contains("already in progress"))
+}
+
+impl LandingWorld for GatedLanding<'_> {
+    type Landing = DefaultLanding;
+
+    fn route(&self) -> &'static str {
+        if self.via_github {
+            "github"
+        } else {
+            "store"
+        }
+    }
+
+    async fn observe(&mut self) -> Result<Observation, String> {
+        let source = self.merge_context.source_branch.as_str();
+        let prospect = {
+            let _guard = self
+                .orch
+                .acquire_jj_store_lock(
+                    &self.store.path,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    format!("approval prospect for {source}"),
+                )
+                .await;
+            build_prospect(self.orch, self.merge_context, self.method, &self.store).await?
+        };
+        validate_prospect(&self.store, self.merge_context, &prospect).await?;
+        let strategy = approval_strategy(self.method, self.via_github)?;
+        // Everything below runs with no store lock held.
+        let auth = installation_authority(&self.orch.db.local, &self.owner).await?;
+        let repository =
+            api::fetch_repository(&*self.orch.services.http, &auth, &self.owner, &self.repo)
+                .await
+                .map_err(|error| format!("the repository could not be read: {error}"))?;
+        let (source_tip, target_tip) = (
+            prospect.merge.source_tip.clone(),
+            prospect.merge.target_tip.clone(),
+        );
+        let source_message = jj_log(
+            &self.store,
+            &source_tip,
+            "description",
+            "jj log description",
+        )?;
+        let count = jj_log(
+            &self.store,
+            &format!("{target_tip}..{source_tip}"),
+            "commit_id ++ \"\\n\"",
+            "jj log source range",
+        )?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+        let source_commit_count = u32::try_from(count)
+            .ok()
+            .filter(|count| *count >= 1)
+            .ok_or_else(|| {
+                format!("`{source}` has no commits to merge that the base does not already hold")
+            })?;
+        let merge_base_oid = crate::jj::revset_commit_checked(
+            &self.store.jj,
+            &self.store.path,
+            &format!("heads(::{target_tip} & ::{source_tip})"),
+        )?;
+        let statuses =
+            crate::execution::checks_status::node_check_statuses(self.orch, self.job_id).await;
+        let observation = Observation {
+            repository_id: repository.id.to_string(),
+            repository_name: repository.full_name,
+            target_ref: format!("refs/heads/{}", self.merge_context.target_branch),
+            target_oid: target_tip,
+            source_ref: format!("refs/heads/{source}"),
+            source_oid: source_tip.clone(),
+            source_message,
+            source_commit_count,
+            merge_base_oid,
+            // Only an unbound GitHub landing merges a commit that exists now;
+            // a fold or a bound head is minted at landing, with fresh dates.
+            candidate_oid: (self.via_github && !prospect.binds).then(|| source_tip.clone()),
+            result_tree_oid: prospect.merge.tree_hash.clone(),
+            strategy,
+            // `after_github_merge` deletes the merged branch on GitHub; the
+            // store fold leaves the branch to worktree teardown.
+            deletes_branch: self.via_github,
+            checks: gate_checks(statuses.as_deref(), &source_tip),
+        };
+        self.prospect = Some(prospect);
+        Ok(observation)
+    }
+
+    async fn execute(&mut self, approved: &Observation) -> Execution<DefaultLanding> {
+        let Some(prospect) = self.prospect.take() else {
+            return Execution::Refused("the landing was never observed".to_string());
+        };
+        let (source, target) = (
+            self.merge_context.source_branch.as_str(),
+            self.merge_context.target_branch.as_str(),
+        );
+        let store = &self.store;
+        // ── The final comparison, local only, under the store lock ──
+        let head = {
+            let guard = self
+                .orch
+                .acquire_jj_store_lock(
+                    &store.path,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    format!("approved landing {source} on {target}"),
+                )
+                .await;
+            let _phase = guard.phase("compare approved state, bind and land");
+            let source_now = crate::jj::bookmark_commit(&store.jj, &store.path, source);
+            let target_now =
+                crate::jj::revset_commit(&store.jj, &store.path, &self.target_revision());
+            if source_now.as_deref() != Some(approved.source_oid.as_str())
+                || target_now.as_deref() != Some(approved.target_oid.as_str())
+            {
+                return Execution::BoundStateChanged {
+                    observed: serde_json::json!({
+                        "sourceOid": source_now,
+                        "targetOid": target_now,
+                    }),
+                };
+            }
+            let operation = match crate::jj::operation_id(&store.jj, &store.path) {
+                Ok(operation) => operation,
+                Err(error) => return Execution::Refused(error),
+            };
+            let restore = || crate::jj::restore_operation(&store.jj, &store.path, &operation);
+            let head = if prospect.binds {
+                let bound = match replay_and_bind(
+                    store,
+                    self.merge_context,
+                    &approved.target_oid,
+                    &prospect.rules,
+                ) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        let _ = restore();
+                        return Execution::Refused(error);
+                    }
+                };
+                let tree = crate::jj::sealed_tree_hash_via_git(&store.jj, &store.path, &bound.head);
+                if tree.as_deref() != Ok(approved.result_tree_oid.as_str()) {
+                    let _ = restore();
+                    return Execution::BoundStateChanged {
+                        observed: serde_json::json!({ "resultTreeOid": tree.ok() }),
+                    };
+                }
+                bound.head
+            } else {
+                approved.source_oid.clone()
+            };
+            if !self.via_github {
+                // The store fold is the route's mutation, and it runs under
+                // the lock exactly as an ungated landing's does.
+                return match land_validated_default(
+                    self.orch,
+                    self.merge_context,
+                    self.method,
+                    &approved.result_tree_oid,
+                )
+                .await
+                {
+                    Ok(commit) => Execution::Landed {
+                        commit: commit.clone(),
+                        approved_head: head,
+                        landing: DefaultLanding {
+                            landed_commit: Some(commit),
+                            plan: prospect.plan,
+                        },
+                    },
+                    Err(error) => {
+                        let _ = restore();
+                        let unchanged = crate::jj::revset_commit(
+                            &store.jj,
+                            &store.path,
+                            &self.target_revision(),
+                        )
+                        .as_deref()
+                            == Some(approved.target_oid.as_str())
+                            && crate::jj::bookmark_commit(&store.jj, &store.path, target)
+                                .as_deref()
+                                == Some(approved.target_oid.as_str());
+                        if unchanged {
+                            Execution::Refused(error)
+                        } else {
+                            Execution::Unknown {
+                                reason: error,
+                                approved_head: Some(head),
+                            }
+                        }
+                    }
+                };
+            }
+            head
+        };
+        // ── GitHub: no lock held; GitHub's `sha` binds the head ──
+        if prospect.binds {
+            if let Err(error) = publish_landing_source(&store.jj, &store.path, target, source) {
+                return Execution::Refused(format!(
+                    "Refusing to merge `{source}`: its bound head could not be pushed to origin \
+                     ({error}). Nothing was merged; merge again."
+                ));
+            }
+        }
+        match github_merge(self.orch, self.merge_context, self.method, &head).await {
+            Ok(Some(commit)) => Execution::Landed {
+                commit: commit.clone(),
+                approved_head: head,
+                landing: DefaultLanding {
+                    landed_commit: Some(commit),
+                    plan: prospect.plan,
+                },
+            },
+            Ok(None) => Execution::Unknown {
+                reason: "GitHub did not name the merge commit".to_string(),
+                approved_head: Some(head),
+            },
+            Err(error) if github_refused_definitively(&error) => Execution::Refused(error),
+            Err(error) => Execution::Unknown {
+                reason: error,
+                approved_head: Some(head),
+            },
+        }
+    }
+
+    async fn landed_shape(&self, commit: &str) -> Result<LandedShape, String> {
+        if !self.via_github {
+            return store_commit_shape(&self.store, commit);
+        }
+        let auth = installation_authority(&self.orch.db.local, &self.owner).await?;
+        let shape = api::fetch_commit_shape(
+            &*self.orch.services.http,
+            &auth,
+            &self.owner,
+            &self.repo,
+            commit,
+        )
+        .await?;
+        Ok(LandedShape {
+            parents: shape.parents,
+            tree: shape.tree,
+        })
+    }
+}
+
+/// Reconcile every approved merge whose outcome was never settled: prove it
+/// landed, find definitive evidence it did not, or leave it `indeterminate`.
+/// Runs at startup and on a slow timer; an attempt still running in this
+/// process is left to the call driving it.
+pub async fn reconcile_approved_merges(orch: &Orchestrator) {
+    let db = &orch.db.local;
+    let attempts = match human_approval::unsettled_attempts(db).await {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            log::warn!("approval reconciliation: {error}");
+            return;
+        }
+    };
+    if attempts.is_empty() {
+        return;
+    }
+    let credential = match crate::api::runner_credential() {
+        Ok(credential) => credential,
+        Err(error) => {
+            log::warn!(
+                "approval reconciliation: {} unsettled approved merge(s) wait: {error}",
+                attempts.len()
+            );
+            return;
+        }
+    };
+    let client = crate::approvals_client::ApprovalsClient::new(
+        &*orch.services.http,
+        orch.runtime_admission_api_config(),
+        credential,
+    );
+    for attempt in attempts {
+        let evidence = landing_evidence(orch, &attempt).await;
+        match human_approval::settle_attempt(db, &client, &attempt, &evidence).await {
+            Ok(Some(outcome)) => log::info!(
+                "approval reconciliation: merge attempt {} settled as {outcome:?}",
+                attempt.attempt_id
+            ),
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "approval reconciliation: merge attempt {}: {error}",
+                attempt.attempt_id
+            ),
+        }
+    }
+}
+
+async fn landing_evidence(
+    orch: &Orchestrator,
+    attempt: &human_approval::UnsettledAttempt,
+) -> LandingEvidence {
+    if attempt.mutation_issued == Some(false) {
+        return LandingEvidence::DefinitelyNotLanded(
+            "the attempt recorded that no mutation was issued".to_string(),
+        );
+    }
+    let context =
+        match super::context::resolve_merge_mr_context_for_job(&orch.db.local, &attempt.job_id)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => return LandingEvidence::Unknown(error),
+        };
+    if attempt.route == "github" {
+        let Some(pr_number) = context.mr.github_pr_number else {
+            return LandingEvidence::Unknown("the pull request has no number".to_string());
+        };
+        let Ok((owner, repo)) = get_owner_repo(&context.mr.repo_path) else {
+            return LandingEvidence::Unknown("the repository is unresolvable".to_string());
+        };
+        let auth = match installation_authority(&orch.db.local, &owner).await {
+            Ok(auth) => auth,
+            Err(error) => return LandingEvidence::Unknown(error),
+        };
+        let http = &*orch.services.http;
+        let state = match api::fetch_pr_merge_state(http, &auth, &owner, &repo, pr_number).await {
+            Ok(state) => state,
+            Err(error) => return LandingEvidence::Unknown(error),
+        };
+        let pr = human_approval::PullRequestState {
+            merged: state.merged,
+            closed: state.state == "closed",
+            head: Some(state.head.sha),
+            merge_commit: state.merge_commit_sha,
+        };
+        let commit = match human_approval::github_attribution(&pr, attempt.bound_head()) {
+            Ok(commit) => commit,
+            Err(evidence) => return evidence,
+        };
+        return match api::fetch_commit_shape(http, &auth, &owner, &repo, &commit).await {
+            Ok(shape) => LandingEvidence::Landed {
+                commit,
+                shape: LandedShape {
+                    parents: shape.parents,
+                    tree: shape.tree,
+                },
+            },
+            Err(error) => LandingEvidence::Unknown(error),
+        };
+    }
+    // The store fold runs in this process under the store lock and its jj
+    // operation is atomic, so once no call is driving it the target either
+    // advanced with this attempt's fold or did not.
+    let store = store_of(orch, &context);
+    let Some(tip) = crate::jj::bookmark_commit(&store.jj, &store.path, &context.target_branch)
+    else {
+        return LandingEvidence::Unknown("the target bookmark is unreadable".to_string());
+    };
+    human_approval::store_evidence(&tip, &attempt.intent, |commit| {
+        store_commit_shape(&store, commit)
+    })
 }
 
 /// Record what a landing bound: one `landing_allocations` row per value, and a

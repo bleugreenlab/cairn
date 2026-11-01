@@ -2410,6 +2410,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("memory_triage_issue_memories", TableScope::ProjectScoped),
     ("merge_requests", TableScope::ProjectScoped),
     ("merge_attempt_events", TableScope::ProjectScoped),
+    ("human_base_merge_policy_events", TableScope::ProjectScoped),
     ("pr_resolution_attributions", TableScope::ProjectScoped),
     ("message_stream_chunks", TableScope::ProjectScoped),
     ("message_streams", TableScope::ProjectScoped),
@@ -3198,6 +3199,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
             "merge_request_id",
             "job_id",
         ],
+    },
+    RekeyTableManifest {
+        table: "human_base_merge_policy_events",
+        id_columns: &["event_id", "project_id"],
     },
     RekeyTableManifest {
         table: "pr_resolution_attributions",

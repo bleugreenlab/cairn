@@ -388,7 +388,7 @@ pub struct PullRequest {
     pub(crate) head: PrHead,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct PrHead {
     pub(crate) sha: String,
 }
@@ -535,6 +535,90 @@ pub(crate) async fn merge_pr(
         .json::<serde_json::Value>()
         .ok()
         .and_then(|body| body["sha"].as_str().map(str::to_string)))
+}
+
+/// A repository's stable numeric id and its current `owner/name`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RepositoryIdentity {
+    pub id: i64,
+    pub full_name: String,
+}
+
+/// Read a repository's identity. A renamed repository answers with a redirect,
+/// which is an error here: the name the caller holds no longer names it.
+pub(crate) async fn fetch_repository(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+) -> Result<RepositoryIdentity, String> {
+    let url = format!("{}/repos/{}/{}", GITHUB_API_BASE, owner, repo);
+    github_get_json(http, auth, &url).await
+}
+
+/// A commit's parents and tree, as GitHub reports them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitShape {
+    pub parents: Vec<String>,
+    pub tree: String,
+}
+
+pub(crate) async fn fetch_commit_shape(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Result<CommitShape, String> {
+    #[derive(Deserialize)]
+    struct Sha {
+        sha: String,
+    }
+    #[derive(Deserialize)]
+    struct Inner {
+        tree: Sha,
+    }
+    #[derive(Deserialize)]
+    struct Commit {
+        parents: Vec<Sha>,
+        commit: Inner,
+    }
+    let url = format!(
+        "{}/repos/{}/{}/commits/{}",
+        GITHUB_API_BASE, owner, repo, sha
+    );
+    let commit: Commit = github_get_json(http, auth, &url).await?;
+    Ok(CommitShape {
+        parents: commit
+            .parents
+            .into_iter()
+            .map(|parent| parent.sha)
+            .collect(),
+        tree: commit.commit.tree.sha,
+    })
+}
+
+/// Whether a pull request merged, and as which commit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PullRequestMergeState {
+    pub state: String,
+    pub merged: bool,
+    pub merge_commit_sha: Option<String>,
+    pub head: PrHead,
+}
+
+pub(crate) async fn fetch_pr_merge_state(
+    http: &dyn HttpClient,
+    auth: &InstallationAuthority,
+    owner: &str,
+    repo: &str,
+    pr_number: i32,
+) -> Result<PullRequestMergeState, String> {
+    let url = format!(
+        "{}/repos/{}/{}/pulls/{}",
+        GITHUB_API_BASE, owner, repo, pr_number
+    );
+    github_get_json(http, auth, &url).await
 }
 
 /// Delete a branch via REST API.

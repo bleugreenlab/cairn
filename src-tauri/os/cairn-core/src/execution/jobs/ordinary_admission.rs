@@ -800,13 +800,10 @@ fn enqueue_and_promote_team(
 ) -> Result<bool, String> {
     let request_id = request.id.clone();
     let team_id = request.workspace_id.clone();
-    let token = match std::env::var("CAIRN_RUNNER_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => token,
-        _ => {
-            log::warn!(
-                "team ordinary admission {} remains pending: CAIRN_RUNNER_TOKEN is unavailable",
-                request_id
-            );
+    let token = match crate::api::runner_credential() {
+        Ok(credential) => credential.token().to_string(),
+        Err(error) => {
+            log::warn!("team ordinary admission {request_id} remains pending: {error}");
             return Ok(false);
         }
     };

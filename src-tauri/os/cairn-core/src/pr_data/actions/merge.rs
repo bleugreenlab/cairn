@@ -10,24 +10,60 @@ use crate::pr_data::helpers::{
     reconcile_main_checkout_after_merge,
 };
 
+/// What the provably-human base-merge policy decides for one merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BaseMergeGate {
+    /// The merge does not cross into the base branch.
+    NotApplicable,
+    Disabled,
+    /// The stored policy cannot be read, so the merge is refused.
+    Unavailable(String),
+    /// The merge lands only on the selected phone's approval.
+    RequiresHumanApproval {
+        enrollment_id: String,
+    },
+}
+
+impl BaseMergeGate {
+    /// The gate decision's journal state and detail (sequence 0).
+    fn journal(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::NotApplicable => ("not_applicable", None),
+            Self::Disabled => ("policy_disabled", None),
+            Self::Unavailable(_) => ("policy_unavailable", Some("stored policy unavailable")),
+            Self::RequiresHumanApproval { .. } => ("approval_required", None),
+        }
+    }
+}
+
 fn enforce_human_base_merge_policy(
-    policy: HumanBaseMergePolicyReadState,
+    policy: &HumanBaseMergePolicyReadState,
     crosses_base: bool,
-) -> Result<(), String> {
+) -> BaseMergeGate {
     if !crosses_base {
-        return Ok(());
+        return BaseMergeGate::NotApplicable;
     }
     match policy {
         HumanBaseMergePolicyReadState::Available { policy }
             if policy.state == HumanBaseMergePolicyState::Disabled =>
         {
-            Ok(())
+            BaseMergeGate::Disabled
         }
-        HumanBaseMergePolicyReadState::Available { .. } => Err(
-            "Refusing to merge into the project base branch: provably-human approval is required, but the companion approval ceremony is unavailable."
-                .to_string(),
-        ),
-        HumanBaseMergePolicyReadState::Unavailable { reason } => Err(format!(
+        HumanBaseMergePolicyReadState::Available { policy } => {
+            match policy.approval_enrollment_id.as_deref() {
+                Some(enrollment_id) => BaseMergeGate::RequiresHumanApproval {
+                    enrollment_id: enrollment_id.to_string(),
+                },
+                // `parse` refuses this shape; kept total so the gate fails closed.
+                None => BaseMergeGate::Unavailable(
+                    "Refusing to merge into the project base branch: provably-human approval is \
+                     required, but no approval phone is selected. Choose a phone in project \
+                     settings."
+                        .to_string(),
+                ),
+            }
+        }
+        HumanBaseMergePolicyReadState::Unavailable { reason } => BaseMergeGate::Unavailable(format!(
             "Refusing to merge into the project base branch: the provably-human merge policy is unavailable ({reason:?})."
         )),
     }
@@ -122,16 +158,73 @@ pub fn parse_merge_precondition(
         .map_err(|error| format!("payload.precondition: {error}"))
 }
 
-struct MergeAttemptJournal<'a> {
-    attempt_id: &'a str,
-    project_id: &'a str,
-    merge_request_id: &'a str,
-    job_id: &'a str,
-    target_ref: &'a str,
-    source_ref: &'a str,
-    policy_json: &'a str,
+/// The identity every event of one merge attempt repeats.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MergeAttemptJournal<'a> {
+    pub attempt_id: &'a str,
+    pub project_id: &'a str,
+    pub merge_request_id: &'a str,
+    pub job_id: &'a str,
+    pub target_ref: &'a str,
+    pub source_ref: &'a str,
+    pub policy_json: &'a str,
 }
 
+/// The optional columns of one merge attempt event: what was asked, of
+/// which challenge, and the Human evidence the approval carried.
+#[derive(Debug, Clone, Default)]
+pub(super) struct JournalEntry {
+    pub detail: Option<String>,
+    pub intent_digest_sha256: Option<String>,
+    pub challenge_id: Option<String>,
+    pub approval_id: Option<String>,
+    pub human_principal_json: Option<String>,
+    pub human_appearance_json: Option<String>,
+    pub verification_json: Option<String>,
+}
+
+/// Append one event to a merge attempt's immutable journal.
+pub(super) async fn journal_merge_attempt_event(
+    db: &LocalDb,
+    attempt: &MergeAttemptJournal<'_>,
+    sequence: i64,
+    state: &str,
+    entry: &JournalEntry,
+) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO merge_attempt_events (
+            event_id, attempt_id, sequence, project_id, merge_request_id, job_id,
+            state, target_ref, source_ref, intent_digest_sha256, challenge_id, approval_id,
+            policy_json, human_principal_json, human_appearance_json, verification_json,
+            detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            Uuid::new_v4().to_string(),
+            attempt.attempt_id,
+            sequence,
+            attempt.project_id,
+            attempt.merge_request_id,
+            attempt.job_id,
+            state,
+            attempt.target_ref,
+            attempt.source_ref,
+            entry.intent_digest_sha256.as_deref(),
+            entry.challenge_id.as_deref(),
+            entry.approval_id.as_deref(),
+            attempt.policy_json,
+            entry.human_principal_json.as_deref(),
+            entry.human_appearance_json.as_deref(),
+            entry.verification_json.as_deref(),
+            entry.detail.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ],
+    )
+    .await
+    .map_err(|error| format!("Failed to journal merge attempt event: {error}"))?;
+    Ok(())
+}
+
+/// Append an ordinary (ungated) attempt's terminal event, sequence 1.
 async fn journal_merge_attempt_outcome(
     db: &LocalDb,
     attempt: MergeAttemptJournal<'_>,
@@ -145,35 +238,23 @@ async fn journal_merge_attempt_outcome(
     journal_merge_attempt_terminal(db, attempt, state, detail).await
 }
 
-/// Append the attempt's terminal event (sequence 1).
 async fn journal_merge_attempt_terminal(
     db: &LocalDb,
     attempt: MergeAttemptJournal<'_>,
     state: &str,
     detail: Option<&str>,
 ) -> Result<(), String> {
-    db.execute(
-        "INSERT INTO merge_attempt_events (
-            event_id, attempt_id, sequence, project_id, merge_request_id, job_id,
-            state, target_ref, source_ref, policy_json, detail, created_at
-         ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            Uuid::new_v4().to_string(),
-            attempt.attempt_id,
-            attempt.project_id,
-            attempt.merge_request_id,
-            attempt.job_id,
-            state,
-            attempt.target_ref,
-            attempt.source_ref,
-            attempt.policy_json,
-            detail,
-            chrono::Utc::now().timestamp(),
-        ],
+    journal_merge_attempt_event(
+        db,
+        &attempt,
+        1,
+        state,
+        &JournalEntry {
+            detail: detail.map(str::to_string),
+            ..JournalEntry::default()
+        },
     )
     .await
-    .map_err(|error| format!("Failed to journal merge attempt outcome: {error}"))?;
-    Ok(())
 }
 use crate::security::broker::github::installation_authority;
 use crate::storage::LocalDb;
@@ -761,25 +842,8 @@ async fn merge_pr_for_job_past_barrier(
         })?;
     let policy = HumanBaseMergePolicyReadState::from_stored(&stored_policy);
     let crosses_base = merge_context.target_branch == resolved_default;
-    let policy_result = enforce_human_base_merge_policy(policy, crosses_base);
-    let (journal_state, detail) = if !crosses_base {
-        ("not_applicable", None)
-    } else {
-        match policy {
-            HumanBaseMergePolicyReadState::Available { policy }
-                if policy.state == HumanBaseMergePolicyState::Disabled =>
-            {
-                ("policy_disabled", None)
-            }
-            HumanBaseMergePolicyReadState::Available { .. } => (
-                "policy_unavailable",
-                Some("companion approval ceremony unavailable"),
-            ),
-            HumanBaseMergePolicyReadState::Unavailable { .. } => {
-                ("policy_unavailable", Some("stored policy unavailable"))
-            }
-        }
-    };
+    let gate = enforce_human_base_merge_policy(&policy, crosses_base);
+    let (journal_state, detail) = gate.journal();
     let attempt_id = journal_policy_gate_event(
         &db,
         &merge_context,
@@ -801,7 +865,7 @@ async fn merge_pr_for_job_past_barrier(
                 &db,
                 &merge_context,
                 &resolved_default,
-                policy,
+                policy.clone(),
             )
             .await;
             match super::pin_bump::evaluate(&inputs) {
@@ -837,13 +901,61 @@ async fn merge_pr_for_job_past_barrier(
         .as_ref()
         .map(|evidence| evidence.head_commit.clone());
     let pin_bump_detail = pin_bump.as_ref().map(ToString::to_string);
-    policy_result?;
+    let approval_enrollment = match gate {
+        BaseMergeGate::Unavailable(refusal) => return Err(refusal),
+        BaseMergeGate::RequiresHumanApproval { enrollment_id } => Some(enrollment_id),
+        BaseMergeGate::NotApplicable | BaseMergeGate::Disabled => None,
+    };
+    let mr_description = if approval_enrollment.is_some() {
+        db.query_opt_text(
+            "SELECT body FROM merge_requests WHERE id = ?1",
+            (merge_context.mr.mr_id.clone(),),
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
 
     let journal_project_id = merge_context.project_id.clone();
     let journal_merge_request_id = merge_context.mr.mr_id.clone();
     let journal_target_ref = merge_context.target_branch.clone();
     let journal_source_ref = merge_context.source_branch.clone();
+    // An earlier approved merge of this pull request whose outcome is still
+    // being reconciled owns whatever lands next; a second one would make that
+    // landing impossible to attribute.
+    if approval_enrollment.is_some() {
+        if let Some(previous) =
+            super::human_approval::unsettled_attempt_for(&db, &merge_context.mr.mr_id).await?
+        {
+            let refusal = format!(
+                "Refusing to merge: the outcome of the previous approved merge of this pull \
+                 request ({previous}) is still being reconciled. Check the pull request, then \
+                 merge again once that settles."
+            );
+            journal_merge_attempt_terminal(
+                &db,
+                MergeAttemptJournal {
+                    attempt_id: &attempt_id,
+                    project_id: &journal_project_id,
+                    merge_request_id: &journal_merge_request_id,
+                    job_id,
+                    target_ref: &journal_target_ref,
+                    source_ref: &journal_source_ref,
+                    policy_json: &stored_policy,
+                },
+                "failed",
+                Some(&refusal),
+            )
+            .await?;
+            return Err(refusal);
+        }
+    }
     let mut config_notice: Option<String> = None;
+    // Once the ceremony starts it journals the attempt's outcome itself; a
+    // gated attempt refused before then is journaled here like any other.
+    let mut ceremony_started = false;
     let merge_result = async {
         let db = db.clone();
         // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
@@ -930,15 +1042,48 @@ async fn merge_pr_for_job_past_barrier(
         let via_github = should_merge_via_github(&merge_context);
         let method =
             default_landing_method(&merge_context, &resolved_default, merge_method.clone());
-        let landed = super::default_landing::land_on_default(
-            orch,
-            job_id,
-            &merge_context,
-            &method,
-            via_github,
-            verified_head.as_deref(),
-        )
-        .await?;
+        let landed = match approval_enrollment.as_deref() {
+            Some(enrollment_id) => {
+                ceremony_started = true;
+                let (landed, notice) = super::default_landing::land_on_default_with_approval(
+                    orch,
+                    job_id,
+                    &merge_context,
+                    &method,
+                    via_github,
+                    super::default_landing::ApprovalGate {
+                        db: &db,
+                        enrollment_id,
+                        description: mr_description.clone(),
+                        attempt: MergeAttemptJournal {
+                            attempt_id: &attempt_id,
+                            project_id: &journal_project_id,
+                            merge_request_id: &journal_merge_request_id,
+                            job_id,
+                            target_ref: &journal_target_ref,
+                            source_ref: &journal_source_ref,
+                            policy_json: &stored_policy,
+                        },
+                    },
+                )
+                .await?;
+                if let Some(notice) = notice {
+                    config_notice = merge_journal_detail(&[config_notice.as_deref(), Some(&notice)]);
+                }
+                landed
+            }
+            None => {
+                super::default_landing::land_on_default(
+                    orch,
+                    job_id,
+                    &merge_context,
+                    &method,
+                    via_github,
+                    verified_head.as_deref(),
+                )
+                .await?
+            }
+        };
         log::info!(
             "merge_pr_for_job[{job_id}]: merge gates and the default-branch landing took {:?}",
             gate_started.elapsed()
@@ -1104,21 +1249,26 @@ async fn merge_pr_for_job_past_barrier(
     }
     .await;
 
-    journal_merge_attempt_outcome(
-        &db,
-        MergeAttemptJournal {
-            attempt_id: &attempt_id,
-            project_id: &journal_project_id,
-            merge_request_id: &journal_merge_request_id,
-            job_id,
-            target_ref: &journal_target_ref,
-            source_ref: &journal_source_ref,
-            policy_json: &stored_policy,
-        },
-        &merge_result,
-        merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()]).as_deref(),
-    )
-    .await?;
+    // An approval-gated attempt's ceremony journals its own outcome, which
+    // only a proven landing makes `succeeded`.
+    if approval_enrollment.is_none() || !ceremony_started {
+        journal_merge_attempt_outcome(
+            &db,
+            MergeAttemptJournal {
+                attempt_id: &attempt_id,
+                project_id: &journal_project_id,
+                merge_request_id: &journal_merge_request_id,
+                job_id,
+                target_ref: &journal_target_ref,
+                source_ref: &journal_source_ref,
+                policy_json: &stored_policy,
+            },
+            &merge_result,
+            merge_journal_detail(&[pin_bump_detail.as_deref(), config_notice.as_deref()])
+                .as_deref(),
+        )
+        .await?;
+    }
     merge_result
 }
 
@@ -1128,8 +1278,8 @@ async fn merge_pr_for_job_past_barrier(
 pub(super) async fn landing_record(db: &LocalDb, merge_request_id: &str) -> Option<String> {
     db.query_opt_text(
         "SELECT detail FROM merge_attempt_events
-          WHERE merge_request_id = ?1 AND sequence = 1 AND state = 'succeeded'
-            AND detail IS NOT NULL
+          WHERE merge_request_id = ?1 AND state = 'succeeded'
+            AND challenge_id IS NULL AND detail IS NOT NULL
           ORDER BY created_at DESC, rowid DESC
           LIMIT 1",
         params![merge_request_id],
@@ -1298,8 +1448,8 @@ mod tests {
     async fn policy_refusal_is_a_truthful_terminal_sequence_zero_event() {
         let db = merge_journal_test_db().await;
         let context = merge_context(false, false);
-        let policy = r#"{"version":1,"state":"enabled"}"#;
-        let detail = "companion approval ceremony unavailable";
+        let policy = r#"{"version":2,"state":"enabled"}"#;
+        let detail = "stored policy unavailable";
 
         let attempt_id = journal_policy_gate_event(
             &db,
@@ -1330,19 +1480,42 @@ mod tests {
     fn human_base_merge_policy_gates_only_the_actual_base_crossing() {
         let disabled =
             HumanBaseMergePolicyReadState::from_stored(r#"{"version":1,"state":"disabled"}"#);
-        assert!(enforce_human_base_merge_policy(disabled, true).is_ok());
+        assert_eq!(
+            enforce_human_base_merge_policy(&disabled, true),
+            BaseMergeGate::Disabled
+        );
 
-        let enabled =
-            HumanBaseMergePolicyReadState::from_stored(r#"{"version":1,"state":"enabled"}"#);
-        let refusal = enforce_human_base_merge_policy(enabled, true).unwrap_err();
-        assert!(refusal.contains("provably-human approval is required"));
-        assert!(enforce_human_base_merge_policy(enabled, false).is_ok());
+        let enabled = HumanBaseMergePolicyReadState::from_stored(
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_1"}"#,
+        );
+        assert_eq!(
+            enforce_human_base_merge_policy(&enabled, true),
+            BaseMergeGate::RequiresHumanApproval {
+                enrollment_id: "cae_1".to_string()
+            }
+        );
+        assert_eq!(
+            enforce_human_base_merge_policy(&enabled, false),
+            BaseMergeGate::NotApplicable
+        );
 
-        let unavailable =
-            HumanBaseMergePolicyReadState::from_stored(r#"{"version":2,"state":"enabled"}"#);
-        let refusal = enforce_human_base_merge_policy(unavailable, true).unwrap_err();
-        assert!(refusal.contains("policy is unavailable"));
-        assert!(enforce_human_base_merge_policy(unavailable, false).is_ok());
+        // Enabled without a phone, and an unknown version, both fail closed.
+        for stored in [
+            r#"{"version":1,"state":"enabled"}"#,
+            r#"{"version":2,"state":"enabled"}"#,
+        ] {
+            let unavailable = HumanBaseMergePolicyReadState::from_stored(stored);
+            let BaseMergeGate::Unavailable(refusal) =
+                enforce_human_base_merge_policy(&unavailable, true)
+            else {
+                panic!("{stored} must refuse");
+            };
+            assert!(refusal.contains("policy is unavailable"), "{refusal}");
+            assert_eq!(
+                enforce_human_base_merge_policy(&unavailable, false),
+                BaseMergeGate::NotApplicable
+            );
+        }
     }
 
     fn merge_context(is_workspace: bool, has_triage_batch: bool) -> MergeMrContext {

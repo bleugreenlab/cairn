@@ -12,7 +12,7 @@ pub enum HumanBaseMergePolicyState {
     Enabled,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "availability", rename_all = "snake_case")]
 pub enum HumanBaseMergePolicyReadState {
     Available { policy: HumanBaseMergePolicy },
@@ -28,18 +28,42 @@ impl HumanBaseMergePolicyReadState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Whether a project's merges into its base branch need a person's approval on
+/// a phone, and which phone.
+///
+/// Enabling the policy and choosing the phone are one act: an enabled policy
+/// always names exactly one approval enrollment, and a disabled one names none.
+/// A stored value that breaks that pairing reads as unavailable, so the merge
+/// gate fails closed rather than guessing a phone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HumanBaseMergePolicy {
     pub version: u32,
     pub state: HumanBaseMergePolicyState,
+    /// The approvals-service enrollment whose phone approves this project's
+    /// base merges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_enrollment_id: Option<String>,
 }
 
 impl HumanBaseMergePolicy {
+    /// The policy id an approval intent binds; its version is `version`.
+    pub const POLICY_ID: &'static str = "human-base-merge";
+
     pub const DISABLED_V1: Self = Self {
         version: 1,
         state: HumanBaseMergePolicyState::Disabled,
+        approval_enrollment_id: None,
     };
+
+    /// An enabled policy that requires approval on the given enrollment's phone.
+    pub fn enabled_v1(approval_enrollment_id: impl Into<String>) -> Self {
+        Self {
+            version: 1,
+            state: HumanBaseMergePolicyState::Enabled,
+            approval_enrollment_id: Some(approval_enrollment_id.into()),
+        }
+    }
 
     pub fn parse(value: &str) -> Result<Self, HumanBaseMergePolicyError> {
         let policy: Self =
@@ -49,11 +73,25 @@ impl HumanBaseMergePolicy {
                 policy.version,
             ));
         }
+        let names_a_phone = policy
+            .approval_enrollment_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        if names_a_phone != policy.is_enabled()
+            || (policy.approval_enrollment_id.is_some() && !names_a_phone)
+        {
+            return Err(HumanBaseMergePolicyError::InconsistentSelection);
+        }
         Ok(policy)
     }
 
-    pub fn is_enabled(self) -> bool {
+    pub fn is_enabled(&self) -> bool {
         self.state == HumanBaseMergePolicyState::Enabled
+    }
+
+    /// The canonical stored form.
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).expect("a policy always serializes")
     }
 }
 
@@ -62,6 +100,8 @@ impl HumanBaseMergePolicy {
 pub enum HumanBaseMergePolicyError {
     InvalidEncoding,
     UnsupportedVersion(u32),
+    /// Enabled without naming a phone, or disabled while naming one.
+    InconsistentSelection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +262,41 @@ mod human_base_merge_policy_tests {
                 "availability": "unavailable",
                 "reason": {"reason": "unsupported_version", "version": 2}
             })
+        );
+    }
+
+    #[test]
+    fn enabling_names_exactly_one_phone_and_disabling_names_none() {
+        let enabled = HumanBaseMergePolicy::enabled_v1("cae_1");
+        let encoded = enabled.encode();
+        assert_eq!(
+            encoded,
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_1"}"#
+        );
+        assert_eq!(HumanBaseMergePolicy::parse(&encoded).unwrap(), enabled);
+
+        for inconsistent in [
+            r#"{"version":1,"state":"enabled"}"#,
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":""}"#,
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":"  "}"#,
+            r#"{"version":1,"state":"disabled","approval_enrollment_id":"cae_1"}"#,
+            r#"{"version":1,"state":"disabled","approval_enrollment_id":""}"#,
+        ] {
+            assert_eq!(
+                HumanBaseMergePolicy::parse(inconsistent),
+                Err(HumanBaseMergePolicyError::InconsistentSelection),
+                "{inconsistent}"
+            );
+            assert!(matches!(
+                HumanBaseMergePolicyReadState::from_stored(inconsistent),
+                HumanBaseMergePolicyReadState::Unavailable { .. }
+            ));
+        }
+        assert_eq!(
+            HumanBaseMergePolicy::parse(
+                r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_1","phone":"x"}"#
+            ),
+            Err(HumanBaseMergePolicyError::InvalidEncoding)
         );
     }
 }

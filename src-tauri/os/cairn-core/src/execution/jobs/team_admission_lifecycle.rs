@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) fn team_client(orch: &Orchestrator) -> Result<Arc<dyn RuntimeAdmissionClient>, String> {
-    let token = std::env::var("CAIRN_RUNNER_TOKEN")
-        .map_err(|_| "CAIRN_RUNNER_TOKEN is unavailable".to_string())?;
-    TeamAdmissionClient::with_api(orch.runtime_admission_api_config(), token)
-        .map(|client| Arc::new(client) as Arc<dyn RuntimeAdmissionClient>)
-        .map_err(|error| error.to_string())
+    let credential = crate::api::runner_credential()?;
+    TeamAdmissionClient::with_api(
+        orch.runtime_admission_api_config(),
+        credential.token().to_string(),
+    )
+    .map(|client| Arc::new(client) as Arc<dyn RuntimeAdmissionClient>)
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn durable_lease_belongs_to_host(

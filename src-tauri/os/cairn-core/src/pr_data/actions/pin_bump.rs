@@ -394,7 +394,7 @@ pub(crate) fn evaluate(inputs: &PinBumpInputs) -> Result<PinBumpEvidence, PinBum
     // 2. The precondition reads the policy itself, independently of the
     //    ordinary policy gate, so approval machinery added there later can
     //    never silently open this path.
-    match inputs.policy {
+    match &inputs.policy {
         HumanBaseMergePolicyReadState::Available { policy }
             if policy.state == HumanBaseMergePolicyState::Disabled => {}
         HumanBaseMergePolicyReadState::Available { .. } => {
@@ -1087,8 +1087,9 @@ pinBumps:
         let mut inputs = inputs();
         inputs.target_branch = "agent/cairn-1-coordinator-0".to_string();
         // Also policy-enabled: the base-landing condition is evaluated first.
-        inputs.policy =
-            HumanBaseMergePolicyReadState::from_stored(r#"{"version":1,"state":"enabled"}"#);
+        inputs.policy = HumanBaseMergePolicyReadState::from_stored(
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_1"}"#,
+        );
         let refusal = refuse(inputs);
         assert!(
             matches!(refusal, PinBumpRefusal::NotBaseLanding { .. }),
@@ -1100,8 +1101,9 @@ pinBumps:
     #[test]
     fn pin_bump_refuses_when_the_human_merge_policy_is_enabled() {
         let mut inputs = inputs();
-        inputs.policy =
-            HumanBaseMergePolicyReadState::from_stored(r#"{"version":1,"state":"enabled"}"#);
+        inputs.policy = HumanBaseMergePolicyReadState::from_stored(
+            r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_1"}"#,
+        );
         let refusal = refuse(inputs);
         assert_eq!(
             refusal,

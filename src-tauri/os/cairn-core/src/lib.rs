@@ -62,6 +62,7 @@ pub use error::CairnError;
 pub mod account;
 pub mod agents;
 pub mod api;
+pub mod approvals_client;
 pub mod config;
 pub mod credentials;
 pub mod diff;

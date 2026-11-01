@@ -386,6 +386,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("pack_catalog_backfill_attempts", "execution_history"),
     owned("pack_catalog_references", "pack_catalog"),
     owned("merge_attempt_events", "merge_requests"),
+    owned("human_base_merge_policy_events", "projects"),
     owned("doc_references", "issues"),
     owned("issue_labels", "issues"),
     owned("issue_workspaces", "issues"),

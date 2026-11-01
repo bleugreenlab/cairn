@@ -45,6 +45,29 @@ impl ApiConfig {
     pub fn runner_admission_request_url(&self, request_id: &str) -> String {
         self.runner_admission_url(request_id)
     }
+    /// A runner-authenticated approvals-service endpoint, `path` below
+    /// `/approvals/`.
+    pub fn approvals_url(&self, path: &str) -> String {
+        format!(
+            "{}/approvals/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+
+    /// The API's published signing keys.
+    pub fn jwks_url(&self) -> String {
+        format!(
+            "{}/.well-known/jwks.json",
+            self.base_url.trim_end_matches('/')
+        )
+    }
+
+    /// The base URL, which keys per-deployment caches.
+    pub fn base_url(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
+
     /// Device JWT refresh endpoint.
     pub(crate) fn device_refresh_url(&self) -> String {
         format!("{}/tokens/device/refresh", self.base_url)
@@ -108,9 +131,142 @@ impl ApiConfig {
     }
 }
 
+/// This runner's credential for the cloud API: the bearer token, and the runner
+/// and organization it was issued to.
+///
+/// The token is our own service's credential, so its payload is read without
+/// verifying the signature: the runner needs to know whom it speaks as (the
+/// approval audience is `cairn-runner:<runner_id>`), and the service verifies
+/// the token on every request anyway.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunnerCredential {
+    token: String,
+    runner_id: String,
+    org_id: String,
+}
+
+impl std::fmt::Debug for RunnerCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerCredential")
+            .field("runner_id", &self.runner_id)
+            .field("org_id", &self.org_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunnerCredential {
+    /// Read a runner token's identity claims.
+    pub fn parse(token: &str) -> Result<Self, String> {
+        use base64::Engine as _;
+        let token = token.trim();
+        let payload = token
+            .split('.')
+            .nth(1)
+            .filter(|_| token.split('.').count() == 3)
+            .ok_or_else(|| "the runner token is not a JWT".to_string())?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| "the runner token's payload is not base64url".to_string())?;
+        #[derive(serde::Deserialize)]
+        struct Claims {
+            sub: String,
+            org_id: String,
+        }
+        let claims: Claims = serde_json::from_slice(&bytes)
+            .map_err(|_| "the runner token names no runner and organization".to_string())?;
+        let runner_id = claims
+            .sub
+            .strip_prefix("runner:")
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| "the runner token's subject is not a runner".to_string())?;
+        if claims.org_id.trim().is_empty() {
+            return Err("the runner token names no organization".to_string());
+        }
+        Ok(Self {
+            token: token.to_string(),
+            runner_id: runner_id.to_string(),
+            org_id: claims.org_id,
+        })
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub fn runner_id(&self) -> &str {
+        &self.runner_id
+    }
+
+    pub fn org_id(&self) -> &str {
+        &self.org_id
+    }
+
+    /// The audience an approval intent and its Human assertion are bound to.
+    pub fn audience(&self) -> String {
+        format!("cairn-runner:{}", self.runner_id)
+    }
+}
+
+/// This runner's credential, from `CAIRN_RUNNER_TOKEN`. The one place the
+/// token is read.
+pub fn runner_credential() -> Result<RunnerCredential, String> {
+    let token = std::env::var("CAIRN_RUNNER_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "CAIRN_RUNNER_TOKEN is unavailable".to_string())?;
+    RunnerCredential::parse(&token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(claims: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let encode = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+        format!(
+            "{}.{}.sig",
+            encode(br#"{"alg":"EdDSA"}"#),
+            encode(claims.to_string().as_bytes())
+        )
+    }
+
+    #[test]
+    fn a_runner_token_names_its_runner_organization_and_audience() {
+        let credential = RunnerCredential::parse(&token(serde_json::json!({
+            "sub": "runner:runner-1", "org_id": "org-1", "type": "runner"
+        })))
+        .unwrap();
+        assert_eq!(credential.runner_id(), "runner-1");
+        assert_eq!(credential.org_id(), "org-1");
+        assert_eq!(credential.audience(), "cairn-runner:runner-1");
+        assert!(!format!("{credential:?}").contains("sig"));
+
+        for bad in [
+            token(serde_json::json!({"sub": "user-1", "org_id": "org-1"})),
+            token(serde_json::json!({"sub": "runner:", "org_id": "org-1"})),
+            token(serde_json::json!({"sub": "runner:r", "org_id": ""})),
+            token(serde_json::json!({"sub": "runner:r"})),
+            "not-a-jwt".to_string(),
+        ] {
+            assert!(RunnerCredential::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn approvals_and_jwks_urls_hang_off_the_base() {
+        let config = ApiConfig {
+            base_url: "https://api.cairn.computer/".to_string(),
+        };
+        assert_eq!(
+            config.approvals_url("/challenges/apr_1"),
+            "https://api.cairn.computer/approvals/challenges/apr_1"
+        );
+        assert_eq!(
+            config.jwks_url(),
+            "https://api.cairn.computer/.well-known/jwks.json"
+        );
+    }
 
     #[test]
     fn test_production_base_url() {

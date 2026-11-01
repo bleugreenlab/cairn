@@ -13,6 +13,7 @@ mod conflict;
 mod context;
 mod create_pr;
 mod default_landing;
+mod human_approval;
 mod merge;
 mod pin_bump;
 pub(crate) mod refresh;
@@ -30,6 +31,7 @@ pub use context::{
     try_resolve_mr_context_for_job, MergeMrContext, MrContext, PrNodeResolution,
 };
 pub(crate) use create_pr::{publish_pr_branch_for_job, sync_create_pr_artifact_for_job};
+pub use default_landing::reconcile_approved_merges;
 pub use merge::{
     merge_pr_for_job, parse_merge_precondition, reconcile_after_merge, CheckoutReconciliation,
     MergePrecondition,

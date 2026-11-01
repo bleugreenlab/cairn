@@ -2741,6 +2741,21 @@ impl Orchestrator {
         }
     }
 
+    /// Settle approved base merges whose outcome a crash or an unreachable
+    /// provider left open: once now, then on a slow cadence. A merge still
+    /// being driven in this process is left to its own call.
+    pub fn spawn_approved_merge_reconcile(&self) {
+        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            loop {
+                interval.tick().await;
+                crate::pr_data::actions::reconcile_approved_merges(&orch).await;
+            }
+        });
+    }
+
     pub fn spawn_memory_triage_reconcile(&self) {
         self.spawn_memory_triage_reconcile_loop(false);
     }
