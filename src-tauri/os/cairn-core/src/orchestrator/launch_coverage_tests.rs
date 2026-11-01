@@ -737,9 +737,13 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
 }
 
 /// One cairn-inference deployment of [`INFERENCE_MODEL`], whose engine answers
-/// to [`INFERENCE_SERVED_NAME`], on a pool Cairn controls. The built-in
-/// provider's catalog is refreshed, which installs it, so a decision can be
-/// offered on it without the workspace enabling anything.
+/// to [`INFERENCE_SERVED_NAME`], on a pool Cairn controls, which the act side
+/// holds healthy: the state in which the pool controller answers a request on
+/// the pass that makes it. In a controlled pool only the act side's own phase
+/// says a deployment answers, so the row is written before control is taken,
+/// which adopts what is healthy then. Nothing probes it here: no head is
+/// attached. The built-in provider's catalog is refreshed, which installs it,
+/// so a decision can be offered on it without the workspace enabling anything.
 async fn seed_inference(orch: &Orchestrator) {
     use crate::orchestrator::pool_control::{patch_pool, PoolPatch};
     use cairn_db::turso::params;
@@ -794,6 +798,17 @@ pools:
         .await
         .unwrap();
     }
+    let healthy = cairn_inference::control::Phase::Healthy {
+        since_ms: 1,
+        load_ms: None,
+    };
+    db.execute(
+        "INSERT INTO inference_deployment_state (deployment_id, phase_json, command_id, updated_at)
+         VALUES ('coverage-deployment', ?1, NULL, 1)",
+        params![serde_json::to_string(&healthy).unwrap()],
+    )
+    .await
+    .unwrap();
 
     // Built in: nothing enables it, and what discovery finds installs it.
     assert!(!orch.provider_enabled(crate::backends::inference::INFERENCE_BACKEND_KEY));

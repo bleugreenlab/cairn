@@ -1819,6 +1819,9 @@ mod tests {
     /// and the pool controller's two surfaces carry its writes.
     #[test]
     fn affordance_for_inference_kinds() {
+        // Recipes and deployments are written at the index, so their pages
+        // carry the index's authoring actions through its back link, and
+        // nothing of the pools' or requests' own.
         for kind in [
             ResourceKind::InferenceRecipes,
             ResourceKind::InferenceDeployments,
@@ -1833,6 +1836,16 @@ mod tests {
             );
             let output = affordance_for_kind(kind);
             assert!(output.contains("cairn://inference"), "{kind:?}:\n{output}");
+            assert!(
+                output.contains(r#"target:"cairn://inference",mode:"replace""#),
+                "{kind:?}:\n{output}"
+            );
+            assert!(
+                output.contains(r#"target:"cairn://inference",mode:"patch""#),
+                "{kind:?}:\n{output}"
+            );
+            assert!(!output.contains("control a pool"), "{kind:?}:\n{output}");
+            assert!(!output.contains("request a model"), "{kind:?}:\n{output}");
         }
         let index = affordance_for_kind(ResourceKind::Inference);
         assert!(index.contains("format"), "{index}");
@@ -1848,8 +1861,8 @@ mod tests {
         assert!(requests.contains("cancel a waiting request"), "{requests}");
     }
 
-    /// One deployment is the act side: a patch starts or stops it, and nothing
-    /// else is offered.
+    /// One deployment is the act side: a patch starts or stops it. Its page
+    /// also carries the index's authoring actions through its back link.
     #[test]
     fn affordance_for_one_inference_deployment_offers_start_and_stop() {
         let output = affordance_for_kind(ResourceKind::InferenceDeployment);

@@ -2663,6 +2663,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::InferenceDeployment => "cairn://inference/deployments/dsv4f-tp2",
         K::ModelsAccounts => "cairn://models/accounts",
         K::ModelsAccount => "cairn://models/accounts/acc_1",
+        K::ModelsClients => "cairn://models/clients",
+        K::ModelsClient => "cairn://models/clients/cli_0011223344556677",
         K::InferencePools => "cairn://inference/pools",
         K::InferenceRequests => "cairn://inference/requests",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
