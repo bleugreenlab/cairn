@@ -6637,11 +6637,7 @@ fn spawn_parked_resolver(
         // A permission that took this call over but did not suspend the item is
         // being withdrawn, and its withdrawal hands this row back.
         durable_suspend::await_inner_wait_release(&db, &record).await;
-        if let Err(error) =
-            durable_suspend::resolve(&orch, &db, &record, &answer.resume_text, false).await
-        {
-            log::warn!("run batch suspension resolution failed: {error}");
-        }
+        durable_suspend::drive_resolution(&orch, &db, &record, &answer.resume_text, false).await;
     });
 }
 

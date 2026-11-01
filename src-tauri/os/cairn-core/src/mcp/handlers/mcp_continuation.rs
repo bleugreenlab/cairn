@@ -510,7 +510,7 @@ const SCHEDULER_SCAN_LIMIT: usize = 64;
 /// Gives the suspended `run` response time to reach the provider before the
 /// global scheduler can drive its first continuation transition.
 const INITIAL_PARK_HANDOFF_MS: i64 = 1_000;
-const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const SCHEDULER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 async fn load_record(
     db: &LocalDb,
@@ -577,11 +577,7 @@ async fn drive_and_resolve(
         return;
     };
     if let DriveOutcome::Terminal(result) = drive(orch.clone(), db.clone(), record.clone()).await {
-        if let Err(error) =
-            super::durable_suspend::resolve(&orch, &db, &record, &result, false).await
-        {
-            log::warn!("MCP continuation resolution failed for {wait_id}: {error}");
-        }
+        super::durable_suspend::drive_resolution(&orch, &db, &record, &result, false).await;
     }
 }
 
@@ -601,16 +597,6 @@ pub(crate) async fn scheduler_tick(orch: &crate::orchestrator::Orchestrator) {
             Err(error) => log::warn!("durable MCP scheduler scan failed: {error}"),
         }
     }
-}
-
-pub(crate) fn spawn_scheduler(orch: crate::orchestrator::Orchestrator) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(SCHEDULER_INTERVAL);
-        loop {
-            interval.tick().await;
-            scheduler_tick(&orch).await;
-        }
-    });
 }
 
 fn input_prompt(requests: serde_json::Value) -> crate::mcp::types::AskUserPayload {

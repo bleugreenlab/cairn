@@ -1232,7 +1232,15 @@ mod tests {
             super::super::node::read_job_todos(&db, "thr", 0, 0, "design-review", None).await;
         assert!(!todos.contains("/0/0/"), "{todos}");
 
-        let tasks = super::super::node::read_node_tasks(&db, "thr", 0, 0, "design-review").await;
+        let tasks = super::super::node::read_node_tasks(
+            &db,
+            "thr",
+            0,
+            0,
+            "design-review",
+            &Default::default(),
+        )
+        .await;
         assert!(tasks.contains("research"), "{tasks}");
         assert!(!tasks.contains("/0/0/"), "{tasks}");
 
@@ -1278,7 +1286,15 @@ mod tests {
         for body in [
             super::super::node::read_node_wakes(&db, "thr", 0, 0, "design-review").await,
             super::super::node::read_job_todos(&db, "thr", 0, 0, "design-review", None).await,
-            super::super::node::read_node_tasks(&db, "thr", 0, 0, "design-review").await,
+            super::super::node::read_node_tasks(
+                &db,
+                "thr",
+                0,
+                0,
+                "design-review",
+                &Default::default(),
+            )
+            .await,
         ] {
             assert!(body.contains("has no session yet"), "{body}");
             assert!(body.contains("cairn://p/thr/design-review"), "{body}");

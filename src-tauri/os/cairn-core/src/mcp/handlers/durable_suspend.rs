@@ -22,7 +22,7 @@ use crate::models::{TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 // In-process poll for a racing continuation to START the predecessor's successor
 // it just created. There is deliberately NO fixed cutoff: a healthy continuation
@@ -32,6 +32,22 @@ use std::{sync::Arc, time::Duration};
 // reconciliation.
 const COLLISION_POLL_INITIAL: Duration = Duration::from_millis(50);
 const COLLISION_POLL_MAX: Duration = Duration::from_secs(2);
+
+// Pacing for re-driving a resolution that returned an error while the host
+// stayed up -- a contended database, most often. Tests shrink it so a retry
+// does not cost seconds.
+#[cfg(not(test))]
+const RESOLVE_RETRY_INITIAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const RESOLVE_RETRY_INITIAL: Duration = Duration::from_millis(5);
+#[cfg(not(test))]
+const RESOLVE_RETRY_MAX: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const RESOLVE_RETRY_MAX: Duration = Duration::from_millis(40);
+/// How many times the live resolver retries a row whose result is already
+/// durable before handing it to the periodic sweep. Past this the failure is
+/// not transient, and a task spinning on it forever helps nobody.
+const DURABLE_RETRY_ATTEMPTS: u32 = 8;
 
 /// What a suspension is waiting for. Serialized into `agent_waits.condition_json`;
 /// the tag keeps the encoding forward-compatible, so adding a variant never
@@ -856,6 +872,10 @@ async fn abandon(
         complete_resolution_in_fact(db, &call.id).await?;
         return Ok(false);
     }
+    // Answering holds the resolver guard when it is free, so the periodic sweep
+    // never mistakes this delivery claim for a stale one. A live resolver that
+    // already holds the guard is raced by the delivery claim itself, as before.
+    let _guard = claim_resolver(orch, &call.id);
     finish_abandonment(orch, db, call, cause).await?;
     Ok(true)
 }
@@ -920,8 +940,8 @@ async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<b
         Box::pin(async move {
             let marked = c
                 .execute(
-                    "UPDATE agent_waits SET state='resolving',resolution_json=?2 WHERE id=?1 AND state IN ('pending','resolving') AND successor_turn_id IS NULL",
-                    params![id, result],
+                    "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=COALESCE(resolving_at,?3) WHERE id=?1 AND state IN ('pending','resolving') AND successor_turn_id IS NULL",
+                    params![id, result, chrono::Utc::now().timestamp_millis()],
                 )
                 .await?;
             Ok(marked > 0)
@@ -1088,8 +1108,8 @@ pub(crate) async fn resolve(
             Box::pin(async move {
                 let changed = c
                     .execute(
-                        "UPDATE agent_waits SET state='resolving',resolution_json=?2 WHERE id=?1 AND state='pending'",
-                        params![id, out],
+                        "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3 WHERE id=?1 AND state='pending'",
+                        params![id, out, chrono::Utc::now().timestamp_millis()],
                     )
                     .await?;
                 Ok(changed)
@@ -1637,20 +1657,35 @@ async fn result_already_delivered(
     .map_err(|e| e.to_string())
 }
 
-/// Release a delivery claim that a restart interrupted, so the re-drive can
-/// still answer the call.
+/// Release a delivery claim whose writer is gone, so the re-drive can still
+/// answer the call.
 ///
 /// A claim is a lock, not a fact. A host that died between committing the claim
 /// and appending the event leaves it held with nothing behind it, and every
 /// later writer — including startup's own replay — would then decline to answer,
-/// losing the result permanently. No delivery survives a restart, so a claim
-/// with no event behind it at startup is stale by construction. An unreadable
+/// losing the result permanently. No delivery survives a restart, so at startup
+/// (`stale_after: None`) a claim with no event behind it is stale by
+/// construction.
+///
+/// While the host is up, a claim can also be orphaned by a failed release after
+/// a failed append. The periodic sweep passes a staleness bound: a real append
+/// is one write with seconds of retry, so a claim older than the bound with no
+/// event behind it is a failed release, never a live append. An unreadable
 /// transcript is treated as delivered: declining to answer twice is the safer
 /// failure.
-async fn reclaim_interrupted_delivery(db: &LocalDb, call: &SuspendedCall) {
-    let held = matches!(load_delivery_claim(db, &call.id).await, Ok(Some(_)));
-    if !held {
+async fn reclaim_interrupted_delivery(
+    db: &LocalDb,
+    call: &SuspendedCall,
+    stale_after: Option<Duration>,
+) {
+    let Ok(Some(claimed_at)) = load_delivery_claim(db, &call.id).await else {
         return;
+    };
+    if let Some(bound) = stale_after {
+        let age_ms = chrono::Utc::now().timestamp_millis() - claimed_at;
+        if age_ms < bound.as_millis() as i64 {
+            return;
+        }
     }
     if result_already_delivered(db, &call.run_id, &call.tool_use_id)
         .await
@@ -1659,7 +1694,7 @@ async fn reclaim_interrupted_delivery(db: &LocalDb, call: &SuspendedCall) {
         return;
     }
     log::warn!(
-        "suspension {} held a delivery claim with no result behind it; reclaimed after restart",
+        "suspension {} held a delivery claim with no result behind it; reclaimed",
         call.id
     );
     release_result_delivery(db, &call.id).await;
@@ -1720,6 +1755,11 @@ async fn append_claimed_result(
     r: &Record,
     result: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(error) = tests::fail_result_append(&r.id) {
+        release_result_delivery(db, &r.id).await;
+        return Err(error);
+    }
     if let Err(error) = crate::execution::jobs::store_tool_result_event_with_turn(
         orch,
         &r.run_id,
@@ -1748,6 +1788,263 @@ async fn store_result_once(
     append_claimed_result(orch, db, r, result).await
 }
 
+/// This host's claim to be the one live resolver of a suspension.
+///
+/// The claim lives in memory, not in a lease column, because every resolver is
+/// a task in the one host that owns resolution -- startup reconciliation already
+/// rests on "no delivery survives a restart". A lease would need renewing
+/// through the unbounded collision backoff in [`resolve`] and an expiry policy,
+/// all for a cross-host case nothing else supports. Dropping the guard (return,
+/// panic, or a cancelled task) releases the claim.
+pub(crate) struct ResolverGuard {
+    resolvers: Arc<std::sync::Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        self.resolvers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// Become the live resolver of suspension `id`, or `None` if another task in
+/// this host already is.
+pub(crate) fn claim_resolver(orch: &Orchestrator, id: &str) -> Option<ResolverGuard> {
+    let claimed = orch
+        .suspension_resolvers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id.to_string());
+    claimed.then(|| ResolverGuard {
+        resolvers: orch.suspension_resolvers.clone(),
+        id: id.to_string(),
+    })
+}
+
+/// The suspensions with a live resolver in this host right now.
+pub(crate) fn live_resolvers(orch: &Orchestrator) -> HashSet<String> {
+    orch.suspension_resolvers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The one entry point that drives a suspension's resolution. Every resolver --
+/// a settled `run` batch, an owned wait's trigger, an MCP continuation, startup
+/// reconciliation, and the periodic sweep -- goes through here rather than
+/// calling [`resolve`] directly.
+///
+/// A resolution that fails while the host stays up is retried here, not left
+/// for the next boot: a parked agent cannot be reached by message, so a row
+/// stranded in `resolving` strands the agent with it (cairn/5778).
+pub(crate) async fn drive_resolution(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    record: &Record,
+    result: &str,
+    replay: bool,
+) {
+    let Some(guard) = claim_resolver(orch, &record.id) else {
+        log::info!(
+            "suspension {} already has a live resolver in this host; deferring to it",
+            record.id
+        );
+        return;
+    };
+    drive_claimed(orch, db, record, result, replay, &guard).await;
+}
+
+/// The retry loop behind [`drive_resolution`], for a caller already holding the
+/// suspension's guard.
+///
+/// After each failure the row's durable state decides what happens next:
+///
+/// - Gone, `resolved`, or `cancelled`: something else finished it.
+/// - `pending`: the `pending -> resolving` write never landed, so `result` held
+///   here is the only copy of the outcome. Keep trying, without a bound.
+/// - `resolving` with an abandonment: finish the abandonment, never resume.
+/// - `resolving` otherwise: the stored resolution is authoritative, so re-drive
+///   it as a replay. That is bounded; past [`DURABLE_RETRY_ATTEMPTS`] the
+///   periodic sweep owns the long tail.
+///
+/// A recorded successor does not stop the retry. A continuation that failed
+/// after `claim_continuation` leaves its successor `pending` with nothing to
+/// start it, and a replay is exactly what relaunches it.
+///
+/// Before any retry, a row whose node can no longer take a turn is settled
+/// rather than retried (see [`settle_if_unresumable`]): that failure is
+/// permanent, and retrying it is a stuck row with log spam.
+async fn drive_claimed(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    record: &Record,
+    result: &str,
+    mut replay: bool,
+    _guard: &ResolverGuard,
+) {
+    let mut backoff = RESOLVE_RETRY_INITIAL;
+    let mut durable_attempts = 0;
+    for attempt in 1u32.. {
+        let error = match resolve(orch, db, record, result, replay).await {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        log::warn!(
+            "suspension {} resolution attempt {attempt} failed: {error}",
+            record.id
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RESOLVE_RETRY_MAX);
+        let (state, stored) = match load_resolution(db, &record.id).await {
+            Ok(Some((state, stored, _))) => (state, stored),
+            Ok(None) => return,
+            Err(read_error) => {
+                log::warn!(
+                    "could not re-read suspension {} before retrying: {read_error}",
+                    record.id
+                );
+                continue;
+            }
+        };
+        match state.as_str() {
+            "resolved" | "cancelled" => return,
+            "pending" | "resolving" => {}
+            other => {
+                log::warn!(
+                    "suspension {} has invalid resolution state {other}; not retrying",
+                    record.id
+                );
+                return;
+            }
+        }
+        if state == "resolving" && is_abandonment(stored.as_deref()) {
+            let cause = AbandonCause::of(stored.as_deref());
+            if let Err(error) =
+                finish_abandonment(orch, db, &SuspendedCall::of(record), cause).await
+            {
+                log::warn!(
+                    "could not finish abandoned suspension {}: {error}",
+                    record.id
+                );
+            }
+            return;
+        }
+        if settle_if_unresumable(db, record).await {
+            return;
+        }
+        if state == "pending" {
+            continue;
+        }
+        replay = true;
+        durable_attempts += 1;
+        if durable_attempts >= DURABLE_RETRY_ATTEMPTS {
+            log::warn!(
+                "suspension {} still failing after {durable_attempts} retries of its stored result; the periodic sweep owns it now",
+                record.id
+            );
+            return;
+        }
+    }
+}
+
+/// Why this suspension's node can no longer take a turn, or `None` if it can.
+///
+/// These are the permanent refusals: a terminal job (a terminal issue settles
+/// its jobs), a job that has moved on to a newer session than the one this
+/// call parked in, and a current session that refuses every further turn. A
+/// read failure is not evidence of any of them.
+async fn unresumable_cause(db: &LocalDb, record: &Record) -> Option<String> {
+    let job = db
+        .query_opt(
+            "SELECT status,current_session_id FROM jobs WHERE id=?1",
+            params![record.job_id.as_str()],
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await;
+    let (status, current_session) = match job {
+        Ok(Some(job)) => job,
+        Ok(None) => return Some("its node no longer exists".into()),
+        Err(_) => return None,
+    };
+    if matches!(status.as_str(), "complete" | "failed" | "cancelled") {
+        return Some(format!("its node's job is {status}"));
+    }
+    if current_session
+        .as_deref()
+        .is_some_and(|current| current != record.session_id)
+    {
+        return Some("its node has moved on to a newer session".into());
+    }
+    if crate::execution::jobs::current_session_refuses_turns(db, &record.job_id).await {
+        return Some("its node's session is closed and cannot take another turn".into());
+    }
+    None
+}
+
+/// The resolution a suspension is settled with when its node can no longer
+/// take a turn. It names the cause and keeps whatever result the row held.
+fn unresumable_resolution(cause: &str, stored: Option<&str>) -> String {
+    serde_json::json!({
+        "outcome": "cancelled",
+        "error": format!("This call's wait was settled without resuming because {cause}."),
+        "result": stored,
+    })
+    .to_string()
+}
+
+/// Settle a suspension whose node can no longer take a turn, the way a Stop
+/// settles one: `cancelled`, with a resolution naming why. Reports whether it
+/// settled the row.
+async fn settle_if_unresumable(db: &LocalDb, record: &Record) -> bool {
+    let Some(cause) = unresumable_cause(db, record).await else {
+        return false;
+    };
+    let (id, now) = (record.id.clone(), chrono::Utc::now().timestamp_millis());
+    let settled = db
+        .write(|c| {
+            let (id, cause) = (id.clone(), cause.clone());
+            Box::pin(async move {
+                let mut rows = c
+                    .query(
+                        "SELECT resolution_json FROM agent_waits WHERE id=?1",
+                        params![id.clone()],
+                    )
+                    .await?;
+                let stored = match rows.next().await? {
+                    Some(row) => row.opt_text(0)?,
+                    None => return Ok(false),
+                };
+                drop(rows);
+                let changed = c
+                    .execute(
+                        "UPDATE agent_waits SET state='cancelled',resolution_json=?2,resolved_at=COALESCE(resolved_at,?3) WHERE id=?1 AND state IN ('pending','resolving')",
+                        params![id, unresumable_resolution(&cause, stored.as_deref()), now],
+                    )
+                    .await?;
+                Ok(changed > 0)
+            })
+        })
+        .await;
+    match settled {
+        Ok(settled) => {
+            if settled {
+                log::warn!("suspension {} settled without resuming: {cause}", record.id);
+            }
+            settled
+        }
+        Err(error) => {
+            log::warn!(
+                "could not settle unresumable suspension {}: {error}",
+                record.id
+            );
+            false
+        }
+    }
+}
+
 /// Re-drive every suspension left pending or mid-resolution by a host restart.
 ///
 /// A waitFor condition is level-triggered and can simply be re-armed. A run
@@ -1765,14 +2062,7 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
             ).await?;
             let mut found = Vec::new();
             while let Some(row) = rows.next().await? {
-                let condition_json = row.text(6)?;
-                let condition = serde_json::from_str::<Condition>(&condition_json)
-                    .map_err(|error| DbError::internal(error.to_string()))?;
-                found.push((Record {
-                    id: row.text(0)?, job_id: row.text(1)?, run_id: row.text(2)?,
-                    session_id: row.text(3)?, turn_id: row.text(4)?, tool_use_id: row.text(5)?,
-                    condition, deadline: row.opt_i64(7)?, created: row.i64(8)?,
-                }, row.text(9)?, row.opt_text(10)?, row.opt_text(11)?.is_some()));
+                found.push((record_from_row(&row)?, row.text(9)?, row.opt_text(10)?, row.opt_text(11)?.is_some()));
             }
             Ok(found)
         })).await;
@@ -1780,7 +2070,7 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
             log::warn!("failed to load pending suspensions during startup");
             continue;
         };
-        for (record, state, stored_result, held) in records {
+        for (record, row_state, stored_result, held) in records {
             // A call held open on its socket when the host died: its socket is
             // gone with the host, so it becomes the park it would have been,
             // and this reconciler is its turn's only resumer. Yielding here as
@@ -1794,57 +2084,302 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                     );
                 }
             }
-            // MCP continuations are owned by the one host-global scheduler. At
-            // startup their durable rows are already normalized; do not create a
-            // per-wait task or wait for their next poll here.
-            if let Condition::McpContinuation { mut state } = record.condition.clone() {
-                super::mcp_continuation::ensure_deadline(
-                    &mut state,
-                    chrono::Utc::now().timestamp_millis(),
-                );
-                if let Err(error) = super::mcp_continuation::store(&db, &record.id, &state).await {
-                    log::warn!(
-                        "startup could not normalize MCP wait {}: {error}",
-                        record.id
+            // A pending MCP continuation is owned by the one host-global
+            // scheduler. At startup its durable row is already normalized; do
+            // not create a per-wait task or wait for its next poll here. A
+            // `resolving` one already holds its result, which the scheduler
+            // never looks at again, so it is re-driven below like any other.
+            if row_state == "pending" {
+                if let Condition::McpContinuation { mut state } = record.condition.clone() {
+                    super::mcp_continuation::ensure_deadline(
+                        &mut state,
+                        chrono::Utc::now().timestamp_millis(),
                     );
+                    if let Err(error) =
+                        super::mcp_continuation::store(&db, &record.id, &state).await
+                    {
+                        log::warn!(
+                            "startup could not normalize MCP wait {}: {error}",
+                            record.id
+                        );
+                    }
+                    reclaim_interrupted_delivery(&db, &SuspendedCall::of(&record), None).await;
+                    continue;
                 }
-                reclaim_interrupted_delivery(&db, &SuspendedCall::of(&record)).await;
+            }
+            let (owned_orch, owned_db) = (orch.clone(), db.clone());
+            tokio::spawn(async move {
+                if row_state == "resolving" {
+                    redrive_resolving(&owned_orch, &owned_db, &record, stored_result, None).await;
+                    return;
+                }
+                let Some(guard) = claim_resolver(&owned_orch, &record.id) else {
+                    return;
+                };
+                reclaim_interrupted_delivery(&owned_db, &SuspendedCall::of(&record), None).await;
+                let result = resolution_after_restart(&owned_orch, &owned_db, &record).await;
+                drive_claimed(&owned_orch, &owned_db, &record, &result, true, &guard).await;
+            });
+        }
+    }
+}
+
+/// A suspension's [`Record`] from the first nine columns of an `agent_waits`
+/// row: `id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id,
+/// condition_json, deadline_ms, created_at`.
+fn record_from_row(row: &cairn_db::turso::Row) -> DbResult<Record> {
+    let condition = serde_json::from_str::<Condition>(&row.text(6)?)
+        .map_err(|error| DbError::internal(error.to_string()))?;
+    Ok(Record {
+        id: row.text(0)?,
+        job_id: row.text(1)?,
+        run_id: row.text(2)?,
+        session_id: row.text(3)?,
+        turn_id: row.text(4)?,
+        tool_use_id: row.text(5)?,
+        condition,
+        deadline: row.opt_i64(7)?,
+        created: row.i64(8)?,
+    })
+}
+
+/// Re-drive a `resolving` row from its durable state. This is the one step
+/// startup reconciliation and the periodic sweep share.
+///
+/// The guard comes first, so nothing below races a live resolver. Then any
+/// delivery claim whose writer is gone is given back (see
+/// [`reclaim_interrupted_delivery`] for what `stale_claim_after` means), and
+/// the row is finished from what it stored.
+///
+/// An abandonment is FINISHED, never re-driven. Its turn is gone, so driving it
+/// as an ordinary wait would create a successor and resume a run the job has
+/// already moved past -- resurrecting the suspension that was discarded.
+async fn redrive_resolving(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    record: &Record,
+    stored_result: Option<String>,
+    stale_claim_after: Option<Duration>,
+) {
+    let Some(guard) = claim_resolver(orch, &record.id) else {
+        return;
+    };
+    let call = SuspendedCall::of(record);
+    reclaim_interrupted_delivery(db, &call, stale_claim_after).await;
+    if is_abandonment(stored_result.as_deref()) {
+        let cause = AbandonCause::of(stored_result.as_deref());
+        if let Err(error) = finish_abandonment(orch, db, &call, cause).await {
+            log::warn!(
+                "could not finish abandoned suspension {}: {error}",
+                record.id
+            );
+        }
+        return;
+    }
+    let result = stored_result.unwrap_or_else(|| {
+        serde_json::json!({"outcome":"error","error":"wait resolution payload missing"}).to_string()
+    });
+    drive_claimed(orch, db, record, &result, true, &guard).await;
+}
+
+/// How long a suspension may sit in `resolving` before it counts as stuck.
+///
+/// One bound serves the periodic sweep, which re-drives a stuck row, and the
+/// node summary, which shows it, so the two always agree on what "stuck" is.
+/// It is well past the live resolver's own retry window for a transient error.
+pub(crate) const STUCK_AFTER: Duration = Duration::from_secs(120);
+
+/// How often the periodic sweep looks for stuck resolutions.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Where a resolution past [`STUCK_AFTER`] is stuck.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum StuckPhase {
+    /// The call's result never reached the agent's transcript.
+    Delivering,
+    /// The result was delivered, but resuming the turn keeps failing.
+    Resuming,
+    /// The result was delivered, and the live resolver is waiting for another
+    /// continuation to start the turn. Nothing has failed; it is only slow.
+    AwaitingContinuation,
+}
+
+/// A suspension that has been `resolving` for longer than [`STUCK_AFTER`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StuckResolution {
+    pub(crate) job_id: String,
+    pub(crate) wait_id: String,
+    /// The parked call, as [`Condition::label`] names it.
+    pub(crate) label: String,
+    /// When the row entered `resolving`, i.e. when the call settled.
+    pub(crate) since_ms: i64,
+    pub(crate) phase: StuckPhase,
+}
+
+/// The suspensions of `job_ids` stuck mid-resolution at `now_ms`, by the same
+/// [`STUCK_AFTER`] bound the sweep uses.
+///
+/// A row whose result is already in the transcript is told apart by `live`, the
+/// set from [`live_resolvers`]: one a live resolver holds is waiting in its
+/// collision backoff, which is slow rather than failed, and must not be shown
+/// as a failure. Abandonments are left out; they never resume the agent.
+pub(crate) async fn stuck_resolutions(
+    db: &LocalDb,
+    job_ids: &[String],
+    now_ms: i64,
+    live: &HashSet<String>,
+) -> Result<Vec<StuckResolution>, String> {
+    let cutoff_ms = now_ms - STUCK_AFTER.as_millis() as i64;
+    let mut stuck = Vec::new();
+    for job_id in job_ids {
+        let rows = db
+            .read(|c| {
+                let job_id = job_id.clone();
+                let [superseded, compacted] = AbandonCause::ALL.map(abandoned_result);
+                Box::pin(async move {
+                    let mut rows = c
+                        .query(
+                            "SELECT w.id,w.condition_json,COALESCE(w.resolving_at,w.created_at),EXISTS (SELECT 1 FROM events e WHERE e.run_id=w.run_id AND e.event_type='tool_result' AND json_extract(e.data,'$.toolUseId')=w.tool_use_id) FROM agent_waits w WHERE w.job_id=?1 AND w.state='resolving' AND COALESCE(w.resolving_at,w.created_at)<=?2 AND (w.resolution_json IS NULL OR w.resolution_json NOT IN (?3,?4)) ORDER BY 3",
+                            params![job_id, cutoff_ms, superseded, compacted],
+                        )
+                        .await?;
+                    let mut found = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        found.push((row.text(0)?, row.text(1)?, row.i64(2)?, row.i64(3)? != 0));
+                    }
+                    Ok(found)
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        for (wait_id, condition_json, since_ms, delivered) in rows {
+            let label = serde_json::from_str::<Condition>(&condition_json)
+                .map(|condition| condition.label())
+                .unwrap_or_else(|_| "suspended call".to_string());
+            let phase = if !delivered {
+                StuckPhase::Delivering
+            } else if live.contains(&wait_id) {
+                StuckPhase::AwaitingContinuation
+            } else {
+                StuckPhase::Resuming
+            };
+            stuck.push(StuckResolution {
+                job_id: job_id.clone(),
+                wait_id,
+                label,
+                since_ms,
+                phase,
+            });
+        }
+    }
+    Ok(stuck)
+}
+
+/// What one pass of [`sweep_stuck_resolutions`] did.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SweepOutcome {
+    /// Rows handed to a fresh re-drive.
+    pub(crate) redriven: usize,
+    /// Rows settled because their node can no longer take a turn.
+    pub(crate) settled: usize,
+}
+
+/// The periodic backstop for a resolution that failed while the host stayed up.
+///
+/// Startup reconciliation re-drives every `resolving` row once, at boot; this
+/// runs the same [`redrive_resolving`] step every [`SWEEP_INTERVAL`] for rows
+/// stuck past [`STUCK_AFTER`] that no live resolver in this host holds. A row
+/// whose node can no longer take a turn is settled here instead, and so leaves
+/// the set the next pass reads.
+pub(crate) async fn sweep_stuck_resolutions(orch: &Orchestrator) -> SweepOutcome {
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - STUCK_AFTER.as_millis() as i64;
+    let live = live_resolvers(orch);
+    let mut outcome = SweepOutcome::default();
+    for db in orch.db.all_dbs().await {
+        let rows = match stale_resolving(&db, cutoff_ms).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!("stuck-resolution sweep could not read suspensions: {error}");
+                continue;
+            }
+        };
+        for (record, stored_result) in rows {
+            if live.contains(&record.id) {
+                continue;
+            }
+            if !is_abandonment(stored_result.as_deref())
+                && settle_if_unresumable(&db, &record).await
+            {
+                outcome.settled += 1;
                 continue;
             }
             let (owned_orch, owned_db) = (orch.clone(), db.clone());
             tokio::spawn(async move {
-                let call = SuspendedCall::of(&record);
-                // Before re-driving, give back any delivery claim this row was
-                // holding when the host died: the writer that held it is gone,
-                // and the re-drive is what will actually answer the call.
-                reclaim_interrupted_delivery(&owned_db, &call).await;
-                // An abandonment the restart interrupted is FINISHED, never
-                // re-driven. Its turn is gone, so driving it as an ordinary wait
-                // would create a successor and resume a run the job has already
-                // moved past -- resurrecting the suspension that was discarded.
-                if is_abandonment(stored_result.as_deref()) {
-                    let cause = AbandonCause::of(stored_result.as_deref());
-                    if let Err(error) =
-                        finish_abandonment(&owned_orch, &owned_db, &call, cause).await
-                    {
-                        log::warn!("startup could not finish an abandoned suspension: {error}");
-                    }
-                    return;
-                }
-                let result = resolution_after_restart(
+                redrive_resolving(
                     &owned_orch,
                     &owned_db,
                     &record,
-                    &state,
                     stored_result,
+                    Some(STUCK_AFTER),
                 )
                 .await;
-                if let Err(error) = resolve(&owned_orch, &owned_db, &record, &result, true).await {
-                    log::warn!("startup suspension resolution failed: {error}");
-                }
             });
+            outcome.redriven += 1;
         }
     }
+    outcome
+}
+
+/// `resolving` rows that entered that state at or before `cutoff_ms`, with
+/// their stored resolution.
+async fn stale_resolving(
+    db: &LocalDb,
+    cutoff_ms: i64,
+) -> Result<Vec<(Record, Option<String>)>, String> {
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,resolution_json FROM agent_waits WHERE state='resolving' AND COALESCE(resolving_at,created_at)<=?1",
+                    params![cutoff_ms],
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push((record_from_row(&row)?, row.opt_text(9)?));
+            }
+            Ok(found)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Spawn the single host-global scheduler for durable waits. It arms due MCP
+/// continuations every tick and runs [`sweep_stuck_resolutions`] every
+/// [`SWEEP_INTERVAL`]. Resolution belongs to the execution host, so only that
+/// host spawns this.
+pub(crate) fn spawn_scheduler(orch: Orchestrator) {
+    tokio::spawn(async move {
+        let mut mcp = tokio::time::interval(super::mcp_continuation::SCHEDULER_INTERVAL);
+        let mut sweep = tokio::time::interval(SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = mcp.tick() => super::mcp_continuation::scheduler_tick(&orch).await,
+                _ = sweep.tick() => {
+                    let outcome = sweep_stuck_resolutions(&orch).await;
+                    if outcome != SweepOutcome::default() {
+                        log::warn!(
+                            "stuck-resolution sweep re-drove {} and settled {} suspension(s)",
+                            outcome.redriven,
+                            outcome.settled
+                        );
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Turn a held row whose host died into an ordinary park: the row stops being
@@ -1869,19 +2404,13 @@ async fn release_held_turn(db: &LocalDb, record: &Record) -> Result<(), String> 
     .map_err(|error| error.to_string())
 }
 
+/// The result a `pending` row resolves to after a restart. (A `resolving` row
+/// already holds its result; see [`redrive_resolving`].)
 async fn resolution_after_restart(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
     record: &Record,
-    state: &str,
-    stored_result: Option<String>,
 ) -> String {
-    if state == "resolving" {
-        return stored_result.unwrap_or_else(|| {
-            serde_json::json!({"outcome":"error","error":"wait resolution payload missing"})
-                .to_string()
-        });
-    }
     match &record.condition {
         Condition::McpContinuation { .. } => {
             match super::mcp_continuation::drive(orch.clone(), db.clone(), record.clone()).await {
@@ -2705,6 +3234,41 @@ mod tests {
     static OWNED_CONTINUATION_BARRIERS: std::sync::LazyLock<
         Mutex<std::collections::HashMap<String, OwnedContinuationBarrier>>,
     > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    /// Injected result-append failures, keyed by wait id, counting down. Keyed
+    /// by id because tests share the process: a test arming a fault uses a wait
+    /// id no other test does.
+    static RESULT_APPEND_FAULTS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+    pub(super) fn fail_result_append(wait_id: &str) -> Option<String> {
+        let mut faults = RESULT_APPEND_FAULTS.lock().unwrap();
+        let remaining = faults.get_mut(wait_id)?;
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        Some(format!(
+            "database transaction failed: injected result-append failure for {wait_id}"
+        ))
+    }
+
+    fn arm_result_append_failures(wait_id: &str, count: usize) {
+        RESULT_APPEND_FAULTS
+            .lock()
+            .unwrap()
+            .insert(wait_id.to_string(), count);
+    }
+
+    fn remaining_result_append_failures(wait_id: &str) -> usize {
+        RESULT_APPEND_FAULTS
+            .lock()
+            .unwrap()
+            .get(wait_id)
+            .copied()
+            .unwrap_or(0)
+    }
 
     pub(super) async fn before_owned_continuation(wait_id: &str) {
         let barrier = OWNED_CONTINUATION_BARRIERS.lock().unwrap().remove(wait_id);
@@ -4018,6 +4582,335 @@ mod tests {
         );
     }
 
+    /// A transient failure delivering the result, with the host still up, must
+    /// not strand the parked call until the next boot (cairn/5778). The live
+    /// resolver retries from the row's durable state, so the call gets its
+    /// answer and its turn resumes without a restart.
+    #[tokio::test]
+    async fn a_failed_result_append_is_retried_without_a_restart() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-append-flake".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        arm_result_append_failures(&record.id, 1);
+
+        drive_resolution(&orch, &orch.db.local, &record, ELAPSED, false).await;
+
+        assert_eq!(
+            tool_results(&orch).await.len(),
+            1,
+            "the call is answered once, without a restart"
+        );
+        assert_eq!(wait_row(&orch, &record.id).await.0, "resolved");
+        let successors = wait_resolved_turns(&orch).await;
+        assert_eq!(successors.len(), 1, "exactly one WaitResolved successor");
+        assert_eq!(successors[0].1, "running", "the turn resumed");
+        assert!(
+            live_resolvers(&orch).is_empty(),
+            "the guard is released once the resolution lands"
+        );
+    }
+
+    /// A failure that can never succeed -- here the node's job finished while
+    /// its call was parked -- settles the row instead of retrying it forever.
+    #[tokio::test]
+    async fn a_failing_resolution_for_a_finished_job_settles_instead_of_retrying() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-finished-job".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        orch.db
+            .local
+            .execute("UPDATE jobs SET status='complete' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+        arm_result_append_failures(&record.id, 50);
+
+        drive_resolution(&orch, &orch.db.local, &record, ELAPSED, false).await;
+
+        let (state, resolution, _) = wait_row(&orch, &record.id).await;
+        assert_eq!(state, "cancelled");
+        let resolution = resolution.unwrap();
+        assert!(resolution.contains("job is complete"), "{resolution}");
+        assert!(
+            resolution.contains("elapsedMs"),
+            "the stored result is kept: {resolution}"
+        );
+        assert_eq!(
+            remaining_result_append_failures(&record.id),
+            49,
+            "settled after one failure, not retried"
+        );
+        assert!(wait_resolved_turns(&orch).await.is_empty());
+    }
+
+    /// Poll until the wait row reaches `state`, failing loudly if it never does.
+    async fn await_wait_state(orch: &Orchestrator, id: &str, state: &str) {
+        for _ in 0..400 {
+            if wait_row(orch, id).await.0 == state {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "wait {id} never reached {state}; it is {}",
+            wait_row(orch, id).await.0
+        );
+    }
+
+    /// Move a row to `resolving` with `resolution`, entered `age` ago.
+    async fn set_resolving(orch: &Orchestrator, id: &str, resolution: &str, age: Duration) {
+        let at = chrono::Utc::now().timestamp_millis() - age.as_millis() as i64;
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3 WHERE id=?1",
+                (id.to_string(), resolution.to_string(), at),
+            )
+            .await
+            .unwrap();
+    }
+
+    const STALE: Duration = Duration::from_secs(180);
+
+    /// The periodic backstop: a row left `resolving` with its result stored and
+    /// no live resolver is re-driven without a restart, once it is old enough.
+    #[tokio::test]
+    async fn the_sweep_redrives_a_stale_resolving_row_with_no_live_resolver() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-sweep-stale".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+
+        set_resolving(&orch, &record.id, ELAPSED, Duration::ZERO).await;
+        assert_eq!(
+            sweep_stuck_resolutions(&orch).await,
+            SweepOutcome::default(),
+            "a row that only just entered resolving is not stuck yet"
+        );
+
+        set_resolving(&orch, &record.id, ELAPSED, STALE).await;
+        assert_eq!(
+            sweep_stuck_resolutions(&orch).await,
+            SweepOutcome {
+                redriven: 1,
+                settled: 0
+            }
+        );
+        await_wait_state(&orch, &record.id, "resolved").await;
+
+        assert_eq!(tool_results(&orch).await.len(), 1);
+        let successors = wait_resolved_turns(&orch).await;
+        assert_eq!(successors.len(), 1);
+        assert_eq!(successors[0].1, "running");
+    }
+
+    /// A resolver legitimately waiting in its collision backoff holds its guard,
+    /// so the sweep leaves it alone however old its row is, and the call is
+    /// answered and resolved exactly once when the foreign successor starts.
+    #[tokio::test]
+    async fn the_sweep_does_not_double_drive_a_resolver_in_collision_backoff() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-sweep-collision".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        insert_foreign_successor(&orch, "pending").await;
+        register_warm(&orch);
+
+        let driver = tokio::spawn({
+            let (orch, record) = (orch.clone(), record.clone());
+            async move {
+                drive_resolution(&orch, &orch.db.local, &record, ELAPSED, false).await;
+            }
+        });
+        // In the collision loop: the guard is held and the call already answered.
+        for _ in 0..400 {
+            if live_resolvers(&orch).contains(&record.id) && tool_result_count(&orch).await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(live_resolvers(&orch).contains(&record.id));
+        assert_eq!(wait_row(&orch, &record.id).await.0, "resolving");
+
+        set_resolving(&orch, &record.id, ELAPSED, STALE).await;
+        assert_eq!(
+            sweep_stuck_resolutions(&orch).await,
+            SweepOutcome::default(),
+            "the sweep must not re-drive a row its live resolver holds"
+        );
+
+        orch.db
+            .local
+            .execute("UPDATE turns SET state='running' WHERE id='foreign'", ())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), driver)
+            .await
+            .expect("the live resolver finishes once the foreign successor starts")
+            .unwrap();
+
+        assert_eq!(tool_results(&orch).await.len(), 1);
+        assert!(wait_resolved_turns(&orch).await.is_empty());
+        assert_eq!(wait_row(&orch, &record.id).await.0, "resolved");
+        assert!(live_resolvers(&orch).is_empty());
+    }
+
+    /// A failed release after a failed append orphans a delivery claim while the
+    /// host is up. The sweep's bounded reclaim gives back an old claim with no
+    /// event behind it, and leaves a fresh one -- possibly a live append -- alone.
+    #[tokio::test]
+    async fn the_sweep_releases_a_stale_claim_with_no_event_but_not_a_fresh_one() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-sweep-claim".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        let call = SuspendedCall::of(&record);
+        assert!(claim_result_delivery(&orch.db.local, &record.id)
+            .await
+            .unwrap());
+
+        reclaim_interrupted_delivery(&orch.db.local, &call, Some(STUCK_AFTER)).await;
+        assert!(
+            wait_row(&orch, &record.id).await.2.is_some(),
+            "a fresh claim may be a live append"
+        );
+
+        let old = chrono::Utc::now().timestamp_millis() - STALE.as_millis() as i64;
+        orch.db
+            .local
+            .execute(
+                "UPDATE agent_waits SET result_stored_at=?2 WHERE id=?1",
+                (record.id.clone(), old),
+            )
+            .await
+            .unwrap();
+        reclaim_interrupted_delivery(&orch.db.local, &call, Some(STUCK_AFTER)).await;
+        assert_eq!(
+            wait_row(&orch, &record.id).await.2,
+            None,
+            "an old claim with nothing behind it is released"
+        );
+    }
+
+    /// A permanent refusal must settle the row, not be re-driven every pass: a
+    /// stuck row whose job finished is settled by one sweep and absent from the
+    /// next.
+    #[tokio::test]
+    async fn a_stuck_row_whose_job_finished_is_settled_by_one_sweep_and_not_redriven() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-sweep-finished".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        set_resolving(&orch, &record.id, ELAPSED, STALE).await;
+        orch.db
+            .local
+            .execute("UPDATE jobs SET status='cancelled' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sweep_stuck_resolutions(&orch).await,
+            SweepOutcome {
+                redriven: 0,
+                settled: 1
+            }
+        );
+        let (state, resolution, _) = wait_row(&orch, &record.id).await;
+        assert_eq!(state, "cancelled");
+        assert!(resolution.unwrap().contains("job is cancelled"));
+        assert_eq!(
+            sweep_stuck_resolutions(&orch).await,
+            SweepOutcome::default(),
+            "a settled row is not picked up again"
+        );
+        assert!(tool_results(&orch).await.is_empty());
+        assert!(wait_resolved_turns(&orch).await.is_empty());
+    }
+
+    /// Visibility uses the sweep's bound, and tells a failing delivery or resume
+    /// from a live resolver merely waiting on another continuation.
+    #[tokio::test]
+    async fn stuck_resolutions_tell_a_failure_from_a_guarded_collision_wait() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-stuck-phases".into(),
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        let jobs = ["job-1".to_string()];
+        let now = || chrono::Utc::now().timestamp_millis();
+        let none = HashSet::new();
+
+        set_resolving(&orch, &record.id, ELAPSED, Duration::ZERO).await;
+        assert!(stuck_resolutions(&orch.db.local, &jobs, now(), &none)
+            .await
+            .unwrap()
+            .is_empty());
+
+        set_resolving(&orch, &record.id, ELAPSED, STALE).await;
+        let stuck = stuck_resolutions(&orch.db.local, &jobs, now(), &none)
+            .await
+            .unwrap();
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].wait_id, record.id);
+        assert_eq!(stuck[0].label, "waitFor: duration");
+        assert_eq!(stuck[0].phase, StuckPhase::Delivering);
+
+        store_result_once(&orch, &orch.db.local, &record, ELAPSED)
+            .await
+            .unwrap();
+        let stuck = stuck_resolutions(&orch.db.local, &jobs, now(), &none)
+            .await
+            .unwrap();
+        assert_eq!(stuck[0].phase, StuckPhase::Resuming);
+
+        let _guard = claim_resolver(&orch, &record.id).unwrap();
+        let stuck = stuck_resolutions(&orch.db.local, &jobs, now(), &live_resolvers(&orch))
+            .await
+            .unwrap();
+        assert_eq!(stuck[0].phase, StuckPhase::AwaitingContinuation);
+    }
+
+    /// The MCP scheduler only reads `pending` rows, so a `resolving` MCP
+    /// continuation was skipped at startup and stranded across every restart.
+    #[tokio::test]
+    async fn startup_reconcile_redrives_a_resolving_mcp_continuation_row() {
+        let (orch, base, _) = durable_env().await;
+        let record = Record {
+            id: "wait-mcp-resolving".into(),
+            condition: Condition::McpContinuation { state: mcp_state() },
+            deadline: None,
+            ..base
+        };
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        set_resolving(&orch, &record.id, "mcp tool finished", Duration::ZERO).await;
+
+        reconcile(&orch).await;
+        await_wait_state(&orch, &record.id, "resolved").await;
+
+        let results = tool_results(&orch).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("mcp tool finished"), "{results:?}");
+        assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+    }
+
     #[tokio::test]
     async fn duplicate_resolution_creates_no_second_successor_or_result() {
         let (orch, record, _) = durable_env().await;
@@ -4994,7 +5887,7 @@ mod tests {
         );
 
         // Reclaiming it is exactly what lets the answer land.
-        reclaim_interrupted_delivery(&orch.db.local, &SuspendedCall::of(&record)).await;
+        reclaim_interrupted_delivery(&orch.db.local, &SuspendedCall::of(&record), None).await;
         store_result_once(&orch, &orch.db.local, &record, ELAPSED)
             .await
             .unwrap();
@@ -5304,7 +6197,7 @@ mod tests {
         let claimed_at = wait_row(&orch, "wait-1").await.2;
         assert!(claimed_at.is_some());
 
-        reclaim_interrupted_delivery(&orch.db.local, &SuspendedCall::of(&record)).await;
+        reclaim_interrupted_delivery(&orch.db.local, &SuspendedCall::of(&record), None).await;
 
         assert_eq!(
             wait_row(&orch, "wait-1").await.2,

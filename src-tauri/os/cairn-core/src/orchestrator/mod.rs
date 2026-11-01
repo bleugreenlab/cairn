@@ -759,6 +759,7 @@ impl OrchestratorBuilder {
             compile_cache_service: Arc::new(RwLock::new(None)),
             codemap_refresh_in_flight: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
+            suspension_resolvers: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
             main_cadence: Arc::new(Mutex::new(Default::default())),
@@ -1528,6 +1529,11 @@ pub struct Orchestrator {
     /// unresolvable. A second attempt on the same id is either a duplicate
     /// finalize or a failure that retrying will not fix.
     pub(crate) session_reseed_fallback_attempted: Arc<Mutex<HashSet<String>>>,
+
+    /// Durable suspensions with a live resolver task in this host, by wait id.
+    /// Held through `durable_suspend::claim_resolver`'s guard, so the periodic
+    /// sweep never re-drives a row its own resolver is still working.
+    pub(crate) suspension_resolvers: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Resolve the `/embed` gateway token: account JWT preferred, anonymous device
@@ -2657,10 +2663,11 @@ impl Orchestrator {
         crate::execution::scheduler::spawn_recipe_scheduler(self.clone());
     }
 
-    /// Spawn the single host-global scheduler for durable MCP continuations.
-    /// It scans every routed database in bounded batches and arms only due waits.
-    pub fn spawn_mcp_scheduler(&self) {
-        crate::mcp::handlers::mcp_continuation::spawn_scheduler(self.clone());
+    /// Spawn the single host-global scheduler for durable waits. It arms due MCP
+    /// continuations across every routed database, and periodically re-drives
+    /// suspensions stuck mid-resolution with no live resolver.
+    pub fn spawn_durable_wait_scheduler(&self) {
+        crate::mcp::handlers::durable_suspend::spawn_scheduler(self.clone());
     }
 
     /// Spawn external human-gate delivery. Runtime owners choose and construct

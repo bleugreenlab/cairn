@@ -188,12 +188,14 @@ pub(crate) async fn handle_owned_wait(
                             serde_json::json!({"outcome":"error","error":error}).to_string()
                         }
                     };
-                if let Err(error) =
-                    durable_suspend::resolve(&owned_orch, &owned_db, &owned_record, &result, false)
-                        .await
-                {
-                    log::warn!("owned wait resolution failed: {error}");
-                }
+                durable_suspend::drive_resolution(
+                    &owned_orch,
+                    &owned_db,
+                    &owned_record,
+                    &result,
+                    false,
+                )
+                .await;
             });
             WAIT_SUSPENDED_MARKER.into()
         }

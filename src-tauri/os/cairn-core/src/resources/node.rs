@@ -1,6 +1,8 @@
 //! Node, task, todo, question, and node transcript resource readers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::mcp::handlers::durable_suspend::{stuck_resolutions, StuckPhase, StuckResolution};
 
 use cairn_db::turso::params;
 
@@ -260,6 +262,57 @@ fn job_status_icon(status: &str) -> &'static str {
 
 fn format_node_timestamp(timestamp: i64) -> String {
     crate::clock::stamp(timestamp).unwrap_or_else(|| "Unknown".to_string())
+}
+
+/// The node summary's paragraph for one of its calls stuck mid-resolution.
+/// Only a phase that is actually failing says so; a resolver waiting on another
+/// continuation has delivered its result and is merely slow.
+fn describe_stuck_resolution(stuck: &StuckResolution) -> String {
+    let since = format_node_timestamp(stuck.since_ms / 1_000);
+    let (label, id) = (&stuck.label, &stuck.wait_id);
+    match stuck.phase {
+        StuckPhase::Delivering => format!(
+            "**Stuck delivering a result.** Its `{label}` call settled at {since}, but handing the result back to the agent has failed since then (wait `{id}`). Cairn retries automatically every 30 seconds; the agent stays parked until it lands."
+        ),
+        StuckPhase::Resuming => format!(
+            "**Stuck resuming.** Its `{label}` call settled at {since} and the result reached the agent's transcript, but resuming its turn has failed since then (wait `{id}`). Cairn retries automatically every 30 seconds; the agent stays parked until its turn resumes."
+        ),
+        StuckPhase::AwaitingContinuation => format!(
+            "**Waiting for another continuation to start.** Its `{label}` call settled at {since} and the result reached the agent's transcript; its turn resumes through another continuation that has not started yet (wait `{id}`)."
+        ),
+    }
+}
+
+/// How a parent's task or call listing names a child stuck mid-resolution.
+fn stuck_status(stuck: &StuckResolution) -> String {
+    let since = format_node_timestamp(stuck.since_ms / 1_000);
+    match stuck.phase {
+        StuckPhase::Delivering => format!("running, stuck delivering a result since {since}"),
+        StuckPhase::Resuming => format!("running, stuck resuming since {since}"),
+        StuckPhase::AwaitingContinuation => {
+            format!("running, waiting for another continuation to start since {since}")
+        }
+    }
+}
+
+/// The stuck resolutions of `job_ids`, or none if they cannot be read: a
+/// listing is better without the notice than not rendered at all.
+async fn load_stuck_resolutions(
+    db: &LocalDb,
+    job_ids: &[String],
+    live_resolvers: &HashSet<String>,
+) -> Vec<StuckResolution> {
+    stuck_resolutions(
+        db,
+        job_ids,
+        chrono::Utc::now().timestamp_millis(),
+        live_resolvers,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("could not read stuck resolutions: {error}");
+        Vec::new()
+    })
 }
 
 fn append_optional_timestamp(output: &mut String, label: &str, timestamp: Option<i64>) {
@@ -722,14 +775,15 @@ pub(super) async fn read_node_calls(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    live_resolvers: &HashSet<String>,
 ) -> String {
     let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
         Box::pin(async move {
-            let mut calls: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
+            let mut calls: Vec<CallListItem> = Vec::new();
             if let Ok(mut rows) = conn
                 .query(
                     "
-                    SELECT uri_segment, agent_config_id, task_description, status
+                    SELECT uri_segment, agent_config_id, task_description, status, id
                     FROM jobs
                     WHERE parent_job_id = ?1 AND output_contract IS NOT NULL
                     ORDER BY task_index ASC, created_at ASC
@@ -739,16 +793,22 @@ pub(super) async fn read_node_calls(
                 .await
             {
                 while let Ok(Some(row)) = rows.next().await {
-                    let (Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
+                    let (Ok(segment), Ok(agent), Ok(description), Ok(status), Ok(job_id)) = (
                         row.opt_text(0),
                         row.opt_text(1),
                         row.opt_text(2),
                         row.text(3),
+                        row.text(4),
                     ) else {
                         continue;
                     };
-                    let segment = segment.unwrap_or_else(|| "call".to_string());
-                    calls.push((segment, agent, description, status));
+                    calls.push(CallListItem {
+                        job_id,
+                        segment: segment.unwrap_or_else(|| "call".to_string()),
+                        agent,
+                        description,
+                        status,
+                    });
                 }
             }
             calls
@@ -764,7 +824,16 @@ pub(super) async fn read_node_calls(
         output.push_str("No ephemeral calls yet.\n\n");
     } else {
         output.push_str(&format!("{} call(s)\n\n", calls.len()));
-        for (segment, agent, description, status) in &calls {
+        let call_ids: Vec<String> = calls.iter().map(|call| call.job_id.clone()).collect();
+        let stuck = load_stuck_resolutions(db, &call_ids, live_resolvers).await;
+        for CallListItem {
+            job_id,
+            segment,
+            agent,
+            description,
+            status,
+        } in &calls
+        {
             let icon = match status.as_str() {
                 "complete" => "✓",
                 "running" => "◐",
@@ -777,14 +846,28 @@ pub(super) async fn read_node_calls(
                 .filter(|value| !value.is_empty())
                 .or_else(|| agent.clone())
                 .unwrap_or_else(|| segment.clone());
-            output.push_str(&format!("- {icon} {label} ({segment})\n"));
+            let stuck_suffix = stuck
+                .iter()
+                .find(|stuck| &stuck.job_id == job_id)
+                .map(|stuck| format!(" — {}", stuck_status(stuck)))
+                .unwrap_or_default();
+            output.push_str(&format!("- {icon} {label} ({segment}){stuck_suffix}\n"));
         }
         output.push('\n');
     }
     output
 }
 
+struct CallListItem {
+    job_id: String,
+    segment: String,
+    agent: Option<String>,
+    description: Option<String>,
+    status: String,
+}
+
 struct TaskListItem {
+    job_id: String,
     segment: String,
     agent: Option<String>,
     description: Option<String>,
@@ -798,6 +881,7 @@ pub(super) async fn read_node_tasks(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    live_resolvers: &HashSet<String>,
 ) -> String {
     let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
         Box::pin(async move {
@@ -826,8 +910,9 @@ pub(super) async fn read_node_tasks(
                     };
                     let segment = segment.unwrap_or_else(|| "task".to_string());
                     listed.push((
-                        task_id,
+                        task_id.clone(),
                         TaskListItem {
+                            job_id: task_id,
                             segment,
                             agent,
                             description,
@@ -855,8 +940,11 @@ pub(super) async fn read_node_tasks(
         output.push_str("No delegated tasks yet.\n\n");
     } else {
         output.push_str(&format!("{} task(s)\n\n", tasks.len()));
+        let task_ids: Vec<String> = tasks.iter().map(|task| task.job_id.clone()).collect();
+        let stuck = load_stuck_resolutions(db, &task_ids, live_resolvers).await;
         for task in &tasks {
             let TaskListItem {
+                job_id,
                 segment,
                 agent,
                 description,
@@ -895,6 +983,9 @@ pub(super) async fn read_node_tasks(
                 ));
             } else if status == "failed" || status == "cancelled" {
                 detail.push_str(&format!(" — {status}, no verdict"));
+            }
+            if let Some(stuck) = stuck.iter().find(|stuck| &stuck.job_id == job_id) {
+                detail.push_str(&format!(" — {}", stuck_status(stuck)));
             }
             detail.push('\n');
             output.push_str(&detail);
@@ -1613,6 +1704,14 @@ pub(super) async fn read_node(
             position,
             &format_node_timestamp(since_ms / 1_000),
         ));
+        output.push_str("\n\n");
+    }
+    // A call that settled but whose result never made it back reads like a
+    // healthy `running` node with an outstanding call unless the summary says
+    // otherwise.
+    let live = crate::mcp::handlers::durable_suspend::live_resolvers(orch);
+    for stuck in load_stuck_resolutions(db, std::slice::from_ref(&job.id), &live).await {
+        output.push_str(&describe_stuck_resolution(&stuck));
         output.push_str("\n\n");
     }
 
@@ -3691,5 +3790,115 @@ mod gated_artifact_tests {
         assert!(output.contains("[continue](cairn://p/cairn/2160/1/planner/messages)"));
         assert!(output.contains("target:\"cairn://p/cairn/2160/1/planner/messages\""));
         assert!(!output.contains("target:\"cairn://p/cairn/2160/1/planner\""));
+    }
+}
+
+#[cfg(test)]
+mod stuck_resolution_tests {
+    use super::{describe_stuck_resolution, read_node_calls, read_node_tasks};
+    use crate::mcp::handlers::durable_suspend::{StuckPhase, StuckResolution};
+    use crate::storage::LocalDb;
+    use std::collections::HashSet;
+
+    /// A thread session job, as the node renderers resolve it, with one
+    /// delegated child `research` whose `run` call is parked in `resolving`,
+    /// entered `age_ms` ago with no result delivered.
+    async fn parent_with_parked_child(age_ms: i64) -> LocalDb {
+        let db = crate::storage::migrated_test_db("stuck-resolutions.db").await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-threads', 'default', 'Threads', 'thr', '/tmp/threads', 1, 1);
+             INSERT INTO threads (id, project_id, name, jurisdiction, created_at, updated_at)
+             VALUES ('t-design', 'p-threads', 'design-review', 'Own architecture decisions', 2, 3);",
+        )
+        .await
+        .unwrap();
+        let parent = crate::threads::ensure_thread_session(&db, "t-design")
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, parent_job_id, project_id, status, node_name, uri_segment, output_contract, created_at, updated_at) VALUES ('j-task', ?1, 'p-threads', 'running', 'research', 'research', NULL, 7, 8)",
+            (parent.as_str(),),
+        )
+        .await
+        .unwrap();
+        db.execute_script(
+            "INSERT INTO sessions (id, job_id, status, backend_id, created_at, updated_at) VALUES ('s-task', 'j-task', 'open', 'h', 1, 1);
+             INSERT INTO runs (id, project_id, job_id, status, session_id, created_at, updated_at) VALUES ('r-task', 'p-threads', 'j-task', 'live', 's-task', 1, 1);
+             INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('t-task', 's-task', 'r-task', 'j-task', 1, 'yielded', 'initial', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let at = chrono::Utc::now().timestamp_millis() - age_ms;
+        db.execute(
+            r#"INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id, condition_json, state, resolution_json, created_at, resolving_at) VALUES ('w-task', 'j-task', 'r-task', 's-task', 't-task', 'tool-1', '{"kind":"run_batch","request_id":"req","commits":false,"label":"cargo test"}', 'resolving', 'batch output', ?1, ?1)"#,
+            (at,),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn tasks_of(db: &LocalDb) -> String {
+        read_node_tasks(db, "thr", 0, 0, "design-review", &HashSet::new()).await
+    }
+
+    #[tokio::test]
+    async fn a_child_stuck_delivering_reads_as_stuck_in_its_parents_task_listing() {
+        let db = parent_with_parked_child(3 * 60_000).await;
+        let tasks = tasks_of(&db).await;
+        assert!(
+            tasks.contains("running, stuck delivering a result since"),
+            "{tasks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_that_only_just_settled_reads_as_plain_running() {
+        let db = parent_with_parked_child(0).await;
+        let tasks = tasks_of(&db).await;
+        assert!(tasks.contains("research"), "{tasks}");
+        assert!(!tasks.contains("stuck"), "{tasks}");
+    }
+
+    #[tokio::test]
+    async fn a_delegated_task_is_not_listed_among_calls() {
+        let db = parent_with_parked_child(3 * 60_000).await;
+        let calls = read_node_calls(&db, "thr", 0, 0, "design-review", &HashSet::new()).await;
+        assert!(!calls.contains("stuck"), "{calls}");
+    }
+
+    fn stuck(phase: StuckPhase) -> StuckResolution {
+        StuckResolution {
+            job_id: "j".into(),
+            wait_id: "w-1".into(),
+            label: "run: cargo test".into(),
+            since_ms: 1_793_570_000_000,
+            phase,
+        }
+    }
+
+    #[test]
+    fn the_summary_names_a_failing_phase_as_failing() {
+        for phase in [StuckPhase::Delivering, StuckPhase::Resuming] {
+            let text = describe_stuck_resolution(&stuck(phase));
+            assert!(text.contains("`run: cargo test`"), "{text}");
+            assert!(text.contains("has failed since then"), "{text}");
+            assert!(text.contains("`w-1`"), "{text}");
+        }
+        assert!(describe_stuck_resolution(&stuck(StuckPhase::Delivering))
+            .starts_with("**Stuck delivering a result.**"));
+    }
+
+    /// A live resolver in its collision backoff delivered its result already;
+    /// the notice must not claim a failure that did not happen.
+    #[test]
+    fn the_summary_does_not_call_a_guarded_collision_wait_a_failure() {
+        let text = describe_stuck_resolution(&stuck(StuckPhase::AwaitingContinuation));
+        assert!(
+            text.starts_with("**Waiting for another continuation to start.**"),
+            "{text}"
+        );
+        assert!(!text.contains("failed"), "{text}");
     }
 }

@@ -2693,7 +2693,15 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node tasks", &params) {
                 error
             } else {
-                read_node_tasks(db, &project, number, exec_seq, &node_id).await
+                read_node_tasks(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &crate::mcp::handlers::durable_suspend::live_resolvers(orch),
+                )
+                .await
             }
         }
         CairnResource::NodeCalls {
@@ -2705,7 +2713,15 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node calls", &params) {
                 error
             } else {
-                read_node_calls(db, &project, number, exec_seq, &node_id).await
+                read_node_calls(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &crate::mcp::handlers::durable_suspend::live_resolvers(orch),
+                )
+                .await
             }
         }
         CairnResource::NodeWakes {

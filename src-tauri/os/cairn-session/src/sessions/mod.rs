@@ -51,6 +51,9 @@ pub async fn create_with_id_and_lineage(
     .map_err(|e| format!("Failed to create session: {e}"))
 }
 
+/// Load one session. A missing row and a failed lookup are told apart: a lock
+/// or transaction error is not evidence the session is gone, and reporting it
+/// as "not found" sends whoever reads it after the wrong cause.
 pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
     let session_id = session_id.to_string();
     db.query_opt(
@@ -63,10 +66,8 @@ pub async fn get(db: &LocalDb, session_id: &str) -> Result<Session, String> {
         session_from_row,
     )
     .await
-    .and_then(|session| {
-        session.ok_or_else(|| DbError::Row(format!("Session not found: {session_id}")))
-    })
-    .map_err(|e| format!("Session not found ({session_id}): {e}"))
+    .map_err(|e| format!("Session lookup failed ({session_id}): {e}"))?
+    .ok_or_else(|| format!("Session not found: {session_id}"))
 }
 
 pub async fn update_status(
@@ -251,4 +252,21 @@ pub async fn account_assignments(db: &LocalDb) -> Result<Vec<(String, i64)>, Str
     )
     .await
     .map_err(|e| format!("Failed to load session account assignments: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_missing_session_reads_as_not_found() {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = LocalDb::open_migrated_for_test(dir.join("sessions.db"))
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&db, "absent").await.unwrap_err(),
+            "Session not found: absent"
+        );
+    }
 }
