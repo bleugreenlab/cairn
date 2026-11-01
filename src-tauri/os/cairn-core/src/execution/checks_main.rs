@@ -57,9 +57,9 @@ use crate::config::project_settings::CheckCommand;
 use crate::execution::check_parsers::is_test_runner_command;
 use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
-    execute_check_contract, load_checks_contract_at_commit_detailed,
-    resolve_check_contract_at_commit, terminating_signal, CheckRunProducer, CheckRunTarget,
-    CommitChecksContract, CommitChecksContractError, MAIN_CADENCE_STREAM_PREFIX,
+    execute_check_contract, host_ended_compile, load_checks_contract_at_commit_detailed,
+    resolve_check_contract_at_commit, CheckRunProducer, CheckRunTarget, CommitChecksContract,
+    CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -1730,91 +1730,12 @@ fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
     }
 }
 
-/// A compile the tree did not fail: cargo reports a crate that could not
-/// compile, the same output says the host ended it, and no compiler error
-/// about the code appears anywhere. The host ends a compile by signalling its
-/// process from outside (a stall stop, a pressure reclaim, a cell operation)
-/// or by failing its storage (a full disk, an I/O error). Either way the row
-/// is a death on the execution side of the seam, and there is no rustc
-/// signature to match against a build break on main.
-#[derive(Debug, PartialEq, Eq)]
-struct HostEndedCompile {
-    by: HostEnding,
-    krate: Option<String>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum HostEnding {
-    /// A compiler process ended by this terminating signal.
-    Signal(&'static str),
-    /// The operating system's storage error, as the OS words it.
-    Storage(&'static str),
-}
-
-fn host_ended_compile(tail: &str) -> Option<HostEndedCompile> {
-    let mut by = None;
-    let mut krate = None;
-    let mut compiling = false;
-    // Whether the lines being read belong to an uncoded `error:` diagnostic,
-    // which is about the code only when it points at a source location.
-    // Warnings carry locations too, and say nothing about the verdict.
-    let mut in_error = false;
-    for line in tail.lines().map(str::trim_start) {
-        if line.starts_with("error[E") || (in_error && line.starts_with("--> ")) {
-            return None;
-        }
-        if line.starts_with("error") || line.starts_with("warning") {
-            in_error = false;
-        }
-        let subject = line
-            .strip_prefix("error: could not compile ")
-            .or_else(|| line.strip_prefix("error: failed to run custom build command for "));
-        if let Some(subject) = subject {
-            compiling = true;
-            krate = krate.or_else(|| backticked(subject));
-        } else if let Some(storage) = storage_error(line) {
-            by = by.or(Some(HostEnding::Storage(storage)));
-        } else if let Some(signal) = process_signal(line) {
-            by = by.or(Some(HostEnding::Signal(signal)));
-        } else if line.starts_with("error: ") {
-            in_error = true;
-        }
-    }
-    let by = by?;
-    compiling.then_some(HostEndedCompile { by, krate })
-}
-
-/// The storage error an output line reports, in the operating system's words
-/// (Linux and macOS, then Windows). Matched by text: the same `os error` number
-/// means different things on different platforms.
-fn storage_error(line: &str) -> Option<&'static str> {
-    let line = line.to_ascii_lowercase();
-    [
-        ("no space left on device", "No space left on device"),
-        ("input/output error", "Input/output error"),
-        (
-            "there is not enough space on the disk",
-            "There is not enough space on the disk",
-        ),
-    ]
-    .into_iter()
-    .find_map(|(needle, words)| line.contains(needle).then_some(words))
-}
-
-fn backticked(text: &str) -> Option<String> {
-    let (name, _) = text.strip_prefix('`')?.split_once('`')?;
-    Some(name.to_string())
-}
-
-/// The terminating signal a cargo process line reports, as in
-/// ``process didn't exit successfully: `rustc …` (signal: 15, SIGTERM: termination signal)``.
-/// The line is often cut at its head in a stored tail, so only its end is read.
-fn process_signal(line: &str) -> Option<&'static str> {
-    let (_, after) = line.rsplit_once("(signal: ")?;
-    let number = after.split(|c: char| !c.is_ascii_digit()).next()?;
-    terminating_signal(number.parse().ok()?)
-}
-
+/// The cause a row reports when its compile was ended by the host (see
+/// [`host_ended_compile`], the predicate the store's classifier also uses):
+/// a death on the execution side of the seam, with no rustc signature to
+/// match against a build break on main. Read from the stored tail rather than
+/// the stored `failure_kind` so a row stored before the classifier knew this
+/// shape still reads as the death it was.
 fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
     if row.verdict_passed || row.failed() > 0 {
         return None;
@@ -3520,6 +3441,9 @@ pub(crate) fn render_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::checks::host_ended_compile_specimens::{
+        COMPILE_ERROR_TAIL, DISK_FULL_TAIL, KILLED_RMCP_TAIL,
+    };
 
     fn row(id: &str, commit: &str, ran_at_ms: i64, tests: &[(&str, TestOutcome)]) -> CadenceRow {
         CadenceRow {
@@ -5437,18 +5361,6 @@ mod tests {
         assert!(!text.contains("MAIN CADENCE DID NOT COMPLETE"), "{text}");
     }
 
-    /// Specimen a08e20f0's tail, shortened: rustc for `rmcp` ended by SIGTERM
-    /// mid-compile, its process line cut at the head by the stored tail.
-    const KILLED_RMCP_TAIL: &str = "error: could not compile `rmcp` (lib)\n\
-        …\n\
-        /build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libpin_project_lite-b547d44ab2a3e239.rmeta --extern tokio=/home/dev/.cairn-exec/build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libtokio-c4d896466688d916.rmeta --cap-lints allow` (signal: 15, SIGTERM: termination signal)\n\
-        warning: build failed, waiting for other jobs to finish...\n\
-        warning: field `job_id` is never read\n\
-        \x20 --> os/cairn-core/src/notifications/derive.rs:32:5\n\
-        warning: `cairn-core` (lib) generated 4 warnings (run `cargo fix --lib -p cairn-core` to apply 1 suggestion)\n\
-        error: command `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
-        error: script \"test:rust:full\" exited with code 101";
-
     fn compile_row(id: &str, tail: &str) -> CadenceRow {
         let mut row = row(id, "cccccccccccccccccccc", HOUR, &[]);
         row.exit_code = 101;
@@ -5521,10 +5433,12 @@ mod tests {
                 CadenceVerdict::NoVerdict { row: Some(_), .. }
             )
         };
-        let compile_error = "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
-        assert!(no_verdict(compile_error), "a compile error is the tree's");
         assert!(
-            no_verdict(&format!("{compile_error}\n{KILLED_RMCP_TAIL}")),
+            no_verdict(COMPILE_ERROR_TAIL),
+            "a compile error is the tree's"
+        );
+        assert!(
+            no_verdict(&format!("{COMPILE_ERROR_TAIL}\n{KILLED_RMCP_TAIL}")),
             "a diagnostic beside a killed compile is still the tree's"
         );
         let uncoded = "error: expected one of `,` or `}`, found `turn`\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
@@ -5551,17 +5465,6 @@ mod tests {
         );
         assert!(no_verdict(""), "a bare zero-test exit stays a no-verdict");
     }
-
-    /// Specimen 6ebdcedb's tail, shortened: warnings that point at the source,
-    /// then rustc's write of an object file refused by a full disk.
-    const DISK_FULL_TAIL: &str = "warning: field `computed_at` is never read\n\
-        \x20  --> os/cairn-core/src/projects/codemap.rs:138:9\n\
-        \x20   |\n\
-        error: could not write output to /Users/dev/.cairn-exec/build-slots/cairn/slot-705/src-tauri/target/debug/deps/cairn_core-a2de4dd904051819.f391dbsmm5xj2b3xuwpopitus.1cihbaz.rcgu.o: No space left on device\n\
-        \n\
-        error: could not compile `cairn-core` (lib test) due to 1 previous error; 7 warnings emitted\n\
-        error: command `/Users/dev/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
-        error: script \"test:rust:full\" exited with code 101";
 
     /// Specimen 6ebdcedb: a compile that failed because the host's disk was
     /// full is the host's death, though rustc counts the OS error as its one

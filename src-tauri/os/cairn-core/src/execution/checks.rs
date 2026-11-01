@@ -4740,7 +4740,7 @@ enum NoStart {
 
 #[cfg(test)]
 impl NoStart {
-    fn is_transient(self) -> bool {
+    fn is_transient(&self) -> bool {
         matches!(self, Self::Substrate(shape) if shape.is_transient())
     }
 }
@@ -5692,6 +5692,21 @@ fn classify_check_failure(
             cache_corruption: false,
         });
     }
+    // A compile the host ended exits as a build failure (cargo's 101), but the
+    // host's signal or storage error is the cause, not the tree. Storing it as
+    // infrastructure is what charges the death to the machine.
+    if let Some(ended) = host_ended_compile(output) {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Infrastructure,
+            reason: format!(
+                "Cairn: {}; the host ended the build and no compiler error about the code was \
+                 printed, so this run is not a verdict on the tree",
+                ended.describe()
+            ),
+            evidence_line: Some(ended.evidence_line),
+            cache_corruption: false,
+        });
+    }
     if let Some(evidence_line) = explicit_infrastructure
         .or(cache_or_sandbox_denial)
         .or(transport)
@@ -5783,7 +5798,7 @@ fn termination_signal(exit_code: i32) -> Option<&'static str> {
 /// The name of a signal that is sent from outside a process to end it (an OOM
 /// killer, a supervisor, a shutdown), by number. Crash signals (SIGSEGV,
 /// SIGABRT) have none: those are the process's own outcome.
-pub(crate) fn terminating_signal(signal: i32) -> Option<&'static str> {
+fn terminating_signal(signal: i32) -> Option<&'static str> {
     match signal {
         1 => Some("SIGHUP"),
         2 => Some("SIGINT"),
@@ -5791,6 +5806,159 @@ pub(crate) fn terminating_signal(signal: i32) -> Option<&'static str> {
         15 => Some("SIGTERM"),
         _ => None,
     }
+}
+
+/// A compile the tree did not fail: cargo reports a crate that could not
+/// compile, the same output says the host ended it, and no compiler error
+/// about the code appears anywhere. The host ends a compile by signalling its
+/// process from outside (a stall stop, a pressure reclaim, a cell operation)
+/// or by failing its storage (a full disk, an I/O error). Either way it is
+/// the execution side of the seam, and there is no rustc signature to match
+/// against a build break.
+///
+/// One predicate serves both halves: the store's classifier reads it over the
+/// run's whole output to store the row as `infrastructure`, and the main
+/// cadence reads it over a stored row's tail to report the row as a death.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HostEndedCompile {
+    pub(crate) by: HostEnding,
+    pub(crate) krate: Option<String>,
+    /// Index, among the output's lines, of the line that names the ending.
+    pub(crate) evidence_line: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostEnding {
+    /// A compiler process ended by this terminating signal.
+    Signal(&'static str),
+    /// The operating system's storage error, as the OS words it.
+    Storage(&'static str),
+}
+
+impl HostEndedCompile {
+    /// What ended the compile, and which crate it was compiling.
+    fn describe(&self) -> String {
+        let krate = self
+            .krate
+            .as_ref()
+            .map(|krate| format!(" while compiling `{krate}`"))
+            .unwrap_or_default();
+        match self.by {
+            HostEnding::Signal(signal) => {
+                format!("a compiler process was killed by {signal}{krate}")
+            }
+            HostEnding::Storage(error) => format!("the host's storage failed ({error}){krate}"),
+        }
+    }
+}
+
+pub(crate) fn host_ended_compile(output: &str) -> Option<HostEndedCompile> {
+    let mut by = None;
+    let mut krate = None;
+    let mut compiling = false;
+    // Whether the lines being read belong to an uncoded `error:` diagnostic,
+    // which is about the code only when it points at a source location.
+    // Warnings carry locations too, and say nothing about the verdict.
+    let mut in_error = false;
+    for (index, line) in output.lines().map(str::trim_start).enumerate() {
+        if line.starts_with("error[E") || (in_error && line.starts_with("--> ")) {
+            return None;
+        }
+        if line.starts_with("error") || line.starts_with("warning") {
+            in_error = false;
+        }
+        let subject = line
+            .strip_prefix("error: could not compile ")
+            .or_else(|| line.strip_prefix("error: failed to run custom build command for "));
+        if let Some(subject) = subject {
+            compiling = true;
+            krate = krate.or_else(|| backticked(subject));
+        } else if let Some(storage) = storage_error(line) {
+            by = by.or(Some((index, HostEnding::Storage(storage))));
+        } else if let Some(signal) = process_signal(line) {
+            by = by.or(Some((index, HostEnding::Signal(signal))));
+        } else if line.starts_with("error: ") {
+            in_error = true;
+        }
+    }
+    let (evidence_line, by) = by?;
+    compiling.then_some(HostEndedCompile {
+        by,
+        krate,
+        evidence_line,
+    })
+}
+
+/// The storage error an output line reports, in the operating system's words
+/// (Linux and macOS, then Windows). Matched by text: the same `os error` number
+/// means different things on different platforms.
+fn storage_error(line: &str) -> Option<&'static str> {
+    let line = line.to_ascii_lowercase();
+    [
+        ("no space left on device", "No space left on device"),
+        ("input/output error", "Input/output error"),
+        (
+            "there is not enough space on the disk",
+            "There is not enough space on the disk",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(needle, words)| line.contains(needle).then_some(words))
+}
+
+fn backticked(text: &str) -> Option<String> {
+    let (name, _) = text.strip_prefix('`')?.split_once('`')?;
+    Some(name.to_string())
+}
+
+/// The terminating signal a cargo process line reports, as in
+/// ``process didn't exit successfully: `rustc …` (signal: 15, SIGTERM: termination signal)``.
+/// The line is often cut at its head in a stored tail, so only its end is read.
+fn process_signal(line: &str) -> Option<&'static str> {
+    let (_, after) = line.rsplit_once("(signal: ")?;
+    let number = after.split(|c: char| !c.is_ascii_digit()).next()?;
+    terminating_signal(number.parse().ok()?)
+}
+
+/// Host-ended compiles from the fleet, shortened, shared by the store's
+/// classifier tests and the main cadence's so both halves are held to the
+/// same specimens.
+#[cfg(test)]
+pub(crate) mod host_ended_compile_specimens {
+    /// Specimen a08e20f0 (fedora, `c5a7e3fc`): rustc for `rmcp` killed by
+    /// SIGTERM mid-compile, its process line cut at the head by the stored tail.
+    pub(crate) const KILLED_RMCP_TAIL: &str = "error: could not compile `rmcp` (lib)\n\
+        …\n\
+        /build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libpin_project_lite-b547d44ab2a3e239.rmeta --extern tokio=/home/dev/.cairn-exec/build-slots/cairn/slot-1109/src-tauri/target/debug/deps/libtokio-c4d896466688d916.rmeta --cap-lints allow` (signal: 15, SIGTERM: termination signal)\n\
+        warning: build failed, waiting for other jobs to finish...\n\
+        warning: field `job_id` is never read\n\
+        \x20 --> os/cairn-core/src/notifications/derive.rs:32:5\n\
+        warning: `cairn-core` (lib) generated 4 warnings (run `cargo fix --lib -p cairn-core` to apply 1 suggestion)\n\
+        error: command `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
+        error: script \"test:rust:full\" exited with code 101";
+
+    /// Specimen 6ebdcedb (bgsrv-mac, `ffa890b2`): warnings that point at the
+    /// source, then rustc's write of an object file refused by a full disk.
+    pub(crate) const DISK_FULL_TAIL: &str = "warning: field `computed_at` is never read\n\
+        \x20  --> os/cairn-core/src/projects/codemap.rs:138:9\n\
+        \x20   |\n\
+        error: could not write output to /Users/dev/.cairn-exec/build-slots/cairn/slot-705/src-tauri/target/debug/deps/cairn_core-a2de4dd904051819.f391dbsmm5xj2b3xuwpopitus.1cihbaz.rcgu.o: No space left on device\n\
+        \n\
+        error: could not compile `cairn-core` (lib test) due to 1 previous error; 7 warnings emitted\n\
+        error: command `/Users/dev/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo test --no-run --message-format json-render-diagnostics --workspace --features test-utils` exited with code 101\n\
+        error: script \"test:rust:full\" exited with code 101";
+
+    /// cairn/5641's bgsrv-ub specimen (`d092b4cd`): rustc SIGKILLed under
+    /// memory pressure while compiling the cairn-core lib test binary.
+    pub(crate) const KILLED_CORE_TEST_TAIL: &str = "   Compiling cairn-core v0.13.1 (/home/dev/.cairn-exec/build-slots/cairn/slot-212/src-tauri/os/cairn-core)\n\
+        error: could not compile `cairn-core` (lib test)\n\
+        \n\
+        Caused by:\n\
+        \x20 process didn't exit successfully: `/home/dev/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/rustc --crate-name cairn_core --edition=2021 os/cairn-core/src/lib.rs --test --cfg 'feature=\"test-utils\"'` (signal: 9, SIGKILL: kill)\n\
+        error: script \"test:rust\" exited with code 101";
+
+    /// A compile the tree failed: a coded diagnostic with its location.
+    pub(crate) const COMPILE_ERROR_TAIL: &str = "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
 }
 
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
@@ -15653,6 +15821,146 @@ cairn-common = { path = "../cairn-common" }
             None,
             "a segfault is the process's own outcome"
         );
+    }
+
+    /// cairn/5735: a compile the host ended (a terminating signal under rustc,
+    /// or a storage error) exits 101 like a compile error, and is stored as
+    /// `infrastructure` naming the ending, so it is charged to the machine as a
+    /// death and never reused. A compile error about the code stays the
+    /// tree's, and a crash signal stays the compiler's own outcome.
+    #[test]
+    fn a_compile_the_host_ended_is_stored_as_infrastructure_naming_the_ending() {
+        use super::host_ended_compile_specimens::*;
+        let command = "bun run test:rust:full";
+        // What the Rust test script reports for a build that never ran a test.
+        let result = r#"{"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[]}"#;
+        for (tail, ending, evidence) in [
+            (
+                KILLED_RMCP_TAIL,
+                "a compiler process was killed by SIGTERM while compiling `rmcp`",
+                "(signal: 15, SIGTERM",
+            ),
+            (
+                KILLED_CORE_TEST_TAIL,
+                "a compiler process was killed by SIGKILL while compiling `cairn-core`",
+                "(signal: 9, SIGKILL",
+            ),
+            (
+                DISK_FULL_TAIL,
+                "the host's storage failed (No space left on device) while compiling `cairn-core`",
+                "No space left on device",
+            ),
+        ] {
+            let output = format!("{tail}\n{RESULT_ARTIFACT_JSON_MARKER}{result}");
+            let parsed = parse_check_output(command, &output);
+            for parsed in [None, parsed.as_ref()] {
+                let classification =
+                    classify_check_failure(command, Some(101), false, false, parsed, &output)
+                        .expect("a host-ended compile is classified");
+                assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+                assert!(
+                    classification
+                        .reason
+                        .starts_with(&format!("Cairn: {ending};")),
+                    "{}",
+                    classification.reason
+                );
+                let line = output
+                    .lines()
+                    .nth(classification.evidence_line.expect("evidence is cited"))
+                    .unwrap();
+                assert!(line.contains(evidence), "{line}");
+                assert!(!check_reuse_decision(command, Some(classification.kind), parsed).reusable);
+                assert_eq!(
+                    infra_repair_domain(None, Some(classification.kind)),
+                    InfraRepairDomain::Environment,
+                    "the death is charged to the machine, not the head"
+                );
+            }
+        }
+
+        let classify = |output: &str| {
+            classify_check_failure(command, Some(101), false, false, None, output)
+                .map(|classification| classification.kind)
+        };
+        assert_eq!(
+            classify(COMPILE_ERROR_TAIL),
+            None,
+            "a compile error is the tree's red"
+        );
+        assert_eq!(
+            classify(&format!("{COMPILE_ERROR_TAIL}\n{KILLED_RMCP_TAIL}")),
+            None,
+            "a compile error beside a killed compile is still the tree's"
+        );
+        assert_eq!(
+            classify(&KILLED_RMCP_TAIL.replace(
+                "signal: 15, SIGTERM: termination signal",
+                "signal: 11, SIGSEGV: invalid memory reference"
+            )),
+            None,
+            "a crash signal is the compiler's own outcome"
+        );
+        assert_eq!(
+            classify(
+                "error: test failed, to rerun pass `-p cairn-core --lib`\n\nCaused by:\n  process didn't exit successfully: `/target/debug/deps/cairn_core-0a1b` (signal: 9, SIGKILL: kill)"
+            ),
+            None,
+            "a killed test binary is not a killed compile"
+        );
+    }
+
+    /// The store and the main cadence answer "did the host end this compile"
+    /// with one predicate: the classifier stores `infrastructure` exactly when
+    /// [`host_ended_compile`] holds over the output, and the excerpt it stores
+    /// still yields the same ending to the cadence, which reads the stored
+    /// tail with that predicate.
+    #[test]
+    fn the_store_and_the_cadence_share_one_host_ended_compile_predicate() {
+        use super::host_ended_compile_specimens::*;
+        let command = "bun run test:rust:full";
+        let io =
+            DISK_FULL_TAIL.replace("No space left on device", "Input/output error (os error 5)");
+        let windows = DISK_FULL_TAIL.replace(
+            "No space left on device",
+            "There is not enough space on the disk. (os error 112)",
+        );
+        let build_script = "error: failed to run custom build command for `ring v0.17.8`\n\nCaused by:\n  process didn't exit successfully: `/target/debug/build/ring-1/build-script-build` (signal: 15, SIGTERM: termination signal)";
+        let segv = KILLED_RMCP_TAIL.replace(
+            "signal: 15, SIGTERM: termination signal",
+            "signal: 11, SIGSEGV: invalid memory reference",
+        );
+        let beside_error = format!("{COMPILE_ERROR_TAIL}\n{DISK_FULL_TAIL}");
+        for output in [
+            KILLED_RMCP_TAIL,
+            KILLED_CORE_TEST_TAIL,
+            DISK_FULL_TAIL,
+            &io,
+            &windows,
+            build_script,
+            COMPILE_ERROR_TAIL,
+            &segv,
+            &beside_error,
+            "",
+        ] {
+            let ended = host_ended_compile(output);
+            let classification =
+                classify_check_failure(command, Some(101), false, false, None, output);
+            assert_eq!(
+                classification.as_ref().map(|c| c.kind),
+                ended.as_ref().map(|_| CheckFailureKind::Infrastructure),
+                "{output}"
+            );
+            let Some(ended) = ended else { continue };
+            let stored = classified_output_excerpt(output, classification.as_ref(), None);
+            let reread =
+                host_ended_compile(&stored).expect("the stored row still reads as host-ended");
+            assert_eq!(
+                (reread.by, reread.krate),
+                (ended.by, ended.krate),
+                "{stored}"
+            );
+        }
     }
 
     /// The manual reply classifies a failed run the way the wake body and the
