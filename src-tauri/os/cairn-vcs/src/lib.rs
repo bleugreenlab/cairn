@@ -523,6 +523,98 @@ pub struct LogicalHeadPublication {
     pub affected_paths: Vec<String>,
 }
 
+/// Re-point a local bookmark at `target`, but only while it still holds exactly
+/// the targets the caller observed.
+///
+/// A CLI `jj bookmark set` resolves the bookmark against whatever operation head
+/// it loads, so a decision made from an earlier read is stale by the time it
+/// writes, and `--allow-backwards` then moves the bookmark back over any commit
+/// published in between. Here the comparison and the write share one repository
+/// load. A transaction that commits concurrently with this one and also moves
+/// the bookmark is merged by jj into a conflicted bookmark: a loud state that
+/// every publication refuses, never a silently dropped commit.
+///
+/// `observed` is every target the caller read: one commit for an ordinary
+/// bookmark, several for a conflicted name. Callable from any context, async
+/// included: the transaction runs on its own thread.
+pub fn repoint_bookmark_if_unchanged(
+    repository_path: &Path,
+    bookmark: &str,
+    observed: &[String],
+    target: &str,
+    description: &str,
+) -> Result<(), String> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("start bookmark re-point runtime: {error}"))?
+                    .block_on(repoint_bookmark_if_unchanged_inner(
+                        repository_path,
+                        bookmark,
+                        observed,
+                        target,
+                        description,
+                    ))
+            })
+            .join()
+            .map_err(|_| "bookmark re-point worker panicked".to_string())?
+    })
+}
+
+async fn repoint_bookmark_if_unchanged_inner(
+    repository_path: &Path,
+    bookmark: &str,
+    observed: &[String],
+    target: &str,
+    description: &str,
+) -> Result<(), String> {
+    let target_id = CommitId::try_from_hex(target)
+        .ok_or_else(|| format!("bookmark target `{target}` is not a full hexadecimal object ID"))?;
+    let repo = load_repo_at_head(repository_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let name = RefName::new(bookmark);
+    let mut current = repo
+        .view()
+        .get_local_bookmark(name)
+        .added_ids()
+        .map(|id| id.hex())
+        .collect::<Vec<_>>();
+    current.sort();
+    current.dedup();
+    let mut expected = observed
+        .iter()
+        .map(|id| id.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    expected.sort();
+    expected.dedup();
+    if current != expected {
+        let render = |ids: &[String]| match ids {
+            [] => "<absent>".to_string(),
+            ids => ids.join(" and "),
+        };
+        return Err(format!(
+            "bookmark `{bookmark}` moved after it was read (read {}, now {}), so it was not \
+             re-pointed to {target}",
+            render(&expected),
+            render(&current)
+        ));
+    }
+    repo.store()
+        .get_commit(&target_id)
+        .map_err(|error| format!("read bookmark target `{target}`: {error}"))?;
+    let mut tx = repo.start_transaction();
+    tx.repo_mut()
+        .set_local_bookmark_target(name, RefTarget::normal(target_id));
+    tx.commit(description.to_string())
+        .await
+        .map_err(|error| format!("commit bookmark re-point of `{bookmark}`: {error}"))?;
+    Ok(())
+}
+
 impl std::fmt::Display for CoordinateResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

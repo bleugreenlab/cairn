@@ -1797,7 +1797,7 @@ fn shell_quote(value: &str) -> String {
 /// `bookmarks(exact:...)` resolves to EVERY positive target of the conflicted
 /// name, which is why the single-commit resolver returns nothing for it. Here
 /// that plurality is the answer rather than the problem.
-fn conflicted_bookmark_targets(
+pub(crate) fn conflicted_bookmark_targets(
     jj: &JjEnv,
     store: &Path,
     branch: &str,

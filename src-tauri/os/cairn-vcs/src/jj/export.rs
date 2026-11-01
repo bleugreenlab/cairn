@@ -352,15 +352,38 @@ fn verify_exported_refs(
     expect: &[(&str, &str)],
     export_stderr: &str,
 ) -> Result<(), String> {
-    let frozen: Vec<(&str, &str, Option<String>)> = expect
+    let mismatched: Vec<(&str, &str, Option<String>)> = expect
         .iter()
         .filter_map(|(branch, commit)| {
             let actual = git_ref_commit(git, repo, branch);
             (actual.as_deref() != Some(*commit)).then_some((*branch, *commit, actual))
         })
         .collect();
-    if frozen.is_empty() {
+    if mismatched.is_empty() {
         return Ok(());
+    }
+
+    // A mismatch is a freeze only while the bookmark still holds the expected
+    // commit. An expectation is a read of the bookmark, and a caller verifying
+    // outside the store lock (the push) can read it just before a concurrent
+    // publication advances and exports it. Repairing that "freeze" re-points the
+    // bookmark at the stale read and silently drops the publication.
+    let mut frozen = Vec::new();
+    let mut moved = Vec::new();
+    for (branch, expected, actual) in mismatched {
+        match judge_ref_mismatch(jj, export_cwd, repo, branch, expected, actual.as_deref()) {
+            RefMismatch::Frozen => frozen.push((branch, expected, actual)),
+            RefMismatch::Superseded { current } => log::info!(
+                "{ctx}: `{branch}` advanced from {expected} to {current} while this export was \
+                 verified, and git already carries {current}; nothing to repair"
+            ),
+            RefMismatch::Moved(reason) => moved.push(reason),
+        }
+    }
+    let moved_error =
+        (!moved.is_empty()).then(|| format!("{EXPORT_FREEZE_MSG} ({ctx}): {}", moved.join("; ")));
+    if frozen.is_empty() {
+        return moved_error.map_or(Ok(()), Err);
     }
 
     for (branch, expected, actual) in &frozen {
@@ -396,12 +419,70 @@ fn verify_exported_refs(
             "{ctx}: repaired {} frozen git ref(s) after a silent jj export refusal",
             frozen.len()
         );
-        return Ok(());
+        return moved_error.map_or(Ok(()), Err);
     }
     Err(format!(
-        "{EXPORT_FREEZE_MSG} ({ctx}): {}",
-        still_frozen.join("; ")
+        "{EXPORT_FREEZE_MSG} ({ctx}): {}{}",
+        still_frozen.join("; "),
+        moved
+            .iter()
+            .map(|reason| format!("; {reason}"))
+            .collect::<String>()
     ))
+}
+
+/// Why `refs/heads/<branch>` disagrees with the commit an export was expected
+/// to publish.
+#[derive(Debug, PartialEq, Eq)]
+enum RefMismatch {
+    /// The bookmark still holds the expected commit and the git ref did not
+    /// follow it: the freeze the repair exists for.
+    Frozen,
+    /// Another writer advanced the bookmark past the expected commit and
+    /// exported it. Git already publishes a descendant of the expected commit.
+    Superseded { current: String },
+    /// The bookmark no longer holds the expected commit and git does not
+    /// publish a descendant of it, or the bookmark could not be re-read. Never
+    /// repaired: the bookmark belongs to whoever moved it.
+    Moved(String),
+}
+
+fn judge_ref_mismatch(
+    jj: &JjEnv,
+    store: &Path,
+    repo: &Path,
+    branch: &str,
+    expected: &str,
+    actual: Option<&str>,
+) -> RefMismatch {
+    let targets = match conflicted_bookmark_targets(jj, store, branch) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return RefMismatch::Moved(format!(
+            "`{branch}` could not be re-read to tell a frozen ref from a moved bookmark: {error}"
+        ))
+        }
+    };
+    match targets.as_slice() {
+        [current] if current == expected => RefMismatch::Frozen,
+        [current]
+            if actual == Some(current.as_str()) && git_is_ancestor(repo, expected, current) =>
+        {
+            RefMismatch::Superseded {
+                current: current.clone(),
+            }
+        }
+        _ => RefMismatch::Moved(format!(
+            "`{branch}` was expected at {expected}, but its bookmark moved to {} (git ref {}) \
+             without carrying {expected}; the bookmark was left where another writer put it",
+            if targets.is_empty() {
+                "<absent>".to_string()
+            } else {
+                targets.join(" and ")
+            },
+            actual.unwrap_or("<absent>")
+        )),
+    }
 }
 
 /// The proven repair for a frozen ref, in the order that actually works.
@@ -423,19 +504,35 @@ fn repair_frozen_export(
     if let Err(error) = import_git(jj, export_cwd) {
         log::warn!("{ctx}: import while repairing a frozen export failed: {error}");
     }
+    // The re-point is a compare-and-swap against the targets read after the
+    // import: the expected commit and, in a real freeze, the ref the import
+    // observed beside it. A publication landing in between changes those
+    // targets, and the re-point then refuses instead of moving the bookmark
+    // back over it.
     for (branch, expected, _) in frozen {
-        if let Err(error) = jj.run(
+        let targets = match conflicted_bookmark_targets(jj, export_cwd, branch) {
+            Ok(targets) => targets,
+            Err(error) => {
+                log::warn!("{ctx}: re-reading `{branch}` during repair failed: {error}");
+                continue;
+            }
+        };
+        if targets.len() == 1 && targets[0] == *expected {
+            continue;
+        }
+        if !targets.iter().any(|target| target == expected) {
+            log::warn!(
+                "{ctx}: `{branch}` no longer carries {expected} (it holds {}); not re-pointing it",
+                targets.join(" and ")
+            );
+            continue;
+        }
+        if let Err(error) = crate::repoint_bookmark_if_unchanged(
             export_cwd,
-            &[
-                "bookmark",
-                "set",
-                branch,
-                "-r",
-                expected,
-                "--allow-backwards",
-                "--ignore-working-copy",
-            ],
-            "jj bookmark set (frozen export repair)",
+            branch,
+            &targets,
+            expected,
+            &format!("re-point bookmark `{branch}` to {expected} (frozen export repair)"),
         ) {
             log::warn!("{ctx}: re-pointing `{branch}` to {expected} during repair failed: {error}");
         }
@@ -519,27 +616,54 @@ pub(crate) fn verified_publish_target(
     cwd: &Path,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    if bookmark_name_is_conflicted(jj, cwd, branch)? {
-        return Err(format!(
-            "refusing to push `{branch}`: its bookmark name is conflicted in the store, so the \
-             commit to publish is ambiguous. Reconcile the bookmark against its remote first."
-        ));
+    // A push runs outside the store lock, so a publication can advance the
+    // bookmark while this verifies. What the push publishes is the bookmark as
+    // it stands afterwards; a verification of an earlier read proves nothing
+    // about that, so a read the bookmark has moved past is verified again.
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        if bookmark_name_is_conflicted(jj, cwd, branch)? {
+            return Err(format!(
+                "refusing to push `{branch}`: its bookmark name is conflicted in the store, so the \
+                 commit to publish is ambiguous. Reconcile the bookmark against its remote first."
+            ));
+        }
+        // `Ok(None)` is the one benign answer: the bookmark is genuinely absent,
+        // so there is nothing to publish. A resolver FAILURE is propagated rather
+        // than read as absence, or a push would proceed unverified and skip its
+        // post-push origin confirmation on exactly the runs where the store
+        // cannot answer.
+        let Some(commit) = bookmark_commit_checked(jj, cwd, branch)? else {
+            return Ok(None);
+        };
+        let verified = export_git_verified(
+            jj,
+            cwd,
+            true,
+            &format!("publish `{branch}`: verify exported ref"),
+            &[(branch, commit.as_str())],
+        );
+        let now = bookmark_commit_checked(jj, cwd, branch)?;
+        if now.as_deref() == Some(commit.as_str()) {
+            verified?;
+            return Ok(Some(commit));
+        }
+        if attempt == ATTEMPTS {
+            verified?;
+            return Err(format!(
+                "refusing to push `{branch}`: its bookmark kept moving while the export was \
+                 verified (read {commit}, now {})",
+                now.as_deref().unwrap_or("<absent>")
+            ));
+        }
+        log::info!(
+            "publish `{branch}`: the bookmark moved from {commit} to {} during export \
+             verification; verifying the new tip",
+            now.as_deref().unwrap_or("<absent>")
+        );
     }
-    // `Ok(None)` is the one benign answer: the bookmark is genuinely absent, so
-    // there is nothing to publish. A resolver FAILURE is propagated rather than
-    // read as absence, or a push would proceed unverified and skip its post-push
-    // origin confirmation on exactly the runs where the store cannot answer.
-    let Some(commit) = bookmark_commit_checked(jj, cwd, branch)? else {
-        return Ok(None);
-    };
-    export_git_verified(
-        jj,
-        cwd,
-        true,
-        &format!("publish `{branch}`: verify exported ref"),
-        &[(branch, commit.as_str())],
-    )?;
-    Ok(Some(commit))
 }
 
 /// Confirm origin's tip for `branch` equals `expected` after a push.

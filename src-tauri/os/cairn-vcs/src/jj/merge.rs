@@ -1791,29 +1791,24 @@ pub(crate) fn fast_forward_bookmark(
     let Some(before) = before else {
         return Err(error);
     };
-    let restored = jj
-        .run(
+    // Rolled back only from `dest`: a bookmark another writer has moved since is
+    // theirs, and moving it back would drop what they published.
+    let restored = crate::repoint_bookmark_if_unchanged(
+        store,
+        branch,
+        &[dest.to_string()],
+        &before,
+        &format!("roll back fast-forward of `{branch}` to {before}"),
+    )
+    .and_then(|()| {
+        export_git_verified(
+            jj,
             store,
-            &[
-                "bookmark",
-                "set",
-                branch,
-                "-r",
-                &before,
-                "--allow-backwards",
-                "--ignore-working-copy",
-            ],
-            "jj bookmark fast-forward rollback",
+            true,
+            "jj git export (fast-forward rolled back)",
+            &[(branch, before.as_str())],
         )
-        .and_then(|_| {
-            export_git_verified(
-                jj,
-                store,
-                true,
-                "jj git export (fast-forward rolled back)",
-                &[(branch, before.as_str())],
-            )
-        });
+    });
     Err(match restored {
         Ok(()) => format!("{error}\nThe fast-forward was rolled back to {before}."),
         Err(rollback) => format!(

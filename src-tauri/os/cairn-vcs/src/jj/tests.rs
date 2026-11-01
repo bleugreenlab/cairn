@@ -12724,3 +12724,232 @@ fn publication_refuses_a_branch_that_is_only_empty_commits() {
     );
     assert_eq!(bookmark_commit(&jj, &store, branch), Some(only));
 }
+
+/// A store and project for the stale-expectation tests: the project checkout
+/// detached so the export's HEAD repair stays out of the picture, and `branch`
+/// created at `main`.
+fn stale_expectation_fixture(
+    bin: &str,
+    branch: &str,
+) -> (TempDir, TempDir, JjEnv, PathBuf, String) {
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    git(proj.path(), &["checkout", "-q", "--detach"]);
+    let jj = JjEnv::resolve(bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    create_bookmark_at(&jj, &store, branch, &base).unwrap();
+    (home, proj, jj, store, base)
+}
+
+async fn publish_file(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    expected: &str,
+    path: &str,
+) -> Result<String, String> {
+    let published = publish_logical_head_exported(
+        jj,
+        store,
+        branch,
+        expected,
+        ProposedPublication::Mutations(vec![crate::LogicalTreeMutation {
+            path: path.to_string(),
+            content: Some(format!("{path}\n").into_bytes()),
+        }]),
+        None,
+        crate::PublicationMode::Child {
+            description: format!("add {path}"),
+        },
+    )
+    .await?;
+    published.export?;
+    Ok(published.landed.head)
+}
+
+/// cairn/5757. A push runs after its publication, outside the store lock, and
+/// verifies the export against the bookmark as it read it. A second publication
+/// built on the first landed and exported between that read and the
+/// verification, so the git ref held the newer commit. The verifier called that a
+/// freeze and "repaired" it with `jj bookmark set --allow-backwards` to the stale
+/// read, orphaning the second publication after its write had reported it
+/// committed.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_stale_export_expectation_never_rewinds_a_later_publication() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping stale export expectation test: jj not resolvable");
+        return;
+    };
+    let branch = "agent/cairn-5757-builder-0";
+    let (_home, proj, jj, store, base) = stale_expectation_fixture(&bin, branch);
+
+    let first = publish_file(&jj, &store, branch, &base, "first.rs")
+        .await
+        .unwrap();
+    // The first publication's push reads the bookmark here...
+    let push_read = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_eq!(push_read, first);
+    // ...and the second lands on top of it before that push verifies.
+    let second = publish_file(&jj, &store, branch, &first, "second.rs")
+        .await
+        .unwrap();
+
+    export_git_verified(
+        &jj,
+        &store,
+        true,
+        "push verifies a stale read",
+        &[(branch, push_read.as_str())],
+    )
+    .expect("git carrying a descendant of the expected commit is not a freeze");
+
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(second.as_str()),
+        "the second publication must still be the branch head"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        second
+    );
+    assert_eq!(
+        verified_publish_target(&jj, &store, branch)
+            .unwrap()
+            .as_deref(),
+        Some(second.as_str()),
+        "a push publishes the bookmark as it stands, not an earlier read"
+    );
+}
+
+/// The other side of the same judgment: a bookmark moved somewhere that does not
+/// carry the expected commit is not a freeze either, and not this caller's to
+/// fix. The verification fails loudly and leaves the bookmark where it is,
+/// because the expected commit is genuinely not on the branch.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_bookmark_moved_off_the_expected_commit_is_an_error_and_left_alone() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping moved-bookmark export test: jj not resolvable");
+        return;
+    };
+    let branch = "agent/cairn-5757-builder-1";
+    let (_home, proj, jj, store, base) = stale_expectation_fixture(&bin, branch);
+
+    let first = publish_file(&jj, &store, branch, &base, "first.rs")
+        .await
+        .unwrap();
+    let scratch = "agent/cairn-5757-scratch";
+    create_bookmark_at(&jj, &store, scratch, &base).unwrap();
+    let sibling = publish_file(&jj, &store, scratch, &base, "sibling.rs")
+        .await
+        .unwrap();
+    jj.run(
+        &store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            &sibling,
+            "--allow-backwards",
+            "--ignore-working-copy",
+        ],
+        "move the branch sideways",
+    )
+    .unwrap();
+    export_git_preserving_checkout(&jj, &store, true, "export the sideways move").unwrap();
+
+    let error = export_git_verified(
+        &jj,
+        &store,
+        true,
+        "verify a commit the branch no longer carries",
+        &[(branch, first.as_str())],
+    )
+    .expect_err("the expected commit is not on the branch, so this cannot be success");
+    assert!(is_export_freeze_error(&error), "{error}");
+    assert!(
+        error.contains(&first) && error.contains(&sibling),
+        "{error}"
+    );
+
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(sibling.as_str()),
+        "the verifier must not move a bookmark another writer moved"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        sibling
+    );
+}
+
+/// Two publishers start from the same parent and publish to one branch
+/// concurrently, the way two sub-agent tasks on a shared branch do: each
+/// publication under the store lock (a mutex here), each followed by its push's
+/// export verification outside it. A publisher whose parent has moved by the
+/// time it holds the lock publishes onto the moved head, as the write and run
+/// paths do. Every commit reported as published must end on the branch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(jj)]
+async fn concurrent_publications_from_one_parent_all_stay_on_the_branch() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping concurrent publication test: jj not resolvable");
+        return;
+    };
+    let branch = "agent/cairn-5757-builder-2";
+    let (_home, proj, jj, store, base) = stale_expectation_fixture(&bin, branch);
+    let store_lock = std::sync::Arc::new(futures::lock::Mutex::new(()));
+
+    let publisher = |name: &'static str| {
+        let jj = jj.clone();
+        let store = store.clone();
+        let store_lock = store_lock.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            let mut landed = Vec::new();
+            for round in 0..3 {
+                let parent = if round == 0 {
+                    base.clone()
+                } else {
+                    bookmark_commit(&jj, &store, branch).unwrap()
+                };
+                let head = {
+                    let _guard = store_lock.lock().await;
+                    let current = bookmark_commit(&jj, &store, branch).unwrap();
+                    let onto = if current == parent { parent } else { current };
+                    publish_file(&jj, &store, branch, &onto, &format!("{name}-{round}.rs"))
+                        .await
+                        .unwrap()
+                };
+                let (verify_jj, verify_store) = (jj.clone(), store.clone());
+                tokio::task::spawn_blocking(move || {
+                    verified_publish_target(&verify_jj, &verify_store, branch)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                landed.push(head);
+            }
+            landed
+        })
+    };
+    let (left, right) = tokio::join!(publisher("left"), publisher("right"));
+    let landed = [left.unwrap(), right.unwrap()].concat();
+
+    let tip = bookmark_commit(&jj, &store, branch).unwrap();
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", &format!("refs/heads/{branch}")]),
+        tip
+    );
+    for head in &landed {
+        assert!(
+            git_is_ancestor(proj.path(), head, &tip),
+            "published commit {head} is not on `{branch}` (tip {tip})"
+        );
+    }
+}
