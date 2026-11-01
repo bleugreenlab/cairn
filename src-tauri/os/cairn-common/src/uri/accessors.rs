@@ -417,6 +417,11 @@ impl CairnResource {
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
+            | Self::InferenceModels
+            | Self::InferenceModel { .. }
+            | Self::InferenceRecipe { .. }
+            | Self::InferenceVerifications
+            | Self::InferenceVerification { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -630,6 +635,11 @@ impl CairnResource {
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
+            | Self::InferenceModels
+            | Self::InferenceModel { .. }
+            | Self::InferenceRecipe { .. }
+            | Self::InferenceVerifications
+            | Self::InferenceVerification { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -811,6 +821,11 @@ impl CairnResource {
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
+            | Self::InferenceModels
+            | Self::InferenceModel { .. }
+            | Self::InferenceRecipe { .. }
+            | Self::InferenceVerifications
+            | Self::InferenceVerification { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch

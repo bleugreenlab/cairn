@@ -750,6 +750,8 @@ async fn seed_inference(orch: &Orchestrator) {
 
     let inventory = cairn_inference::Inventory::from_yaml(
         r#"
+models:
+  - {name: coverage/Coverage-Chat}
 recipes:
   - id: coverage-recipe
     source: cairn
@@ -765,6 +767,13 @@ pools:
     )
     .unwrap();
     let mut rows: Vec<(&str, String, String)> = Vec::new();
+    for model in inventory.models.values() {
+        rows.push((
+            "inference_models",
+            model.name.clone(),
+            serde_json::to_string(model).unwrap(),
+        ));
+    }
     for recipe in inventory.recipes.values() {
         rows.push((
             "inference_recipes",

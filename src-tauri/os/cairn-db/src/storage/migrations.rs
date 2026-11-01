@@ -2541,6 +2541,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_pools",
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
+    // The models those recipes serve, by real name (cairn/5730).
+    (
+        "inference_models",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
+    // What verifying a recipe on this install's pools measured (cairn/5730).
+    (
+        "inference_verifications",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // What this runner has commanded its inference machines to do (cairn/5660):
     // the phase of each deployment it acted on, and the loads it measured.
     (

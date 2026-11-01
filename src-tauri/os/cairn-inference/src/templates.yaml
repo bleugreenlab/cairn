@@ -1,0 +1,50 @@
+# Engine templates generation fills in: which image serves which weights on
+# which hardware. Each image is pinned by the digest its registry served when
+# it was chosen; a template is changed by changing its digest here, and every
+# recipe generated from it records which template it came from.
+#
+# `command` is the full serving command with the container's entrypoint
+# cleared; generation appends the flags it computes (context, memory share,
+# tensor parallelism, and the rendezvous flags of a recipe spanning machines).
+
+# vLLM on DGX Spark (GB10, aarch64): NVIDIA's NGC build, the one bginf's
+# Qwen3.6 ran. nvcr.io/nvidia/vllm:26.05.post1-py3.
+- id: vllm-ngc
+  server: vllm
+  family: nvidia
+  runtime: cuda
+  arch: aarch64
+  image: nvcr.io/nvidia/vllm@sha256:94e21552f644e0c1627464ba89d2f7a4ce7442e196f72afa0bb5d7fba23cbb03
+  formats: [safetensors]
+  command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
+
+# vLLM on x86_64 NVIDIA cards: the upstream release image,
+# vllm/vllm-openai:v0.32.0.
+- id: vllm-openai
+  server: vllm
+  family: nvidia
+  runtime: cuda
+  arch: x86_64
+  image: docker.io/vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+  formats: [safetensors]
+  command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
+
+# llama.cpp's server on NVIDIA, for GGUF weights.
+# ghcr.io/ggml-org/llama.cpp:server-cuda.
+- id: llamacpp-cuda
+  server: llamaCpp
+  family: nvidia
+  runtime: cuda
+  image: ghcr.io/ggml-org/llama.cpp@sha256:75037a842f2ec1d1b5317ce64078bbb4a2a134238e91a755c10ce31d8f90550a
+  formats: [gguf]
+  command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
+
+# llama.cpp's server on AMD through Vulkan, for GGUF weights: the build halo
+# has run its embedder on (server-vulkan, b11681).
+- id: llamacpp-vulkan
+  server: llamaCpp
+  family: amd
+  runtime: vulkan
+  image: ghcr.io/ggml-org/llama.cpp@sha256:afdc5265d1cfc729ad3ebaac59fd60e5d15c3b7aef455d7dc16bc1dccbc4dc64
+  formats: [gguf]
+  command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]

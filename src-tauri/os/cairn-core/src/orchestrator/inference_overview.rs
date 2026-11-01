@@ -658,7 +658,7 @@ impl Sources<'_> {
         let recipe = self.inventory.recipes.get(&record.recipe)?;
         let measure = self.measures.get(deployment);
         let runs = match &recipe.engine {
-            Engine::Container { image, .. } => Some(image.clone()),
+            Engine::Container(container) => Some(container.image.clone()),
             Engine::Native {
                 artifact, version, ..
             } => Some(format!("{artifact} {version}")),
@@ -821,6 +821,10 @@ mod tests {
     fn inventory() -> Inventory {
         Inventory::from_yaml(
             r#"
+models:
+  - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
+  - {name: Qwen/Qwen3.6-35B-A3B}
+  - {name: Qwen/Qwen3-Embedding-4B}
 recipes:
   - id: dsv4f-tp2
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}

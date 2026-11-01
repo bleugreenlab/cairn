@@ -429,6 +429,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("inference_recipes", CONFIG),
     keep("inference_deployments", CONFIG),
     keep("inference_pools", CONFIG),
+    keep("inference_models", CONFIG),
+    owned_by(
+        "inference_verifications",
+        "cairn-core orchestrator::inference_verify",
+        "the newest verifications per recipe and pool, pruned on insert",
+    ),
     keep(
         "inference_deployment_state",
         "one row per inference deployment the runner has acted on",

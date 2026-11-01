@@ -23,13 +23,14 @@ use serde::Serialize;
 use super::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
+const MODELS: &str = "inference_models";
 const RECIPES: &str = "inference_recipes";
 const DEPLOYMENTS: &str = "inference_deployments";
 const POOLS: &str = "inference_pools";
 
 /// Every read-modify-write of the inventory holds this, so two writes never
 /// interleave.
-static INVENTORY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static INVENTORY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -66,6 +67,9 @@ fn parse_bodies<T: serde::de::DeserializeOwned>(
 /// The stored inventory.
 pub async fn load_inventory(db: &LocalDb) -> Result<Inventory, String> {
     let mut inventory = Inventory::default();
+    for model in parse_bodies(MODELS, load_bodies(db, MODELS).await?) {
+        inventory.insert_model(model);
+    }
     for recipe in parse_bodies(RECIPES, load_bodies(db, RECIPES).await?) {
         inventory.insert_recipe(recipe);
     }
@@ -80,7 +84,7 @@ pub async fn load_inventory(db: &LocalDb) -> Result<Inventory, String> {
 
 /// One row to write: `body` `None` deletes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RowChange {
+pub(crate) struct RowChange {
     table: &'static str,
     id: String,
     source: &'static str,
@@ -116,8 +120,15 @@ fn diff_kind<K: Ord + ToString, T: Serialize + PartialEq>(
     }
 }
 
-fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange> {
+pub(crate) fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange> {
     let mut changes = Vec::new();
+    diff_kind(
+        MODELS,
+        &current.models,
+        &next.models,
+        |m| m.source,
+        &mut changes,
+    );
     diff_kind(
         RECIPES,
         &current.recipes,
@@ -143,7 +154,11 @@ fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange> {
 }
 
 /// Write every changed row in one transaction.
-async fn save_rows(db: &LocalDb, changes: Vec<RowChange>, at: i64) -> Result<(), String> {
+pub(crate) async fn save_rows(
+    db: &LocalDb,
+    changes: Vec<RowChange>,
+    at: i64,
+) -> Result<(), String> {
     db.write(move |conn| {
         let changes = changes.clone();
         Box::pin(async move {
@@ -203,6 +218,7 @@ pub async fn adopt(db: &LocalDb, from: RecordSource) -> Result<String, String> {
 /// Records to take out of the inventory, by kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Removals {
+    pub models: Vec<String>,
     pub recipes: Vec<RecipeId>,
     pub deployments: Vec<DeploymentId>,
     pub pools: Vec<PoolId>,
@@ -267,6 +283,7 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
             if let Some(text) = upsert {
                 next.upsert(Inventory::parse_yaml(text).map_err(document_problems)?);
             }
+            remove_each("model", &mut next.models, &remove.models, &mut problems);
             remove_each("recipe", &mut next.recipes, &remove.recipes, &mut problems);
             remove_each(
                 "deployment",
@@ -410,6 +427,8 @@ pub struct InferenceView {
     pub deployment_control: super::inference_control::ControlView,
     /// The pool controller's records and plans.
     pub control: super::pool_control::ControlView,
+    /// Every verification, newest first.
+    pub verifications: Vec<super::inference_verify::VerificationRow>,
     pub now_ms: i64,
 }
 
@@ -433,6 +452,7 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
         executors,
         deployment_control: super::inference_control::load_control_view(orch).await?,
         control,
+        verifications: super::inference_verify::load_verifications(&orch.db.local).await?,
         now_ms: now_ms(),
     })
 }
@@ -445,6 +465,9 @@ mod tests {
     /// The Sparks and halo as bginf mirrored them, written as the retired
     /// poller wrote them.
     const MIRRORED: &str = r#"
+models:
+  - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
+  - {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}
 recipes:
   - id: dsv4f-tp2
     source: bginf
@@ -651,7 +674,7 @@ pools:
         for problem in [
             "deployment qwen3-embed-4b has head bginf-sp1, which is not one of its machines",
             "pool halo default names unknown deployment nope",
-            "recipe dsv4f-tp2 (bginf) is not Cairn's",
+            "model Qwen/Qwen3-Embedding-4B-GGUF (Q8_0) (bginf) is not Cairn's",
         ] {
             assert!(refusal.contains(problem), "{problem}: {refusal}");
         }
@@ -667,6 +690,8 @@ pools:
         let db = seeded("inference-patch").await;
         adopt(&db, RecordSource::Bginf).await.unwrap();
         let upsert = r#"
+models:
+  - {name: nvidia/Qwen3.6-35B-A3B-NVFP4}
 recipes:
   - {id: qwen36-fast, model: {name: nvidia/Qwen3.6-35B-A3B-NVFP4}, servedName: qwen3.6-35b, engine: {kind: command, start: ./serve-qwen36.sh}, requirements: {machines: 1}}
 deployments:
@@ -684,6 +709,7 @@ pools:
         .await
         .unwrap();
         for line in [
+            "added model nvidia/Qwen3.6-35B-A3B-NVFP4",
             "added recipe qwen36-fast",
             "added deployment qwen36-fast",
             "updated pool sparks: default, machines, pin",
@@ -718,7 +744,7 @@ pools:
                 remove: Removals {
                     recipes: vec!["qwen36-fast".into()],
                     deployments: vec!["qwen36-fast".into(), "nope".into()],
-                    pools: Vec::new(),
+                    ..Removals::default()
                 },
             },
         )

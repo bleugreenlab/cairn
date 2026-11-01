@@ -554,6 +554,9 @@ mod tests {
         use cairn_inference::{EngineMeasure, Inventory};
         let inventory = Inventory::from_yaml(
             r#"
+ models:
+   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
+   - {name: qwen/qwen3-embedding-4b}
  recipes:
    - id: dsv4f-tp2
      source: bginf

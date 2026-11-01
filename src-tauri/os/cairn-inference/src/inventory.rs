@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::deployment::{Deployment, DeploymentId};
 use crate::machine::MachineName;
+use crate::model::Model;
 use crate::pool::{Pool, PoolId, RecordSource};
 use crate::recipe::{Recipe, RecipeId};
 use crate::resolve::{self, Resolution, Slot};
@@ -14,6 +15,8 @@ use crate::resolve::{self, Resolution, Slot};
 /// Every inference record Cairn knows, keyed by id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
+    /// Models by name, their Hugging Face repository id.
+    pub models: BTreeMap<String, Model>,
     pub recipes: BTreeMap<RecipeId, Recipe>,
     pub deployments: BTreeMap<DeploymentId, Deployment>,
     pub pools: BTreeMap<PoolId, Pool>,
@@ -23,6 +26,8 @@ pub struct Inventory {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InventoryFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    models: Vec<Model>,
     #[serde(default)]
     recipes: Vec<Recipe>,
     #[serde(default)]
@@ -55,6 +60,33 @@ pub enum ValidationError {
     },
     EmptyStart {
         recipe: RecipeId,
+    },
+    /// A container's args or env name a placeholder the renderer does not
+    /// fill.
+    UnknownPlaceholder {
+        recipe: RecipeId,
+        placeholder: String,
+    },
+    /// A container spanning machines without exactly one rank env per
+    /// machine.
+    RanksMismatch {
+        recipe: RecipeId,
+        ranks: usize,
+        machines: u32,
+    },
+    /// A container mounting from its source files without pinning them.
+    UnpinnedSourceMount {
+        recipe: RecipeId,
+        path: String,
+    },
+    BadSourceCommit {
+        recipe: RecipeId,
+        commit: String,
+    },
+    /// A recipe serving a model the inventory does not register.
+    RecipeModelUnregistered {
+        recipe: RecipeId,
+        model: String,
     },
     UnknownRecipe {
         deployment: DeploymentId,
@@ -143,6 +175,32 @@ impl fmt::Display for ValidationError {
                 "recipe {recipe} native artifact sha256 is not 64 lowercase hex digits"
             ),
             Self::EmptyStart { recipe } => write!(f, "recipe {recipe} has an empty start command"),
+            Self::UnknownPlaceholder {
+                recipe,
+                placeholder,
+            } => write!(f, "recipe {recipe} uses unknown placeholder {{{placeholder}}}"),
+            Self::RanksMismatch {
+                recipe,
+                ranks,
+                machines,
+            } => write!(
+                f,
+                "recipe {recipe} runs on {machines} {} but gives env for {ranks} {}; give one entry per machine",
+                if *machines == 1 { "machine" } else { "machines" },
+                if *ranks == 1 { "rank" } else { "ranks" }
+            ),
+            Self::UnpinnedSourceMount { recipe, path } => write!(
+                f,
+                "recipe {recipe} mounts {path} from its source files but pins no source (files: {{url, commit}})"
+            ),
+            Self::BadSourceCommit { recipe, commit } => write!(
+                f,
+                "recipe {recipe} pins source commit {commit:?}, which is not a full 40-hex sha"
+            ),
+            Self::RecipeModelUnregistered { recipe, model } => write!(
+                f,
+                "recipe {recipe} serves model {model}, which is not registered; register it at cairn://inference/models first"
+            ),
             Self::UnknownRecipe { deployment, recipe } => {
                 write!(f, "deployment {deployment} names unknown recipe {recipe}")
             }
@@ -265,6 +323,7 @@ impl std::error::Error for UnknownPool {}
 /// kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeReport {
+    pub models: KindReport,
     pub recipes: KindReport,
     pub deployments: KindReport,
     pub pools: KindReport,
@@ -293,13 +352,17 @@ impl KindReport {
 impl ChangeReport {
     /// Whether any record was added, removed or updated.
     pub fn has_changes(&self) -> bool {
-        !(self.recipes.is_empty() && self.deployments.is_empty() && self.pools.is_empty())
+        !(self.models.is_empty()
+            && self.recipes.is_empty()
+            && self.deployments.is_empty()
+            && self.pools.is_empty())
     }
 
     /// One line per change.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (kind, report) in [
+            ("model", &self.models),
             ("recipe", &self.recipes),
             ("deployment", &self.deployments),
             ("pool", &self.pools),
@@ -342,7 +405,7 @@ macro_rules! sourced {
     )*};
 }
 
-sourced!(Recipe, Deployment, Pool);
+sourced!(Model, Recipe, Deployment, Pool);
 
 fn changed_fields<T: Serialize>(before: &T, after: &T) -> Vec<String> {
     let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
@@ -409,6 +472,10 @@ fn path_ok(path: &str) -> bool {
 }
 
 impl Inventory {
+    pub fn insert_model(&mut self, model: Model) {
+        self.models.insert(model.name.clone(), model);
+    }
+
     pub fn insert_recipe(&mut self, recipe: Recipe) {
         self.recipes.insert(recipe.id.clone(), recipe);
     }
@@ -426,6 +493,12 @@ impl Inventory {
         let mut problems = Vec::new();
         for recipe in self.recipes.values() {
             problems.extend(recipe.problems());
+            if !self.models.contains_key(&recipe.model.name) {
+                problems.push(ValidationError::RecipeModelUnregistered {
+                    recipe: recipe.id.clone(),
+                    model: recipe.model.name.clone(),
+                });
+            }
         }
 
         let mut membership: BTreeMap<&MachineName, &PoolId> = BTreeMap::new();
@@ -572,7 +645,8 @@ impl Inventory {
     /// Every record that is not Cairn's own, as `kind id (source)`, recipes
     /// first, then deployments, then pools, each in id order.
     pub fn foreign_records(&self) -> Vec<String> {
-        foreign_of("recipe", &self.recipes)
+        foreign_of("model", &self.models)
+            .chain(foreign_of("recipe", &self.recipes))
             .chain(foreign_of("deployment", &self.deployments))
             .chain(foreign_of("pool", &self.pools))
             .collect()
@@ -582,6 +656,7 @@ impl Inventory {
     /// and name each one adopted. Adopting again adopts nothing.
     pub fn adopt(&mut self, from: RecordSource) -> Vec<String> {
         let mut adopted = Vec::new();
+        adopt_kind("model", &mut self.models, from, &mut adopted);
         adopt_kind("recipe", &mut self.recipes, from, &mut adopted);
         adopt_kind("deployment", &mut self.deployments, from, &mut adopted);
         adopt_kind("pool", &mut self.pools, from, &mut adopted);
@@ -590,6 +665,7 @@ impl Inventory {
 
     /// Add each of `records`' records, replacing the one with its id.
     pub fn upsert(&mut self, records: Inventory) {
+        self.models.extend(records.models);
         self.recipes.extend(records.recipes);
         self.deployments.extend(records.deployments);
         self.pools.extend(records.pools);
@@ -598,6 +674,7 @@ impl Inventory {
     /// What turning `current` into `next` adds, removes and updates.
     pub fn changes(current: &Inventory, next: &Inventory) -> ChangeReport {
         ChangeReport {
+            models: diff_kind(&current.models, &next.models),
             recipes: diff_kind(&current.recipes, &next.recipes),
             deployments: diff_kind(&current.deployments, &next.deployments),
             pools: diff_kind(&current.pools, &next.pools),
@@ -647,6 +724,7 @@ impl Inventory {
     /// Cairn's own record format, as YAML.
     pub fn to_yaml(&self) -> String {
         let file = InventoryFile {
+            models: self.models.values().cloned().collect(),
             recipes: self.recipes.values().cloned().collect(),
             deployments: self.deployments.values().cloned().collect(),
             pools: self.pools.values().cloned().collect(),
@@ -667,6 +745,12 @@ impl Inventory {
                 id: id.to_string(),
             })
         };
+        for model in file.models {
+            match inventory.models.contains_key(&model.name) {
+                true => duplicate("model", &model.name),
+                false => inventory.insert_model(model),
+            }
+        }
         for recipe in file.recipes {
             match inventory.recipes.contains_key(&recipe.id) {
                 true => duplicate("recipe", &recipe.id),
@@ -716,7 +800,7 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{command_recipe, deployment, set, test_inventory};
+    use crate::fixture::{command_recipe, deployment, insert_command_recipe, set, test_inventory};
     use crate::pool::PoolMachine;
     use crate::recipe::Engine;
 
@@ -734,7 +818,7 @@ mod tests {
     #[test]
     fn a_deployment_spanning_pools_is_refused() {
         let mut inventory = test_inventory();
-        inventory.insert_recipe(command_recipe("straddle", 2));
+        insert_command_recipe(&mut inventory, "straddle", 2);
         inventory.insert_deployment(deployment("straddle", &["sp1", "halo"]));
         assert_eq!(
             problems_of(&inventory),
@@ -811,6 +895,7 @@ mod tests {
             .push(PoolMachine {
                 name: "sp2".into(),
                 address: None,
+                link: None,
             });
         let problems = problems_of(&inventory);
         assert!(
@@ -900,9 +985,7 @@ mod tests {
     #[test]
     fn adopting_makes_every_mirrored_record_cairns_and_is_idempotent() {
         let mut inventory = mirrored();
-        let mut own = command_recipe("own", 1);
-        own.source = RecordSource::Cairn;
-        inventory.insert_recipe(own);
+        insert_command_recipe(&mut inventory, "own", 1);
         assert_eq!(inventory.foreign_records().len(), 8);
         assert_eq!(inventory.foreign_records()[0], "recipe dsv4f-tp2 (bginf)");
 
@@ -940,9 +1023,7 @@ mod tests {
 
     fn test_inventory_with_own() -> Inventory {
         let mut inventory = test_inventory();
-        let mut own = command_recipe("own", 1);
-        own.source = RecordSource::Cairn;
-        inventory.insert_recipe(own);
+        insert_command_recipe(&mut inventory, "own", 1);
         inventory
     }
 
@@ -1020,6 +1101,7 @@ pools:
             problems,
             vec![
                 "recipe r appears twice",
+                "recipe r serves model r, which is not registered; register it at cairn://inference/models first",
                 "deployment d names unknown recipe missing",
                 "deployment d has head b, which is not one of its machines",
                 "pool p default names unknown deployment nope",
@@ -1041,6 +1123,29 @@ pools:
         assert_eq!(
             parsed.recipes[&RecipeId::from("r")].source,
             RecordSource::Cairn
+        );
+    }
+
+    #[test]
+    fn models_round_trip_and_a_recipe_needs_its_model_registered() {
+        let mut inventory = test_inventory();
+        let yaml = inventory.to_yaml();
+        assert!(yaml.starts_with("models:\n- name: dsv4f-tp2\n"), "{yaml}");
+        assert_eq!(Inventory::from_yaml(&yaml), Ok(inventory.clone()));
+
+        inventory.models.remove("qwen36-fast");
+        assert_eq!(
+            inventory.problems(),
+            vec![ValidationError::RecipeModelUnregistered {
+                recipe: "qwen36-fast".into(),
+                model: "qwen36-fast".into(),
+            }]
+        );
+        let mut next = inventory.clone();
+        next.insert_model(crate::model::Model::named("qwen36-fast"));
+        assert_eq!(
+            Inventory::changes(&inventory, &next).lines(),
+            vec!["added model qwen36-fast"]
         );
     }
 

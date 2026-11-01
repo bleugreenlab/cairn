@@ -621,6 +621,8 @@ mod tests {
     fn a_declaration_lies_over_the_record_and_one_for_no_recipe_changes_nothing() {
         let mut inventory = Inventory::from_yaml(
             r#"
+models:
+  - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
 recipes:
   - id: dsv4f-tp2
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}

@@ -1949,7 +1949,12 @@ async fn render_resource_body(
         | CairnResource::InferenceDeployments
         | CairnResource::InferenceDeployment { .. }
         | CairnResource::InferencePools
-        | CairnResource::InferenceRequests => {
+        | CairnResource::InferenceRequests
+        | CairnResource::InferenceModels
+        | CairnResource::InferenceModel { .. }
+        | CairnResource::InferenceRecipe { .. }
+        | CairnResource::InferenceVerifications
+        | CairnResource::InferenceVerification { .. } => {
             match crate::orchestrator::inference::load_view(orch).await {
                 Err(error) => format!("cairn://inference is unavailable: {error}"),
                 Ok(view) => match resource {
@@ -1967,6 +1972,21 @@ async fn render_resource_body(
                     }
                     CairnResource::InferenceRequests => {
                         crate::resources::inference::render_requests(&view, &params)
+                    }
+                    CairnResource::InferenceModels => {
+                        crate::resources::inference::render_models(&view, &params)
+                    }
+                    CairnResource::InferenceModel { name } => {
+                        crate::resources::inference::render_model(&view, name, &params)
+                    }
+                    CairnResource::InferenceRecipe { id } => {
+                        crate::resources::inference::render_recipe(&view, id, &params)
+                    }
+                    CairnResource::InferenceVerifications => {
+                        crate::resources::inference::render_verifications(&view, &params)
+                    }
+                    CairnResource::InferenceVerification { id } => {
+                        crate::resources::inference::render_verification(&view, id, &params)
                     }
                     _ => crate::resources::inference::render_pools(&view, &params),
                 },

@@ -1128,6 +1128,8 @@ mod tests {
 
     fn inventory() -> Inventory {
         let yaml = r#"
+models:
+  - {name: DeepSeek V4 Flash}
 recipes:
   - id: dsv4f-tp2
     model: {name: DeepSeek V4 Flash}
@@ -1641,6 +1643,8 @@ pools:
             use crate::orchestrator::inference::{write_inventory, Authoring};
             let db = crate::storage::migrated_test_db(name).await;
             let yaml = r#"
+models:
+  - {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}
 recipes:
   - {id: qwen3-embed-4b, model: {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}, servedName: qwen3-embedding-4b, engine: {kind: command, start: ./start-embed.sh, stop: podman rm -f bginf-embed}, requirements: {machines: 1}}
 deployments:

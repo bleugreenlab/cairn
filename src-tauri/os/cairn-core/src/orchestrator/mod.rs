@@ -34,9 +34,13 @@ pub(crate) mod generation_cache;
 pub mod identity;
 pub mod inference;
 pub mod inference_control;
+pub mod inference_generate;
+pub mod inference_import;
 pub mod inference_metrics;
+pub mod inference_models;
 pub mod inference_overview;
 pub mod inference_route;
+pub mod inference_verify;
 pub(crate) mod landing;
 pub mod lifecycle;
 pub mod model_defaults;
@@ -2185,6 +2189,7 @@ impl Orchestrator {
         crate::tenets::evidence::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
+        crate::orchestrator::inference_verify::spawn_recovery(self.clone());
         crate::orchestrator::pool_control::spawn_pool_controller(self.clone());
         crate::orchestrator::inference_metrics::spawn_engine_metrics(self.clone());
         // A machine that reconnects holding replicas of closed scratches is

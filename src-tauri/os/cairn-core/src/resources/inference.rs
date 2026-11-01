@@ -17,6 +17,7 @@ use cairn_inference::{
 use super::common::find_query_value;
 use crate::orchestrator::inference::InferenceView;
 use crate::orchestrator::inference_control::{holds_of, LoadRow};
+use crate::orchestrator::inference_verify::VerificationRow;
 use crate::orchestrator::pool_control::ANSWERED_KEPT_MS;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
 use cairn_inference::{Deployment, DeploymentId};
@@ -187,6 +188,91 @@ fn fenced(out: &mut String, label: &str, text: &str) {
     out.push_str("    ```\n\n");
 }
 
+fn container_lines(out: &mut String, container: &cairn_inference::Container) {
+    let _ = writeln!(out, "  - image: {}", container.image);
+    let _ = writeln!(out, "  - server: {}", container.server.as_str());
+    if let Some(entrypoint) = &container.entrypoint {
+        let _ = writeln!(out, "  - entrypoint: {entrypoint:?}");
+    }
+    if !container.args.is_empty() {
+        let _ = writeln!(out, "  - args: {}", container.args.join(" "));
+    }
+    for (key, value) in &container.env {
+        let _ = writeln!(out, "  - env {key}={value}");
+    }
+    for (rank, env) in container.ranks.iter().enumerate() {
+        let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let _ = writeln!(
+            out,
+            "  - rank {rank} env: {}",
+            if pairs.is_empty() {
+                "none".to_string()
+            } else {
+                pairs.join(" ")
+            }
+        );
+    }
+    for mount in &container.mounts {
+        let from = match &mount.from {
+            cairn_inference::MountSource::HfCache => "the Hugging Face cache".to_string(),
+            cairn_inference::MountSource::Source { path } => format!("source {path}"),
+        };
+        let _ = writeln!(
+            out,
+            "  - mount: {from} at {}{}",
+            mount.to,
+            if mount.read_only { " (read-only)" } else { "" }
+        );
+    }
+    let host = &container.host;
+    let mut flags = Vec::new();
+    if host.gpus {
+        flags.push("gpus".to_string());
+    }
+    if host.ipc_host {
+        flags.push("host ipc".to_string());
+    }
+    if host.network_host {
+        flags.push("host network".to_string());
+    }
+    if let Some(size) = &host.shm_size {
+        flags.push(format!("shm {size}"));
+    }
+    flags.extend(host.devices.iter().map(|d| format!("device {d}")));
+    if !flags.is_empty() {
+        let _ = writeln!(out, "  - host: {}", flags.join(", "));
+    }
+    if let Some(files) = &container.files {
+        let _ = writeln!(out, "  - source files: {} at {}", files.url, files.commit);
+    }
+}
+
+fn origin_line(out: &mut String, origin: &cairn_inference::RecipeOrigin) {
+    match origin {
+        cairn_inference::RecipeOrigin::Authored => out.push_str("- origin: authored\n"),
+        cairn_inference::RecipeOrigin::Imported {
+            url,
+            commit,
+            compose,
+            service,
+        } => {
+            let _ = writeln!(
+                out,
+                "- origin: imported from {url} at {commit}, service {service} of {compose}"
+            );
+        }
+        cairn_inference::RecipeOrigin::Generated {
+            template,
+            model_revision,
+        } => {
+            let _ = writeln!(
+                out,
+                "- origin: generated from template {template} for the model at {model_revision}"
+            );
+        }
+    }
+}
+
 fn recipe_section(out: &mut String, recipe: &Recipe) {
     let _ = writeln!(out, "## {}\n", recipe.id);
     let _ = writeln!(out, "- source: {}", source_label(recipe.source));
@@ -203,6 +289,12 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
             );
         }
     }
+    let _ = writeln!(
+        out,
+        "- quantization: {}",
+        recipe.quantization.as_deref().unwrap_or("unknown")
+    );
+    origin_line(out, &recipe.origin);
     let _ = writeln!(out, "- served name: {}", recipe.served_name);
     let _ = writeln!(
         out,
@@ -220,12 +312,7 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
     let _ = writeln!(out, "- verbs: {verbs}");
     let _ = writeln!(out, "- engine: {}", recipe.engine.kind());
     match &recipe.engine {
-        Engine::Container { image, args } => {
-            let _ = writeln!(out, "  - image: {image}");
-            if !args.is_empty() {
-                let _ = writeln!(out, "  - args: {}", args.join(" "));
-            }
-        }
+        Engine::Container(container) => container_lines(out, container),
         Engine::Native {
             artifact,
             version,
@@ -738,6 +825,293 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
     out
 }
 
+/// One verification in one line: what it reached and what it measured.
+fn verification_line(view: &InferenceView, row: &VerificationRow) -> String {
+    let mut parts = vec![format!(
+        "{} on pool {} ({}) {}",
+        row.outcome,
+        row.pool,
+        row.machines.join(", "),
+        at(view, row.started_at)
+    )];
+    if row.outcome != "passed" {
+        parts.push(format!("stage {}", row.stage));
+    }
+    if let Some(ms) = row.load_ms {
+        parts.push(format!("loaded in {}", duration(ms.max(0) as u64)));
+    }
+    if let Some(footprint) = &row.footprint {
+        let per: Vec<String> = footprint
+            .iter()
+            .map(|(machine, bytes)| format!("{machine} {}", gib(*bytes)))
+            .collect();
+        parts.push(format!("memory {}", per.join(", ")));
+    }
+    if let Some(context) = row.context_tokens {
+        parts.push(format!("context {context}"));
+    }
+    if let Some(kv) = row.kv_tokens {
+        parts.push(format!("KV cache {kv} tokens"));
+    }
+    if let Some(ttft) = row.ttft_ms {
+        parts.push(format!("TTFT {ttft} ms"));
+    }
+    if let Some(tps) = row.decode_tps {
+        parts.push(format!("decode {tps:.1} tok/s"));
+    }
+    if let Some(tps) = row.prefill_tps {
+        parts.push(format!("prefill {tps:.0} tok/s"));
+    }
+    if let Some(tps) = row.embed_tps {
+        parts.push(format!("embeddings {tps:.0} tok/s"));
+    }
+    if let Some(version) = &row.engine_version {
+        parts.push(format!("engine {version}"));
+    }
+    if let Some(reason) = &row.reason {
+        parts.push(format!("reason: {reason}"));
+    }
+    if row.stale(&view.inventory) {
+        parts.push("stale: the recipe has changed since".into());
+    }
+    format!("`{}`: {}", row.id, parts.join("; "))
+}
+
+/// The newest verification of `recipe` on each pool.
+fn latest_per_pool<'a>(view: &'a InferenceView, recipe: &str) -> Vec<&'a VerificationRow> {
+    let mut seen = std::collections::BTreeSet::new();
+    view.verifications
+        .iter()
+        .filter(|row| row.recipe == recipe && seen.insert(row.pool.clone()))
+        .collect()
+}
+
+fn model_line(model: &cairn_inference::Model) -> String {
+    format!(
+        "{} (revision {}{})",
+        crate::orchestrator::inference_models::describe(model),
+        model
+            .revision
+            .as_deref()
+            .unwrap_or("unread: its facts are unknown"),
+        model
+            .read_at
+            .map(|at| format!(", read {}", when_ms(at)))
+            .unwrap_or_default()
+    )
+}
+
+fn recipe_summary(recipe: &Recipe) -> String {
+    let server = match &recipe.engine {
+        Engine::Container(container) => container.server.as_str(),
+        other => other.kind(),
+    };
+    format!(
+        "{}, {server}, x{}, {}",
+        recipe
+            .quantization
+            .as_deref()
+            .unwrap_or("quantization unknown"),
+        recipe.requirements.machines,
+        recipe.origin.label()
+    )
+}
+
+pub(crate) fn render_models(view: &InferenceView, params: &[QueryParam]) -> String {
+    if let Some(error) = reject_params("cairn://inference/models", params, &[]) {
+        return error;
+    }
+    let mut out = String::from("# Inference models\n\n");
+    if view.inventory.models.is_empty() {
+        out.push_str("No models yet. Register one by appending its Hugging Face name to cairn://inference/models.\n");
+        return out;
+    }
+    for model in view.inventory.models.values() {
+        let recipes: Vec<String> = view
+            .inventory
+            .recipes
+            .values()
+            .filter(|r| r.model.name == model.name)
+            .map(|r| format!("`{}`", r.id))
+            .collect();
+        let _ = writeln!(
+            out,
+            "- `{}`: {}; recipes: {}",
+            model.name,
+            model_line(model),
+            if recipes.is_empty() {
+                "none".to_string()
+            } else {
+                recipes.join(", ")
+            }
+        );
+    }
+    out
+}
+
+pub(crate) fn render_model(view: &InferenceView, name: &str, params: &[QueryParam]) -> String {
+    let uri = format!("cairn://inference/models/{name}");
+    if let Some(error) = reject_params(&uri, params, &[]) {
+        return error;
+    }
+    let Some(model) = view.inventory.models.get(name) else {
+        return format!("There is no model {name}. cairn://inference/models lists them; append a Hugging Face name there to register one.");
+    };
+    let mut out = format!("# {}\n\n- {}\n", model.name, model_line(model));
+    let facts = &model.facts;
+    let unknown = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
+    let _ = writeln!(out, "- model type: {}", unknown(facts.model_type.clone()));
+    if let Some(modalities) = &facts.modalities {
+        let list = |m: &[cairn_models::types::catalog::Modality]| {
+            m.iter()
+                .map(|m| m.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "- takes {} and gives {}",
+            list(&modalities.input),
+            list(&modalities.output)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "- KV geometry: {}",
+        match facts.kv_elements_per_token() {
+            Some(elements) => format!("{elements} elements a token across its layers"),
+            None => "unknown, so verification clamps the context to the cache the engine measures"
+                .into(),
+        }
+    );
+    out.push_str("\n## Recipes\n\n");
+    let recipes: Vec<&Recipe> = view
+        .inventory
+        .recipes
+        .values()
+        .filter(|r| r.model.name == model.name)
+        .collect();
+    if recipes.is_empty() {
+        out.push_str("None yet: import one or generate candidates at cairn://inference/recipes.\n");
+    }
+    for recipe in recipes {
+        let _ = writeln!(out, "- `{}`: {}", recipe.id, recipe_summary(recipe));
+        for row in latest_per_pool(view, recipe.id.as_str()) {
+            let _ = writeln!(out, "  - {}", verification_line(view, row));
+        }
+    }
+    out
+}
+
+pub(crate) fn render_recipe(view: &InferenceView, id: &str, params: &[QueryParam]) -> String {
+    let uri = format!("cairn://inference/recipes/{id}");
+    if let Some(error) = reject_params(&uri, params, &[]) {
+        return error;
+    }
+    let Some(recipe) = view
+        .inventory
+        .recipes
+        .get(&cairn_inference::RecipeId::from(id))
+    else {
+        return format!("There is no recipe {id}. cairn://inference/recipes lists them.");
+    };
+    let mut out = String::new();
+    recipe_section(&mut out, recipe);
+    for deployment in view
+        .inventory
+        .deployments
+        .values()
+        .filter(|d| d.recipe == recipe.id)
+    {
+        let pool = view.inventory.pool_of_deployment(deployment);
+        let machines: Vec<cairn_inference::render::MachineAt> = deployment
+            .machines
+            .iter()
+            .map(|name| cairn_inference::render::MachineAt {
+                name: name.clone(),
+                address: pool.and_then(|p| p.address_of(name)).map(str::to_string),
+                link: pool.and_then(|p| p.link_of(name)).map(str::to_string),
+            })
+            .collect();
+        let _ = writeln!(out, "## As deployment {}\n", deployment.id);
+        match cairn_inference::render::render(recipe, deployment, &machines) {
+            Ok(rendered) => {
+                fenced(&mut out, "start", &rendered.start);
+                if let Some(stop) = &rendered.stop {
+                    fenced(&mut out, "stop", stop);
+                }
+            }
+            Err(refusal) => {
+                let _ = writeln!(out, "- it cannot be rendered: {}\n", refusal.0);
+            }
+        }
+    }
+    out.push_str("## Verifications\n\n");
+    let rows: Vec<&VerificationRow> = view
+        .verifications
+        .iter()
+        .filter(|r| r.recipe == id)
+        .collect();
+    if rows.is_empty() {
+        let _ = writeln!(
+            out,
+            "None yet. Verify it on a pool: patch {uri} {{verify:{{pool:\"<pool>\"}}}}"
+        );
+    }
+    for row in rows {
+        let _ = writeln!(out, "- {}", verification_line(view, row));
+    }
+    out
+}
+
+pub(crate) fn render_verifications(view: &InferenceView, params: &[QueryParam]) -> String {
+    if let Some(error) = reject_params("cairn://inference/verifications", params, &[]) {
+        return error;
+    }
+    let mut out = String::from("# Inference verifications\n\n");
+    if view.verifications.is_empty() {
+        out.push_str("None yet. Patch a recipe or a model with verify to load it on a pool and measure it.\n");
+    }
+    for row in &view.verifications {
+        let _ = writeln!(
+            out,
+            "- recipe `{}`: {}",
+            row.recipe,
+            verification_line(view, row)
+        );
+    }
+    out
+}
+
+pub(crate) fn render_verification(view: &InferenceView, id: &str, params: &[QueryParam]) -> String {
+    if let Some(error) = reject_params(
+        &format!("cairn://inference/verifications/{id}"),
+        params,
+        &[],
+    ) {
+        return error;
+    }
+    let Some(row) = view.verifications.iter().find(|r| r.id == id) else {
+        return format!(
+            "There is no verification {id}. cairn://inference/verifications lists them."
+        );
+    };
+    let mut out = format!("# Verification {id}\n\n");
+    let _ = writeln!(
+        out,
+        "- recipe: `{}` (cairn://inference/recipes/{})",
+        row.recipe, row.recipe
+    );
+    let _ = writeln!(out, "- deployment: `{}`", row.deployment);
+    let _ = writeln!(out, "- requested by: {}", row.requested_by);
+    let _ = writeln!(out, "- stage: {}", row.stage);
+    if let Some(finished) = row.finished_at {
+        let _ = writeln!(out, "- finished: {}", at(view, finished));
+    }
+    let _ = writeln!(out, "- {}", verification_line(view, row));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +1121,10 @@ mod tests {
     const NOW: i64 = 1_800_000_000_000;
 
     const INVENTORY: &str = r#"
+models:
+  - {name: dsv4f-tp2}
+  - {name: qwen36-fast}
+  - {name: qwen3-embed-4b}
 recipes:
   - {id: dsv4f-tp2, model: {name: dsv4f-tp2}, servedName: dsv4f-tp2, engine: {kind: command, start: ./start.sh --port 8888, stop: ./stop.sh, description: vllm}, requirements: {machines: 2}}
   - {id: qwen36-fast, model: {name: qwen36-fast}, servedName: qwen36-fast, engine: {kind: command, start: ./start.sh --port 8001, stop: ./stop.sh}, requirements: {machines: 1}}
@@ -767,8 +1145,63 @@ pools:
             executors: BTreeMap::from([("fedora".to_string(), true)]),
             control: Default::default(),
             deployment_control: Default::default(),
+            verifications: Vec::new(),
             now_ms: NOW,
         }
+    }
+
+    #[test]
+    fn the_model_and_recipe_pages_show_facts_recipes_and_verifications() {
+        let mut view = view();
+        let recipe = view.inventory.recipes.values().next().unwrap().clone();
+        let model = recipe.model.name.clone();
+        let row = VerificationRow {
+            id: "v1".into(),
+            recipe: recipe.id.to_string(),
+            recipe_digest: crate::orchestrator::inference_verify::digest(&recipe),
+            pool: "sparks".into(),
+            deployment: format!("verify-{}-sparks", recipe.id),
+            machines: vec!["bginf-sp1".into()],
+            requested_by: "operator".into(),
+            started_at: NOW - 600_000,
+            finished_at: Some(NOW - 60_000),
+            outcome: "passed".into(),
+            stage: "done".into(),
+            reason: None,
+            load_ms: Some(400_000),
+            footprint: Some(BTreeMap::from([("bginf-sp1".to_string(), 100 << 30)])),
+            context_tokens: Some(262_144),
+            kv_tokens: Some(1_447_093),
+            ttft_ms: Some(180),
+            decode_tps: Some(41.5),
+            prefill_tps: Some(4_200.0),
+            embed_tps: None,
+            engine_version: Some("0.32.0".into()),
+        };
+        view.verifications.push(row);
+        let page = render_model(&view, &model, &[]);
+        assert!(page.contains("unread: its facts are unknown"), "{page}");
+        assert!(page.contains(&format!("- `{}`: ", recipe.id)), "{page}");
+        assert!(page.contains("passed on pool sparks (bginf-sp1)"), "{page}");
+        assert!(
+            page.contains("loaded in 6m 40s; memory bginf-sp1 100.0 GiB"),
+            "{page}"
+        );
+        assert!(page.contains("decode 41.5 tok/s"), "{page}");
+        assert!(!page.contains("stale"), "{page}");
+
+        let page = render_recipe(&view, recipe.id.as_str(), &[]);
+        assert!(page.contains("## Verifications"), "{page}");
+        assert!(page.contains("`v1`: passed"), "{page}");
+
+        view.inventory.recipes.get_mut(&recipe.id).unwrap().notes = Some("changed".into());
+        let page = render_verifications(&view, &[]);
+        assert!(
+            page.contains("stale: the recipe has changed since"),
+            "{page}"
+        );
+        assert!(render_model(&view, "nobody/Nothing", &[])
+            .starts_with("There is no model nobody/Nothing"));
     }
 
     #[test]

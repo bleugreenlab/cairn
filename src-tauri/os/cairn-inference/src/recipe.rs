@@ -1,6 +1,6 @@
 //! Recipes: how to run one model on a class of hardware.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_models_types::catalog::{Modalities, VerbKind};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,8 @@ pub struct Recipe {
     #[serde(default)]
     pub source: RecordSource,
     pub model: ModelRef,
-    /// The model name the engine serves it under.
+    /// The model name the engine serves it under. A recipe Cairn writes
+    /// serves under the model's real name.
     pub served_name: String,
     /// The id catalog matching uses (an OpenRouter slug).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,10 +38,56 @@ pub struct Recipe {
     /// [`crate::served::modalities`]'s to say, never a guess from its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Modalities>,
+    /// The weights' quantization as a label (`nvfp4`, `fp8`, `bf16`, `q8_0`).
+    /// `None` is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
+    /// Where the recipe came from.
+    #[serde(default, skip_serializing_if = "RecipeOrigin::is_authored")]
+    pub origin: RecipeOrigin,
     pub engine: Engine,
     pub requirements: Requirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+/// Where a recipe came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RecipeOrigin {
+    /// Written by hand.
+    #[default]
+    Authored,
+    /// Compiled from a published compose file at a pinned commit.
+    #[serde(rename_all = "camelCase")]
+    Imported {
+        url: String,
+        commit: String,
+        /// The compose file's path in the repository.
+        compose: String,
+        /// The compose service it was compiled from.
+        service: String,
+    },
+    /// Generated from a template for the model's facts at a revision.
+    #[serde(rename_all = "camelCase")]
+    Generated {
+        template: String,
+        model_revision: String,
+    },
+}
+
+impl RecipeOrigin {
+    pub fn is_authored(&self) -> bool {
+        matches!(self, Self::Authored)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Imported { .. } => "imported",
+            Self::Generated { .. } => "generated",
+        }
+    }
 }
 
 /// The model a recipe serves, with its weight files pinned.
@@ -54,8 +101,21 @@ pub struct ModelRef {
     pub name: String,
     /// Container and native recipes pin at least one weight file; command
     /// recipes may pin none, because their shell fetches whatever it fetches.
+    /// The files may come from a quantized derivative's repository rather
+    /// than the model's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub weights: Vec<WeightFile>,
+}
+
+impl ModelRef {
+    /// The repository and revision the weights come from: the first weight
+    /// file's, or the model's own name with no revision when none is pinned.
+    pub fn weights_source(&self) -> (&str, Option<&str>) {
+        match self.weights.first() {
+            Some(weight) => (weight.repo.as_str(), Some(weight.revision.as_str())),
+            None => (self.name.as_str(), None),
+        }
+    }
 }
 
 /// One weight file, pinned by Hugging Face repository, revision, path and
@@ -68,18 +128,17 @@ pub struct WeightFile {
     pub path: String,
     /// Lowercase hex SHA-256 of the file.
     pub sha256: String,
+    /// The file's size in bytes, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// The engine that serves the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Engine {
-    /// A container image pinned by digest (`...@sha256:<64 hex>`).
-    Container {
-        image: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        args: Vec<String>,
-    },
+    /// A container image pinned by digest, and everything needed to run it.
+    Container(Container),
     /// A pinned native artifact.
     Native {
         artifact: String,
@@ -103,10 +162,181 @@ pub enum Engine {
 impl Engine {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Container { .. } => "container",
+            Self::Container(_) => "container",
             Self::Native { .. } => "native",
             Self::Command { .. } => "command",
         }
+    }
+}
+
+/// A container recipe's complete runnable form: what
+/// [`crate::render`] turns into the start and stop scripts its head runs.
+///
+/// `args`, `env` and each rank's env may hold the placeholders in
+/// [`PLACEHOLDERS`], filled in per deployment and per rank when rendered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Container {
+    /// `name@sha256:<64 hex>`.
+    pub image: String,
+    pub server: Server,
+    /// Replaces the image's entrypoint; `Some` of an empty list clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
+    #[serde(default)]
+    pub host: HostOptions,
+    /// A repository checked out on every machine at a pinned commit, which
+    /// [`MountSource::Source`] mounts read from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<SourcePin>,
+    /// Extra env per rank, rank 0 (the head) first. On a recipe of more than
+    /// one machine there is exactly one entry per machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranks: Vec<BTreeMap<String, String>>,
+}
+
+/// The serving program inside the image, which says how it is health-checked
+/// and benchmarked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Server {
+    Vllm,
+    LlamaCpp,
+}
+
+impl Server {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vllm => "vllm",
+            Self::LlamaCpp => "llamaCpp",
+        }
+    }
+}
+
+/// One bind mount into the container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mount {
+    pub from: MountSource,
+    /// The path inside the container.
+    pub to: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Where a mount's host side is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MountSource {
+    /// A path within the recipe's pinned [`Container::files`] checkout.
+    Source { path: String },
+    /// The machine's Hugging Face cache (`$HF_HOME`, or
+    /// `~/.cache/huggingface`).
+    HfCache,
+}
+
+/// How the container shares the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostOptions {
+    #[serde(default)]
+    pub ipc_host: bool,
+    /// Host networking; without it the deployment's API port is published.
+    #[serde(default)]
+    pub network_host: bool,
+    /// `/dev/shm` size as the runtime takes it (`64g`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// Give the container the machine's GPUs, in whatever form its
+    /// accelerator family takes.
+    #[serde(default)]
+    pub gpus: bool,
+    /// Further host devices, as paths (`/dev/infiniband`, or
+    /// `host:container`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
+    /// Resource limits by name, as `soft:hard` (`memlock: "-1:-1"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ulimits: BTreeMap<String, String>,
+}
+
+/// A git repository pinned at a commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePin {
+    /// A clone URL (`https://github.com/<owner>/<repo>`).
+    pub url: String,
+    /// The full 40-hex commit sha.
+    pub commit: String,
+}
+
+/// The placeholders a container's args and env may hold, filled in when it
+/// is rendered: the deployment's API port, the recipe's served name, the
+/// weights' repository and revision, the rank and machine count, the fast-link
+/// address of the head and of the machine itself, and the in-container path of
+/// the first weight file.
+pub const PLACEHOLDERS: &[&str] = &[
+    "port",
+    "servedName",
+    "model",
+    "revision",
+    "rank",
+    "machines",
+    "head.link",
+    "self.link",
+    "weights",
+];
+
+/// Every `{name}` placeholder in `text`: a brace, a letter, letters, digits
+/// and dots, a brace. JSON in an argument (`{"method":...}`) is never one,
+/// and neither is a shell expansion (`${HEADLESS}`), which the container's
+/// own shell expands.
+pub fn placeholders(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while let Some(offset) = text[index..].find('{') {
+        let open = index + offset;
+        index = open + 1;
+        if open > 0 && bytes[open - 1] == b'$' {
+            continue;
+        }
+        let rest = &text[open + 1..];
+        let Some(close) = rest.find(['{', '}']) else {
+            break;
+        };
+        if rest.as_bytes()[close] == b'{' {
+            continue;
+        }
+        let name = &rest[..close];
+        let well_formed = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+        if well_formed {
+            found.push(name);
+            index = open + 1 + close + 1;
+        }
+    }
+    found
+}
+
+impl Container {
+    /// Every string the renderer fills placeholders in.
+    fn templated(&self) -> impl Iterator<Item = &str> {
+        self.args
+            .iter()
+            .map(String::as_str)
+            .chain(self.env.values().map(String::as_str))
+            .chain(
+                self.ranks
+                    .iter()
+                    .flat_map(|env| env.values().map(String::as_str)),
+            )
     }
 }
 
@@ -132,7 +362,7 @@ pub struct Accelerator {
     pub runtime: AcceleratorRuntime,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcceleratorFamily {
     Nvidia,
@@ -140,7 +370,17 @@ pub enum AcceleratorFamily {
     Apple,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl AcceleratorFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nvidia => "nvidia",
+            Self::Amd => "amd",
+            Self::Apple => "apple",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AcceleratorRuntime {
     Cuda,
@@ -197,10 +437,26 @@ pub struct SystemRamBytes(pub u64);
 pub struct VramBytes(pub u64);
 
 pub(crate) fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64
+    is_lower_hex(value, 64)
+}
+
+/// Whether `value` is a full git commit sha: 40 lowercase hex digits.
+pub fn is_commit_sha(value: &str) -> bool {
+    is_lower_hex(value, 40)
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `image` is pinned by digest: `name@sha256:<64 hex>`.
+pub fn is_pinned_image(image: &str) -> bool {
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(name, digest)| !name.is_empty() && is_sha256_hex(digest))
 }
 
 impl Recipe {
@@ -232,16 +488,8 @@ impl Recipe {
             }
         }
         match &self.engine {
-            Engine::Container { image, .. } => {
-                let pinned = image
-                    .rsplit_once("@sha256:")
-                    .is_some_and(|(name, digest)| !name.is_empty() && is_sha256_hex(digest));
-                if !pinned {
-                    problems.push(ValidationError::BadImageDigest {
-                        recipe: recipe(),
-                        image: image.clone(),
-                    });
-                }
+            Engine::Container(container) => {
+                problems.extend(self.container_problems(container));
             }
             Engine::Native { sha256, .. } => {
                 if !is_sha256_hex(sha256) {
@@ -256,6 +504,64 @@ impl Recipe {
         }
         if !matches!(self.engine, Engine::Command { .. }) && self.model.weights.is_empty() {
             problems.push(ValidationError::UnpinnedWeights { recipe: recipe() });
+        }
+        problems
+    }
+
+    fn container_problems(&self, container: &Container) -> Vec<ValidationError> {
+        let mut problems = Vec::new();
+        let recipe = || self.id.clone();
+        if !is_pinned_image(&container.image) {
+            problems.push(ValidationError::BadImageDigest {
+                recipe: recipe(),
+                image: container.image.clone(),
+            });
+        }
+        let mut unknown = BTreeSet::new();
+        for text in container.templated() {
+            for name in placeholders(text) {
+                if !PLACEHOLDERS.contains(&name) {
+                    unknown.insert(name.to_string());
+                }
+            }
+        }
+        for placeholder in unknown {
+            problems.push(ValidationError::UnknownPlaceholder {
+                recipe: recipe(),
+                placeholder,
+            });
+        }
+        let machines = self.requirements.machines as usize;
+        let ranks_fit = if machines > 1 {
+            container.ranks.len() == machines
+        } else {
+            container.ranks.len() <= 1
+        };
+        if !ranks_fit {
+            problems.push(ValidationError::RanksMismatch {
+                recipe: recipe(),
+                ranks: container.ranks.len(),
+                machines: self.requirements.machines,
+            });
+        }
+        match &container.files {
+            Some(pin) if !is_commit_sha(&pin.commit) => {
+                problems.push(ValidationError::BadSourceCommit {
+                    recipe: recipe(),
+                    commit: pin.commit.clone(),
+                });
+            }
+            Some(_) => {}
+            None => {
+                for mount in &container.mounts {
+                    if let MountSource::Source { path } = &mount.from {
+                        problems.push(ValidationError::UnpinnedSourceMount {
+                            recipe: recipe(),
+                            path: path.clone(),
+                        });
+                    }
+                }
+            }
         }
         problems
     }
@@ -277,6 +583,8 @@ mod tests {
             upstream_id: None,
             verbs: None,
             modalities: None,
+            quantization: None,
+            origin: RecipeOrigin::Authored,
             engine,
             requirements: Requirements {
                 machines: 1,
@@ -294,18 +602,31 @@ mod tests {
             revision: "abc123".into(),
             path: "model.gguf".into(),
             sha256: sha256.into(),
+            size: None,
         }
     }
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn container(image: String) -> Container {
+        Container {
+            image,
+            server: Server::Vllm,
+            entrypoint: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            mounts: vec![],
+            host: HostOptions::default(),
+            files: None,
+            ranks: vec![],
+        }
+    }
 
     #[test]
     fn a_container_must_be_pinned_by_digest_and_pin_its_weights() {
         let tagged = recipe(
-            Engine::Container {
-                image: "ghcr.io/org/server:latest".into(),
-                args: vec![],
-            },
+            Engine::Container(container("ghcr.io/org/server:latest".into())),
             vec![weight(SHA)],
         );
         assert!(matches!(
@@ -314,10 +635,7 @@ mod tests {
         ));
 
         let unweighted = recipe(
-            Engine::Container {
-                image: format!("ghcr.io/org/server@sha256:{SHA}"),
-                args: vec![],
-            },
+            Engine::Container(container(format!("ghcr.io/org/server@sha256:{SHA}"))),
             vec![],
         );
         assert!(matches!(
@@ -326,13 +644,65 @@ mod tests {
         ));
 
         let pinned = recipe(
-            Engine::Container {
-                image: format!("ghcr.io/org/server@sha256:{SHA}"),
-                args: vec![],
-            },
+            Engine::Container(container(format!("ghcr.io/org/server@sha256:{SHA}"))),
             vec![weight(SHA)],
         );
         assert_eq!(pinned.problems(), vec![]);
+    }
+
+    #[test]
+    fn placeholders_are_braced_names_and_json_is_not_one() {
+        assert_eq!(
+            placeholders("--port {port} --x {head.link}:{rank}"),
+            vec!["port", "head.link", "rank"]
+        );
+        assert!(placeholders(r#"{"method":"dspark","n":5}"#).is_empty());
+        assert_eq!(placeholders("{{port}}"), vec!["port"]);
+        assert!(placeholders("--node-rank ${NODE_RANK} ${HEADLESS:+--headless} ${A}").is_empty());
+        assert_eq!(placeholders("${A}{port}"), vec!["port"]);
+    }
+
+    #[test]
+    fn a_container_is_refused_for_unknown_placeholders_ranks_and_unpinned_sources() {
+        let mut engine = container(format!("ghcr.io/org/server@sha256:{SHA}"));
+        engine.args = vec!["--port".into(), "{port}".into(), "{gpuCount}".into()];
+        engine.env.insert("A".into(), "{nope}".into());
+        engine.mounts.push(Mount {
+            from: MountSource::Source {
+                path: "patches".into(),
+            },
+            to: "/opt/patches".into(),
+            read_only: true,
+        });
+        engine.ranks = vec![BTreeMap::new()];
+        let mut gang = recipe(Engine::Container(engine.clone()), vec![weight(SHA)]);
+        gang.requirements.machines = 2;
+        let problems: Vec<String> = gang.problems().iter().map(ToString::to_string).collect();
+        assert_eq!(
+            problems,
+            vec![
+                "recipe r uses unknown placeholder {gpuCount}",
+                "recipe r uses unknown placeholder {nope}",
+                "recipe r runs on 2 machines but gives env for 1 rank; give one entry per machine",
+                "recipe r mounts patches from its source files but pins no source (files: {url, commit})",
+            ]
+        );
+
+        engine.files = Some(SourcePin {
+            url: "https://github.com/o/r".into(),
+            commit: "f3d7645".into(),
+        });
+        engine.args = vec!["{port}".into()];
+        engine.env.clear();
+        engine.ranks = vec![BTreeMap::new(), BTreeMap::new()];
+        gang.engine = Engine::Container(engine.clone());
+        assert!(matches!(
+            gang.problems().as_slice(),
+            [ValidationError::BadSourceCommit { .. }]
+        ));
+        engine.files.as_mut().unwrap().commit = COMMIT.into();
+        gang.engine = Engine::Container(engine);
+        assert_eq!(gang.problems(), vec![]);
     }
 
     #[test]
@@ -366,6 +736,31 @@ mod tests {
             vec![],
         );
         assert_eq!(command.problems(), vec![]);
+    }
+
+    #[test]
+    fn the_container_form_round_trips_through_yaml() {
+        let mut engine = container(format!("ghcr.io/org/server@sha256:{SHA}"));
+        engine.server = Server::LlamaCpp;
+        engine.entrypoint = Some(vec![]);
+        engine.mounts.push(Mount {
+            from: MountSource::HfCache,
+            to: "/root/.cache/huggingface".into(),
+            read_only: false,
+        });
+        engine.host.gpus = true;
+        let mut generated = recipe(Engine::Container(engine), vec![weight(SHA)]);
+        generated.origin = RecipeOrigin::Generated {
+            template: "llamacpp-vulkan".into(),
+            model_revision: "abc".into(),
+        };
+        generated.quantization = Some("q8_0".into());
+        let yaml = serde_yaml::to_string(&generated).unwrap();
+        assert!(yaml.contains("kind: container"), "{yaml}");
+        assert!(yaml.contains("server: llamaCpp"), "{yaml}");
+        assert!(yaml.contains("kind: hfCache"), "{yaml}");
+        assert!(yaml.contains("modelRevision: abc"), "{yaml}");
+        assert_eq!(serde_yaml::from_str::<Recipe>(&yaml).unwrap(), generated);
     }
 
     #[test]

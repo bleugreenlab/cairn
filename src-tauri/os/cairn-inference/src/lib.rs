@@ -28,14 +28,20 @@
 //! on the models facet's vocabulary, so it is hostable outside Cairn.
 pub mod control;
 pub mod deployment;
+pub mod generate;
+pub mod hf;
+pub mod import;
 pub mod inventory;
 pub mod machine;
 pub mod metrics;
+pub mod model;
 pub mod pool;
 pub mod pool_control;
 pub mod recipe;
+pub mod render;
 pub mod resolve;
 pub mod served;
+pub mod verify;
 
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -45,10 +51,12 @@ pub use inventory::{
     ChangeReport, Inventory, KindReport, UpdatedRecord, ValidationError, YamlError,
 };
 pub use machine::MachineName;
+pub use model::{Model, ModelFacts};
 pub use pool::{DeploymentSet, Pool, PoolId, PoolMachine, RecordSource};
 pub use recipe::{
-    Accelerator, AcceleratorFamily, AcceleratorRuntime, Engine, Interconnect, MemoryPerMachine,
-    ModelRef, Recipe, RecipeId, Requirements, SystemRamBytes, VramBytes, WeightFile,
+    Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
+    Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, Recipe, RecipeId, RecipeOrigin,
+    Requirements, Server, SourcePin, SystemRamBytes, VramBytes, WeightFile,
 };
 pub use resolve::{resolve, Blocked, Reason, Resolution, Slot, SLOTS};
 pub use served::{served_models, EngineMeasure, ServedModel};

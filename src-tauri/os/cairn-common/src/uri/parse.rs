@@ -137,6 +137,17 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }),
         ["inference", "pools"] => Some(CairnResource::InferencePools),
         ["inference", "requests"] => Some(CairnResource::InferenceRequests),
+        ["inference", "models"] => Some(CairnResource::InferenceModels),
+        ["inference", "models", owner, name] => Some(CairnResource::InferenceModel {
+            name: format!("{owner}/{name}"),
+        }),
+        ["inference", "recipes", id] => Some(CairnResource::InferenceRecipe {
+            id: (*id).to_string(),
+        }),
+        ["inference", "verifications"] => Some(CairnResource::InferenceVerifications),
+        ["inference", "verifications", id] => Some(CairnResource::InferenceVerification {
+            id: (*id).to_string(),
+        }),
         ["models", "sessions"] => Some(CairnResource::ModelsSessions),
         ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),

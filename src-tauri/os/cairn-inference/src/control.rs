@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::deployment::{Deployment, DeploymentId};
 use crate::inventory::Inventory;
 use crate::machine::MachineName;
-use crate::recipe::{Engine, MemoryPerMachine, Recipe};
+use crate::recipe::{MemoryPerMachine, Recipe};
 
 /// How long the head may take to start a deployment and see it answer its
 /// health check, from the moment it receives the command: bginf's
@@ -521,19 +521,6 @@ pub fn conflict(
             ))
         })
     })
-}
-
-/// The commands a recipe's engine runs on the head, or why it cannot be run
-/// by Cairn yet.
-pub fn commands(recipe: &Recipe) -> Result<(&str, Option<&str>), Refusal> {
-    match &recipe.engine {
-        Engine::Command { start, stop, .. } => Ok((start.as_str(), stop.as_deref())),
-        other => Err(Refusal(format!(
-            "recipe {} uses a {} engine, which Cairn cannot start yet; only command recipes are run",
-            recipe.id,
-            other.kind()
-        ))),
-    }
 }
 
 /// What one machine has left for a deployment and what the deployment needs
@@ -1554,23 +1541,6 @@ mod tests {
             panic!("the stopped check's memory covers the shortfall");
         };
         assert!(why.contains("the 1 batch already preempted"), "{why}");
-    }
-
-    #[test]
-    fn only_command_recipes_can_be_run() {
-        let mut recipe = crate::fixture::command_recipe("r", 1);
-        assert_eq!(
-            commands(&recipe).unwrap(),
-            ("./start.sh", Some("./stop.sh"))
-        );
-        recipe.engine = Engine::Container {
-            image: "x@sha256:00".into(),
-            args: Vec::new(),
-        };
-        assert!(commands(&recipe)
-            .unwrap_err()
-            .0
-            .contains("container engine"));
     }
 
     #[test]

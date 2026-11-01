@@ -73,6 +73,11 @@ pub struct PoolMachine {
     /// carry a LAN address. `None` is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The machine's address on the pool's fast link (the Sparks' ConnectX
+    /// cable), which a recipe spanning machines rendezvouses over. `None` is
+    /// unknown: the operator writes it until link detection reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 impl Pool {
@@ -85,5 +90,12 @@ impl Pool {
             .iter()
             .find(|m| &m.name == machine)
             .and_then(|m| m.address.as_deref())
+    }
+
+    pub fn link_of(&self, machine: &MachineName) -> Option<&str> {
+        self.machines
+            .iter()
+            .find(|m| &m.name == machine)
+            .and_then(|m| m.link.as_deref())
     }
 }

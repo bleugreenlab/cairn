@@ -32,6 +32,7 @@ use cairn_inference::control::{
     self, Allocation, AllocationWatch, Drain, GangMachine, LoadOutcome, Observation, Phase, Report,
     Request, Room, RunningBatch, START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
+use cairn_inference::render::{render, MachineAt};
 use cairn_inference::MachineName;
 use cairn_inference::{Deployment, DeploymentId, Inventory};
 
@@ -468,6 +469,7 @@ pub(crate) async fn refresh_holds(db: &LocalDb, heads: &dyn Heads) -> Result<(),
 struct Plan {
     start: String,
     stop: Option<String>,
+    cleanup: Option<String>,
     health_url: String,
 }
 
@@ -477,7 +479,19 @@ impl Plan {
             .recipes
             .get(&deployment.recipe)
             .ok_or_else(|| format!("its recipe {} is missing", deployment.recipe))?;
-        let (start, stop) = control::commands(recipe).map_err(|refusal| refusal.0)?;
+        let pool = inventory.pool_of_deployment(deployment);
+        let machines: Vec<MachineAt> = deployment
+            .machines
+            .iter()
+            .map(|name| MachineAt {
+                name: name.clone(),
+                address: pool
+                    .and_then(|pool| pool.address_of(name))
+                    .map(str::to_string),
+                link: pool.and_then(|pool| pool.link_of(name)).map(str::to_string),
+            })
+            .collect();
+        let rendered = render(recipe, deployment, &machines).map_err(|refusal| refusal.0)?;
         let address = inventory.address_of(&deployment.head).ok_or_else(|| {
             format!(
                 "the head {}'s address is unknown, so its health URL cannot be formed",
@@ -485,8 +499,9 @@ impl Plan {
             )
         })?;
         Ok(Self {
-            start: start.to_string(),
-            stop: stop.map(str::to_string),
+            start: rendered.start,
+            stop: rendered.stop,
+            cleanup: rendered.cleanup,
             health_url: deployment.health_url(address),
         })
     }
@@ -496,7 +511,7 @@ impl Plan {
             script: self.start.clone(),
             timeout_secs: START_TIMEOUT_SECS,
             health_url: self.health_url.clone(),
-            cleanup: self.stop.clone().map(|script| DeploymentScript {
+            cleanup: self.cleanup.clone().map(|script| DeploymentScript {
                 script,
                 timeout_secs: STOP_TIMEOUT_SECS,
             }),
@@ -511,6 +526,13 @@ impl Plan {
             stopped_health_wait_secs: STOPPED_HEALTH_WAIT_SECS,
         })
     }
+}
+
+/// Why Cairn could not render `deployment`'s start and stop for its head, or
+/// `None` when it can: what a start would refuse, asked before anything is
+/// stopped to make room for it.
+pub(crate) fn render_problem(inventory: &Inventory, deployment: &Deployment) -> Option<String> {
+    Plan::of(inventory, deployment).err()
 }
 
 /// Which stored command an observation must belong to.
@@ -1332,6 +1354,8 @@ pub(crate) mod tests {
             upstream_id: None,
             verbs: None,
             modalities: None,
+            quantization: None,
+            origin: Default::default(),
             engine: Engine::Command {
                 start: format!("./start-{id}.sh"),
                 stop: Some(format!("./stop-{id}.sh")),
@@ -1365,6 +1389,8 @@ pub(crate) mod tests {
     pub(crate) async fn sparks_db(name: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
         let mut inventory = Inventory::default();
+        inventory.insert_model(cairn_inference::Model::named(DSV4F));
+        inventory.insert_model(cairn_inference::Model::named(QWEN));
         inventory.insert_recipe(recipe(DSV4F, 2));
         inventory.insert_deployment(deployment(DSV4F, &[SP1, SP2]));
         inventory.insert_recipe(recipe(QWEN, 1));
@@ -1376,10 +1402,12 @@ pub(crate) mod tests {
                 PoolMachine {
                     name: SP1.into(),
                     address: Some("10.20.20.40".into()),
+                    link: Some("10.0.1.1".into()),
                 },
                 PoolMachine {
                     name: SP2.into(),
                     address: Some("10.20.20.41".into()),
+                    link: Some("10.0.1.2".into()),
                 },
             ],
             default: DeploymentSet::new(),
@@ -1387,15 +1415,22 @@ pub(crate) mod tests {
         });
         inventory.validate().expect("the test inventory is valid");
         let rows: Vec<(&str, String, String)> = inventory
-            .recipes
+            .models
             .values()
-            .map(|r| {
+            .map(|m| {
+                (
+                    "inference_models",
+                    m.name.clone(),
+                    serde_json::to_string(m).unwrap(),
+                )
+            })
+            .chain(inventory.recipes.values().map(|r| {
                 (
                     "inference_recipes",
                     r.id.to_string(),
                     serde_json::to_string(r).unwrap(),
                 )
-            })
+            }))
             .chain(inventory.deployments.values().map(|d| {
                 (
                     "inference_deployments",

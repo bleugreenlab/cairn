@@ -1058,6 +1058,23 @@ pub enum CairnResource {
     InferencePools,
     /// The pool controller's queue of model requests.
     InferenceRequests,
+    /// Models by their Hugging Face name, with the facts their config states.
+    InferenceModels,
+    /// One model (`<owner>/<name>`): its facts, its recipes and each one's
+    /// latest verification per pool.
+    InferenceModel {
+        name: String,
+    },
+    /// One recipe, patched to verify it on a pool.
+    InferenceRecipe {
+        id: String,
+    },
+    /// Every verification of a recipe on a pool, newest first.
+    InferenceVerifications,
+    /// One verification: its stage, outcome and what it measured.
+    InferenceVerification {
+        id: String,
+    },
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -1202,6 +1219,11 @@ impl CairnResource {
             Self::InferenceDeployment { .. } => ResourceKind::InferenceDeployment,
             Self::InferencePools => ResourceKind::InferencePools,
             Self::InferenceRequests => ResourceKind::InferenceRequests,
+            Self::InferenceModels => ResourceKind::InferenceModels,
+            Self::InferenceModel { .. } => ResourceKind::InferenceModel,
+            Self::InferenceRecipe { .. } => ResourceKind::InferenceRecipe,
+            Self::InferenceVerifications => ResourceKind::InferenceVerifications,
+            Self::InferenceVerification { .. } => ResourceKind::InferenceVerification,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,

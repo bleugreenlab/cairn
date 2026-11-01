@@ -16,11 +16,16 @@
 use super::super::{build_failure, payload_str, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::inference::{adopt, write_inventory, Authoring, Removals};
+use crate::orchestrator::inference_generate::{generate, pool_hardware, StatedHardware};
+use crate::orchestrator::inference_import::import;
+use crate::orchestrator::inference_models::{register, Web};
+use crate::orchestrator::inference_verify;
 use crate::orchestrator::pool_control::{cancel_request, patch_pool, request_model, PoolPatch};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityRequest;
 use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_inference::control::Request;
+use cairn_inference::import::ImportSpec;
 use cairn_inference::RecordSource;
 use serde_json::Value;
 
@@ -46,22 +51,22 @@ fn removal_ids<T: From<String>>(remove: &Value, kind: &str) -> Result<Vec<T>, St
     }
 }
 
+const REMOVABLE: &[&str] = &["models", "recipes", "deployments", "pools"];
+
 fn parse_removals(remove: Option<&Value>) -> Result<Removals, String> {
     let Some(remove) = remove.filter(|remove| !remove.is_null()) else {
         return Ok(Removals::default());
     };
-    let object = remove
-        .as_object()
-        .ok_or("payload.remove must be {recipes?, deployments?, pools?}, each a list of ids")?;
-    if let Some(key) = object
-        .keys()
-        .find(|key| !["recipes", "deployments", "pools"].contains(&key.as_str()))
-    {
+    let object = remove.as_object().ok_or(
+        "payload.remove must be {models?, recipes?, deployments?, pools?}, each a list of ids",
+    )?;
+    if let Some(key) = object.keys().find(|key| !REMOVABLE.contains(&key.as_str())) {
         return Err(format!(
-            "payload.remove.{key} is not a record kind; it takes recipes, deployments and pools"
+            "payload.remove.{key} is not a record kind; it takes models, recipes, deployments and pools"
         ));
     }
     Ok(Removals {
+        models: removal_ids(remove, "models")?,
         recipes: removal_ids(remove, "recipes")?,
         deployments: removal_ids(remove, "deployments")?,
         pools: removal_ids(remove, "pools")?,
@@ -125,15 +130,26 @@ fn parse_inventory_replace(payload: &Value) -> Result<Authoring, String> {
 pub(crate) fn inference_records_authority(
     item: &ChangeItem,
 ) -> Option<Result<AuthorityRequest, String>> {
-    if !matches!(parse_uri(&item.target), Some(CairnResource::Inference)) {
-        return None;
-    }
-    let authoring = match item.mode {
-        ChangeMode::Replace => true,
-        ChangeMode::Patch => item
-            .payload
+    let payload_has = |key: &str| {
+        item.payload
             .as_ref()
-            .is_some_and(|payload| payload.get("adopt").is_none()),
+            .is_some_and(|payload| payload.get(key).is_some())
+    };
+    let authoring = match (parse_uri(&item.target)?, item.mode) {
+        (CairnResource::Inference, ChangeMode::Replace) => true,
+        (CairnResource::Inference, ChangeMode::Patch) => !payload_has("adopt"),
+        // Registering, refreshing and removing a model, and importing or
+        // generating a recipe, write records. Verifying does not cross the
+        // records authority, as starting a deployment from its page does not,
+        // though it writes two bounded records of its own: its
+        // `verify-<recipe>-<pool>` deployment, which runs a recipe already
+        // written under the authority, and, when the engine's KV cache is
+        // smaller than the recipe's context, that recipe's context lowered to
+        // fit. Neither adds shell or raises what a recipe asks of a machine.
+        (CairnResource::InferenceModels, ChangeMode::Append) => true,
+        (CairnResource::InferenceModel { .. }, ChangeMode::Delete) => true,
+        (CairnResource::InferenceModel { .. }, ChangeMode::Patch) => payload_has("refresh"),
+        (CairnResource::InferenceRecipes, ChangeMode::Append) => true,
         _ => false,
     };
     authoring.then(|| {
@@ -168,6 +184,46 @@ fn refresh_offers(orch: &Orchestrator) {
     orch.spawn_provider_model_catalog_refresh(vec![
         crate::backends::inference::INFERENCE_BACKEND_KEY.to_string(),
     ]);
+}
+
+/// Authorize a write of Cairn's own records, then run it.
+async fn authorized<F>(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    write: F,
+) -> Result<String, String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    let authority = crate::authorization::normalize::inference_records_write(
+        crate::authorization::WORKSPACE_ID,
+    );
+    crate::resources::mutations::authorize_account_change(orch, request, &authority).await?;
+    write.await
+}
+
+/// The latest health of every attached executor, by public name.
+fn snapshots(
+    orch: &Orchestrator,
+) -> std::collections::BTreeMap<String, cairn_common::executor_protocol::ExecutorHealthSnapshot> {
+    orch.fleet
+        .executor_health(crate::fleet::unix_time_ms())
+        .into_iter()
+        .map(|snapshot| (snapshot.public_name.clone(), snapshot))
+        .collect()
+}
+
+fn pool_of(payload: &Value, key: &str) -> Result<(String, bool), String> {
+    let verify = payload
+        .get(key)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("payload.{key} must be {{pool}}"))?;
+    let pool = verify
+        .get("pool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("payload.{key}.pool must name a pool"))?;
+    let all = verify.get("all").and_then(Value::as_bool).unwrap_or(false);
+    Ok((pool.to_string(), all))
 }
 
 async fn actor(orch: &Orchestrator, request: &McpCallbackRequest, named: Option<&str>) -> String {
@@ -307,6 +363,174 @@ pub(super) async fn dispatch(
                 .map(Some)
                 .map_err(fail)
         }
+        (CairnResource::InferenceModels, ChangeMode::Append) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| fail("mode=append requires payload".into()))?;
+            let repo = payload_str(payload, "repo", &[])
+                .ok_or_else(|| fail("payload.repo must be a Hugging Face repository id".into()))?;
+            let revision = payload_str(payload, "revision", &[]);
+            if dry_run {
+                return Ok(Some(format!("Would register the model {repo}")));
+            }
+            let hub = Web::new().map_err(fail)?;
+            authorized(
+                orch,
+                request,
+                register(&orch.db.local, &hub, repo, revision),
+            )
+            .await
+            .map(Some)
+            .map_err(fail)
+        }
+        (CairnResource::InferenceModel { name }, ChangeMode::Patch) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| fail("mode=patch requires payload".into()))?;
+            if payload.get("refresh").and_then(Value::as_bool) == Some(true) {
+                if dry_run {
+                    return Ok(Some(format!("Would read {name}'s config again")));
+                }
+                let hub = Web::new().map_err(fail)?;
+                return authorized(orch, request, register(&orch.db.local, &hub, name, None))
+                    .await
+                    .map(Some)
+                    .map_err(fail);
+            }
+            let (pool, all) = pool_of(payload, "verify").map_err(|why| {
+                fail(format!(
+                    "{why}; the patch takes refresh:true or verify:{{pool, all?}}"
+                ))
+            })?;
+            if dry_run {
+                return Ok(Some(format!(
+                    "Would verify {name}'s recipes on pool {pool}"
+                )));
+            }
+            let inventory = crate::orchestrator::inference::load_inventory(&orch.db.local)
+                .await
+                .map_err(fail)?;
+            let pool_id = cairn_inference::PoolId::from(pool.as_str());
+            let family = pool_hardware(&inventory, &pool_id, &snapshots(orch), &Default::default())
+                .ok()
+                .and_then(|hw| hw.machines.first().map(|m| m.family));
+            let recipes = inference_verify::candidates(&inventory, name, &pool_id, family);
+            if recipes.is_empty() {
+                return Err(fail(format!(
+                    "model {name} has no container recipe that suits pool {pool}; import one or generate candidates at cairn://inference/recipes"
+                )));
+            }
+            let requester = actor(orch, request, None).await;
+            let count = recipes.len();
+            let id = inference_verify::spawn(orch, recipes, &pool, &requester, all)
+                .await
+                .map_err(fail)?;
+            Ok(Some(format!(
+                "Verifying {name}'s recipes on pool {pool} ({count} to try, {}), starting with verification {id}. Read cairn://inference/models/{name} for each one's outcome.",
+                if all { "every one" } else { "until one passes" }
+            )))
+        }
+        (CairnResource::InferenceModel { name }, ChangeMode::Delete) => {
+            if dry_run {
+                return Ok(Some(format!("Would remove the model {name}")));
+            }
+            let authoring = Authoring::Patch {
+                upsert: None,
+                remove: Removals {
+                    models: vec![name.clone()],
+                    ..Removals::default()
+                },
+            };
+            author(orch, request, &authoring, false)
+                .await
+                .map(Some)
+                .map_err(fail)
+        }
+        (CairnResource::InferenceRecipes, ChangeMode::Append) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| fail("mode=append requires payload".into()))?;
+            if let Some(spec) = payload.get("import") {
+                let spec: ImportSpec = serde_json::from_value(spec.clone()).map_err(|error| {
+                    fail(format!("payload.import is not an import spec: {error}"))
+                })?;
+                if dry_run {
+                    return Ok(Some(format!(
+                        "Would import service {} of {}",
+                        spec.service, spec.url
+                    )));
+                }
+                let hub = Web::new().map_err(fail)?;
+                return authorized(orch, request, import(&orch.db.local, &hub, &spec))
+                    .await
+                    .map(Some)
+                    .map_err(fail);
+            }
+            let generate_payload = payload
+                .get("generate")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    fail("payload takes import:{...} or generate:{model, pool, hardware?}".into())
+                })?;
+            let model = generate_payload
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    fail("payload.generate.model must name a registered model".into())
+                })?;
+            let pool = generate_payload
+                .get("pool")
+                .and_then(Value::as_str)
+                .ok_or_else(|| fail("payload.generate.pool must name a pool".into()))?;
+            let stated: std::collections::BTreeMap<String, StatedHardware> =
+                match generate_payload.get("hardware") {
+                    None | Some(Value::Null) => Default::default(),
+                    Some(hardware) => serde_json::from_value(hardware.clone()).map_err(|error| {
+                        fail(format!("payload.generate.hardware is {{<machine>: {{family, memoryGib, unified, arch, gpu?}}}}: {error}"))
+                    })?,
+                };
+            if dry_run {
+                return Ok(Some(format!(
+                    "Would generate recipes for {model} on pool {pool}"
+                )));
+            }
+            let hub = Web::new().map_err(fail)?;
+            let snapshots = snapshots(orch);
+            authorized(
+                orch,
+                request,
+                generate(&orch.db.local, &hub, model, pool, &snapshots, &stated),
+            )
+            .await
+            .map(Some)
+            .map_err(fail)
+        }
+        (CairnResource::InferenceRecipe { id }, ChangeMode::Patch) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| fail("mode=patch requires payload".into()))?;
+            let (pool, _) = pool_of(payload, "verify").map_err(fail)?;
+            if dry_run {
+                return Ok(Some(format!("Would verify recipe {id} on pool {pool}")));
+            }
+            let requester = actor(orch, request, None).await;
+            let verification = inference_verify::spawn(
+                orch,
+                vec![cairn_inference::RecipeId::from(id.as_str())],
+                &pool,
+                &requester,
+                false,
+            )
+            .await
+            .map_err(fail)?;
+            Ok(Some(format!(
+                "Verification {verification} started: recipe {id} loads on pool {pool} as deployment verify-{id}-{pool}, then its health is checked and it is benchmarked; the pool's own model is stopped first and restored after. Read cairn://inference/verifications/{verification} for its stage."
+            )))
+        }
         _ => Ok(None),
     }
 }
@@ -349,7 +573,7 @@ mod tests {
             }))
         );
         assert!(parse_inventory_patch(&serde_json::json!({})).is_err());
-        assert!(parse_inventory_patch(&serde_json::json!({"remove": {"models": []}})).is_err());
+        assert!(parse_inventory_patch(&serde_json::json!({"remove": {"modelz": []}})).is_err());
         assert!(parse_inventory_patch(&serde_json::json!({"remove": {"pools": [1]}})).is_err());
     }
 
@@ -390,6 +614,31 @@ mod tests {
             )),
             None
         );
+        let register = ChangeItem {
+            target: "cairn://inference/models".into(),
+            ..item(
+                ChangeMode::Append,
+                serde_json::json!({"repo": "Qwen/Qwen3-Embedding-4B"}),
+            )
+        };
+        assert_eq!(scope(&register), inference);
+        let verify = ChangeItem {
+            target: "cairn://inference/recipes/embed".into(),
+            ..item(
+                ChangeMode::Patch,
+                serde_json::json!({"verify": {"pool": "halo"}}),
+            )
+        };
+        assert_eq!(
+            scope(&verify),
+            None,
+            "verifying starts a deployment, as its page does"
+        );
+        let refresh = ChangeItem {
+            target: "cairn://inference/models/Qwen/Qwen3-Embedding-4B".into(),
+            ..item(ChangeMode::Patch, serde_json::json!({"refresh": true}))
+        };
+        assert_eq!(scope(&refresh), inference);
         let pools = ChangeItem {
             target: "cairn://inference/pools".into(),
             ..item(ChangeMode::Patch, serde_json::json!({"pool": "halo"}))

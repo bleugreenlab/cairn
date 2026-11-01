@@ -1538,6 +1538,11 @@ impl CairnResource {
             Self::InferenceDeployment { id } => format!("cairn://inference/deployments/{id}"),
             Self::InferencePools => "cairn://inference/pools".to_string(),
             Self::InferenceRequests => "cairn://inference/requests".to_string(),
+            Self::InferenceModels => "cairn://inference/models".to_string(),
+            Self::InferenceModel { name } => format!("cairn://inference/models/{name}"),
+            Self::InferenceRecipe { id } => format!("cairn://inference/recipes/{id}"),
+            Self::InferenceVerifications => "cairn://inference/verifications".to_string(),
+            Self::InferenceVerification { id } => format!("cairn://inference/verifications/{id}"),
             Self::Executor { name } => format!("cairn://executors/{name}"),
             Self::ExecutorAction { name, action } => {
                 format!("cairn://executors/{name}/{action}")

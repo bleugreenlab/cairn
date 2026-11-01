@@ -1,14 +1,16 @@
 //! The test inventory, bginf's own test fixture (`ctl/test_ctl.py`) as Cairn
 //! records: sp1 and sp2 in pool `sparks`, halo in pool `halo`, the defaults
-//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins.
+//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins. Each recipe's model is
+//! registered under the recipe's id, every fact unknown.
 
 use std::collections::BTreeSet;
 
 use crate::deployment::Deployment;
 use crate::inventory::Inventory;
 use crate::machine::MachineName;
+use crate::model::Model;
 use crate::pool::{DeploymentSet, Pool, PoolMachine, RecordSource};
-use crate::recipe::{Engine, ModelRef, Recipe, Requirements};
+use crate::recipe::{Engine, ModelRef, Recipe, RecipeOrigin, Requirements};
 
 pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
     Recipe {
@@ -22,6 +24,8 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
         upstream_id: None,
         verbs: None,
         modalities: None,
+        quantization: None,
+        origin: RecipeOrigin::Authored,
         engine: Engine::Command {
             start: "./start.sh".into(),
             stop: Some("./stop.sh".into()),
@@ -68,11 +72,18 @@ pub(crate) fn pool(id: &str, machines: &[&str], default: &[&str]) -> Pool {
             .map(|m| PoolMachine {
                 name: (*m).into(),
                 address: None,
+                link: None,
             })
             .collect(),
         default: set(default),
         pin: None,
     }
+}
+
+/// A recipe and its model, registered together.
+pub(crate) fn insert_command_recipe(inventory: &mut Inventory, id: &str, machines: u32) {
+    inventory.insert_model(Model::named(id));
+    inventory.insert_recipe(command_recipe(id, machines));
 }
 
 pub(crate) fn test_inventory() -> Inventory {
@@ -82,7 +93,7 @@ pub(crate) fn test_inventory() -> Inventory {
         ("qwen36-fast", &["sp1"][..]),
         ("qwen3-embed-4b", &["halo"][..]),
     ] {
-        inventory.insert_recipe(command_recipe(id, nodes.len() as u32));
+        insert_command_recipe(&mut inventory, id, nodes.len() as u32);
         inventory.insert_deployment(deployment(id, nodes));
     }
     inventory.insert_pool(pool("sparks", &["sp1", "sp2"], &["dsv4f-tp2"]));

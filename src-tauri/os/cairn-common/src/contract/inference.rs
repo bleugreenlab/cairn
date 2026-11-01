@@ -16,9 +16,19 @@ const DEPLOYMENT_ACTION: KeySpec = KeySpec::new("action", KeyType::Str, "start|s
 
 const INFERENCE_RELATED: &[RelatedSpec] = &[
     RelatedSpec {
-        label: "recipes: how each model is run",
-        kind: ResourceKind::InferenceRecipes,
+        label: "models: registered by their Hugging Face name",
+        kind: ResourceKind::InferenceModels,
+        actions: true,
+    },
+    RelatedSpec {
+        label: "verifications: what loading each recipe on a pool measured",
+        kind: ResourceKind::InferenceVerifications,
         actions: false,
+    },
+    RelatedSpec {
+        label: "recipes: how each model is run; import or generate one",
+        kind: ResourceKind::InferenceRecipes,
+        actions: true,
     },
     RelatedSpec {
         label: "deployments: recipes placed on machines",
@@ -44,6 +54,11 @@ const INFERENCE_BACK: &[RelatedSpec] = &[
         label: "the inference index, where the records are written",
         kind: ResourceKind::Inference,
         actions: true,
+    },
+    RelatedSpec {
+        label: "models",
+        kind: ResourceKind::InferenceModels,
+        actions: false,
     },
     RelatedSpec {
         label: "recipes",
@@ -90,7 +105,7 @@ const INFERENCE_UPSERT: KeySpec = KeySpec::new(
 const INFERENCE_REMOVE: KeySpec = KeySpec::new(
     "remove",
     KeyType::Object,
-    "{recipes?, deployments?, pools?}: the ids of records to take out",
+    "{models?, recipes?, deployments?, pools?}: the ids of records to take out",
 );
 
 const INFERENCE_POOL: KeySpec = KeySpec::new("pool", KeyType::Str, "");
@@ -179,11 +194,138 @@ pub(crate) const INFERENCE_CONTRACT: ResourceContract = ResourceContract {
     ],
 };
 
+const INFERENCE_IMPORT: KeySpec = KeySpec::new(
+    "import",
+    KeyType::Object,
+    "{url, commit, compose, service, model, envFiles?, env?, ranks?, hostPaths?, weights?, image?, id?}: compile a GitHub compose service at a pinned commit; a refusal lists every key the files cannot supply",
+);
+
+const INFERENCE_GENERATE: KeySpec = KeySpec::new(
+    "generate",
+    KeyType::Object,
+    "{model, pool, hardware?}: candidate recipes for a registered model on a pool, from its machines' reported hardware (hardware: {<machine>: {family, memoryGib, unified, arch}} for one that reports none)",
+);
+
+const INFERENCE_VERIFY: KeySpec = KeySpec::new(
+    "verify",
+    KeyType::Object,
+    "{pool}: load it on the pool, check health, benchmark, and record memory per machine, load time and speed; answers a verification id at once",
+);
+
+const INFERENCE_MODEL_VERIFY: KeySpec = KeySpec::new(
+    "verify",
+    KeyType::Object,
+    "{pool, all?}: verify the model's recipes that suit the pool, imported first, stopping at the first pass unless all",
+);
+
+const INFERENCE_REFRESH: KeySpec = KeySpec::new(
+    "refresh",
+    KeyType::Bool,
+    "true reads the model's config again at its current revision",
+);
+
+const INFERENCE_REPO: KeySpec = KeySpec::new(
+    "repo",
+    KeyType::Str,
+    "a Hugging Face repository id; a quantized repository registers the model it quantizes",
+);
+
+const INFERENCE_REVISION: KeySpec =
+    KeySpec::new("revision", KeyType::Str, "a sha or ref; main when absent");
+
 pub(crate) const INFERENCE_RECIPES_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::InferenceRecipes,
     uri_template: "cairn://inference/recipes",
     name: "Inference recipes",
-    description: "Every recipe: the model and its pinned weight files, the served name, the upstream id catalog matching uses, the verbs it serves (unknown unless declared), the engine (a digest-pinned container, a pinned native artifact, or an operator's start and stop commands, shown in full), what the hardware must provide (machine count, accelerator, interconnect, memory per machine by kind, each stated as unknown when it is), and whose record it is. Recipes are written at cairn://inference.",
+    description: "Every recipe: the model and its pinned weight files, the quantization, where it came from (authored, imported from a compose file at a commit, or generated from a template), the served name, the verbs it serves (unknown unless declared), the engine (a digest-pinned container with its server, arguments, env per rank, mounts and host options; a pinned native artifact; or an operator's start and stop commands, shown in full), and what the hardware must provide. Append an import to compile a published compose service into a recipe, or a generate request to have Cairn write candidates for a registered model on a pool; both are verified before they are trusted. Recipes are also written as records at cairn://inference.",
+    read_projections: NO_PROJECTIONS,
+    related: INFERENCE_BACK,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[],
+        optional: &[INFERENCE_IMPORT, INFERENCE_GENERATE],
+        label: "import a recipe from a compose file, or generate candidates for a model on a pool",
+        example: r#"write({changes:[{target:"cairn://inference/recipes",mode:"append",payload:{generate:{model:"Qwen/Qwen3-Embedding-4B",pool:"bbs"}}}]})"#,
+    }],
+};
+
+pub(crate) const INFERENCE_RECIPE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::InferenceRecipe,
+    uri_template: "cairn://inference/recipes/{id}",
+    name: "Inference recipe",
+    description: "One recipe in full, with the scripts its head would run rendered for each deployment of it, and every verification of it per pool (stale once the recipe has changed). Patch it with verify to load it on a pool as deployment verify-<recipe>-<pool>, check its health, benchmark it and record what it measured; the pool's own model is stopped first and restored after, and a pool pinned by anyone else is refused.",
+    read_projections: NO_PROJECTIONS,
+    related: INFERENCE_BACK,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[INFERENCE_VERIFY],
+        optional: &[],
+        label: "verify the recipe on a pool",
+        example: r#"write({changes:[{target:"cairn://inference/recipes/qwen3-embedding-4b-q8_0-llamacpp-x1",mode:"patch",payload:{verify:{pool:"halo"}}}]})"#,
+    }],
+};
+
+pub(crate) const INFERENCE_MODELS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::InferenceModels,
+    uri_template: "cairn://inference/models",
+    name: "Inference models",
+    description: "Every model, by its real Hugging Face name: architecture, parameters, dtype or quantization, context, modalities and verbs as its config states them (unknown where it does not), the revision they were read at, and its recipes. Append a repository id to register a model; a quantized repository registers the model it quantizes, since its files are the weights of one of that model's recipes.",
+    read_projections: NO_PROJECTIONS,
+    related: INFERENCE_BACK,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[INFERENCE_REPO],
+        optional: &[INFERENCE_REVISION],
+        label: "register a model by its Hugging Face name",
+        example: r#"write({changes:[{target:"cairn://inference/models",mode:"append",payload:{repo:"Qwen/Qwen3.6-35B-A3B"}}]})"#,
+    }],
+};
+
+pub(crate) const INFERENCE_MODEL_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::InferenceModel,
+    uri_template: "cairn://inference/models/{owner}/{name}",
+    name: "Inference model",
+    description: "One model: its facts and the revision they were read at, and each recipe that serves it with its quantization, server, machine count, origin and latest verification per pool. Patch it to read its config again or to verify its recipes on a pool; delete it once no recipe serves it.",
+    read_projections: NO_PROJECTIONS,
+    related: INFERENCE_BACK,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[],
+            optional: &[INFERENCE_REFRESH, INFERENCE_MODEL_VERIFY],
+            label: "read the model's config again, or verify its recipes on a pool",
+            example: r#"write({changes:[{target:"cairn://inference/models/Qwen/Qwen3.6-35B-A3B",mode:"patch",payload:{verify:{pool:"sparks"}}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Delete,
+            required: &[],
+            optional: &[],
+            label: "remove the model; refused while a recipe serves it",
+            example: r#"write({changes:[{target:"cairn://inference/models/Qwen/Qwen3.6-35B-A3B",mode:"delete"}]})"#,
+        },
+    ],
+};
+
+pub(crate) const INFERENCE_VERIFICATIONS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::InferenceVerifications,
+    uri_template: "cairn://inference/verifications",
+    name: "Inference verifications",
+    description: "Every verification of a recipe on a pool, newest first: the outcome, the stage it reached and why it failed, its load time, the memory each machine held, the context and KV cache the engine reported, time to first token, decode, prefill and embedding speeds, and whether its recipe has changed since. Verifications are started by patching a recipe or a model.",
+    read_projections: NO_PROJECTIONS,
+    related: INFERENCE_BACK,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const INFERENCE_VERIFICATION_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::InferenceVerification,
+    uri_template: "cairn://inference/verifications/{id}",
+    name: "Inference verification",
+    description: "One verification: its recipe, pool and machines, who asked, when it started and finished, the stage it reached, its outcome and reason, and everything it measured.",
     read_projections: NO_PROJECTIONS,
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,

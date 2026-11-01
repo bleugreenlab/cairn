@@ -210,7 +210,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{command_recipe, deployment, machines, pool, set, test_inventory};
+    use crate::fixture::{deployment, machines, pool, set, test_inventory};
     use crate::inventory::{Inventory, UnknownPool};
     use crate::pool::PoolId;
 
@@ -391,7 +391,7 @@ mod tests {
             ("pair-a", &["b", "a"][..]),
             ("solo", &["a"][..]),
         ] {
-            inventory.insert_recipe(command_recipe(id, nodes.len() as u32));
+            crate::fixture::insert_command_recipe(&mut inventory, id, nodes.len() as u32);
             inventory.insert_deployment(deployment(id, nodes));
         }
         inventory.insert_pool(pool("p", &["a", "b", "c"], &["wide"]));
@@ -406,7 +406,7 @@ mod tests {
     /// The sets case: qwen36-fast on sp1 together with another model on sp2.
     fn sets_inventory() -> Inventory {
         let mut inventory = test_inventory();
-        inventory.insert_recipe(command_recipe("other", 1));
+        crate::fixture::insert_command_recipe(&mut inventory, "other", 1);
         inventory.insert_deployment(deployment("other", &["sp2"]));
         pool_mut(&mut inventory, "sparks").default = set(&["qwen36-fast", "other"]);
         assert_eq!(inventory.validate(), Ok(()));
