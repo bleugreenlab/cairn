@@ -3338,31 +3338,18 @@ pub fn get_checkpoint_cache_result_impl(
     }))
 }
 
-/// Run a cache read from synchronous code: on a thread of its own when called
-/// from inside a runtime, which a nested `block_on` would panic in. One call is
-/// one thread and one current-thread runtime, so a caller with several reads
-/// makes them all inside a single call rather than one call each.
+/// Run a cache read from synchronous code through
+/// [`crate::storage::run_db_blocking`]. One call is one thread and one
+/// current-thread runtime, so a caller with several reads makes them all inside
+/// a single call rather than one call each; async callers await the underlying
+/// futures (such as [`resolve_job_logical_head`]) instead.
 pub(crate) fn run_checkpoint_cache_db<T>(
     future: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
 ) -> Result<T, String>
 where
     T: Send + 'static,
 {
-    fn run<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(future)
-    }
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run(future))
-            .join()
-            .map_err(|_| "Checkpoint cache DB runtime thread panicked".to_string())?
-    } else {
-        run(future)
-    }
+    crate::storage::run_db_blocking(move || future)
 }
 
 #[cfg(test)]

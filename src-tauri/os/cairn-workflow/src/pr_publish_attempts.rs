@@ -236,7 +236,7 @@ async fn rearm(
     let db = runtime.database(WorkflowOwner::ActionRun(id))?;
     let (execution, node, _, _) = action_fields(&db, id).await?;
     let last = latest_publish_attempt(&db, id).await?;
-    let revision = runtime.host.pr_publish_input_revision(id)?;
+    let revision = runtime.host.pr_publish_input_revision(id).await?;
     if !manual
         && !is_pr_publish_retry_eligible(
             revision.as_deref(),
@@ -349,33 +349,38 @@ pub(crate) fn prepare_initial_publish_attempt(
     Ok(attempt)
 }
 
-/// Resolve only an initial, not-yet-dispatched baseline. Unknown revisions stay
-/// conservative; failing to resolve a revision must not strand the durable action.
-pub(crate) fn capture_initial_publish_revision(runtime: &WorkflowRuntime, id: &str) {
-    let result = (|| {
-        let revision = runtime.host.pr_publish_input_revision(id)?;
-        let db = runtime.database(WorkflowOwner::ActionRun(id))?;
-        let id = id.to_owned();
-        run_advancement_db(async move {
-            db.execute("UPDATE pr_publish_attempts SET input_revision=?2 WHERE action_run_id=?1 AND cycle=1 AND attempt=1 AND input_revision IS NULL AND dispatched_at IS NULL AND outcome IS NULL",
-                params![id,revision]).await.map_err(|e|e.to_string())?;
-            Ok(())
-        })
-    })();
-    if let Err(error) = result {
+/// Resolve only an initial, not-yet-dispatched baseline; a no-op for any other
+/// action. Unknown revisions stay conservative: failing to resolve a revision
+/// is logged and must not strand the durable action. Errs only when the journal
+/// itself cannot be read.
+pub(crate) async fn capture_initial_publish_revision(
+    runtime: &WorkflowRuntime,
+    id: &str,
+) -> Result<(), String> {
+    let db = runtime.database(WorkflowOwner::ActionRun(id))?;
+    if !latest_publish_attempt(&db, id).await?.is_some_and(|a| {
+        a.cycle == 1 && a.attempt == 1 && a.input_revision.is_none() && a.outcome.is_none()
+    }) {
+        return Ok(());
+    }
+    let recorded = async {
+        let revision = runtime.host.pr_publish_input_revision(id).await?;
+        db.execute("UPDATE pr_publish_attempts SET input_revision=?2 WHERE action_run_id=?1 AND cycle=1 AND attempt=1 AND input_revision IS NULL AND dispatched_at IS NULL AND outcome IS NULL",
+            params![id.to_owned(),revision]).await.map_err(|e|e.to_string())?;
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(error) = recorded {
         log::warn!("Could not capture initial PR publication revision: {error}");
     }
+    Ok(())
 }
 
 /// Only the winner of pending -> running may cross the host boundary. Legacy
 /// actions without a PR journal retain their existing execution semantics.
 pub async fn claim_dispatch(runtime: &WorkflowRuntime, id: &str) -> Result<bool, String> {
     let db = runtime.database(WorkflowOwner::ActionRun(id))?;
-    if latest_publish_attempt(&db, id).await?.is_some_and(|a| {
-        a.cycle == 1 && a.attempt == 1 && a.input_revision.is_none() && a.outcome.is_none()
-    }) {
-        capture_initial_publish_revision(runtime, id);
-    }
+    capture_initial_publish_revision(runtime, id).await?;
     db.write(|conn| {
         let id = id.to_owned();
         Box::pin(async move {

@@ -45,7 +45,7 @@ impl WorkflowHost for Host {
     fn job_head(&self, _: &str) -> Result<String, String> {
         Ok(self.head.lock().unwrap().clone())
     }
-    fn pr_publish_input_revision(&self, _: &str) -> Result<Option<String>, String> {
+    async fn pr_publish_input_revision(&self, _: &str) -> Result<Option<String>, String> {
         let head = self.head.lock().unwrap().clone();
         if head == "revision-unavailable" {
             return Err("revision lookup failed".into());

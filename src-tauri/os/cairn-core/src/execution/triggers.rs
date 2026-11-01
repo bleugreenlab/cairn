@@ -309,21 +309,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    fn run<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(future)
-    }
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run(future))
-            .join()
-            .map_err(|_| "event trigger database task panicked".to_string())?
-    } else {
-        run(future)
-    }
+    crate::storage::run_db_blocking(move || future)
 }
 
 fn record_trigger_sources(

@@ -233,21 +233,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_outbox_db_future(future))
-            .join()
-            .map_err(|_| "Outbox database task panicked".to_string())?
-    } else {
-        run_outbox_db_future(future)
-    }
-}
-
-fn run_outbox_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Failed to create outbox database runtime: {error}"))?
-        .block_on(future)
+    crate::storage::run_db_blocking(move || future)
 }
 
 #[cfg(test)]

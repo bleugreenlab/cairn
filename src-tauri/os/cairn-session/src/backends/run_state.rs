@@ -1,4 +1,4 @@
-use cairn_db::storage::{LocalDb, RowExt};
+use cairn_db::storage::{run_db_blocking, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::{future::Future, sync::Arc};
 pub fn run_backend_db<T, Fut>(backend_name: &str, future: Fut) -> Result<T, String>
@@ -6,31 +6,13 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    // Copied because the name crosses into the spawned thread below. Taking a
-    // borrow rather than a `'static` literal is what lets a run be attributed
-    // to a provider its operator named.
-    let backend_name = backend_name.to_string();
-    if tokio::runtime::Handle::try_current().is_ok() {
-        let panicked = format!("{backend_name} backend database task panicked");
-        std::thread::spawn(move || run_backend_db_future(&backend_name, future))
-            .join()
-            .map_err(|_| panicked)?
-    } else {
-        run_backend_db_future(&backend_name, future)
+    // The bridge's own failures (no runtime, a panic) carry the backend name,
+    // a borrow rather than a `'static` literal so a run is attributed to the
+    // provider its operator named; the future's errors pass through unchanged.
+    match run_db_blocking(move || async move { Ok(future.await) }) {
+        Ok(result) => result,
+        Err(error) => Err(format!("{backend_name} backend: {error}")),
     }
-}
-
-fn run_backend_db_future<T>(
-    backend_name: &str,
-    future: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            format!("Failed to create {backend_name} backend database runtime: {error}")
-        })?
-        .block_on(future)
 }
 
 pub fn set_session_backend_id(

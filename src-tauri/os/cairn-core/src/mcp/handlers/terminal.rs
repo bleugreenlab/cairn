@@ -1971,26 +1971,14 @@ where
     T: Send,
     F: std::future::Future<Output = DbResult<T>> + Send,
 {
-    let run = move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(crate::storage::DbError::from)?
-            .block_on(fut)
-    };
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // Lifetime events are delivered from the runner's Tokio transport.
-        // A nested runtime would panic there, so cross a real thread boundary
-        // while preserving the finalizer's synchronous exactly-once contract.
-        std::thread::scope(|scope| {
-            scope
-                .spawn(run)
-                .join()
-                .map_err(|_| crate::storage::DbError::Row("terminal finalizer panicked".into()))?
-        })
-    } else {
-        run()
-    }
+    // Lifetime events are delivered from the runner's Tokio transport, where a
+    // nested runtime would panic, so the finalizer crosses a real thread
+    // boundary while keeping its synchronous exactly-once contract.
+    crate::storage::run_db_blocking(move || async move { Ok(fut.await) }).unwrap_or_else(|error| {
+        Err(crate::storage::DbError::internal(format!(
+            "terminal finalizer: {error}"
+        )))
+    })
 }
 
 /// Context loaded while marking a terminal exited: the row's `created_at` (for

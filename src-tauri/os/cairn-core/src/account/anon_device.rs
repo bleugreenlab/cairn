@@ -304,21 +304,7 @@ fn block_on_anon_db<T>(
 where
     T: Send + 'static,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_anon_db_future(future))
-            .join()
-            .map_err(|_| "Anon DB runtime thread panicked".to_string())?
-    } else {
-        run_anon_db_future(future)
-    }
-}
-
-fn run_anon_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Failed to create anon DB runtime: {error}"))?
-        .block_on(future)
+    crate::storage::run_db_blocking(move || future)
 }
 
 #[cfg(test)]

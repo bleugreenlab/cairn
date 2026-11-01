@@ -1382,7 +1382,8 @@ pub async fn pr_publish_input_revision(
     let Ok(implementation) = find_implementation_context(orch, action_run).await else {
         return Ok(None);
     };
-    let Ok(head) = crate::execution::cache::get_job_logical_head_sha(orch, &implementation.job_id)
+    let Ok(head) =
+        crate::execution::cache::resolve_job_logical_head(orch, &implementation.job_id).await
     else {
         return Ok(None);
     };

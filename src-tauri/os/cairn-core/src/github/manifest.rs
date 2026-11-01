@@ -26,6 +26,7 @@ pub struct Permissions {
     contents: String,
     metadata: String,
     actions: String,
+    issues: String,
 }
 
 /// Response from GitHub's manifest flow completion endpoint.
@@ -76,6 +77,10 @@ pub fn create_manifest(
             contents: "write".to_string(),
             metadata: "read".to_string(),
             actions: "read".to_string(),
+            // GitHub rejects a manifest that subscribes to `issue_comment`
+            // without this permission. Mentions are only received, never
+            // answered on GitHub, so read is sufficient.
+            issues: "read".to_string(),
         },
         default_events: vec![
             "pull_request".to_string(),
@@ -153,6 +158,37 @@ mod tests {
         assert_eq!(m.name, "Cairn abc");
     }
 
+    /// The repository permission GitHub requires (at read level or above)
+    /// before an app may subscribe to each webhook event. GitHub refuses the
+    /// whole manifest when a default event lacks its permission.
+    fn required_permission(event: &str) -> Option<&'static str> {
+        match event {
+            "pull_request" | "pull_request_review" => Some("pull_requests"),
+            "check_run" | "check_suite" => Some("checks"),
+            "push" => Some("contents"),
+            "issue_comment" => Some("issues"),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn every_default_event_has_its_required_permission() {
+        let m = create_manifest("https://example.com/hooks/ch123", "http://redir", None);
+        let json = serde_json::to_value(&m).unwrap();
+        let permissions = json["default_permissions"].as_object().unwrap();
+        for event in json["default_events"].as_array().unwrap() {
+            let event = event.as_str().unwrap();
+            let permission = required_permission(event).unwrap_or_else(|| {
+                panic!("default event `{event}` has no known required permission; add it to required_permission")
+            });
+            let level = permissions.get(permission).and_then(|v| v.as_str());
+            assert!(
+                matches!(level, Some("read" | "write")),
+                "default event `{event}` requires the `{permission}` permission, manifest has {level:?}"
+            );
+        }
+    }
+
     #[test]
     fn manifest_fields_are_correct() {
         let m = create_manifest(
@@ -165,6 +201,7 @@ mod tests {
         assert!(m.hook_attributes.active);
         assert!(m.public);
         assert_eq!(m.default_permissions.pull_requests, "write");
+        assert_eq!(m.default_permissions.issues, "read");
         assert_eq!(
             m.default_events,
             vec![

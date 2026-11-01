@@ -1163,21 +1163,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_stream_db_future(future))
-            .join()
-            .map_err(|_| "Stream database task panicked".to_string())?
-    } else {
-        run_stream_db_future(future)
-    }
-}
-
-fn run_stream_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Failed to create stream database runtime: {error}"))?
-        .block_on(future)
+    cairn_db::storage::run_db_blocking(move || future)
 }
 
 #[cfg(any(test, feature = "test-utils"))]

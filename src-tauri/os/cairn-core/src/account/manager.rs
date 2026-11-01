@@ -713,21 +713,7 @@ fn block_on_account_db<T>(
 where
     T: Send + 'static,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_account_db_future(future))
-            .join()
-            .map_err(|_| "Account DB runtime thread panicked".to_string())?
-    } else {
-        run_account_db_future(future)
-    }
-}
-
-fn run_account_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Failed to create account DB runtime: {error}"))?
-        .block_on(future)
+    crate::storage::run_db_blocking(move || future)
 }
 
 /// Decode JWT claims for device tokens (no org_id/org_role required).

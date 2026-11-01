@@ -63,8 +63,29 @@ pub async fn reduce_dag(
     runtime: &WorkflowRuntime,
     execution_id: &str,
 ) -> Result<(Vec<Job>, Vec<WorkflowEffect>), crate::advancement::AdvanceError> {
-    let _guard = runtime.host.execution_snapshot_guard(execution_id).await;
-    reduce_dag_under_guard(runtime, execution_id)
+    let (agent_jobs, effects) = {
+        let _guard = runtime.host.execution_snapshot_guard(execution_id).await;
+        reduce_dag_under_guard(runtime, execution_id)?
+    };
+    // A new PR action's baseline publication revision resolves the
+    // implementation branch's head through jj, which under load answers in
+    // tens of seconds. It is captured here, after the guard is released and
+    // on this task rather than inside the synchronous reduction, so neither
+    // the guard nor a runtime worker waits on jj. Claiming the dispatch
+    // captures it again if this attempt fails.
+    for effect in &effects {
+        if let WorkflowEffect::ExecuteAction { action_run_id, .. } = effect {
+            if let Err(error) =
+                crate::pr_publish_attempts::capture_initial_publish_revision(runtime, action_run_id)
+                    .await
+            {
+                log::warn!(
+                    "Could not read the PR publication journal for {action_run_id}: {error}"
+                );
+            }
+        }
+    }
+    Ok((agent_jobs, effects))
 }
 
 fn reduce_dag_under_guard(

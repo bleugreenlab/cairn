@@ -14,6 +14,7 @@ pub mod management;
 pub(crate) mod occupancy;
 pub(crate) mod output_guard;
 pub(crate) mod placement;
+pub mod pools;
 pub(crate) mod preparation;
 pub(crate) mod purpose;
 pub(crate) mod queue;
@@ -23969,6 +23970,18 @@ mod tests {
         ) {
             let (id, mut connection) = fleet_entry("executor-test", "linux", 0, &[]);
             Arc::make_mut(&mut connection.snapshot).cells = cells;
+            self.lock_connections().insert(id, connection);
+        }
+
+        /// Attach one test executor named `name` whose posted health reports
+        /// exactly `host`.
+        pub(crate) fn seed_host_for_test(
+            &self,
+            name: &str,
+            host: cairn_common::executor_protocol::HostHealth,
+        ) {
+            let (id, mut connection) = fleet_entry(name, "linux", 0, &[]);
+            Arc::make_mut(&mut connection.health).host = host;
             self.lock_connections().insert(id, connection);
         }
     }

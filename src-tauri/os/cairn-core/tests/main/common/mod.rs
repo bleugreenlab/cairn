@@ -706,6 +706,12 @@ impl cairn_exec::machine::MachineProbe for MeasuredTestMachine {
     fn gpus(&self, now: u64) -> Measurement<Vec<cairn_common::executor_protocol::GpuDevice>> {
         Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
     }
+    fn interconnects(
+        &self,
+        now: u64,
+    ) -> Measurement<Vec<cairn_common::executor_protocol::Interconnect>> {
+        Measurement::unavailable(now, MeasurementGap::UnsupportedPlatform)
+    }
 }
 
 fn attach_executor(

@@ -24,21 +24,7 @@ pub(super) fn block_on<T>(
 where
     T: Send + 'static,
 {
-    fn run<T>(fut: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(fut)
-    }
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run(fut))
-            .join()
-            .map_err(|_| "database helper thread panicked".to_string())?
-    } else {
-        run(fut)
-    }
+    crate::storage::run_db_blocking(move || fut)
 }
 
 pub(super) fn block_on_value<T>(

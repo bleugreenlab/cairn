@@ -138,6 +138,8 @@ use cairn_common::executor_protocol::{
 };
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
+use crate::fleet::pools::{derive_pools, FAST_LINK_FLOOR_GBPS};
+use cairn_common::executor_protocol::{HostHealth, Interconnect};
 
 /// The runner's own abnormal restart, when it had one.
 ///
@@ -423,6 +425,7 @@ pub(crate) fn render_executors(
         ));
         out.push_str(&format!("- Read: cairn://executors/{}\n\n", executor.name));
     }
+    out.push_str(&render_model_pools(executors));
     if !enrolled.is_empty() {
         out.push_str(&format!(
             "## Enrolled, not attached ({})\n\nThese machines are enrolled with this runner and are not reporting. They cannot be targeted until they attach.\n\n",
@@ -1160,6 +1163,10 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&render_gpus(
         &health.host.gpus,
         &machine.memory,
+        executor.captured_at_unix_ms,
+    ));
+    out.push_str(&render_interconnects(
+        &health.host.interconnects,
         executor.captured_at_unix_ms,
     ));
 
@@ -3650,6 +3657,115 @@ fn render_gpus(
     }
     out.push('\n');
     out
+}
+
+/// A machine's RDMA ports, each with the interface and IPv4 addresses it
+/// carries: the links a model pool is derived from.
+fn render_interconnects(
+    ports: &Measurement<Vec<Interconnect>>,
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut out = String::from("## Interconnects\n");
+    let listed = match &ports.reading {
+        MeasurementReading::Unavailable { reason, detail } => {
+            out.push_str(&format!("- UNMEASURED: {}", reason.describe()));
+            if let Some(detail) = detail {
+                out.push_str(&format!(" ({detail})"));
+            }
+            out.push_str("\n\n");
+            return out;
+        }
+        MeasurementReading::Measured { value } => value,
+    };
+    let measured = format!("(measured {})", age(ports.age_ms(captured_at_unix_ms)));
+    if listed.is_empty() {
+        out.push_str(&format!(
+            "- No InfiniBand or RoCE ports: the reader works and found none {measured}\n\n"
+        ));
+        return out;
+    }
+    for port in listed {
+        let carries = match (&port.netdev, port.addresses.as_slice()) {
+            (None, _) => "no network interface".to_string(),
+            (Some(netdev), []) => format!("{netdev}, no IPv4 address"),
+            (Some(netdev), addresses) => format!("{netdev} {}", addresses.join(", ")),
+        };
+        out.push_str(&format!(
+            "- {} port {} ({}): {}, {} Gb/s, {carries} {measured}\n",
+            port.device,
+            port.port,
+            port.kind.label(),
+            if port.active { "active" } else { "down" },
+            port.rate_gbps,
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// The model pools the attached machines' own reports derive, or nothing when
+/// no attached machine reports a GPU.
+fn render_model_pools(executors: &[ExecutorInspection]) -> String {
+    let pools = derive_pools(
+        executors
+            .iter()
+            .map(|executor| (executor.name.as_str(), &executor.health.host)),
+    );
+    if pools.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "## Model pools\n\nThe machines one model can be split across. Every machine reporting a GPU is in exactly one; two are joined when both report an active RDMA port of at least {FAST_LINK_FLOOR_GBPS} Gb/s on an IPv4 subnet they share. Derived from the machines' own reports, never configured.\n\n"
+    );
+    for pool in &pools {
+        match pool.rate_gbps {
+            Some(rate) => {
+                let members: Vec<String> = pool
+                    .members
+                    .iter()
+                    .map(|member| match member.link_address {
+                        Some(address) => format!("{} at {address}", member.machine),
+                        None => member.machine.clone(),
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "- {}: linked at {rate} Gb/s; {}\n",
+                    pool.key,
+                    members.join(", ")
+                ));
+            }
+            None => {
+                let why = executors
+                    .iter()
+                    .find(|executor| pool.members.iter().any(|m| m.machine == executor.name))
+                    .map(|executor| standing_alone_because(&executor.health.host))
+                    .unwrap_or_default();
+                out.push_str(&format!("- {}: one machine; {why}\n", pool.key));
+            }
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Why a GPU machine is a pool of its own, in the terms an operator acts on:
+/// a reading it never sent is a different fix from a cable it does not have.
+fn standing_alone_because(host: &HostHealth) -> String {
+    match &host.interconnects.reading {
+        MeasurementReading::Unavailable { reason, .. } => {
+            format!("its RDMA ports are unmeasured: {}", reason.describe())
+        }
+        MeasurementReading::Measured { value }
+            if !value
+                .iter()
+                .any(|port| port.active && port.rate_gbps >= FAST_LINK_FLOOR_GBPS) =>
+        {
+            format!("it reports no active RDMA port of {FAST_LINK_FLOOR_GBPS} Gb/s or more")
+        }
+        MeasurementReading::Measured { .. } => {
+            "no other GPU machine reports a fast port on a subnet it shares".to_string()
+        }
+    }
 }
 
 fn render_gpu_memory(
@@ -7948,6 +8064,126 @@ mod tests {
                 available_bytes: 7_971_312 * 1024,
             },
         )
+    }
+
+    fn roce(device: &str, active: bool, netdev: Option<&str>, addresses: &[&str]) -> Interconnect {
+        Interconnect {
+            kind: cairn_common::executor_protocol::InterconnectKind::Roce,
+            device: device.into(),
+            port: 1,
+            active,
+            rate_gbps: 200,
+            netdev: netdev.map(Into::into),
+            addresses: addresses
+                .iter()
+                .map(|address| address.to_string())
+                .collect(),
+        }
+    }
+
+    /// A Spark as the gate reads it: a GB10 and two of its four RoCE links to
+    /// its twin, this machine at `.host` on each.
+    fn spark_inspection(name: &str, host: u8) -> ExecutorInspection {
+        let mut executor = inspection(name, false);
+        measured(&mut executor);
+        executor.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, vec![gb10()]);
+        executor.health.host.interconnects = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![
+                roce(
+                    "rocep1s0f0",
+                    true,
+                    Some("enp1s0f0np0"),
+                    &[&format!("10.0.3.{host}/24")],
+                ),
+                roce(
+                    "rocep1s0f1",
+                    true,
+                    Some("enp1s0f1np1"),
+                    &[&format!("10.0.1.{host}/24")],
+                ),
+            ],
+        );
+        executor
+    }
+
+    /// Each port renders on the machine's page with the interface and
+    /// addresses it carries, after the GPUs; a gap says why there is no list.
+    #[test]
+    fn interconnects_render_each_port_or_the_gap() {
+        let mut executor = spark_inspection("bginf-sp1", 1);
+        executor.health.host.interconnects = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![
+                roce("rocep1s0f1", true, Some("enp1s0f1np1"), &["10.0.1.1/24"]),
+                roce("roceP2p1s0f0", false, Some("enP2p1s0f0np0"), &[]),
+                roce("mlx5_0", true, None, &[]),
+            ],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "## Interconnects\n\
+                 - rocep1s0f1 port 1 (RoCE): active, 200 Gb/s, enp1s0f1np1 10.0.1.1/24 (measured 2s ago)\n\
+                 - roceP2p1s0f0 port 1 (RoCE): down, 200 Gb/s, enP2p1s0f0np0, no IPv4 address (measured 2s ago)\n\
+                 - mlx5_0 port 1 (RoCE): active, 200 Gb/s, no network interface (measured 2s ago)\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.find("## GPU") < rendered.find("## Interconnects"),
+            "{rendered}"
+        );
+
+        executor.health.host.interconnects = Measurement::default();
+        assert!(
+            render_executor(&executor).contains("## Interconnects\n- UNMEASURED: not sampled"),
+            "{}",
+            render_executor(&executor)
+        );
+    }
+
+    /// The fleet page names every pool, the link joining a pair with each
+    /// member's address on it, and why a GPU machine stands alone.
+    #[test]
+    fn the_fleet_lists_model_pools_and_why_a_machine_stands_alone() {
+        let mut bbs = inspection("bbs", false);
+        measured(&mut bbs);
+        bbs.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, vec![gb10()]);
+        bbs.health.host.interconnects = Measurement::measured(CAPTURED_AT - 2_000, Vec::new());
+        let mut fedora = inspection("fedora", false);
+        measured(&mut fedora);
+        fedora.health.host.gpus = Measurement::measured(CAPTURED_AT - 2_000, vec![gb10()]);
+        let mut mac = inspection("bgsrv-mac", false);
+        measured(&mut mac);
+        let listed = render_executors(
+            &[
+                bbs,
+                spark_inspection("bginf-sp1", 1),
+                spark_inspection("bginf-sp2", 2),
+                fedora,
+                mac,
+            ],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(
+            listed.contains(
+                "- bbs: one machine; it reports no active RDMA port of 100 Gb/s or more\n\
+                 - bginf-sp1+bginf-sp2: linked at 200 Gb/s; bginf-sp1 at 10.0.1.1, bginf-sp2 at 10.0.1.2\n\
+                 - fedora: one machine; its RDMA ports are unmeasured: not sampled yet\n"
+            ),
+            "{listed}"
+        );
+        assert!(!listed.contains("- bgsrv-mac:"), "{listed}");
+
+        let mut mac = inspection("bgsrv-mac", false);
+        measured(&mut mac);
+        let quiet = render_executors(&[mac], &[], &[], None, CAPTURED_AT, false);
+        assert!(!quiet.contains("## Model pools"), "{quiet}");
     }
 
     /// Each GPU renders as one line under its own heading after placement

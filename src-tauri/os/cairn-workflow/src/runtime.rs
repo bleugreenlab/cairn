@@ -63,7 +63,14 @@ pub trait WorkflowHost: Send + Sync {
     fn claimed_launch_job_ids(&self) -> HashSet<String>;
     fn resolve_coordinate(&self, repository: &Path, branch: &str) -> Result<String, String>;
     fn job_head(&self, job_id: &str) -> Result<String, String>;
-    fn pr_publish_input_revision(&self, action_run_id: &str) -> Result<Option<String>, String>;
+    /// The revision a PR action would publish (its handoff artifact version,
+    /// branch and logical head). Resolving the head is a jj call, so this is
+    /// async: no workflow path holds a runtime worker or the execution
+    /// snapshot guard while it answers.
+    async fn pr_publish_input_revision(
+        &self,
+        action_run_id: &str,
+    ) -> Result<Option<String>, String>;
     /// Answer a decision node's questions. A refused question is an answer,
     /// not an error; an error means nothing answered (no decision-capable
     /// offer, or the provider failed), and blocks the node with that text.

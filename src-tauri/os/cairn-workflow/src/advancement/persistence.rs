@@ -1,26 +1,15 @@
 use super::*;
 
+/// Run an advancement DB future to completion from synchronous code, through
+/// [`cairn_db::storage::run_db_blocking`] (which hands a runtime worker's core
+/// off before it blocks).
 pub fn run_advancement_db<T>(
     future: impl Future<Output = Result<T, String>> + Send + 'static,
 ) -> Result<T, String>
 where
     T: Send + 'static,
 {
-    fn run<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(future)
-    }
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run(future))
-            .join()
-            .map_err(|_| "Advancement DB runtime thread panicked".to_string())?
-    } else {
-        run(future)
-    }
+    cairn_db::storage::run_db_blocking(move || future)
 }
 
 pub fn db_internal(message: impl Into<String>) -> DbError {

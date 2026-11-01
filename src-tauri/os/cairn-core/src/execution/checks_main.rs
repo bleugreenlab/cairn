@@ -4088,6 +4088,7 @@ mod tests {
             "typecheck-ui",
             "frontend-build",
             "workspace-compile",
+            "lint",
         ] {
             assert_eq!(verdict(check), Some(LaneVerdict::Exit), "{check}");
         }

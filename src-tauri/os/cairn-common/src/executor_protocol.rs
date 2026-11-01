@@ -6315,6 +6315,14 @@ pub struct LearnedResourceEstimate {
 /// absence. What a runner gets wrong talking to an older executor: nothing;
 /// that executor reports neither edge, so no page-call batch is ever placed
 /// on it, and it is updated by build hash before it takes other work.
+///
+/// cairn/5732 adds [`HostHealth::interconnects`] without a bump (tenet 1250).
+/// It is defaulted on decode, and [`HostHealth`] refuses no unknown fields. An
+/// older executor reports nothing, which a runner reads as a `NotSampled` gap,
+/// so that machine stays a model pool of its own: the failure is closed, never
+/// a link that is not there. An older runner ignores the field. The runner
+/// derives model pools from it (`fleet::pools`) and only displays them; no
+/// admission, placement, or load-context input reads it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -12154,6 +12162,61 @@ pub struct HostHealth {
     /// works and found no devices.
     #[serde(default)]
     pub gpus: Measurement<Vec<GpuDevice>>,
+    /// The machine's RDMA ports, InfiniBand and RoCE: the links fast enough to
+    /// split one model across machines. Defaulted, and so a `NotSampled` gap
+    /// rather than "no links", from an executor too old to report it, which
+    /// leaves that machine a pool of its own. `Measured` with an empty list is
+    /// a positive claim: the reader works and found no RDMA device.
+    #[serde(default)]
+    pub interconnects: Measurement<Vec<Interconnect>>,
+}
+
+/// One RDMA port as the kernel's `infiniband` class describes it, with the
+/// network interface it carries and that interface's IPv4 addresses.
+///
+/// Not [`ExecutorLinkPath`], which is the TCP path of the executor's link to the
+/// runner. This is a machine-to-machine link that may carry no Cairn traffic at
+/// all; what it is for is collective traffic between inference processes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct Interconnect {
+    pub kind: InterconnectKind,
+    /// The RDMA device, as `/sys/class/infiniband` names it (`rocep1s0f1`).
+    pub device: String,
+    /// The port number on that device, from one.
+    pub port: u32,
+    /// Whether the port's state is `ACTIVE`.
+    pub active: bool,
+    /// The port's rate in gigabits per second as sysfs states it
+    /// (`200 Gb/sec (2X NDR)` is 200), rounded down where it is fractional.
+    pub rate_gbps: u32,
+    /// The network interface this port carries, when the device has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netdev: Option<String>,
+    /// That interface's IPv4 addresses in CIDR form (`10.0.1.1/24`). Empty
+    /// when it has none, or when there is no interface.
+    #[serde(default)]
+    pub addresses: Vec<String>,
+}
+
+/// The fabric an RDMA port runs on, from its `link_layer`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum InterconnectKind {
+    /// `link_layer` is `InfiniBand`.
+    #[serde(rename = "infiniband")]
+    InfiniBand,
+    /// `link_layer` is `Ethernet`: RDMA over Converged Ethernet.
+    #[serde(rename = "roce")]
+    Roce,
+}
+
+impl InterconnectKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::InfiniBand => "InfiniBand",
+            Self::Roce => "RoCE",
+        }
+    }
 }
 
 /// The machine readings that need nothing but the machine, published apart from
@@ -20223,6 +20286,29 @@ mod tests {
                             reason: MeasurementGap::SamplingFailed,
                             detail: Some("no Device Utilization %".into()),
                         },
+                    },
+                ],
+            ),
+            interconnects: Measurement::measured(
+                7,
+                vec![
+                    Interconnect {
+                        kind: InterconnectKind::Roce,
+                        device: "rocep1s0f1".into(),
+                        port: 1,
+                        active: true,
+                        rate_gbps: 200,
+                        netdev: Some("enp1s0f1np1".into()),
+                        addresses: vec!["10.0.1.1/24".into()],
+                    },
+                    Interconnect {
+                        kind: InterconnectKind::InfiniBand,
+                        device: "mlx5_0".into(),
+                        port: 1,
+                        active: false,
+                        rate_gbps: 100,
+                        netdev: None,
+                        addresses: Vec::new(),
                     },
                 ],
             ),

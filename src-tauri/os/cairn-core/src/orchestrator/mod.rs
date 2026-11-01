@@ -3249,31 +3249,17 @@ impl Orchestrator {
     }
 
     /// Run a warm-GC lookup to completion from synchronous code, off any async
-    /// worker the caller may be on. `None` when no runtime could be built.
+    /// worker the caller may be on. `None` when the lookup's runtime could not
+    /// be built or the lookup panicked.
     fn run_gc_lookup<T, F, Fut>(lookup: F) -> Option<T>
     where
         T: Send + 'static,
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T>,
     {
-        let run = move || match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => Some(rt.block_on(lookup())),
-            Err(error) => {
-                log::error!("GC: failed to create database runtime: {}", error);
-                None
-            }
-        };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::spawn(run).join().unwrap_or_else(|_| {
-                log::error!("GC: database lookup thread panicked");
-                None
-            })
-        } else {
-            run()
-        }
+        crate::storage::run_db_blocking(move || async move { Ok::<_, String>(lookup().await) })
+            .map_err(|error| log::error!("GC: database lookup failed: {error}"))
+            .ok()
     }
 
     /// Shared warm-eviction pass. `spawn_room` additionally frees room for work

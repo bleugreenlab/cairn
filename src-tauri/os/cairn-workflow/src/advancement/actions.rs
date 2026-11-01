@@ -302,9 +302,6 @@ pub fn create_action_run(
         ),
     );
 
-    if node.node_type == "pr" {
-        crate::pr_publish_attempts::capture_initial_publish_revision(runtime, &action_run_id);
-    }
     Ok(action_run_id)
 }
 
