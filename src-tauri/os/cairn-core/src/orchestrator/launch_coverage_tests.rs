@@ -6,9 +6,12 @@
 //! provider in the shipped catalog, plus a custom one, is then launched
 //! through the ordinary `backend_for_name(key).start_session` path, and the
 //! recorder must have seen it. A provider that answers decisions only
-//! (TypeSafe) has its session launch refused and a decision asked instead. A
-//! provider added to the catalog without an adapter here fails, because
-//! `plan` has no answer for it.
+//! (TypeSafe) has its session launch refused and a decision asked instead.
+//! Cairn inference is launched against a deployment on a pool under Cairn's
+//! control, so each request asks the pool controller for its model and is sent
+//! to that deployment under the engine's own name for it. A provider added to
+//! the catalog without an adapter here fails, because `plan` has no answer for
+//! it.
 
 use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex};
@@ -16,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use cairn_models::codex::app_server::AppServerClient;
 use cairn_models::interface::complete::{
-    Complete, CompletionCall, CompletionError, CompletionReply, Delivery,
+    Complete, CompletionCall, CompletionError, CompletionReply, CompletionWire, Delivery,
 };
 use cairn_models::interface::session::{
     Cli, CodexModels, CodexServer, CodexSessionProvider, LaunchedSession, ProviderSpec,
@@ -51,15 +54,37 @@ const CODEX_KEY: &str = "sk-coverage-codex-key";
 const OPENROUTER_KEY: &str = "sk-or-coverage-key";
 const OPENCODE_KEY: &str = "sk-oc-coverage-key";
 const TYPESAFE_KEY: &str = "ts-coverage-key";
+const BGINF_KEY: &str = "bginf-coverage-token";
 const WAIT: Duration = Duration::from_secs(20);
+
+/// The coverage deployment's alias, which runs name it by.
+const INFERENCE_ALIAS: &str = "coverage-chat";
+/// The name the coverage deployment's engine answers to.
+const INFERENCE_SERVED_NAME: &str = "coverage-engine-chat";
+/// The coverage deployment's chat endpoint, on the dead loopback port the
+/// other local providers' fixtures use: the engine probe a route takes is
+/// refused at once, and nothing leaves the machine.
+const INFERENCE_CHAT_URL: &str = "http://127.0.0.1:9/v1/chat/completions";
+
+/// One request as it reached [`Complete`].
+#[derive(Debug, Clone)]
+struct Sent {
+    key: String,
+    delivery: &'static str,
+    wire: Wire,
+    /// The model id its body names.
+    model: Option<String>,
+    /// Where an OpenAI-chat request is posted.
+    chat_url: Option<String>,
+}
 
 /// Everything the fakes saw, and the gate that holds an HTTP turn open.
 #[derive(Default)]
 struct Recorder {
     calls: Mutex<Vec<String>>,
-    /// Every completion's backend key, delivery, and the wire its route
-    /// spoke, so a test can hold it against what the catalog declares.
-    wires: Mutex<Vec<(String, &'static str, Wire)>>,
+    /// Every completion as it reached Complete, so a test can hold it against
+    /// what the catalog declares and where its route says it goes.
+    sent: Mutex<Vec<Sent>>,
     released: Mutex<bool>,
     gate: Condvar,
     /// Senders that keep each fake session's output open until the test ends.
@@ -79,7 +104,16 @@ impl Recorder {
     }
 
     fn saw(&self, call: &str) -> bool {
-        self.calls.lock().unwrap().iter().any(|seen| seen == call)
+        self.count(call) > 0
+    }
+
+    fn count(&self, call: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| *seen == call)
+            .count()
     }
 
     fn wait_for(&self, call: &str) {
@@ -200,11 +234,20 @@ impl Complete for RecordingComplete {
             call.wire.family(),
             call.wire.backend_key()
         ));
-        self.0.wires.lock().unwrap().push((
-            call.wire.backend_key().to_string(),
+        self.0.sent.lock().unwrap().push(Sent {
+            key: call.wire.backend_key().to_string(),
             delivery,
-            call.wire.wire(),
-        ));
+            wire: call.wire.wire(),
+            model: call
+                .body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            chat_url: match &call.wire {
+                CompletionWire::Chat(endpoint) => Some(endpoint.chat_url.clone()),
+                _ => None,
+            },
+        });
         if delivery == "stream" {
             self.0.hold();
         }
@@ -514,6 +557,19 @@ struct Plan {
     /// For a provider that answers decisions only: the call a decision must
     /// make. Its session launch must be refused instead.
     decide: Option<String>,
+    /// For a provider that also answers decisions over a logprobs route: the
+    /// call admitting a decision must make, probing that route.
+    logprobs_decide: Option<String>,
+    /// For a provider that routes each request to the deployment serving its
+    /// model: where every request must arrive, and under which name.
+    routed: Option<Routed>,
+}
+
+/// Where a routed provider's every request must arrive.
+struct Routed {
+    chat_url: &'static str,
+    /// The engine's own name for the model, which an alias is sent as.
+    model: &'static str,
 }
 
 fn plan(key: &str) -> Plan {
@@ -523,6 +579,8 @@ fn plan(key: &str) -> Plan {
         one_shot: Some(format!("complete:chat:{key}:whole")),
         warm: None,
         decide: None,
+        logprobs_decide: None,
+        routed: None,
     };
     match key {
         "claude" => Plan {
@@ -535,6 +593,8 @@ fn plan(key: &str) -> Plan {
             one_shot: None,
             warm: Some("claude"),
             decide: None,
+            logprobs_decide: None,
+            routed: None,
         },
         "codex" => Plan {
             model: "gpt-coverage",
@@ -548,6 +608,8 @@ fn plan(key: &str) -> Plan {
             one_shot: None,
             warm: Some("codex"),
             decide: None,
+            logprobs_decide: None,
+            routed: None,
         },
         "openrouter" => http("openai/gpt-coverage", key),
         "opencode-go" => http("glm-coverage", key),
@@ -557,9 +619,20 @@ fn plan(key: &str) -> Plan {
             one_shot: None,
             warm: None,
             decide: Some(format!("complete:systemone:{key}:whole")),
+            logprobs_decide: None,
+            routed: None,
         },
         "ollama" => http("qwen3:32b", key),
         "actual" => http("coverage-model", key),
+        // Launched by alias against the deployment `seed_inference` stands up.
+        "inference" => Plan {
+            logprobs_decide: Some(format!("complete:chat:{key}:whole")),
+            routed: Some(Routed {
+                chat_url: INFERENCE_CHAT_URL,
+                model: INFERENCE_SERVED_NAME,
+            }),
+            ..http(INFERENCE_ALIAS, key)
+        },
         custom if custom.starts_with(CUSTOM_KEY_PREFIX) => http("qwen3.8-27b", custom),
         other => panic!(
             "provider {other} is in the shipped catalog but has no launch coverage: give it an \
@@ -661,6 +734,119 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         .expect("the seeded custom provider")
         .id;
     (orch, format!("{CUSTOM_KEY_PREFIX}{custom}"))
+}
+
+/// One cairn-inference deployment serving [`INFERENCE_SERVED_NAME`] under the
+/// alias [`INFERENCE_ALIAS`], on a pool Cairn controls, which bginf's last
+/// state reports healthy: the state in which the pool controller answers a
+/// request on the pass that makes it. The provider is installed and its
+/// catalog refreshed, so a decision can be offered on it. Nothing polls bginf
+/// here; its link is configured only so its stored state is read.
+async fn seed_inference(orch: &Orchestrator) {
+    use crate::orchestrator::pool_control::{patch_pool, PoolPatch};
+    use cairn_config::inference::{BginfLinkSettings, InferenceSettings};
+    use cairn_db::turso::params;
+
+    let inventory = cairn_inference::Inventory::from_yaml(
+        r#"
+recipes:
+  - id: coverage-recipe
+    source: cairn
+    model: {name: coverage/Coverage-Chat}
+    servedName: coverage-engine-chat
+    engine: {kind: command, start: ./start.sh}
+    requirements: {machines: 1}
+    aliases: [coverage-chat]
+deployments:
+  - {id: coverage-deployment, source: cairn, recipe: coverage-recipe, machines: [coverage-box], head: coverage-box, apiPort: 9, apiPath: /v1, healthPath: /v1/models}
+pools:
+  - {id: coverage-pool, source: cairn, machines: [{name: coverage-box, address: 127.0.0.1}], default: [coverage-deployment], pin: []}
+"#,
+    )
+    .unwrap();
+    let mut rows: Vec<(&str, String, String)> = Vec::new();
+    for recipe in inventory.recipes.values() {
+        rows.push((
+            "inference_recipes",
+            recipe.id.to_string(),
+            serde_json::to_string(recipe).unwrap(),
+        ));
+    }
+    for deployment in inventory.deployments.values() {
+        rows.push((
+            "inference_deployments",
+            deployment.id.to_string(),
+            serde_json::to_string(deployment).unwrap(),
+        ));
+    }
+    for pool in inventory.pools.values() {
+        rows.push((
+            "inference_pools",
+            pool.id.to_string(),
+            serde_json::to_string(pool).unwrap(),
+        ));
+    }
+    let db = &orch.db.local;
+    for (table, id, body) in rows {
+        db.execute(
+            format!(
+                "INSERT INTO {table} (id, source, body_json, created_at, updated_at)
+                 VALUES (?1, 'cairn', ?2, 1, 1)"
+            ),
+            params![id, body],
+        )
+        .await
+        .unwrap();
+    }
+    let state = json!({"nodes": {"coverage-box": {
+        "running": "coverage-deployment", "healthy": true, "stale": false}}});
+    db.execute(
+        "INSERT INTO inference_bginf_link (link, last_attempt_at, last_ok_at, state_json)
+         VALUES ('bginf', 1, 1, ?1)",
+        params![state.to_string()],
+    )
+    .await
+    .unwrap();
+
+    let mut enabled = orch.enabled_providers();
+    enabled.push(crate::backends::inference::INFERENCE_BACKEND_KEY.to_string());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(enabled),
+        ..Default::default()
+    })
+    .unwrap();
+    crate::config::settings::set_inference(
+        &orch.config_dir,
+        &InferenceSettings {
+            bginf: Some(BginfLinkSettings {
+                url: "http://127.0.0.1:9".into(),
+                machines: Default::default(),
+            }),
+            recipes: Default::default(),
+        },
+    )
+    .unwrap();
+    orch.add_account(
+        ApiProvider::Bginf,
+        "bginf ctl".into(),
+        ProviderAuth::ApiKey {
+            value: BGINF_KEY.into(),
+        },
+        None,
+    )
+    .unwrap();
+    patch_pool(
+        orch,
+        &PoolPatch {
+            pool: "coverage-pool".into(),
+            controlled: Some(true),
+            ..PoolPatch::default()
+        },
+        "coverage",
+    )
+    .await
+    .unwrap();
+    orch.refresh_provider_model_catalog_blocking(crate::backends::inference::INFERENCE_BACKEND_KEY);
 }
 
 fn identity() -> UserIdentity {
@@ -776,6 +962,7 @@ fn view(orch: &Orchestrator, run_id: &str) -> cairn_models::interface::SessionVi
 async fn every_catalog_provider_launches_through_the_facet() {
     let recorder = Arc::new(Recorder::default());
     let (orch, custom_key) = orchestrator(&recorder).await;
+    seed_inference(&orch).await;
     let keys: Vec<String> = PROVIDER_CATALOG
         .iter()
         .map(|descriptor| descriptor.key.to_string())
@@ -888,6 +1075,58 @@ async fn every_catalog_provider_launches_through_the_facet() {
             assert!(outcome.is_err(), "{key}: the recorder refuses every call");
             assert!(recorder.saw(&call), "{key} one-shot did not reach Complete");
         }
+
+        if let Some(call) = &plan.logprobs_decide {
+            // Admitting the decision probes its logprobs route, which the
+            // recorder refuses like every other call.
+            let before = recorder.count(call);
+            let request = serde_json::from_value(json!({
+                "model": format!("{key}/{}", plan.model),
+                "input": "hi",
+                "questions": [{"name": "greeting", "type": "predicate",
+                               "instructions": "Is this a greeting?"}],
+            }))
+            .unwrap();
+            assert!(
+                orch.decide_named(None, request).await.is_err(),
+                "{key}: the recorder refuses every call"
+            );
+            assert!(
+                recorder.count(call) > before,
+                "{key} decision did not reach Complete"
+            );
+        }
+    }
+
+    // Every Cairn inference launch asked the pool controller for its model,
+    // which answered each from the deployment it found healthy.
+    let requests = crate::orchestrator::pool_control::load_requests(&orch.db.local)
+        .await
+        .unwrap();
+    let requesters: Vec<&str> = requests
+        .iter()
+        .map(|stored| stored.request.requester.as_str())
+        .collect();
+    for requester in [
+        "cairn://p/COVERAGE/1/1/builder",
+        "a completion",
+        "a decision",
+    ] {
+        assert!(
+            requesters.contains(&requester),
+            "{requester} made no request: {requests:?}"
+        );
+    }
+    for stored in &requests {
+        assert_eq!(stored.request.model, INFERENCE_ALIAS);
+        assert_eq!(stored.request.deployment.as_str(), "coverage-deployment");
+        assert!(
+            matches!(
+                stored.request.state,
+                cairn_inference::pool_control::RequestState::Ready { .. }
+            ),
+            "{stored:?}"
+        );
     }
 
     // Every HTTP launch spoke a wire its catalog entry declares for the verb:
@@ -896,9 +1135,16 @@ async fn every_catalog_provider_launches_through_the_facet() {
     // in the workspace's installed list.
     let catalog = orch.catalog(&ModelScope::default()).unwrap();
     let discovered = orch.model_catalog.read().unwrap().clone();
-    let wires = recorder.wires.lock().unwrap().clone();
-    assert!(!wires.is_empty(), "no HTTP launch reached Complete");
-    for (key, delivery, wire) in wires {
+    let sent = recorder.sent.lock().unwrap().clone();
+    assert!(!sent.is_empty(), "no HTTP launch reached Complete");
+    for Sent {
+        key,
+        delivery,
+        wire,
+        model,
+        chat_url,
+    } in sent
+    {
         let mut provider = catalog
             .providers
             .iter()
@@ -921,7 +1167,28 @@ async fn every_catalog_provider_launches_through_the_facet() {
                 .any(|served| served.verb.kind() == verb && served.wire == wire),
             "{key} sent a {verb} over {wire}, but its catalog entry declares {declared:?}"
         );
+        if let Some(routed) = plan(&key).routed {
+            assert_eq!(
+                model.as_deref(),
+                Some(routed.model),
+                "{key} sent a {verb} under another name than its engine's"
+            );
+            assert_eq!(
+                chat_url.as_deref(),
+                Some(routed.chat_url),
+                "{key} sent a {verb} somewhere other than its deployment"
+            );
+        }
     }
+    assert!(
+        recorder
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sent| sent.key == "inference" && sent.delivery == "stream"),
+        "no Cairn inference session reached Complete"
+    );
 
     // The pooled Codex call path starts its server and opens its thread
     // through the same provider, on a shared server.
@@ -980,6 +1247,7 @@ async fn every_catalog_provider_launches_through_the_facet() {
         OPENROUTER_KEY,
         OPENCODE_KEY,
         TYPESAFE_KEY,
+        BGINF_KEY,
     ] {
         assert!(!stored.contains(secret), "{secret} reached a stored row");
     }
@@ -1542,12 +1810,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
     let failed = failed.to_string();
     assert!(failed.contains("recorded, not sent"), "{failed}");
     assert_eq!(
-        recorder
-            .wires
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(_, _, wire)| *wire),
+        recorder.sent.lock().unwrap().last().map(|sent| sent.wire),
         Some(offer.served.wire),
         "the Decisions POST rides the wire the offer declares"
     );
@@ -1601,12 +1864,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         "the recorder refuses the probe"
     );
     assert_eq!(
-        recorder
-            .wires
-            .lock()
-            .unwrap()
-            .last()
-            .map(|(_, _, wire)| *wire),
+        recorder.sent.lock().unwrap().last().map(|sent| sent.wire),
         Some(offer.served.wire),
         "the logprobs probe rides the wire the offer declares"
     );
