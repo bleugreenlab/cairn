@@ -967,7 +967,6 @@ impl ProviderAccount {
             (ApiProvider::Ollama, ProviderAuth::BaseUrl { .. }) => vec!["ollama"],
             (ApiProvider::Actual, ProviderAuth::ActualTarget { .. }) => vec!["actual"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
-            (ApiProvider::Bginf, _) => vec![],
             // OAuth is CLI-specific
             (ApiProvider::OpenAI, ProviderAuth::OAuthToken { .. }) => vec!["codex"],
             (ApiProvider::Google, ProviderAuth::OAuthToken { .. }) => vec![],
@@ -3474,7 +3473,6 @@ mod tests {
                 ApiProvider::Ollama,
                 ApiProvider::Actual,
                 ApiProvider::GitHub,
-                ApiProvider::Bginf,
                 ApiProvider::Custom,
             ]
         );

@@ -14,9 +14,9 @@
 //! inside one database transaction, so a request and the task never act on
 //! two different readings of a phase.
 //!
-//! Deployments Cairn has never acted on are left alone entirely: bginf may be
-//! running them, and Cairn takes no machine away from builds for a model it did
-//! not load or stop.
+//! Deployments Cairn has never acted on are left alone entirely: whatever runs
+//! there was not started by Cairn, and Cairn takes no machine away from builds
+//! for a model it did not load or stop.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -1199,7 +1199,7 @@ pub(crate) mod tests {
     fn recipe(id: &str, machines: u32) -> Recipe {
         Recipe {
             id: id.into(),
-            source: RecordSource::Bginf,
+            source: RecordSource::Cairn,
             model: ModelRef {
                 name: id.into(),
                 weights: Vec::new(),
@@ -1227,7 +1227,7 @@ pub(crate) mod tests {
     fn deployment(id: &str, machines: &[&str]) -> Deployment {
         Deployment {
             id: id.into(),
-            source: RecordSource::Bginf,
+            source: RecordSource::Cairn,
             recipe: id.into(),
             machines: machines.iter().map(|m| (*m).into()).collect(),
             head: machines[0].into(),
@@ -1248,7 +1248,7 @@ pub(crate) mod tests {
         inventory.insert_deployment(deployment(QWEN, &[SP1]));
         inventory.insert_pool(Pool {
             id: "sparks".into(),
-            source: RecordSource::Bginf,
+            source: RecordSource::Cairn,
             machines: vec![
                 PoolMachine {
                     name: SP1.into(),
@@ -1292,7 +1292,7 @@ pub(crate) mod tests {
             db.execute(
                 format!(
                     "INSERT INTO {table} (id, source, body_json, created_at, updated_at)
-                     VALUES (?1, 'bginf', ?2, 0, 0)"
+                     VALUES (?1, 'cairn', ?2, 0, 0)"
                 ),
                 params![id, body],
             )

@@ -43,7 +43,8 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.
     "buildServices",
-    // Where the bginf token is sent: changing the URL redirects a credential.
+    // Which verbs each inference recipe's model is offered for, and so which
+    // work is routed to it, as the model bindings above route work.
     "inference",
     // Outward-facing message delivery and the identity commits are attributed
     // to: both let a local change speak as the operator to the outside world.

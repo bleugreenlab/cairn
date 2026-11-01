@@ -605,6 +605,13 @@ impl BaseTipSource {
                 .filter(|branch| !branch.is_empty())
                 .ok_or_else(|| format!("project {project_id} has no default branch"))?;
         let repo_root = PathBuf::from(&repo_path);
+        // Checked here because git, spawned in a missing directory, reports
+        // only "No such file or directory", naming neither the path nor why.
+        if !tokio::fs::try_exists(&repo_root).await.unwrap_or(false) {
+            return Err(format!(
+                "project {project_id}'s repository {repo_path} does not exist"
+            ));
+        }
         let commit = crate::projects::codemap::head_commit(orch, &repo_root, &branch).await?;
         tokio::task::spawn_blocking(move || Self::at_commit(repo_root, commit))
             .await

@@ -22,6 +22,7 @@ mod executors;
 mod feed;
 mod grants;
 mod inference;
+pub(crate) use inference::inference_records_authority;
 mod issues;
 mod labels;
 mod mcp;

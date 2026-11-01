@@ -71,6 +71,30 @@ pub fn workspace_settings_write(
     ))
 }
 
+/// Writing Cairn's inference records (`cairn://inference` replace, or a patch
+/// that upserts or removes) → the same `WorkspaceSettings(inference) + Write`
+/// place a `cairn://settings` `inference` patch reaches.
+///
+/// Both say what this workspace's inference machines run, and a recipe's
+/// start and stop commands are shell its head machine runs as its account.
+/// Authority is keyed to the place reached rather than the carrier, so a grant
+/// for either door covers the other.
+pub fn inference_records_write(workspace_id: &str) -> AuthorityRequest {
+    let scope = AuthorityScope::new(
+        AuthorityPlace::WorkspaceSettings {
+            workspace_id: workspace_id.to_string(),
+            section: "inference".to_string(),
+        },
+        AuthorityAction::Write,
+    );
+    AuthorityRequest::new(
+        scope,
+        AuthorityMutation::Update,
+        "write the inference records, whose start and stop commands run on their head machines"
+            .to_string(),
+    )
+}
+
 /// Workspace `cairn://mcp` create/patch/delete → `Tool(…, McpServer, …) + Write`.
 ///
 /// Enabling or disabling a server is a reconfiguration of an existing entry, so

@@ -55,7 +55,11 @@ pub fn mutation_spec(kind: ResourceKind, mode: ChangeMode) -> Option<&'static Mu
 /// `cairn-core`'s `every_run_target_resolves_to_its_own_spec` pins each entry
 /// to a run-dispatch arm, as `contract_mutations_all_have_dispatch_arms` pins
 /// mutations.
-pub const RUN_TARGETS: &[RunTargetSpec] = &[models::MODELS_DECIDE_RUN_TARGET];
+pub const RUN_TARGETS: &[RunTargetSpec] = &[
+    models::MODELS_DECIDE_RUN_TARGET,
+    models::MODELS_EMBED_RUN_TARGET,
+    models::MODELS_COMPLETE_RUN_TARGET,
+];
 
 /// The run target `kind` is, if it is one.
 pub fn run_target_for(kind: ResourceKind) -> Option<&'static RunTargetSpec> {
@@ -82,6 +86,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     models::MODELS_CONTRACT,
     models::MODELS_CATALOG_CONTRACT,
     models::MODELS_DECIDE_CONTRACT,
+    models::MODELS_EMBED_CONTRACT,
+    models::MODELS_COMPLETE_CONTRACT,
     models::MODELS_ACCOUNTS_CONTRACT,
     models::MODELS_ACCOUNT_CONTRACT,
     models::MODELS_USAGE_CONTRACT,

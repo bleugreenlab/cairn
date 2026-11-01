@@ -336,9 +336,9 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "buildSlots")]
     pub fleet: Option<crate::fleet::FleetConfig>,
-    /// How this workspace reaches inference control services (today, the
-    /// read-only bginf link). Config-only (YAML, not in the Settings DTO);
-    /// written through `cairn://settings` and preserved across saves.
+    /// What each inference recipe's model serves and takes, as the operator
+    /// declares it. Config-only (YAML, not in the Settings DTO); written
+    /// through `cairn://settings` and preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<crate::inference::InferenceSettings>,
     /// Typed web-fetch provider options, keyed by provider id
@@ -2314,10 +2314,6 @@ buildServices:
         let dir = tempfile::tempdir().unwrap();
         save_settings(dir.path(), &test_settings()).unwrap();
         let link = crate::inference::InferenceSettings {
-            bginf: Some(crate::inference::BginfLinkSettings {
-                url: "http://ctl.example:4100".into(),
-                machines: [("halo".to_string(), "fedora".to_string())].into(),
-            }),
             recipes: [(
                 "dsv4f-tp2".to_string(),
                 crate::inference::RecipeDeclaration {
@@ -2326,6 +2322,7 @@ buildServices:
                 },
             )]
             .into(),
+            ..Default::default()
         };
         set_inference(dir.path(), &link).unwrap();
         save_settings(dir.path(), &test_settings()).unwrap();
@@ -2342,14 +2339,39 @@ buildServices:
         assert!(set_inference(
             dir.path(),
             &crate::inference::InferenceSettings {
-                bginf: Some(crate::inference::BginfLinkSettings {
-                    url: "ctl.example".into(),
-                    machines: Default::default(),
-                }),
-                recipes: Default::default(),
+                recipes: [("r".to_string(), Default::default())].into(),
+                ..Default::default()
             }
         )
         .is_err());
+    }
+
+    /// A file that still names the retired bginf link loads every other
+    /// section, and the next write of the inference section drops the link.
+    #[test]
+    fn a_settings_file_naming_the_retired_bginf_link_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        save_settings(dir.path(), &test_settings()).unwrap();
+        let path = get_settings_path(dir.path());
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "inference:\n  bginf:\n    url: http://10.20.20.16:4100\n    machines: {halo: fedora}\n  recipes:\n    dsv4f-tp2: {verbs: [session]}\n",
+        );
+        std::fs::write(&path, text).unwrap();
+
+        assert!(load_settings_file(dir.path()).is_ok());
+        let loaded = load_inference(dir.path());
+        assert!(loaded.retired_bginf_link);
+        assert!(loaded.recipes.contains_key("dsv4f-tp2"));
+
+        let kept = crate::inference::InferenceSettings {
+            recipes: loaded.recipes.clone(),
+            ..Default::default()
+        };
+        set_inference(dir.path(), &kept).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("bginf"), "{text}");
+        assert_eq!(load_inference(dir.path()), kept);
     }
 
     #[test]

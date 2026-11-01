@@ -1559,6 +1559,234 @@ async fn a_rewrite_without_the_schedule_drops_it() {
         .is_empty());
 }
 
+// ---- Runner start (cairn/5723) ----
+
+/// The schedule row once its occurrence has settled.
+async fn settled(h: &Harness, owner: &ServiceOwner, service: &str) -> ScheduleRow {
+    for _ in 0..500 {
+        let row = schedule::list(&h.orch.db.local, "p", owner, service)
+            .await
+            .unwrap()
+            .remove(0);
+        if row.last_status.is_some() {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {service}'s occurrence to settle");
+}
+
+/// Record `entries` as a predecessor runner did ten minutes ago, so a
+/// five-minute cadence has an occurrence due now.
+async fn recorded_earlier(
+    h: &Harness,
+    owner: &ServiceOwner,
+    service: &str,
+    entries: &[crate::project_services::declaration::ScheduleEntry],
+) {
+    schedule::sync(
+        &h.orch.db.local,
+        "p",
+        owner,
+        service,
+        entries,
+        now_secs() - 600,
+    )
+    .await
+    .unwrap();
+}
+
+fn started(log: &[String]) -> usize {
+    log.iter()
+        .filter(|text| text.starts_with("started generation"))
+        .count()
+}
+
+/// A thread's schedule runs from boot: with no project repository reconciled
+/// and no catch-up, the occurrence that fell due while no runner was up
+/// fires. The project pass that follows the catch-up leaves it serving.
+#[tokio::test]
+async fn a_thread_schedule_fires_at_boot_without_the_catch_up() {
+    let h = thread_harness().await;
+    let payload = scheduled("echo");
+    crate::project_services::thread_store::write(
+        &h.orch.db.local,
+        "p",
+        &spanish(),
+        "tutor",
+        TUTOR,
+        &crate::project_services::thread_store::ServiceWriter {
+            job_id: "spanish-session".into(),
+        },
+        &payload,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let entries = crate::project_services::thread_store::package("tutor", TUTOR, &payload)
+        .unwrap()
+        .declaration
+        .schedule;
+    recorded_earlier(&h, &spanish(), "tutor", &entries).await;
+    assert!(
+        tutor().status(&h.orch).is_none(),
+        "nothing runs before boot"
+    );
+
+    start_at_boot(&h.orch).await;
+    assert!(
+        !h.orch
+            .project_services
+            .supervisor
+            .projects_current
+            .load(Ordering::Acquire),
+        "boot does not wait for, or stand in for, the catch-up"
+    );
+    eventually("the boot-time scheduled call", || {
+        h.host.frames_of("call").len() == 1
+    })
+    .await;
+    let frame = h.host.frames_of("call").remove(0);
+    assert_eq!(frame["method"], "echo");
+    assert_eq!(frame["caller"]["kind"], "schedule");
+    let row = settled(&h, &spanish(), "tutor").await;
+    assert_eq!(row.last_status.as_deref(), Some("ok"));
+
+    // The project pass after the catch-up finalizes nothing boot started.
+    let run_id = tutor().status(&h.orch).unwrap().run_id.unwrap();
+    start_project_launch_services(&h.orch).await;
+    assert_eq!(
+        tutor().status(&h.orch).unwrap().state,
+        ServiceState::Running
+    );
+    assert_eq!(
+        count(
+            &h,
+            &format!("SELECT COUNT(*) FROM runs WHERE id = '{run_id}' AND status = 'exited'")
+        )
+        .await,
+        0
+    );
+    assert_eq!(started(&tutor_log(&h).await), 1);
+}
+
+const SCHEDULED_WATCHER: &str =
+    "name: Watcher\nstart: launch\nschedule:\n  - every: 5m\n    method: echo\n";
+
+/// A project's schedule runs from boot too, but its due occurrence defers,
+/// unclaimed and logged once, until the project pass after the catch-up. That
+/// pass starts the `launch` service, runs the occurrence, and runs once.
+#[tokio::test]
+async fn a_project_schedule_defers_until_the_project_pass_which_runs_once() {
+    let h = harness().await;
+    let repo = h._config.path().to_string_lossy().to_string();
+    h.orch
+        .db
+        .local
+        .execute("UPDATE projects SET repo_path = ?1 WHERE id = 'p'", (repo,))
+        .await
+        .unwrap();
+    h.source.put("watcher", SCHEDULED_WATCHER, "serve({})");
+    let entries = h
+        .source
+        .package("watcher")
+        .unwrap()
+        .unwrap()
+        .declaration
+        .schedule;
+    recorded_earlier(&h, &ServiceOwner::Project, "watcher", &entries).await;
+
+    start_at_boot(&h.orch).await;
+    let deferrals = || async {
+        log_texts(&h, "watcher")
+            .await
+            .iter()
+            .filter(|text| text.starts_with("scheduled `echo` due ") && text.contains("deferred"))
+            .count()
+    };
+    for _ in 0..500 {
+        if deferrals().await > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        deferrals().await,
+        1,
+        "boot's schedule task defers the occurrence"
+    );
+    let watcher = ServiceRef::project("p", "cairn", "watcher");
+    assert_eq!(run_due(&h.orch, &watcher, now_secs()).await, 0);
+    assert_eq!(deferrals().await, 1, "one row, not one per recheck");
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 0);
+    assert!(h.host.frames_of("call").is_empty());
+    let row = schedule::list(&h.orch.db.local, "p", &ServiceOwner::Project, "watcher")
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        row.last_fired_occurrence_at, None,
+        "a deferral claims nothing"
+    );
+    assert_eq!(
+        row.last_status, None,
+        "a deferral is neither run nor skipped"
+    );
+    assert_eq!(row.consecutive_failures, 0);
+
+    start_project_launch_services(&h.orch).await;
+    assert_eq!(status(&h, "watcher").state, ServiceState::Running);
+    eventually("the deferred occurrence", || {
+        h.host.frames_of("call").len() == 1
+    })
+    .await;
+    assert_eq!(h.host.frames_of("call")[0]["caller"]["kind"], "schedule");
+    let row = settled(&h, &ServiceOwner::Project, "watcher").await;
+    assert_eq!(row.last_status.as_deref(), Some("ok"));
+
+    start_project_launch_services(&h.orch).await;
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 1);
+    assert_eq!(started(&log_texts(&h, "watcher").await), 1);
+}
+
+/// A project whose checkout is gone is skipped by the project pass, and the
+/// source that would read it says which path is missing.
+#[tokio::test]
+async fn a_missing_repository_is_named_and_its_project_skipped() {
+    let h = harness().await;
+    let missing = h._config.path().join("moved-away");
+    let missing_text = missing.to_string_lossy().to_string();
+    h.orch
+        .db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path = ?1 WHERE id = 'p'",
+            (missing_text.clone(),),
+        )
+        .await
+        .unwrap();
+    let error = crate::project_services::declaration::BaseTipSource::resolve(&h.orch, "p")
+        .await
+        .err()
+        .expect("a missing repository has no base tip");
+    assert!(
+        error.contains(&missing_text) && error.contains("does not exist"),
+        "{error}"
+    );
+
+    h.source
+        .put("watcher", "name: Watcher\nstart: launch\n", "serve({})");
+    start_project_launch_services(&h.orch).await;
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 0);
+    assert!(h
+        .orch
+        .project_services
+        .supervisor
+        .status("p", &ServiceOwner::Project, "watcher")
+        .is_none());
+}
+
 /// An `on_demand` service with no call for its idle stop is stopped, not
 /// stickily, and the next call starts it again; a call in flight holds it.
 #[tokio::test]

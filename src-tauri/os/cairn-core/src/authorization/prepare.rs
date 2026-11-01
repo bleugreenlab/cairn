@@ -81,6 +81,18 @@ pub async fn prepare_batch(
                 },
             ));
         }
+        // Cairn's own inference records say what its inference machines run,
+        // shell included, which is the place the `inference` settings section
+        // reaches.
+        if let Some(request) = crate::resources::mutations::inference_records_authority(item) {
+            prepared.push((
+                index,
+                match request {
+                    Ok(request) => Prepared::Authority(request),
+                    Err(error) => Prepared::Invalid(error),
+                },
+            ));
+        }
         for request in crate::resources::mutations::workspace_settings_authority(item) {
             prepared.push((
                 index,

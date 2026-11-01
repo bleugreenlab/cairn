@@ -1942,9 +1942,8 @@ async fn render_resource_body(
         CairnResource::Grant { id } => {
             crate::resources::grants::read_grant(&orch.db.local, &id).await
         }
-        // The cairn-inference facet: the stored inventory and the bginf link's
-        // last read, compared live on the pools page, and the pool controller's
-        // state and request queue.
+        // The cairn-inference facet: the stored inventory, what the act side
+        // has done to it, and the pool controller's state and request queue.
         CairnResource::Inference
         | CairnResource::InferenceRecipes
         | CairnResource::InferenceDeployments
@@ -1984,6 +1983,16 @@ async fn render_resource_body(
             match reject_query_params("cairn://models/decide", &params) {
                 Some(error) => error,
                 None => crate::resources::models::render_decide(orch),
+            }
+        }
+        CairnResource::ModelsEmbed => match reject_query_params("cairn://models/embed", &params) {
+            Some(error) => error,
+            None => crate::resources::models::render_embed(orch),
+        },
+        CairnResource::ModelsComplete => {
+            match reject_query_params("cairn://models/complete", &params) {
+                Some(error) => error,
+                None => crate::resources::models::render_complete(orch),
             }
         }
         CairnResource::ModelsAccounts => crate::resources::models::render_accounts(

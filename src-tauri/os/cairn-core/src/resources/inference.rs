@@ -1,26 +1,21 @@
 //! Renderers for the cairn-inference facet's resources, `cairn://inference/*`.
 //!
-//! Each page renders an [`InferenceView`]: the stored inventory, the bginf
-//! link row, the link's configuration and the enrolled executors. The pools
-//! page computes the comparison against bginf from the last successful
-//! `/state` the poller stored, which is the same snapshot the stored records
-//! were imported from, and never hides or corrects a disagreement. A pool
-//! under Cairn's control also shows the pool controller's state, and the
-//! requests page lists the controller's queue, each computed by the same plan
-//! the next tick writes.
+//! Each page renders an [`InferenceView`]: the stored inventory, what Cairn
+//! has done to the deployments it acted on, the pool controller's state and
+//! the enrolled executors. A pool under Cairn's control shows the
+//! controller's state, and the requests page lists the controller's queue,
+//! each computed by the same plan the next tick writes.
 
 use std::fmt::Write as _;
 
 use cairn_common::query::QueryParam;
-use cairn_inference::bginf::compare::{self as bginf_compare, CairnSide};
-use cairn_inference::bginf::{MachineMap, PoolComparison, PoolState, State, Verdict};
 use cairn_inference::pool_control::{self, RequestState};
 use cairn_inference::{
     DeploymentSet, Engine, MachineName, MemoryPerMachine, Pool, Recipe, Requirements,
 };
 
 use super::common::find_query_value;
-use crate::orchestrator::inference::{machine_map, InferenceView, LinkConfig, LinkRow};
+use crate::orchestrator::inference::InferenceView;
 use crate::orchestrator::inference_control::{holds_of, LoadRow};
 use crate::orchestrator::pool_control::ANSWERED_KEPT_MS;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
@@ -37,7 +32,7 @@ const INDEX: &[(&str, &str)] = &[
     ),
     (
         "cairn://inference/pools",
-        "each pool's machines, pin and default, Cairn's resolution beside bginf's with a verdict, and the pool controller's state; patch it to take a pool under Cairn's control",
+        "each pool's machines, pin and default, and the pool controller's state; patch it to take a pool under Cairn's control",
     ),
     (
         "cairn://inference/requests",
@@ -68,29 +63,14 @@ fn age_since(view: &InferenceView, ms: i64) -> String {
     age((view.now_ms - ms) / 1_000)
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
-}
-
 fn set_label(set: &DeploymentSet) -> String {
     if set.is_empty() {
-        "nothing (bginf `off`)".to_string()
+        "nothing".to_string()
     } else {
         set.iter()
             .map(|id| format!("`{id}`"))
             .collect::<Vec<_>>()
             .join(" + ")
-    }
-}
-
-fn map_of(view: &InferenceView) -> MachineMap {
-    match &view.config {
-        LinkConfig::Configured(link) => machine_map(link),
-        LinkConfig::Missing { .. } => MachineMap::default(),
     }
 }
 
@@ -102,67 +82,20 @@ fn enrolment(view: &InferenceView, machine: &MachineName) -> &'static str {
     }
 }
 
-/// The link's configuration and its last read, one fact per line.
-fn link_status(view: &InferenceView) -> String {
+/// What is left of bginf, and how to clear it, one fact per line.
+fn retired_lines(view: &InferenceView) -> String {
     let mut out = String::new();
-    match &view.config {
-        LinkConfig::Configured(link) => {
-            let _ = writeln!(
-                out,
-                "- bginf link: {} (read-only: GET /profiles and GET /state)",
-                link.url
-            );
-        }
-        LinkConfig::Missing { setting, account } => {
-            let mut missing = Vec::new();
-            if *setting {
-                missing.push("the `inference.bginf` section of cairn://settings");
-            }
-            if *account {
-                missing.push("a `bginf` account holding ctl's token (cairn://settings `accounts.add` with provider `bginf`)");
-            }
-            let _ = writeln!(
-                out,
-                "- bginf link: not configured; missing {}",
-                missing.join(" and ")
-            );
-        }
+    let foreign = view.inventory.foreign_records();
+    if !foreign.is_empty() {
+        let _ = writeln!(
+            out,
+            "- {} records are still mirrored from bginf and read-only ({}); adopt them as Cairn's own, keeping their ids: `write({{changes:[{{target:\"cairn://inference\",mode:\"patch\",payload:{{adopt:\"bginf\"}}}}]}})`",
+            foreign.len(),
+            foreign.join(", ")
+        );
     }
-    match &view.link {
-        None => out.push_str("- bginf has not been read yet\n"),
-        Some(row) => {
-            if let Some(error) = &row.last_error {
-                let since = row
-                    .failing_since
-                    .or(row.last_attempt_at)
-                    .unwrap_or(view.now_ms);
-                let _ = writeln!(
-                    out,
-                    "- bginf unreachable since {} ({} ago): {error}",
-                    when_ms(since),
-                    age_since(view, since)
-                );
-            }
-            match row.last_ok_at {
-                Some(ok) if row.last_error.is_some() => {
-                    let _ = writeln!(
-                        out,
-                        "- showing the last successful read, from {} ({} old)",
-                        when_ms(ok),
-                        age_since(view, ok)
-                    );
-                }
-                Some(ok) => {
-                    let _ = writeln!(
-                        out,
-                        "- bginf last read {} ({} ago)",
-                        when_ms(ok),
-                        age_since(view, ok)
-                    );
-                }
-                None => out.push_str("- no successful read yet\n"),
-            }
-        }
+    if view.retired_link_setting {
+        out.push_str("- settings.yaml still names the retired bginf link (`inference.bginf`), which nothing reads; writing the `inference` section of cairn://settings drops it\n");
     }
     out
 }
@@ -180,7 +113,7 @@ fn reject_params(uri: &str, params: &[QueryParam], allowed: &[&str]) -> Option<S
     })
 }
 
-/// `cairn://inference`: the link's status, the collections, and, under
+/// `cairn://inference`: the record counts, the collections, and, under
 /// `?format=yaml`, the inventory in Cairn's own record format.
 pub(crate) fn render_index(view: &InferenceView, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://inference";
@@ -193,32 +126,9 @@ pub(crate) fn render_index(view: &InferenceView, params: &[QueryParam]) -> Strin
         Some(other) => return format!("Unknown format='{other}' for {URI}; expected yaml."),
     }
     let mut out = String::from(
-        "# cairn-inference\n\nWhich model each inference machine should run. Recipes say how a model is run, deployments place a recipe on named machines, and each pool resolves its pin over its default against the machines that are powered. Every record mirrors bginf and is read-only. A pool taken under Cairn's control is decided instead by the pool controller: a request loads its model, batches waiting for the pool unload an idle one, and an idle pool loads its default. The controller writes desired state; one deployment's page (`cairn://inference/deployments/<id>`) is the act side, starting or stopping it on its head and holding every machine of the gang away from batch work while it does. Cairn powers nothing.\n\n",
+        "# cairn-inference\n\nWhich model each inference machine should run. Recipes say how a model is run, deployments place a recipe on named machines, and pools are the sets of machines that share one desired state. Every record is Cairn's own and the operator writes it here: replace this resource with a whole inventory (the document `?format=yaml` reads), or patch it to add, replace or remove records; a write is validated as a whole and refused naming every problem. A pool taken under Cairn's control is decided by the pool controller: a request loads its model, batches waiting for the pool unload an idle one, and an idle pool loads its default. The controller writes desired state; one deployment's page (`cairn://inference/deployments/<id>`) is the act side, starting or stopping it on its head and holding every machine of the gang away from batch work while it does. Cairn powers nothing.\n\n",
     );
-    out.push_str(&link_status(view));
-    if let Some(row) = &view.link {
-        if let (Some(at), Some(report)) = (row.last_change_at, &row.last_change_report) {
-            let _ = writeln!(
-                out,
-                "- last change {} ({} ago):",
-                when_ms(at),
-                age_since(view, at)
-            );
-            for line in report
-                .lines()
-                .iter()
-                .filter(|l| !l.starts_with("warning: "))
-            {
-                let _ = writeln!(out, "  - {line}");
-            }
-        }
-        if !row.last_warnings.is_empty() {
-            out.push_str("- the last import refused or could not map:\n");
-            for warning in &row.last_warnings {
-                let _ = writeln!(out, "  - {warning}");
-            }
-        }
-    }
+    out.push_str(&retired_lines(view));
     let _ = writeln!(
         out,
         "- records: {} recipes, {} deployments, {} pools\n",
@@ -262,7 +172,9 @@ fn requirements_lines(out: &mut String, requirements: &Requirements) {
 
 fn source_label(source: cairn_inference::RecordSource) -> &'static str {
     match source {
-        cairn_inference::RecordSource::Bginf => "bginf (mirrored, read-only)",
+        cairn_inference::RecordSource::Bginf => {
+            "bginf (mirrored before bginf retired; read-only until adopted)"
+        }
         cairn_inference::RecordSource::Cairn => "cairn",
     }
 }
@@ -297,14 +209,13 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
         "- upstream id: {}",
         recipe.upstream_id.as_deref().unwrap_or("unknown")
     );
-    let verbs = match (&recipe.verbs, recipe.source) {
-        (Some(verbs), _) => verbs
+    let verbs = match &recipe.verbs {
+        Some(verbs) => verbs
             .iter()
             .map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-        (None, cairn_inference::RecordSource::Bginf) => "unknown (imported from bginf)".to_string(),
-        (None, _) => "unknown".to_string(),
+        None => "unknown".to_string(),
     };
     let _ = writeln!(out, "- verbs: {verbs}");
     let _ = writeln!(out, "- engine: {}", recipe.engine.kind());
@@ -357,7 +268,7 @@ pub(crate) fn render_recipes(view: &InferenceView, params: &[QueryParam]) -> Str
     }
     let mut out = String::from("# Inference recipes\n\n");
     if view.inventory.recipes.is_empty() {
-        out.push_str("No recipes yet. Imported recipes appear once bginf has been read; see cairn://inference.\n");
+        out.push_str("No recipes yet. Write them by replacing or patching cairn://inference.\n");
         return out;
     }
     for recipe in view.inventory.recipes.values() {
@@ -373,7 +284,9 @@ pub(crate) fn render_deployments(view: &InferenceView, params: &[QueryParam]) ->
     let inventory = &view.inventory;
     let mut out = String::from("# Inference deployments\n\n");
     if inventory.deployments.is_empty() {
-        out.push_str("No deployments yet. Imported deployments appear once bginf has been read; see cairn://inference.\n");
+        out.push_str(
+            "No deployments yet. Write them by replacing or patching cairn://inference.\n",
+        );
         return out;
     }
     for deployment in inventory.deployments.values() {
@@ -436,7 +349,7 @@ fn at(view: &InferenceView, ms: i64) -> String {
 /// One deployment's phase as Cairn holds it, in one sentence.
 fn phase_summary(view: &InferenceView, id: &DeploymentId) -> String {
     let Some(row) = view.deployment_control.states.get(id) else {
-        return "never acted on by Cairn, so it is neither probed nor reserved (bginf may be running it)".into();
+        return "never acted on by Cairn, so it is neither probed nor reserved; whatever answers there now was not started by Cairn".into();
     };
     match &row.phase {
         DeploymentPhase::Stopped { since_ms } => format!("stopped since {}", at(view, *since_ms)),
@@ -609,111 +522,26 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     }
     let _ = write!(
         out,
-        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` reserves every machine above at once, then runs the recipe's start command on the head once each has room.\n- stop: the same with `action:\"stop\"` runs the recipe's stop command on the head and waits for the health check to stop answering.\n- While Cairn controls this deployment, bginf must not: pin bginf's pool `{pool}` to `off` or stop its ctl, or ctl's reconcile loop will start or stop it behind Cairn's back.\n"
+        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` reserves every machine above at once, then runs the recipe's start command on the head once each has room.\n- stop: the same with `action:\"stop\"` runs the recipe's stop command on the head and waits for the health check to stop answering.\n- While it holds its machines, a write to cairn://inference may not remove it or move it to other machines; stop it first. A changed start or stop command takes effect at the next start or stop.\n"
     );
     out
 }
 
-fn pool_records(
-    out: &mut String,
-    view: &InferenceView,
-    pool: &Pool,
-    state: Option<&State>,
-    map: &MachineMap,
-) {
+fn pool_records(out: &mut String, view: &InferenceView, pool: &Pool) {
+    let _ = writeln!(out, "- source: {}", source_label(pool.source));
     out.push_str("- machines:\n");
     for machine in &pool.machines {
         let address = machine.address.as_deref().unwrap_or("address unknown");
-        let power = match state {
-            None => "power unknown".to_string(),
-            Some(state) => match state.power.get(&map.bginf(&machine.name)) {
-                None => "no outlet bginf manages, so always powered".to_string(),
-                Some(power) => format!(
-                    "bginf wants power {}{}",
-                    power.desired,
-                    power
-                        .phase
-                        .as_deref()
-                        .map(|phase| format!(", phase {phase}"))
-                        .unwrap_or_default()
-                ),
-            },
-        };
         let _ = writeln!(
             out,
-            "  - `{}`: {}; {address}; {power}",
+            "  - `{}`: {}; {address}",
             machine.name,
             enrolment(view, &machine.name)
         );
     }
     let pin = pool.pin.as_ref().map_or("none".to_string(), set_label);
-    let _ = writeln!(out, "- pin (mirrored): {pin}");
-    let _ = writeln!(out, "- default (mirrored): {}", set_label(&pool.default));
-}
-
-fn cairn_line(out: &mut String, cairn: &CairnSide) {
-    let _ = writeln!(
-        out,
-        "- Cairn: desired {}; because {}; converged {}",
-        set_label(&cairn.resolution.desired),
-        cairn.resolution.reason,
-        yes_no(cairn.converged)
-    );
-}
-
-fn bginf_line(out: &mut String, bginf: &PoolState) {
-    let running = bginf
-        .running
-        .as_ref()
-        .map_or("nothing".to_string(), ToString::to_string);
-    let _ = writeln!(
-        out,
-        "- bginf: desired `{}`; reason {:?}; running {running}; converged {}",
-        bginf.desired,
-        bginf.reason,
-        yes_no(bginf.converged)
-    );
-}
-
-fn verdict_line(verdict: &Verdict) -> String {
-    match verdict {
-        Verdict::Agree => "agree".to_string(),
-        Verdict::Disagree(differences) => format!(
-            "DISAGREE: {}",
-            differences
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-    }
-}
-
-fn comparison_section(
-    out: &mut String,
-    view: &InferenceView,
-    comparison: &PoolComparison,
-    state: &State,
-    map: &MachineMap,
-) {
-    let _ = writeln!(out, "## {}\n", comparison.pool);
-    let _ = writeln!(out, "- verdict: {}", verdict_line(&comparison.verdict));
-    let pool = view.inventory.pools.get(&comparison.pool);
-    if let Some(pool) = pool {
-        pool_records(out, view, pool, Some(state), map);
-    }
-    match &comparison.cairn {
-        Some(cairn) => cairn_line(out, cairn),
-        None => out.push_str("- Cairn: no record of this pool\n"),
-    }
-    match &comparison.bginf {
-        Some(bginf) => bginf_line(out, bginf),
-        None => out.push_str("- bginf: does not report this pool\n"),
-    }
-    if let Some(pool) = pool {
-        control_lines(out, view, pool);
-    }
-    out.push('\n');
+    let _ = writeln!(out, "- pin (record): {pin}");
+    let _ = writeln!(out, "- default: {}", set_label(&pool.default));
 }
 
 fn control_set(set: &DeploymentSet) -> String {
@@ -755,7 +583,7 @@ fn control_lines(out: &mut String, view: &InferenceView, pool: &Pool) {
     let Some(control) = control_view.controls.get(&pool.id) else {
         let _ = writeln!(
             out,
-            "- Cairn's control: not taken, so bginf decides this pool; patch this resource with {{pool:\"{}\", controlled:true}} to take it",
+            "- Cairn's control: not taken, so nothing decides this pool and its deployments start and stop only from their own pages; patch this resource with {{pool:\"{}\", controlled:true}} to take it",
             pool.id
         );
         return;
@@ -771,7 +599,7 @@ fn control_lines(out: &mut String, view: &InferenceView, pool: &Pool) {
     );
     let Some(planned) = control_view.plans.get(&pool.id) else {
         out.push_str(
-            "- Cairn's control: handed back, so bginf decides this pool; its settings are kept\n",
+            "- Cairn's control: handed back, so nothing decides this pool; its settings are kept\n",
         );
         let _ = writeln!(out, "{settings_line}");
         return;
@@ -786,13 +614,6 @@ fn control_lines(out: &mut String, view: &InferenceView, pool: &Pool) {
         plan.resolution.slot.as_str(),
         plan.resolution.reason.describe(now)
     );
-    if pool.pin.as_ref().is_none_or(|pin| !pin.is_empty()) {
-        let _ = writeln!(
-            out,
-            "- warning: bginf still drives this pool (its pin is {}, not off); pin bginf to nothing for this pool or stop it, or bginf and Cairn will fight over it",
-            pool.pin.as_ref().map_or("unset".to_string(), set_label)
-        );
-    }
     match &plan.control.pin {
         None => out.push_str("- Cairn pin: none\n"),
         Some(pin) => {
@@ -845,28 +666,15 @@ pub(crate) fn render_pools(view: &InferenceView, params: &[QueryParam]) -> Strin
         return error;
     }
     let mut out = String::from("# Inference pools\n\n");
-    out.push_str(&link_status(view));
-    out.push('\n');
-    let map = map_of(view);
-    let state = view.link.as_ref().and_then(LinkRow::state);
-    match &state {
-        Some(state) => {
-            for comparison in bginf_compare::compare(&view.inventory, state, &map) {
-                comparison_section(&mut out, view, &comparison, state, &map);
-            }
-        }
-        None if view.inventory.pools.is_empty() => {
-            out.push_str("No pools yet. They appear once bginf has been read.\n");
-        }
-        None => {
-            for pool in view.inventory.pools.values() {
-                let _ = writeln!(out, "## {}\n", pool.id);
-                out.push_str("- verdict: no bginf read to compare against\n");
-                pool_records(&mut out, view, pool, None, &map);
-                control_lines(&mut out, view, pool);
-                out.push('\n');
-            }
-        }
+    if view.inventory.pools.is_empty() {
+        out.push_str("No pools yet. Write them by replacing or patching cairn://inference.\n");
+        return out;
+    }
+    for pool in view.inventory.pools.values() {
+        let _ = writeln!(out, "## {}\n", pool.id);
+        pool_records(&mut out, view, pool);
+        control_lines(&mut out, view, pool);
+        out.push('\n');
     }
     out
 }
@@ -932,68 +740,29 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_config::inference::BginfLinkSettings;
-    use cairn_inference::bginf::{import, Profiles, Topology};
+    use cairn_inference::{Inventory, RecordSource};
     use std::collections::BTreeMap;
 
     const NOW: i64 = 1_800_000_000_000;
 
-    fn profiles() -> Profiles {
-        serde_json::from_value(serde_json::json!({
-            "dsv4f-tp2": {"id": "dsv4f-tp2", "nodes": ["sp1", "sp2"], "head": "sp1",
-                "start": "./start.sh --port 8888", "stop": "./stop.sh", "engine": "vllm",
-                "health": "http://192.0.2.40:8888/v1/models", "api_base": "http://192.0.2.40:8888/v1"},
-            "qwen36-fast": {"id": "qwen36-fast", "nodes": ["sp1"], "head": "sp1",
-                "start": "./start.sh --port 8001", "stop": "./stop.sh",
-                "health": "http://192.0.2.40:8001/v1/models", "api_base": "http://192.0.2.40:8001/v1"},
-            "qwen3-embed-4b": {"id": "qwen3-embed-4b", "nodes": ["halo"], "head": "halo",
-                "start": "./start.sh --port 8090", "stop": "./stop.sh",
-                "health": "http://192.0.2.43:8090/health", "api_base": "http://192.0.2.43:8090/v1"},
-            "off": {"id": "off", "nodes": []}
-        }))
-        .unwrap()
-    }
+    const INVENTORY: &str = r#"
+recipes:
+  - {id: dsv4f-tp2, model: {name: dsv4f-tp2}, servedName: dsv4f-tp2, engine: {kind: command, start: ./start.sh --port 8888, stop: ./stop.sh, description: vllm}, requirements: {machines: 2}}
+  - {id: qwen36-fast, model: {name: qwen36-fast}, servedName: qwen36-fast, engine: {kind: command, start: ./start.sh --port 8001, stop: ./stop.sh}, requirements: {machines: 1}}
+  - {id: qwen3-embed-4b, model: {name: qwen3-embed-4b}, servedName: qwen3-embed-4b, engine: {kind: command, start: ./start.sh --port 8090, stop: ./stop.sh}, requirements: {machines: 1}}
+deployments:
+  - {id: dsv4f-tp2, recipe: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen36-fast, recipe: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+pools:
+  - {id: sparks, machines: [{name: sp1, address: 192.0.2.40}, {name: sp2}], default: [dsv4f-tp2]}
+  - {id: halo, machines: [{name: fedora, address: 192.0.2.43}], default: [qwen3-embed-4b]}
+"#;
 
-    fn state(sparks_reason: &str) -> serde_json::Value {
-        serde_json::json!({
-            "pools": {
-                "sparks": {"desired": "dsv4f-tp2", "reason": sparks_reason, "pin": null,
-                           "default": "dsv4f-tp2", "running": "dsv4f-tp2", "converged": true,
-                           "nodes": ["sp1", "sp2"]},
-                "halo": {"desired": "qwen3-embed-4b", "reason": "default", "pin": null,
-                         "default": "qwen3-embed-4b", "running": "qwen3-embed-4b", "converged": true,
-                         "nodes": ["halo"]}
-            },
-            "power": {"sp1": {"desired": "on", "phase": "on"}, "sp2": {"desired": "on", "phase": "on"}},
-            "nodes": {
-                "sp1": {"running": "dsv4f-tp2", "healthy": true, "stale": false},
-                "sp2": {"running": "dsv4f-tp2", "healthy": true, "stale": false},
-                "halo": {"running": "qwen3-embed-4b", "healthy": true, "stale": false}
-            }
-        })
-    }
-
-    fn link() -> BginfLinkSettings {
-        BginfLinkSettings {
-            url: "http://ctl.example:4100".into(),
-            machines: BTreeMap::from([("halo".to_string(), "fedora".to_string())]),
-        }
-    }
-
-    fn view(state_json: serde_json::Value, row: impl FnOnce(&mut LinkRow)) -> InferenceView {
-        let parsed: State = serde_json::from_value(state_json.clone()).unwrap();
-        let imported = import(&profiles(), Topology::Live(&parsed), &machine_map(&link()));
-        let mut link_row = LinkRow {
-            last_attempt_at: Some(NOW - 12_000),
-            last_ok_at: Some(NOW - 12_000),
-            state_json: Some(state_json.to_string()),
-            ..LinkRow::default()
-        };
-        row(&mut link_row);
+    fn view() -> InferenceView {
         InferenceView {
-            config: LinkConfig::Configured(link()),
-            link: Some(link_row),
-            inventory: imported.inventory,
+            inventory: Inventory::from_yaml(INVENTORY).unwrap(),
+            retired_link_setting: false,
             executors: BTreeMap::from([("fedora".to_string(), true)]),
             control: Default::default(),
             deployment_control: Default::default(),
@@ -1002,88 +771,61 @@ mod tests {
     }
 
     #[test]
-    fn the_pools_page_agrees_pool_by_pool() {
-        let page = render_pools(&view(state("default"), |_| {}), &[]);
+    fn the_pools_page_shows_each_pools_records() {
+        let page = render_pools(&view(), &[]);
         assert!(
-            page.contains("- bginf last read 2027-01-15 07:59:48 UTC (12s ago)"),
-            "{page}"
-        );
-        assert_eq!(page.matches("- verdict: agree").count(), 2, "{page}");
-        assert!(page.contains("- `fedora`: enrolled executor (attached); 192.0.2.43; no outlet bginf manages, so always powered"), "{page}");
-        assert!(
-            page.contains("- `sp2`: not enrolled; address unknown; bginf wants power on, phase on"),
+            page.contains("- `fedora`: enrolled executor (attached); 192.0.2.43\n"),
             "{page}"
         );
         assert!(
-            page.contains("- Cairn: desired `dsv4f-tp2`; because default; converged yes"),
+            page.contains("- `sp2`: not enrolled; address unknown\n"),
             "{page}"
         );
-        assert!(page.contains("- bginf: desired `dsv4f-tp2`; reason \"default\"; running dsv4f-tp2; converged yes"), "{page}");
+        assert!(page.contains("- default: `dsv4f-tp2`"), "{page}");
+        assert!(page.contains("- pin (record): none"), "{page}");
+        assert!(!page.contains("bginf"), "{page}");
     }
 
     #[test]
-    fn a_disagreement_is_shown_not_corrected() {
-        let page = render_pools(&view(state("pin"), |_| {}), &[]);
-        assert!(
-            page.contains("- verdict: DISAGREE: reason: Cairn \"default\", bginf \"pin\""),
-            "{page}"
-        );
-        assert!(
-            page.contains("- Cairn: desired `dsv4f-tp2`; because default"),
-            "{page}"
-        );
-    }
-
-    #[test]
-    fn an_unreachable_bginf_shows_the_last_read_with_its_age() {
-        let page = render_pools(
-            &view(state("default"), |row| {
-                row.last_attempt_at = Some(NOW - 5_000);
-                row.failing_since = Some(NOW - 95_000);
-                row.last_error = Some("GET /state: connection refused".into());
-                row.last_ok_at = Some(NOW - 125_000);
-            }),
-            &[],
-        );
-        assert!(page.contains("- bginf unreachable since 2027-01-15 07:58:25 UTC (1m ago): GET /state: connection refused"), "{page}");
-        assert!(
-            page.contains(
-                "- showing the last successful read, from 2027-01-15 07:57:55 UTC (2m old)"
-            ),
-            "{page}"
-        );
-        assert_eq!(page.matches("- verdict: agree").count(), 2, "{page}");
-    }
-
-    #[test]
-    fn an_unconfigured_link_names_what_is_missing() {
+    fn an_empty_inventory_says_where_records_are_written() {
         let view = InferenceView {
-            config: LinkConfig::Missing {
-                setting: true,
-                account: true,
-            },
-            link: None,
             inventory: Default::default(),
-            executors: BTreeMap::new(),
-            control: Default::default(),
-            deployment_control: Default::default(),
-            now_ms: NOW,
+            ..view()
         };
         let page = render_pools(&view, &[]);
-        assert!(page.contains("- bginf link: not configured; missing the `inference.bginf` section of cairn://settings and a `bginf` account"), "{page}");
-        assert!(page.contains("No pools yet."), "{page}");
+        assert!(
+            page.contains("No pools yet. Write them by replacing or patching cairn://inference."),
+            "{page}"
+        );
         let index = render_index(&view, &[]);
         assert!(index.contains("- `cairn://inference/pools`"), "{index}");
+        assert!(index.contains("- records: 0 recipes"), "{index}");
+    }
+
+    #[test]
+    fn the_index_says_what_is_left_of_bginf_until_it_is_cleared() {
+        let mut view = view();
+        assert!(!render_index(&view, &[]).contains("bginf"));
+        view.inventory.pools.get_mut(&"halo".into()).unwrap().source = RecordSource::Bginf;
+        view.retired_link_setting = true;
+        let index = render_index(&view, &[]);
+        assert!(
+            index.contains("- 1 records are still mirrored from bginf and read-only (pool halo (bginf)); adopt them as Cairn's own"),
+            "{index}"
+        );
+        assert!(index.contains("payload:{adopt:\"bginf\"}"), "{index}");
+        assert!(
+            index.contains("settings.yaml still names the retired bginf link"),
+            "{index}"
+        );
     }
 
     #[test]
     fn recipes_and_deployments_state_their_unknowns() {
-        let view = view(state("default"), |_| {});
+        let view = view();
         let recipes = render_recipes(&view, &[]);
-        assert!(
-            recipes.contains("- verbs: unknown (imported from bginf)"),
-            "{recipes}"
-        );
+        assert!(recipes.contains("- verbs: unknown\n"), "{recipes}");
+        assert!(recipes.contains("- source: cairn\n"), "{recipes}");
         assert!(recipes.contains("  - accelerator: unknown"), "{recipes}");
         assert!(recipes.contains("    ./start.sh --port 8888"), "{recipes}");
         let deployments = render_deployments(&view, &[]);
@@ -1109,8 +851,7 @@ mod tests {
         use cairn_inference::pool_control::{
             BuildPressure, Observed, PoolControl, PoolSettings, Request,
         };
-        let mut view = view(state("default"), |_| {});
-        view.inventory.pools.get_mut(&"sparks".into()).unwrap().pin = Some(DeploymentSet::new());
+        let mut view = view();
         let pool = view.inventory.pools[&"sparks".into()].clone();
         let phases = BTreeMap::from([(
             "dsv4f-tp2".into(),
@@ -1209,11 +950,7 @@ mod tests {
             "{page}"
         );
         assert!(
-            !page.contains("warning: bginf"),
-            "bginf is pinned off: {page}"
-        );
-        assert!(
-            page.contains("- Cairn's control: not taken, so bginf decides this pool; patch this resource with {pool:\"halo\", controlled:true} to take it"),
+            page.contains("- Cairn's control: not taken, so nothing decides this pool and its deployments start and stop only from their own pages; patch this resource with {pool:\"halo\", controlled:true} to take it"),
             "{page}"
         );
     }
@@ -1238,7 +975,7 @@ mod tests {
     #[test]
     fn a_deployment_page_shows_its_phase_holds_memory_and_loads() {
         use crate::orchestrator::inference_control::{MachineReading, StateRow};
-        let mut view = view(state("default"), |_| {});
+        let mut view = view();
         let page = render_deployment(&view, "dsv4f-tp2", &[]);
         assert!(
             page.contains("- phase: never acted on by Cairn, so it is neither probed nor reserved"),
@@ -1307,7 +1044,9 @@ mod tests {
             "{page}"
         );
         assert!(
-            page.contains("pin bginf's pool `sparks` to `off`"),
+            page.contains(
+                "a write to cairn://inference may not remove it or move it to other machines"
+            ),
             "{page}"
         );
 
@@ -1321,7 +1060,7 @@ mod tests {
 
     #[test]
     fn the_index_exports_yaml_on_request() {
-        let view = view(state("default"), |_| {});
+        let view = view();
         let format = QueryParam {
             key: "format".into(),
             value: "yaml".into(),

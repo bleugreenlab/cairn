@@ -556,6 +556,7 @@ impl EmbedSource for DeviceTokenGateway {
                 capabilities: &capabilities,
                 request,
                 timeout: cairn_models::interface::embed::EMBED_TIMEOUT,
+                cancel: None,
             },
         )
     }

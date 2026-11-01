@@ -53,7 +53,7 @@ pub async fn invoke_definition(
     caller: ResponseCaller,
 ) -> Result<ResponseOutcome, ResponseError> {
     definition.validate().map_err(ResponseError::Upstream)?;
-    let (caller_kind, caller_label, caller_run_id, project_id, project_path) = caller.fields();
+    let (_, _, _, project_id, project_path) = caller.fields();
     // Runtime eligibility is the backend's own account and model check, made
     // before anything launches, exactly as for a named response. The closed
     // catalog check (`validate_runnable_model`) is for authoring: a built-in's
@@ -61,86 +61,19 @@ pub async fn invoke_definition(
     // journaled like any other failure, so history shows why it never ran.
     let attempt =
         complete_definition(orch, definition, args, project_id, project_path, None, None).await?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let args_json = serde_json::to_string(args).ok();
     let scope_key = project_id
         .map(|id| format!("project:{id}"))
         .unwrap_or_else(|| "workspace".into());
-
-    match attempt.result {
-        Ok(outcome) => {
-            let record = crate::storage::insert_response_invocation(
-                &orch.db.local,
-                NewResponseInvocation {
-                    response_id: response_id.to_string(),
-                    scope_key,
-                    project_id: project_id.map(str::to_owned),
-                    caller_kind: caller_kind.into(),
-                    caller_label: caller_label.map(str::to_owned),
-                    caller_run_id: caller_run_id.map(str::to_owned),
-                    rendered_prompt: attempt.rendered,
-                    args_json,
-                    status: "ok".into(),
-                    output_text: Some(outcome.text.clone()),
-                    error: None,
-                    model: Some(outcome.model.clone()),
-                    backend: Some(outcome.backend.clone()),
-                    latency_ms: Some(outcome.latency_ms as i64),
-                    input_tokens: outcome.input_tokens.map(|value| value as i64),
-                    output_tokens: outcome.output_tokens.map(|value| value as i64),
-                    cost: outcome.cost,
-                    created_at: now,
-                    account_id: outcome.account_id.clone(),
-                },
-            )
-            .await
-            .map_err(|error| {
-                ResponseError::Upstream(format!("failed to persist response history: {error}"))
-            })?;
-            Ok(ResponseOutcome {
-                seq: record.seq,
-                text: outcome.text,
-                parsed: outcome.parsed,
-                model: outcome.model,
-                backend: outcome.backend,
-                latency_ms: outcome.latency_ms,
-                cost: outcome.cost,
-            })
-        }
-        Err(AttemptFailure { error, account_id }) => {
-            crate::storage::insert_response_invocation(
-                &orch.db.local,
-                NewResponseInvocation {
-                    response_id: response_id.to_string(),
-                    scope_key,
-                    project_id: project_id.map(str::to_owned),
-                    caller_kind: caller_kind.into(),
-                    caller_label: caller_label.map(str::to_owned),
-                    caller_run_id: caller_run_id.map(str::to_owned),
-                    rendered_prompt: attempt.rendered,
-                    args_json,
-                    status: "failed".into(),
-                    output_text: None,
-                    error: Some(error.to_string()),
-                    model: Some(attempt.model.to_string()),
-                    backend: Some(attempt.backend),
-                    latency_ms: None,
-                    input_tokens: None,
-                    output_tokens: None,
-                    cost: None,
-                    created_at: now,
-                    account_id,
-                },
-            )
-            .await
-            .map_err(|storage_error| {
-                ResponseError::Upstream(format!(
-                    "{error}; additionally failed to persist response history: {storage_error}"
-                ))
-            })?;
-            Err(error)
-        }
-    }
+    record_attempt(
+        orch,
+        response_id,
+        scope_key,
+        project_id.map(str::to_owned),
+        &caller,
+        serde_json::to_string(args).ok(),
+        attempt,
+    )
+    .await
 }
 
 fn saved_discovery_selection(
@@ -393,6 +326,8 @@ pub struct ResponseOutcome {
     pub backend: String,
     pub latency_ms: u64,
     pub cost: Option<f64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// A caller's bound on a whole model call, and what decided it.
@@ -813,7 +748,7 @@ pub async fn invoke(
     bound: Option<&InvocationBound>,
     interrupt: Option<&InvocationInterrupt>,
 ) -> Result<ResponseOutcome, ResponseError> {
-    let (caller_kind, caller_label, caller_run_id, project_id, project_path) = caller.fields();
+    let (_, _, _, project_id, project_path) = caller.fields();
     let file = crate::config::responses::get_response(&orch.config_dir, id, project_path)
         .map_err(ResponseError::Upstream)?
         .ok_or_else(|| ResponseError::UnknownResponse(id.to_string()))?;
@@ -844,17 +779,80 @@ pub async fn invoke(
         interrupt,
     )
     .await?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let args_json = serde_json::to_string(args).ok();
+    record_attempt(
+        orch,
+        id,
+        scope_key,
+        definition_project_id,
+        &caller,
+        serde_json::to_string(args).ok(),
+        attempt,
+    )
+    .await
+}
 
+/// Run one completion its caller prepared, with the model it pins, and journal
+/// it under `response_id` as any response is: the door behind
+/// `run cairn://models/complete`. `definition` contributes only what it governs
+/// on this path: the output contract and the per-request timeout.
+pub(crate) async fn invoke_prepared(
+    orch: &Orchestrator,
+    definition: &ResponseDefinition,
+    prepared: PreparedCompletion,
+    response_id: &str,
+    caller: ResponseCaller,
+    args: &Value,
+    bound: Option<&InvocationBound>,
+    interrupt: Option<&InvocationInterrupt>,
+) -> Result<ResponseOutcome, ResponseError> {
+    let (_, _, _, project_id, _) = caller.fields();
+    let scope_key = project_id
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "workspace".into());
+    let journal_project_id = project_id.map(str::to_owned);
+    let attempt = execute_completion(
+        orch,
+        definition,
+        prepared,
+        bound,
+        interrupt,
+        completion_executor(orch),
+    )
+    .await;
+    record_attempt(
+        orch,
+        response_id,
+        scope_key,
+        journal_project_id,
+        &caller,
+        serde_json::to_string(args).ok(),
+        attempt,
+    )
+    .await
+}
+
+/// Journal a finished attempt under `response_id` and answer it: the one record
+/// every completion leaves, whoever asked. A failure is journaled too, so the
+/// history says why a call never answered.
+async fn record_attempt(
+    orch: &Orchestrator,
+    response_id: &str,
+    scope_key: String,
+    journal_project_id: Option<String>,
+    caller: &ResponseCaller,
+    args_json: Option<String>,
+    attempt: CompletionAttempt,
+) -> Result<ResponseOutcome, ResponseError> {
+    let (caller_kind, caller_label, caller_run_id, _, _) = caller.fields();
+    let now = chrono::Utc::now().timestamp_millis();
     match attempt.result {
         Ok(outcome) => {
             let record = crate::storage::insert_response_invocation(
                 &orch.db.local,
                 NewResponseInvocation {
-                    response_id: id.to_string(),
+                    response_id: response_id.to_string(),
                     scope_key,
-                    project_id: definition_project_id,
+                    project_id: journal_project_id,
                     caller_kind: caller_kind.into(),
                     caller_label: caller_label.map(str::to_owned),
                     caller_run_id: caller_run_id.map(str::to_owned),
@@ -885,15 +883,17 @@ pub async fn invoke(
                 backend: outcome.backend,
                 latency_ms: outcome.latency_ms,
                 cost: outcome.cost,
+                input_tokens: outcome.input_tokens,
+                output_tokens: outcome.output_tokens,
             })
         }
         Err(AttemptFailure { error, account_id }) => {
             let journaled = crate::storage::insert_response_invocation(
                 &orch.db.local,
                 NewResponseInvocation {
-                    response_id: id.to_string(),
+                    response_id: response_id.to_string(),
                     scope_key,
-                    project_id: definition_project_id,
+                    project_id: journal_project_id,
                     caller_kind: caller_kind.into(),
                     caller_label: caller_label.map(str::to_owned),
                     caller_run_id: caller_run_id.map(str::to_owned),
@@ -914,7 +914,10 @@ pub async fn invoke(
             )
             .await;
             if let Some(detached) = attempt.detached {
-                detached.watch(id, journaled.as_ref().ok().map(|row| row.id.as_str()));
+                detached.watch(
+                    response_id,
+                    journaled.as_ref().ok().map(|row| row.id.as_str()),
+                );
             }
             journaled.map_err(|storage_error| {
                 ResponseError::Upstream(format!(
@@ -935,20 +938,6 @@ async fn complete_definition(
     bound: Option<&InvocationBound>,
     interrupt: Option<&InvocationInterrupt>,
 ) -> Result<CompletionAttempt, ResponseError> {
-    #[cfg(test)]
-    if let Some(executor) = test_completion::executor_for(&orch.config_dir) {
-        return complete_definition_with_executor(
-            orch,
-            definition,
-            args,
-            project_id,
-            project_path,
-            bound,
-            interrupt,
-            executor,
-        )
-        .await;
-    }
     complete_definition_with_executor(
         orch,
         definition,
@@ -957,37 +946,50 @@ async fn complete_definition(
         project_path,
         bound,
         interrupt,
-        Arc::new(|backend_name, request, orch| {
-            // Run-time eligibility, in order: the workspace has the provider
-            // installed, an account can serve it, and (at the launch door) the
-            // model serves completions. Catalog membership is an authoring
-            // concern and is not checked.
-            if !orch.provider_enabled(&backend_name) {
-                return Err(ResponseError::BackendUnavailable(format!(
-                    "the {backend_name} provider isn't enabled in this workspace; enable it in Settings → Providers"
-                ))
-                .into());
-            }
-            let backend = backend_for_name(Some(&backend_name));
-            backend
-                .response_completion_availability(orch, request.project_id.as_deref())
-                .map_err(ResponseError::BackendUnavailable)?;
-            backend
-                .response_model_availability(orch, request.project_id.as_deref(), &request.model)
-                .map_err(ResponseError::BackendUnavailable)?;
-            crate::backends::launch::complete(orch, &backend_name, backend.as_ref(), request)
-                .map_err(|error| match error {
-                    crate::backends::launch::LaunchError::Unserved(refusal) => {
-                        ResponseError::Unserved(refusal.to_string()).into()
-                    }
-                    crate::backends::launch::LaunchError::Completion(failure) => AttemptFailure {
-                        error: map_completion_error(failure.error),
-                        account_id: failure.account_id,
-                    },
-                })
-        }),
+        completion_executor(orch),
     )
     .await
+}
+
+/// How a completion is sent: through the sealed launch door
+/// ([`crate::backends::launch::complete`]) after the workspace's own
+/// eligibility checks. Tests may substitute their own.
+fn completion_executor(orch: &Orchestrator) -> CompletionExecutor {
+    #[cfg(test)]
+    if let Some(executor) = test_completion::executor_for(&orch.config_dir) {
+        return executor;
+    }
+    let _ = orch;
+    Arc::new(|backend_name, request, orch| {
+        // Run-time eligibility, in order: the workspace has the provider
+        // installed, an account can serve it, and (at the launch door) the
+        // model serves completions. Catalog membership is an authoring
+        // concern and is not checked.
+        if !orch.provider_enabled(&backend_name) {
+            return Err(ResponseError::BackendUnavailable(format!(
+                "the {backend_name} provider isn't enabled in this workspace; enable it in Settings → Providers"
+            ))
+            .into());
+        }
+        let backend = backend_for_name(Some(&backend_name));
+        backend
+            .response_completion_availability(orch, request.project_id.as_deref())
+            .map_err(ResponseError::BackendUnavailable)?;
+        backend
+            .response_model_availability(orch, request.project_id.as_deref(), &request.model)
+            .map_err(ResponseError::BackendUnavailable)?;
+        crate::backends::launch::complete(orch, &backend_name, backend.as_ref(), request).map_err(
+            |error| match error {
+                crate::backends::launch::LaunchError::Unserved(refusal) => {
+                    ResponseError::Unserved(refusal.to_string()).into()
+                }
+                crate::backends::launch::LaunchError::Completion(failure) => AttemptFailure {
+                    error: map_completion_error(failure.error),
+                    account_id: failure.account_id,
+                },
+            },
+        )
+    })
 }
 
 type CompletionExecutor = Arc<
@@ -1011,14 +1013,6 @@ async fn complete_definition_with_executor(
     interrupt: Option<&InvocationInterrupt>,
     executor: CompletionExecutor,
 ) -> Result<CompletionAttempt, ResponseError> {
-    let deadline = bound.map(|bound| (tokio::time::Instant::now() + bound.limit, bound));
-    let mut interrupt = interrupt.cloned();
-    let interrupted =
-        |interruption: Interruption| interruption.into_error(bound, definition.timeout);
-    let outlived = |bound: &InvocationBound| ResponseError::OutlivedBound {
-        bound: bound.clone(),
-        declared: definition.timeout,
-    };
     let rendered = definition.render(args).map_err(classify_render_error)?;
     let (model, extras, backend_name) = if let Some(model) = &definition.model {
         let preset = Preset {
@@ -1077,7 +1071,7 @@ async fn complete_definition_with_executor(
         role: CompletionRole::User,
         content: rendered.clone(),
     });
-    let mut request = CompletionRequest {
+    let request = CompletionRequest {
         system: None,
         messages,
         model: model.to_string(),
@@ -1085,6 +1079,61 @@ async fn complete_definition_with_executor(
         options: extras,
         output_schema: output_schema.clone(),
         timeout: definition.timeout,
+    };
+    Ok(execute_completion(
+        orch,
+        definition,
+        PreparedCompletion {
+            rendered,
+            model,
+            backend: backend_name,
+            request,
+            output_schema,
+        },
+        bound,
+        interrupt,
+        executor,
+    )
+    .await)
+}
+
+/// A completion ready to send, and what its journal row records it as.
+pub(crate) struct PreparedCompletion {
+    /// The prompt as the journal shows it.
+    pub(crate) rendered: String,
+    pub(crate) model: Model,
+    pub(crate) backend: String,
+    pub(crate) request: CompletionRequest,
+    pub(crate) output_schema: Option<Value>,
+}
+
+/// Send a prepared completion through `executor` and keep the answer that meets
+/// `definition`'s output contract: one retry naming the violation when it does
+/// not, the caller's `bound` and `interrupt` ending it early, and a request
+/// still running when the caller is released handed back as detached. Every
+/// completion takes this path, a named response's and a model door's alike.
+async fn execute_completion(
+    orch: &Orchestrator,
+    definition: &ResponseDefinition,
+    prepared: PreparedCompletion,
+    bound: Option<&InvocationBound>,
+    interrupt: Option<&InvocationInterrupt>,
+    executor: CompletionExecutor,
+) -> CompletionAttempt {
+    let PreparedCompletion {
+        rendered,
+        model,
+        backend: backend_name,
+        mut request,
+        output_schema,
+    } = prepared;
+    let deadline = bound.map(|bound| (tokio::time::Instant::now() + bound.limit, bound));
+    let mut interrupt = interrupt.cloned();
+    let interrupted =
+        |interruption: Interruption| interruption.into_error(bound, definition.timeout);
+    let outlived = |bound: &InvocationBound| ResponseError::OutlivedBound {
+        bound: bound.clone(),
+        declared: definition.timeout,
     };
     // The failure that ends the call is the last attempt's, account and all: a
     // retry that ran on a different account replaces the first one's.
@@ -1228,7 +1277,7 @@ async fn complete_definition_with_executor(
             }
         }
     }
-    Ok(CompletionAttempt {
+    CompletionAttempt {
         rendered,
         model,
         backend: backend_name,
@@ -1238,7 +1287,7 @@ async fn complete_definition_with_executor(
             })
         }),
         detached,
-    })
+    }
 }
 
 fn classify_render_error(error: String) -> ResponseError {

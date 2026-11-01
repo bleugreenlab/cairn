@@ -856,13 +856,6 @@ fn apply_patch(
             control
         }
     };
-    if patch.controlled == Some(true) && pool.pin.as_ref().is_none_or(|pin| !pin.is_empty()) {
-        lines.push(format!(
-            "warning: bginf still drives pool {} (its pin is {}, not off); pin bginf to nothing for this pool or stop it, or bginf and Cairn will fight over it",
-            pool.id,
-            pool.pin.as_ref().map_or("unset".to_string(), set_label)
-        ));
-    }
     if patch.controlled == Some(false) && control.controlled {
         control.controlled = false;
         lines.push(format!(
@@ -936,14 +929,12 @@ mod tests {
         let yaml = r#"
 recipes:
   - id: dsv4f-tp2
-    source: bginf
     model: {name: DeepSeek V4 Flash}
     servedName: deepseek-v4-flash
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 2}
 deployments:
   - id: dsv4f-tp2
-    source: bginf
     recipe: dsv4f-tp2
     machines: [sp1, sp2]
     head: sp1
@@ -952,10 +943,8 @@ deployments:
     healthPath: /v1/models
 pools:
   - id: sparks
-    source: bginf
     machines: [{name: sp1}, {name: sp2}]
     default: [dsv4f-tp2]
-    pin: []
 "#;
         Inventory::from_yaml(yaml).unwrap()
     }
@@ -1029,9 +1018,10 @@ pools:
             lines[0],
             "took control of pool sparks: the controller now decides its desired set, starting from dsv4f-tp2 (what the act side knows is healthy); a deployment of the pool Cairn has never acted on is stopped, which brings it under probing"
         );
+        assert_eq!(lines.len(), 2, "took control, then the settings: {lines:?}");
         assert!(
-            !lines.iter().any(|l| l.starts_with("warning")),
-            "bginf is pinned off for the pool: {lines:?}"
+            lines[1].starts_with("settings for pool sparks:"),
+            "{lines:?}"
         );
 
         let back = PoolPatch {
@@ -1071,36 +1061,6 @@ pools:
         );
         assert_eq!(control.settings.min_residency_secs, Some(900));
         assert_eq!(control.generation, 3, "the generation never goes back");
-    }
-
-    #[test]
-    fn taking_control_warns_while_bginf_still_drives_the_pool() {
-        let mut inventory = inventory();
-        inventory
-            .pools
-            .get_mut(&PoolId::from("sparks"))
-            .unwrap()
-            .pin = None;
-        let take = PoolPatch {
-            pool: "sparks".into(),
-            controlled: Some(true),
-            ..PoolPatch::default()
-        };
-        let (_, lines) = apply_patch(
-            sparks(&inventory),
-            &inventory,
-            None,
-            &take,
-            "operator",
-            &BTreeMap::new(),
-            None,
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            lines[1],
-            "warning: bginf still drives pool sparks (its pin is unset, not off); pin bginf to nothing for this pool or stop it, or bginf and Cairn will fight over it"
-        );
     }
 
     #[test]
@@ -1308,7 +1268,7 @@ pools:
             assert_eq!(sent(&heads).last(), Some(&(QWEN.to_string(), "stop")));
             assert!(
                 !known(&db, DSV4F).await,
-                "the start is refused while qwen36-fast still holds bginf-sp1"
+                "the start is refused while qwen36-fast still holds {SP1}"
             );
 
             pass(&db, &heads, &no_builds, 40_000).await.unwrap();
@@ -1369,6 +1329,132 @@ pools:
             pass(&db, &heads, &no_builds, 90_000).await.unwrap();
             assert_eq!(phase(&db, QWEN).await.label(), "stopping");
             assert_eq!(sent(&heads).last(), Some(&(QWEN.to_string(), "stop")));
+        }
+
+        const FEDORA: &str = "fedora";
+        const EMBED: &str = "qwen3-embed-4b";
+        const MIN: Ms = 60_000;
+
+        /// The halo pool as adopted from bginf: its one machine is `fedora`,
+        /// which is also a general build executor, and its default is the
+        /// llama.cpp embedder.
+        async fn halo_db(name: &str) -> LocalDb {
+            use crate::orchestrator::inference::{write_inventory, Authoring};
+            let db = crate::storage::migrated_test_db(name).await;
+            let yaml = r#"
+recipes:
+  - {id: qwen3-embed-4b, model: {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}, servedName: qwen3-embedding-4b, engine: {kind: command, start: ./start-embed.sh, stop: podman rm -f bginf-embed}, requirements: {machines: 1}}
+deployments:
+  - {id: qwen3-embed-4b, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+pools:
+  - {id: halo, machines: [{name: fedora, address: 10.20.20.43}], default: [qwen3-embed-4b]}
+"#;
+            write_inventory(&db, &Authoring::Replace(yaml.into()))
+                .await
+                .unwrap();
+            db
+        }
+
+        fn builds(running_other: u32, waiting: u32) -> impl Fn(&Pool) -> BuildPressure + Sync {
+            move |_| BuildPressure {
+                running_other,
+                waiting,
+                ..BuildPressure::default()
+            }
+        }
+
+        async fn fedora_reports(
+            db: &LocalDb,
+            heads: &FakeHeads,
+            phase: DeploymentPhaseReport,
+            now: Ms,
+        ) {
+            let (_, command_id, _, _) = heads.last_sent();
+            on_report(
+                db,
+                heads,
+                DeploymentReportReceived {
+                    executor: FEDORA.into(),
+                    command_id,
+                    deployment: EMBED.into(),
+                    phase,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Tenets 1321 and 1322 on a pool whose one machine also runs builds,
+        /// with nothing special about it: the embedder bginf left running is
+        /// stopped once, which brings it under probing; the default loads only
+        /// after a pool idle window with no batch work; and builds waiting for
+        /// the machine unload it once it is idle past its minimum residency.
+        #[tokio::test]
+        async fn the_controller_takes_halo_and_fedora_builds_whenever_the_embedder_is_unloaded() {
+            let db = halo_db("pool-control-halo").await;
+            let heads = FakeHeads::default();
+            heads.attach(FEDORA, 60, 0);
+            let inventory = load_inventory(&db).await.unwrap();
+            let halo = &inventory.pools[&PoolId::from("halo")];
+            let take = PoolPatch {
+                pool: "halo".into(),
+                controlled: Some(true),
+                ..PoolPatch::default()
+            };
+            let (control, lines) = apply_patch(
+                halo,
+                &inventory,
+                None,
+                &take,
+                "operator",
+                &BTreeMap::new(),
+                None,
+                0,
+            )
+            .unwrap();
+            assert!(
+                lines == [took_control(&control)]
+                    && lines[0].starts_with("took control of pool halo"),
+                "{lines:?}"
+            );
+            save_control(&db, &control, 0).await.unwrap();
+
+            pass(&db, &heads, &builds(1, 2), MIN).await.unwrap();
+            assert_eq!(sent(&heads), vec![(EMBED.to_string(), "stop")]);
+            fedora_reports(&db, &heads, DeploymentPhaseReport::Stopped, MIN + 5_000).await;
+            assert!(heads.held().is_empty(), "fedora is free for builds");
+
+            pass(&db, &heads, &builds(1, 0), 10 * MIN).await.unwrap();
+            pass(&db, &heads, &no_builds, 20 * MIN).await.unwrap();
+            assert_eq!(sent(&heads).len(), 1, "builds ran there ten minutes ago");
+            assert!(heads.held().is_empty());
+
+            pass(&db, &heads, &no_builds, 26 * MIN).await.unwrap();
+            assert_eq!(phase(&db, EMBED).await.label(), "reserving");
+            assert_eq!(heads.held(), [FEDORA]);
+            inference_control::tick(&db, &heads, &mut Probes::default(), 26 * MIN + 1)
+                .await
+                .unwrap();
+            assert_eq!(sent(&heads).last(), Some(&(EMBED.to_string(), "start")));
+            fedora_reports(
+                &db,
+                &heads,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+                27 * MIN,
+            )
+            .await;
+            assert_eq!(phase(&db, EMBED).await.label(), "healthy");
+
+            pass(&db, &heads, &builds(0, 3), 28 * MIN).await.unwrap();
+            assert_eq!(
+                phase(&db, EMBED).await.label(),
+                "healthy",
+                "inside its minimum residency"
+            );
+            pass(&db, &heads, &builds(0, 3), 60 * MIN).await.unwrap();
+            assert_eq!(phase(&db, EMBED).await.label(), "stopping");
+            assert_eq!(sent(&heads).last(), Some(&(EMBED.to_string(), "stop")));
         }
 
         #[tokio::test]

@@ -215,10 +215,11 @@ pub(crate) enum RunSpec {
         args: serde_json::Value,
         timeout: Option<u32>,
     },
-    /// A decision answered by a named model (`cairn://models/decide`),
-    /// executed on the host. `args` is the item's `payload.args_json`, parsed
-    /// into a decision request when the item runs.
-    Decide {
+    /// A cairn-models verb called with a named model through its door
+    /// (`cairn://models/<verb>`), executed on the host. `args` is the item's
+    /// `payload.args_json`, parsed into the door's request when the item runs.
+    ModelDoor {
+        door: cairn_common::run_contract::ModelDoor,
         args: serde_json::Value,
         timeout: Option<u32>,
     },
@@ -276,6 +277,10 @@ pub(crate) struct ItemOutcome {
     pub(crate) images: Vec<ImageBlock>,
     pub(crate) tracked_modifications:
         Option<cairn_common::executor_protocol::TrackedModificationEvidence>,
+    /// The item's typed result, carried whole to programmatic callers in the
+    /// run envelope's `data` while `body` is what the agent reads. Only a
+    /// model door sets it.
+    pub(crate) data: Option<serde_json::Value>,
 }
 
 impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutcome {
@@ -291,6 +296,7 @@ impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutc
                 .filter_map(|image| serde_json::from_value(image).ok())
                 .collect(),
             tracked_modifications: outcome.tracked_modifications,
+            data: None,
         }
     }
 }
@@ -306,6 +312,7 @@ impl ItemOutcome {
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
+            data: None,
         }
     }
 }

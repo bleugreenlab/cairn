@@ -24,6 +24,7 @@
 //! [`Complete`]: super::complete::Complete
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use cairn_models_types::catalog::{Verb, VerbKind, Wire};
@@ -164,6 +165,10 @@ pub struct EmbedCall<'a> {
     pub request: &'a EmbedRequest,
     /// Bounds each provider request.
     pub timeout: Duration,
+    /// Set when the caller has gone. Checked before each sub-batch and before
+    /// any retry, so an abandoned call ends within the one request in flight
+    /// ([`EMBED_TIMEOUT`]) instead of embedding the rest of a large request.
+    pub cancel: Option<&'a AtomicBool>,
 }
 
 /// Why an embedding produced no vectors.
@@ -184,6 +189,8 @@ pub enum EmbedError {
     },
     /// The provider failed, timed out, or answered something unreadable.
     Completion(CompletionError),
+    /// The caller cancelled the call before every sub-batch was embedded.
+    Cancelled,
 }
 
 impl fmt::Display for EmbedError {
@@ -207,6 +214,7 @@ impl fmt::Display for EmbedError {
                 "the reply's vectors differ in width (one is {got} wide), so none were used"
             ),
             Self::Completion(error) => error.fmt(f),
+            Self::Cancelled => f.write_str("the embedding was cancelled before it finished"),
         }
     }
 }

@@ -18269,7 +18269,7 @@ fn serialize_process_batch(
             RunSpec::McpCall(_)
             | RunSpec::ExecutorAction(_)
             | RunSpec::ResponseCall { .. }
-            | RunSpec::Decide { .. }
+            | RunSpec::ModelDoor { .. }
             | RunSpec::ReplSend { .. } => {
                 return Err(format!(
                     "{header} is not process-backed and cannot use a build cell"

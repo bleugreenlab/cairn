@@ -1014,8 +1014,8 @@ pub const RESTOP_AFTER_MS: Ms = 60_000;
 /// reserving, starting or healthy. One that ended failed is stopped again
 /// [`RESTOP_AFTER_MS`] after it failed: a failure frees its machines though
 /// the model may still be resident. One the act side has never acted on is
-/// stopped too, which is what brings whatever bginf left running under the
-/// act side's probing, unless another deployment holds one of its machines,
+/// stopped too, which is what brings whatever was left running before Cairn
+/// acted (bginf's last model, say) under the act side's probing, unless another deployment holds one of its machines,
 /// since the two cannot both run there.
 ///
 /// A desired deployment is started when it is unknown, stopped, or failed

@@ -299,4 +299,12 @@ pub struct RunBatchEnvelope {
     /// from 'the machine failed'.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub invalid_input: bool,
+    /// Each item's typed result, in input order and `null` for an item that
+    /// has none; absent when no item has one. Only a model door
+    /// (`cairn://models/<verb>`) produces one today. Unlike `text`, it is never
+    /// capped, because its payload (vectors, generated media) is routinely
+    /// larger than a run result shows; the SDKs read it, and the agent-facing
+    /// edges ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<serde_json::Value>>,
 }

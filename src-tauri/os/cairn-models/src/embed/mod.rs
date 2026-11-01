@@ -11,6 +11,7 @@ mod split;
 #[cfg(test)]
 mod tests;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use cairn_models_types::embedding::{BatchLimits, PurposeHandling};
@@ -42,11 +43,17 @@ const FIRST_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// honours it instead of a blocking thread sitting on it.
 const MAX_IN_CALL_WAIT: Duration = Duration::from_secs(30);
 
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+}
+
 /// Run `attempt` until it succeeds, fails for good, or has been tried
 /// [`ATTEMPTS`] times. Only a transient failure is retried, after the doubling
-/// delay or the provider's `Retry-After`, whichever is longer.
+/// delay or the provider's `Retry-After`, whichever is longer, and never once
+/// the caller has cancelled.
 fn with_retry<T>(
     sleep: &dyn Fn(Duration),
+    cancel: Option<&AtomicBool>,
     mut attempt: impl FnMut() -> Result<T, CompletionError>,
 ) -> Result<T, CompletionError> {
     let mut tried = 1;
@@ -56,7 +63,11 @@ fn with_retry<T>(
             Err(error) => error,
         };
         let asked = error.retry_after().unwrap_or_default();
-        if !error.is_transient() || tried >= ATTEMPTS || asked > MAX_IN_CALL_WAIT {
+        if !error.is_transient()
+            || tried >= ATTEMPTS
+            || asked > MAX_IN_CALL_WAIT
+            || cancelled(cancel)
+        {
             return Err(error);
         }
         sleep((FIRST_RETRY_DELAY * 2u32.pow(tried - 1)).max(asked));
@@ -82,6 +93,7 @@ fn embed_with(
         capabilities,
         request,
         timeout,
+        cancel,
     } = call;
     if request.texts.is_empty() {
         return Err(EmbedError::InvalidRequest(
@@ -104,6 +116,9 @@ fn embed_with(
     let mut tokens = Tally::default();
     let mut cost = Tally::default();
     for range in batches {
+        if cancelled(cancel) {
+            return Err(EmbedError::Cancelled);
+        }
         let first_text = range.start;
         let batch = &texts[range];
         let wire = route.completion_wire();
@@ -112,7 +127,7 @@ fn embed_with(
                 let input_type = matches!(capabilities.purpose, PurposeHandling::Native)
                     .then(|| request.purpose.input_type());
                 let body = openai_wire::build_body(model, batch, dimensions, input_type);
-                let reply = with_retry(sleep, || {
+                let reply = with_retry(sleep, cancel, || {
                     complete.complete(CompletionCall::whole(wire, body.clone(), timeout))
                 })?
                 .into_embeddings()?;
@@ -120,7 +135,7 @@ fn embed_with(
             }
             EmbedRoute::Gateway(_) => {
                 let body = gateway_wire::build_body(batch, request.purpose.input_type());
-                let reply = with_retry(sleep, || {
+                let reply = with_retry(sleep, cancel, || {
                     complete.complete(CompletionCall::whole(wire, body.clone(), timeout))
                 })?
                 .into_gateway_embed()?;

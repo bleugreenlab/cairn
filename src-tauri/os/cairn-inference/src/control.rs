@@ -53,9 +53,11 @@ pub const STOP_REPORT_BOUND_SECS: u64 =
 /// A deployment's phase as the orch holds it.
 ///
 /// Times are epoch milliseconds. A deployment Cairn has never acted on has no
-/// phase at all, and is neither probed nor reserved: bginf may be running it,
-/// and Cairn does not take a machine away from builds for a model it did not
-/// load.
+/// phase at all, and is neither probed nor reserved: whatever runs there was
+/// not started by Cairn (bginf left the Sparks' and halo's models running when
+/// it retired), and Cairn does not take a machine away from builds for a model
+/// it did not load. Taking its pool under control stops it once, which brings
+/// it under probing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "camelCase")]
 pub enum Phase {
@@ -82,7 +84,8 @@ pub enum Phase {
         since_ms: i64,
         /// How long the start command took to bring it to health, from the
         /// head receiving it. `None` when Cairn found it already answering
-        /// (started by bginf, or brought back by a power cycle).
+        /// (started before Cairn acted on it, or brought back by a power
+        /// cycle).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_ms: Option<u64>,
     },
@@ -738,7 +741,7 @@ fn duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::bginf_test_inventory;
+    use crate::fixture::test_inventory;
 
     const T0: i64 = 1_000_000;
 
@@ -1017,7 +1020,7 @@ mod tests {
 
     #[test]
     fn a_gang_reserves_every_machine_and_blocks_an_overlapping_start() {
-        let inventory = bginf_test_inventory();
+        let inventory = test_inventory();
         let mut phases = BTreeMap::new();
         phases.insert(DeploymentId::from("dsv4f-tp2"), starting());
         phases.insert(
@@ -1057,7 +1060,7 @@ mod tests {
 
     #[test]
     fn a_deployment_whose_record_is_gone_holds_nothing() {
-        let inventory = bginf_test_inventory();
+        let inventory = test_inventory();
         let mut phases = BTreeMap::new();
         phases.insert(DeploymentId::from("gone"), starting());
         assert!(reservations(&inventory, &phases).is_empty());

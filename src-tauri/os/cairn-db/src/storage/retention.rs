@@ -424,7 +424,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("inference_recipes", CONFIG),
     keep("inference_deployments", CONFIG),
     keep("inference_pools", CONFIG),
-    keep("inference_bginf_link", CONFIG),
     keep(
         "inference_deployment_state",
         "one row per inference deployment the runner has acted on",

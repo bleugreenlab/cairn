@@ -225,7 +225,7 @@ fn string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
 fn parse_provider(value: &str) -> Result<ApiProvider, String> {
     serde_json::from_value(Value::String(value.to_string())).map_err(|_| {
         format!(
-            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|opencode|ollama|github|bginf"
+            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|opencode|ollama|github"
         )
     })
 }
@@ -249,6 +249,12 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
 }
 
 fn parse_inference(section: &Value) -> Result<cairn_config::inference::InferenceSettings, String> {
+    if section.get("bginf").is_some() {
+        return Err(
+            "inference.bginf retired with bginf: the section takes only `recipes`, and writing it without `bginf` drops the link"
+                .into(),
+        );
+    }
     let inference: cairn_config::inference::InferenceSettings = match section {
         Value::Null => Default::default(),
         other => serde_json::from_value(other.clone())
@@ -442,15 +448,17 @@ pub(super) async fn apply_settings_patch(
         summary.push(format!("build services ({count} op(s))"));
     }
 
-    // --- Inference link and recipe declarations (replaces the section) ---
+    // --- Inference recipe declarations (replaces the section) ---
     if let Some(section) = obj.get("inference") {
         let inference = parse_inference(section)?;
+        let dropped_link = settings::load_inference(&orch.config_dir).retired_bginf_link;
         if !dry_run {
             settings::set_inference(&orch.config_dir, &inference)?;
         }
-        let link = match &inference.bginf {
-            Some(link) => format!("inference (bginf link {})", link.url),
-            None => "inference (bginf link removed)".to_string(),
+        let link = if dropped_link {
+            "inference (the retired bginf link dropped)"
+        } else {
+            "inference"
         };
         summary.push(if inference.recipes.is_empty() {
             format!("{link}; no recipe declarations")
@@ -578,28 +586,17 @@ mod tests {
     #[test]
     fn the_inference_section_parses_validates_and_clears() {
         let parsed = parse_inference(&serde_json::json!({
-            "bginf": {"url": "http://ctl.example:4100", "machines": {"halo": "fedora"}}
+            "recipes": {"dsv4f-tp2": {"verbs": ["session"]}}
         }))
         .unwrap();
-        let link = parsed.bginf.unwrap();
-        assert_eq!(link.url, "http://ctl.example:4100");
-        assert_eq!(
-            link.machines.get("halo").map(String::as_str),
-            Some("fedora")
-        );
-        assert_eq!(parse_inference(&Value::Null).unwrap().bginf, None);
-        assert_eq!(
-            parse_inference(&serde_json::json!({"bginf": null}))
-                .unwrap()
-                .bginf,
-            None
-        );
-        assert!(parse_inference(&serde_json::json!({"bginf": {"url": "ctl"}})).is_err());
-        assert!(
-            parse_inference(&serde_json::json!({"bginf": {"url": "http://x", "token": "t"}}))
-                .is_err()
-        );
-        assert_eq!(parse_provider("bginf").unwrap(), ApiProvider::Bginf);
+        assert!(parsed.recipes.contains_key("dsv4f-tp2"));
+        assert_eq!(parse_inference(&Value::Null).unwrap(), Default::default());
+        assert!(parse_inference(&serde_json::json!({"recipes": {"r": {}}})).is_err());
+        let retired =
+            parse_inference(&serde_json::json!({"bginf": {"url": "http://x"}})).unwrap_err();
+        assert!(retired.contains("retired with bginf"), "{retired}");
+        assert!(parse_inference(&serde_json::json!({"bginf": null})).is_err());
+        assert!(parse_provider("bginf").is_err());
     }
 
     #[test]

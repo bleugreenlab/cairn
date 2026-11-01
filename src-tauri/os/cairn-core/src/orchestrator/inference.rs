@@ -1,62 +1,41 @@
-//! The cairn-inference facet's host: the inventory and the bginf link row in
-//! the orch's database, and the poller that mirrors bginf into them.
+//! The cairn-inference facet's host: the inventory in the orch's database, and
+//! the writes that change it.
 //!
-//! The poller sends bginf exactly two GET requests per tick (`/profiles` and
-//! `/state`) through the facet's GET-only client, and starts, stops or powers
-//! nothing; acting on deployments is `inference_control`'s, through Cairn's
-//! own executors. Each tick re-imports bginf's configuration and reconciles it into
-//! the records whose source is bginf; the raw responses are kept beside them so
-//! the comparison is always computed from one snapshot.
+//! Every record is Cairn's own and the operator writes it: the whole inventory
+//! at once ([`Authoring::Replace`], a document in Cairn's record format, the
+//! inverse of `cairn://inference?format=yaml`), or records added, replaced and
+//! removed within it ([`Authoring::Patch`]). Either is validated as a whole and
+//! refused naming every problem, and neither may take away what is running: a
+//! deployment the act side holds machines for is stopped before it is removed
+//! or moved, and a pool the controller drives is handed back before it is
+//! removed. Records mirrored from bginf before it retired are read-only until
+//! [`adopt`] makes them Cairn's, keeping their ids; authoring is refused until
+//! then, so nothing half-adopted is ever written.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use cairn_db::turso::params;
-use cairn_inference::bginf::{self, BginfClient, MachineMap, Profiles, State, Topology};
-use cairn_inference::{ImportReport, Inventory, RecordSource};
+use cairn_inference::control::Phase;
+use cairn_inference::pool_control::PoolControl;
+use cairn_inference::{DeploymentId, Inventory, PoolId, RecipeId, RecordSource, YamlError};
 use serde::Serialize;
 
 use super::Orchestrator;
-use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::storage::{LocalDb, RowExt};
-use cairn_config::inference::BginfLinkSettings;
-
-/// How often the poller reads bginf.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 const RECIPES: &str = "inference_recipes";
 const DEPLOYMENTS: &str = "inference_deployments";
 const POOLS: &str = "inference_pools";
+
+/// Every read-modify-write of the inventory holds this, so two writes never
+/// interleave.
+static INVENTORY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// The bginf link's one row.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LinkRow {
-    pub last_attempt_at: Option<i64>,
-    /// The last attempt's error; cleared by a successful read.
-    pub last_error: Option<String>,
-    /// When the current run of failed reads began.
-    pub failing_since: Option<i64>,
-    pub last_ok_at: Option<i64>,
-    pub profiles_json: Option<String>,
-    pub state_json: Option<String>,
-    /// What the last successful import refused or could not map.
-    pub last_warnings: Vec<String>,
-    pub last_change_at: Option<i64>,
-    pub last_change_report: Option<ImportReport>,
-}
-
-impl LinkRow {
-    /// The last successful `/state`, parsed.
-    pub fn state(&self) -> Option<State> {
-        serde_json::from_str(self.state_json.as_deref()?).ok()
-    }
 }
 
 async fn load_bodies(db: &LocalDb, table: &'static str) -> Result<Vec<(String, String)>, String> {
@@ -97,36 +76,6 @@ pub async fn load_inventory(db: &LocalDb) -> Result<Inventory, String> {
         inventory.insert_pool(pool);
     }
     Ok(inventory)
-}
-
-/// The bginf link row, if the poller has ever written it.
-pub async fn load_link(db: &LocalDb) -> Result<Option<LinkRow>, String> {
-    db.query_opt(
-        "SELECT last_attempt_at, last_error, failing_since, last_ok_at, profiles_json, state_json,
-                last_warnings_json, last_change_at, last_change_report_json
-           FROM inference_bginf_link WHERE link = 'bginf'",
-        (),
-        |row| {
-            Ok(LinkRow {
-                last_attempt_at: row.opt_i64(0)?,
-                last_error: row.opt_text(1)?,
-                failing_since: row.opt_i64(2)?,
-                last_ok_at: row.opt_i64(3)?,
-                profiles_json: row.opt_text(4)?,
-                state_json: row.opt_text(5)?,
-                last_warnings: row
-                    .opt_text(6)?
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or_default(),
-                last_change_at: row.opt_i64(7)?,
-                last_change_report: row
-                    .opt_text(8)?
-                    .and_then(|json| serde_json::from_str(&json).ok()),
-            })
-        },
-    )
-    .await
-    .map_err(|error| format!("read inference_bginf_link: {error}"))
 }
 
 /// One row to write: `body` `None` deletes it.
@@ -193,35 +142,10 @@ fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange> {
     changes
 }
 
-/// What one successful read writes beside the records.
-#[derive(Debug, Clone)]
-struct SuccessfulRead {
-    at: i64,
-    profiles_json: String,
-    state_json: String,
-    warnings: Vec<String>,
-    report: ImportReport,
-}
-
-async fn save_success(
-    db: &LocalDb,
-    changes: Vec<RowChange>,
-    read: SuccessfulRead,
-) -> Result<(), String> {
-    let warnings = serde_json::to_string(&read.warnings).expect("warnings serialize");
-    let (change_at, change_report) = if read.report.has_changes() {
-        (
-            Some(read.at),
-            Some(serde_json::to_string(&read.report).expect("import reports serialize")),
-        )
-    } else {
-        (None, None)
-    };
+/// Write every changed row in one transaction.
+async fn save_rows(db: &LocalDb, changes: Vec<RowChange>, at: i64) -> Result<(), String> {
     db.write(move |conn| {
         let changes = changes.clone();
-        let read = read.clone();
-        let warnings = warnings.clone();
-        let change_report = change_report.clone();
         Box::pin(async move {
             for change in changes {
                 match change.body {
@@ -234,7 +158,7 @@ async fn save_success(
                                    body_json = excluded.body_json, updated_at = excluded.updated_at",
                                 change.table
                             ),
-                            params![change.id, change.source, body, read.at],
+                            params![change.id, change.source, body, at],
                         )
                         .await?;
                     }
@@ -247,32 +171,6 @@ async fn save_success(
                     }
                 }
             }
-            conn.execute(
-                "INSERT INTO inference_bginf_link
-                   (link, last_attempt_at, last_error, failing_since, last_ok_at, profiles_json,
-                    state_json, last_warnings_json, last_change_at, last_change_report_json)
-                 VALUES ('bginf', ?1, NULL, NULL, ?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(link) DO UPDATE SET
-                   last_attempt_at = excluded.last_attempt_at,
-                   last_error = NULL,
-                   failing_since = NULL,
-                   last_ok_at = excluded.last_ok_at,
-                   profiles_json = excluded.profiles_json,
-                   state_json = excluded.state_json,
-                   last_warnings_json = excluded.last_warnings_json,
-                   last_change_at = COALESCE(excluded.last_change_at, inference_bginf_link.last_change_at),
-                   last_change_report_json =
-                     COALESCE(excluded.last_change_report_json, inference_bginf_link.last_change_report_json)",
-                params![
-                    read.at,
-                    read.profiles_json,
-                    read.state_json,
-                    warnings,
-                    change_at,
-                    change_report
-                ],
-            )
-            .await?;
             Ok(())
         })
     })
@@ -280,162 +178,189 @@ async fn save_success(
     .map_err(|error| format!("write inference records: {error}"))
 }
 
-async fn save_failure(db: &LocalDb, at: i64, error: String) -> Result<(), String> {
-    db.execute(
-        "INSERT INTO inference_bginf_link (link, last_attempt_at, last_error, failing_since)
-         VALUES ('bginf', ?1, ?2, ?1)
-         ON CONFLICT(link) DO UPDATE SET
-           last_attempt_at = excluded.last_attempt_at,
-           last_error = excluded.last_error,
-           failing_since = COALESCE(inference_bginf_link.failing_since, excluded.failing_since)",
-        params![at, error],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| format!("write inference_bginf_link: {error}"))
-}
-
-/// Import one successful read and persist it with the records it changed.
-/// Records that would leave the inventory invalid are not written; why goes
-/// into the warnings.
-async fn apply_read(
-    db: &LocalDb,
-    profiles: serde_json::Value,
-    state: serde_json::Value,
-    map: &MachineMap,
-    at: i64,
-) -> Result<ImportReport, String> {
-    let parsed_profiles: Profiles = serde_json::from_value(profiles.clone())
-        .map_err(|error| format!("GET /profiles: unexpected shape: {error}"))?;
-    let parsed_state: State = serde_json::from_value(state.clone())
-        .map_err(|error| format!("GET /state: unexpected shape: {error}"))?;
-    let imported = bginf::import(&parsed_profiles, Topology::Live(&parsed_state), map);
+/// Make every record of `from` Cairn's own, keeping its id and contents, and
+/// say which. Adopting again adopts nothing and says so.
+pub async fn adopt(db: &LocalDb, from: RecordSource) -> Result<String, String> {
+    let _held = INVENTORY.lock().await;
     let current = load_inventory(db).await?;
-    let (merged, mut report) =
-        Inventory::reconcile(&current, &imported.inventory, RecordSource::Bginf);
-    report.warnings = imported.warnings;
-    let next = match merged.validate() {
-        Ok(()) => merged,
-        Err(problems) => {
-            report
-                .warnings
-                .extend(problems.iter().map(|p| format!("not written: {p}")));
-            report.recipes = Default::default();
-            report.deployments = Default::default();
-            report.pools = Default::default();
-            current.clone()
-        }
-    };
-    let changes = diff_rows(&current, &next);
-    save_success(
-        db,
-        changes,
-        SuccessfulRead {
-            at,
-            profiles_json: profiles.to_string(),
-            state_json: state.to_string(),
-            warnings: report.warnings.clone(),
-            report: report.clone(),
-        },
-    )
-    .await?;
-    Ok(report)
+    let mut next = current.clone();
+    let adopted = next.adopt(from);
+    if adopted.is_empty() {
+        return Ok(format!(
+            "Nothing to adopt: no record is a {} record.",
+            from.as_str()
+        ));
+    }
+    save_rows(db, diff_rows(&current, &next), now_ms()).await?;
+    Ok(format!(
+        "Adopted {} {} records as Cairn's own, keeping their ids:\n- {}",
+        adopted.len(),
+        from.as_str(),
+        adopted.join("\n- ")
+    ))
 }
 
-/// The token of the first `bginf` account, if one is stored.
-fn bginf_token(orch: &Orchestrator) -> Option<String> {
-    let store = orch.get_credential_store()?;
-    store
-        .accounts_for_provider(ApiProvider::Bginf, None)
-        .into_iter()
-        .find_map(|account| match &account.auth {
-            ProviderAuth::ApiKey { value } | ProviderAuth::OAuthToken { value } => {
-                Some(value.clone())
-            }
-            _ => None,
-        })
+/// Records to take out of the inventory, by kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removals {
+    pub recipes: Vec<RecipeId>,
+    pub deployments: Vec<DeploymentId>,
+    pub pools: Vec<PoolId>,
 }
 
-/// Whether the link is configured, and what is missing when it is not.
+/// A change the operator writes to Cairn's own records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinkConfig {
-    Configured(BginfLinkSettings),
-    Missing { setting: bool, account: bool },
+pub enum Authoring {
+    /// The whole inventory, as a document in Cairn's record format.
+    Replace(String),
+    /// Add or replace the records of a document in Cairn's record format,
+    /// then remove these.
+    Patch {
+        upsert: Option<String>,
+        remove: Removals,
+    },
 }
 
-pub fn link_config(orch: &Orchestrator) -> LinkConfig {
-    let setting = crate::config::settings::load_inference(&orch.config_dir).bginf;
-    let has_token = bginf_token(orch).is_some();
-    match setting {
-        Some(link) if has_token => LinkConfig::Configured(link),
-        setting => LinkConfig::Missing {
-            setting: setting.is_none(),
-            account: !has_token,
-        },
+fn document_problems(error: YamlError) -> Vec<String> {
+    match error {
+        YamlError::Parse(error) => vec![format!("the document does not parse: {error}")],
+        YamlError::Invalid(problems) => problems.iter().map(ToString::to_string).collect(),
     }
 }
 
-pub fn machine_map(link: &BginfLinkSettings) -> MachineMap {
-    MachineMap::new(link.machines.clone())
+fn remove_each<K: Ord + std::fmt::Display, T>(
+    kind: &str,
+    records: &mut BTreeMap<K, T>,
+    ids: &[K],
+    problems: &mut Vec<String>,
+) {
+    for id in ids {
+        if records.remove(id).is_none() {
+            problems.push(format!("there is no {kind} {id} to remove"));
+        }
+    }
 }
 
-/// One poller tick. Does nothing while the link is not configured.
-pub async fn poll_once(orch: &Orchestrator) {
-    let LinkConfig::Configured(link) = link_config(orch) else {
-        return;
-    };
-    let Some(token) = bginf_token(orch) else {
-        return;
-    };
-    let at = now_ms();
-    let url = link.url.clone();
-    let fetched = tokio::task::spawn_blocking(move || {
-        let client = BginfClient::new(url, token).map_err(|error| error.to_string())?;
-        let profiles = client.get_profiles().map_err(|error| error.to_string())?;
-        let state = client.get_state().map_err(|error| error.to_string())?;
-        Ok::<_, String>((profiles, state))
-    })
-    .await
-    .unwrap_or_else(|error| Err(format!("the bginf read did not finish: {error}")));
-    let db = &orch.db.local;
-    let outcome = match fetched {
-        Ok((profiles, state)) => apply_read(db, profiles, state, &machine_map(&link), at).await,
-        Err(error) => Err(error),
-    };
-    match outcome {
-        Ok(report) if report.has_changes() => {
-            log::info!(
-                "inference: bginf import changed {}",
-                report.lines().join("; ")
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            if let Err(write) = save_failure(db, at, error.clone()).await {
-                log::warn!(
-                    "inference: bginf read failed ({error}) and could not be recorded: {write}"
-                );
+/// The inventory `authoring` leaves, or every reason it is refused.
+fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec<String>> {
+    let foreign = current.foreign_records();
+    if !foreign.is_empty() {
+        return Err(vec![format!(
+            "{} records are still mirrored from bginf and read-only ({}); adopt them first: patch cairn://inference {{adopt:\"bginf\"}}",
+            foreign.len(),
+            foreign.join(", ")
+        )]);
+    }
+    let mut problems = Vec::new();
+    let next = match authoring {
+        Authoring::Replace(text) => match Inventory::from_yaml(text) {
+            Ok(next) => next,
+            Err(YamlError::Invalid(found)) => {
+                // Still name any record that is not Cairn's, below.
+                problems.extend(found.iter().map(ToString::to_string));
+                Inventory::parse_yaml(text).unwrap_or_default()
             }
+            Err(error) => return Err(document_problems(error)),
+        },
+        Authoring::Patch { upsert, remove } => {
+            let mut next = current.clone();
+            if let Some(text) = upsert {
+                next.upsert(Inventory::parse_yaml(text).map_err(document_problems)?);
+            }
+            remove_each("recipe", &mut next.recipes, &remove.recipes, &mut problems);
+            remove_each(
+                "deployment",
+                &mut next.deployments,
+                &remove.deployments,
+                &mut problems,
+            );
+            remove_each("pool", &mut next.pools, &remove.pools, &mut problems);
+            problems.extend(next.problems().iter().map(ToString::to_string));
+            next
         }
+    };
+    problems.extend(next.foreign_records().into_iter().map(|record| {
+        format!("{record} is not Cairn's; a record written here says `source: cairn` or names no source")
+    }));
+    if problems.is_empty() {
+        Ok(next)
+    } else {
+        Err(problems)
     }
 }
 
-/// Read bginf now and every [`POLL_INTERVAL`] for the life of the process.
-pub fn spawn_bginf_poller(orch: Orchestrator) {
-    tokio::spawn(async move {
-        loop {
-            poll_once(&orch).await;
-            tokio::time::sleep(POLL_INTERVAL).await;
+/// What `next` would take away that is running: a deployment the act side
+/// holds machines for, removed or moved to other machines, and a pool the
+/// controller drives, removed.
+fn running_refusals(
+    current: &Inventory,
+    next: &Inventory,
+    phases: &BTreeMap<DeploymentId, Phase>,
+    controls: &BTreeMap<PoolId, PoolControl>,
+) -> Vec<String> {
+    let mut refusals = Vec::new();
+    for (id, phase) in phases.iter().filter(|(_, phase)| phase.reserves()) {
+        let Some(before) = current.deployments.get(id) else {
+            continue;
+        };
+        let page = format!("cairn://inference/deployments/{id}");
+        match next.deployments.get(id) {
+            None => refusals.push(format!(
+                "deployment {id} is {} on {}; stop it first ({page}), or its machines would be released with the model still on them",
+                phase.label(),
+                before.machines.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            )),
+            Some(after) if after.machines != before.machines || after.head != before.head => {
+                refusals.push(format!(
+                    "deployment {id} is {}; stop it ({page}) before moving it to other machines",
+                    phase.label()
+                ))
+            }
+            Some(_) => {}
         }
-    });
+    }
+    for (pool, _) in controls.iter().filter(|(_, control)| control.controlled) {
+        if current.pools.contains_key(pool) && !next.pools.contains_key(pool) {
+            refusals.push(format!(
+                "pool {pool} is under Cairn's control; hand it back first (patch cairn://inference/pools {{pool:\"{pool}\", controlled:false}})"
+            ));
+        }
+    }
+    refusals
+}
+
+fn refused(problems: Vec<String>) -> String {
+    format!("Refused; nothing was written:\n- {}", problems.join("\n- "))
+}
+
+/// Write Cairn's own records, or refuse with every problem and write nothing.
+pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<String, String> {
+    let _held = INVENTORY.lock().await;
+    let current = load_inventory(db).await?;
+    let next = authored(&current, authoring).map_err(refused)?;
+    let phases = super::pool_control::deployment_phases(db).await?;
+    let controls = super::pool_control::load_controls(db).await?;
+    let running = running_refusals(&current, &next, &phases, &controls);
+    if !running.is_empty() {
+        return Err(refused(running));
+    }
+    let report = Inventory::changes(&current, &next);
+    if !report.has_changes() {
+        return Ok("The inventory is unchanged.".to_string());
+    }
+    save_rows(db, diff_rows(&current, &next), now_ms()).await?;
+    Ok(format!(
+        "Wrote the inventory:\n- {}\nRead cairn://inference?format=yaml for the whole of it.",
+        report.lines().join("\n- ")
+    ))
 }
 
 /// Everything the `cairn://inference` pages render.
 #[derive(Debug, Clone)]
 pub struct InferenceView {
-    pub config: LinkConfig,
-    pub link: Option<LinkRow>,
     pub inventory: Inventory,
+    /// Whether settings.yaml still names the retired bginf link.
+    pub retired_link_setting: bool,
     /// Enrolled executors by name: `true` when attached now.
     pub executors: BTreeMap<String, bool>,
     /// What Cairn has done to the deployments it acts on.
@@ -459,9 +384,9 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
     let inventory = load_inventory(&orch.db.local).await?;
     let control = super::pool_control::load_control_view(orch, &inventory).await?;
     Ok(InferenceView {
-        config: link_config(orch),
-        link: load_link(&orch.db.local).await?,
         inventory,
+        retired_link_setting: crate::config::settings::load_inference(&orch.config_dir)
+            .retired_bginf_link,
         executors,
         deployment_control: super::inference_control::load_control_view(orch).await?,
         control,
@@ -472,120 +397,299 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_inference::ValidationError;
 
-    fn profiles() -> serde_json::Value {
-        serde_json::json!({
-            "qwen36-fast": {"id": "qwen36-fast", "nodes": ["sp1"], "head": "sp1",
-                "start": "./start.sh", "stop": "./stop.sh",
-                "health": "http://192.0.2.40:8001/v1/models", "api_base": "http://192.0.2.40:8001/v1"},
-            "qwen3-embed-4b": {"id": "qwen3-embed-4b", "nodes": ["halo"], "head": "halo",
-                "start": "./start.sh", "stop": "./stop.sh",
-                "health": "http://192.0.2.43:8090/health", "api_base": "http://192.0.2.43:8090/v1"},
-            "off": {"id": "off", "nodes": []}
-        })
+    /// The Sparks and halo as bginf mirrored them, written as the retired
+    /// poller wrote them.
+    const MIRRORED: &str = r#"
+recipes:
+  - id: dsv4f-tp2
+    source: bginf
+    model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
+    servedName: deepseek-v4-flash-vision-exp
+    engine: {kind: command, start: ./start-deepseek.sh, stop: ./stop-deepseek.sh}
+    requirements: {machines: 2}
+  - id: qwen3-embed-4b
+    source: bginf
+    model: {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}
+    servedName: qwen3-embedding-4b
+    engine: {kind: command, start: podman run bginf-embed, stop: podman rm -f bginf-embed}
+    requirements: {machines: 1}
+deployments:
+  - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [bginf-sp1, bginf-sp2], head: bginf-sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+pools:
+  - {id: sparks, source: bginf, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2}], default: [dsv4f-tp2], pin: []}
+  - {id: halo, source: bginf, machines: [{name: fedora, address: 10.20.20.43}], default: [qwen3-embed-4b]}
+"#;
+
+    fn mirrored() -> Inventory {
+        Inventory::from_yaml(MIRRORED).unwrap()
     }
 
-    fn state() -> serde_json::Value {
-        serde_json::json!({
-            "pools": {
-                "sparks": {"desired": "qwen36-fast", "reason": "default", "pin": null,
-                           "default": "qwen36-fast", "running": null, "converged": false,
-                           "nodes": ["sp1", "sp2"]},
-                "halo": {"desired": "qwen3-embed-4b", "reason": "default", "pin": null,
-                         "default": "qwen3-embed-4b", "running": null, "converged": false,
-                         "nodes": ["halo"]}
-            }
-        })
+    fn adopted() -> Inventory {
+        let mut inventory = mirrored();
+        inventory.adopt(RecordSource::Bginf);
+        inventory
     }
 
-    fn halo_is_fedora() -> MachineMap {
-        MachineMap::new([("halo".to_string(), "fedora".to_string())])
+    async fn seeded(name: &str) -> LocalDb {
+        let db = crate::storage::migrated_test_db(name).await;
+        save_rows(&db, diff_rows(&Inventory::default(), &mirrored()), 1)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn sources(db: &LocalDb) -> Vec<String> {
+        let mut sources = Vec::new();
+        for table in [RECIPES, DEPLOYMENTS, POOLS] {
+            sources.extend(
+                db.query_all(
+                    format!("SELECT id || ' ' || source FROM {table} ORDER BY id"),
+                    (),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        sources
     }
 
     #[tokio::test]
-    async fn a_read_persists_and_a_repeat_changes_nothing() {
-        let db = crate::storage::migrated_test_db("inference-store").await;
-        let report = apply_read(&db, profiles(), state(), &halo_is_fedora(), 1_000)
-            .await
-            .unwrap();
-        assert!(report.has_changes());
+    async fn adopting_re_sources_every_mirrored_record_once_keeping_ids() {
+        let db = seeded("inference-adopt").await;
+        assert_eq!(
+            load_inventory(&db).await.unwrap().foreign_records().len(),
+            6
+        );
+
+        let said = adopt(&db, RecordSource::Bginf).await.unwrap();
+        assert!(
+            said.starts_with("Adopted 6 bginf records as Cairn's own, keeping their ids:"),
+            "{said}"
+        );
+        assert!(said.contains("- deployment qwen3-embed-4b"), "{said}");
         let stored = load_inventory(&db).await.unwrap();
-        assert_eq!(stored.deployments.len(), 2);
-        assert_eq!(
-            stored.deployments[&"qwen3-embed-4b".into()].head,
-            "fedora".into()
+        assert!(stored.foreign_records().is_empty());
+        assert_eq!(stored, adopted(), "every record kept, but Cairn's");
+        assert!(
+            sources(&db).await.iter().all(|row| row.ends_with(" cairn")),
+            "{:?}",
+            sources(&db).await
         );
-        let link = load_link(&db).await.unwrap().unwrap();
-        assert_eq!(link.last_ok_at, Some(1_000));
-        assert_eq!(link.last_change_at, Some(1_000));
-        assert!(link.state().is_some());
 
-        let again = apply_read(&db, profiles(), state(), &halo_is_fedora(), 2_000)
-            .await
-            .unwrap();
-        assert!(!again.has_changes(), "{again:?}");
-        assert_eq!(load_inventory(&db).await.unwrap(), stored);
-        let link = load_link(&db).await.unwrap().unwrap();
-        assert_eq!(link.last_ok_at, Some(2_000));
         assert_eq!(
-            link.last_change_at,
-            Some(1_000),
-            "a quiet read keeps the last change"
+            adopt(&db, RecordSource::Bginf).await.unwrap(),
+            "Nothing to adopt: no record is a bginf record."
         );
+        assert_eq!(load_inventory(&db).await.unwrap(), adopted());
     }
 
     #[tokio::test]
-    async fn a_removed_profile_is_deleted_and_failures_keep_the_last_read() {
-        let db = crate::storage::migrated_test_db("inference-store-remove").await;
-        apply_read(&db, profiles(), state(), &halo_is_fedora(), 1_000)
+    async fn authoring_waits_for_the_adoption() {
+        let db = seeded("inference-author-before-adopt").await;
+        let refusal = write_inventory(&db, &Authoring::Replace(adopted().to_yaml()))
             .await
-            .unwrap();
-        let mut fewer = profiles();
-        fewer.as_object_mut().unwrap().remove("qwen36-fast");
-        let report = apply_read(&db, fewer, state(), &halo_is_fedora(), 2_000)
-            .await
-            .unwrap();
-        assert!(report
-            .lines()
-            .contains(&"removed deployment qwen36-fast".to_string()));
-        assert!(!load_inventory(&db)
-            .await
-            .unwrap()
-            .deployments
-            .contains_key(&"qwen36-fast".into()));
-
-        save_failure(&db, 3_000, "GET /state: connection refused".into())
-            .await
-            .unwrap();
-        save_failure(&db, 4_000, "GET /state: connection refused".into())
-            .await
-            .unwrap();
-        let link = load_link(&db).await.unwrap().unwrap();
-        assert_eq!(link.failing_since, Some(3_000));
-        assert_eq!(link.last_attempt_at, Some(4_000));
-        assert_eq!(link.last_ok_at, Some(2_000));
-        assert!(link.state().is_some());
-
-        apply_read(&db, profiles(), state(), &halo_is_fedora(), 5_000)
-            .await
-            .unwrap();
-        let link = load_link(&db).await.unwrap().unwrap();
-        assert_eq!((link.last_error, link.failing_since), (None, None));
+            .unwrap_err();
+        assert!(
+            refusal.contains("6 records are still mirrored from bginf and read-only"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("adopt them first"), "{refusal}");
+        assert_eq!(load_inventory(&db).await.unwrap(), mirrored());
     }
 
     #[tokio::test]
-    async fn a_malformed_response_is_a_failure_not_an_import() {
-        let db = crate::storage::migrated_test_db("inference-store-shape").await;
-        let error = apply_read(
+    async fn the_yaml_read_replaces_back_unchanged_and_an_edit_lands() {
+        let db = seeded("inference-replace").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let read = load_inventory(&db).await.unwrap().to_yaml();
+        assert_eq!(
+            write_inventory(&db, &Authoring::Replace(read.clone()))
+                .await
+                .unwrap(),
+            "The inventory is unchanged."
+        );
+
+        let edited = read.replace("podman run bginf-embed", "podman run cairn-embed");
+        let said = write_inventory(&db, &Authoring::Replace(edited.clone()))
+            .await
+            .unwrap();
+        assert!(
+            said.starts_with("Wrote the inventory:\n- updated recipe qwen3-embed-4b: engine"),
+            "{said}"
+        );
+        assert_eq!(load_inventory(&db).await.unwrap().to_yaml(), edited);
+    }
+
+    #[tokio::test]
+    async fn a_refused_replace_names_every_problem_and_writes_nothing() {
+        let db = seeded("inference-replace-refused").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let before = load_inventory(&db).await.unwrap();
+        let broken = before
+            .to_yaml()
+            .replace("head: fedora", "head: bginf-sp1")
+            .replace("- qwen3-embed-4b\n", "- nope\n")
+            .replacen("source: cairn", "source: bginf", 1);
+        let refusal = write_inventory(&db, &Authoring::Replace(broken))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.starts_with("Refused; nothing was written:"),
+            "{refusal}"
+        );
+        for problem in [
+            "deployment qwen3-embed-4b has head bginf-sp1, which is not one of its machines",
+            "pool halo default names unknown deployment nope",
+            "recipe dsv4f-tp2 (bginf) is not Cairn's",
+        ] {
+            assert!(refusal.contains(problem), "{problem}: {refusal}");
+        }
+        let parse = write_inventory(&db, &Authoring::Replace("recipes: {".into()))
+            .await
+            .unwrap_err();
+        assert!(parse.contains("the document does not parse"), "{parse}");
+        assert_eq!(load_inventory(&db).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_patch_adds_replaces_and_removes_records() {
+        let db = seeded("inference-patch").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let upsert = r#"
+recipes:
+  - {id: qwen36-fast, model: {name: nvidia/Qwen3.6-35B-A3B-NVFP4}, servedName: qwen3.6-35b, engine: {kind: command, start: ./serve-qwen36.sh}, requirements: {machines: 1}}
+deployments:
+  - {id: qwen36-fast, recipe: qwen36-fast, machines: [bginf-sp1], head: bginf-sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
+pools:
+  - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [qwen36-fast]}
+"#;
+        let said = write_inventory(
             &db,
-            serde_json::json!([1, 2]),
-            state(),
-            &halo_is_fedora(),
-            1_000,
+            &Authoring::Patch {
+                upsert: Some(upsert.into()),
+                remove: Removals::default(),
+            },
+        )
+        .await
+        .unwrap();
+        for line in [
+            "added recipe qwen36-fast",
+            "added deployment qwen36-fast",
+            "updated pool sparks: default, machines, pin",
+        ] {
+            assert!(said.contains(line), "{line}: {said}");
+        }
+        let stored = load_inventory(&db).await.unwrap();
+        assert_eq!(stored.address_of(&"bginf-sp2".into()), Some("10.20.20.41"));
+
+        let removal = Removals {
+            recipes: vec!["qwen36-fast".into()],
+            ..Removals::default()
+        };
+        let refusal = write_inventory(
+            &db,
+            &Authoring::Patch {
+                upsert: None,
+                remove: removal,
+            },
         )
         .await
         .unwrap_err();
-        assert!(error.starts_with("GET /profiles"), "{error}");
-        assert_eq!(load_inventory(&db).await.unwrap(), Inventory::default());
+        assert!(
+            refusal.contains("deployment qwen36-fast names unknown recipe qwen36-fast"),
+            "{refusal}"
+        );
+
+        let said = write_inventory(
+            &db,
+            &Authoring::Patch {
+                upsert: Some("pools:\n  - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [dsv4f-tp2]}\n".into()),
+                remove: Removals {
+                    recipes: vec!["qwen36-fast".into()],
+                    deployments: vec!["qwen36-fast".into(), "nope".into()],
+                    pools: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            said.contains("there is no deployment nope to remove"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_running_deployment_or_a_controlled_pool_is_not_taken_away() {
+        let current = adopted();
+        let healthy = Phase::Healthy {
+            since_ms: 0,
+            load_ms: None,
+        };
+        let phases = BTreeMap::from([
+            (DeploymentId::from("qwen3-embed-4b"), healthy),
+            (
+                DeploymentId::from("dsv4f-tp2"),
+                Phase::Stopped { since_ms: 0 },
+            ),
+        ]);
+        let halo = &current.pools[&PoolId::from("halo")];
+        let controls = BTreeMap::from([(
+            halo.id.clone(),
+            PoolControl::begin(halo, &current.deployments, &phases, 0),
+        )]);
+
+        let mut without_halo = current.clone();
+        without_halo.pools.remove(&PoolId::from("halo"));
+        without_halo
+            .deployments
+            .remove(&DeploymentId::from("qwen3-embed-4b"));
+        without_halo
+            .deployments
+            .remove(&DeploymentId::from("dsv4f-tp2"));
+        assert_eq!(
+            running_refusals(&current, &without_halo, &phases, &controls),
+            vec![
+                "deployment qwen3-embed-4b is healthy on fedora; stop it first (cairn://inference/deployments/qwen3-embed-4b), or its machines would be released with the model still on them",
+                "pool halo is under Cairn's control; hand it back first (patch cairn://inference/pools {pool:\"halo\", controlled:false})",
+            ],
+            "a stopped deployment goes freely"
+        );
+
+        let mut moved = current.clone();
+        let embed = moved
+            .deployments
+            .get_mut(&DeploymentId::from("qwen3-embed-4b"))
+            .unwrap();
+        embed.machines = vec!["bginf-sp2".into()];
+        embed.head = "bginf-sp2".into();
+        assert_eq!(
+            running_refusals(&current, &moved, &phases, &controls),
+            vec!["deployment qwen3-embed-4b is healthy; stop it (cairn://inference/deployments/qwen3-embed-4b) before moving it to other machines"]
+        );
+
+        let mut restarted = current.clone();
+        restarted
+            .recipes
+            .get_mut(&RecipeId::from("qwen3-embed-4b"))
+            .unwrap()
+            .notes = Some("a new start command takes effect at the next start".into());
+        assert!(running_refusals(&current, &restarted, &phases, &controls).is_empty());
+    }
+
+    #[test]
+    fn the_validation_error_for_a_duplicate_reads_plainly() {
+        assert_eq!(
+            ValidationError::DuplicateId {
+                kind: "pool",
+                id: "halo".into()
+            }
+            .to_string(),
+            "pool halo appears twice"
+        );
     }
 }

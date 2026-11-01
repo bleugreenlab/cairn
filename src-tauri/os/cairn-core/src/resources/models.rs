@@ -45,6 +45,14 @@ const INDEX: &[(&str, &str)] = &[
         "answer typed questions with a named model: a run target, not a write",
     ),
     (
+        "cairn://models/embed",
+        "embed texts with a named model: a run target, not a write",
+    ),
+    (
+        "cairn://models/complete",
+        "send one completion to a named model: a run target, not a write",
+    ),
+    (
         "cairn://models/accounts",
         "provider accounts by provider, with their live usage windows (never a credential)",
     ),
@@ -398,6 +406,103 @@ pub(crate) fn render_decide(facet: &dyn Models) -> String {
         );
     }
     out.push_str("\nA logprobs offer not yet seen to answer is asked one probe question before its first decision. Each offer in full: `cairn://models/catalog?serves=decide`.\n");
+    out
+}
+
+/// The embed door: what it takes, and every offer that could embed through it
+/// now, with what each declares.
+pub(crate) fn render_embed(facet: &dyn Models) -> String {
+    let mut out = String::from(
+        "# Embed\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/embed\", payload:{args_json:{model, input, purpose?, width?}}}]})`. It returns one vector per text, in input order, with the exact model and width that produced them. `purpose` is `document` (the default) or `query`; `width` asks for exactly that many dimensions, and is refused when the offer cannot return it. The model is never chosen for you.\n\n",
+    );
+    let catalog = match facet.catalog(&ModelScope::workspace()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = writeln!(out, "Could not read the catalog: {error}");
+            return out;
+        }
+    };
+    let offers = catalog.offers_serving(VerbKind::Embed);
+    if offers.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing in this workspace serves embed yet. {}",
+            cairn_models::interface::fixes(VerbKind::Embed)
+        );
+        return out;
+    }
+    out.push_str("## Offers that serve embed\n\nEach gives its native width, the other widths it can return, how it tells documents from queries, and its batch limits. A request over the limits is split into consecutive requests and joined in order.\n\n");
+    for offer in offers {
+        let declared = match &offer.served.verb {
+            Verb::Embed(capabilities) => capabilities.summary(),
+            _ => "declares nothing".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "- `{}` on `{}` — {declared}",
+            offer.model, offer.provider
+        );
+    }
+    out.push_str("\nEach offer in full: `cairn://models/catalog?serves=embed`.\n");
+    out
+}
+
+/// How many of a provider's completion models the complete page names before
+/// pointing at the catalog.
+const COMPLETE_MODELS_NAMED: usize = 5;
+
+/// The complete door: what it takes, and which providers serve completions
+/// now. A routing provider offers hundreds of models, so each provider is a
+/// line with its count and a few names, and the catalog holds the rest.
+pub(crate) fn render_complete(facet: &dyn Models) -> String {
+    let mut out = String::from(
+        "# Complete\n\nInvoke with `run`, not `write`: `run({commands:[{target:\"cairn://models/complete\", payload:{args_json:{model, prompt | messages, system?, options?, output?}}}]})`. One tool-free completion, sent and journaled exactly as a named response's is, without writing a definition first. `output` is a JSON Schema the answer must meet; the parsed answer comes back as `structured`. The model is never chosen for you.\n\n",
+    );
+    let catalog = match facet.catalog(&ModelScope::workspace()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = writeln!(out, "Could not read the catalog: {error}");
+            return out;
+        }
+    };
+    let mut providers: Vec<(String, Vec<String>)> = Vec::new();
+    for offer in catalog.offers_serving(VerbKind::Complete) {
+        match providers.iter_mut().find(|(key, _)| *key == offer.provider) {
+            Some((_, models)) => models.push(offer.model),
+            None => providers.push((offer.provider, vec![offer.model])),
+        }
+    }
+    if providers.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing in this workspace serves complete yet. {}",
+            cairn_models::interface::fixes(VerbKind::Complete)
+        );
+        return out;
+    }
+    out.push_str("## Providers that serve complete\n\nName a model as `provider/model`, or by its catalog id.\n\n");
+    for (provider, models) in providers {
+        let named = models
+            .iter()
+            .take(COMPLETE_MODELS_NAMED)
+            .map(|model| format!("`{model}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = models.len().saturating_sub(COMPLETE_MODELS_NAMED);
+        let _ = write!(
+            out,
+            "- `{provider}` — {} model{}: {named}",
+            models.len(),
+            if models.len() == 1 { "" } else { "s" }
+        );
+        if more > 0 {
+            let _ = write!(
+                out,
+                " and {more} more (`cairn://models/catalog?serves=complete&provider={provider}`)"
+            );
+        }
+        out.push('\n');
+    }
     out
 }
 
@@ -1401,6 +1506,8 @@ mod tests {
         "cairn://models/catalog?installed=all",
         "cairn://models/catalog?provider=claude",
         "cairn://models/decide",
+        "cairn://models/embed",
+        "cairn://models/complete",
         "cairn://models/accounts",
         "cairn://models/accounts?provider=claude",
         "cairn://models/usage",
@@ -1482,6 +1589,35 @@ mod tests {
         let nothing = read(&bare, "cairn://models/decide").await;
         assert!(
             nothing.contains("Nothing in this workspace serves decide yet"),
+            "{nothing}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_embed_page_lists_each_offer_with_what_it_declares() {
+        let (orch, _, key) =
+            crate::orchestrator::embed::tests::workspace_with_hub(Vec::new()).await;
+        let page = read(&orch, "cairn://models/embed").await;
+        assert!(
+            page.contains(&format!(
+                "`qwen/qwen3-embedding-4b` on `{key}` — 4 · native width only"
+            )),
+            "{page}"
+        );
+        assert!(page.contains("≤32 texts"), "the batch limit: {page}");
+        assert!(
+            page.contains("run({commands:[{target:\"cairn://models/embed\""),
+            "the affordance carries the invocation: {page}"
+        );
+        assert!(
+            !page.contains("`big`"),
+            "a chat model is not an embed offer: {page}"
+        );
+
+        let bare = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let nothing = read(&bare, "cairn://models/embed").await;
+        assert!(
+            nothing.contains("Nothing in this workspace serves embed yet"),
             "{nothing}"
         );
     }

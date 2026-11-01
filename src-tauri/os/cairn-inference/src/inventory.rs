@@ -112,6 +112,11 @@ pub enum ValidationError {
         second: DeploymentId,
         machine: MachineName,
     },
+    /// An id written twice in one inventory document.
+    DuplicateId {
+        kind: &'static str,
+        id: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -215,88 +220,18 @@ impl fmt::Display for ValidationError {
                 "pool {pool} {} holds deployments {first} and {second}, which both use machine {machine}",
                 slot.as_str()
             ),
+            Self::DuplicateId { kind, id } => write!(f, "{kind} {id} appears twice"),
         }
     }
 }
 
 impl std::error::Error for ValidationError {}
 
-/// What pruning removes to cure one validation error.
-enum Culprit {
-    Recipe(RecipeId),
-    Deployment(DeploymentId),
-    /// Drop `machine` from `pool`; with `keep_first`, only its repeats.
-    PoolMachine {
-        pool: PoolId,
-        machine: MachineName,
-        keep_first: bool,
-    },
-    SetMember {
-        pool: PoolId,
-        slot: Slot,
-        deployment: DeploymentId,
-    },
-}
-
-impl ValidationError {
-    fn culprit(&self) -> Culprit {
-        match self {
-            Self::RecipeZeroMachines { recipe }
-            | Self::UnpinnedWeights { recipe }
-            | Self::BadWeightFile { recipe, .. }
-            | Self::BadImageDigest { recipe, .. }
-            | Self::BadArtifactSha { recipe }
-            | Self::EmptyStart { recipe } => Culprit::Recipe(recipe.clone()),
-            Self::UnknownRecipe { deployment, .. }
-            | Self::HeadNotInDeployment { deployment, .. }
-            | Self::DuplicateDeploymentMachine { deployment, .. }
-            | Self::MachineCount { deployment, .. }
-            | Self::BadPath { deployment, .. }
-            | Self::DeploymentSpansPools { deployment, .. } => {
-                Culprit::Deployment(deployment.clone())
-            }
-            Self::DuplicatePoolMachine { pool, machine } => Culprit::PoolMachine {
-                pool: pool.clone(),
-                machine: machine.clone(),
-                keep_first: true,
-            },
-            Self::MachineInTwoPools {
-                machine, second, ..
-            } => Culprit::PoolMachine {
-                pool: second.clone(),
-                machine: machine.clone(),
-                keep_first: false,
-            },
-            Self::UnknownSetMember {
-                pool,
-                slot,
-                deployment,
-            }
-            | Self::SetMemberOutsidePool {
-                pool,
-                slot,
-                deployment,
-                ..
-            }
-            | Self::OverlappingSet {
-                pool,
-                slot,
-                second: deployment,
-                ..
-            } => Culprit::SetMember {
-                pool: pool.clone(),
-                slot: *slot,
-                deployment: deployment.clone(),
-            },
-        }
-    }
-}
-
-/// A YAML import that could not become an inventory.
+/// An inventory document that could not become an inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum YamlError {
     Parse(String),
-    DuplicateId { kind: &'static str, id: String },
+    /// Every reason the document is not coherent.
     Invalid(Vec<ValidationError>),
 }
 
@@ -304,7 +239,6 @@ impl fmt::Display for YamlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Parse(err) => write!(f, "inventory YAML does not parse: {err}"),
-            Self::DuplicateId { kind, id } => write!(f, "{kind} {id} appears twice"),
             Self::Invalid(problems) => {
                 let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
                 write!(f, "inventory is invalid: {}", problems.join("; "))
@@ -327,37 +261,23 @@ impl fmt::Display for UnknownPool {
 
 impl std::error::Error for UnknownPool {}
 
-/// What one import changed, per record kind.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportReport {
-    #[serde(default)]
+/// What one change to the inventory added, removed and updated, per record
+/// kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChangeReport {
     pub recipes: KindReport,
-    #[serde(default)]
     pub deployments: KindReport,
-    #[serde(default)]
     pub pools: KindReport,
-    /// Imported records whose id another source already owns; skipped.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conflicts: Vec<String>,
-    /// What the import refused or could not map, in words.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KindReport {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub added: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub updated: Vec<UpdatedRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdatedRecord {
     pub id: String,
     /// The record's top-level fields that changed, in serde naming.
@@ -370,13 +290,13 @@ impl KindReport {
     }
 }
 
-impl ImportReport {
+impl ChangeReport {
     /// Whether any record was added, removed or updated.
     pub fn has_changes(&self) -> bool {
         !(self.recipes.is_empty() && self.deployments.is_empty() && self.pools.is_empty())
     }
 
-    /// One line per change, conflict and warning.
+    /// One line per change.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (kind, report) in [
@@ -398,33 +318,31 @@ impl ImportReport {
                     .map(|u| format!("updated {kind} {}: {}", u.id, u.fields.join(", "))),
             );
         }
-        lines.extend(self.conflicts.iter().map(|c| format!("conflict: {c}")));
-        lines.extend(self.warnings.iter().map(|w| format!("warning: {w}")));
         lines
     }
 }
 
-trait Sourced: Clone + PartialEq + Serialize {
+/// What the inventory needs of every record kind: who owns it.
+trait Sourced: PartialEq + Serialize {
     fn source(&self) -> RecordSource;
+    fn set_source(&mut self, source: RecordSource);
 }
 
-impl Sourced for Recipe {
-    fn source(&self) -> RecordSource {
-        self.source
-    }
+macro_rules! sourced {
+    ($($record:ty),*) => {$(
+        impl Sourced for $record {
+            fn source(&self) -> RecordSource {
+                self.source
+            }
+
+            fn set_source(&mut self, source: RecordSource) {
+                self.source = source;
+            }
+        }
+    )*};
 }
 
-impl Sourced for Deployment {
-    fn source(&self) -> RecordSource {
-        self.source
-    }
-}
-
-impl Sourced for Pool {
-    fn source(&self) -> RecordSource {
-        self.source
-    }
-}
+sourced!(Recipe, Deployment, Pool);
 
 fn changed_fields<T: Serialize>(before: &T, after: &T) -> Vec<String> {
     let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
@@ -439,55 +357,51 @@ fn changed_fields<T: Serialize>(before: &T, after: &T) -> Vec<String> {
         .collect()
 }
 
-fn reconcile_kind<K: Ord + Clone + fmt::Display, T: Sourced>(
-    kind: &str,
+fn diff_kind<K: Ord + fmt::Display, T: Sourced>(
     current: &BTreeMap<K, T>,
-    imported: &BTreeMap<K, T>,
-    source: RecordSource,
-    report: &mut KindReport,
-    conflicts: &mut Vec<String>,
-) -> BTreeMap<K, T> {
-    let mut merged: BTreeMap<K, T> = current
-        .iter()
-        .filter(|(_, record)| record.source() != source)
-        .map(|(id, record)| (id.clone(), record.clone()))
-        .collect();
-    for (id, record) in current {
-        if record.source() == source && !imported.contains_key(id) {
-            report.removed.push(id.to_string());
-        }
-    }
-    for (id, record) in imported {
-        if record.source() != source {
-            conflicts.push(format!(
-                "{kind} {id} is a {} record in a {} import; skipped",
-                record.source().as_str(),
-                source.as_str()
-            ));
-            continue;
-        }
+    next: &BTreeMap<K, T>,
+) -> KindReport {
+    let mut report = KindReport::default();
+    for (id, record) in next {
         match current.get(id) {
-            Some(existing) if existing.source() != source => conflicts.push(format!(
-                "{kind} {id} is already a {} record; the {} import of it was skipped",
-                existing.source().as_str(),
-                source.as_str()
-            )),
-            Some(existing) => {
-                if existing != record {
-                    report.updated.push(UpdatedRecord {
-                        id: id.to_string(),
-                        fields: changed_fields(existing, record),
-                    });
-                }
-                merged.insert(id.clone(), record.clone());
-            }
-            None => {
-                report.added.push(id.to_string());
-                merged.insert(id.clone(), record.clone());
-            }
+            None => report.added.push(id.to_string()),
+            Some(before) if before != record => report.updated.push(UpdatedRecord {
+                id: id.to_string(),
+                fields: changed_fields(before, record),
+            }),
+            Some(_) => {}
         }
     }
-    merged
+    report.removed = current
+        .keys()
+        .filter(|id| !next.contains_key(*id))
+        .map(ToString::to_string)
+        .collect();
+    report
+}
+
+fn foreign_of<'a, K: fmt::Display, T: Sourced>(
+    kind: &'static str,
+    records: &'a BTreeMap<K, T>,
+) -> impl Iterator<Item = String> + 'a {
+    records
+        .iter()
+        .filter(|(_, record)| record.source() != RecordSource::Cairn)
+        .map(move |(id, record)| format!("{kind} {id} ({})", record.source().as_str()))
+}
+
+fn adopt_kind<K: fmt::Display, T: Sourced>(
+    kind: &str,
+    records: &mut BTreeMap<K, T>,
+    from: RecordSource,
+    adopted: &mut Vec<String>,
+) {
+    for (id, record) in records.iter_mut() {
+        if record.source() == from && from != RecordSource::Cairn {
+            record.set_source(RecordSource::Cairn);
+            adopted.push(format!("{kind} {id}"));
+        }
+    }
 }
 
 fn path_ok(path: &str) -> bool {
@@ -655,69 +569,38 @@ impl Inventory {
         }
     }
 
-    /// Remove whatever makes the inventory invalid, returning what was wrong.
-    /// A bad recipe goes, then any deployment of it; a bad deployment goes;
-    /// a bad set member leaves its set; a machine in two pools leaves the
-    /// later one.
-    pub fn prune_invalid(&mut self) -> Vec<ValidationError> {
-        let mut found = Vec::new();
-        loop {
-            let problems = self.problems();
-            if problems.is_empty() {
-                break;
-            }
-            let before = self.clone();
-            for problem in &problems {
-                self.remove(problem.culprit());
-            }
-            found.extend(problems);
-            if *self == before {
-                break;
-            }
-        }
-        found
+    /// Every record that is not Cairn's own, as `kind id (source)`, recipes
+    /// first, then deployments, then pools, each in id order.
+    pub fn foreign_records(&self) -> Vec<String> {
+        foreign_of("recipe", &self.recipes)
+            .chain(foreign_of("deployment", &self.deployments))
+            .chain(foreign_of("pool", &self.pools))
+            .collect()
     }
 
-    fn remove(&mut self, culprit: Culprit) {
-        match culprit {
-            Culprit::Recipe(id) => {
-                self.recipes.remove(&id);
-            }
-            Culprit::Deployment(id) => {
-                self.deployments.remove(&id);
-            }
-            Culprit::PoolMachine {
-                pool,
-                machine,
-                keep_first,
-            } => {
-                if let Some(pool) = self.pools.get_mut(&pool) {
-                    let mut kept = false;
-                    pool.machines.retain(|m| {
-                        if m.name != machine {
-                            return true;
-                        }
-                        let keep = keep_first && !kept;
-                        kept = true;
-                        keep
-                    });
-                }
-            }
-            Culprit::SetMember {
-                pool,
-                slot,
-                deployment,
-            } => {
-                if let Some(pool) = self.pools.get_mut(&pool) {
-                    let set = match slot {
-                        Slot::Pin => pool.pin.as_mut(),
-                        Slot::Default => Some(&mut pool.default),
-                    };
-                    if let Some(set) = set {
-                        set.remove(&deployment);
-                    }
-                }
-            }
+    /// Make every record of `from` Cairn's own, keeping its id and contents,
+    /// and name each one adopted. Adopting again adopts nothing.
+    pub fn adopt(&mut self, from: RecordSource) -> Vec<String> {
+        let mut adopted = Vec::new();
+        adopt_kind("recipe", &mut self.recipes, from, &mut adopted);
+        adopt_kind("deployment", &mut self.deployments, from, &mut adopted);
+        adopt_kind("pool", &mut self.pools, from, &mut adopted);
+        adopted
+    }
+
+    /// Add each of `records`' records, replacing the one with its id.
+    pub fn upsert(&mut self, records: Inventory) {
+        self.recipes.extend(records.recipes);
+        self.deployments.extend(records.deployments);
+        self.pools.extend(records.pools);
+    }
+
+    /// What turning `current` into `next` adds, removes and updates.
+    pub fn changes(current: &Inventory, next: &Inventory) -> ChangeReport {
+        ChangeReport {
+            recipes: diff_kind(&current.recipes, &next.recipes),
+            deployments: diff_kind(&current.deployments, &next.deployments),
+            pools: diff_kind(&current.pools, &next.pools),
         }
     }
 
@@ -761,51 +644,6 @@ impl Inventory {
         Ok(resolve::resolve(pool, &self.deployments, powered))
     }
 
-    /// Replace the records of `source` with `imported`'s, leaving every other
-    /// source's records alone, and report what changed. Re-importing the same
-    /// input reports nothing.
-    pub fn reconcile(
-        current: &Inventory,
-        imported: &Inventory,
-        source: RecordSource,
-    ) -> (Inventory, ImportReport) {
-        let mut report = ImportReport::default();
-        let mut conflicts = Vec::new();
-        let recipes = reconcile_kind(
-            "recipe",
-            &current.recipes,
-            &imported.recipes,
-            source,
-            &mut report.recipes,
-            &mut conflicts,
-        );
-        let deployments = reconcile_kind(
-            "deployment",
-            &current.deployments,
-            &imported.deployments,
-            source,
-            &mut report.deployments,
-            &mut conflicts,
-        );
-        let pools = reconcile_kind(
-            "pool",
-            &current.pools,
-            &imported.pools,
-            source,
-            &mut report.pools,
-            &mut conflicts,
-        );
-        report.conflicts = conflicts;
-        (
-            Inventory {
-                recipes,
-                deployments,
-                pools,
-            },
-            report,
-        )
-    }
-
     /// Cairn's own record format, as YAML.
     pub fn to_yaml(&self) -> String {
         let file = InventoryFile {
@@ -816,47 +654,69 @@ impl Inventory {
         serde_yaml::to_string(&file).expect("inventory records serialize to YAML")
     }
 
-    /// Parse Cairn's own record format and validate it.
-    pub fn from_yaml(text: &str) -> Result<Inventory, YamlError> {
+    /// The records a document in Cairn's own record format holds, keeping the
+    /// first of any id written twice, and each id written twice.
+    fn parse_records(text: &str) -> Result<(Inventory, Vec<ValidationError>), YamlError> {
         let file: InventoryFile =
             serde_yaml::from_str(text).map_err(|err| YamlError::Parse(err.to_string()))?;
         let mut inventory = Inventory::default();
+        let mut duplicates = Vec::new();
+        let mut duplicate = |kind: &'static str, id: &dyn fmt::Display| {
+            duplicates.push(ValidationError::DuplicateId {
+                kind,
+                id: id.to_string(),
+            })
+        };
         for recipe in file.recipes {
-            if inventory.recipes.contains_key(&recipe.id) {
-                return Err(YamlError::DuplicateId {
-                    kind: "recipe",
-                    id: recipe.id.to_string(),
-                });
+            match inventory.recipes.contains_key(&recipe.id) {
+                true => duplicate("recipe", &recipe.id),
+                false => inventory.insert_recipe(recipe),
             }
-            inventory.insert_recipe(recipe);
         }
         for deployment in file.deployments {
-            if inventory.deployments.contains_key(&deployment.id) {
-                return Err(YamlError::DuplicateId {
-                    kind: "deployment",
-                    id: deployment.id.to_string(),
-                });
+            match inventory.deployments.contains_key(&deployment.id) {
+                true => duplicate("deployment", &deployment.id),
+                false => inventory.insert_deployment(deployment),
             }
-            inventory.insert_deployment(deployment);
         }
         for pool in file.pools {
-            if inventory.pools.contains_key(&pool.id) {
-                return Err(YamlError::DuplicateId {
-                    kind: "pool",
-                    id: pool.id.to_string(),
-                });
+            match inventory.pools.contains_key(&pool.id) {
+                true => duplicate("pool", &pool.id),
+                false => inventory.insert_pool(pool),
             }
-            inventory.insert_pool(pool);
         }
-        inventory.validate().map_err(YamlError::Invalid)?;
-        Ok(inventory)
+        Ok((inventory, duplicates))
+    }
+
+    /// Parse records in Cairn's own record format without checking that they
+    /// cohere, as a document of some records to add to an inventory is. An id
+    /// written twice is refused.
+    pub fn parse_yaml(text: &str) -> Result<Inventory, YamlError> {
+        let (inventory, duplicates) = Self::parse_records(text)?;
+        if duplicates.is_empty() {
+            Ok(inventory)
+        } else {
+            Err(YamlError::Invalid(duplicates))
+        }
+    }
+
+    /// Parse a whole inventory in Cairn's own record format and validate it,
+    /// refusing it with every problem it has.
+    pub fn from_yaml(text: &str) -> Result<Inventory, YamlError> {
+        let (inventory, mut problems) = Self::parse_records(text)?;
+        problems.extend(inventory.problems());
+        if problems.is_empty() {
+            Ok(inventory)
+        } else {
+            Err(YamlError::Invalid(problems))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{bginf_test_inventory, command_recipe, deployment, set};
+    use crate::fixture::{command_recipe, deployment, set, test_inventory};
     use crate::pool::PoolMachine;
     use crate::recipe::Engine;
 
@@ -865,15 +725,15 @@ mod tests {
     }
 
     #[test]
-    fn the_bginf_fixture_is_valid() {
-        assert_eq!(bginf_test_inventory().validate(), Ok(()));
+    fn the_test_inventory_is_valid() {
+        assert_eq!(test_inventory().validate(), Ok(()));
     }
 
     /// bginf `test_pools_resolve_independently`: the `straddle` profile spans
     /// two pools and is refused.
     #[test]
     fn a_deployment_spanning_pools_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.insert_recipe(command_recipe("straddle", 2));
         inventory.insert_deployment(deployment("straddle", &["sp1", "halo"]));
         assert_eq!(
@@ -883,19 +743,13 @@ mod tests {
                 pools: vec![Some("halo".into()), Some("sparks".into())],
             }]
         );
-        let pruned = inventory.prune_invalid();
-        assert_eq!(pruned.len(), 1);
-        assert!(!inventory
-            .deployments
-            .contains_key(&DeploymentId::from("straddle")));
-        assert_eq!(inventory.validate(), Ok(()));
     }
 
     /// bginf `test_pin_targets_the_profiles_pool_and_off_every_pool`: a pin
     /// of a Spark profile in pool halo is refused.
     #[test]
     fn a_set_member_outside_the_pool_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&["qwen36-fast"]));
         assert_eq!(
             problems_of(&inventory),
@@ -910,7 +764,7 @@ mod tests {
 
     #[test]
     fn overlapping_deployments_in_one_set_are_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory
             .pools
             .get_mut(&PoolId::from("sparks"))
@@ -930,7 +784,7 @@ mod tests {
 
     #[test]
     fn an_unknown_set_member_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory
             .pools
             .get_mut(&PoolId::from("sparks"))
@@ -948,7 +802,7 @@ mod tests {
 
     #[test]
     fn a_machine_in_two_pools_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory
             .pools
             .get_mut(&PoolId::from("halo"))
@@ -971,7 +825,7 @@ mod tests {
 
     #[test]
     fn a_head_outside_the_deployment_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory
             .deployments
             .get_mut(&DeploymentId::from("qwen36-fast"))
@@ -988,7 +842,7 @@ mod tests {
 
     #[test]
     fn a_machine_count_unlike_the_recipe_is_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory
             .deployments
             .get_mut(&DeploymentId::from("qwen36-fast"))
@@ -1007,7 +861,7 @@ mod tests {
 
     #[test]
     fn duplicate_machines_and_unknown_recipes_are_refused() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.insert_deployment(deployment("twice", &["sp1", "sp1"]));
         inventory
             .deployments
@@ -1028,21 +882,77 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn reimporting_identical_input_reports_nothing() {
-        let current = bginf_test_inventory();
-        let (merged, report) = Inventory::reconcile(&current, &current, RecordSource::Bginf);
-        assert_eq!(merged, current);
-        assert!(!report.has_changes());
-        assert_eq!(report.lines(), Vec::<String>::new());
+    /// Every record of the fixture, as bginf mirrored it before it retired.
+    fn mirrored() -> Inventory {
+        let mut inventory = test_inventory();
+        for recipe in inventory.recipes.values_mut() {
+            recipe.source = RecordSource::Bginf;
+        }
+        for deployment in inventory.deployments.values_mut() {
+            deployment.source = RecordSource::Bginf;
+        }
+        for pool in inventory.pools.values_mut() {
+            pool.source = RecordSource::Bginf;
+        }
+        inventory
     }
 
     #[test]
-    fn a_changed_start_command_updates_the_recipe_in_place() {
-        let current = bginf_test_inventory();
-        let mut imported = current.clone();
-        imported
-            .recipes
+    fn adopting_makes_every_mirrored_record_cairns_and_is_idempotent() {
+        let mut inventory = mirrored();
+        let mut own = command_recipe("own", 1);
+        own.source = RecordSource::Cairn;
+        inventory.insert_recipe(own);
+        assert_eq!(inventory.foreign_records().len(), 8);
+        assert_eq!(inventory.foreign_records()[0], "recipe dsv4f-tp2 (bginf)");
+
+        let before = inventory.clone();
+        let adopted = inventory.adopt(RecordSource::Bginf);
+        assert_eq!(
+            adopted,
+            vec![
+                "recipe dsv4f-tp2",
+                "recipe qwen3-embed-4b",
+                "recipe qwen36-fast",
+                "deployment dsv4f-tp2",
+                "deployment qwen3-embed-4b",
+                "deployment qwen36-fast",
+                "pool halo",
+                "pool sparks",
+            ]
+        );
+        assert!(inventory.foreign_records().is_empty());
+        assert_eq!(
+            inventory,
+            test_inventory_with_own(),
+            "ids and contents kept"
+        );
+        let report = Inventory::changes(&before, &inventory);
+        assert_eq!(report.lines().len(), 8);
+        assert!(report
+            .lines()
+            .iter()
+            .all(|line| line.starts_with("updated ") && line.ends_with(": source")));
+
+        assert!(inventory.adopt(RecordSource::Bginf).is_empty());
+        assert!(inventory.adopt(RecordSource::Cairn).is_empty());
+    }
+
+    fn test_inventory_with_own() -> Inventory {
+        let mut inventory = test_inventory();
+        let mut own = command_recipe("own", 1);
+        own.source = RecordSource::Cairn;
+        inventory.insert_recipe(own);
+        inventory
+    }
+
+    #[test]
+    fn changes_name_what_was_added_removed_and_updated() {
+        let current = test_inventory();
+        assert!(!Inventory::changes(&current, &current).has_changes());
+
+        let mut next = current.clone();
+        next.recipes
             .get_mut(&RecipeId::from("qwen36-fast"))
             .unwrap()
             .engine = Engine::Command {
@@ -1050,53 +960,35 @@ mod tests {
             stop: Some("./stop.sh".into()),
             description: None,
         };
-        let (merged, report) = Inventory::reconcile(&current, &imported, RecordSource::Bginf);
-        assert_eq!(merged, imported);
-        assert_eq!(report.lines(), vec!["updated recipe qwen36-fast: engine"]);
-    }
-
-    #[test]
-    fn a_removed_profile_removes_its_records_and_cairn_records_stay() {
-        let mut current = bginf_test_inventory();
-        let mut own = command_recipe("own", 1);
-        own.source = RecordSource::Cairn;
-        current.insert_recipe(own.clone());
-
-        let mut imported = bginf_test_inventory();
-        imported.recipes.remove(&RecipeId::from("qwen36-fast"));
-        imported
-            .deployments
-            .remove(&DeploymentId::from("qwen36-fast"));
-        let (merged, report) = Inventory::reconcile(&current, &imported, RecordSource::Bginf);
+        next.insert_recipe(command_recipe("new", 1));
+        next.pools.remove(&PoolId::from("halo"));
         assert_eq!(
-            report.lines(),
+            Inventory::changes(&current, &next).lines(),
             vec![
-                "removed recipe qwen36-fast",
-                "removed deployment qwen36-fast"
+                "added recipe new",
+                "updated recipe qwen36-fast: engine",
+                "removed pool halo",
             ]
         );
-        assert_eq!(merged.recipes.get(&RecipeId::from("own")), Some(&own));
-        assert!(!merged.recipes.contains_key(&RecipeId::from("qwen36-fast")));
     }
 
     #[test]
-    fn an_import_never_overwrites_another_sources_record() {
-        let mut current = bginf_test_inventory();
-        let mut own = command_recipe("qwen36-fast", 1);
-        own.source = RecordSource::Cairn;
-        current.insert_recipe(own.clone());
-        let (merged, report) =
-            Inventory::reconcile(&current, &bginf_test_inventory(), RecordSource::Bginf);
-        assert_eq!(
-            merged.recipes.get(&RecipeId::from("qwen36-fast")),
-            Some(&own)
-        );
-        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+    fn an_upsert_adds_and_replaces_records_by_id() {
+        let mut inventory = test_inventory();
+        let mut records = Inventory::default();
+        let mut changed = command_recipe("qwen36-fast", 1);
+        changed.served_name = "qwen3.6-35b".into();
+        records.insert_recipe(changed.clone());
+        records.insert_recipe(command_recipe("new", 1));
+        inventory.upsert(records);
+        assert_eq!(inventory.recipes[&RecipeId::from("qwen36-fast")], changed);
+        assert!(inventory.recipes.contains_key(&RecipeId::from("new")));
+        assert_eq!(inventory.deployments.len(), 3);
     }
 
     #[test]
     fn the_yaml_format_round_trips_and_validates_on_import() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&[]));
         let yaml = inventory.to_yaml();
         assert_eq!(Inventory::from_yaml(&yaml), Ok(inventory.clone()));
@@ -1110,8 +1002,51 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_document_names_every_problem_at_once() {
+        let yaml = r#"
+recipes:
+  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./start.sh}, requirements: {machines: 1}}
+  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ''}, requirements: {machines: 1}}
+deployments:
+  - {id: d, recipe: missing, machines: [a], head: b, apiPort: 8000, apiPath: /v1, healthPath: /health}
+pools:
+  - {id: p, machines: [{name: a}], default: [nope]}
+"#;
+        let Err(YamlError::Invalid(problems)) = Inventory::from_yaml(yaml) else {
+            panic!("the document is refused");
+        };
+        let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            problems,
+            vec![
+                "recipe r appears twice",
+                "deployment d names unknown recipe missing",
+                "deployment d has head b, which is not one of its machines",
+                "pool p default names unknown deployment nope",
+            ]
+        );
+        assert!(Inventory::parse_yaml(yaml).is_err(), "an id written twice");
+        assert!(matches!(
+            Inventory::from_yaml("recipes: {"),
+            Err(YamlError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_record_without_a_source_is_cairns() {
+        let parsed = Inventory::parse_yaml(
+            "recipes:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.recipes[&RecipeId::from("r")].source,
+            RecordSource::Cairn
+        );
+    }
+
+    #[test]
     fn the_empty_pin_survives_yaml_as_pinned_to_nothing() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&[]));
         let parsed = Inventory::from_yaml(&inventory.to_yaml()).unwrap();
         assert_eq!(parsed.pools[&PoolId::from("halo")].pin, Some(set(&[])));

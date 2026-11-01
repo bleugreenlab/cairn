@@ -54,7 +54,6 @@ const CODEX_KEY: &str = "sk-coverage-codex-key";
 const OPENROUTER_KEY: &str = "sk-or-coverage-key";
 const OPENCODE_KEY: &str = "sk-oc-coverage-key";
 const TYPESAFE_KEY: &str = "ts-coverage-key";
-const BGINF_KEY: &str = "bginf-coverage-token";
 const WAIT: Duration = Duration::from_secs(20);
 
 /// The coverage deployment's alias, which runs name it by.
@@ -737,14 +736,10 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
 }
 
 /// One cairn-inference deployment serving [`INFERENCE_SERVED_NAME`] under the
-/// alias [`INFERENCE_ALIAS`], on a pool Cairn controls, which bginf's last
-/// state reports healthy: the state in which the pool controller answers a
-/// request on the pass that makes it. The provider is installed and its
-/// catalog refreshed, so a decision can be offered on it. Nothing polls bginf
-/// here; its link is configured only so its stored state is read.
+/// alias [`INFERENCE_ALIAS`], on a pool Cairn controls. The provider is
+/// installed and its catalog refreshed, so a decision can be offered on it.
 async fn seed_inference(orch: &Orchestrator) {
     use crate::orchestrator::pool_control::{patch_pool, PoolPatch};
-    use cairn_config::inference::{BginfLinkSettings, InferenceSettings};
     use cairn_db::turso::params;
 
     let inventory = cairn_inference::Inventory::from_yaml(
@@ -798,15 +793,6 @@ pools:
         .await
         .unwrap();
     }
-    let state = json!({"nodes": {"coverage-box": {
-        "running": "coverage-deployment", "healthy": true, "stale": false}}});
-    db.execute(
-        "INSERT INTO inference_bginf_link (link, last_attempt_at, last_ok_at, state_json)
-         VALUES ('bginf', 1, 1, ?1)",
-        params![state.to_string()],
-    )
-    .await
-    .unwrap();
 
     let mut enabled = orch.enabled_providers();
     enabled.push(crate::backends::inference::INFERENCE_BACKEND_KEY.to_string());
@@ -814,26 +800,6 @@ pools:
         enabled_providers: Some(enabled),
         ..Default::default()
     })
-    .unwrap();
-    crate::config::settings::set_inference(
-        &orch.config_dir,
-        &InferenceSettings {
-            bginf: Some(BginfLinkSettings {
-                url: "http://127.0.0.1:9".into(),
-                machines: Default::default(),
-            }),
-            recipes: Default::default(),
-        },
-    )
-    .unwrap();
-    orch.add_account(
-        ApiProvider::Bginf,
-        "bginf ctl".into(),
-        ProviderAuth::ApiKey {
-            value: BGINF_KEY.into(),
-        },
-        None,
-    )
     .unwrap();
     patch_pool(
         orch,
@@ -1247,7 +1213,6 @@ async fn every_catalog_provider_launches_through_the_facet() {
         OPENROUTER_KEY,
         OPENCODE_KEY,
         TYPESAFE_KEY,
-        BGINF_KEY,
     ] {
         assert!(!stored.contains(secret), "{secret} reached a stored row");
     }

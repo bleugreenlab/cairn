@@ -9,7 +9,7 @@ use cairn_models::types::catalog::{
 
 use super::*;
 
-/// The Sparks and halo as bginf mirrors them, with DeepSeek declared as the
+/// The Sparks and halo as adopted from bginf, with DeepSeek declared as the
 /// operator declares it and the embedder declared an embedder.
 fn inventory() -> Inventory {
     let mut inventory = Inventory::from_yaml(

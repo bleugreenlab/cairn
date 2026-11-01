@@ -141,6 +141,7 @@ fn run(
             capabilities,
             request,
             timeout: Duration::from_secs(5),
+            cancel: None,
         },
     )
 }
@@ -463,6 +464,79 @@ fn texts(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("t{index}")).collect()
 }
 
+/// A `Scripted` that cancels its caller as it answers the first request, as
+/// a caller that timed out mid-call does.
+struct CancelledAfterFirst {
+    inner: Scripted,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Complete for CancelledAfterFirst {
+    fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.complete(call)
+    }
+}
+
+#[test]
+fn a_cancelled_call_sends_no_further_sub_batch() {
+    let capabilities = EmbeddingCapabilities {
+        limits: BatchLimits {
+            max_texts: Some(2),
+            ..BatchLimits::default()
+        },
+        ..plain(Some(2), EmbeddingWidths::NativeOnly)
+    };
+    let complete = CancelledAfterFirst {
+        inner: Scripted::answering(vec![Ok(in_order(2, 2)), Ok(in_order(2, 2))]),
+        cancel: Default::default(),
+    };
+    let request = EmbedRequest {
+        texts: texts(4),
+        purpose: Purpose::Document,
+        width: Width::Native,
+    };
+    let error = embed(
+        &complete,
+        EmbedCall {
+            route: &hub(),
+            model: "m",
+            capabilities: &capabilities,
+            request: &request,
+            timeout: Duration::from_secs(5),
+            cancel: Some(&complete.cancel),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, EmbedError::Cancelled);
+    assert_eq!(
+        complete.inner.requests().len(),
+        1,
+        "the second sub-batch is never sent"
+    );
+
+    // A cancelled call is not retried either.
+    let flaky = CancelledAfterFirst {
+        inner: Scripted::answering(vec![Err(http(503, None))]),
+        cancel: Default::default(),
+    };
+    let error = embed_with(
+        &flaky,
+        EmbedCall {
+            route: &hub(),
+            model: "m",
+            capabilities: &capabilities,
+            request: &request,
+            timeout: Duration::from_secs(5),
+            cancel: Some(&flaky.cancel),
+        },
+        &|_| panic!("a cancelled call does not wait to retry"),
+    )
+    .unwrap_err();
+    assert_eq!(error, EmbedError::Completion(http(503, None)));
+    assert_eq!(flaky.inner.requests().len(), 1);
+}
+
 #[test]
 fn an_oversized_request_is_split_in_order_and_joined_in_input_order() {
     let capabilities = EmbeddingCapabilities {
@@ -714,6 +788,7 @@ fn on_gateway_recording_sleeps(
             capabilities: &EmbeddingCapabilities::cairn_gateway(),
             request,
             timeout: Duration::from_secs(5),
+            cancel: None,
         },
         &|wait| slept.borrow_mut().push(wait),
     );

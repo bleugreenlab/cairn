@@ -144,13 +144,65 @@ fn item_target(item: &serde_json::Value) -> Option<CairnResource> {
         .and_then(parse_uri)
 }
 
+/// A cairn-models facet verb reached through `run` at `cairn://models/<verb>`:
+/// an item the host answers itself by calling the facet with the model the
+/// caller names, never a process. Every door shares one run-dispatch arm; what
+/// differs between them is stated here, so the classifiers that need it (the
+/// grace window, the host-item cap) read one answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDoor {
+    Decide,
+    Embed,
+    Complete,
+}
+
+impl ModelDoor {
+    /// The door `resource` addresses, if it addresses one.
+    pub fn for_resource(resource: &CairnResource) -> Option<Self> {
+        match resource {
+            CairnResource::ModelsDecide => Some(Self::Decide),
+            CairnResource::ModelsEmbed => Some(Self::Embed),
+            CairnResource::ModelsComplete => Some(Self::Complete),
+            _ => None,
+        }
+    }
+
+    /// The URI the door is addressed by.
+    pub fn uri(self) -> &'static str {
+        match self {
+            Self::Decide => "cairn://models/decide",
+            Self::Embed => "cairn://models/embed",
+            Self::Complete => "cairn://models/complete",
+        }
+    }
+
+    /// Whether an item may run past the grace window, suspending its batch as a
+    /// response item does. A door that always answers inside its own short
+    /// per-request bounds keeps the host-item cap instead, and never makes its
+    /// batch suspendable.
+    pub fn outlives_grace(self) -> bool {
+        match self {
+            // Each provider request has its own short bound, and a corpus too
+            // large for the window is sent in several calls.
+            Self::Decide | Self::Embed => false,
+            // It is the verb a response item calls, and a reasoning model's
+            // answer can take minutes.
+            Self::Complete => true,
+        }
+    }
+}
+
 /// True for an item that runs on the host and cannot suspend past the grace
-/// window: a REPL send, a decide, or an executor action.
+/// window: a REPL send, an executor action, or a model door that keeps the
+/// host-item cap ([`ModelDoor::outlives_grace`]).
 pub fn is_host_clamped_item(repl: bool, target: Option<&str>) -> bool {
-    repl || matches!(
-        target.and_then(parse_uri),
-        Some(CairnResource::ModelsDecide | CairnResource::ExecutorAction { .. })
-    )
+    repl || match target.and_then(parse_uri) {
+        Some(CairnResource::ExecutorAction { .. }) => true,
+        Some(resource) => {
+            ModelDoor::for_resource(&resource).is_some_and(|door| !door.outlives_grace())
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +271,7 @@ mod tests {
         for item in [
             json!({"code": "1", "interpreter": "python", "repl": "s", "timeout": 600_000}),
             json!({"target": "cairn://models/decide", "timeout": 600_000}),
+            json!({"target": "cairn://models/embed", "timeout": 600_000}),
         ] {
             assert_eq!(
                 need(json!({"commands": [item.clone()]})),
@@ -233,6 +286,21 @@ mod tests {
             ]})),
             Some(Duration::from_millis(300_000))
         );
+    }
+
+    #[test]
+    fn every_model_door_is_addressed_by_its_own_uri_and_only_complete_suspends() {
+        for door in [ModelDoor::Decide, ModelDoor::Embed, ModelDoor::Complete] {
+            let resource = parse_uri(door.uri()).expect("a door's URI parses");
+            assert_eq!(ModelDoor::for_resource(&resource), Some(door));
+            assert_eq!(
+                is_host_clamped_item(false, Some(door.uri())),
+                !door.outlives_grace(),
+                "{door:?}"
+            );
+        }
+        assert!(ModelDoor::Complete.outlives_grace());
+        assert!(!is_host_clamped_item(false, Some("cairn://models/catalog")));
     }
 
     #[test]

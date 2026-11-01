@@ -5393,6 +5393,15 @@ pub struct LearnedResourceEstimate {
 /// a runner talking to an older executor gets nothing wrong: that executor is
 /// never sent a decide item at all.
 ///
+/// cairn/5714 does not move the number. It folds the decide item into one
+/// host-executed `ModelDoor` run item (decide, embed, complete), which the
+/// runner-only `fleet/mod.rs` refuses to turn into a build-cell process before
+/// anything is framed, exactly as it refused decide. It also adds an optional
+/// `data` field to `RunBatchEnvelope` in the shared `read.rs`, but that
+/// envelope is the runner's answer to its own MCP callback caller and never
+/// crosses the executor link, so no frame gains, loses, or reinterprets a
+/// field, and an older executor gets nothing wrong.
+///
 /// Version 154 (cairn/5217) adds [`ProcessSandboxMode::CredentialFloor`], the
 /// mode a runner now sends for agent work its fence leaves unconfined,
 /// [`ProcessSandboxMode::BranchCode`] for checks, and the containment edge

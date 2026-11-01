@@ -1,24 +1,34 @@
-//! `inference:` in `settings.yaml`: how this workspace reaches the services
-//! that decide what its inference machines run.
+//! `inference:` in `settings.yaml`: the operator's word on what each
+//! inference recipe's model serves and takes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_models_types::catalog::{Modality, VerbKind};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InferenceSettings {
-    /// The read-only link to bginf's control service. Absent means Cairn does
-    /// not mirror bginf.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bginf: Option<BginfLinkSettings>,
     /// The operator's word on what each recipe's model serves and takes, by
-    /// recipe id. It lies over the recipe record wherever the record is read,
-    /// so it survives every re-import of a mirrored record, which is why it
-    /// lives here rather than on the record (bginf's profiles never say).
+    /// recipe id. It lies over the recipe record wherever the record is read.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub recipes: BTreeMap<String, RecipeDeclaration>,
+    /// Whether the file still names the retired bginf link (`bginf:`).
+    /// Accepted and dropped, as `fleet`'s retired `tunnelPort` is: refusing
+    /// it would fail the whole settings file under `deny_unknown_fields`, and
+    /// every section read from it would fall back to its default. Nothing
+    /// reads the link, and the next write of the section drops it.
+    #[serde(
+        default,
+        rename = "bginf",
+        skip_serializing,
+        deserialize_with = "present"
+    )]
+    pub retired_bginf_link: bool,
+}
+
+fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 /// What one recipe's model serves and takes, as the operator declares it.
@@ -58,51 +68,8 @@ impl RecipeDeclaration {
     }
 }
 
-/// Where bginf's control service listens, and how its node names map to
-/// Cairn machines. Its token is never here: it is a `bginf` account in the
-/// encrypted credential store. Retires with bginf.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct BginfLinkSettings {
-    /// The control service's base URL, `http://<host>:<port>`.
-    pub url: String,
-    /// bginf node name to Cairn machine name; a node absent here keeps its name.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub machines: BTreeMap<String, String>,
-}
-
-impl BginfLinkSettings {
-    pub fn validate(&self) -> Result<(), String> {
-        let rest = self
-            .url
-            .strip_prefix("http://")
-            .or_else(|| self.url.strip_prefix("https://"))
-            .ok_or_else(|| format!("inference.bginf.url {:?} must be an http(s) URL", self.url))?;
-        if rest.trim_end_matches('/').is_empty() {
-            return Err(format!("inference.bginf.url {:?} has no host", self.url));
-        }
-        let mut targets = BTreeSet::new();
-        for (node, machine) in &self.machines {
-            if node.trim().is_empty() || machine.trim().is_empty() {
-                return Err(
-                    "inference.bginf.machines entries must name a node and a machine".into(),
-                );
-            }
-            if !targets.insert(machine) {
-                return Err(format!(
-                    "inference.bginf.machines maps two nodes to machine {machine}"
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 impl InferenceSettings {
     pub fn validate(&self) -> Result<(), String> {
-        self.bginf
-            .as_ref()
-            .map_or(Ok(()), BginfLinkSettings::validate)?;
         self.recipes
             .iter()
             .try_for_each(|(recipe, declared)| declared.validate(recipe))
@@ -113,32 +80,25 @@ impl InferenceSettings {
 mod tests {
     use super::*;
 
-    fn link(url: &str, machines: &[(&str, &str)]) -> BginfLinkSettings {
-        BginfLinkSettings {
-            url: url.into(),
-            machines: machines
-                .iter()
-                .map(|(n, m)| (n.to_string(), m.to_string()))
-                .collect(),
-        }
-    }
-
     #[test]
-    fn a_link_needs_an_http_url_and_an_invertible_machine_map() {
-        assert!(link("http://ctl.example:4100", &[("halo", "fedora")])
-            .validate()
-            .is_ok());
-        assert!(link("ctl.example:4100", &[]).validate().is_err());
-        assert!(link("http://", &[]).validate().is_err());
-        assert!(link("http://ctl.example", &[("a", "m"), ("b", "m")])
-            .validate()
-            .is_err());
+    fn the_retired_link_is_accepted_and_never_written() {
+        let parsed: InferenceSettings = serde_yaml::from_str(
+            "bginf: {url: 'http://10.20.20.16:4100', machines: {halo: fedora}}\nrecipes: {r: {verbs: [session]}}\n",
+        )
+        .unwrap();
+        assert!(parsed.retired_bginf_link);
+        assert!(parsed.recipes.contains_key("r"));
+        let written = serde_yaml::to_string(&parsed).unwrap();
+        assert!(!written.contains("bginf"), "{written}");
+        let reread: InferenceSettings = serde_yaml::from_str(&written).unwrap();
+        assert!(!reread.retired_bginf_link);
+        assert_eq!(reread.recipes, parsed.recipes);
     }
 
     #[test]
     fn unknown_keys_are_refused() {
         let parsed: Result<InferenceSettings, _> =
-            serde_json::from_value(serde_json::json!({"bginf": {"url": "http://x", "token": "t"}}));
+            serde_json::from_value(serde_json::json!({"url": "http://x"}));
         assert!(parsed.is_err());
         let parsed: Result<InferenceSettings, _> = serde_json::from_value(
             serde_json::json!({"recipes": {"r": {"verbs": ["session"], "contextLength": 4}}}),

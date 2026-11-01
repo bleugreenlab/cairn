@@ -21,20 +21,26 @@
 //!
 //! [`Complete`]: cairn_models::interface::complete::Complete
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use cairn_models::embed::{embed, gateway, openai};
 use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::embed::{
     EmbedCall, EmbedError, EmbedRequest, EmbedRoute, Embeddings, Purpose, Width, EMBED_TIMEOUT,
 };
-use cairn_models::interface::{CatalogProvider, ModelScope, Models, SelectedOffer};
+use cairn_models::interface::{
+    Catalog, CatalogProvider, ModelScope, Models, NoOffer, SelectedOffer,
+};
+use cairn_models::types::catalog::VerbKind;
 use cairn_models::types::catalog::{
     self, DiscoveredModel, Modalities, Modality, ProviderModelCatalog, ServedVerb, Verb, Wire,
 };
 use cairn_models::types::embedding::{
     EmbeddingCapabilities, CAIRN_GATEWAY_EMBED_MODEL, CAIRN_GATEWAY_KEY,
 };
+use cairn_models::types::usage::{BillingUnit, Charge};
 
 use super::{resolve_embed_token, Orchestrator};
 use crate::backends::custom::CustomProviderConfig;
@@ -57,6 +63,89 @@ pub struct EmbedSelection {
     /// Set explicitly, rather than the default an unset setting means.
     /// Choosing a model is consent to embed history with it.
     pub explicit: bool,
+}
+
+/// Whether texts are what is searched or what searches, as the embed door
+/// takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EmbedPurpose {
+    #[default]
+    Document,
+    Query,
+}
+
+/// What `run cairn://models/embed` takes. Nothing here is chosen for the
+/// caller: no workspace default, no best offer.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EmbedDoorRequest {
+    /// A catalog id or `provider/model`. Optional only so its absence is
+    /// refused by name.
+    #[serde(default)]
+    pub model: Option<String>,
+    pub input: Vec<String>,
+    #[serde(default)]
+    pub purpose: EmbedPurpose,
+    /// Exactly this width; absent is the model's native one.
+    #[serde(default)]
+    pub width: Option<u32>,
+}
+
+/// Input tokens, when the provider reported them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmbedUsage {
+    pub input_tokens: Option<u64>,
+}
+
+/// What the embed door returns: one vector per text in input order, and the
+/// exact `(model, dims)` the facet reports for them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EmbedOutcome {
+    pub vectors: Vec<Vec<f32>>,
+    pub model: String,
+    pub dims: u32,
+    pub provider: String,
+    pub usage: EmbedUsage,
+    /// USD, only when every provider request reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    pub latency_ms: u64,
+}
+
+/// How many offers a refusal names as the ones that do serve `embed`.
+const ALTERNATIVES_NAMED: usize = 3;
+
+/// The offers serving `embed` in scope, named `provider/model`: at most
+/// [`ALTERNATIVES_NAMED`], then how many more. Empty when there are none.
+fn embed_offers_named(catalog: &Catalog) -> String {
+    let all: Vec<String> = catalog
+        .offers_serving(VerbKind::Embed)
+        .into_iter()
+        .map(|offer| format!("{}/{}", offer.provider, offer.model))
+        .collect();
+    let mut named = all
+        .iter()
+        .take(ALTERNATIVES_NAMED)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if all.len() > ALTERNATIVES_NAMED {
+        named.push_str(&format!(" and {} more", all.len() - ALTERNATIVES_NAMED));
+    }
+    named
+}
+
+/// Sets its flag when dropped: the embedding future it lives in was
+/// abandoned (or finished, when setting it no longer matters).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The selected model, as this workspace reaches it.
@@ -290,6 +379,18 @@ impl Orchestrator {
         model: &str,
         request: &EmbedRequest,
     ) -> Result<Embeddings, EmbedError> {
+        self.embed_cancellable(scope, model, request, None)
+    }
+
+    /// [`Self::embed_blocking`], ending before its next sub-batch once
+    /// `cancel` is set.
+    fn embed_cancellable(
+        &self,
+        scope: &ModelScope,
+        model: &str,
+        request: &EmbedRequest,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Embeddings, EmbedError> {
         if model.trim().is_empty() {
             return Err(EmbedError::InvalidRequest(
                 "name the embedding model: stored vectors are keyed by it, so it is never chosen implicitly"
@@ -309,11 +410,15 @@ impl Orchestrator {
                 capabilities: &capabilities,
                 request,
                 timeout: EMBED_TIMEOUT,
+                cancel,
             },
         )
     }
 
-    /// [`Self::embed_blocking`], off the async runtime.
+    /// [`Self::embed_blocking`], off the async runtime. Dropping the future
+    /// releases the caller at once; the blocking worker then sends no further
+    /// sub-batch, so it ends within the one request in flight
+    /// ([`EMBED_TIMEOUT`]).
     pub async fn embed(
         &self,
         scope: ModelScope,
@@ -321,13 +426,117 @@ impl Orchestrator {
         request: EmbedRequest,
     ) -> Result<Embeddings, EmbedError> {
         let orch = self.clone();
-        tokio::task::spawn_blocking(move || orch.embed_blocking(&scope, &model, &request))
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+        tokio::task::spawn_blocking(move || {
+            orch.embed_cancellable(&scope, &model, &request, Some(&cancel))
+        })
+        .await
+        .map_err(|error| {
+            EmbedError::Completion(CompletionError::Upstream(format!(
+                "the embedding task failed: {error}"
+            )))
+        })?
+    }
+
+    /// Embed `request`'s texts with the model it names, and only that model:
+    /// the door behind `run cairn://models/embed`. A model that serves no
+    /// embeddings is refused naming the offers that do; a width the offer
+    /// cannot return is refused by the facet's own selector, naming the widths
+    /// it can. Usage is returned, not recorded, as it is for every embedding
+    /// consumer.
+    pub(crate) async fn embed_named(
+        &self,
+        project_id: Option<&str>,
+        request: EmbedDoorRequest,
+    ) -> Result<EmbedOutcome, String> {
+        let started = Instant::now();
+        let scope = ModelScope {
+            project_id: project_id.map(str::to_string),
+        };
+        let catalog = self
+            .catalog(&scope)
+            .map_err(|error| format!("the model catalog is unavailable: {error}"))?;
+        let Some(model) = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            let lead = "Name the model to embed with (a catalog id, or provider/model): this door never chooses one, because vectors are only comparable within one model";
+            let offers = embed_offers_named(&catalog);
+            return Err(if offers.is_empty() {
+                let nothing = NoOffer {
+                    verb: VerbKind::Embed,
+                    requested: None,
+                    detail: None,
+                };
+                format!("{lead}. {nothing}")
+            } else {
+                format!("{lead}; offers that serve embed: {offers}.")
+            });
+        };
+        let width = match request.width {
+            None => Width::Native,
+            Some(0) => {
+                return Err(
+                    "`width` must be at least 1; omit it for the model's native width.".to_string(),
+                )
+            }
+            Some(width) => Width::Exactly(width),
+        };
+        // The serves gate first, at the native width every embedding offer
+        // admits, so a model that does not embed at all is told apart from one
+        // that cannot return the width asked for.
+        let any_width = EmbedRequest {
+            texts: Vec::new(),
+            purpose: Purpose::Document,
+            width: Width::Native,
+        };
+        if let Err(error) = catalog.embedding_offer(Some(model), &any_width) {
+            return Err(match error {
+                EmbedError::NoOffer(mut refusal) => {
+                    let offers = embed_offers_named(&catalog);
+                    if !offers.is_empty() {
+                        let suffix = format!("offers that serve embed: {offers}");
+                        refusal.detail = Some(match refusal.detail.take() {
+                            Some(detail) => format!("{detail}; {suffix}"),
+                            None => suffix,
+                        });
+                    }
+                    refusal.to_string()
+                }
+                other => other.to_string(),
+            });
+        }
+        let embeddings = self
+            .embed(
+                scope,
+                model.to_string(),
+                EmbedRequest {
+                    texts: request.input,
+                    purpose: match request.purpose {
+                        EmbedPurpose::Document => Purpose::Document,
+                        EmbedPurpose::Query => Purpose::Query,
+                    },
+                    width,
+                },
+            )
             .await
-            .map_err(|error| {
-                EmbedError::Completion(CompletionError::Upstream(format!(
-                    "the embedding task failed: {error}"
-                )))
-            })?
+            .map_err(|error| error.to_string())?;
+        Ok(EmbedOutcome {
+            usage: EmbedUsage {
+                input_tokens: embeddings
+                    .usage
+                    .quantity(Charge::Input, BillingUnit::Tokens),
+            },
+            cost: embeddings.usage.cost_usd,
+            vectors: embeddings.vectors,
+            model: embeddings.model,
+            dims: embeddings.dims,
+            provider: embeddings.provider,
+            latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     /// Where `offer` is embedded, with this workspace's credentials for it.
@@ -415,8 +624,10 @@ impl Orchestrator {
     }
 }
 
+/// The scripted hub these tests embed on, shared with the run handler's tests
+/// of the embed door and the read page's.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -438,9 +649,30 @@ mod tests {
 
     /// An embeddings server that answers from a script and records requests.
     #[derive(Default)]
-    struct Scripted {
+    pub(crate) struct Scripted {
         replies: Mutex<VecDeque<Value>>,
         requests: Mutex<Vec<(&'static str, Value)>>,
+    }
+
+    impl Scripted {
+        /// How many texts each request carried, in order.
+        pub(crate) fn batch_sizes(&self) -> Vec<usize> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, body)| body["input"].as_array().map_or(0, Vec::len))
+                .collect()
+        }
+    }
+
+    /// An OpenAI-wire reply of `count` four-wide vectors, each starting with
+    /// its in-batch index so order can be read back.
+    pub(crate) fn hub_reply(count: usize) -> Value {
+        let data: Vec<Value> = (0..count)
+            .map(|index| json!({"index": index, "embedding": [index as f32, 0.5, 0.5, 0.5]}))
+            .collect();
+        json!({"model": "qwen3-embedding-4b", "data": data, "usage": {"prompt_tokens": count}})
     }
 
     impl Complete for Scripted {
@@ -492,7 +724,9 @@ mod tests {
 
     /// A workspace whose one provider is a chat hub declaring one embedding
     /// model, answering from `replies`.
-    async fn workspace_with_hub(replies: Vec<Value>) -> (Orchestrator, Arc<Scripted>, String) {
+    pub(crate) async fn workspace_with_hub(
+        replies: Vec<Value>,
+    ) -> (Orchestrator, Arc<Scripted>, String) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let scripted = Arc::new(Scripted {
             replies: Mutex::new(replies.into()),
@@ -605,6 +839,123 @@ mod tests {
             "{error}"
         );
         assert!(server.requests.lock().unwrap().is_empty());
+    }
+
+    fn door(model: Option<&str>, texts: usize, width: Option<u32>) -> super::EmbedDoorRequest {
+        super::EmbedDoorRequest {
+            model: model.map(str::to_string),
+            input: (0..texts).map(|index| format!("text {index}")).collect(),
+            purpose: super::EmbedPurpose::Document,
+            width,
+        }
+    }
+
+    const HUB_MODEL: &str = "qwen/qwen3-embedding-4b";
+
+    /// The door embeds on exactly the model named, reports the facet's
+    /// `(model, dims)`, and leaves an over-limit batch to the facet, which
+    /// splits it within the offer's declared limit and keeps input order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_door_embeds_with_the_named_model_and_the_facet_splits_the_batch() {
+        let (orch, server, key) = workspace_with_hub(vec![hub_reply(32), hub_reply(8)]).await;
+        let outcome = orch
+            .embed_named(None, door(Some(HUB_MODEL), 40, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                outcome.provider.as_str(),
+                outcome.model.as_str(),
+                outcome.dims
+            ),
+            (key.as_str(), HUB_MODEL, 4)
+        );
+        assert_eq!(server.batch_sizes(), [32, 8], "the hub's declared limit");
+        assert_eq!(outcome.vectors.len(), 40);
+        assert_eq!(outcome.vectors[31][0], 31.0);
+        assert_eq!(
+            outcome.vectors[33][0], 1.0,
+            "the second batch follows the first"
+        );
+        assert_eq!(outcome.usage.input_tokens, Some(40));
+        assert_eq!(outcome.cost, None, "the hub reports no cost");
+
+        // The provider-qualified form names the same offer.
+        let (orch, _, key) = workspace_with_hub(vec![hub_reply(1)]).await;
+        let outcome = orch
+            .embed_named(None, door(Some(&format!("{key}/{HUB_MODEL}")), 1, None))
+            .await
+            .unwrap();
+        assert_eq!(outcome.model, HUB_MODEL);
+    }
+
+    /// Every refusal comes before any request and names what would work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_door_refuses_naming_the_fix_and_asks_nothing() {
+        let (orch, server, key) = workspace_with_hub(vec![]).await;
+        let serving = format!("offers that serve embed: {key}/{HUB_MODEL}");
+
+        for unnamed in [None, Some("  ")] {
+            let refusal = orch
+                .embed_named(None, door(unnamed, 1, None))
+                .await
+                .unwrap_err();
+            assert!(
+                refusal.starts_with("Name the model to embed with"),
+                "{refusal}"
+            );
+            assert!(refusal.contains(&serving), "{refusal}");
+        }
+
+        // A chat model on the same hub serves no embeddings.
+        let refusal = orch
+            .embed_named(None, door(Some("big"), 1, None))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.starts_with("No embedding-capable model serves 'big'"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&serving), "{refusal}");
+
+        let refusal = orch
+            .embed_named(None, door(Some("nowhere/model"), 1, None))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("no installed provider offers"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(&serving), "{refusal}");
+
+        // A width the offer cannot return names the one it can.
+        let refusal = orch
+            .embed_named(None, door(Some(HUB_MODEL), 1, Some(2)))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("only its native 4, not 2"), "{refusal}");
+        let refusal = orch
+            .embed_named(None, door(Some(HUB_MODEL), 1, Some(0)))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("`width` must be at least 1"), "{refusal}");
+
+        let refusal = orch
+            .embed_named(None, door(Some(HUB_MODEL), 0, None))
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("there are no texts to embed"), "{refusal}");
+        assert!(server.batch_sizes().is_empty(), "nothing was asked");
+
+        let bare = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let refusal = bare
+            .embed_named(None, door(None, 1, None))
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.contains("No embedding-capable model is configured"),
+            "{refusal}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

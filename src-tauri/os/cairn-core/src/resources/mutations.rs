@@ -21,7 +21,7 @@ mod skills;
 pub(crate) use blocking::{
     blocking_append_kind, run_blocking_group, validate_blocking_group, BlockingResult,
 };
-pub(crate) use dispatch::dispatch_resource_change;
+pub(crate) use dispatch::{dispatch_resource_change, inference_records_authority};
 pub(crate) use hash::hash_resource_target;
 pub(crate) use mcp::workspace_mcp_authority;
 pub(crate) use models_accounts::{

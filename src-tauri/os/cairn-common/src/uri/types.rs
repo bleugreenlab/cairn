@@ -1012,6 +1012,12 @@ pub enum CairnResource {
     /// The `decide` verb's door: a `run` target that answers typed questions
     /// with the model the caller names.
     ModelsDecide,
+    /// The `embed` verb's door: a `run` target that embeds texts with the
+    /// model the caller names.
+    ModelsEmbed,
+    /// The `complete` verb's door: a `run` target that sends one completion
+    /// to the model the caller names.
+    ModelsComplete,
     /// Every provider account, with its live usage windows and no secret.
     ModelsAccounts,
     /// One provider account by id.
@@ -1028,8 +1034,8 @@ pub enum CairnResource {
     ModelsSession {
         id: String,
     },
-    /// The cairn-inference facet's index: the bginf link's status and one line
-    /// per `cairn://inference/*` collection.
+    /// The cairn-inference facet's index: the record counts, one line per
+    /// `cairn://inference/*` collection, and where the records are written.
     Inference,
     /// How each model is run.
     InferenceRecipes,
@@ -1040,8 +1046,8 @@ pub enum CairnResource {
     InferenceDeployment {
         id: String,
     },
-    /// Pools, their pin and default, Cairn's resolution beside bginf's, and
-    /// the pool controller's state for pools under Cairn's control.
+    /// Pools, their machines, pin and default, and the pool controller's state
+    /// for pools under Cairn's control.
     InferencePools,
     /// The pool controller's queue of model requests.
     InferenceRequests,
@@ -1173,6 +1179,8 @@ impl CairnResource {
             Self::Models => ResourceKind::Models,
             Self::ModelsCatalog => ResourceKind::ModelsCatalog,
             Self::ModelsDecide => ResourceKind::ModelsDecide,
+            Self::ModelsEmbed => ResourceKind::ModelsEmbed,
+            Self::ModelsComplete => ResourceKind::ModelsComplete,
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,

@@ -65,8 +65,8 @@ macro_rules! private_command_outcome_history {
 }
 
 /// cairn/5099: the cairn-inference facet's recipes, deployments and pools, and
-/// the bginf link's last read. The orch's own inventory, mirrored from this
-/// installation's bginf, so private.
+/// the bginf link's last read (dropped since, when bginf retired). The orch's
+/// own inventory of this installation's machines, so private.
 macro_rules! private_inference_records {
     () => {
         migration!("0268_inference_records")
@@ -2178,6 +2178,10 @@ pub enum PrivateReason {
     RunnerTransient,
     /// A rebuildable / refetchable cache (CI logs).
     RebuildableCache,
+    /// This install's own configuration of the machines it runs (the
+    /// inference inventory): written by its operator, durable, and rebuilt
+    /// from nowhere, but about this install's hardware, so never synced.
+    HostConfiguration,
     /// Private today, but its lean is to be shared; the move is DEFERRED to a
     /// named owner. Recorded as an owned, documented exception, never an
     /// anonymous allowlist line.
@@ -2512,23 +2516,19 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "command_outcome_history",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
-    // The inference records (0267). Every row today mirrors this install's
-    // bginf and is rebuilt by the next import; the link row is its last read.
+    // The inference records (0268): how this install's inference machines run
+    // their models, written by its operator and rebuilt from nowhere.
     (
         "inference_recipes",
-        TableScope::Private(PrivateReason::RebuildableCache),
+        TableScope::Private(PrivateReason::HostConfiguration),
     ),
     (
         "inference_deployments",
-        TableScope::Private(PrivateReason::RebuildableCache),
+        TableScope::Private(PrivateReason::HostConfiguration),
     ),
     (
         "inference_pools",
-        TableScope::Private(PrivateReason::RebuildableCache),
-    ),
-    (
-        "inference_bginf_link",
-        TableScope::Private(PrivateReason::RebuildableCache),
+        TableScope::Private(PrivateReason::HostConfiguration),
     ),
     // What this runner has commanded its inference machines to do (cairn/5660):
     // the phase of each deployment it acted on, and the loads it measured.

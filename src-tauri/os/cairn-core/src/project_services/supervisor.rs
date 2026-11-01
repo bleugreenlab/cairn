@@ -322,6 +322,10 @@ struct Cell {
     last_activity: StdMutex<Instant>,
     schedule_task: StdMutex<ScheduleTask>,
     schedule_changed: Notify,
+    /// Whether a deferred occurrence has been logged this runner, so a
+    /// project service whose schedule waits on the startup catch-up writes
+    /// one row rather than one per recheck.
+    deferral_noted: AtomicBool,
     /// Sends a call's first attempt to this incarnation, standing in for the
     /// race where a replacement lands between choosing one and sending.
     #[cfg(test)]
@@ -379,6 +383,10 @@ pub(crate) struct ServiceSupervisor {
     host: RwLock<Arc<dyn ServiceHost>>,
     sources: RwLock<Arc<dyn SourceProvider>>,
     cells: StdMutex<HashMap<CellKey, Arc<Cell>>>,
+    /// Set when the project pass of runner start begins, after the startup
+    /// catch-up has brought every base tip current. Until then a project
+    /// service's scheduled occurrence is deferred, not run from a stale tip.
+    projects_current: AtomicBool,
 }
 
 impl Default for ServiceSupervisor {
@@ -387,6 +395,7 @@ impl Default for ServiceSupervisor {
             host: RwLock::new(Arc::new(super::host::LeaseHost::default())),
             sources: RwLock::new(Arc::new(OwnerSources)),
             cells: StdMutex::default(),
+            projects_current: AtomicBool::new(false),
         }
     }
 }
@@ -433,6 +442,7 @@ impl ServiceSupervisor {
                     last_activity: StdMutex::new(Instant::now()),
                     schedule_task: StdMutex::default(),
                     schedule_changed: Notify::new(),
+                    deferral_noted: AtomicBool::new(false),
                     #[cfg(test)]
                     force_first_pick: StdMutex::default(),
                 })
@@ -1742,13 +1752,15 @@ async fn run_schedule(orch: Orchestrator, cell: Arc<Cell>) {
 }
 
 /// Run every occurrence of `rows` due at `now` (epoch seconds), one after
-/// another. Answers how many were due.
+/// another. Answers how many were due and not deferred: a deferred occurrence
+/// stays due, and the task waits for a wake or its recheck to try it again.
 async fn fire_due(orch: &Orchestrator, cell: &Arc<Cell>, rows: &[ScheduleRow], now: i64) -> usize {
     let mut due_count = 0;
     for row in rows {
         if let Some(due) = row.due_at(now) {
-            due_count += 1;
-            fire_occurrence(orch, cell, row, due).await;
+            if fire_occurrence(orch, cell, row, due).await {
+                due_count += 1;
+            }
         }
     }
     due_count
@@ -1756,23 +1768,51 @@ async fn fire_due(orch: &Orchestrator, cell: &Arc<Cell>, rows: &[ScheduleRow], n
 
 /// Claim occurrence `due` of one entry, call its method as the owner, record
 /// the outcome, and tell the owning thread if a failure streak begins.
-async fn fire_occurrence(orch: &Orchestrator, cell: &Arc<Cell>, row: &ScheduleRow, due: i64) {
+/// Answers false when the occurrence was deferred, unclaimed, to run later.
+async fn fire_occurrence(
+    orch: &Orchestrator,
+    cell: &Arc<Cell>,
+    row: &ScheduleRow,
+    due: i64,
+) -> bool {
+    if cell.owner == ServiceOwner::Project
+        && !supervisor(orch).projects_current.load(Ordering::Acquire)
+    {
+        if !cell.deferral_noted.swap(true, Ordering::AcqRel) {
+            let at = chrono::DateTime::from_timestamp(due, 0)
+                .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| due.to_string());
+            lifecycle(
+                orch,
+                cell,
+                0,
+                &format!(
+                    "scheduled `{}` due {at} deferred: a project's services start after the \
+                     runner's startup catch-up brings its base tip current, and it runs then",
+                    row.method
+                ),
+                "schedule",
+            )
+            .await;
+        }
+        return false;
+    }
     let db = match crate::execution::routing::owning_db_for_project(&orch.db, &cell.project_id)
         .await
     {
         Ok(db) => db,
         Err(error) => {
             tracing::warn!(%error, service = %cell.service, "could not reach a service's schedule");
-            return;
+            return true;
         }
     };
     let (project_id, owner, service) = (&cell.project_id, &cell.owner, &cell.service);
     match schedule::claim(&db, project_id, owner, service, &row.entry_key, due).await {
         Ok(true) => {}
-        Ok(false) => return,
+        Ok(false) => return true,
         Err(error) => {
             tracing::warn!(%error, service = %cell.service, "could not claim a scheduled occurrence");
-            return;
+            return true;
         }
     }
     let outcome = if cell.state.lock().unwrap().sticky_stop {
@@ -1826,6 +1866,7 @@ async fn fire_occurrence(orch: &Orchestrator, cell: &Arc<Cell>, row: &ScheduleRo
             tracing::warn!(%error, service = %cell.service, "could not send a schedule failure notice");
         }
     }
+    true
 }
 
 /// Run what `target`'s schedule has due at `now` (epoch seconds), as its
@@ -1900,41 +1941,16 @@ pub(crate) fn note_base_advance(orch: &Orchestrator, project_id: &str) {
     });
 }
 
-/// Runner start: finalize what a predecessor left live, then start every
-/// `launch` service of every project with a repository and of every thread
-/// that has written one.
-pub(crate) async fn start_launch_services(orch: &Orchestrator) {
+/// Runner start, at boot and independent of the startup catch-up: finalize
+/// what a predecessor left live, start every thread's `launch` services, and
+/// resume every schedule whose rows exist. A thread's services come from its
+/// own store, which no repository catch-up touches, so nothing here waits on
+/// one. Placement is the only precondition, and the colocated executor's
+/// pending attach holds a lease request rather than refusing it.
+pub(crate) async fn start_at_boot(orch: &Orchestrator) {
     let db = orch.db.local.clone();
     if let Err(error) = rows::finalize_orphaned_runs(&db).await {
         tracing::warn!(%error, "could not finalize orphaned service runs");
-    }
-    let projects = db
-        .read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id FROM projects WHERE repo_path IS NOT NULL AND repo_path <> ''",
-                        (),
-                    )
-                    .await?;
-                let mut ids = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    ids.push(crate::storage::RowExt::text(&row, 0)?);
-                }
-                Ok(ids)
-            })
-        })
-        .await
-        .unwrap_or_default();
-    for project_id in projects {
-        apply_source(
-            orch,
-            &project_id,
-            &ServiceOwner::Project,
-            "runner start",
-            None,
-        )
-        .await;
     }
     match super::thread_store::owners(&db).await {
         Ok(owners) => {
@@ -1944,6 +1960,115 @@ pub(crate) async fn start_launch_services(orch: &Orchestrator) {
         }
         Err(error) => tracing::warn!(%error, "could not list thread-owned services"),
     }
+    resume_schedules(orch).await;
+}
+
+/// Start a schedule task for every service with schedule rows, whatever its
+/// owner, so a cadence runs from boot even when its source cannot be read
+/// yet. A project service's occurrences defer until the project pass.
+async fn resume_schedules(orch: &Orchestrator) {
+    for (project_id, _) in project_repositories(orch).await {
+        let db = match crate::execution::routing::owning_db_for_project(&orch.db, &project_id).await
+        {
+            Ok(db) => db,
+            Err(error) => {
+                tracing::warn!(%error, project_id, "could not reach a project's service schedules");
+                continue;
+            }
+        };
+        let services = match schedule::scheduled_services(&db, &project_id).await {
+            Ok(services) if services.is_empty() => continue,
+            Ok(services) => services,
+            Err(error) => {
+                tracing::warn!(%error, project_id, "could not list scheduled services");
+                continue;
+            }
+        };
+        let key = match project_key(orch, &project_id).await {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::warn!(%error, project_id, "could not resolve a project key for services");
+                continue;
+            }
+        };
+        for (owner, service) in services {
+            let cell = supervisor(orch).cell(&project_id, &key, &owner, &service);
+            wake_schedule(orch, &cell);
+        }
+    }
+}
+
+/// Runner start, after the startup catch-up: start every project's `launch`
+/// services from the base tip the runner has just brought current, and let
+/// project schedules run. Once per runner; a second call does nothing.
+pub(crate) async fn start_project_launch_services(orch: &Orchestrator) {
+    if supervisor(orch)
+        .projects_current
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+    for (project_id, repo_path) in project_repositories(orch).await {
+        // A project whose checkout was moved or deleted is an ordinary state,
+        // not a fault to report on every boot; its services wait for it.
+        if !tokio::fs::try_exists(&repo_path).await.unwrap_or(false) {
+            tracing::debug!(
+                project_id,
+                repo_path,
+                "project repository is missing; its services do not start"
+            );
+            continue;
+        }
+        apply_source(
+            orch,
+            &project_id,
+            &ServiceOwner::Project,
+            "runner start",
+            None,
+        )
+        .await;
+    }
+    let deferred: Vec<Arc<Cell>> = supervisor(orch)
+        .cells
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|cell| cell.owner == ServiceOwner::Project)
+        .cloned()
+        .collect();
+    for cell in deferred {
+        wake_schedule(orch, &cell);
+    }
+}
+
+/// Every project with a repository: (id, repository path).
+async fn project_repositories(orch: &Orchestrator) -> Vec<(String, String)> {
+    orch.db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, repo_path FROM projects
+                         WHERE repo_path IS NOT NULL AND repo_path <> ''",
+                        (),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push((
+                        crate::storage::RowExt::text(&row, 0)?,
+                        crate::storage::RowExt::text(&row, 1)?,
+                    ));
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not list projects for services");
+            Vec::new()
+        })
 }
 
 /// One call to a service.

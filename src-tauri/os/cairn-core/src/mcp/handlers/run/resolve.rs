@@ -86,9 +86,27 @@ pub(super) async fn resolve_run_item(
                 Err(error) => return (item_header(item, raw_target), Err(error)),
             };
             let header = item_header(item, &target);
+            let parsed = cairn_common::uri::parse_uri(&target);
+            if let Some(door) = parsed
+                .as_ref()
+                .and_then(cairn_common::run_contract::ModelDoor::for_resource)
+            {
+                return (
+                    header,
+                    Ok(RunSpec::ModelDoor {
+                        door,
+                        args: item
+                            .payload
+                            .as_ref()
+                            .and_then(|payload| payload.args_json.clone())
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        timeout: item.timeout,
+                    }),
+                );
+            }
             // Branch on the target URI family: MCP gateway tool calls are
             // proxied RPC; everything else is a skill-script process exec.
-            match cairn_common::uri::parse_uri(&target) {
+            match parsed {
                 Some(CairnResource::Mcp { server, resource }) => {
                     let spec = resolve_mcp_call(orch, run_context, server, resource, item).await;
                     (header, spec)
@@ -102,17 +120,6 @@ pub(super) async fn resolve_run_item(
                     Ok(RunSpec::ResponseCall {
                         response_id,
                         project: None,
-                        args: item
-                            .payload
-                            .as_ref()
-                            .and_then(|payload| payload.args_json.clone())
-                            .unwrap_or_else(|| serde_json::json!({})),
-                        timeout: item.timeout,
-                    }),
-                ),
-                Some(CairnResource::ModelsDecide) => (
-                    header,
-                    Ok(RunSpec::Decide {
                         args: item
                             .payload
                             .as_ref()

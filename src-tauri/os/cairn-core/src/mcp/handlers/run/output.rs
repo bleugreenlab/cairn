@@ -146,9 +146,19 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
 /// Serializing a struct of string/array fields does not fail in practice; the
 /// fallback returns the bare text so a run never errors on rendering.
 pub(super) fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
+    run_envelope_with_data(text, images, None)
+}
+
+/// [`run_envelope`] carrying each item's typed result ([`collect_run_data`]).
+pub(super) fn run_envelope_with_data(
+    text: String,
+    images: Vec<ImageBlock>,
+    data: Option<Vec<serde_json::Value>>,
+) -> String {
     encode_envelope(RunBatchEnvelope {
         text,
         images,
+        data,
         invalid_input: false,
     })
 }
@@ -160,6 +170,7 @@ pub(super) fn run_input_refusal(text: String) -> String {
         text,
         images: Vec::new(),
         invalid_input: true,
+        data: None,
     })
 }
 
@@ -170,6 +181,20 @@ fn encode_envelope(envelope: RunBatchEnvelope) -> String {
 /// Collect every item's image blocks across the batch, in item order.
 pub(super) fn collect_run_images(outcomes: Vec<ItemOutcome>) -> Vec<ImageBlock> {
     outcomes.into_iter().flat_map(|o| o.images).collect()
+}
+
+/// Every item's typed result in item order, `null` for an item without one;
+/// `None` when no item has one, so an ordinary batch's envelope is unchanged.
+pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde_json::Value>> {
+    if outcomes.iter().all(|outcome| outcome.data.is_none()) {
+        return None;
+    }
+    Some(
+        outcomes
+            .iter_mut()
+            .map(|outcome| outcome.data.take().unwrap_or(serde_json::Value::Null))
+            .collect(),
+    )
 }
 
 /// Compose per-item outcomes into a single result string, bounded by
@@ -620,6 +645,7 @@ mod tests {
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
+            data: None,
         }
     }
 
@@ -647,6 +673,7 @@ mod tests {
                 suspended: false,
                 images: vec![img_a.clone()],
                 tracked_modifications: None,
+                data: None,
             },
             // A text-only item contributes no images and is skipped.
             ItemOutcome::failed("echo".to_string(), "out"),
@@ -657,6 +684,7 @@ mod tests {
                 suspended: false,
                 images: vec![img_b.clone()],
                 tracked_modifications: None,
+                data: None,
             },
         ];
         assert_eq!(collect_run_images(outcomes), vec![img_a, img_b]);

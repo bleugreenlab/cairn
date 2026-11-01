@@ -887,7 +887,7 @@ pub(crate) const SETTINGS_BUILD_SERVICES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_INFERENCE: KeySpec = KeySpec::new(
     "inference",
     KeyType::Object,
-    "{bginf:{url,machines?{node:machine}}|null, recipes?{recipeId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section (carry both keys); recipes declare what a recipe's model serves and takes, over every re-import; the bginf token is a `bginf` account, never a setting",
+    "{recipes?{recipeId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section; recipes declare what a recipe's model serves and takes, over the record; the records themselves are written at cairn://inference",
 );
 pub(crate) const SETTINGS_MAX_THINKING_TOKENS: KeySpec = KeySpec::new(
     "maxThinkingTokens",

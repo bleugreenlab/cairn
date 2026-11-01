@@ -119,6 +119,7 @@ async fn run_executor_action(
             suspended: false,
             images: result.images,
             tracked_modifications: None,
+            data: None,
         },
         Ok(_) => ItemOutcome::failed(header, "Desktop verbs cannot suspend for follow-up input"),
         Err(error) => ItemOutcome::failed(header, format!("{}: {error}", spec.executor_name)),
@@ -163,14 +164,172 @@ fn strip_dev_instance_routing_env(mut config: SpawnConfig) -> SpawnConfig {
     config
 }
 
-/// Answer a `cairn://models/decide` item in the caller's project scope (the
-/// workspace's, outside a run), bounded by the item's timeout under the
-/// host-item cap.
+/// Answer a model-door item (`cairn://models/<verb>`) in the caller's project
+/// scope (the workspace's, outside a run).
+async fn run_model_door(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    header: String,
+    door: cairn_common::run_contract::ModelDoor,
+    args: serde_json::Value,
+    timeout: Option<u32>,
+    interrupt: Option<&crate::responses::InvocationInterrupt>,
+) -> ItemOutcome {
+    use cairn_common::run_contract::ModelDoor;
+    match door {
+        ModelDoor::Decide => run_decide(orch, run_context, header, args, timeout).await,
+        ModelDoor::Embed => run_embed(orch, run_context, header, args, timeout).await,
+        ModelDoor::Complete => {
+            run_complete(orch, run_context, header, args, timeout, interrupt).await
+        }
+    }
+}
+
+/// Answer a `cairn://models/complete` item. Like a response item, it runs to
+/// its own bound up to the run ceiling (its batch suspends past the grace
+/// window), and the bound and any interruption are enforced inside the
+/// invocation so the call is always journaled.
+async fn run_complete(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    header: String,
+    args: serde_json::Value,
+    timeout: Option<u32>,
+    interrupt: Option<&crate::responses::InvocationInterrupt>,
+) -> ItemOutcome {
+    let project_id = run_context.map(|context| context.project_id.clone());
+    let caller = match run_context {
+        Some(context) if context.agent_config_id.as_deref() == Some("workflow") => {
+            crate::responses::ResponseCaller::Workflow {
+                label: context.job_name.clone(),
+                run_id: context.run_id.clone(),
+                project_id: project_id.clone(),
+                project_path: None,
+            }
+        }
+        Some(context) => crate::responses::ResponseCaller::Agent {
+            label: context.job_name.clone(),
+            run_id: context.run_id.clone(),
+            project_id: project_id.clone(),
+            project_path: None,
+        },
+        None => crate::responses::ResponseCaller::Internal {
+            label: "cairn://models/complete".into(),
+        },
+    };
+    let bound = super::response_item_bound(timeout);
+    match orch
+        .complete_named(project_id.as_deref(), caller, args, &bound, interrupt)
+        .await
+    {
+        Err(refusal) => ItemOutcome::failed(header, refusal),
+        Ok(outcome) => ItemOutcome {
+            header: format!(
+                "{} [{} · {} · {:.1}s{}]",
+                outcome.history,
+                outcome.provider,
+                outcome.model,
+                outcome.latency_ms as f64 / 1000.0,
+                outcome
+                    .cost
+                    .map(|cost| format!(" · ${cost:.4}"))
+                    .unwrap_or_default()
+            ),
+            body: outcome
+                .structured
+                .as_ref()
+                .map_or_else(|| outcome.text.clone(), serde_json::Value::to_string),
+            succeeded: true,
+            suspended: false,
+            images: Vec::new(),
+            tracked_modifications: None,
+            data: serde_json::to_value(&outcome).ok(),
+        },
+    }
+}
+
+/// The most characters an embed reply's text may take with its vectors in it.
+/// Past it the text names what came back and leaves the vectors to the
+/// envelope's `data`, because a vector cut short by the run result's cap reads
+/// as a valid shorter one.
+const EMBED_TEXT_BUDGET: usize = 40_000;
+
+/// The text an agent reads for an embed reply: the reply itself while it
+/// fits, else the reply with its vectors replaced by a sentence saying where
+/// they are.
+pub(super) fn embed_text(outcome: &crate::orchestrator::embed::EmbedOutcome) -> String {
+    let full = serde_json::to_string(outcome).unwrap_or_default();
+    if full.len() <= EMBED_TEXT_BUDGET {
+        return full;
+    }
+    let mut summary = serde_json::to_value(outcome).unwrap_or_default();
+    summary["vectors"] = serde_json::Value::String(format!(
+        "{} vectors of {} dimensions omitted: at {} characters they are more than a run result shows. A script receives them whole from embed() in @cairn/sdk or cairn-sdk.",
+        outcome.vectors.len(),
+        outcome.dims,
+        full.len()
+    ));
+    serde_json::to_string(&summary).unwrap_or_default()
+}
+
+/// Answer a `cairn://models/embed` item, bounded by the item's timeout under
+/// the host-item cap. A timeout releases the caller at once, and the call it
+/// abandons sends no further request.
+async fn run_embed(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    header: String,
+    args: serde_json::Value,
+    timeout: Option<u32>,
+) -> ItemOutcome {
+    let request: crate::orchestrator::embed::EmbedDoorRequest = match serde_json::from_value(args) {
+        Ok(request) => request,
+        Err(error) => {
+            return ItemOutcome::failed(
+                header,
+                format!(
+                    "cairn://models/embed takes {{model, input, purpose?, width?}} in payload.args_json: {error}. Read cairn://models/embed for the shape."
+                ),
+            )
+        }
+    };
+    let bound = super::host_item_bound(timeout);
+    let project_id = run_context.map(|context| context.project_id.as_str());
+    match tokio::time::timeout(bound.limit, orch.embed_named(project_id, request)).await {
+        Err(_) => ItemOutcome::failed(
+            header,
+            format!(
+                "Embedding {} The call it abandoned sends no further request, and the one in flight ends within 60 s.",
+                bound.describe(None)
+            ),
+        ),
+        Ok(Err(refusal)) => ItemOutcome::failed(header, refusal),
+        Ok(Ok(outcome)) => ItemOutcome {
+            header: format!(
+                "cairn://models/embed [{} · {} · {}×{} · {:.1}s]",
+                outcome.provider,
+                outcome.model,
+                outcome.vectors.len(),
+                outcome.dims,
+                outcome.latency_ms as f64 / 1000.0
+            ),
+            body: embed_text(&outcome),
+            succeeded: true,
+            suspended: false,
+            images: Vec::new(),
+            tracked_modifications: None,
+            data: serde_json::to_value(&outcome).ok(),
+        },
+    }
+}
+
+/// Answer a `cairn://models/decide` item, bounded by the item's timeout under
+/// the host-item cap.
 ///
 /// The facet's decide takes no cancel token, so a timeout releases the
 /// caller at once and the abandoned provider call ends within its own bounds.
 /// Decisions keep no invocation journal, so there is no row to write for one.
-pub(super) async fn run_decide(
+async fn run_decide(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
     header: String,
@@ -212,6 +371,7 @@ pub(super) async fn run_decide(
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
+            data: serde_json::to_value(&outcome).ok(),
         },
     }
 }
@@ -281,8 +441,12 @@ pub(crate) async fn run_one(
         RunSpec::ExecutorAction(spec) => {
             return run_executor_action(orch, header, *spec).await;
         }
-        RunSpec::Decide { args, timeout } => {
-            return run_decide(orch, run_context, header, args, timeout).await;
+        RunSpec::ModelDoor {
+            door,
+            args,
+            timeout,
+        } => {
+            return run_model_door(orch, run_context, header, door, args, timeout, interrupt).await;
         }
         RunSpec::ResponseCall {
             response_id,
@@ -397,6 +561,7 @@ pub(crate) async fn run_one(
                         suspended: false,
                         images: Vec::new(),
                         tracked_modifications: None,
+                        data: None,
                     }
                 }
                 Err(error) => ItemOutcome::failed(header, error.to_string()),
@@ -533,6 +698,7 @@ pub(crate) async fn run_one(
                             suspended: true,
                             images: Vec::new(),
                             tracked_modifications: None,
+                            data: None,
                         }
                     }
                 }
@@ -577,6 +743,7 @@ pub(crate) async fn run_one(
         suspended: false,
         images: Vec::new(),
         tracked_modifications: None,
+        data: None,
     }
 }
 
@@ -660,6 +827,7 @@ async fn run_mcp_call(
             suspended: false,
             images: result.images,
             tracked_modifications: None,
+            data: None,
         },
         Ok(outcome) => {
             suspend_mcp_call(
@@ -872,7 +1040,7 @@ async fn suspend_mcp_call(
     // persisted handoff delay prevents a first transition until this suspension
     // marker has reached the provider, without retaining a per-call task or
     // receiver in memory.
-    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None }
+    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None }
 }
 
 /// Send inline code to a live REPL session and compose its outcome. Fails
@@ -950,6 +1118,7 @@ async fn run_repl_send(
                     suspended: false,
                     images: Vec::new(),
                     tracked_modifications: None,
+                    data: None,
                 }
             }
             // Died / Timeout / Protocol (and the impossible lingering Pending) all

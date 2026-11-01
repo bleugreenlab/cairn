@@ -3276,7 +3276,10 @@ async fn finalize_delta_receipt(
 }
 
 use hygiene::check_cd_commands;
-use output::{collect_run_images, compose_run_output, run_envelope, run_input_refusal};
+use output::{
+    collect_run_data, collect_run_images, compose_run_output, run_envelope, run_envelope_with_data,
+    run_input_refusal,
+};
 use process::run_one;
 pub(crate) use process::READ_ONLY_CHECKOUT_DENIAL;
 use resolve::resolve_run_item;
@@ -3313,7 +3316,7 @@ pub(crate) fn build_slot_command_parts(
                 RunSpec::McpCall(_)
                 | RunSpec::ExecutorAction(_)
                 | RunSpec::ResponseCall { .. }
-                | RunSpec::Decide { .. }
+                | RunSpec::ModelDoor { .. }
                 | RunSpec::ReplSend { .. },
             )
             | Err(_) => None,
@@ -3390,7 +3393,7 @@ pub(crate) fn clamp_host_item_timeout_ms(requested: Option<u32>) -> Option<u32> 
 /// Decide keeps the cap on purpose: it is single-pass, bounded by its own
 /// per-request and probe timeouts, and a decision that needs minutes is the
 /// wrong verb rather than a reason to suspend.
-pub(crate) const HOST_ITEM_CAP_WHY: &str = "Decide items run on the host and cannot suspend past it, and a `cairn.run` call from @cairn/sdk inside a shell or script item is held to the same cap, so there is no longer route to retry through.";
+pub(crate) const HOST_ITEM_CAP_WHY: &str = "Decide and embed items run on the host and cannot suspend past it, and a `cairn.run` call from @cairn/sdk inside a shell or script item is held to the same cap, so there is no longer route to retry through.";
 
 /// The bound a decide item runs under: its own ask when that fits under the
 /// host-item cap, the cap otherwise. The ask is carried along so a timeout can
@@ -3910,7 +3913,7 @@ async fn prepare_and_run_batch(
     let has_response = resolved.iter().any(|(_, spec)| {
         matches!(
             spec,
-            Ok(RunSpec::ResponseCall { .. } | RunSpec::Decide { .. })
+            Ok(RunSpec::ResponseCall { .. } | RunSpec::ModelDoor { .. })
         )
     });
     let has_repl = resolved
@@ -4442,13 +4445,18 @@ struct HostBatch {
 impl HostBatch {
     /// Whether the batch holds an item allowed to run past the grace window. A
     /// response item is: it runs as long as its definition declares. So is an
-    /// MCP-tool item: it runs to its declared `timeout`. Decide, REPL, and
+    /// MCP-tool item: it runs to its declared `timeout`, and a model door that
+    /// says it may ([`ModelDoor::outlives_grace`]). Decide, REPL, and
     /// executor-action items are capped at the window and never need to
     /// suspend.
+    ///
+    /// [`ModelDoor::outlives_grace`]: cairn_common::run_contract::ModelDoor::outlives_grace
     fn may_outlive_grace(&self) -> bool {
-        self.resolved
-            .iter()
-            .any(|(_, spec)| matches!(spec, Ok(RunSpec::ResponseCall { .. } | RunSpec::McpCall(_))))
+        self.resolved.iter().any(|(_, spec)| match spec {
+            Ok(RunSpec::ResponseCall { .. } | RunSpec::McpCall(_)) => true,
+            Ok(RunSpec::ModelDoor { door, .. }) => door.outlives_grace(),
+            _ => false,
+        })
     }
 }
 
@@ -4559,11 +4567,11 @@ async fn settle_host_batch(
     .await
 }
 
-fn host_batch_envelope(settled: SettledRunBatch) -> String {
+fn settled_envelope(settled: SettledRunBatch) -> String {
     if settled.suspended {
         return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
     }
-    run_envelope(settled.text, settled.images)
+    run_envelope_with_data(settled.text, settled.images, settled.data)
 }
 
 fn joined_host_outcomes(
@@ -4624,7 +4632,7 @@ async fn run_host_batch(
     let settled =
         off_frame(|| settle_host_batch(orch, &settlement, joined_host_outcomes(joined))).await;
     control.phase_done("settle");
-    host_batch_envelope(settled)
+    settled_envelope(settled)
 }
 
 /// A host batch run under a given grace window, the way a `run` call runs it.
@@ -5092,10 +5100,12 @@ impl RunBatchSettlement {
     }
 }
 
-/// A settled batch: the composed agent-facing text plus any image blocks.
+/// A settled batch: the composed agent-facing text plus any image blocks, and
+/// each item's typed result for programmatic callers.
 struct SettledRunBatch {
     text: String,
     images: Vec<cairn_common::read::ImageBlock>,
+    data: Option<Vec<serde_json::Value>>,
     suspended: bool,
 }
 
@@ -5104,6 +5114,7 @@ impl SettledRunBatch {
         Self {
             text,
             images: Vec::new(),
+            data: None,
             suspended: false,
         }
     }
@@ -5112,7 +5123,18 @@ impl SettledRunBatch {
         Self {
             text: String::new(),
             images: Vec::new(),
+            data: None,
             suspended: true,
+        }
+    }
+
+    /// A batch that ran to `text`, carrying its items' images and data.
+    fn settled(text: String, mut outcomes: Vec<ItemOutcome>) -> Self {
+        Self {
+            text,
+            data: collect_run_data(&mut outcomes),
+            images: collect_run_images(outcomes),
+            suspended: false,
         }
     }
 }
@@ -5406,10 +5428,7 @@ async fn run_routed_batch(
     let settled =
         off_frame(|| settle_joined_batch(orch, &settlement, joined, ceiling_detail)).await;
     control.phase_done("settle");
-    if settled.suspended {
-        return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
-    }
-    run_envelope(settled.text, settled.images)
+    settled_envelope(settled)
 }
 
 /// What a batch abandoned by its call before settlement settles to. Its call
@@ -7174,11 +7193,7 @@ async fn settle_run_batch(
         } else {
             result
         };
-        return SettledRunBatch {
-            text,
-            images: collect_run_images(outcomes),
-            suspended: false,
-        };
+        return SettledRunBatch::settled(text, outcomes);
     }
 
     // Publish an authenticated cell delta through the runner-owned logical-head
@@ -7575,11 +7590,7 @@ async fn settle_run_batch(
     } else {
         result
     };
-    SettledRunBatch {
-        text,
-        images: collect_run_images(outcomes),
-        suspended: false,
-    }
+    SettledRunBatch::settled(text, outcomes)
 }
 
 /// The Cairn environment a placed process carries to whatever machine runs it.
@@ -7749,6 +7760,7 @@ mod tests {
             suspended: true,
             images: Vec::new(),
             tracked_modifications: None,
+            data: None,
         };
         let tail = ItemOutcome::failed("tail".to_string(), "later failure");
 
@@ -9127,7 +9139,12 @@ mod decide_door_tests {
             .unwrap();
             let (_, spec) = resolve_run_item(&orch, &request(json!({})), None, &item).await;
             match spec {
-                Ok(RunSpec::Decide { args, timeout }) => {
+                Ok(RunSpec::ModelDoor {
+                    door,
+                    args,
+                    timeout,
+                }) => {
+                    assert_eq!(door.uri(), sample.resource.to_uri());
                     assert_eq!(args, json!({}));
                     assert_eq!(timeout, Some(5000));
                 }
@@ -9157,6 +9174,83 @@ mod decide_door_tests {
         let mixed = run(&orch, json!([decide_item(None), {"command": "true"}])).await;
         assert!(mixed.contains("may not mix"), "{mixed}");
         assert_eq!(server.calls(), 2, "a refused batch asks nothing");
+    }
+
+    /// An embed item answers in its text and, whole, in the envelope's `data`,
+    /// which is what the SDKs read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_embed_item_returns_its_vectors_in_the_text_and_the_envelope_data() {
+        use crate::orchestrator::embed::tests::{hub_reply, workspace_with_hub};
+        use crate::orchestrator::embed::EmbedOutcome;
+        let (orch, _, key) = workspace_with_hub(vec![hub_reply(2)]).await;
+        let envelope = super::handle_run(
+            &orch,
+            &request(json!({"commands": [{
+                "target": "cairn://models/embed",
+                "payload": {"args_json": {"model": "qwen/qwen3-embedding-4b", "input": ["a", "b"], "purpose": "query"}}
+            }]})),
+        )
+        .await;
+        let envelope: cairn_common::read::RunBatchEnvelope =
+            serde_json::from_str(&envelope).unwrap();
+        let data = envelope.data.expect("the envelope carries the item's data");
+        let outcome: EmbedOutcome = serde_json::from_value(data[0].clone()).unwrap();
+        assert_eq!(outcome.provider, key);
+        assert_eq!((outcome.vectors.len(), outcome.dims), (2, 4));
+        let text: EmbedOutcome = serde_json::from_str(&envelope.text).unwrap_or_else(|error| {
+            panic!("a small reply is its own text ({error}): {}", envelope.text)
+        });
+        assert_eq!(text, outcome);
+
+        // A refused item carries no data, so a script sees the refusal text.
+        let envelope = super::handle_run(
+            &orch,
+            &request(json!({"commands": [{"target": "cairn://models/embed",
+                "payload": {"args_json": {"model": "big", "input": ["a"]}}}]})),
+        )
+        .await;
+        let envelope: cairn_common::read::RunBatchEnvelope =
+            serde_json::from_str(&envelope).unwrap();
+        assert_eq!(envelope.data, None);
+        assert!(
+            envelope.text.contains("offers that serve embed"),
+            "{}",
+            envelope.text
+        );
+
+        let text = run(
+            &orch,
+            json!([{"target": "cairn://models/embed",
+                    "payload": {"args_json": {"model": "m", "texts": ["a"]}}}]),
+        )
+        .await;
+        assert!(text.contains("{model, input, purpose?, width?}"), "{text}");
+    }
+
+    /// Vectors too long for a run result leave the text rather than arriving
+    /// cut short, which would read as valid shorter vectors.
+    #[test]
+    fn an_embed_reply_too_large_for_a_run_result_names_where_its_vectors_are() {
+        let outcome = crate::orchestrator::embed::EmbedOutcome {
+            vectors: vec![vec![0.123_456_79; 1536]; 8],
+            model: "openai/text-embedding-3-small".into(),
+            dims: 1536,
+            provider: "openrouter".into(),
+            usage: crate::orchestrator::embed::EmbedUsage {
+                input_tokens: Some(16),
+            },
+            cost: Some(0.000_001),
+            latency_ms: 420,
+        };
+        let text = super::process::embed_text(&outcome);
+        assert!(text.len() < 1_000, "{text}");
+        let summary: Value = serde_json::from_str(&text).unwrap();
+        assert!(summary["vectors"]
+            .as_str()
+            .unwrap()
+            .starts_with("8 vectors of 1536 dimensions omitted"));
+        assert_eq!(summary["dims"], 1536);
+        assert_eq!(summary["usage"]["inputTokens"], 16);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9921,11 +10015,27 @@ mod host_batch_tests {
             sequential: false,
             stop_on_error: true,
         };
-        assert!(!host(RunSpec::Decide {
+        assert!(!host(RunSpec::ModelDoor {
+            door: cairn_common::run_contract::ModelDoor::Decide,
             args: json!({}),
             timeout: None
         })
         .may_outlive_grace());
+        assert!(!host(RunSpec::ModelDoor {
+            door: cairn_common::run_contract::ModelDoor::Embed,
+            args: json!({}),
+            timeout: None
+        })
+        .may_outlive_grace());
+        assert!(
+            host(RunSpec::ModelDoor {
+                door: cairn_common::run_contract::ModelDoor::Complete,
+                args: json!({}),
+                timeout: None
+            })
+            .may_outlive_grace(),
+            "a completion suspends like the response item it is"
+        );
         assert!(host(RunSpec::ResponseCall {
             response_id: "slow".into(),
             project: None,

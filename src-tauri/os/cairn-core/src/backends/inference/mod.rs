@@ -16,9 +16,9 @@
 //! states it: the verbs it names (those this provider carries, conversation and
 //! decide over openai-chat), or, when it names none, the provider-wide claim of
 //! those verbs for a model that outputs text and nothing for one that does not.
-//! Embeddings through this provider follow the halo pool's move off bginf,
-//! since they need a route into the embed door; until then a recipe declared as
-//! an embedder is listed here and serves nothing.
+//! Embeddings through this provider need a route into the embed door, which
+//! does not exist yet; until it does, a recipe declared as an embedder is
+//! listed here and serves nothing.
 
 mod adapter;
 #[cfg(test)]

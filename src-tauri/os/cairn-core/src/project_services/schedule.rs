@@ -132,6 +132,42 @@ pub(crate) async fn list(
     .map_err(|error| format!("Failed to read the service's schedule: {error}"))
 }
 
+/// Every service of `project_id` with schedule rows, and its owner. A row
+/// whose owning thread no longer exists is left out: nothing can call it.
+pub(crate) async fn scheduled_services(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Vec<(ServiceOwner, String)>, String> {
+    let project_id = project_id.to_string();
+    db.read(move |conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT DISTINCT s.owner_thread, s.service, t.name FROM service_schedules s
+                     LEFT JOIN threads t ON t.id = s.owner_thread
+                     WHERE s.project_id = ?1
+                     ORDER BY s.owner_thread, s.service",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let (owner, service, name) = (row.text(0)?, row.text(1)?, row.opt_text(2)?);
+                let owner = match (owner.is_empty(), name) {
+                    (true, _) => ServiceOwner::Project,
+                    (false, Some(name)) => ServiceOwner::Thread { id: owner, name },
+                    (false, None) => continue,
+                };
+                out.push((owner, service));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to list scheduled services: {error}"))
+}
+
 /// Bring a service's rows in step with its declared `entries` (empty when the
 /// service is no longer declared). A new entry's first occurrence is one
 /// interval after it was first seen; an unchanged entry keeps its anchor and

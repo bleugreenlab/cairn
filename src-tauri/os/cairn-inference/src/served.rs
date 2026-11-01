@@ -247,7 +247,7 @@ fn listing_entry(model: &ServedModel) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{bginf_test_inventory, command_recipe, deployment};
+    use crate::fixture::{command_recipe, deployment, test_inventory};
 
     /// The live `vllm:cache_config_info` series of DeepSeek V4 Flash on the
     /// Sparks, read 2026-10-31.
@@ -260,10 +260,10 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
     /// The same engine's own `/v1/models`, read the same day.
     const DSV4_MODELS: &str = r#"{"object":"list","data":[{"id":"deepseek-v4-flash-vision-exp","object":"model","created":1793470670,"owned_by":"vllm","root":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","parent":null,"max_model_len":1048576,"permission":[]}]}"#;
 
-    /// bginf's test inventory, with DeepSeek's served name and aliases as its
-    /// profile has them.
+    /// The test inventory, with DeepSeek's served name and aliases as its
+    /// recipe has them.
     fn sparks() -> Inventory {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         let recipe = inventory
             .recipes
             .get_mut(&RecipeId::from("dsv4f-tp2"))

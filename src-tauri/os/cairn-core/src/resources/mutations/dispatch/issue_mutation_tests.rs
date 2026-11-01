@@ -2659,6 +2659,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectResponse => "cairn://p/cairn/responses/summarize",
         K::Grant => "cairn://grants/grant-1",
         K::ModelsSession => "cairn://models/sessions/session-1",
+        K::Inference => "cairn://inference",
         K::InferenceDeployment => "cairn://inference/deployments/dsv4f-tp2",
         K::ModelsAccounts => "cairn://models/accounts",
         K::ModelsAccount => "cairn://models/accounts/acc_1",

@@ -8,8 +8,9 @@
 //! pass, and an unloaded one loads while the caller waits on what its request
 //! waits on. Every call counts as demand, which is what keeps a model in use
 //! from looking idle to the controller. On a pool Cairn does not control, a
-//! deployment its owner reports healthy is reached directly and any other is
-//! refused, since nothing here would load it.
+//! deployment the act side holds healthy (one started from its own page) is
+//! reached directly and any other is refused, since nothing here would load
+//! it.
 //!
 //! The wait belongs to the caller. A caller with a cancel signal (an agent
 //! turn's interrupt) cancels its request when it stops waiting. A caller with
@@ -29,15 +30,13 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use cairn_config::inference::RecipeDeclaration;
-use cairn_inference::bginf::compare;
 use cairn_inference::control::Phase;
 use cairn_inference::pool_control::{Ms, PoolControl, RequestState};
-use cairn_inference::resolve::observed_healthy;
 use cairn_inference::served::{self, EngineMeasure, ServedModel};
 use cairn_inference::{Deployment, DeploymentId, Inventory, PoolId, RecipeId};
 use cairn_models::types::catalog::Modalities;
 
-use super::inference::{link_config, load_inventory, load_link, machine_map, LinkConfig};
+use super::inference::load_inventory;
 use super::pool_control::{
     cancel_request, deployment_for, deployment_phases, load_controls, load_requests, request_model,
     uncontrolled_refusal, RequestHandle,
@@ -112,59 +111,24 @@ pub(crate) fn declare(
     }
 }
 
-/// The deployments answering now. A deployment the act side has acted on is
-/// healthy when its phase says so. One it has never acted on is healthy only in
-/// a pool Cairn does not control, when bginf reports it healthy on every
-/// machine: bginf decides that pool, so its report is the authority there.
-async fn healthy_now(
-    orch: &Orchestrator,
-    inventory: &Inventory,
-    controls: &BTreeMap<PoolId, PoolControl>,
-) -> Result<BTreeSet<DeploymentId>, String> {
-    let phases = deployment_phases(&orch.db.local).await?;
-    let observations = bginf_observations(orch).await;
-    Ok(inventory
-        .deployments
-        .values()
-        .filter(|deployment| match phases.get(&deployment.id) {
-            Some(phase) => matches!(phase, Phase::Healthy { .. }),
-            None => {
-                let controlled = inventory
-                    .pool_of_deployment(deployment)
-                    .and_then(|pool| controls.get(&pool.id))
-                    .is_some_and(|control| control.controlled);
-                !controlled && observed_healthy(deployment, &observations)
-            }
-        })
-        .map(|deployment| deployment.id.clone())
+/// The deployments answering now: those the act side holds healthy. One it
+/// has never acted on is not known to answer, since nothing but Cairn starts a
+/// model now; taking its pool under control stops it once and brings it under
+/// probing.
+async fn healthy_now(orch: &Orchestrator) -> Result<BTreeSet<DeploymentId>, String> {
+    Ok(deployment_phases(&orch.db.local)
+        .await?
+        .into_iter()
+        .filter(|(_, phase)| matches!(phase, Phase::Healthy { .. }))
+        .map(|(id, _)| id)
         .collect())
-}
-
-/// What bginf's last stored `/state` says each machine runs, or nothing when
-/// the link is not configured or has not answered.
-async fn bginf_observations(
-    orch: &Orchestrator,
-) -> BTreeMap<cairn_inference::MachineName, cairn_inference::resolve::MachineObservation> {
-    let LinkConfig::Configured(link) = link_config(orch) else {
-        return BTreeMap::new();
-    };
-    let state = match load_link(&orch.db.local).await {
-        Ok(row) => row.and_then(|row| row.state()),
-        Err(error) => {
-            log::warn!("inference: the router could not read bginf's last state: {error}");
-            None
-        }
-    };
-    state
-        .map(|state| compare::observations(&state, &machine_map(&link)))
-        .unwrap_or_default()
 }
 
 /// Every name served now, each healthy engine measured for its current load.
 pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, String> {
     let inventory = served_inventory(orch).await?;
     let controls = load_controls(&orch.db.local).await?;
-    let healthy = healthy_now(orch, &inventory, &controls).await?;
+    let healthy = healthy_now(orch).await?;
     for deployment in inventory.deployments.values() {
         if !healthy.contains(&deployment.id) {
             forget(&deployment.id);
@@ -207,10 +171,7 @@ pub(crate) async fn ask(
         .get(&pool)
         .is_some_and(|control| control.controlled);
     if !controlled {
-        if !healthy_now(orch, &inventory, &controls)
-            .await?
-            .contains(&deployment)
-        {
+        if !healthy_now(orch).await?.contains(&deployment) {
             forget(&deployment);
             return Err(uncontrolled_refusal(&pool, &deployment));
         }
@@ -659,7 +620,6 @@ mod tests {
             r#"
 recipes:
   - id: dsv4f-tp2
-    source: bginf
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
     servedName: deepseek-v4-flash-vision-exp
     engine: {kind: command, start: ./start.sh}

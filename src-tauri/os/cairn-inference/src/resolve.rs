@@ -1,6 +1,7 @@
-//! The pin-over-default resolver and the convergence check, ported from
-//! bginf's `ctl.py` (`resolve` and `converged`) and generalised from one
-//! profile per pool to sets of deployments.
+//! The pin-over-default resolver, ported from bginf's `ctl.py` (`resolve`)
+//! and generalised from one profile per pool to sets of deployments: what a
+//! pool's own records ask for against the machines that are powered. A pool
+//! under Cairn's control is decided by [`crate::pool_control`] instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -206,74 +207,10 @@ pub fn resolve(
     }
 }
 
-/// What one machine last reported.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineObservation {
-    /// The deployment answering its health check on this machine, if any.
-    pub running: Option<DeploymentId>,
-    pub healthy: bool,
-    /// The report is too old to trust.
-    pub stale: bool,
-}
-
-/// Whether every machine of `deployment` reports running it, healthy and
-/// fresh: bginf's account of a deployment it runs.
-pub fn observed_healthy(
-    deployment: &Deployment,
-    observations: &BTreeMap<MachineName, MachineObservation>,
-) -> bool {
-    !deployment.machines.is_empty()
-        && deployment.machines.iter().all(|m| {
-            observations.get(m).is_some_and(|o| {
-                o.running.as_ref() == Some(&deployment.id) && o.healthy && !o.stale
-            })
-        })
-}
-
-/// Whether `pool` is running exactly `desired`: every machine of every
-/// desired deployment runs that deployment, healthy and not stale, and every
-/// other machine of the pool that reported runs nothing or a desired
-/// deployment. As in bginf, staleness is not checked for those other
-/// machines, and a machine that never reported does not hold the pool back
-/// unless a desired deployment needs it.
-pub fn converged(
-    pool: &Pool,
-    deployments: &BTreeMap<DeploymentId, Deployment>,
-    desired: &DeploymentSet,
-    observations: &BTreeMap<MachineName, MachineObservation>,
-) -> bool {
-    let mut wanted = BTreeSet::new();
-    for id in desired {
-        let Some(deployment) = deployments.get(id) else {
-            return false;
-        };
-        for machine in &deployment.machines {
-            let running_it = observations
-                .get(machine)
-                .is_some_and(|o| o.running.as_ref() == Some(id) && o.healthy && !o.stale);
-            if !running_it {
-                return false;
-            }
-            wanted.insert(machine);
-        }
-    }
-    pool.machines
-        .iter()
-        .filter(|m| !wanted.contains(&m.name))
-        .filter_map(|m| observations.get(&m.name))
-        .all(|o| o.running.as_ref().is_none_or(|r| desired.contains(r)))
-}
-
-/// Whether `deployment` is loaded: desired in a pool that has converged.
-pub fn loaded(deployment: &DeploymentId, desired: &DeploymentSet, converged: bool) -> bool {
-    converged && desired.contains(deployment)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{bginf_test_inventory, command_recipe, deployment, machines, pool, set};
+    use crate::fixture::{command_recipe, deployment, machines, pool, set, test_inventory};
     use crate::inventory::{Inventory, UnknownPool};
     use crate::pool::PoolId;
 
@@ -300,7 +237,7 @@ mod tests {
     /// bginf `test_pools_resolve_independently`.
     #[test]
     fn pools_resolve_independently() {
-        let inventory = bginf_test_inventory();
+        let inventory = test_inventory();
         assert_eq!(
             resolve_in(&inventory, "sparks", &all_powered()),
             Resolution {
@@ -321,107 +258,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn observed_healthy_needs_every_machine_running_it_healthy_and_fresh() {
-        let inventory = bginf_test_inventory();
-        let gang = &inventory.deployments[&DeploymentId::from("dsv4f-tp2")];
-        let mut observations = BTreeMap::from([("sp1".into(), observe(Some("dsv4f-tp2"), true))]);
-        assert!(!observed_healthy(gang, &observations), "sp2 never reported");
-        observations.insert("sp2".into(), observe(Some("dsv4f-tp2"), true));
-        assert!(observed_healthy(gang, &observations));
-        observations
-            .get_mut(&MachineName::from("sp2"))
-            .unwrap()
-            .stale = true;
-        assert!(!observed_healthy(gang, &observations));
-    }
-
-    fn observe(running: Option<&str>, healthy: bool) -> MachineObservation {
-        MachineObservation {
-            running: running.map(DeploymentId::from),
-            healthy,
-            stale: false,
-        }
-    }
-
-    fn state_of(
-        inventory: &Inventory,
-        pool: &str,
-        observations: &BTreeMap<MachineName, MachineObservation>,
-    ) -> (DeploymentSet, bool) {
-        let resolution = resolve_in(inventory, pool, &all_powered());
-        let pool = &inventory.pools[&PoolId::from(pool)];
-        let done = converged(
-            pool,
-            &inventory.deployments,
-            &resolution.desired,
-            observations,
-        );
-        (resolution.desired, done)
-    }
-
-    /// bginf `test_each_pool_converges_on_its_own`.
-    #[test]
-    fn each_pool_converges_on_its_own() {
-        let inventory = bginf_test_inventory();
-        let mut observations = BTreeMap::new();
-        for node in ["sp1", "sp2"] {
-            observations.insert(MachineName::from(node), observe(Some("dsv4f-tp2"), true));
-        }
-        let (sparks, sparks_done) = state_of(&inventory, "sparks", &observations);
-        let (halo, halo_done) = state_of(&inventory, "halo", &observations);
-        assert!(sparks_done && !halo_done);
-        assert!(
-            loaded(&"dsv4f-tp2".into(), &sparks, sparks_done),
-            "halo running nothing yet doesn't hold the Sparks back"
-        );
-        assert!(!loaded(&"qwen3-embed-4b".into(), &halo, halo_done));
-
-        observations.insert("halo".into(), observe(Some("qwen3-embed-4b"), true));
-        let (sparks, sparks_done) = state_of(&inventory, "sparks", &observations);
-        let (halo, halo_done) = state_of(&inventory, "halo", &observations);
-        assert!(loaded(&"dsv4f-tp2".into(), &sparks, sparks_done));
-        assert!(loaded(&"qwen3-embed-4b".into(), &halo, halo_done));
-
-        // A Spark drops out: only its pool unconverges.
-        observations.insert("sp2".into(), observe(None, false));
-        let (sparks, sparks_done) = state_of(&inventory, "sparks", &observations);
-        let (halo, halo_done) = state_of(&inventory, "halo", &observations);
-        assert!(!loaded(&"dsv4f-tp2".into(), &sparks, sparks_done));
-        assert!(loaded(&"qwen3-embed-4b".into(), &halo, halo_done));
-    }
-
-    #[test]
-    fn a_stale_wanted_machine_is_not_converged_but_a_stale_bystander_is_ignored() {
-        let inventory = bginf_test_inventory();
-        let mut inventory = inventory;
-        pool_mut(&mut inventory, "sparks").default = set(&["qwen36-fast"]);
-        let mut observations = BTreeMap::new();
-        observations.insert(
-            MachineName::from("sp1"),
-            MachineObservation {
-                stale: true,
-                ..observe(Some("qwen36-fast"), true)
-            },
-        );
-        assert!(!state_of(&inventory, "sparks", &observations).1);
-        observations.insert("sp1".into(), observe(Some("qwen36-fast"), true));
-        observations.insert(
-            "sp2".into(),
-            MachineObservation {
-                stale: true,
-                ..observe(None, false)
-            },
-        );
-        assert!(state_of(&inventory, "sparks", &observations).1);
-        observations.insert("sp2".into(), observe(Some("dsv4f-tp2"), true));
-        assert!(!state_of(&inventory, "sparks", &observations).1);
-    }
-
     /// bginf `test_pin_targets_the_profiles_pool_and_off_every_pool`.
     #[test]
     fn pins_target_their_pool_and_the_empty_pin_fits_every_pool() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         pool_mut(&mut inventory, "sparks").pin = Some(set(&["qwen36-fast"]));
         assert_eq!(
             resolve_in(&inventory, "sparks", &all_powered()),
@@ -475,7 +315,7 @@ mod tests {
     /// bginf `test_power_is_per_pool_and_only_for_managed_nodes`, resolver half.
     #[test]
     fn an_unpowered_spark_falls_back_in_its_own_pool_only() {
-        let inventory = bginf_test_inventory();
+        let inventory = test_inventory();
         let powered = machines(&["sp1", "halo"]);
         assert_eq!(
             resolve_in(&inventory, "sparks", &powered),
@@ -501,7 +341,7 @@ mod tests {
 
     #[test]
     fn a_blocked_pin_with_a_fitting_default_records_the_pin() {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         let sparks = pool_mut(&mut inventory, "sparks");
         sparks.pin = Some(set(&["dsv4f-tp2"]));
         sparks.default = set(&["qwen36-fast"]);
@@ -525,7 +365,7 @@ mod tests {
 
     #[test]
     fn when_nothing_fits_the_pool_runs_nothing() {
-        let inventory = bginf_test_inventory();
+        let inventory = test_inventory();
         let resolution = resolve_in(&inventory, "sparks", &machines(&["halo"]));
         assert_eq!(
             resolution,
@@ -565,7 +405,7 @@ mod tests {
 
     /// The sets case: qwen36-fast on sp1 together with another model on sp2.
     fn sets_inventory() -> Inventory {
-        let mut inventory = bginf_test_inventory();
+        let mut inventory = test_inventory();
         inventory.insert_recipe(command_recipe("other", 1));
         inventory.insert_deployment(deployment("other", &["sp2"]));
         pool_mut(&mut inventory, "sparks").default = set(&["qwen36-fast", "other"]);
@@ -627,15 +467,5 @@ mod tests {
                 reason: Reason::Pin
             }
         );
-    }
-
-    #[test]
-    fn a_set_converges_only_when_every_member_runs() {
-        let inventory = sets_inventory();
-        let mut observations = BTreeMap::new();
-        observations.insert(MachineName::from("sp1"), observe(Some("qwen36-fast"), true));
-        assert!(!state_of(&inventory, "sparks", &observations).1);
-        observations.insert("sp2".into(), observe(Some("other"), true));
-        assert!(state_of(&inventory, "sparks", &observations).1);
     }
 }

@@ -18,6 +18,7 @@ crate::string_id!(
 #[serde(rename_all = "camelCase")]
 pub struct Deployment {
     pub id: DeploymentId,
+    #[serde(default)]
     pub source: RecordSource,
     pub recipe: RecipeId,
     /// The machines it occupies, in placement order.

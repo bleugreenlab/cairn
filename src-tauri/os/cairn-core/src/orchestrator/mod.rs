@@ -24,6 +24,7 @@ mod subscription_periods;
 pub(crate) use decide::tests as decide_fixtures;
 pub(crate) use decide::{DecideRequest, DecisionFailure};
 pub(crate) mod base_branch_sync;
+pub(crate) mod complete;
 pub(crate) mod embed;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
@@ -2161,14 +2162,14 @@ impl Orchestrator {
 
     /// Start the process-lifetime workers that hold this orchestrator: thread-era
     /// summary upgrades, tenet evidence evaluation, the wake-condition
-    /// evaluator, and the read-only bginf mirror. Hosts call this once;
+    /// evaluator, and the inference act side and pool controller. Hosts call
+    /// this once;
     /// `build()` never does, so a dropped test orchestrator releases every
     /// channel it owns.
     pub fn start_background_workers(&self) {
         crate::threads::era_worker::spawn(self.clone(), &self.era_summary_tx);
         crate::tenets::evidence::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
-        crate::orchestrator::inference::spawn_bginf_poller(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
         crate::orchestrator::pool_control::spawn_pool_controller(self.clone());
         // A machine that reconnects holding replicas of closed scratches is
@@ -2855,7 +2856,18 @@ impl Orchestrator {
         crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
         crate::execution::checks_main::origin_observed(self).await;
         crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
-        crate::project_services::supervisor::start_launch_services(self).await;
+        crate::project_services::supervisor::start_project_launch_services(self).await;
+    }
+
+    /// Start thread-owned services and every schedule at boot. Both boot
+    /// schedules call this outside any maintenance gate: a thread's services
+    /// come from its own store, so they have no reason to wait for the
+    /// default-advance catch-up that project services follow.
+    pub fn spawn_services_boot(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            crate::project_services::supervisor::start_at_boot(&orch).await;
+        });
     }
 
     pub fn spawn_default_advance_reconcile(&self) {
@@ -2872,9 +2884,10 @@ impl Orchestrator {
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
             crate::execution::checks_main::origin_observed(&orch).await;
-            // After the catch-up, so `launch` services start from the base tip
-            // the runner has just brought current.
-            crate::project_services::supervisor::start_launch_services(&orch).await;
+            // After the catch-up, so project `launch` services start from the
+            // base tip the runner has just brought current. Thread-owned
+            // services started at boot (`spawn_services_boot`).
+            crate::project_services::supervisor::start_project_launch_services(&orch).await;
             orch.spawn_reconcile_intent_sweep();
             crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
         });

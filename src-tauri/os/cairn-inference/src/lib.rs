@@ -16,13 +16,13 @@
 //! transitions start and stop requests and the head's reports move it through,
 //! the machines a phase reserves, and whether a gang fits.
 //!
-//! The [`bginf`] module mirrors the operator's existing bginf control service
-//! into these records and compares Cairn's resolution against bginf's own. It
-//! is read-only by construction and retires with bginf.
+//! Every record is Cairn's own and the operator writes it, as a whole
+//! [`Inventory::from_yaml`] document or records [`Inventory::upsert`]ed into
+//! one. Records mirrored from bginf before it retired stay read-only until
+//! [`Inventory::adopt`] makes them Cairn's, keeping their ids.
 //!
 //! The crate owns no storage: the host persists the inventory. It depends only
 //! on the models facet's vocabulary, so it is hostable outside Cairn.
-pub mod bginf;
 pub mod control;
 pub mod deployment;
 pub mod inventory;
@@ -38,7 +38,7 @@ pub(crate) mod fixture;
 
 pub use deployment::{Deployment, DeploymentId};
 pub use inventory::{
-    ImportReport, Inventory, KindReport, UpdatedRecord, ValidationError, YamlError,
+    ChangeReport, Inventory, KindReport, UpdatedRecord, ValidationError, YamlError,
 };
 pub use machine::MachineName;
 pub use pool::{DeploymentSet, Pool, PoolId, PoolMachine, RecordSource};
@@ -46,9 +46,7 @@ pub use recipe::{
     Accelerator, AcceleratorFamily, AcceleratorRuntime, Engine, Interconnect, MemoryPerMachine,
     ModelRef, Recipe, RecipeId, Requirements, SystemRamBytes, VramBytes, WeightFile,
 };
-pub use resolve::{
-    converged, loaded, resolve, Blocked, MachineObservation, Reason, Resolution, Slot, SLOTS,
-};
+pub use resolve::{resolve, Blocked, Reason, Resolution, Slot, SLOTS};
 pub use served::{served_models, EngineMeasure, ServedModel};
 
 /// A string identifier newtype: transparent in serde, ordered, displayable.

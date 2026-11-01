@@ -19,16 +19,17 @@ crate::string_id!(
 #[serde(rename_all = "camelCase")]
 pub struct Recipe {
     pub id: RecipeId,
+    #[serde(default)]
     pub source: RecordSource,
     pub model: ModelRef,
     /// The model name the engine serves it under.
     pub served_name: String,
-    /// The id catalog matching uses (bginf's `catalog_id`, an OpenRouter slug).
+    /// The id catalog matching uses (an OpenRouter slug).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
-    /// The verbs this recipe serves. `None` is unknown: bginf profiles never
-    /// say, so imported recipes leave it unset rather than guessing from the
-    /// engine's flags.
+    /// The verbs this recipe serves. `None` is unknown, which the records
+    /// adopted from bginf are, since its profiles never said; nothing guesses
+    /// them from the engine's flags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbs: Option<BTreeSet<VerbKind>>,
     /// What the model takes in and gives out. `None` is unknown, for the same
@@ -85,9 +86,9 @@ pub enum Engine {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
     },
-    /// An operator's raw start and stop shell, as bginf runs today. Every
-    /// imported recipe is one; `description` carries bginf's free-text
-    /// `engine`.
+    /// An operator's raw start and stop shell, run on the head as its
+    /// executor's account. Every recipe adopted from bginf is one;
+    /// `description` is free text saying what the shell runs.
     Command {
         start: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

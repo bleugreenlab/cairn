@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::fixture::{bginf_test_inventory, command_recipe, deployment, set};
+use crate::fixture::{command_recipe, deployment, set, test_inventory};
 
 const MIN: Ms = 60_000;
 
 /// sp1 and sp2 in pool `sparks`: `dsv4f-tp2` spans both, `qwen36-fast` is on
 /// sp1, `other` on sp2, and the default is `dsv4f-tp2`.
 fn inventory() -> Inventory {
-    let mut inventory = bginf_test_inventory();
+    let mut inventory = test_inventory();
     inventory.insert_recipe(command_recipe("other", 1));
     inventory.insert_deployment(deployment("other", &["sp2"]));
     assert_eq!(inventory.validate(), Ok(()));

@@ -1,6 +1,6 @@
-//! bginf's own test fixture (`ctl/test_ctl.py`) as Cairn records: sp1 and
-//! sp2 in pool `sparks`, halo in pool `halo`, the defaults its `api` fixture
-//! sets (`dsv4f-tp2` and `qwen3-embed-4b`), and no pins.
+//! The test inventory, bginf's own test fixture (`ctl/test_ctl.py`) as Cairn
+//! records: sp1 and sp2 in pool `sparks`, halo in pool `halo`, the defaults
+//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins.
 
 use std::collections::BTreeSet;
 
@@ -13,7 +13,7 @@ use crate::recipe::{Engine, ModelRef, Recipe, Requirements};
 pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
     Recipe {
         id: id.into(),
-        source: RecordSource::Bginf,
+        source: RecordSource::Cairn,
         model: ModelRef {
             name: id.into(),
             weights: Vec::new(),
@@ -42,7 +42,7 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
 pub(crate) fn deployment(id: &str, machines: &[&str]) -> Deployment {
     Deployment {
         id: id.into(),
-        source: RecordSource::Bginf,
+        source: RecordSource::Cairn,
         recipe: id.into(),
         machines: machines.iter().map(|m| MachineName::from(*m)).collect(),
         head: machines[0].into(),
@@ -63,7 +63,7 @@ pub(crate) fn machines(names: &[&str]) -> BTreeSet<MachineName> {
 pub(crate) fn pool(id: &str, machines: &[&str], default: &[&str]) -> Pool {
     Pool {
         id: id.into(),
-        source: RecordSource::Bginf,
+        source: RecordSource::Cairn,
         machines: machines
             .iter()
             .map(|m| PoolMachine {
@@ -76,7 +76,7 @@ pub(crate) fn pool(id: &str, machines: &[&str], default: &[&str]) -> Pool {
     }
 }
 
-pub(crate) fn bginf_test_inventory() -> Inventory {
+pub(crate) fn test_inventory() -> Inventory {
     let mut inventory = Inventory::default();
     for (id, nodes) in [
         ("dsv4f-tp2", &["sp1", "sp2"][..]),

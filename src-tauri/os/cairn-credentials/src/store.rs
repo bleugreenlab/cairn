@@ -91,12 +91,46 @@ struct GitIdentityFile {
     sort_order: i32,
 }
 
+/// On-disk provider id.
+///
+/// `bginf` is a retired id: it held the token for bginf's control service,
+/// which Cairn read its inference records from until bginf retired. Such
+/// rows are readable only so an existing file still parses, and are dropped
+/// when the file loads, as `local_cli` rows are; nothing writes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderFile {
+    Current(ApiProvider),
+    RetiredBginf,
+}
+
+const RETIRED_BGINF_PROVIDER: &str = "bginf";
+
+impl Serialize for ProviderFile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Current(provider) => provider.serialize(serializer),
+            Self::RetiredBginf => serializer.serialize_str(RETIRED_BGINF_PROVIDER),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::IntoDeserializer;
+        let id = String::deserialize(deserializer)?;
+        if id == RETIRED_BGINF_PROVIDER {
+            return Ok(Self::RetiredBginf);
+        }
+        ApiProvider::deserialize(id.as_str().into_deserializer()).map(Self::Current)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountFile {
     id: String,
     label: String,
-    api_provider: ApiProvider,
+    api_provider: ProviderFile,
     source: SourceFile,
     auth: AuthFile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,10 +573,23 @@ fn store_from_v2_file(
     let mut retired_logins = file.retired_logins;
     let already_retired = retired_logins.len();
     let mut dropped_openai_ambient = false;
+    let mut dropped_retired_provider = false;
     let now = chrono::Utc::now().timestamp();
 
     for acc_file in file.accounts {
-        let is_anthropic = acc_file.api_provider == ApiProvider::Anthropic;
+        let api_provider = match acc_file.api_provider {
+            ProviderFile::Current(provider) => provider,
+            ProviderFile::RetiredBginf => {
+                log::info!(
+                    "credentials: dropped the {} account {:?}; bginf retired",
+                    RETIRED_BGINF_PROVIDER,
+                    acc_file.label
+                );
+                dropped_retired_provider = true;
+                continue;
+            }
+        };
+        let is_anthropic = api_provider == ApiProvider::Anthropic;
         let retired_shape = match &acc_file.auth {
             _ if acc_file.source == SourceFile::LocalCli => Some("local_cli"),
             AuthFile::LocalCli => Some("local_cli"),
@@ -637,7 +684,7 @@ fn store_from_v2_file(
         accounts.push(ProviderAccount {
             id: acc_file.id,
             label: acc_file.label,
-            api_provider: acc_file.api_provider,
+            api_provider,
             source: match acc_file.source {
                 SourceFile::Server => AccountSource::Server,
                 SourceFile::Configured | SourceFile::LocalCli => AccountSource::Configured,
@@ -666,7 +713,9 @@ fn store_from_v2_file(
         })
         .collect();
 
-    let migrated = dropped_openai_ambient || retired_logins.len() > already_retired;
+    let migrated = dropped_openai_ambient
+        || dropped_retired_provider
+        || retired_logins.len() > already_retired;
     Ok((
         CredentialStore {
             user_id: file.user_id,
@@ -757,7 +806,7 @@ fn store_to_v2_file(
         accounts.push(AccountFile {
             id: account.id.clone(),
             label: account.label.clone(),
-            api_provider: account.api_provider,
+            api_provider: ProviderFile::Current(account.api_provider),
             source: match account.source {
                 AccountSource::Configured => SourceFile::Configured,
                 AccountSource::Server => SourceFile::Server,
@@ -1289,6 +1338,57 @@ accounts:
         assert!(!raw.contains("type: local_cli"), "got: {raw}");
         assert!(!raw.contains("source: local_cli"), "got: {raw}");
         assert!(!raw.contains("type: oauth_token"), "got: {raw}");
+    }
+
+    #[test]
+    fn a_retired_bginf_account_is_dropped_on_load_and_pruned_from_disk() {
+        let dir = TempDir::new().unwrap();
+        let machine_id = get_machine_id();
+        let token = encrypt_credential("ctl-token", &machine_id).unwrap();
+        let key = encrypt_credential("gh-token", &machine_id).unwrap();
+        let content = format!(
+            r#"version: 2
+userId: test-user
+gitIdentities: []
+accounts:
+  - id: acc_ctl
+    label: bginf ctl
+    apiProvider: bginf
+    source: configured
+    auth:
+      type: api_key
+      encrypted: {token}
+    sortOrder: 0
+    createdAt: 0
+  - id: acc_gh
+    label: GitHub
+    apiProvider: github
+    source: configured
+    auth:
+      type: api_key
+      encrypted: {key}
+    sortOrder: 0
+    createdAt: 0
+"#
+        );
+        std::fs::write(dir.path().join(CREDENTIALS_FILENAME), content).unwrap();
+
+        let store = load_credential_store(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            store
+                .accounts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acc_gh"]
+        );
+        assert!(store.retired_logins.is_empty());
+        let raw = std::fs::read_to_string(dir.path().join(CREDENTIALS_FILENAME)).unwrap();
+        assert!(
+            !raw.contains("bginf"),
+            "the pruned store is written back: {raw}"
+        );
+        assert!(serde_yaml::from_str::<ProviderFile>("nonsense").is_err());
     }
 
     // === V1 migration tests ===

@@ -903,6 +903,7 @@ fn native_search_outcome(header: String, stdout: String) -> ItemOutcome {
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
+            data: None,
         }
     }
 }
@@ -1380,6 +1381,7 @@ mod tests {
                     suspended: false,
                     images: Vec::new(),
                     tracked_modifications: None,
+                    data: None,
                 })
             }
         });

@@ -269,21 +269,29 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         out.push('\n');
     }
 
-    // --- Inference link ---
+    // --- Inference recipe declarations ---
     out.push_str("## Inference\n\n");
-    match crate::config::settings::load_inference(&orch.config_dir).bginf {
-        None => out.push_str("- bginf: not linked\n\n"),
-        Some(link) => {
-            out.push_str(&format!("- bginf url: {}\n", link.url));
-            if link.machines.is_empty() {
-                out.push_str("- bginf machines: every node keeps its name\n");
-            }
-            for (node, machine) in &link.machines {
-                out.push_str(&format!("- bginf node {node} is machine {machine}\n"));
-            }
-            out.push_str("- token: the first `bginf` account; see cairn://inference\n\n");
-        }
+    let inference = crate::config::settings::load_inference(&orch.config_dir);
+    if inference.recipes.is_empty() {
+        out.push_str("- recipe declarations: none\n");
     }
+    for (recipe, declared) in &inference.recipes {
+        let verbs = declared
+            .verbs
+            .as_ref()
+            .map_or("unstated".to_string(), |verbs| {
+                verbs
+                    .iter()
+                    .map(|verb| verb.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+        out.push_str(&format!("- recipe {recipe}: verbs {verbs}\n"));
+    }
+    if inference.retired_bginf_link {
+        out.push_str("- the retired bginf link (`inference.bginf`) is still in settings.yaml and is ignored; writing this section drops it\n");
+    }
+    out.push_str("- the records themselves: cairn://inference\n\n");
 
     // --- GitHub (read-only; connect/disconnect handshake stays UI-only) ---
     out.push_str("## GitHub (read-only)\n\n");

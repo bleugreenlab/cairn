@@ -205,7 +205,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         api_provider: ApiProvider::Custom,
         summary: "The models Cairn's own inference deployments serve, loaded on demand: asking for one that is not loaded loads it.",
         setup_action: "Open inference",
-        setup_requirement: "Cairn holds no inference deployments yet. Link bginf or add a deployment; cairn://inference lists them.",
+        setup_requirement: "Cairn holds no inference deployments yet. Write them at cairn://inference, which lists them.",
         catalog_driven: false,
         supports_mcp_install: false,
         keywords: &[
