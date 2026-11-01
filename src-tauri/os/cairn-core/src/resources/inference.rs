@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use cairn_common::query::QueryParam;
 use cairn_inference::bginf::compare::{self as bginf_compare, CairnSide};
 use cairn_inference::bginf::{MachineMap, PoolComparison, PoolState, State, Verdict};
-use cairn_inference::pool_control::{self, Phase, RequestState};
+use cairn_inference::pool_control::{self, RequestState};
 use cairn_inference::{
     DeploymentSet, Engine, MachineName, MemoryPerMachine, Pool, Recipe, Requirements,
 };
@@ -22,7 +22,7 @@ use cairn_inference::{
 use super::common::find_query_value;
 use crate::orchestrator::inference::{machine_map, InferenceView, LinkConfig, LinkRow};
 use crate::orchestrator::inference_control::{holds_of, LoadRow};
-use crate::orchestrator::pool_control::{effective_settings, ANSWERED_KEPT_MS};
+use crate::orchestrator::pool_control::ANSWERED_KEPT_MS;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
 use cairn_inference::{Deployment, DeploymentId};
 
@@ -727,13 +727,17 @@ fn control_set(set: &DeploymentSet) -> String {
     }
 }
 
-fn phase_label(phase: Option<&Phase>) -> String {
+/// A controller member's phase in a few words; the deployment's own page has
+/// the rest.
+fn phase_label(phase: Option<&DeploymentPhase>) -> String {
     match phase {
-        None | Some(Phase::Stopped) => "stopped".to_string(),
-        Some(Phase::Starting) => "starting".to_string(),
-        Some(Phase::Healthy) => "healthy".to_string(),
-        Some(Phase::Stopping) => "stopping".to_string(),
-        Some(Phase::Failed { reason, .. }) => format!("failed: {reason}"),
+        None => "unknown (Cairn has not acted on it yet)".to_string(),
+        Some(DeploymentPhase::Reserving {
+            waiting_on: Some(on),
+            ..
+        }) => format!("waiting to fit: {on}"),
+        Some(DeploymentPhase::Failed { reason, .. }) => format!("failed: {reason}"),
+        Some(phase) => phase.label().to_string(),
     }
 }
 
@@ -756,7 +760,11 @@ fn control_lines(out: &mut String, view: &InferenceView, pool: &Pool) {
         );
         return;
     };
-    let settings = effective_settings(control);
+    let settings = control_view
+        .settings
+        .get(&pool.id)
+        .copied()
+        .unwrap_or_else(|| control.settings.effective(None));
     let settings_line = format!(
         "- settings: model idle window {}; pool idle window {}; minimum residency {}; load bound {}",
         settings.model_idle, settings.pool_idle, settings.min_residency, settings.load_bound
@@ -1104,7 +1112,13 @@ mod tests {
         let mut view = view(state("default"), |_| {});
         view.inventory.pools.get_mut(&"sparks".into()).unwrap().pin = Some(DeploymentSet::new());
         let pool = view.inventory.pools[&"sparks".into()].clone();
-        let phases = BTreeMap::from([("dsv4f-tp2".into(), Phase::Healthy)]);
+        let phases = BTreeMap::from([(
+            "dsv4f-tp2".into(),
+            DeploymentPhase::Healthy {
+                since_ms: NOW - 30 * 60_000,
+                load_ms: None,
+            },
+        )]);
         let mut control = PoolControl::begin(
             &pool,
             &view.inventory.deployments,
@@ -1139,7 +1153,7 @@ mod tests {
             waiting: 3,
             ..BuildPressure::default()
         };
-        let settings = effective_settings(&control);
+        let settings = control.settings.effective(None);
         let mine: Vec<Request> = requests.iter().map(|r| r.request.clone()).collect();
         let plan = pool_control::plan(
             &pool,
@@ -1164,6 +1178,7 @@ mod tests {
                     plan,
                 },
             )]),
+            settings: BTreeMap::from([("sparks".into(), settings)]),
             phases,
             requests,
         };

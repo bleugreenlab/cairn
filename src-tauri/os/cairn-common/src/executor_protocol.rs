@@ -5346,6 +5346,13 @@ pub struct LearnedResourceEstimate {
 /// as restartable, which is what they are unless it says otherwise. A runner
 /// talking to an older executor gets nothing wrong.
 ///
+/// cairn/5677 does not move the number. The runner notes a held machine on a
+/// waiting entry (`held_for_inference`) only when its own eligibility relation
+/// says the machine would take the entry with the hold lifted. Placement,
+/// offers and declines are unchanged; it is the runner's own reading of state
+/// it already holds, nothing is sent, and no variant, field or serialized form
+/// changes. A runner talking to an older executor gets nothing wrong.
+///
 /// cairn/5650 does not move the number. The runner composes its placement
 /// refusals from each request's recorded declines rather than from its own
 /// reading of a machine at composition time, and names every machine a

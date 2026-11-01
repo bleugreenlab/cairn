@@ -12784,6 +12784,43 @@ impl Fleet {
         rows
     }
 
+    /// The machines `rejected` passed over for an inference hold that would
+    /// take `request` were the hold lifted.
+    ///
+    /// Placement checks the hold before the selector, the platform, colocation
+    /// and the project, so a held machine that could never run the work is
+    /// refused for the hold too. Counting it as waiting would unload a model for
+    /// a batch that cannot use the machine, and reload it on the next request.
+    /// A machine whose own decline of this entry still stands would not take it
+    /// either.
+    fn held_machines_an_unload_would_admit(
+        &self,
+        request: &CellRequest,
+        declined: &HashMap<String, queue::EntryDecline>,
+        rejected: &[PlacementRejection],
+        now_unix_ms: u64,
+    ) -> HashSet<String> {
+        let scope = PlacementScope::of(request);
+        let connections = self.lock_connections();
+        rejected
+            .iter()
+            .filter(|rejection| {
+                matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::InferenceReserved { .. }
+                )
+            })
+            .filter_map(|rejection| connections.get(&rejection.executor_id))
+            .filter(|machine| {
+                candidate_rejection_under(machine, scope, now_unix_ms, None).is_none()
+                    && !declined
+                        .get(&machine.identity.executor_id)
+                        .is_some_and(|decline| decline.stands_on(machine.generation, now_unix_ms))
+            })
+            .map(|machine| machine.identity.executor_id.clone())
+            .collect()
+    }
+
     /// Wait for an executor this request can be placed on, bounded by the
     /// requester's horizon.
     ///
@@ -12857,16 +12894,12 @@ impl Fleet {
             if let Some(entry_id) = entry_id {
                 self.queue.note_inference_holds(
                     entry_id,
-                    rejected
-                        .iter()
-                        .filter(|rejection| {
-                            matches!(
-                                rejection.reason,
-                                PlacementRejectionReason::InferenceReserved { .. }
-                            )
-                        })
-                        .map(|rejection| rejection.executor_id.clone())
-                        .collect(),
+                    self.held_machines_an_unload_would_admit(
+                        request,
+                        &declined,
+                        &rejected,
+                        unix_time_ms(),
+                    ),
                 );
             }
             // Work kept off the machines it cannot run on is pending for a
@@ -14155,6 +14188,18 @@ fn candidate_rejection(
     scope: PlacementScope<'_>,
     now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
+    candidate_rejection_under(entry, scope, now_unix_ms, entry.inference_hold.as_ref())
+}
+
+/// [`candidate_rejection`] with `inference_hold` standing in for the machine's
+/// own, so a caller can ask what the machine would say with its model
+/// unloaded.
+fn candidate_rejection_under(
+    entry: &ExecutorConnectionState,
+    scope: PlacementScope<'_>,
+    now_unix_ms: u64,
+    inference_hold: Option<&InferenceHold>,
+) -> Option<PlacementRejectionReason> {
     let pinned_here = scope.pinned_executor_id == Some(entry.identity.executor_id.as_str());
     if !entry.machine_role.accepts(scope.work_class) && !pinned_here {
         // First, so a machine that is wrong for this class says so rather than
@@ -14177,7 +14222,7 @@ fn candidate_rejection(
         // The self-update rollout's hold, with a drain's exemption for the same
         // reason: resident work has to finish for the machine to empty.
         Some(PlacementRejectionReason::UpdatePending)
-    } else if let Some(hold) = entry.inference_hold.as_ref().filter(|_| !pinned_here) {
+    } else if let Some(hold) = inference_hold.filter(|_| !pinned_here) {
         // An inference deployment holds this machine: a named drain, with the
         // drain's exemption. An idle environment here moves off at its next
         // batch (`drained_home_is_idle`); live work holding one finishes.
@@ -28567,6 +28612,69 @@ mod tests {
                 .0
                 .executor_id,
             "bginf-sp1"
+        );
+    }
+
+    /// A held machine is noted as one a batch waits for, the build pressure
+    /// against its model, only when unloading the model would let the batch
+    /// run there.
+    #[test]
+    fn a_held_machine_is_waited_for_only_by_work_an_unload_would_admit() {
+        let fleet = Fleet::default();
+        let (id, mut sp1) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+        sp1.inference_hold = Some(InferenceHold {
+            deployment: "dsv4f-tp2".into(),
+            phase: "healthy".into(),
+            waiting_on: None,
+        });
+        fleet.lock_connections().insert(id, sp1);
+        let held = |request: CellRequest| {
+            let connections = fleet.lock_connections();
+            let machine = &connections["bginf-sp1"];
+            let reason = candidate_rejection(machine, PlacementScope::of(&request), NOW)
+                .expect("the held machine is passed over");
+            assert!(
+                matches!(reason, PlacementRejectionReason::InferenceReserved { .. }),
+                "the hold is checked before the selector: {reason:?}"
+            );
+            let rejected = vec![PlacementRejection {
+                executor_name: "bginf-sp1".into(),
+                executor_id: "bginf-sp1".into(),
+                reason,
+                prediction: None,
+            }];
+            drop(connections);
+            fleet.held_machines_an_unload_would_admit(&request, &HashMap::new(), &rejected, NOW)
+        };
+        assert_eq!(
+            held(targeted_request("linux")),
+            HashSet::from(["bginf-sp1".to_string()])
+        );
+        assert_eq!(
+            held(targeted_request("macos")),
+            HashSet::new(),
+            "a macOS-targeted lane (SelectorMismatch) could never run here"
+        );
+        let stays_home = CellRequest {
+            executor: None,
+            placement_mobility: Default::default(),
+            ..targeted_request("linux")
+        };
+        let connections = fleet.lock_connections();
+        assert!(matches!(
+            candidate_rejection_under(
+                &connections["bginf-sp1"],
+                PlacementScope::of(&stays_home),
+                NOW,
+                None
+            ),
+            Some(PlacementRejectionReason::NotColocated)
+        ));
+        drop(connections);
+        assert_eq!(
+            held(stays_home),
+            HashSet::new(),
+            "conservative work stays on the home machine (NotColocated)"
         );
     }
 

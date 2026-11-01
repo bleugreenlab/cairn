@@ -217,6 +217,20 @@ pub struct MachineObservation {
     pub stale: bool,
 }
 
+/// Whether every machine of `deployment` reports running it, healthy and
+/// fresh: bginf's account of a deployment it runs.
+pub fn observed_healthy(
+    deployment: &Deployment,
+    observations: &BTreeMap<MachineName, MachineObservation>,
+) -> bool {
+    !deployment.machines.is_empty()
+        && deployment.machines.iter().all(|m| {
+            observations.get(m).is_some_and(|o| {
+                o.running.as_ref() == Some(&deployment.id) && o.healthy && !o.stale
+            })
+        })
+}
+
 /// Whether `pool` is running exactly `desired`: every machine of every
 /// desired deployment runs that deployment, healthy and not stale, and every
 /// other machine of the pool that reported runs nothing or a desired
@@ -305,6 +319,21 @@ mod tests {
             inventory.deployments[&DeploymentId::from("qwen3-embed-4b")].head,
             MachineName::from("halo")
         );
+    }
+
+    #[test]
+    fn observed_healthy_needs_every_machine_running_it_healthy_and_fresh() {
+        let inventory = bginf_test_inventory();
+        let gang = &inventory.deployments[&DeploymentId::from("dsv4f-tp2")];
+        let mut observations = BTreeMap::from([("sp1".into(), observe(Some("dsv4f-tp2"), true))]);
+        assert!(!observed_healthy(gang, &observations), "sp2 never reported");
+        observations.insert("sp2".into(), observe(Some("dsv4f-tp2"), true));
+        assert!(observed_healthy(gang, &observations));
+        observations
+            .get_mut(&MachineName::from("sp2"))
+            .unwrap()
+            .stale = true;
+        assert!(!observed_healthy(gang, &observations));
     }
 
     fn observe(running: Option<&str>, healthy: bool) -> MachineObservation {

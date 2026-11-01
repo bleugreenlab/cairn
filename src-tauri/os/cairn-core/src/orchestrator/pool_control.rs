@@ -3,11 +3,15 @@
 //! pool and writes what it decides, and the request API.
 //!
 //! Each tick reads, per controlled pool, the act side's phase for every
-//! deployment, the build pressure on the pool's machines from the fleet
-//! ([`crate::fleet::Fleet::machine_set_pressure`]), and the pool's requests,
-//! then runs the facet's pure [`control::plan`] and writes back the control
-//! record (the desired set the act side converges on and placement reacts to)
-//! and the requests it answered. It starts, stops and claims nothing.
+//! deployment ([`super::inference_control::load_states`]), the build pressure
+//! on the pool's machines from the fleet
+//! ([`crate::fleet::Fleet::machine_set_pressure`]), the pool's requests and its
+//! measured loads, then runs the facet's pure [`control::plan`] and writes back
+//! the control record (the desired set placement reacts to) and the requests it
+//! answered. It then converges the pool: [`control::converge`] says what to
+//! stop and start, and each is asked of the act side
+//! ([`super::inference_control::request`]), whose refusals stand until the next
+//! pass asks again. It claims no machine itself: the act side's holds do.
 //!
 //! Every read-modify-write of a control record (the tick, a request, a pool
 //! patch) holds one lock, so a patch and a tick never overwrite each other.
@@ -16,14 +20,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use cairn_db::turso::params;
-use cairn_inference::bginf::compare;
+use cairn_inference::control::Phase;
 use cairn_inference::pool_control::{
-    self as control, BuildPressure, EffectiveSettings, Ms, Observed, Phase, Plan, PoolControl,
-    Request, RequestId, RequestState, Wait,
+    self as control, BuildPressure, EffectiveSettings, Ms, Observed, Plan, PoolControl, Request,
+    RequestId, RequestState, Wait,
 };
 use cairn_inference::{DeploymentId, DeploymentSet, Inventory, Pool, PoolId};
 
-use super::inference::{link_config, load_inventory, load_link, machine_map, LinkConfig};
+use super::inference::load_inventory;
+use super::inference_control::{self, Heads};
 use super::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
@@ -161,35 +166,35 @@ async fn prune_answered(db: &LocalDb, now: Ms) -> Result<(), String> {
     .map_err(|error| format!("prune inference_requests: {error}"))
 }
 
-/// Each deployment's phase as the act side reports it.
-///
-/// The act side that starts and stops deployments itself (cairn/5660) reports
-/// phases of its own, failures and stops in progress included; until it is on
-/// the base branch, the phases are read from bginf's node reports, the one
-/// place a deployment's state is observed today. This is the one function to
-/// swap.
+/// Each deployment's phase as the act side holds it. A deployment with no row
+/// is missing from the map: unknown, not stopped, since the act side has never
+/// acted on it. A read that fails is an error, never an empty map, so a pass
+/// never acts on phases it could not read.
 pub(crate) async fn deployment_phases(
-    orch: &Orchestrator,
-    inventory: &Inventory,
-) -> BTreeMap<DeploymentId, Phase> {
-    let LinkConfig::Configured(link) = link_config(orch) else {
-        return BTreeMap::new();
-    };
-    let state = match load_link(&orch.db.local).await {
-        Ok(Some(row)) => row.state(),
-        Ok(None) => None,
-        Err(error) => {
-            log::warn!("inference: the controller could not read bginf's last state: {error}");
-            None
-        }
-    };
-    let Some(state) = state else {
-        return BTreeMap::new();
-    };
-    control::phases_observed(
-        &inventory.deployments,
-        &compare::observations(&state, &machine_map(&link)),
-    )
+    db: &LocalDb,
+) -> Result<BTreeMap<DeploymentId, Phase>, String> {
+    Ok(inference_control::load_states(db)
+        .await?
+        .into_iter()
+        .map(|(id, row)| (id, row.phase))
+        .collect())
+}
+
+/// The slowest healthy load the act side recorded for each deployment, in
+/// milliseconds.
+async fn slowest_loads(db: &LocalDb) -> Result<BTreeMap<DeploymentId, u64>, String> {
+    Ok(inference_control::load_history(db)
+        .await?
+        .into_iter()
+        .filter_map(|(id, loads)| {
+            loads
+                .iter()
+                .filter(|load| load.healthy)
+                .filter_map(|load| load.load_ms)
+                .max()
+                .map(|ms| (id, ms))
+        })
+        .collect())
 }
 
 fn pool_pressure(orch: &Orchestrator, pool: &Pool) -> BuildPressure {
@@ -197,11 +202,19 @@ fn pool_pressure(orch: &Orchestrator, pool: &Pool) -> BuildPressure {
     orch.fleet.machine_set_pressure(&names)
 }
 
-/// The settings a pool runs with. Every unset setting derives from measured
-/// loads, which the act side records (cairn/5660); until it does, each is the
-/// built-in value.
-pub fn effective_settings(control: &PoolControl) -> EffectiveSettings {
-    control.settings.effective(None)
+/// The settings `pool` runs with: each the operator left unset derives from
+/// the slowest healthy load recorded for a deployment of the pool.
+pub fn effective_settings(
+    pool: &Pool,
+    inventory: &Inventory,
+    control: &PoolControl,
+    slowest: &BTreeMap<DeploymentId, u64>,
+) -> EffectiveSettings {
+    control.settings.effective(control::slowest_load_secs(
+        pool,
+        &inventory.deployments,
+        slowest.iter().map(|(id, ms)| (id, *ms)),
+    ))
 }
 
 /// One controlled pool planned against what is observed now.
@@ -212,16 +225,18 @@ pub struct PoolPlan {
     pub plan: Plan,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_pool(
     inventory: &Inventory,
     pool: &Pool,
     control: &PoolControl,
     requests: &[StoredRequest],
     phases: &BTreeMap<DeploymentId, Phase>,
+    slowest: &BTreeMap<DeploymentId, u64>,
     builds: BuildPressure,
     now: Ms,
 ) -> PoolPlan {
-    let settings = effective_settings(control);
+    let settings = effective_settings(pool, inventory, control, slowest);
     let mine: Vec<Request> = requests
         .iter()
         .filter(|r| r.pool == control.pool)
@@ -254,6 +269,8 @@ pub struct ControlView {
     pub now: Ms,
     pub controls: BTreeMap<PoolId, PoolControl>,
     pub plans: BTreeMap<PoolId, PoolPlan>,
+    /// The settings of every pool with a control record, handed back or not.
+    pub settings: BTreeMap<PoolId, EffectiveSettings>,
     pub phases: BTreeMap<DeploymentId, Phase>,
     pub requests: Vec<StoredRequest>,
 }
@@ -277,7 +294,8 @@ pub async fn load_control_view(
     let now = now_ms();
     let controls = load_controls(db).await?;
     let requests = load_requests(db).await?;
-    let phases = deployment_phases(orch, inventory).await;
+    let phases = deployment_phases(db).await?;
+    let slowest = slowest_loads(db).await?;
     let plans = controls
         .values()
         .filter(|c| c.controlled)
@@ -286,7 +304,19 @@ pub async fn load_control_view(
             let builds = pool_pressure(orch, pool);
             Some((
                 c.pool.clone(),
-                plan_pool(inventory, pool, c, &requests, &phases, builds, now),
+                plan_pool(
+                    inventory, pool, c, &requests, &phases, &slowest, builds, now,
+                ),
+            ))
+        })
+        .collect();
+    let settings = controls
+        .values()
+        .filter_map(|c| {
+            let pool = inventory.pools.get(&c.pool)?;
+            Some((
+                c.pool.clone(),
+                effective_settings(pool, inventory, c, &slowest),
             ))
         })
         .collect();
@@ -294,27 +324,47 @@ pub async fn load_control_view(
         now,
         controls,
         plans,
+        settings,
         phases,
         requests,
     })
 }
 
-/// One pass over every controlled pool, writing what it decides.
+/// One pass over every controlled pool: plan it, write what it decides, and
+/// converge it.
 pub async fn tick(orch: &Orchestrator) -> Result<(), String> {
     let _held = CONTROL.lock().await;
-    let db = &orch.db.local;
-    let now = now_ms();
+    pass(
+        &orch.db.local,
+        orch.fleet.as_ref(),
+        &|pool: &Pool| pool_pressure(orch, pool),
+        now_ms(),
+    )
+    .await
+}
+
+/// The body of [`tick`], with the fleet's two parts passed in: the heads the
+/// act side commands, and the build pressure on a pool's machines.
+async fn pass(
+    db: &LocalDb,
+    heads: &dyn Heads,
+    pressure: &(dyn Fn(&Pool) -> BuildPressure + Sync),
+    now: Ms,
+) -> Result<(), String> {
     let controls = load_controls(db).await?;
     if controls.values().any(|c| c.controlled) {
         let inventory = load_inventory(db).await?;
-        let phases = deployment_phases(orch, &inventory).await;
+        let phases = deployment_phases(db).await?;
+        let slowest = slowest_loads(db).await?;
         let requests = load_requests(db).await?;
         for control in controls.values().filter(|c| c.controlled) {
             let Some(pool) = inventory.pools.get(&control.pool) else {
                 continue;
             };
-            let builds = pool_pressure(orch, pool);
-            let planned = plan_pool(&inventory, pool, control, &requests, &phases, builds, now);
+            let builds = pressure(pool);
+            let planned = plan_pool(
+                &inventory, pool, control, &requests, &phases, &slowest, builds, now,
+            );
             let plan = planned.plan;
             if plan.control.generation != control.generation {
                 log::info!(
@@ -328,9 +378,34 @@ pub async fn tick(orch: &Orchestrator) -> Result<(), String> {
                 save_control(db, &plan.control, now).await?;
             }
             settle(db, &plan.settled).await?;
+            converge(db, heads, &inventory, pool, &plan.control, &phases, now).await;
         }
     }
     prune_answered(db, now).await
+}
+
+/// Ask the act side for what `control` wants of `pool`: every stop, then
+/// every start. The act side decides what may be sent now (a start is refused
+/// while another deployment holds one of its machines, a stopping one
+/// included), and whatever it refuses is asked again on the next pass.
+async fn converge(
+    db: &LocalDb,
+    heads: &dyn Heads,
+    inventory: &Inventory,
+    pool: &Pool,
+    control: &PoolControl,
+    phases: &BTreeMap<DeploymentId, Phase>,
+    now: Ms,
+) {
+    for (id, action) in control::converge(pool, &inventory.deployments, control, phases, now) {
+        match inference_control::request(db, heads, id.as_str(), action, now).await {
+            Ok(said) => log::info!("inference: pool {} converging: {said}", pool.id),
+            Err(why) => log::debug!(
+                "inference: pool {} converging: {why}; asked again on the next pass",
+                pool.id
+            ),
+        }
+    }
 }
 
 /// Plan every controlled pool now and every [`TICK_INTERVAL`] for the life of
@@ -715,10 +790,17 @@ pub async fn patch_pool(
                 patch.pool
             )
         })?;
-        let phases = deployment_phases(orch, &inventory).await;
+        let phases = deployment_phases(db).await?;
+        let slowest = control::slowest_load_secs(
+            pool,
+            &inventory.deployments,
+            slowest_loads(db).await?.iter().map(|(id, ms)| (id, *ms)),
+        );
         let mut controls = load_controls(db).await?;
         let existing = controls.remove(&patch.pool);
-        let (control, lines) = apply_patch(pool, &inventory, existing, patch, actor, &phases, now)?;
+        let (control, lines) = apply_patch(
+            pool, &inventory, existing, patch, actor, &phases, slowest, now,
+        )?;
         save_control(db, &control, now).await?;
         if !control.controlled {
             db.execute(
@@ -737,6 +819,9 @@ pub async fn patch_pool(
 }
 
 /// The pure half of [`patch_pool`]: the record after `patch`, and what changed.
+/// `slowest_load_secs` is the pool's slowest measured load, which the unset
+/// settings derive from.
+#[allow(clippy::too_many_arguments)]
 fn apply_patch(
     pool: &Pool,
     inventory: &Inventory,
@@ -744,6 +829,7 @@ fn apply_patch(
     patch: &PoolPatch,
     actor: &str,
     phases: &BTreeMap<DeploymentId, Phase>,
+    slowest_load_secs: Option<u64>,
     now: Ms,
 ) -> Result<(PoolControl, Vec<String>), String> {
     let mut lines = Vec::new();
@@ -788,7 +874,7 @@ fn apply_patch(
         *key.slot(&mut control.settings) = *secs;
     }
     if !patch.settings.is_empty() {
-        let settings = effective_settings(&control);
+        let settings = control.settings.effective(slowest_load_secs);
         lines.push(format!(
             "settings for pool {}: model idle {}, pool idle {}, minimum residency {}, load bound {}",
             pool.id,
@@ -836,7 +922,7 @@ fn apply_patch(
 
 fn took_control(control: &PoolControl) -> String {
     format!(
-        "took control of pool {}: the controller now decides its desired set, starting from {} (what was healthy)",
+        "took control of pool {}: the controller now decides its desired set, starting from {} (what the act side knows is healthy); a deployment of the pool Cairn has never acted on is stopped, which brings it under probing",
         control.pool,
         set_label(&control.active.set())
     )
@@ -920,7 +1006,13 @@ pools:
     fn taking_control_adopts_what_is_healthy_and_keeps_settings_across_a_hand_back() {
         let inventory = inventory();
         let pool = sparks(&inventory);
-        let healthy = BTreeMap::from([(DeploymentId::from("dsv4f-tp2"), Phase::Healthy)]);
+        let healthy = BTreeMap::from([(
+            DeploymentId::from("dsv4f-tp2"),
+            Phase::Healthy {
+                since_ms: 0,
+                load_ms: None,
+            },
+        )]);
         let take = PoolPatch {
             pool: "sparks".into(),
             controlled: Some(true),
@@ -928,14 +1020,14 @@ pools:
             ..PoolPatch::default()
         };
         let (control, lines) =
-            apply_patch(pool, &inventory, None, &take, "operator", &healthy, 5).unwrap();
+            apply_patch(pool, &inventory, None, &take, "operator", &healthy, None, 5).unwrap();
         assert!(control.controlled);
         assert_eq!(control.active.set(), BTreeSet::from(["dsv4f-tp2".into()]));
         assert_eq!(control.settings.min_residency_secs, Some(900));
         assert_eq!(control.generation, 1, "no controller before, one now");
         assert_eq!(
             lines[0],
-            "took control of pool sparks: the controller now decides its desired set, starting from dsv4f-tp2 (what was healthy)"
+            "took control of pool sparks: the controller now decides its desired set, starting from dsv4f-tp2 (what the act side knows is healthy); a deployment of the pool Cairn has never acted on is stopped, which brings it under probing"
         );
         assert!(
             !lines.iter().any(|l| l.starts_with("warning")),
@@ -954,6 +1046,7 @@ pools:
             &back,
             "operator",
             &healthy,
+            None,
             6,
         )
         .unwrap();
@@ -967,6 +1060,7 @@ pools:
             &take,
             "operator",
             &BTreeMap::new(),
+            None,
             7,
         )
         .unwrap();
@@ -999,6 +1093,7 @@ pools:
             &take,
             "operator",
             &BTreeMap::new(),
+            None,
             0,
         )
         .unwrap();
@@ -1025,6 +1120,7 @@ pools:
             &pin(&["dsv4f-tp2"]),
             "operator",
             &none,
+            None,
             0
         )
         .unwrap_err()
@@ -1038,12 +1134,13 @@ pools:
             &pin(&["dsv4f-tp2"]),
             "operator",
             &none,
+            None,
             1,
         )
         .unwrap();
         assert_eq!(lines, vec!["pinned pool sparks to dsv4f-tp2 for operator"]);
         assert_eq!(
-            apply_patch(pool, &inventory, Some(control.clone()), &pin(&[]), "cairn://p/cairn/9/1/builder", &none, 2)
+            apply_patch(pool, &inventory, Some(control.clone()), &pin(&[]), "cairn://p/cairn/9/1/builder", &none, None, 2)
                 .unwrap_err(),
             "the pool is pinned to dsv4f-tp2 by operator; only they can release it, or revoke it explicitly"
         );
@@ -1055,6 +1152,7 @@ pools:
                 &pin(&["nope"]),
                 "operator",
                 &none,
+                None,
                 2
             )
             .unwrap_err(),
@@ -1072,6 +1170,7 @@ pools:
             &revoke,
             "cairn://p/cairn/9/1/builder",
             &none,
+            None,
             3,
         )
         .unwrap();
@@ -1095,6 +1194,203 @@ pools:
         ] {
             let (name, at, reason) = state_columns(&state);
             assert_eq!(stored_state(name, at, reason), state);
+        }
+    }
+
+    mod convergence {
+        use super::super::*;
+        use crate::fleet::DeploymentReportReceived;
+        use crate::orchestrator::inference_control::tests::{
+            phase, sparks_db, FakeHeads, DSV4F, QWEN, SP1, SP2,
+        };
+        use crate::orchestrator::inference_control::{on_report, Probes};
+        use cairn_common::executor_protocol::{DeploymentOperation, DeploymentPhaseReport};
+        use cairn_inference::control::Request as Act;
+        use cairn_inference::pool_control::Member;
+
+        fn no_builds(_: &Pool) -> BuildPressure {
+            BuildPressure::default()
+        }
+
+        async fn report(
+            db: &LocalDb,
+            heads: &FakeHeads,
+            deployment: &str,
+            command_id: &str,
+            phase: DeploymentPhaseReport,
+            now: Ms,
+        ) {
+            on_report(
+                db,
+                heads,
+                DeploymentReportReceived {
+                    executor: SP1.into(),
+                    command_id: command_id.into(),
+                    deployment: deployment.into(),
+                    phase,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Load `id` through the act side, as a manual start would, taking
+        /// `load_ms` from the head receiving the start to health.
+        async fn load(db: &LocalDb, heads: &FakeHeads, id: &str, at: Ms, load_ms: Ms) {
+            inference_control::request(db, heads, id, Act::Start, at)
+                .await
+                .unwrap();
+            inference_control::tick(db, heads, &mut Probes::default(), at + 1)
+                .await
+                .unwrap();
+            let (_, command, _, _) = heads.last_sent();
+            report(
+                db,
+                heads,
+                id,
+                &command,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+                at + 1 + load_ms,
+            )
+            .await;
+            assert_eq!(phase(db, id).await.label(), "healthy");
+        }
+
+        /// Take control of `sparks` at `at`, the controller wanting `ids`.
+        async fn take_control(db: &LocalDb, ids: &[&str], at: Ms) {
+            let inventory = load_inventory(db).await.unwrap();
+            let pool = &inventory.pools[&PoolId::from("sparks")];
+            let phases = deployment_phases(db).await.unwrap();
+            let mut control = PoolControl::begin(pool, &inventory.deployments, &phases, at);
+            control.active.members = ids
+                .iter()
+                .map(|id| (DeploymentId::from(*id), Member::chosen(at)))
+                .collect();
+            save_control(db, &control, at).await.unwrap();
+        }
+
+        async fn known(db: &LocalDb, id: &str) -> bool {
+            deployment_phases(db)
+                .await
+                .unwrap()
+                .contains_key(&DeploymentId::from(id))
+        }
+
+        fn sent(heads: &FakeHeads) -> Vec<(String, &'static str)> {
+            heads
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, _, deployment, operation)| {
+                    let kind = match operation {
+                        DeploymentOperation::Start { .. } => "start",
+                        DeploymentOperation::Stop { .. } => "stop",
+                        _ => "other",
+                    };
+                    (deployment.clone(), kind)
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_pass_stops_what_the_pool_does_not_want_then_starts_what_it_does() {
+            let db = sparks_db("pool-control-converge").await;
+            let heads = FakeHeads::default();
+            heads.attach(SP1, 110, 0);
+            heads.attach(SP2, 110, 0);
+            load(&db, &heads, QWEN, 1_000, 10_000).await;
+            take_control(&db, &[DSV4F], 20_000).await;
+
+            pass(&db, &heads, &no_builds, 30_000).await.unwrap();
+            assert_eq!(phase(&db, QWEN).await.label(), "stopping");
+            assert_eq!(sent(&heads).last(), Some(&(QWEN.to_string(), "stop")));
+            assert!(
+                !known(&db, DSV4F).await,
+                "the start is refused while qwen36-fast still holds bginf-sp1"
+            );
+
+            pass(&db, &heads, &no_builds, 40_000).await.unwrap();
+            assert!(!known(&db, DSV4F).await, "refused again, asked again");
+            assert_eq!(
+                sent(&heads)
+                    .iter()
+                    .filter(|(_, kind)| *kind == "stop")
+                    .count(),
+                1,
+                "a stop in flight is not sent twice"
+            );
+
+            let (_, stop_id, _, _) = heads.last_sent();
+            report(
+                &db,
+                &heads,
+                QWEN,
+                &stop_id,
+                DeploymentPhaseReport::Stopped,
+                45_000,
+            )
+            .await;
+            pass(&db, &heads, &no_builds, 50_000).await.unwrap();
+            assert_eq!(phase(&db, DSV4F).await.label(), "reserving");
+            assert_eq!(heads.held(), [SP1, SP2]);
+        }
+
+        #[tokio::test]
+        async fn a_stop_that_ended_failed_is_sent_again() {
+            let db = sparks_db("pool-control-restop").await;
+            let heads = FakeHeads::default();
+            heads.attach(SP1, 110, 0);
+            heads.attach(SP2, 110, 0);
+            load(&db, &heads, QWEN, 1_000, 10_000).await;
+            take_control(&db, &[], 20_000).await;
+
+            *heads.refuse.lock().unwrap() = Some("the link is down".into());
+            pass(&db, &heads, &no_builds, 30_000).await.unwrap();
+            let Phase::Failed { reason, .. } = phase(&db, QWEN).await else {
+                panic!("the unsent stop failed");
+            };
+            assert!(reason.contains("the link is down"), "{reason}");
+            *heads.refuse.lock().unwrap() = None;
+
+            pass(&db, &heads, &no_builds, 60_000).await.unwrap();
+            assert_eq!(
+                phase(&db, QWEN).await.label(),
+                "failed",
+                "not asked again within the minute"
+            );
+            assert_eq!(
+                phase(&db, DSV4F).await.label(),
+                "stopping",
+                "never acted on, and no longer behind a held machine: stopped to bring it under probing"
+            );
+
+            pass(&db, &heads, &no_builds, 90_000).await.unwrap();
+            assert_eq!(phase(&db, QWEN).await.label(), "stopping");
+            assert_eq!(sent(&heads).last(), Some(&(QWEN.to_string(), "stop")));
+        }
+
+        #[tokio::test]
+        async fn the_settings_derive_from_the_slowest_healthy_load() {
+            let db = sparks_db("pool-control-settings").await;
+            let heads = FakeHeads::default();
+            heads.attach(SP1, 110, 0);
+            heads.attach(SP2, 110, 0);
+            load(&db, &heads, QWEN, 1_000, 250_400).await;
+            let inventory = load_inventory(&db).await.unwrap();
+            let pool = &inventory.pools[&PoolId::from("sparks")];
+            let control = PoolControl::begin(pool, &inventory.deployments, &BTreeMap::new(), 0);
+            let settings = effective_settings(
+                pool,
+                &inventory,
+                &control,
+                &slowest_loads(&db).await.unwrap(),
+            );
+            assert_eq!(
+                settings.load_bound.to_string(),
+                "12m 33s (from a measured load of 4m 11s)"
+            );
         }
     }
 

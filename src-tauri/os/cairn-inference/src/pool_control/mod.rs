@@ -27,15 +27,22 @@
 //! pin's, the active set is left alone, and releasing it hands its set to the
 //! controller so the rules carry on from what is loaded.
 //!
-//! The controller never starts or stops an engine and never claims a machine:
-//! the act side converges deployments on [`desired`], and placement reacts to
-//! the same record, watching its `generation`.
+//! Phases are the act side's ([`crate::control::Phase`]), keyed by deployment.
+//! A deployment missing from the map is unknown: the act side has never acted
+//! on it, so nothing says whether it runs, and it is never read as stopped.
+//!
+//! [`plan`] decides and [`converge`] says what the act side must be asked for
+//! the pool to run what was decided: stops first, then starts. The host sends
+//! those through the act side, whose refusals are the one authority over what
+//! may be sent now, and asks again on its next pass. Placement reacts to the
+//! same record, watching its `generation`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::{self as act, Phase};
 use crate::deployment::{Deployment, DeploymentId};
 use crate::inventory::Inventory;
 use crate::machine::MachineName;
@@ -174,7 +181,7 @@ impl PoolControl {
         let members = deployments
             .values()
             .filter(|d| in_pool(pool, d))
-            .filter(|d| phases.get(&d.id) == Some(&Phase::Healthy))
+            .filter(|d| matches!(phases.get(&d.id), Some(Phase::Healthy { .. })))
             .map(|d| {
                 (
                     d.id.clone(),
@@ -249,7 +256,8 @@ impl PoolControl {
             .iter()
             .map(|id| {
                 let member = previous.get(id).cloned().unwrap_or_else(|| Member {
-                    healthy_since: (phases.get(id) == Some(&Phase::Healthy)).then_some(pin.at),
+                    healthy_since: matches!(phases.get(id), Some(Phase::Healthy { .. }))
+                        .then_some(pin.at),
                     ..Member::chosen(now)
                 });
                 (id.clone(), member)
@@ -287,61 +295,6 @@ impl fmt::Display for PinRefused {
 }
 
 impl std::error::Error for PinRefused {}
-
-/// A deployment's phase as the act side reports it. A deployment with no
-/// report is stopped.
-///
-/// A stand-in until the act side's own phase (cairn/5660's
-/// `cairn_inference::control::Phase`) is on the base branch; the controller
-/// then reads that one directly and this type goes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "camelCase")]
-pub enum Phase {
-    Stopped,
-    Starting,
-    Healthy,
-    Stopping,
-    /// The last start failed at `at`. A failure from before the controller
-    /// chose the deployment again is history, not this attempt's outcome.
-    Failed {
-        at: Ms,
-        reason: String,
-    },
-}
-
-/// Phases read from machine observations, for a host whose act side reports
-/// only what each machine runs (bginf's node reports): a deployment every
-/// machine of which runs it healthy and fresh is healthy, one some machine runs
-/// otherwise is starting, and the rest are stopped. Such a source cannot see a
-/// stop in progress or a failed start; the act side's own phases can.
-pub fn phases_observed(
-    deployments: &BTreeMap<DeploymentId, Deployment>,
-    observations: &BTreeMap<MachineName, crate::resolve::MachineObservation>,
-) -> BTreeMap<DeploymentId, Phase> {
-    deployments
-        .values()
-        .filter(|d| !d.machines.is_empty())
-        .filter_map(|d| {
-            let runs = |m: &MachineName| {
-                observations
-                    .get(m)
-                    .filter(|o| o.running.as_ref() == Some(&d.id))
-            };
-            let healthy = d
-                .machines
-                .iter()
-                .all(|m| runs(m).is_some_and(|o| o.healthy && !o.stale));
-            let phase = if healthy {
-                Phase::Healthy
-            } else if d.machines.iter().any(|m| runs(m).is_some()) {
-                Phase::Starting
-            } else {
-                return None;
-            };
-            Some((d.id.clone(), phase))
-        })
-        .collect()
-}
 
 /// Batch work on, or waiting for, a pool's machines.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -435,13 +388,23 @@ pub struct Hold {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Wait {
-    /// Its deployment is desired; batches still run on the pool's machines.
-    Draining { turns: u32, other: u32 },
     /// Its deployment is desired; others still occupy its machines.
     Unloading { deployments: Vec<DeploymentId> },
-    /// Its deployment is desired and nothing is in the way; the act side has
-    /// not started it.
+    /// Its deployment is desired and nothing is in the way; the controller
+    /// asks the act side to start it on this pass.
     Starting,
+    /// Its deployment is desired and its machines are reserved, but the start
+    /// has not been sent: the act side waits for every machine to have the
+    /// memory the deployment needs (`waiting_on`, in the act side's words)
+    /// while the batches on the pool's machines finish, and fails the start
+    /// if it never fits.
+    Fitting {
+        since: Ms,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        waiting_on: Option<String>,
+        turns: u32,
+        other: u32,
+    },
     /// The act side is loading it.
     Loading { since: Ms, bound_at: Ms },
     /// Its deployment is desired, and the act side is still stopping it.
@@ -724,7 +687,7 @@ pub fn plan(
     observed: Observed<'_>,
 ) -> Plan {
     let now = observed.now;
-    let phase = |id: &DeploymentId| observed.phases.get(id).cloned().unwrap_or(Phase::Stopped);
+    let phase = |id: &DeploymentId| observed.phases.get(id);
     let before = desired(control);
     let mut control = control.clone();
     if observed.builds.any() {
@@ -769,23 +732,28 @@ pub fn plan(
             .get_mut(&id)
             .expect("listed from the members");
         match phase(&id) {
-            Phase::Starting => {
-                member.loading_since.get_or_insert(now);
+            // The load is timed from the head receiving the start, not from
+            // the wait for the gang to fit.
+            Some(Phase::Starting { since_ms, .. }) => {
+                member.loading_since.get_or_insert(*since_ms);
             }
-            Phase::Healthy => {
-                member.healthy_since.get_or_insert(now);
+            Some(Phase::Healthy { since_ms, .. }) => {
+                member.healthy_since.get_or_insert(*since_ms);
             }
-            Phase::Failed { at, reason } if at >= member.chosen_at => {
-                failed.push((id.clone(), reason));
+            Some(Phase::Failed { at_ms, reason }) if *at_ms >= member.chosen_at => {
+                failed.push((id.clone(), reason.clone()));
                 continue;
             }
-            Phase::Stopped | Phase::Stopping | Phase::Failed { .. } => {
+            Some(Phase::Stopped { .. } | Phase::Stopping { .. } | Phase::Failed { .. }) => {
                 // Seen healthy, now gone: whatever comes back is a new load.
                 if member.healthy_since.is_some() {
                     member.healthy_since = None;
                     member.loading_since = None;
                 }
             }
+            // Reserved, but nothing sent: no load to protect yet. Unknown: the
+            // act side has not been asked yet.
+            Some(Phase::Reserving { .. }) | None => {}
         }
         if let (Some(since), None) = (member.loading_since, member.healthy_since) {
             if since + settings.load_bound.ms() <= now {
@@ -802,9 +770,9 @@ pub fn plan(
     // A pinned deployment's failure fails the requests waiting on it too.
     if let Some(pin) = &control.pin {
         for id in &pin.set {
-            if let Phase::Failed { at, reason } = phase(id) {
-                if at >= pin.at && !failed.iter().any(|(f, _)| f == id) {
-                    failed.push((id.clone(), reason));
+            if let Some(Phase::Failed { at_ms, reason }) = phase(id) {
+                if *at_ms >= pin.at && !failed.iter().any(|(f, _)| f == id) {
+                    failed.push((id.clone(), reason.clone()));
                 }
             }
         }
@@ -955,47 +923,46 @@ pub fn plan(
         let needs = pass.machines_of(id);
         let wait = if desired_set.contains(id) {
             match phase(id) {
-                Phase::Healthy => {
+                Some(Phase::Healthy { .. }) => {
                     settled.push((request.id, RequestState::Ready { at: now }));
                     continue;
                 }
-                Phase::Starting => {
+                Some(Phase::Starting { since_ms, .. }) => {
                     let since = control
                         .active
                         .members
                         .get(id)
                         .and_then(|m| m.loading_since)
-                        .unwrap_or(now);
+                        .unwrap_or(*since_ms);
                     Wait::Loading {
                         since,
                         bound_at: since + settings.load_bound.ms(),
                     }
                 }
-                Phase::Stopping => Wait::Stopping,
-                Phase::Stopped | Phase::Failed { .. } => {
+                Some(Phase::Reserving {
+                    since_ms,
+                    waiting_on,
+                }) => Wait::Fitting {
+                    since: *since_ms,
+                    waiting_on: waiting_on.clone(),
+                    turns: observed.builds.running_turns,
+                    other: observed.builds.running_other,
+                },
+                Some(Phase::Stopping { .. }) => Wait::Stopping,
+                None | Some(Phase::Stopped { .. } | Phase::Failed { .. }) => {
                     let in_the_way: Vec<DeploymentId> = deployments
                         .values()
                         .filter(|d| in_pool(pool, d) && !desired_set.contains(&d.id))
                         .filter(|d| !machines(d).is_disjoint(&needs))
-                        .filter(|d| {
-                            matches!(
-                                phase(&d.id),
-                                Phase::Starting | Phase::Healthy | Phase::Stopping
-                            )
-                        })
+                        .filter(|d| phase(&d.id).is_some_and(Phase::reserves))
                         .map(|d| d.id.clone())
                         .collect();
-                    if !in_the_way.is_empty() {
+                    if in_the_way.is_empty() {
+                        Wait::Starting
+                    } else {
                         Wait::Unloading {
                             deployments: in_the_way,
                         }
-                    } else if observed.builds.running() > 0 {
-                        Wait::Draining {
-                            turns: observed.builds.running_turns,
-                            other: observed.builds.running_other,
-                        }
-                    } else {
-                        Wait::Starting
                     }
                 }
             }
@@ -1033,6 +1000,93 @@ pub fn plan(
         settled,
         waits,
     }
+}
+
+/// How long after a deployment the pool does not want ended failed the
+/// controller asks for it to be stopped again, so a head that cannot be
+/// reached is not sent a stop on every pass.
+pub const RESTOP_AFTER_MS: Ms = 60_000;
+
+/// What the act side is asked on one pass for `pool` to run what `control`
+/// wants: every stop, then every start. Empty for a pool not under control.
+///
+/// A deployment of the pool that is not desired is stopped while it is
+/// reserving, starting or healthy. One that ended failed is stopped again
+/// [`RESTOP_AFTER_MS`] after it failed: a failure frees its machines though
+/// the model may still be resident. One the act side has never acted on is
+/// stopped too, which is what brings whatever bginf left running under the
+/// act side's probing, unless another deployment holds one of its machines,
+/// since the two cannot both run there.
+///
+/// A desired deployment is started when it is unknown, stopped, or failed
+/// before it was chosen. One that failed since is the plan's to give up; a
+/// pinned one stays failed until the pin changes. A start the act side
+/// refuses (another deployment still holds a machine) is asked again on the
+/// next pass, and no fit bound is added here: the act side fails a start that
+/// never fits.
+pub fn converge(
+    pool: &Pool,
+    deployments: &BTreeMap<DeploymentId, Deployment>,
+    control: &PoolControl,
+    phases: &BTreeMap<DeploymentId, Phase>,
+    now: Ms,
+) -> Vec<(DeploymentId, act::Request)> {
+    let Some(wanted) = desired(control) else {
+        return Vec::new();
+    };
+    let held: BTreeSet<&MachineName> = phases
+        .iter()
+        .filter(|(_, phase)| phase.reserves())
+        .filter_map(|(id, _)| deployments.get(id))
+        .flat_map(|d| &d.machines)
+        .collect();
+    let mut steps = Vec::new();
+    for deployment in deployments
+        .values()
+        .filter(|d| in_pool(pool, d) && !wanted.contains(&d.id))
+    {
+        let stop = match phases.get(&deployment.id) {
+            Some(Phase::Reserving { .. } | Phase::Starting { .. } | Phase::Healthy { .. }) => true,
+            Some(Phase::Failed { at_ms, .. }) => now - at_ms >= RESTOP_AFTER_MS,
+            Some(Phase::Stopped { .. } | Phase::Stopping { .. }) => false,
+            None => deployment.machines.iter().all(|m| !held.contains(m)),
+        };
+        if stop {
+            steps.push((deployment.id.clone(), act::Request::Stop));
+        }
+    }
+    let chosen_at = |id: &DeploymentId| match &control.pin {
+        Some(pin) => Some(pin.at),
+        None => control.active.members.get(id).map(|m| m.chosen_at),
+    };
+    for id in &wanted {
+        if !deployments.get(id).is_some_and(|d| in_pool(pool, d)) {
+            continue;
+        }
+        let start = match phases.get(id) {
+            None | Some(Phase::Stopped { .. }) => true,
+            Some(Phase::Failed { at_ms, .. }) => chosen_at(id).is_some_and(|at| *at_ms < at),
+            Some(_) => false,
+        };
+        if start {
+            steps.push((id.clone(), act::Request::Start));
+        }
+    }
+    steps
+}
+
+/// The slowest healthy load recorded for a deployment of `pool`, in whole
+/// seconds rounded up: what the pool's unset settings derive from.
+pub fn slowest_load_secs<'a>(
+    pool: &Pool,
+    deployments: &BTreeMap<DeploymentId, Deployment>,
+    healthy_loads_ms: impl IntoIterator<Item = (&'a DeploymentId, u64)>,
+) -> Option<u64> {
+    healthy_loads_ms
+        .into_iter()
+        .filter(|(id, _)| deployments.get(*id).is_some_and(|d| in_pool(pool, d)))
+        .map(|(_, ms)| ms.div_ceil(1_000))
+        .max()
 }
 
 /// How long ago `at` was, or how far off, relative to `now`.
@@ -1088,23 +1142,42 @@ impl Wait {
     /// What the request waits on, in a sentence fragment.
     pub fn describe(&self, now: Ms) -> String {
         match self {
-            Self::Draining { turns, other } => {
-                let running = plural(turns + other, "batch", "batches");
-                let turns = match turns {
-                    0 => String::new(),
-                    n => format!(
-                        ", {} of them {} that is never preempted",
-                        n,
-                        if *n == 1 { "an agent turn" } else { "agent turns" }
-                    ),
-                };
-                format!("draining builds: {running} still running on the pool's machines{turns}")
-            }
             Self::Unloading { deployments } => {
                 format!("unloading {} from its machines", ids_label(deployments))
             }
-            Self::Starting => {
-                "nothing in the way; waiting for the act side to start it".to_string()
+            Self::Starting => "nothing in the way; the controller is starting it".to_string(),
+            Self::Fitting {
+                since,
+                waiting_on,
+                turns,
+                other,
+            } => {
+                let mut said = format!(
+                    "waiting to fit since {}, its machines reserved and taking no new batches",
+                    relative(*since, now)
+                );
+                if let Some(on) = waiting_on {
+                    said.push_str(&format!("; waiting on {on}"));
+                }
+                if turns + other > 0 {
+                    said.push_str(&format!(
+                        "; {} still running on the pool's machines",
+                        plural(turns + other, "batch", "batches")
+                    ));
+                    match turns {
+                        0 => {}
+                        1 => said.push_str(", 1 of them an agent turn that is never preempted"),
+                        n => said.push_str(&format!(
+                            ", {n} of them agent turns that are never preempted"
+                        )),
+                    }
+                }
+                let gives_up = since + (act::FIT_WAIT_SECS as Ms) * 1_000;
+                said.push_str(&format!(
+                    "; the start fails {} if it never fits",
+                    relative(gives_up, now)
+                ));
+                said
             }
             Self::Loading { since, bound_at } => format!(
                 "loading since {}, given up {} if it is not healthy by then",

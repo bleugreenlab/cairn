@@ -50,6 +50,27 @@ fn phases(entries: &[(&str, Phase)]) -> BTreeMap<DeploymentId, Phase> {
     entries.iter().map(|(id, p)| (d(id), p.clone())).collect()
 }
 
+fn healthy(since_ms: Ms) -> Phase {
+    Phase::Healthy {
+        since_ms,
+        load_ms: None,
+    }
+}
+
+fn starting(since_ms: Ms) -> Phase {
+    Phase::Starting {
+        since_ms,
+        requested_ms: since_ms,
+    }
+}
+
+fn failed(at_ms: Ms, reason: &str) -> Phase {
+    Phase::Failed {
+        at_ms,
+        reason: reason.into(),
+    }
+}
+
 fn builds(running_turns: u32, running_other: u32, waiting: u32) -> BuildPressure {
     BuildPressure {
         running_turns,
@@ -92,7 +113,7 @@ impl Harness {
     /// Control taken at 0 with `id` loaded and healthy since then.
     fn with_loaded(id: &str) -> Self {
         let mut harness = Self::new();
-        harness.phases = phases(&[(id, Phase::Healthy)]);
+        harness.phases = phases(&[(id, healthy(0))]);
         harness.control = PoolControl::begin(
             harness.pool(),
             &harness.inventory.deployments,
@@ -162,24 +183,49 @@ fn a_request_for_an_unloaded_model_makes_it_the_desired_set() {
 }
 
 #[test]
-fn a_request_waits_visibly_through_drain_load_and_ready() {
+fn a_request_waits_visibly_through_fit_load_and_ready() {
     let mut h = Harness::new();
     h.builds = builds(1, 2, 0);
     h.requests.push(request(1, "dsv4f-tp2", 0));
     h.tick(0);
     assert_eq!(h.desired(), set(&["dsv4f-tp2"]));
-    assert_eq!(h.wait(1), &Wait::Draining { turns: 1, other: 2 });
     assert_eq!(
-        h.wait(1).describe(0),
-        "draining builds: 3 batches still running on the pool's machines, 1 of them an agent turn that is never preempted"
+        h.wait(1),
+        &Wait::Starting,
+        "a load never waits for an empty machine, only for the memory it needs"
+    );
+
+    let on = "memory: sp1 has 20.0 GiB free and needs 100.0 GiB";
+    h.phases = phases(&[(
+        "dsv4f-tp2",
+        Phase::Reserving {
+            since_ms: 0,
+            waiting_on: Some(on.into()),
+        },
+    )]);
+    h.tick(MIN);
+    assert_eq!(
+        h.wait(1),
+        &Wait::Fitting {
+            since: 0,
+            waiting_on: Some(on.into()),
+            turns: 1,
+            other: 2
+        }
+    );
+    assert_eq!(
+        h.wait(1).describe(MIN),
+        "waiting to fit since 1m ago, its machines reserved and taking no new batches; waiting on memory: sp1 has 20.0 GiB free and needs 100.0 GiB; 3 batches still running on the pool's machines, 1 of them an agent turn that is never preempted; the start fails in 14m if it never fits"
+    );
+    assert_eq!(
+        h.control.active.members[&d("dsv4f-tp2")].loading_since,
+        None,
+        "waiting to fit is not loading"
     );
 
     h.builds = BuildPressure::default();
-    h.tick(MIN);
-    assert_eq!(h.wait(1), &Wait::Starting);
-
-    h.phases = phases(&[("dsv4f-tp2", Phase::Starting)]);
-    h.tick(2 * MIN);
+    h.phases = phases(&[("dsv4f-tp2", starting(2 * MIN))]);
+    h.tick(2 * MIN + 5_000);
     assert_eq!(
         h.wait(1),
         &Wait::Loading {
@@ -192,13 +238,47 @@ fn a_request_waits_visibly_through_drain_load_and_ready() {
         "loading since 3m ago, given up in 7m if it is not healthy by then"
     );
 
-    h.phases = phases(&[("dsv4f-tp2", Phase::Healthy)]);
-    let plan = h.tick(6 * MIN);
+    h.phases = phases(&[("dsv4f-tp2", healthy(6 * MIN))]);
+    let plan = h.tick(6 * MIN + 5_000);
     assert!(plan.waits.is_empty());
-    assert_eq!(h.state(1), &RequestState::Ready { at: 6 * MIN });
+    assert_eq!(
+        h.state(1),
+        &RequestState::Ready {
+            at: 6 * MIN + 5_000
+        }
+    );
     assert_eq!(
         h.control.active.members[&d("dsv4f-tp2")].healthy_since,
-        Some(6 * MIN)
+        Some(6 * MIN),
+        "residency counts from when the act side saw it healthy"
+    );
+}
+
+#[test]
+fn a_deployment_with_no_phase_is_unknown_not_stopped() {
+    let mut h = Harness::with_loaded("dsv4f-tp2");
+    h.phases.clear();
+    h.tick(MIN);
+    assert_eq!(
+        h.control.active.members[&d("dsv4f-tp2")].healthy_since,
+        Some(0),
+        "nothing says it went away"
+    );
+    h.phases = phases(&[("dsv4f-tp2", Phase::Stopped { since_ms: MIN })]);
+    h.tick(2 * MIN);
+    assert_eq!(
+        h.control.active.members[&d("dsv4f-tp2")].healthy_since,
+        None,
+        "stopped is gone: whatever comes back is a new load"
+    );
+
+    let inventory = inventory();
+    let pool = &inventory.pools[&PoolId::from("sparks")];
+    let control = PoolControl::begin(pool, &inventory.deployments, &BTreeMap::new(), 0);
+    assert_eq!(
+        control.active.set(),
+        set(&[]),
+        "taking control adopts only what the act side knows is healthy"
     );
 }
 
@@ -215,7 +295,7 @@ fn a_request_for_a_loaded_model_is_ready_at_once() {
 fn a_desired_model_waits_for_another_to_unload_from_its_machines() {
     let mut h = Harness::new();
     // `qwen36-fast` still runs on sp1 though nothing wants it.
-    h.phases = phases(&[("qwen36-fast", Phase::Healthy)]);
+    h.phases = phases(&[("qwen36-fast", healthy(0))]);
     h.requests.push(request(1, "dsv4f-tp2", 0));
     h.tick(0);
     assert_eq!(
@@ -282,7 +362,7 @@ fn the_minimum_residency_holds_a_fresh_load_against_waiting_builds() {
     .effective(None);
     let inventory = inventory();
     let pool = &inventory.pools[&PoolId::from("sparks")];
-    let loaded = phases(&[("dsv4f-tp2", Phase::Healthy)]);
+    let loaded = phases(&[("dsv4f-tp2", healthy(0))]);
     let control = PoolControl::begin(pool, &inventory.deployments, &loaded, 0);
     let at = |now| {
         plan(
@@ -314,12 +394,12 @@ fn a_load_in_progress_is_not_unloaded_for_builds() {
     h.requests.push(request(1, "dsv4f-tp2", 0));
     h.tick(0);
     h.requests[0].state = RequestState::Cancelled { at: MIN };
-    h.phases = phases(&[("dsv4f-tp2", Phase::Starting)]);
+    h.phases = phases(&[("dsv4f-tp2", starting(2 * MIN))]);
     h.builds = builds(0, 0, 2);
     h.tick(2 * MIN);
     assert_eq!(h.desired(), set(&["dsv4f-tp2"]), "mid-load");
 
-    h.phases = phases(&[("dsv4f-tp2", Phase::Healthy)]);
+    h.phases = phases(&[("dsv4f-tp2", healthy(3 * MIN))]);
     h.tick(3 * MIN);
     assert_eq!(h.desired(), set(&["dsv4f-tp2"]), "resident from 3m");
     h.tick(13 * MIN);
@@ -335,6 +415,27 @@ fn a_chosen_model_that_never_started_yields_to_builds_at_once() {
     h.builds = builds(0, 0, 1);
     h.tick(MIN);
     assert_eq!(h.desired(), set(&[]));
+}
+
+#[test]
+fn a_model_still_waiting_to_fit_yields_to_builds_at_once() {
+    let mut h = Harness::new();
+    h.tick(10 * MIN);
+    assert_eq!(h.desired(), set(&["dsv4f-tp2"]), "the idle default");
+    h.phases = phases(&[(
+        "dsv4f-tp2",
+        Phase::Reserving {
+            since_ms: 10 * MIN,
+            waiting_on: None,
+        },
+    )]);
+    h.builds = builds(0, 0, 2);
+    h.tick(11 * MIN);
+    assert_eq!(
+        h.desired(),
+        set(&[]),
+        "nothing has been loaded, so there is no load to protect"
+    );
 }
 
 // Rule 3: an idle pool loads its default.
@@ -577,7 +678,7 @@ fn a_load_past_its_bound_fails_its_requests_and_leaves_the_set() {
     let mut h = Harness::new();
     h.requests.push(request(1, "dsv4f-tp2", 0));
     h.tick(0);
-    h.phases = phases(&[("dsv4f-tp2", Phase::Starting)]);
+    h.phases = phases(&[("dsv4f-tp2", starting(MIN))]);
     h.tick(MIN);
     h.tick(10 * MIN);
     assert_eq!(h.state(1), &RequestState::Waiting);
@@ -594,13 +695,7 @@ fn a_load_past_its_bound_fails_its_requests_and_leaves_the_set() {
 
     // The pool is idle, but the failure restarted the window: the default is
     // retried once a window, not on every pass.
-    h.phases = phases(&[(
-        "dsv4f-tp2",
-        Phase::Failed {
-            at: 11 * MIN,
-            reason: "gave up".into(),
-        },
-    )]);
+    h.phases = phases(&[("dsv4f-tp2", failed(11 * MIN, "gave up"))]);
     h.tick(20 * MIN);
     assert_eq!(h.desired(), set(&[]));
     let plan = h.tick(21 * MIN);
@@ -616,13 +711,7 @@ fn a_load_past_its_bound_fails_its_requests_and_leaves_the_set() {
 #[test]
 fn a_reported_failure_fails_the_attempt_but_an_old_one_does_not() {
     let mut h = Harness::new();
-    h.phases = phases(&[(
-        "dsv4f-tp2",
-        Phase::Failed {
-            at: 0,
-            reason: "exit 1".into(),
-        },
-    )]);
+    h.phases = phases(&[("dsv4f-tp2", failed(0, "exit 1"))]);
     h.requests.push(request(1, "dsv4f-tp2", MIN));
     h.tick(MIN);
     assert_eq!(
@@ -632,13 +721,7 @@ fn a_reported_failure_fails_the_attempt_but_an_old_one_does_not() {
     );
     assert_eq!(h.desired(), set(&["dsv4f-tp2"]));
 
-    h.phases = phases(&[(
-        "dsv4f-tp2",
-        Phase::Failed {
-            at: 2 * MIN,
-            reason: "health timed out".into(),
-        },
-    )]);
+    h.phases = phases(&[("dsv4f-tp2", failed(2 * MIN, "health timed out"))]);
     h.tick(3 * MIN);
     assert_eq!(
         h.state(1),
@@ -739,9 +822,9 @@ fn taking_control_adopts_what_is_healthy() {
         pool,
         &inventory.deployments,
         &phases(&[
-            ("qwen36-fast", Phase::Healthy),
-            ("other", Phase::Starting),
-            ("qwen3-embed-4b", Phase::Healthy),
+            ("qwen36-fast", healthy(0)),
+            ("other", starting(0)),
+            ("qwen3-embed-4b", healthy(0)),
         ]),
         5,
     );
@@ -749,28 +832,193 @@ fn taking_control_adopts_what_is_healthy() {
     assert_eq!(control.last_batch_work_at, 5);
 }
 
+// Convergence: what the act side is asked for.
+
+fn wanting(h: &mut Harness, ids: &[&str], at: Ms) {
+    h.control.active.members = ids.iter().map(|id| (d(id), Member::chosen(at))).collect();
+}
+
+fn converge_at(h: &Harness, now: Ms) -> Vec<(DeploymentId, act::Request)> {
+    converge(
+        h.pool(),
+        &h.inventory.deployments,
+        &h.control,
+        &h.phases,
+        now,
+    )
+}
+
+fn stop(id: &str) -> (DeploymentId, act::Request) {
+    (d(id), act::Request::Stop)
+}
+
+fn start(id: &str) -> (DeploymentId, act::Request) {
+    (d(id), act::Request::Start)
+}
+
 #[test]
-fn observed_phases_need_every_machine_healthy() {
-    use crate::resolve::MachineObservation;
-    let inventory = inventory();
-    let observe = |running: &str, healthy: bool| MachineObservation {
-        running: Some(d(running)),
-        healthy,
-        stale: false,
-    };
-    let mut observations = BTreeMap::from([("sp1".into(), observe("dsv4f-tp2", true))]);
+fn convergence_stops_what_is_not_wanted_before_starting_what_is() {
+    let mut h = Harness::new();
+    wanting(&mut h, &["dsv4f-tp2"], MIN);
+    h.phases = phases(&[
+        ("qwen36-fast", healthy(0)),
+        ("other", Phase::Stopped { since_ms: 0 }),
+        ("qwen3-embed-4b", healthy(0)),
+    ]);
     assert_eq!(
-        phases_observed(&inventory.deployments, &observations),
-        phases(&[("dsv4f-tp2", Phase::Starting)])
+        converge_at(&h, MIN),
+        vec![stop("qwen36-fast"), start("dsv4f-tp2")],
+        "a stopped deployment is left alone, and another pool's never touched"
     );
-    observations.insert("sp2".into(), observe("dsv4f-tp2", true));
-    observations.insert("halo".into(), observe("qwen3-embed-4b", false));
+
+    // Every phase that holds a model, or is about to, is stopped.
+    for phase in [
+        starting(0),
+        Phase::Reserving {
+            since_ms: 0,
+            waiting_on: None,
+        },
+    ] {
+        h.phases = phases(&[
+            ("qwen36-fast", phase),
+            ("other", Phase::Stopped { since_ms: 0 }),
+        ]);
+        assert_eq!(
+            converge_at(&h, MIN),
+            vec![stop("qwen36-fast"), start("dsv4f-tp2")]
+        );
+    }
+    // A stop in flight is waited for, and the start is asked for regardless:
+    // the act side refuses it by name while a machine is held, and the next
+    // pass asks again.
+    h.phases = phases(&[
+        ("qwen36-fast", Phase::Stopping { since_ms: MIN }),
+        ("other", Phase::Stopped { since_ms: 0 }),
+    ]);
+    assert_eq!(converge_at(&h, MIN), vec![start("dsv4f-tp2")]);
+    assert_eq!(converge_at(&h, 2 * MIN), vec![start("dsv4f-tp2")]);
+}
+
+#[test]
+fn a_desired_deployment_is_asked_for_until_the_act_side_has_it() {
+    let mut h = Harness::new();
+    wanting(&mut h, &["other"], 2 * MIN);
+    h.phases = phases(&[
+        ("qwen36-fast", Phase::Stopped { since_ms: 0 }),
+        ("dsv4f-tp2", Phase::Stopped { since_ms: 0 }),
+    ]);
+    let asked = |h: &mut Harness, phase: Option<Phase>| {
+        match phase {
+            Some(phase) => h.phases.insert(d("other"), phase),
+            None => h.phases.remove(&d("other")),
+        };
+        converge_at(h, 3 * MIN)
+    };
+    assert_eq!(asked(&mut h, None), vec![start("other")], "unknown");
     assert_eq!(
-        phases_observed(&inventory.deployments, &observations),
-        phases(&[
-            ("dsv4f-tp2", Phase::Healthy),
-            ("qwen3-embed-4b", Phase::Starting)
-        ])
+        asked(&mut h, Some(Phase::Stopped { since_ms: 0 })),
+        vec![start("other")]
+    );
+    assert_eq!(
+        asked(&mut h, Some(failed(MIN, "exit 1"))),
+        vec![start("other")],
+        "that failure was before it was chosen"
+    );
+    assert_eq!(
+        asked(&mut h, Some(failed(2 * MIN, "exit 1"))),
+        vec![],
+        "this attempt failed: the plan gives it up"
+    );
+    for phase in [
+        Phase::Reserving {
+            since_ms: 2 * MIN,
+            waiting_on: None,
+        },
+        starting(2 * MIN),
+        healthy(2 * MIN),
+        Phase::Stopping { since_ms: 0 },
+    ] {
+        assert_eq!(asked(&mut h, Some(phase)), vec![]);
+    }
+}
+
+#[test]
+fn a_stop_that_ended_failed_is_asked_for_again_after_a_minute() {
+    let mut h = Harness::new();
+    h.phases = phases(&[
+        (
+            "dsv4f-tp2",
+            failed(MIN, "the stop could not be sent: link down"),
+        ),
+        ("qwen36-fast", Phase::Stopped { since_ms: 0 }),
+        ("other", Phase::Stopped { since_ms: 0 }),
+    ]);
+    assert_eq!(converge_at(&h, MIN + 30_000), vec![]);
+    assert_eq!(converge_at(&h, 2 * MIN), vec![stop("dsv4f-tp2")]);
+}
+
+#[test]
+fn an_unknown_deployment_is_stopped_unless_another_holds_its_machines() {
+    let mut h = Harness::new();
+    wanting(&mut h, &["other"], 0);
+    h.phases = phases(&[("other", healthy(0))]);
+    assert_eq!(
+        converge_at(&h, MIN),
+        vec![stop("qwen36-fast")],
+        "dsv4f-tp2 cannot be running: `other` holds sp2"
+    );
+}
+
+#[test]
+fn a_pinned_deployment_is_started_but_a_failure_since_the_pin_stands() {
+    let mut h = Harness::new();
+    h.phases = phases(&[
+        ("qwen36-fast", Phase::Stopped { since_ms: 0 }),
+        ("other", Phase::Stopped { since_ms: 0 }),
+        ("dsv4f-tp2", failed(MIN, "exit 1")),
+    ]);
+    h.control
+        .pin(set(&["dsv4f-tp2"]), "operator", 2 * MIN)
+        .unwrap();
+    assert_eq!(converge_at(&h, 3 * MIN), vec![start("dsv4f-tp2")]);
+    h.phases
+        .insert(d("dsv4f-tp2"), failed(4 * MIN, "health timed out"));
+    assert_eq!(converge_at(&h, 5 * MIN), vec![]);
+}
+
+#[test]
+fn an_uncontrolled_pool_is_never_converged() {
+    let mut h = Harness::new();
+    wanting(&mut h, &["dsv4f-tp2"], 0);
+    h.phases = phases(&[("qwen36-fast", healthy(0))]);
+    h.control.controlled = false;
+    assert_eq!(converge_at(&h, MIN), vec![]);
+}
+
+// Settings from measured loads.
+
+#[test]
+fn the_settings_derive_from_the_pool_s_slowest_healthy_load() {
+    let inventory = inventory();
+    let pool = &inventory.pools[&PoolId::from("sparks")];
+    let (dsv4f, qwen, embed) = (d("dsv4f-tp2"), d("qwen36-fast"), d("qwen3-embed-4b"));
+    let loads = [(&dsv4f, 250_400), (&qwen, 30_000), (&embed, 999_000)];
+    let slowest = slowest_load_secs(pool, &inventory.deployments, loads);
+    assert_eq!(
+        slowest,
+        Some(251),
+        "rounded up; another pool's load is not counted"
+    );
+    assert_eq!(
+        PoolSettings::default()
+            .effective(slowest)
+            .load_bound
+            .to_string(),
+        "12m 33s (from a measured load of 4m 11s)"
+    );
+    assert_eq!(
+        slowest_load_secs(pool, &inventory.deployments, [(&embed, 999_000)]),
+        None
     );
 }
 

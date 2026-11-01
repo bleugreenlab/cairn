@@ -1085,19 +1085,20 @@ pub fn spawn_deployment_control(orch: Orchestrator) {
     });
 }
 
+/// The act side's test fixtures, shared with the pool controller's tests.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cairn_inference::{
         DeploymentSet, Engine, ModelRef, Pool, PoolMachine, Recipe, RecordSource, Requirements,
     };
 
     #[derive(Default)]
-    struct FakeHeads {
-        sent: Mutex<Vec<(String, String, String, DeploymentOperation)>>,
+    pub(crate) struct FakeHeads {
+        pub(crate) sent: Mutex<Vec<(String, String, String, DeploymentOperation)>>,
         readings: Mutex<BTreeMap<String, MachineReading>>,
         holds: Mutex<HashMap<String, InferenceHold>>,
-        refuse: Mutex<Option<String>>,
+        pub(crate) refuse: Mutex<Option<String>>,
         running: Mutex<BTreeMap<String, Vec<RunningBatch>>>,
         preempted: Mutex<Vec<(String, Preemption)>>,
     }
@@ -1151,7 +1152,7 @@ mod tests {
     }
 
     impl FakeHeads {
-        fn attach(&self, name: &str, free_gib: u64, allocated_gib: u64) {
+        pub(crate) fn attach(&self, name: &str, free_gib: u64, allocated_gib: u64) {
             self.readings.lock().unwrap().insert(
                 name.into(),
                 MachineReading {
@@ -1175,7 +1176,7 @@ mod tests {
                     preempted: false,
                 });
         }
-        fn last_sent(&self) -> (String, String, String, DeploymentOperation) {
+        pub(crate) fn last_sent(&self) -> (String, String, String, DeploymentOperation) {
             self.sent
                 .lock()
                 .unwrap()
@@ -1183,16 +1184,17 @@ mod tests {
                 .cloned()
                 .expect("something was sent")
         }
-        fn held(&self) -> Vec<String> {
+        pub(crate) fn held(&self) -> Vec<String> {
             let mut names: Vec<_> = self.holds.lock().unwrap().keys().cloned().collect();
             names.sort();
             names
         }
     }
 
-    const SP1: &str = "bginf-sp1";
-    const SP2: &str = "bginf-sp2";
-    const DSV4F: &str = "dsv4f-tp2";
+    pub(crate) const SP1: &str = "bginf-sp1";
+    pub(crate) const SP2: &str = "bginf-sp2";
+    pub(crate) const DSV4F: &str = "dsv4f-tp2";
+    pub(crate) const QWEN: &str = "qwen36-fast";
 
     fn recipe(id: &str, machines: u32) -> Recipe {
         Recipe {
@@ -1235,13 +1237,15 @@ mod tests {
         }
     }
 
-    async fn sparks_db(name: &str) -> LocalDb {
+    /// sp1 and sp2 in pool `sparks`, which has no default: `dsv4f-tp2` spans
+    /// both and `qwen36-fast` is on sp1.
+    pub(crate) async fn sparks_db(name: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
         let mut inventory = Inventory::default();
         inventory.insert_recipe(recipe(DSV4F, 2));
         inventory.insert_deployment(deployment(DSV4F, &[SP1, SP2]));
-        inventory.insert_recipe(recipe("qwen36-fast", 1));
-        inventory.insert_deployment(deployment("qwen36-fast", &[SP1]));
+        inventory.insert_recipe(recipe(QWEN, 1));
+        inventory.insert_deployment(deployment(QWEN, &[SP1]));
         inventory.insert_pool(Pool {
             id: "sparks".into(),
             source: RecordSource::Bginf,
@@ -1298,7 +1302,7 @@ mod tests {
         db
     }
 
-    async fn phase(db: &LocalDb, id: &str) -> Phase {
+    pub(crate) async fn phase(db: &LocalDb, id: &str) -> Phase {
         load_states(db).await.unwrap()[&DeploymentId::from(id)]
             .phase
             .clone()
