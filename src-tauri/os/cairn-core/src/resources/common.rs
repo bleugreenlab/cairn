@@ -1814,26 +1814,26 @@ mod tests {
         assert!(index.contains("(cairn://models/decide)"), "{index}");
     }
 
-    /// Recipes and deployments are written at the index, whose writes their
-    /// pages carry, and the recipes collection carries its own (import or
-    /// generate a recipe); the index offers its YAML export as a projection,
+    /// Profiles and deployments are written at the index, whose writes their
+    /// pages carry, and the profiles collection carries its own (import or
+    /// generate a profile); the index offers its YAML export as a projection,
     /// and the pool controller's two surfaces carry its writes.
     #[test]
     fn affordance_for_inference_kinds() {
-        // Recipes and deployments are written at the index, so their pages
+        // Profiles and deployments are written at the index, so their pages
         // carry the index's authoring actions through its back link, and
-        // nothing of the pools' or requests' own. The recipes collection adds
-        // its own: importing or generating a recipe.
+        // nothing of the pools' or requests' own. The profiles collection adds
+        // its own: importing or generating a profile.
         for kind in [
-            ResourceKind::InferenceRecipes,
+            ResourceKind::InferenceProfiles,
             ResourceKind::InferenceDeployments,
         ] {
             let spec = affordance_spec_for_kind(kind, None).unwrap();
             assert!(
                 spec.actions.iter().all(|action| {
                     action.uri_template == "cairn://inference"
-                        || (kind == ResourceKind::InferenceRecipes
-                            && action.uri_template == "cairn://inference/recipes")
+                        || (kind == ResourceKind::InferenceProfiles
+                            && action.uri_template == "cairn://inference/profiles")
                 }),
                 "{kind:?}: {:?}",
                 spec.actions
@@ -1851,10 +1851,10 @@ mod tests {
             assert!(!output.contains("control a pool"), "{kind:?}:\n{output}");
             assert!(!output.contains("request a model"), "{kind:?}:\n{output}");
         }
-        let recipes = affordance_for_kind(ResourceKind::InferenceRecipes);
+        let profiles = affordance_for_kind(ResourceKind::InferenceProfiles);
         assert!(
-            recipes.contains("import a recipe from a compose file, or generate candidates"),
-            "{recipes}"
+            profiles.contains("import a profile from a compose file, or generate candidates"),
+            "{profiles}"
         );
         let models = affordance_for_kind(ResourceKind::InferenceModels);
         assert!(

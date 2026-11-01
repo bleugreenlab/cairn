@@ -7,8 +7,8 @@
 //! here so it can be tested without an executor.
 //!
 //! Only the deployment's head acts, as in bginf: the start and stop commands run
-//! on the head, and a multi-machine recipe's own scripts drive the other
-//! machines (the dspark recipe does that over ssh). Cairn reserves every machine
+//! on the head, and a multi-machine profile's own scripts drive the other
+//! machines (the dspark profile does that over ssh). Cairn reserves every machine
 //! of the gang while it is reserving, starting, healthy or stopping, so nothing
 //! else is placed on a machine whose memory the model is about to take or holds.
 //!
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::deployment::{Deployment, DeploymentId};
 use crate::inventory::Inventory;
 use crate::machine::MachineName;
-use crate::recipe::{MemoryPerMachine, Recipe};
+use crate::profile::{InferenceProfile, MemoryPerMachine};
 
 /// How long the head may take to start a deployment and see it answer its
 /// health check, from the moment it receives the command: bginf's
@@ -536,7 +536,7 @@ pub struct Room {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fit {
     Fits,
-    /// The deployment has never been measured and its recipe states no
+    /// The deployment has never been measured and its profile states no
     /// memory, so nothing can be compared. The start waits for its machines
     /// to run no batch work, preempting none (see [`drain`]), and its load
     /// measures the footprint for next time.
@@ -595,10 +595,10 @@ pub fn fit(rooms: &BTreeMap<MachineName, Room>) -> Fit {
     }
 }
 
-/// What a recipe states it needs on each machine, in the kind of memory the
+/// What a profile states it needs on each machine, in the kind of memory the
 /// fit compares: system RAM on a unified machine, VRAM on a discrete card.
-pub fn stated_need(recipe: &Recipe) -> Option<u64> {
-    match recipe.requirements.memory? {
+pub fn stated_need(profile: &InferenceProfile) -> Option<u64> {
+    match profile.requirements.memory? {
         MemoryPerMachine::Unified { system } => Some(system.0),
         MemoryPerMachine::Discrete { vram, .. } => Some(vram.0),
     }

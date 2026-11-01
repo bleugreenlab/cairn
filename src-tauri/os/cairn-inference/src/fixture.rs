@@ -1,7 +1,7 @@
 //! The test inventory, bginf's own test fixture (`ctl/test_ctl.py`) as Cairn
 //! records: sp1 and sp2 in pool `sparks`, halo in pool `halo`, the defaults
-//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins. Each recipe's model is
-//! registered under the recipe's id, every fact unknown.
+//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins. Each profile's model is
+//! registered under the profile's id, every fact unknown.
 
 use std::collections::BTreeSet;
 
@@ -10,10 +10,10 @@ use crate::inventory::Inventory;
 use crate::machine::MachineName;
 use crate::model::Model;
 use crate::pool::{DeploymentSet, Pool, PoolMachine, RecordSource};
-use crate::recipe::{Engine, ModelRef, Recipe, RecipeOrigin, Requirements};
+use crate::profile::{Engine, InferenceProfile, ModelRef, ProfileOrigin, Requirements};
 
-pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
-    Recipe {
+pub(crate) fn command_profile(id: &str, machines: u32) -> InferenceProfile {
+    InferenceProfile {
         id: id.into(),
         source: RecordSource::Cairn,
         model: ModelRef {
@@ -25,7 +25,7 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
         verbs: None,
         modalities: None,
         quantization: None,
-        origin: RecipeOrigin::Authored,
+        origin: ProfileOrigin::Authored,
         engine: Engine::Command {
             start: "./start.sh".into(),
             stop: Some("./stop.sh".into()),
@@ -41,12 +41,12 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
     }
 }
 
-/// A deployment of the recipe with the same id, headed on its first machine.
+/// A deployment of the profile with the same id, headed on its first machine.
 pub(crate) fn deployment(id: &str, machines: &[&str]) -> Deployment {
     Deployment {
         id: id.into(),
         source: RecordSource::Cairn,
-        recipe: id.into(),
+        profile: id.into(),
         machines: machines.iter().map(|m| MachineName::from(*m)).collect(),
         head: machines[0].into(),
         api_port: 8000,
@@ -80,10 +80,10 @@ pub(crate) fn pool(id: &str, machines: &[&str], default: &[&str]) -> Pool {
     }
 }
 
-/// A recipe and its model, registered together.
-pub(crate) fn insert_command_recipe(inventory: &mut Inventory, id: &str, machines: u32) {
+/// A profile and its model, registered together.
+pub(crate) fn insert_command_profile(inventory: &mut Inventory, id: &str, machines: u32) {
     inventory.insert_model(Model::named(id));
-    inventory.insert_recipe(command_recipe(id, machines));
+    inventory.insert_profile(command_profile(id, machines));
 }
 
 pub(crate) fn test_inventory() -> Inventory {
@@ -93,7 +93,7 @@ pub(crate) fn test_inventory() -> Inventory {
         ("qwen36-fast", &["sp1"][..]),
         ("qwen3-embed-4b", &["halo"][..]),
     ] {
-        insert_command_recipe(&mut inventory, id, nodes.len() as u32);
+        insert_command_profile(&mut inventory, id, nodes.len() as u32);
         inventory.insert_deployment(deployment(id, nodes));
     }
     inventory.insert_pool(pool("sparks", &["sp1", "sp2"], &["dsv4f-tp2"]));

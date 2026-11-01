@@ -7,7 +7,7 @@
 //! takes, so it is validated and refused the same way. A quantized derivative
 //! (`nvidia/Qwen3.6-35B-A3B-NVFP4`) is not registered: its base is, and the
 //! answer says so, because a quantized repository is the weights of one of the
-//! base model's recipes. A gated repository is refused, naming the gate;
+//! base model's profiles. A gated repository is refused, naming the gate;
 //! Hugging Face credentials are not something Cairn holds.
 
 use std::future::Future;
@@ -194,7 +194,7 @@ pub async fn register(
     .await?;
     let mut said = match &resolved.derivative {
         Some(derivative) => format!(
-            "{repo} is a {} quantization of {}, so {} is the model and {repo}'s files are the weights of one of its recipes.\n",
+            "{repo} is a {} quantization of {}, so {} is the model and {repo}'s files are the weights of one of its profiles.\n",
             derivative.facts.quantization.as_deref().unwrap_or("quantized"),
             model.name,
             model.name

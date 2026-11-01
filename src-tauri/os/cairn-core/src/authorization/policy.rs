@@ -43,7 +43,7 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "routeCallsViaOpenRouter",
     // Commands this workspace will execute on the host.
     "buildServices",
-    // Which verbs each inference recipe's model is offered for, and so which
+    // Which verbs each inference profile's model is offered for, and so which
     // work is routed to it, as the model bindings above route work.
     "inference",
     // Opens a network listener that spends this workspace's models for

@@ -426,14 +426,14 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("action_configs", CONFIG),
     keep("skill_configs", CONFIG),
     keep("config_disables", CONFIG),
-    keep("inference_recipes", CONFIG),
+    keep("inference_profiles", CONFIG),
     keep("inference_deployments", CONFIG),
     keep("inference_pools", CONFIG),
     keep("inference_models", CONFIG),
     owned_by(
         "inference_verifications",
         "cairn-core orchestrator::inference_verify",
-        "the newest verifications per recipe and pool, pruned on insert",
+        "the newest verifications per profile and pool, pruned on insert",
     ),
     keep(
         "inference_deployment_state",

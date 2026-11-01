@@ -190,7 +190,7 @@ pub struct StateRow {
 /// One finished load, newest first in [`load_history`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadRow {
-    pub recipe: String,
+    pub profile: String,
     pub requested_at: i64,
     pub sent_at: Option<i64>,
     pub finished_at: i64,
@@ -237,7 +237,7 @@ pub async fn load_states(db: &LocalDb) -> Result<BTreeMap<DeploymentId, StateRow
 pub async fn load_history(db: &LocalDb) -> Result<BTreeMap<DeploymentId, Vec<LoadRow>>, String> {
     let rows = db
         .query_all(
-            "SELECT deployment_id, recipe_id, requested_at, sent_at, finished_at, outcome, load_ms,
+            "SELECT deployment_id, profile_id, requested_at, sent_at, finished_at, outcome, load_ms,
                     reason, footprint_json
                FROM inference_deployment_loads ORDER BY deployment_id, id DESC",
             (),
@@ -245,7 +245,7 @@ pub async fn load_history(db: &LocalDb) -> Result<BTreeMap<DeploymentId, Vec<Loa
                 Ok((
                     row.text(0)?,
                     LoadRow {
-                        recipe: row.text(1)?,
+                        profile: row.text(1)?,
                         requested_at: row.i64(2)?,
                         sent_at: row.opt_i64(3)?,
                         finished_at: row.i64(4)?,
@@ -363,15 +363,15 @@ async fn record_load(
         LoadOutcome::Failed { reason } => ("failed", None, Some(reason)),
     };
     let id = deployment.id.as_str().to_string();
-    let recipe = deployment.recipe.as_str().to_string();
+    let profile = deployment.profile.as_str().to_string();
     db.write(move |conn| {
-        let (id, recipe, reason) = (id.clone(), recipe.clone(), reason.clone());
+        let (id, profile, reason) = (id.clone(), profile.clone(), reason.clone());
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO inference_deployment_loads
-                   (deployment_id, recipe_id, requested_at, sent_at, finished_at, outcome, load_ms, reason)
+                   (deployment_id, profile_id, requested_at, sent_at, finished_at, outcome, load_ms, reason)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id.as_str(), recipe, requested_at, sent_at, now_ms, outcome, load_ms, reason],
+                params![id.as_str(), profile, requested_at, sent_at, now_ms, outcome, load_ms, reason],
             )
             .await?;
             conn.execute(
@@ -475,10 +475,10 @@ struct Plan {
 
 impl Plan {
     fn of(inventory: &Inventory, deployment: &Deployment) -> Result<Self, String> {
-        let recipe = inventory
-            .recipes
-            .get(&deployment.recipe)
-            .ok_or_else(|| format!("its recipe {} is missing", deployment.recipe))?;
+        let profile = inventory
+            .profiles
+            .get(&deployment.profile)
+            .ok_or_else(|| format!("its profile {} is missing", deployment.profile))?;
         let pool = inventory.pool_of_deployment(deployment);
         let machines: Vec<MachineAt> = deployment
             .machines
@@ -491,7 +491,7 @@ impl Plan {
                 link: pool.and_then(|pool| pool.link_of(name)).map(str::to_string),
             })
             .collect();
-        let rendered = render(recipe, deployment, &machines).map_err(|refusal| refusal.0)?;
+        let rendered = render(profile, deployment, &machines).map_err(|refusal| refusal.0)?;
         let address = inventory.address_of(&deployment.head).ok_or_else(|| {
             format!(
                 "the head {}'s address is unknown, so its health URL cannot be formed",
@@ -661,8 +661,8 @@ pub(crate) async fn request(
         Request::Stop => {
             if plan.stop.is_none() {
                 return Err(format!(
-                    "Cairn cannot stop {id}: its recipe {} has no stop command",
-                    deployment.recipe
+                    "Cairn cannot stop {id}: its profile {} has no stop command",
+                    deployment.profile
                 ));
             }
         }
@@ -886,7 +886,7 @@ fn probe(
 }
 
 /// Each gang machine's GPU memory against the deployment's footprint there:
-/// the newest measured load's, or else what its recipe states.
+/// the newest measured load's, or else what its profile states.
 fn allocations_of(
     inventory: &Inventory,
     deployment: &Deployment,
@@ -895,8 +895,8 @@ fn allocations_of(
 ) -> BTreeMap<MachineName, Allocation> {
     let footprint = last_footprint(history.get(&deployment.id));
     let stated = inventory
-        .recipes
-        .get(&deployment.recipe)
+        .profiles
+        .get(&deployment.profile)
         .and_then(control::stated_need);
     deployment
         .machines
@@ -1069,8 +1069,8 @@ async fn dispatch(
         return Ok(());
     }
     let footprint = last_footprint(history.get(id));
-    let recipe = inventory.recipes.get(&deployment.recipe);
-    let stated = recipe.and_then(control::stated_need);
+    let profile = inventory.profiles.get(&deployment.profile);
+    let stated = profile.and_then(control::stated_need);
     let names: BTreeSet<String> = deployment
         .machines
         .iter()
@@ -1099,9 +1099,9 @@ async fn dispatch(
         Drain::Start => None,
         Drain::Wait(on) => Some(on),
         Drain::Preempt { batches, waiting } => {
-            let model = recipe
-                .map(|recipe| recipe.model.name.to_string())
-                .unwrap_or_else(|| deployment.recipe.to_string());
+            let model = profile
+                .map(|profile| profile.model.name.to_string())
+                .unwrap_or_else(|| deployment.profile.to_string());
             for batch in batches {
                 heads.preempt(
                     &batch.request_id,
@@ -1236,7 +1236,8 @@ pub fn spawn_deployment_control(orch: Orchestrator) {
 pub(crate) mod tests {
     use super::*;
     use cairn_inference::{
-        DeploymentSet, Engine, ModelRef, Pool, PoolMachine, Recipe, RecordSource, Requirements,
+        DeploymentSet, Engine, InferenceProfile, ModelRef, Pool, PoolMachine, RecordSource,
+        Requirements,
     };
 
     #[derive(Default)]
@@ -1342,8 +1343,8 @@ pub(crate) mod tests {
     pub(crate) const DSV4F: &str = "dsv4f-tp2";
     pub(crate) const QWEN: &str = "qwen36-fast";
 
-    fn recipe(id: &str, machines: u32) -> Recipe {
-        Recipe {
+    fn profile(id: &str, machines: u32) -> InferenceProfile {
+        InferenceProfile {
             id: id.into(),
             source: RecordSource::Cairn,
             model: ModelRef {
@@ -1375,7 +1376,7 @@ pub(crate) mod tests {
         Deployment {
             id: id.into(),
             source: RecordSource::Cairn,
-            recipe: id.into(),
+            profile: id.into(),
             machines: machines.iter().map(|m| (*m).into()).collect(),
             head: machines[0].into(),
             api_port: 8888,
@@ -1391,9 +1392,9 @@ pub(crate) mod tests {
         let mut inventory = Inventory::default();
         inventory.insert_model(cairn_inference::Model::named(DSV4F));
         inventory.insert_model(cairn_inference::Model::named(QWEN));
-        inventory.insert_recipe(recipe(DSV4F, 2));
+        inventory.insert_profile(profile(DSV4F, 2));
         inventory.insert_deployment(deployment(DSV4F, &[SP1, SP2]));
-        inventory.insert_recipe(recipe(QWEN, 1));
+        inventory.insert_profile(profile(QWEN, 1));
         inventory.insert_deployment(deployment(QWEN, &[SP1]));
         inventory.insert_pool(Pool {
             id: "sparks".into(),
@@ -1424,9 +1425,9 @@ pub(crate) mod tests {
                     serde_json::to_string(m).unwrap(),
                 )
             })
-            .chain(inventory.recipes.values().map(|r| {
+            .chain(inventory.profiles.values().map(|r| {
                 (
-                    "inference_recipes",
+                    "inference_profiles",
                     r.id.to_string(),
                     serde_json::to_string(r).unwrap(),
                 )
@@ -1678,7 +1679,7 @@ pub(crate) mod tests {
     async fn insert_footprint(db: &LocalDb, gib: u64) {
         db.execute(
             "INSERT INTO inference_deployment_loads
-               (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
              VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
             params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", gib << 30, gib << 30)],
         )
@@ -1939,7 +1940,7 @@ pub(crate) mod tests {
         // A measured footprint from an earlier load makes memory the gate.
         db.execute(
             "INSERT INTO inference_deployment_loads
-               (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
              VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
             params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", 100u64 << 30, 100u64 << 30)],
         )
@@ -1986,7 +1987,7 @@ pub(crate) mod tests {
         let mut probes = Probes::default();
         db.execute(
             "INSERT INTO inference_deployment_loads
-               (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
              VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
             params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", 100u64 << 30, 100u64 << 30)],
         )

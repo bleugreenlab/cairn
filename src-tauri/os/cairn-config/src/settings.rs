@@ -336,7 +336,7 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(rename = "buildSlots")]
     pub fleet: Option<crate::fleet::FleetConfig>,
-    /// What each inference recipe's model serves and takes, as the operator
+    /// What each inference profile's model serves and takes, as the operator
     /// declares it. Config-only (YAML, not in the Settings DTO); written
     /// through `cairn://settings` and preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2418,9 +2418,9 @@ buildServices:
         let dir = tempfile::tempdir().unwrap();
         save_settings(dir.path(), &test_settings()).unwrap();
         let link = crate::inference::InferenceSettings {
-            recipes: [(
+            profiles: [(
                 "dsv4f-tp2".to_string(),
-                crate::inference::RecipeDeclaration {
+                crate::inference::InferenceProfileDeclaration {
                     verbs: Some([cairn_models_types::catalog::VerbKind::Session].into()),
                     ..Default::default()
                 },
@@ -2443,7 +2443,7 @@ buildServices:
         assert!(set_inference(
             dir.path(),
             &crate::inference::InferenceSettings {
-                recipes: [("r".to_string(), Default::default())].into(),
+                profiles: [("r".to_string(), Default::default())].into(),
                 ..Default::default()
             }
         )
@@ -2459,17 +2459,17 @@ buildServices:
         let path = get_settings_path(dir.path());
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str(
-            "inference:\n  bginf:\n    url: http://10.20.20.16:4100\n    machines: {halo: fedora}\n  recipes:\n    dsv4f-tp2: {verbs: [session]}\n",
+            "inference:\n  bginf:\n    url: http://10.20.20.16:4100\n    machines: {halo: fedora}\n  profiles:\n    dsv4f-tp2: {verbs: [session]}\n",
         );
         std::fs::write(&path, text).unwrap();
 
         assert!(load_settings_file(dir.path()).is_ok());
         let loaded = load_inference(dir.path());
         assert!(loaded.retired_bginf_link);
-        assert!(loaded.recipes.contains_key("dsv4f-tp2"));
+        assert!(loaded.profiles.contains_key("dsv4f-tp2"));
 
         let kept = crate::inference::InferenceSettings {
-            recipes: loaded.recipes.clone(),
+            profiles: loaded.profiles.clone(),
             ..Default::default()
         };
         set_inference(dir.path(), &kept).unwrap();

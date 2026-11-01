@@ -1,4 +1,4 @@
-//! The inventory: every recipe, deployment and pool, validated as a whole.
+//! The inventory: every profile, deployment and pool, validated as a whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -9,7 +9,7 @@ use crate::deployment::{Deployment, DeploymentId};
 use crate::machine::MachineName;
 use crate::model::Model;
 use crate::pool::{Pool, PoolId, RecordSource};
-use crate::recipe::{Recipe, RecipeId};
+use crate::profile::{InferenceProfile, InferenceProfileId};
 use crate::resolve::{self, Resolution, Slot};
 
 /// Every inference record Cairn knows, keyed by id.
@@ -17,7 +17,7 @@ use crate::resolve::{self, Resolution, Slot};
 pub struct Inventory {
     /// Models by name, their Hugging Face repository id.
     pub models: BTreeMap<String, Model>,
-    pub recipes: BTreeMap<RecipeId, Recipe>,
+    pub profiles: BTreeMap<InferenceProfileId, InferenceProfile>,
     pub deployments: BTreeMap<DeploymentId, Deployment>,
     pub pools: BTreeMap<PoolId, Pool>,
 }
@@ -29,68 +29,73 @@ struct InventoryFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<Model>,
     #[serde(default)]
-    recipes: Vec<Recipe>,
+    profiles: Vec<InferenceProfile>,
     #[serde(default)]
     deployments: Vec<Deployment>,
     #[serde(default)]
     pools: Vec<Pool>,
+    /// The kind's name before profiles were renamed, read only to refuse it:
+    /// a document still naming it would otherwise parse as holding no
+    /// profiles, which a whole-document replace takes as removing them all.
+    #[serde(default, rename = "recipes", skip_serializing)]
+    retired_recipes: Option<serde::de::IgnoredAny>,
 }
 
 /// One reason the inventory is not coherent, naming the records involved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    RecipeZeroMachines {
-        recipe: RecipeId,
+    ProfileZeroMachines {
+        profile: InferenceProfileId,
     },
-    /// A container or native recipe that pins no weight file.
+    /// A container or native profile that pins no weight file.
     UnpinnedWeights {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
     },
     BadWeightFile {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         index: usize,
         problem: &'static str,
     },
     BadImageDigest {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         image: String,
     },
     BadArtifactSha {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
     },
     EmptyStart {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
     },
     /// A container's args or env name a placeholder the renderer does not
     /// fill.
     UnknownPlaceholder {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         placeholder: String,
     },
     /// A container spanning machines without exactly one rank env per
     /// machine.
     RanksMismatch {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         ranks: usize,
         machines: u32,
     },
     /// A container mounting from its source files without pinning them.
     UnpinnedSourceMount {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         path: String,
     },
     BadSourceCommit {
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         commit: String,
     },
-    /// A recipe serving a model the inventory does not register.
-    RecipeModelUnregistered {
-        recipe: RecipeId,
+    /// A profile serving a model the inventory does not register.
+    ProfileModelUnregistered {
+        profile: InferenceProfileId,
         model: String,
     },
-    UnknownRecipe {
+    UnknownProfile {
         deployment: DeploymentId,
-        recipe: RecipeId,
+        profile: InferenceProfileId,
     },
     HeadNotInDeployment {
         deployment: DeploymentId,
@@ -102,7 +107,7 @@ pub enum ValidationError {
     },
     MachineCount {
         deployment: DeploymentId,
-        recipe: RecipeId,
+        profile: InferenceProfileId,
         required: u32,
         placed: usize,
     },
@@ -154,55 +159,55 @@ pub enum ValidationError {
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RecipeZeroMachines { recipe } => {
-                write!(f, "recipe {recipe} requires zero machines")
+            Self::ProfileZeroMachines { profile } => {
+                write!(f, "profile {profile} requires zero machines")
             }
-            Self::UnpinnedWeights { recipe } => write!(
+            Self::UnpinnedWeights { profile } => write!(
                 f,
-                "recipe {recipe} runs a container or native engine but pins no weight file"
+                "profile {profile} runs a container or native engine but pins no weight file"
             ),
             Self::BadWeightFile {
-                recipe,
+                profile,
                 index,
                 problem,
-            } => write!(f, "recipe {recipe} weight file {index}: {problem}"),
-            Self::BadImageDigest { recipe, image } => write!(
+            } => write!(f, "profile {profile} weight file {index}: {problem}"),
+            Self::BadImageDigest { profile, image } => write!(
                 f,
-                "recipe {recipe} image {image} is not pinned by digest (@sha256:<64 hex>)"
+                "profile {profile} image {image} is not pinned by digest (@sha256:<64 hex>)"
             ),
-            Self::BadArtifactSha { recipe } => write!(
+            Self::BadArtifactSha { profile } => write!(
                 f,
-                "recipe {recipe} native artifact sha256 is not 64 lowercase hex digits"
+                "profile {profile} native artifact sha256 is not 64 lowercase hex digits"
             ),
-            Self::EmptyStart { recipe } => write!(f, "recipe {recipe} has an empty start command"),
+            Self::EmptyStart { profile } => write!(f, "profile {profile} has an empty start command"),
             Self::UnknownPlaceholder {
-                recipe,
+                profile,
                 placeholder,
-            } => write!(f, "recipe {recipe} uses unknown placeholder {{{placeholder}}}"),
+            } => write!(f, "profile {profile} uses unknown placeholder {{{placeholder}}}"),
             Self::RanksMismatch {
-                recipe,
+                profile,
                 ranks,
                 machines,
             } => write!(
                 f,
-                "recipe {recipe} runs on {machines} {} but gives env for {ranks} {}; give one entry per machine",
+                "profile {profile} runs on {machines} {} but gives env for {ranks} {}; give one entry per machine",
                 if *machines == 1 { "machine" } else { "machines" },
                 if *ranks == 1 { "rank" } else { "ranks" }
             ),
-            Self::UnpinnedSourceMount { recipe, path } => write!(
+            Self::UnpinnedSourceMount { profile, path } => write!(
                 f,
-                "recipe {recipe} mounts {path} from its source files but pins no source (files: {{url, commit}})"
+                "profile {profile} mounts {path} from its source files but pins no source (files: {{url, commit}})"
             ),
-            Self::BadSourceCommit { recipe, commit } => write!(
+            Self::BadSourceCommit { profile, commit } => write!(
                 f,
-                "recipe {recipe} pins source commit {commit:?}, which is not a full 40-hex sha"
+                "profile {profile} pins source commit {commit:?}, which is not a full 40-hex sha"
             ),
-            Self::RecipeModelUnregistered { recipe, model } => write!(
+            Self::ProfileModelUnregistered { profile, model } => write!(
                 f,
-                "recipe {recipe} serves model {model}, which is not registered; register it at cairn://inference/models first"
+                "profile {profile} serves model {model}, which is not registered; register it at cairn://inference/models first"
             ),
-            Self::UnknownRecipe { deployment, recipe } => {
-                write!(f, "deployment {deployment} names unknown recipe {recipe}")
+            Self::UnknownProfile { deployment, profile } => {
+                write!(f, "deployment {deployment} names unknown profile {profile}")
             }
             Self::HeadNotInDeployment { deployment, head } => write!(
                 f,
@@ -214,12 +219,12 @@ impl fmt::Display for ValidationError {
             } => write!(f, "deployment {deployment} lists machine {machine} twice"),
             Self::MachineCount {
                 deployment,
-                recipe,
+                profile,
                 required,
                 placed,
             } => write!(
                 f,
-                "deployment {deployment} places recipe {recipe} on {placed} machines, but it requires {required}"
+                "deployment {deployment} places profile {profile} on {placed} machines, but it requires {required}"
             ),
             Self::BadPath {
                 deployment,
@@ -324,7 +329,7 @@ impl std::error::Error for UnknownPool {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeReport {
     pub models: KindReport,
-    pub recipes: KindReport,
+    pub profiles: KindReport,
     pub deployments: KindReport,
     pub pools: KindReport,
 }
@@ -353,7 +358,7 @@ impl ChangeReport {
     /// Whether any record was added, removed or updated.
     pub fn has_changes(&self) -> bool {
         !(self.models.is_empty()
-            && self.recipes.is_empty()
+            && self.profiles.is_empty()
             && self.deployments.is_empty()
             && self.pools.is_empty())
     }
@@ -363,7 +368,7 @@ impl ChangeReport {
         let mut lines = Vec::new();
         for (kind, report) in [
             ("model", &self.models),
-            ("recipe", &self.recipes),
+            ("profile", &self.profiles),
             ("deployment", &self.deployments),
             ("pool", &self.pools),
         ] {
@@ -405,7 +410,7 @@ macro_rules! sourced {
     )*};
 }
 
-sourced!(Model, Recipe, Deployment, Pool);
+sourced!(Model, InferenceProfile, Deployment, Pool);
 
 fn changed_fields<T: Serialize>(before: &T, after: &T) -> Vec<String> {
     let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
@@ -476,8 +481,8 @@ impl Inventory {
         self.models.insert(model.name.clone(), model);
     }
 
-    pub fn insert_recipe(&mut self, recipe: Recipe) {
-        self.recipes.insert(recipe.id.clone(), recipe);
+    pub fn insert_profile(&mut self, profile: InferenceProfile) {
+        self.profiles.insert(profile.id.clone(), profile);
     }
 
     pub fn insert_deployment(&mut self, deployment: Deployment) {
@@ -491,12 +496,12 @@ impl Inventory {
     /// Every validation error, in a stable order. Empty when coherent.
     pub fn problems(&self) -> Vec<ValidationError> {
         let mut problems = Vec::new();
-        for recipe in self.recipes.values() {
-            problems.extend(recipe.problems());
-            if !self.models.contains_key(&recipe.model.name) {
-                problems.push(ValidationError::RecipeModelUnregistered {
-                    recipe: recipe.id.clone(),
-                    model: recipe.model.name.clone(),
+        for profile in self.profiles.values() {
+            problems.extend(profile.problems());
+            if !self.models.contains_key(&profile.model.name) {
+                problems.push(ValidationError::ProfileModelUnregistered {
+                    profile: profile.id.clone(),
+                    model: profile.model.name.clone(),
                 });
             }
         }
@@ -527,18 +532,18 @@ impl Inventory {
 
         for deployment in self.deployments.values() {
             let id = || deployment.id.clone();
-            match self.recipes.get(&deployment.recipe) {
-                None => problems.push(ValidationError::UnknownRecipe {
+            match self.profiles.get(&deployment.profile) {
+                None => problems.push(ValidationError::UnknownProfile {
                     deployment: id(),
-                    recipe: deployment.recipe.clone(),
+                    profile: deployment.profile.clone(),
                 }),
-                Some(recipe)
-                    if recipe.requirements.machines as usize != deployment.machines.len() =>
+                Some(profile)
+                    if profile.requirements.machines as usize != deployment.machines.len() =>
                 {
                     problems.push(ValidationError::MachineCount {
                         deployment: id(),
-                        recipe: recipe.id.clone(),
-                        required: recipe.requirements.machines,
+                        profile: profile.id.clone(),
+                        required: profile.requirements.machines,
                         placed: deployment.machines.len(),
                     })
                 }
@@ -642,11 +647,11 @@ impl Inventory {
         }
     }
 
-    /// Every record that is not Cairn's own, as `kind id (source)`, recipes
+    /// Every record that is not Cairn's own, as `kind id (source)`, profiles
     /// first, then deployments, then pools, each in id order.
     pub fn foreign_records(&self) -> Vec<String> {
         foreign_of("model", &self.models)
-            .chain(foreign_of("recipe", &self.recipes))
+            .chain(foreign_of("profile", &self.profiles))
             .chain(foreign_of("deployment", &self.deployments))
             .chain(foreign_of("pool", &self.pools))
             .collect()
@@ -657,7 +662,7 @@ impl Inventory {
     pub fn adopt(&mut self, from: RecordSource) -> Vec<String> {
         let mut adopted = Vec::new();
         adopt_kind("model", &mut self.models, from, &mut adopted);
-        adopt_kind("recipe", &mut self.recipes, from, &mut adopted);
+        adopt_kind("profile", &mut self.profiles, from, &mut adopted);
         adopt_kind("deployment", &mut self.deployments, from, &mut adopted);
         adopt_kind("pool", &mut self.pools, from, &mut adopted);
         adopted
@@ -666,7 +671,7 @@ impl Inventory {
     /// Add each of `records`' records, replacing the one with its id.
     pub fn upsert(&mut self, records: Inventory) {
         self.models.extend(records.models);
-        self.recipes.extend(records.recipes);
+        self.profiles.extend(records.profiles);
         self.deployments.extend(records.deployments);
         self.pools.extend(records.pools);
     }
@@ -675,7 +680,7 @@ impl Inventory {
     pub fn changes(current: &Inventory, next: &Inventory) -> ChangeReport {
         ChangeReport {
             models: diff_kind(&current.models, &next.models),
-            recipes: diff_kind(&current.recipes, &next.recipes),
+            profiles: diff_kind(&current.profiles, &next.profiles),
             deployments: diff_kind(&current.deployments, &next.deployments),
             pools: diff_kind(&current.pools, &next.pools),
         }
@@ -725,9 +730,10 @@ impl Inventory {
     pub fn to_yaml(&self) -> String {
         let file = InventoryFile {
             models: self.models.values().cloned().collect(),
-            recipes: self.recipes.values().cloned().collect(),
+            profiles: self.profiles.values().cloned().collect(),
             deployments: self.deployments.values().cloned().collect(),
             pools: self.pools.values().cloned().collect(),
+            retired_recipes: None,
         };
         serde_yaml::to_string(&file).expect("inventory records serialize to YAML")
     }
@@ -737,6 +743,11 @@ impl Inventory {
     fn parse_records(text: &str) -> Result<(Inventory, Vec<ValidationError>), YamlError> {
         let file: InventoryFile =
             serde_yaml::from_str(text).map_err(|err| YamlError::Parse(err.to_string()))?;
+        if file.retired_recipes.is_some() {
+            return Err(YamlError::Parse(
+                "`recipes:` is now `profiles:` (inference recipes were renamed profiles, and a deployment names its `profile:`)".into(),
+            ));
+        }
         let mut inventory = Inventory::default();
         let mut duplicates = Vec::new();
         let mut duplicate = |kind: &'static str, id: &dyn fmt::Display| {
@@ -751,10 +762,10 @@ impl Inventory {
                 false => inventory.insert_model(model),
             }
         }
-        for recipe in file.recipes {
-            match inventory.recipes.contains_key(&recipe.id) {
-                true => duplicate("recipe", &recipe.id),
-                false => inventory.insert_recipe(recipe),
+        for profile in file.profiles {
+            match inventory.profiles.contains_key(&profile.id) {
+                true => duplicate("profile", &profile.id),
+                false => inventory.insert_profile(profile),
             }
         }
         for deployment in file.deployments {
@@ -800,9 +811,11 @@ impl Inventory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{command_recipe, deployment, insert_command_recipe, set, test_inventory};
+    use crate::fixture::{
+        command_profile, deployment, insert_command_profile, set, test_inventory,
+    };
     use crate::pool::PoolMachine;
-    use crate::recipe::Engine;
+    use crate::profile::Engine;
 
     fn problems_of(inventory: &Inventory) -> Vec<ValidationError> {
         inventory.problems()
@@ -818,7 +831,7 @@ mod tests {
     #[test]
     fn a_deployment_spanning_pools_is_refused() {
         let mut inventory = test_inventory();
-        insert_command_recipe(&mut inventory, "straddle", 2);
+        insert_command_profile(&mut inventory, "straddle", 2);
         inventory.insert_deployment(deployment("straddle", &["sp1", "halo"]));
         assert_eq!(
             problems_of(&inventory),
@@ -926,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_count_unlike_the_recipe_is_refused() {
+    fn a_machine_count_unlike_the_profile_is_refused() {
         let mut inventory = test_inventory();
         inventory
             .deployments
@@ -937,7 +950,7 @@ mod tests {
             problems_of(&inventory),
             vec![ValidationError::MachineCount {
                 deployment: "qwen36-fast".into(),
-                recipe: "qwen36-fast".into(),
+                profile: "qwen36-fast".into(),
                 required: 1,
                 placed: 2,
             }]
@@ -945,14 +958,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_machines_and_unknown_recipes_are_refused() {
+    fn duplicate_machines_and_unknown_profiles_are_refused() {
         let mut inventory = test_inventory();
         inventory.insert_deployment(deployment("twice", &["sp1", "sp1"]));
         inventory
             .deployments
             .get_mut(&DeploymentId::from("twice"))
             .unwrap()
-            .recipe = "dsv4f-tp2".into();
+            .profile = "dsv4f-tp2".into();
         inventory.insert_deployment(deployment("orphan", &["sp1"]));
         let problems = problems_of(&inventory);
         assert!(
@@ -961,17 +974,17 @@ mod tests {
                 machine: "sp1".into(),
             })
         );
-        assert!(problems.contains(&ValidationError::UnknownRecipe {
+        assert!(problems.contains(&ValidationError::UnknownProfile {
             deployment: "orphan".into(),
-            recipe: "orphan".into(),
+            profile: "orphan".into(),
         }));
     }
 
     /// Every record of the fixture, as bginf mirrored it before it retired.
     fn mirrored() -> Inventory {
         let mut inventory = test_inventory();
-        for recipe in inventory.recipes.values_mut() {
-            recipe.source = RecordSource::Bginf;
+        for profile in inventory.profiles.values_mut() {
+            profile.source = RecordSource::Bginf;
         }
         for deployment in inventory.deployments.values_mut() {
             deployment.source = RecordSource::Bginf;
@@ -985,18 +998,18 @@ mod tests {
     #[test]
     fn adopting_makes_every_mirrored_record_cairns_and_is_idempotent() {
         let mut inventory = mirrored();
-        insert_command_recipe(&mut inventory, "own", 1);
+        insert_command_profile(&mut inventory, "own", 1);
         assert_eq!(inventory.foreign_records().len(), 8);
-        assert_eq!(inventory.foreign_records()[0], "recipe dsv4f-tp2 (bginf)");
+        assert_eq!(inventory.foreign_records()[0], "profile dsv4f-tp2 (bginf)");
 
         let before = inventory.clone();
         let adopted = inventory.adopt(RecordSource::Bginf);
         assert_eq!(
             adopted,
             vec![
-                "recipe dsv4f-tp2",
-                "recipe qwen3-embed-4b",
-                "recipe qwen36-fast",
+                "profile dsv4f-tp2",
+                "profile qwen3-embed-4b",
+                "profile qwen36-fast",
                 "deployment dsv4f-tp2",
                 "deployment qwen3-embed-4b",
                 "deployment qwen36-fast",
@@ -1023,7 +1036,7 @@ mod tests {
 
     fn test_inventory_with_own() -> Inventory {
         let mut inventory = test_inventory();
-        insert_command_recipe(&mut inventory, "own", 1);
+        insert_command_profile(&mut inventory, "own", 1);
         inventory
     }
 
@@ -1033,21 +1046,21 @@ mod tests {
         assert!(!Inventory::changes(&current, &current).has_changes());
 
         let mut next = current.clone();
-        next.recipes
-            .get_mut(&RecipeId::from("qwen36-fast"))
+        next.profiles
+            .get_mut(&InferenceProfileId::from("qwen36-fast"))
             .unwrap()
             .engine = Engine::Command {
             start: "./start.sh --port 8002".into(),
             stop: Some("./stop.sh".into()),
             description: None,
         };
-        next.insert_recipe(command_recipe("new", 1));
+        next.insert_profile(command_profile("new", 1));
         next.pools.remove(&PoolId::from("halo"));
         assert_eq!(
             Inventory::changes(&current, &next).lines(),
             vec![
-                "added recipe new",
-                "updated recipe qwen36-fast: engine",
+                "added profile new",
+                "updated profile qwen36-fast: engine",
                 "removed pool halo",
             ]
         );
@@ -1057,13 +1070,18 @@ mod tests {
     fn an_upsert_adds_and_replaces_records_by_id() {
         let mut inventory = test_inventory();
         let mut records = Inventory::default();
-        let mut changed = command_recipe("qwen36-fast", 1);
+        let mut changed = command_profile("qwen36-fast", 1);
         changed.served_name = "qwen3.6-35b".into();
-        records.insert_recipe(changed.clone());
-        records.insert_recipe(command_recipe("new", 1));
+        records.insert_profile(changed.clone());
+        records.insert_profile(command_profile("new", 1));
         inventory.upsert(records);
-        assert_eq!(inventory.recipes[&RecipeId::from("qwen36-fast")], changed);
-        assert!(inventory.recipes.contains_key(&RecipeId::from("new")));
+        assert_eq!(
+            inventory.profiles[&InferenceProfileId::from("qwen36-fast")],
+            changed
+        );
+        assert!(inventory
+            .profiles
+            .contains_key(&InferenceProfileId::from("new")));
         assert_eq!(inventory.deployments.len(), 3);
     }
 
@@ -1085,11 +1103,11 @@ mod tests {
     #[test]
     fn a_refused_document_names_every_problem_at_once() {
         let yaml = r#"
-recipes:
+profiles:
   - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./start.sh}, requirements: {machines: 1}}
   - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ''}, requirements: {machines: 1}}
 deployments:
-  - {id: d, recipe: missing, machines: [a], head: b, apiPort: 8000, apiPath: /v1, healthPath: /health}
+  - {id: d, profile: missing, machines: [a], head: b, apiPort: 8000, apiPath: /v1, healthPath: /health}
 pools:
   - {id: p, machines: [{name: a}], default: [nope]}
 "#;
@@ -1100,34 +1118,48 @@ pools:
         assert_eq!(
             problems,
             vec![
-                "recipe r appears twice",
-                "recipe r serves model r, which is not registered; register it at cairn://inference/models first",
-                "deployment d names unknown recipe missing",
+                "profile r appears twice",
+                "profile r serves model r, which is not registered; register it at cairn://inference/models first",
+                "deployment d names unknown profile missing",
                 "deployment d has head b, which is not one of its machines",
                 "pool p default names unknown deployment nope",
             ]
         );
         assert!(Inventory::parse_yaml(yaml).is_err(), "an id written twice");
         assert!(matches!(
-            Inventory::from_yaml("recipes: {"),
+            Inventory::from_yaml("profiles: {"),
             Err(YamlError::Parse(_))
         ));
     }
 
     #[test]
+    fn a_document_still_naming_recipes_is_refused_not_read_as_empty() {
+        let refused = Inventory::parse_yaml(
+            "recipes:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("`recipes:` is now `profiles:`"),
+            "{refused}"
+        );
+        assert!(!Inventory::default().to_yaml().contains("recipes"));
+    }
+
+    #[test]
     fn a_record_without_a_source_is_cairns() {
         let parsed = Inventory::parse_yaml(
-            "recipes:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\n",
+            "profiles:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\n",
         )
         .unwrap();
         assert_eq!(
-            parsed.recipes[&RecipeId::from("r")].source,
+            parsed.profiles[&InferenceProfileId::from("r")].source,
             RecordSource::Cairn
         );
     }
 
     #[test]
-    fn models_round_trip_and_a_recipe_needs_its_model_registered() {
+    fn models_round_trip_and_a_profile_needs_its_model_registered() {
         let mut inventory = test_inventory();
         let yaml = inventory.to_yaml();
         assert!(yaml.starts_with("models:\n- name: dsv4f-tp2\n"), "{yaml}");
@@ -1136,8 +1168,8 @@ pools:
         inventory.models.remove("qwen36-fast");
         assert_eq!(
             inventory.problems(),
-            vec![ValidationError::RecipeModelUnregistered {
-                recipe: "qwen36-fast".into(),
+            vec![ValidationError::ProfileModelUnregistered {
+                profile: "qwen36-fast".into(),
                 model: "qwen36-fast".into(),
             }]
         );

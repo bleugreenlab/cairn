@@ -1045,8 +1045,8 @@ pub enum CairnResource {
     /// per `cairn://inference/*` collection.
     Inference,
     /// How each model is run.
-    InferenceRecipes,
-    /// Recipes placed on named machines.
+    InferenceProfiles,
+    /// Profiles placed on named machines.
     InferenceDeployments,
     /// One deployment: its phase as Cairn controls it, its machines and their
     /// holds, and its measured loads. Patched to start or stop it.
@@ -1060,16 +1060,16 @@ pub enum CairnResource {
     InferenceRequests,
     /// Models by their Hugging Face name, with the facts their config states.
     InferenceModels,
-    /// One model (`<owner>/<name>`): its facts, its recipes and each one's
+    /// One model (`<owner>/<name>`): its facts, its profiles and each one's
     /// latest verification per pool.
     InferenceModel {
         name: String,
     },
-    /// One recipe, patched to verify it on a pool.
-    InferenceRecipe {
+    /// One profile, patched to verify it on a pool.
+    InferenceProfile {
         id: String,
     },
-    /// Every verification of a recipe on a pool, newest first.
+    /// Every verification of a profile on a pool, newest first.
     InferenceVerifications,
     /// One verification: its stage, outcome and what it measured.
     InferenceVerification {
@@ -1214,14 +1214,14 @@ impl CairnResource {
             Self::ModelsClients => ResourceKind::ModelsClients,
             Self::ModelsClient { .. } => ResourceKind::ModelsClient,
             Self::Inference => ResourceKind::Inference,
-            Self::InferenceRecipes => ResourceKind::InferenceRecipes,
+            Self::InferenceProfiles => ResourceKind::InferenceProfiles,
             Self::InferenceDeployments => ResourceKind::InferenceDeployments,
             Self::InferenceDeployment { .. } => ResourceKind::InferenceDeployment,
             Self::InferencePools => ResourceKind::InferencePools,
             Self::InferenceRequests => ResourceKind::InferenceRequests,
             Self::InferenceModels => ResourceKind::InferenceModels,
             Self::InferenceModel { .. } => ResourceKind::InferenceModel,
-            Self::InferenceRecipe { .. } => ResourceKind::InferenceRecipe,
+            Self::InferenceProfile { .. } => ResourceKind::InferenceProfile,
             Self::InferenceVerifications => ResourceKind::InferenceVerifications,
             Self::InferenceVerification { .. } => ResourceKind::InferenceVerification,
             Self::Bug => ResourceKind::Bug,

@@ -595,8 +595,8 @@ pub fn check_set(
     Ok(())
 }
 
-/// The deployments of the model a caller names: every deployment of a recipe
-/// whose model has that real name, case-insensitively. A deployment id, recipe
+/// The deployments of the model a caller names: every deployment of a profile
+/// whose model has that real name, case-insensitively. A deployment id, profile
 /// id or served name is an internal key and names no model (tenet 1336).
 pub fn deployments_serving(inventory: &Inventory, name: &str) -> Vec<DeploymentId> {
     let name = name.trim();
@@ -608,8 +608,8 @@ pub fn deployments_serving(inventory: &Inventory, name: &str) -> Vec<DeploymentI
         .values()
         .filter(|d| {
             inventory
-                .recipes
-                .get(&d.recipe)
+                .profiles
+                .get(&d.profile)
                 .is_some_and(|r| r.model.name.trim().eq_ignore_ascii_case(name))
         })
         .map(|d| d.id.clone())

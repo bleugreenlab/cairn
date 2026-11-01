@@ -3,7 +3,7 @@
 //! Models go by their real names (tenet 1336). A local model's real name is
 //! the model its engine loads (`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`); a
 //! remote one's is the provider's id (`anthropic/claude-sonnet-4.5`), and
-//! `provider/native-id` pins a provider. The upstream slug a local recipe
+//! `provider/native-id` pins a provider. The upstream slug a local profile
 //! declares (the OpenRouter id the catalog merges on) also resolves, local
 //! first. A tier is never a model name. Any other name for a local model (its
 //! engine's served name, one bgllm answered to) is refused with a 404 that

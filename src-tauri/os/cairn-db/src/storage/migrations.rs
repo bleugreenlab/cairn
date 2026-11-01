@@ -64,7 +64,8 @@ macro_rules! private_command_outcome_history {
     };
 }
 
-/// cairn/5099: the cairn-inference facet's recipes, deployments and pools, and
+/// cairn/5099: the cairn-inference facet's profiles (then called recipes),
+/// deployments and pools, and
 /// the bginf link's last read (dropped since, when bginf retired). The orch's
 /// own inventory of this installation's machines, so private.
 macro_rules! private_inference_records {
@@ -2530,7 +2531,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // The inference records (0268): how this install's inference machines run
     // their models, written by its operator and rebuilt from nowhere.
     (
-        "inference_recipes",
+        "inference_profiles",
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
     (
@@ -2541,12 +2542,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_pools",
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
-    // The models those recipes serve, by real name (cairn/5730).
+    // The models those profiles serve, by real name (cairn/5730).
     (
         "inference_models",
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
-    // What verifying a recipe on this install's pools measured (cairn/5730).
+    // What verifying a profile on this install's pools measured (cairn/5730).
     (
         "inference_verifications",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -8617,5 +8618,87 @@ mod tests {
             1
         );
         assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM search_outbox WHERE source_table IN ('posts', 'post_comments')").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn inference_recipes_become_profiles_keeping_every_row() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("inference-profiles.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "inference_profiles")
+            .copied()
+            .collect::<Vec<_>>();
+        let rename = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == "inference_profiles")
+            .copied()
+            .expect("the rename migration is in the private lineage");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            r#"
+            INSERT INTO inference_recipes (id, source, body_json, created_at, updated_at)
+              VALUES ('r', 'cairn', '{"id":"r","model":{"name":"org/Model"}}', 1, 2);
+            INSERT INTO inference_deployments (id, source, body_json, created_at, updated_at)
+              VALUES ('d', 'cairn', '{"id":"d","recipe":"r","machines":["m"],"head":"m"}', 1, 2);
+            INSERT INTO inference_deployment_loads
+                (deployment_id, recipe_id, requested_at, finished_at, outcome)
+              VALUES ('d', 'r', 1, 2, 'healthy');
+            INSERT INTO inference_verifications
+                (id, recipe_id, recipe_digest, pool_id, deployment_id, machines_json,
+                 requested_by, started_at, outcome, stage)
+              VALUES ('v', 'r', 'sha', 'p', 'd', '[]', 'operator', 1, 'passed', 'benchmark');
+            "#,
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![rename]).run(&db).await.unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT json_extract(body_json, '$.model.name') FROM inference_profiles WHERE id = 'r'")
+                .await
+                .unwrap(),
+            "org/Model"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT body_json FROM inference_deployments WHERE id = 'd'"
+            )
+            .await
+            .unwrap()
+            .contains("recipe"),
+            false
+        );
+        assert_eq!(
+            query_text(&db, "SELECT json_extract(body_json, '$.profile') FROM inference_deployments WHERE id = 'd'")
+                .await
+                .unwrap(),
+            "r"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT profile_id FROM inference_deployment_loads WHERE deployment_id = 'd'"
+            )
+            .await
+            .unwrap(),
+            "r"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT profile_id || ' ' || profile_digest FROM inference_verifications WHERE id = 'v'")
+                .await
+                .unwrap(),
+            "r sha"
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_inference_verifications_profile_pool'")
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

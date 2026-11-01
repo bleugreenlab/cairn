@@ -13,12 +13,12 @@
 //! decision does not wait, since it has no cancel signal, and is refused with
 //! what its request waits on while the model loads.
 //!
-//! What a model serves is its recipe's word, as the operator's declaration
+//! What a model serves is its profile's word, as the operator's declaration
 //! states it: the verbs it names (those this provider carries, conversation and
 //! decide over openai-chat), or, when it names none, the provider-wide claim of
 //! those verbs for a model that outputs text and nothing for one that does not.
 //! Embeddings through this provider need a route into the embed door, which
-//! does not exist yet; until it does, a recipe declared as an embedder is
+//! does not exist yet; until it does, a profile declared as an embedder is
 //! listed here and serves nothing.
 
 mod adapter;
@@ -47,7 +47,7 @@ use crate::storage::run_db_blocking;
 pub(crate) const INFERENCE_BACKEND_NAME: &str = "Cairn inference";
 
 /// Conversation and decide over OpenAI chat: everything this provider
-/// carries, and what it serves for a model whose recipe does not say.
+/// carries, and what it serves for a model whose profile does not say.
 fn provider_serves() -> Vec<ServedVerb> {
     let wire = Wire::OpenAiChatCompletions;
     let mut serves = ServedVerb::conversation(wire);
@@ -58,7 +58,7 @@ fn provider_serves() -> Vec<ServedVerb> {
     serves
 }
 
-/// What `served` serves here: the verbs its recipe declares that this
+/// What `served` serves here: the verbs its profile declares that this
 /// provider carries; else the provider's claim (`None`) for a model that
 /// outputs text, and nothing for one that does not.
 fn serves_for(served: &ServedModel) -> Option<Vec<ServedVerb>> {
@@ -88,7 +88,7 @@ fn discovered(served: &ServedModel) -> DiscoveredModel {
         context_window: served
             .context_length
             .and_then(|tokens| i64::try_from(tokens).ok()),
-        // A recipe's upstream id is the OpenRouter slug of what it runs.
+        // A profile's upstream id is the OpenRouter slug of what it runs.
         canonical_slug: served.upstream_id.clone(),
         serving_account_ids: vec![],
         pricing: None,

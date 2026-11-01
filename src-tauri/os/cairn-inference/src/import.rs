@@ -1,5 +1,5 @@
-//! Importing a published serving recipe: compiling one service of a compose
-//! file, pinned at a commit, into a container recipe's engine.
+//! Importing a published serving profile: compiling one service of a compose
+//! file, pinned at a commit, into a container profile's engine.
 //!
 //! The importer is a parser, not a guesser. What it can read from the files it
 //! reads; what it cannot (which values a machine needs, which variable holds
@@ -29,7 +29,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
-use crate::recipe::{
+use crate::profile::{
     is_commit_sha, is_pinned_image, Accelerator, AcceleratorFamily, AcceleratorRuntime, Container,
     HostOptions, Mount, MountSource, Server, SourcePin,
 };
@@ -61,7 +61,7 @@ pub struct ImportSpec {
     /// whose host side is an absolute path.
     #[serde(default)]
     pub host_paths: BTreeMap<String, HostPath>,
-    /// The registered model the recipe serves.
+    /// The registered model the profile serves.
     pub model: String,
     /// The repository the weights come from, when not the model's own (a
     /// quantized derivative).
@@ -70,7 +70,7 @@ pub struct ImportSpec {
     /// The image pinned by digest, when its registry cannot be asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
-    /// The recipe id; derived from the model, quantization, server and
+    /// The profile id; derived from the model, quantization, server and
     /// machine count when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -464,7 +464,7 @@ const BINDINGS: &[Binding] = &[
     Binding {
         flag: "vllm serve",
         placeholder: "{model}",
-        meaning: "the weights' repository, which the recipe pins",
+        meaning: "the weights' repository, which the profile pins",
     },
 ];
 
@@ -516,7 +516,7 @@ pub fn compile(spec: &ImportSpec, files: &Files) -> Result<Compiled, ImportError
             notes.push(format!("dropped `{key}`: {why}"));
         } else if !TRANSLATED.contains(&key.as_str()) {
             error.refused.push(format!(
-                "service key `{key}` has no translation into a Cairn recipe"
+                "service key `{key}` has no translation into a Cairn profile"
             ));
         }
     }
@@ -806,7 +806,7 @@ pub fn compile(spec: &ImportSpec, files: &Files) -> Result<Compiled, ImportError
             );
         } else {
             error.refused.push(format!(
-                "volume {text} mounts a named volume, which a recipe does not carry"
+                "volume {text} mounts a named volume, which a profile does not carry"
             ));
         }
     }
@@ -974,7 +974,7 @@ pub fn compile(spec: &ImportSpec, files: &Files) -> Result<Compiled, ImportError
             missing(
                 &mut error,
                 format!("env.{var}"),
-                "\"{revision}\": the weights' revision, which the recipe pins",
+                "\"{revision}\": the weights' revision, which the profile pins",
             );
         }
     }
@@ -1155,10 +1155,10 @@ mod tests {
     }
 
     #[test]
-    fn the_compiled_dspark_recipe_is_valid_and_renders() {
-        use crate::recipe::{ModelRef, Recipe, RecipeOrigin, Requirements, WeightFile};
+    fn the_compiled_dspark_profile_is_valid_and_renders() {
+        use crate::profile::{InferenceProfile, ModelRef, ProfileOrigin, Requirements, WeightFile};
         let compiled = compile(&dspark_spec(), &files()).unwrap();
-        let recipe = Recipe {
+        let profile = InferenceProfile {
             id: "dsv4".into(),
             source: Default::default(),
             model: ModelRef {
@@ -1176,8 +1176,8 @@ mod tests {
             verbs: None,
             modalities: None,
             quantization: None,
-            origin: RecipeOrigin::Authored,
-            engine: crate::recipe::Engine::Container(compiled.container),
+            origin: ProfileOrigin::Authored,
+            engine: crate::profile::Engine::Container(compiled.container),
             requirements: Requirements {
                 machines: compiled.machines,
                 accelerator: compiled.accelerator,
@@ -1186,7 +1186,7 @@ mod tests {
             },
             notes: None,
         };
-        assert_eq!(recipe.problems(), vec![]);
+        assert_eq!(profile.problems(), vec![]);
     }
 
     #[test]
@@ -1247,7 +1247,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.refused,
-            vec!["service key `cap_add` has no translation into a Cairn recipe"]
+            vec!["service key `cap_add` has no translation into a Cairn profile"]
         );
         let error = compile(
             &ImportSpec {

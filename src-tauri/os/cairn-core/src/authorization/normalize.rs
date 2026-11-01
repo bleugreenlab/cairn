@@ -75,7 +75,7 @@ pub fn workspace_settings_write(
 /// that upserts or removes) → the same `WorkspaceSettings(inference) + Write`
 /// place a `cairn://settings` `inference` patch reaches.
 ///
-/// Both say what this workspace's inference machines run, and a recipe's
+/// Both say what this workspace's inference machines run, and a profile's
 /// start and stop commands are shell its head machine runs as its account.
 /// Authority is keyed to the place reached rather than the carrier, so a grant
 /// for either door covers the other.

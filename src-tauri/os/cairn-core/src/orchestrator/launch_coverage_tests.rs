@@ -752,15 +752,15 @@ async fn seed_inference(orch: &Orchestrator) {
         r#"
 models:
   - {name: coverage/Coverage-Chat}
-recipes:
-  - id: coverage-recipe
+profiles:
+  - id: coverage-profile
     source: cairn
     model: {name: coverage/Coverage-Chat}
     servedName: coverage-engine-chat
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
 deployments:
-  - {id: coverage-deployment, source: cairn, recipe: coverage-recipe, machines: [coverage-box], head: coverage-box, apiPort: 9, apiPath: /v1, healthPath: /v1/models}
+  - {id: coverage-deployment, source: cairn, profile: coverage-profile, machines: [coverage-box], head: coverage-box, apiPort: 9, apiPath: /v1, healthPath: /v1/models}
 pools:
   - {id: coverage-pool, source: cairn, machines: [{name: coverage-box, address: 127.0.0.1}], default: [coverage-deployment], pin: []}
 "#,
@@ -774,11 +774,11 @@ pools:
             serde_json::to_string(model).unwrap(),
         ));
     }
-    for recipe in inventory.recipes.values() {
+    for profile in inventory.profiles.values() {
         rows.push((
-            "inference_recipes",
-            recipe.id.to_string(),
-            serde_json::to_string(recipe).unwrap(),
+            "inference_profiles",
+            profile.id.to_string(),
+            serde_json::to_string(profile).unwrap(),
         ));
     }
     for deployment in inventory.deployments.values() {

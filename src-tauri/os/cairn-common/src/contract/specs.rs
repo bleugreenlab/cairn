@@ -887,7 +887,7 @@ pub(crate) const SETTINGS_BUILD_SERVICES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_INFERENCE: KeySpec = KeySpec::new(
     "inference",
     KeyType::Object,
-    "{recipes?{recipeId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section; recipes declare what a recipe's model serves and takes, over the record; the records themselves are written at cairn://inference",
+    "{profiles?{profileId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section; profiles declare what an inference profile's model serves and takes, over the record; the records themselves are written at cairn://inference",
 );
 pub(crate) const SETTINGS_SERVED_API: KeySpec = KeySpec::new(
     "servedApi",

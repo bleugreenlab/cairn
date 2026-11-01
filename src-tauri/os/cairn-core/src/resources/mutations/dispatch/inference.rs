@@ -51,23 +51,23 @@ fn removal_ids<T: From<String>>(remove: &Value, kind: &str) -> Result<Vec<T>, St
     }
 }
 
-const REMOVABLE: &[&str] = &["models", "recipes", "deployments", "pools"];
+const REMOVABLE: &[&str] = &["models", "profiles", "deployments", "pools"];
 
 fn parse_removals(remove: Option<&Value>) -> Result<Removals, String> {
     let Some(remove) = remove.filter(|remove| !remove.is_null()) else {
         return Ok(Removals::default());
     };
     let object = remove.as_object().ok_or(
-        "payload.remove must be {models?, recipes?, deployments?, pools?}, each a list of ids",
+        "payload.remove must be {models?, profiles?, deployments?, pools?}, each a list of ids",
     )?;
     if let Some(key) = object.keys().find(|key| !REMOVABLE.contains(&key.as_str())) {
         return Err(format!(
-            "payload.remove.{key} is not a record kind; it takes models, recipes, deployments and pools"
+            "payload.remove.{key} is not a record kind; it takes models, profiles, deployments and pools"
         ));
     }
     Ok(Removals {
         models: removal_ids(remove, "models")?,
-        recipes: removal_ids(remove, "recipes")?,
+        profiles: removal_ids(remove, "profiles")?,
         deployments: removal_ids(remove, "deployments")?,
         pools: removal_ids(remove, "pools")?,
     })
@@ -139,17 +139,17 @@ pub(crate) fn inference_records_authority(
         (CairnResource::Inference, ChangeMode::Replace) => true,
         (CairnResource::Inference, ChangeMode::Patch) => !payload_has("adopt"),
         // Registering, refreshing and removing a model, and importing or
-        // generating a recipe, write records. Verifying does not cross the
+        // generating a profile, write records. Verifying does not cross the
         // records authority, as starting a deployment from its page does not,
         // though it writes two bounded records of its own: its
-        // `verify-<recipe>-<pool>` deployment, which runs a recipe already
+        // `verify-<profile>-<pool>` deployment, which runs a profile already
         // written under the authority, and, when the engine's KV cache is
-        // smaller than the recipe's context, that recipe's context lowered to
-        // fit. Neither adds shell or raises what a recipe asks of a machine.
+        // smaller than the profile's context, that profile's context lowered to
+        // fit. Neither adds shell or raises what a profile asks of a machine.
         (CairnResource::InferenceModels, ChangeMode::Append) => true,
         (CairnResource::InferenceModel { .. }, ChangeMode::Delete) => true,
         (CairnResource::InferenceModel { .. }, ChangeMode::Patch) => payload_has("refresh"),
-        (CairnResource::InferenceRecipes, ChangeMode::Append) => true,
+        (CairnResource::InferenceProfiles, ChangeMode::Append) => true,
         _ => false,
     };
     authoring.then(|| {
@@ -406,7 +406,7 @@ pub(super) async fn dispatch(
             })?;
             if dry_run {
                 return Ok(Some(format!(
-                    "Would verify {name}'s recipes on pool {pool}"
+                    "Would verify {name}'s profiles on pool {pool}"
                 )));
             }
             let inventory = crate::orchestrator::inference::load_inventory(&orch.db.local)
@@ -416,19 +416,19 @@ pub(super) async fn dispatch(
             let family = pool_hardware(&inventory, &pool_id, &snapshots(orch), &Default::default())
                 .ok()
                 .and_then(|hw| hw.machines.first().map(|m| m.family));
-            let recipes = inference_verify::candidates(&inventory, name, &pool_id, family);
-            if recipes.is_empty() {
+            let profiles = inference_verify::candidates(&inventory, name, &pool_id, family);
+            if profiles.is_empty() {
                 return Err(fail(format!(
-                    "model {name} has no container recipe that suits pool {pool}; import one or generate candidates at cairn://inference/recipes"
+                    "model {name} has no container profile that suits pool {pool}; import one or generate candidates at cairn://inference/profiles"
                 )));
             }
             let requester = actor(orch, request, None).await;
-            let count = recipes.len();
-            let id = inference_verify::spawn(orch, recipes, &pool, &requester, all)
+            let count = profiles.len();
+            let id = inference_verify::spawn(orch, profiles, &pool, &requester, all)
                 .await
                 .map_err(fail)?;
             Ok(Some(format!(
-                "Verifying {name}'s recipes on pool {pool} ({count} to try, {}), starting with verification {id}. Read cairn://inference/models/{name} for each one's outcome.",
+                "Verifying {name}'s profiles on pool {pool} ({count} to try, {}), starting with verification {id}. Read cairn://inference/models/{name} for each one's outcome.",
                 if all { "every one" } else { "until one passes" }
             )))
         }
@@ -448,7 +448,7 @@ pub(super) async fn dispatch(
                 .map(Some)
                 .map_err(fail)
         }
-        (CairnResource::InferenceRecipes, ChangeMode::Append) => {
+        (CairnResource::InferenceProfiles, ChangeMode::Append) => {
             let payload = item
                 .payload
                 .as_ref()
@@ -494,7 +494,7 @@ pub(super) async fn dispatch(
                 };
             if dry_run {
                 return Ok(Some(format!(
-                    "Would generate recipes for {model} on pool {pool}"
+                    "Would generate profiles for {model} on pool {pool}"
                 )));
             }
             let hub = Web::new().map_err(fail)?;
@@ -508,19 +508,19 @@ pub(super) async fn dispatch(
             .map(Some)
             .map_err(fail)
         }
-        (CairnResource::InferenceRecipe { id }, ChangeMode::Patch) => {
+        (CairnResource::InferenceProfile { id }, ChangeMode::Patch) => {
             let payload = item
                 .payload
                 .as_ref()
                 .ok_or_else(|| fail("mode=patch requires payload".into()))?;
             let (pool, _) = pool_of(payload, "verify").map_err(fail)?;
             if dry_run {
-                return Ok(Some(format!("Would verify recipe {id} on pool {pool}")));
+                return Ok(Some(format!("Would verify profile {id} on pool {pool}")));
             }
             let requester = actor(orch, request, None).await;
             let verification = inference_verify::spawn(
                 orch,
-                vec![cairn_inference::RecipeId::from(id.as_str())],
+                vec![cairn_inference::InferenceProfileId::from(id.as_str())],
                 &pool,
                 &requester,
                 false,
@@ -528,7 +528,7 @@ pub(super) async fn dispatch(
             .await
             .map_err(fail)?;
             Ok(Some(format!(
-                "Verification {verification} started: recipe {id} loads on pool {pool} as deployment verify-{id}-{pool}, then its health is checked and it is benchmarked; the pool's own model is stopped first and restored after. Read cairn://inference/verifications/{verification} for its stage."
+                "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, then its health is checked and it is benchmarked; the pool's own model is stopped first and restored after. Read cairn://inference/verifications/{verification} for its stage."
             )))
         }
         _ => Ok(None),
@@ -623,7 +623,7 @@ mod tests {
         };
         assert_eq!(scope(&register), inference);
         let verify = ChangeItem {
-            target: "cairn://inference/recipes/embed".into(),
+            target: "cairn://inference/profiles/embed".into(),
             ..item(
                 ChangeMode::Patch,
                 serde_json::json!({"verify": {"pool": "halo"}}),

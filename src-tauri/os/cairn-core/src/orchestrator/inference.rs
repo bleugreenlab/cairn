@@ -17,14 +17,16 @@ use std::collections::BTreeMap;
 use cairn_db::turso::params;
 use cairn_inference::control::Phase;
 use cairn_inference::pool_control::PoolControl;
-use cairn_inference::{DeploymentId, Inventory, PoolId, RecipeId, RecordSource, YamlError};
+use cairn_inference::{
+    DeploymentId, InferenceProfileId, Inventory, PoolId, RecordSource, YamlError,
+};
 use serde::Serialize;
 
 use super::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
 const MODELS: &str = "inference_models";
-const RECIPES: &str = "inference_recipes";
+const PROFILES: &str = "inference_profiles";
 const DEPLOYMENTS: &str = "inference_deployments";
 const POOLS: &str = "inference_pools";
 
@@ -70,8 +72,8 @@ pub async fn load_inventory(db: &LocalDb) -> Result<Inventory, String> {
     for model in parse_bodies(MODELS, load_bodies(db, MODELS).await?) {
         inventory.insert_model(model);
     }
-    for recipe in parse_bodies(RECIPES, load_bodies(db, RECIPES).await?) {
-        inventory.insert_recipe(recipe);
+    for profile in parse_bodies(PROFILES, load_bodies(db, PROFILES).await?) {
+        inventory.insert_profile(profile);
     }
     for deployment in parse_bodies(DEPLOYMENTS, load_bodies(db, DEPLOYMENTS).await?) {
         inventory.insert_deployment(deployment);
@@ -130,9 +132,9 @@ pub(crate) fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange>
         &mut changes,
     );
     diff_kind(
-        RECIPES,
-        &current.recipes,
-        &next.recipes,
+        PROFILES,
+        &current.profiles,
+        &next.profiles,
         |r| r.source,
         &mut changes,
     );
@@ -219,7 +221,7 @@ pub async fn adopt(db: &LocalDb, from: RecordSource) -> Result<String, String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Removals {
     pub models: Vec<String>,
-    pub recipes: Vec<RecipeId>,
+    pub profiles: Vec<InferenceProfileId>,
     pub deployments: Vec<DeploymentId>,
     pub pools: Vec<PoolId>,
 }
@@ -284,7 +286,12 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
                 next.upsert(Inventory::parse_yaml(text).map_err(document_problems)?);
             }
             remove_each("model", &mut next.models, &remove.models, &mut problems);
-            remove_each("recipe", &mut next.recipes, &remove.recipes, &mut problems);
+            remove_each(
+                "profile",
+                &mut next.profiles,
+                &remove.profiles,
+                &mut problems,
+            );
             remove_each(
                 "deployment",
                 &mut next.deployments,
@@ -468,7 +475,7 @@ mod tests {
 models:
   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
   - {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}
-recipes:
+profiles:
   - id: dsv4f-tp2
     source: bginf
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
@@ -482,8 +489,8 @@ recipes:
     engine: {kind: command, start: podman run bginf-embed, stop: podman rm -f bginf-embed}
     requirements: {machines: 1}
 deployments:
-  - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [bginf-sp1, bginf-sp2], head: bginf-sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: dsv4f-tp2, source: bginf, profile: dsv4f-tp2, machines: [bginf-sp1, bginf-sp2], head: bginf-sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, source: bginf, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
 pools:
   - {id: sparks, source: bginf, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2}], default: [dsv4f-tp2], pin: []}
   - {id: halo, source: bginf, machines: [{name: fedora, address: 10.20.20.43}], default: [qwen3-embed-4b]}
@@ -509,7 +516,7 @@ pools:
 
     async fn sources(db: &LocalDb) -> Vec<String> {
         let mut sources = Vec::new();
-        for table in [RECIPES, DEPLOYMENTS, POOLS] {
+        for table in [PROFILES, DEPLOYMENTS, POOLS] {
             sources.extend(
                 db.query_all(
                     format!("SELECT id || ' ' || source FROM {table} ORDER BY id"),
@@ -524,10 +531,10 @@ pools:
     }
 
     #[tokio::test]
-    async fn a_stored_recipe_that_still_names_aliases_loads_without_them() {
+    async fn a_stored_profile_that_still_names_aliases_loads_without_them() {
         let db = crate::storage::migrated_test_db("inference-aliases").await;
         db.execute(
-            "INSERT INTO inference_recipes (id, source, body_json, created_at, updated_at)
+            "INSERT INTO inference_profiles (id, source, body_json, created_at, updated_at)
              VALUES ('r', 'cairn', ?1, 0, 0)",
             params![r#"{"id":"r","source":"cairn","model":{"name":"org/Model"},"servedName":"m","engine":{"kind":"command","start":"./s"},"requirements":{"machines":1},"aliases":["big"]}"#],
         )
@@ -535,11 +542,13 @@ pools:
         .unwrap();
         let inventory = load_inventory(&db).await.unwrap();
         assert_eq!(
-            inventory.recipes[&RecipeId::from("r")].model.name,
+            inventory.profiles[&InferenceProfileId::from("r")]
+                .model
+                .name,
             "org/Model"
         );
         assert!(
-            !serde_json::to_string(&inventory.recipes[&RecipeId::from("r")])
+            !serde_json::to_string(&inventory.profiles[&InferenceProfileId::from("r")])
                 .unwrap()
                 .contains("aliases")
         );
@@ -648,7 +657,7 @@ pools:
             .await
             .unwrap();
         assert!(
-            said.starts_with("Wrote the inventory:\n- updated recipe qwen3-embed-4b: engine"),
+            said.starts_with("Wrote the inventory:\n- updated profile qwen3-embed-4b: engine"),
             "{said}"
         );
         assert_eq!(load_inventory(&db).await.unwrap().to_yaml(), edited);
@@ -678,7 +687,7 @@ pools:
         ] {
             assert!(refusal.contains(problem), "{problem}: {refusal}");
         }
-        let parse = write_inventory(&db, &Authoring::Replace("recipes: {".into()))
+        let parse = write_inventory(&db, &Authoring::Replace("profiles: {".into()))
             .await
             .unwrap_err();
         assert!(parse.contains("the document does not parse"), "{parse}");
@@ -692,10 +701,10 @@ pools:
         let upsert = r#"
 models:
   - {name: nvidia/Qwen3.6-35B-A3B-NVFP4}
-recipes:
+profiles:
   - {id: qwen36-fast, model: {name: nvidia/Qwen3.6-35B-A3B-NVFP4}, servedName: qwen3.6-35b, engine: {kind: command, start: ./serve-qwen36.sh}, requirements: {machines: 1}}
 deployments:
-  - {id: qwen36-fast, recipe: qwen36-fast, machines: [bginf-sp1], head: bginf-sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen36-fast, profile: qwen36-fast, machines: [bginf-sp1], head: bginf-sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
 pools:
   - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [qwen36-fast]}
 "#;
@@ -710,7 +719,7 @@ pools:
         .unwrap();
         for line in [
             "added model nvidia/Qwen3.6-35B-A3B-NVFP4",
-            "added recipe qwen36-fast",
+            "added profile qwen36-fast",
             "added deployment qwen36-fast",
             "updated pool sparks: default, machines, pin",
         ] {
@@ -720,7 +729,7 @@ pools:
         assert_eq!(stored.address_of(&"bginf-sp2".into()), Some("10.20.20.41"));
 
         let removal = Removals {
-            recipes: vec!["qwen36-fast".into()],
+            profiles: vec!["qwen36-fast".into()],
             ..Removals::default()
         };
         let refusal = write_inventory(
@@ -733,7 +742,7 @@ pools:
         .await
         .unwrap_err();
         assert!(
-            refusal.contains("deployment qwen36-fast names unknown recipe qwen36-fast"),
+            refusal.contains("deployment qwen36-fast names unknown profile qwen36-fast"),
             "{refusal}"
         );
 
@@ -742,7 +751,7 @@ pools:
             &Authoring::Patch {
                 upsert: Some("pools:\n  - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [dsv4f-tp2]}\n".into()),
                 remove: Removals {
-                    recipes: vec!["qwen36-fast".into()],
+                    profiles: vec!["qwen36-fast".into()],
                     deployments: vec!["qwen36-fast".into(), "nope".into()],
                     ..Removals::default()
                 },
@@ -807,8 +816,8 @@ pools:
 
         let mut restarted = current.clone();
         restarted
-            .recipes
-            .get_mut(&RecipeId::from("qwen3-embed-4b"))
+            .profiles
+            .get_mut(&InferenceProfileId::from("qwen3-embed-4b"))
             .unwrap()
             .notes = Some("a new start command takes effect at the next start".into());
         assert!(running_refusals(&current, &restarted, &phases, &controls).is_empty());

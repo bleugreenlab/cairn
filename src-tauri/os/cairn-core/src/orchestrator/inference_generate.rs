@@ -1,7 +1,7 @@
-//! Generating recipes for a registered model on a pool: the hardware each
+//! Generating profiles for a registered model on a pool: the hardware each
 //! machine reports, the model's weight sources read from Hugging Face, and the
 //! facet's generator (`cairn_inference::generate`) between them. Every
-//! candidate is written as a recipe; what was left out is said with why.
+//! candidate is written as a profile; what was left out is said with why.
 //!
 //! A machine's hardware comes from its executor's latest health: the GPU's
 //! vendor, name and memory, the machine's memory and CPU architecture. A
@@ -152,7 +152,7 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
-/// Generate recipes for `model` on `pool` and write them.
+/// Generate profiles for `model` on `pool` and write them.
 pub async fn generate(
     db: &LocalDb,
     hub: &dyn Hub,
@@ -170,11 +170,14 @@ pub async fn generate(
     let generated = generate::generate(&model, &repos, &hardware);
     let mut said = String::new();
     if generated.candidates.is_empty() {
-        said.push_str(&format!("No recipe for {} fits pool {pool}.\n", model.name));
+        said.push_str(&format!(
+            "No profile for {} fits pool {pool}.\n",
+            model.name
+        ));
     } else {
         let mut records = Inventory::default();
         for candidate in &generated.candidates {
-            records.insert_recipe(candidate.recipe.clone());
+            records.insert_profile(candidate.profile.clone());
         }
         let wrote = write_inventory(
             db,
@@ -192,7 +195,7 @@ pub async fn generate(
             let p = &candidate.predicted;
             said.push_str(&format!(
                 "- {}: x{} machine(s), {} of weights, {} a machine, context {}{}\n",
-                candidate.recipe.id,
+                candidate.profile.id,
                 p.machines,
                 gib(p.weight_bytes),
                 gib(p.per_machine_bytes),
@@ -223,8 +226,8 @@ pub async fn generate(
     }
     if let Some(best) = generated.candidates.first() {
         said.push_str(&format!(
-            "Verify on the pool: patch cairn://inference/models/{} {{verify:{{pool:\"{pool}\"}}}}, or one recipe: patch cairn://inference/recipes/{} {{verify:{{pool:\"{pool}\"}}}}",
-            model.name, best.recipe.id
+            "Verify on the pool: patch cairn://inference/models/{} {{verify:{{pool:\"{pool}\"}}}}, or one profile: patch cairn://inference/profiles/{} {{verify:{{pool:\"{pool}\"}}}}",
+            model.name, best.profile.id
         ));
     }
     Ok(said)
@@ -310,12 +313,12 @@ mod tests {
             "{said}"
         );
         assert!(
-            said.contains("added recipe qwen3-embedding-4b-q8_0-llamacpp-x1"),
+            said.contains("added profile qwen3-embedding-4b-q8_0-llamacpp-x1"),
             "{said}"
         );
         let inventory = load_inventory(&db).await.unwrap();
         assert!(inventory
-            .recipes
+            .profiles
             .contains_key(&"qwen3-embedding-4b-bf16-vllm-x1".into()));
     }
 

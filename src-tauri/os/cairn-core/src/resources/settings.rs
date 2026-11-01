@@ -269,13 +269,13 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         out.push('\n');
     }
 
-    // --- Inference recipe declarations ---
+    // --- Inference profile declarations ---
     out.push_str("## Inference\n\n");
     let inference = crate::config::settings::load_inference(&orch.config_dir);
-    if inference.recipes.is_empty() {
-        out.push_str("- recipe declarations: none\n");
+    if inference.profiles.is_empty() {
+        out.push_str("- profile declarations: none\n");
     }
-    for (recipe, declared) in &inference.recipes {
+    for (profile, declared) in &inference.profiles {
         let verbs = declared
             .verbs
             .as_ref()
@@ -286,7 +286,7 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             });
-        out.push_str(&format!("- recipe {recipe}: verbs {verbs}\n"));
+        out.push_str(&format!("- profile {profile}: verbs {verbs}\n"));
     }
     if inference.retired_bginf_link {
         out.push_str("- the retired bginf link (`inference.bginf`) is still in settings.yaml and is ignored; writing this section drops it\n");

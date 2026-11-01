@@ -18,7 +18,7 @@ models:
   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
   - {name: Qwen/Qwen3-Embedding-4B}
   - {name: Qwen/Qwen3.6-35B-A3B}
-recipes:
+profiles:
   - id: dsv4f-tp2
     source: bginf
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
@@ -39,9 +39,9 @@ recipes:
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
 deployments:
-  - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
-  - {id: qwen36-fast, source: bginf, recipe: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
+  - {id: dsv4f-tp2, source: bginf, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, source: bginf, profile: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: qwen36-fast, source: bginf, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
 pools:
   - {id: sparks, source: bginf, machines: [{name: sp1, address: 10.20.20.40}, {name: sp2, address: 10.20.20.41}], default: [dsv4f-tp2]}
   - {id: halo, source: bginf, machines: [{name: halo, address: 10.20.20.43}], default: [qwen3-embed-4b]}
@@ -51,7 +51,7 @@ pools:
     let declarations = BTreeMap::from([
         (
             "dsv4f-tp2".to_string(),
-            cairn_config::inference::RecipeDeclaration {
+            cairn_config::inference::InferenceProfileDeclaration {
                 verbs: Some(BTreeSet::from([
                     VerbKind::Complete,
                     VerbKind::Session,
@@ -63,7 +63,7 @@ pools:
         ),
         (
             "qwen3-embed-4b".to_string(),
-            cairn_config::inference::RecipeDeclaration {
+            cairn_config::inference::InferenceProfileDeclaration {
                 verbs: Some(BTreeSet::from([VerbKind::Embed])),
                 ..Default::default()
             },
@@ -165,7 +165,7 @@ fn an_embedder_is_listed_and_serves_nothing_here_until_its_route_exists() {
 }
 
 #[test]
-fn an_undeclared_recipe_takes_the_providers_claim() {
+fn an_undeclared_profile_takes_the_providers_claim() {
     let provider = provider();
     let fast = served()
         .into_iter()
@@ -183,7 +183,7 @@ fn an_undeclared_recipe_takes_the_providers_claim() {
 }
 
 #[test]
-fn a_recipe_that_outputs_no_text_and_names_no_verbs_serves_nothing() {
+fn a_profile_that_outputs_no_text_and_names_no_verbs_serves_nothing() {
     let mut model = served()
         .into_iter()
         .find(|model| model.id == "Qwen/Qwen3.6-35B-A3B")

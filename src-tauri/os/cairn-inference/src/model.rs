@@ -3,7 +3,7 @@
 //!
 //! A model is the base checkpoint (`Qwen/Qwen3.6-35B-A3B`), never a quantized
 //! derivative of it: `nvidia/Qwen3.6-35B-A3B-NVFP4` is the weights of one of
-//! that model's recipes. Every fact is optional, because a fact the config does
+//! that model's profiles. Every fact is optional, because a fact the config does
 //! not state is unknown and is rendered as unknown, never guessed.
 
 use std::collections::BTreeSet;
@@ -22,7 +22,7 @@ pub struct Model {
     #[serde(default)]
     pub source: RecordSource,
     /// The revision sha the facts were read at. `None` for a model registered
-    /// without reading its config (the ones backfilled from existing recipes).
+    /// without reading its config (the ones backfilled from existing profiles).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
     #[serde(default)]

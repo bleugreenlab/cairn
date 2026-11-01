@@ -412,14 +412,14 @@ impl CairnResource {
             | Self::ModelsClients
             | Self::ModelsClient { .. }
             | Self::Inference
-            | Self::InferenceRecipes
+            | Self::InferenceProfiles
             | Self::InferenceDeployments
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
             | Self::InferenceModels
             | Self::InferenceModel { .. }
-            | Self::InferenceRecipe { .. }
+            | Self::InferenceProfile { .. }
             | Self::InferenceVerifications
             | Self::InferenceVerification { .. }
             | Self::Bug
@@ -630,14 +630,14 @@ impl CairnResource {
             | Self::ModelsClients
             | Self::ModelsClient { .. }
             | Self::Inference
-            | Self::InferenceRecipes
+            | Self::InferenceProfiles
             | Self::InferenceDeployments
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
             | Self::InferenceModels
             | Self::InferenceModel { .. }
-            | Self::InferenceRecipe { .. }
+            | Self::InferenceProfile { .. }
             | Self::InferenceVerifications
             | Self::InferenceVerification { .. }
             | Self::Bug
@@ -816,14 +816,14 @@ impl CairnResource {
             | Self::ModelsClients
             | Self::ModelsClient { .. }
             | Self::Inference
-            | Self::InferenceRecipes
+            | Self::InferenceProfiles
             | Self::InferenceDeployments
             | Self::InferenceDeployment { .. }
             | Self::InferencePools
             | Self::InferenceRequests
             | Self::InferenceModels
             | Self::InferenceModel { .. }
-            | Self::InferenceRecipe { .. }
+            | Self::InferenceProfile { .. }
             | Self::InferenceVerifications
             | Self::InferenceVerification { .. }
             | Self::Bug

@@ -1,20 +1,20 @@
-//! Importing a published serving recipe: the fetching around the facet's
+//! Importing a published serving profile: the fetching around the facet's
 //! compose compiler (`cairn_inference::import`).
 //!
 //! The repository must be on GitHub: its ref resolves to a full commit, and
-//! the compose and env files are read at that commit, so the recipe pins
+//! the compose and env files are read at that commit, so the profile pins
 //! exactly what was compiled. An image named by tag is resolved to the digest
 //! its registry serves now (ghcr.io, Docker Hub or nvcr.io, each asked
 //! anonymously); a registry that will not answer leaves the import needing the
 //! image in its spec. The weights are the registered model's own files, or a
 //! named derivative's, pinned at a revision with every file's hash.
 
-use cairn_inference::generate::{dtype_label, recipe_id};
+use cairn_inference::generate::{dtype_label, profile_id};
 use cairn_inference::hf::{HfRepo, WeightFormat};
 use cairn_inference::import::{self, Files, ImportError, ImportSpec, Missing};
 use cairn_inference::{
-    Engine, Inventory, Model, ModelRef, Recipe, RecipeOrigin, RecordSource, Requirements, Server,
-    WeightFile,
+    Engine, InferenceProfile, Inventory, Model, ModelRef, ProfileOrigin, RecordSource,
+    Requirements, Server, WeightFile,
 };
 use sha2::{Digest, Sha256};
 
@@ -133,7 +133,7 @@ pub async fn pin_image(hub: &dyn Hub, image: &str) -> Result<String, String> {
     Ok(format!("{name}@sha256:{hex}"))
 }
 
-/// The weight files a recipe of `server` pins from `repo`: every safetensors
+/// The weight files a profile of `server` pins from `repo`: every safetensors
 /// file for vLLM, the one GGUF file for llama.cpp.
 pub fn weight_files(
     repo: &HfRepo,
@@ -171,7 +171,7 @@ pub fn weight_files(
     };
     if files.is_empty() {
         return Err(format!(
-            "{} at {} has no weight files a {} recipe can pin",
+            "{} at {} has no weight files a {} profile can pin",
             repo.repo,
             repo.revision,
             server.as_str()
@@ -185,7 +185,7 @@ fn refused(missing: Vec<Missing>, refused: Vec<String>) -> String {
 }
 
 /// Import `spec`: compile its service, pin its image and weights, and write
-/// the recipe; or refuse with every key it needs.
+/// the profile; or refuse with every key it needs.
 pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<String, String> {
     let inventory = load_inventory(db).await?;
     let model: Model = inventory.models.get(&spec.model).cloned().ok_or_else(|| {
@@ -246,14 +246,14 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
             .or_else(|| model.facts.dtype.as_deref().map(dtype_label)),
     };
     let id = spec.id.clone().unwrap_or_else(|| {
-        recipe_id(
+        profile_id(
             &model.name,
             quantization.as_deref(),
             server,
             compiled.machines,
         )
     });
-    let recipe = Recipe {
+    let profile = InferenceProfile {
         id: id.as_str().into(),
         source: RecordSource::Cairn,
         model: ModelRef {
@@ -265,7 +265,7 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
         verbs: model.facts.verbs.clone(),
         modalities: model.facts.modalities.clone(),
         quantization,
-        origin: RecipeOrigin::Imported {
+        origin: ProfileOrigin::Imported {
             url: spec.url.clone(),
             commit: spec.commit.clone(),
             compose: spec.compose.clone(),
@@ -281,7 +281,7 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
         notes: None,
     };
     let mut records = Inventory::default();
-    records.insert_recipe(recipe);
+    records.insert_profile(profile);
     let wrote = write_inventory(
         db,
         &Authoring::Patch {
@@ -291,7 +291,7 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
     )
     .await?;
     let mut said = format!(
-        "Imported recipe {id} from {} at {}, service {} of {}.\n{wrote}",
+        "Imported profile {id} from {} at {}, service {} of {}.\n{wrote}",
         spec.url, spec.commit, spec.service, spec.compose
     );
     if !compiled.notes.is_empty() {
@@ -299,7 +299,7 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
         said.push_str(&compiled.notes.join("\n- "));
     }
     said.push_str(&format!(
-        "\nVerify it on a pool: patch cairn://inference/recipes/{id} {{verify:{{pool:\"<pool>\"}}}}"
+        "\nVerify it on a pool: patch cairn://inference/profiles/{id} {{verify:{{pool:\"<pool>\"}}}}"
     ));
     Ok(said)
 }
@@ -379,7 +379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_dspark_recipe_imports_pinned_and_says_how_to_verify() {
+    async fn the_dspark_profile_imports_pinned_and_says_how_to_verify() {
         let db = crate::storage::migrated_test_db("inference-import-dspark").await;
         let hub = hub();
         super::super::inference_models::register(
@@ -393,29 +393,29 @@ mod tests {
         let said = import(&db, &hub, &spec()).await.unwrap();
         assert!(
             said.starts_with(&format!(
-                "Imported recipe deepseek-v4-flash-vision-exp-fp8-vllm-x2 from {REPO} at {COMMIT}"
+                "Imported profile deepseek-v4-flash-vision-exp-fp8-vllm-x2 from {REPO} at {COMMIT}"
             )),
             "{said}"
         );
         assert!(said.contains("dropped `restart`"), "{said}");
         let inventory = load_inventory(&db).await.unwrap();
-        let recipe = &inventory.recipes[&"deepseek-v4-flash-vision-exp-fp8-vllm-x2".into()];
+        let profile = &inventory.profiles[&"deepseek-v4-flash-vision-exp-fp8-vllm-x2".into()];
         assert_eq!(
-            recipe.served_name,
+            profile.served_name,
             "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
         );
-        assert_eq!(recipe.quantization.as_deref(), Some("fp8"));
-        assert_eq!(recipe.requirements.machines, 2);
-        assert!(recipe.model.weights.len() > 40);
-        assert!(recipe
+        assert_eq!(profile.quantization.as_deref(), Some("fp8"));
+        assert_eq!(profile.requirements.machines, 2);
+        assert!(profile.model.weights.len() > 40);
+        assert!(profile
             .model
             .weights
             .iter()
             .all(|w| w.revision == "6821d6ad3681a4b137b066b76094fa82ebd0a380"));
         assert!(
-            matches!(&recipe.origin, RecipeOrigin::Imported { commit, .. } if commit == COMMIT)
+            matches!(&profile.origin, ProfileOrigin::Imported { commit, .. } if commit == COMMIT)
         );
-        assert_eq!(recipe.problems(), vec![]);
+        assert_eq!(profile.problems(), vec![]);
     }
 
     #[tokio::test]
@@ -486,9 +486,9 @@ mod tests {
     }
 
     #[test]
-    fn recipe_ids_name_the_model_quant_server_and_machines() {
+    fn profile_ids_name_the_model_quant_server_and_machines() {
         assert_eq!(
-            recipe_id("Qwen/Qwen3-Embedding-4B", Some("q8_0"), Server::LlamaCpp, 1),
+            profile_id("Qwen/Qwen3-Embedding-4B", Some("q8_0"), Server::LlamaCpp, 1),
             "qwen3-embedding-4b-q8_0-llamacpp-x1"
         );
     }

@@ -22,7 +22,9 @@ use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
 use cairn_inference::pool_control::{self as control, PoolControl, RequestState};
 use cairn_inference::served::{self, EngineMeasure};
-use cairn_inference::{DeploymentId, Engine, Inventory, MemoryPerMachine, Pool, PoolId, Recipe};
+use cairn_inference::{
+    DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine, Pool, PoolId,
+};
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
 
@@ -97,7 +99,7 @@ pub enum RunningState {
 pub struct RunningModel {
     pub deployment: String,
     pub model: String,
-    pub recipe: String,
+    pub profile: String,
     pub state: RunningState,
     pub pinned: bool,
     pub loading: Option<Loading>,
@@ -126,7 +128,7 @@ pub struct Rates {
 #[serde(rename_all = "camelCase")]
 pub struct LoadableModel {
     pub model: String,
-    pub recipe: String,
+    pub profile: String,
     pub size_bytes: Option<u64>,
     pub fits: bool,
 }
@@ -147,7 +149,7 @@ pub struct InferenceModel {
     /// Who published it: the part of the name before the slash.
     pub maker: Option<String>,
     pub facts: ModelFacts,
-    pub recipes: Vec<ModelRecipe>,
+    pub profiles: Vec<ModelProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -161,19 +163,19 @@ pub struct ModelFacts {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ModelRecipe {
+pub struct ModelProfile {
     pub id: String,
     pub quantization: Option<String>,
     pub server: Option<String>,
     pub machines: u32,
     pub origin: Option<String>,
     pub in_use: bool,
-    pub fit: Vec<RecipeFit>,
+    pub fit: Vec<ProfileFit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RecipeFit {
+pub struct ProfileFit {
     pub pool: String,
     pub fits: bool,
     pub memory_bytes: Option<u64>,
@@ -195,10 +197,10 @@ pub struct RunningDetail {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunningConfig {
-    pub recipe: String,
+    pub profile: String,
     pub engine: String,
     /// The container image, native artifact, or the description of a command
-    /// recipe.
+    /// profile.
     pub runs: Option<String>,
     pub context_tokens: Option<u64>,
     pub kv_cache_tokens: Option<u64>,
@@ -279,7 +281,7 @@ impl MachineFacts {
 
 /// Everything the overview is assembled from.
 pub(crate) struct Sources<'a> {
-    /// The inventory as served: settings declarations laid over the recipes.
+    /// The inventory as served: settings declarations laid over the profiles.
     pub inventory: &'a Inventory,
     pub phases: &'a BTreeMap<DeploymentId, Phase>,
     pub loads: &'a BTreeMap<DeploymentId, Vec<LoadRow>>,
@@ -296,9 +298,9 @@ fn since(now: i64, at: i64) -> u64 {
 }
 
 impl Sources<'_> {
-    fn model_of(&self, deployment: &DeploymentId) -> Option<&Recipe> {
+    fn model_of(&self, deployment: &DeploymentId) -> Option<&InferenceProfile> {
         let record = self.inventory.deployments.get(deployment)?;
-        self.inventory.recipes.get(&record.recipe)
+        self.inventory.profiles.get(&record.profile)
     }
 
     fn waiting(&self, deployment: &DeploymentId) -> Vec<&StoredRequest> {
@@ -325,7 +327,7 @@ impl Sources<'_> {
     }
 
     fn running(&self, pool: &Pool, deployment: &DeploymentId) -> Option<RunningModel> {
-        let recipe = self.model_of(deployment)?;
+        let profile = self.model_of(deployment)?;
         let waiting = self.waiting(deployment);
         let expected_ms = self.slowest_load_ms(deployment);
         let loading = |at: i64| Loading {
@@ -366,8 +368,8 @@ impl Sources<'_> {
             .filter(|rates| rates.requests_per_min.is_some() || rates.tokens_per_sec.is_some());
         Some(RunningModel {
             deployment: deployment.to_string(),
-            model: recipe.model.name.clone(),
-            recipe: recipe.id.to_string(),
+            model: profile.model.name.clone(),
+            profile: profile.id.to_string(),
             state,
             pinned,
             loading,
@@ -386,8 +388,12 @@ impl Sources<'_> {
     }
 
     /// What `deployment` takes: its whole size and the most it needs of one
-    /// machine, from its measured footprint, else its recipe's declaration.
-    fn size(&self, deployment: &DeploymentId, recipe: &Recipe) -> (Option<u64>, Option<u64>) {
+    /// machine, from its measured footprint, else its profile's declaration.
+    fn size(
+        &self,
+        deployment: &DeploymentId,
+        profile: &InferenceProfile,
+    ) -> (Option<u64>, Option<u64>) {
         let footprint = self.footprint(deployment);
         if !footprint.is_empty() {
             return (
@@ -395,18 +401,18 @@ impl Sources<'_> {
                 footprint.values().max().copied(),
             );
         }
-        let per_machine = recipe.requirements.memory.map(|memory| match memory {
+        let per_machine = profile.requirements.memory.map(|memory| match memory {
             MemoryPerMachine::Unified { system } => system.0,
             MemoryPerMachine::Discrete { vram, .. } => vram.0,
         });
         (
-            per_machine.map(|bytes| bytes * u64::from(recipe.requirements.machines)),
+            per_machine.map(|bytes| bytes * u64::from(profile.requirements.machines)),
             per_machine,
         )
     }
 
-    fn fits(&self, pool: &Pool, recipe: &Recipe, per_machine: Option<u64>) -> bool {
-        if recipe.requirements.machines as usize > pool.machines.len() {
+    fn fits(&self, pool: &Pool, profile: &InferenceProfile, per_machine: Option<u64>) -> bool {
+        if profile.requirements.machines as usize > pool.machines.len() {
             return false;
         }
         match (per_machine, self.smallest_machine(pool)) {
@@ -496,13 +502,13 @@ impl Sources<'_> {
             .iter()
             .filter(|id| !busy.contains(id.as_str()))
             .filter_map(|id| {
-                let recipe = self.model_of(id)?;
-                let (size, per_machine) = self.size(id, recipe);
+                let profile = self.model_of(id)?;
+                let (size, per_machine) = self.size(id, profile);
                 Some(LoadableModel {
-                    model: recipe.model.name.clone(),
-                    recipe: recipe.id.to_string(),
+                    model: profile.model.name.clone(),
+                    profile: profile.id.to_string(),
                     size_bytes: size,
-                    fits: self.fits(pool, recipe, per_machine),
+                    fits: self.fits(pool, profile, per_machine),
                 })
             })
             .collect();
@@ -510,7 +516,7 @@ impl Sources<'_> {
             .default
             .iter()
             .find_map(|id| self.model_of(id))
-            .map(|recipe| recipe.model.name.clone());
+            .map(|profile| profile.model.name.clone());
         let slowest: BTreeMap<&DeploymentId, u64> = deployments
             .iter()
             .filter_map(|id| Some((*id, self.slowest_load_ms(id)?)))
@@ -551,65 +557,65 @@ impl Sources<'_> {
         }
     }
 
-    /// The models, from the recipes grouped by real name, with each recipe's
+    /// The models, from the profiles grouped by real name, with each profile's
     /// fit per pool from the act side's load history.
     ///
     /// The fallback until model records and verifications exist (cairn/5730),
     /// which replace this function: then facts come from the model record and
     /// fit from the verification rows, quantization, server and origin from the
-    /// recipe, and nothing here survives.
-    fn models_from_recipes(&self, running: &[RunningModel]) -> Vec<InferenceModel> {
+    /// profile, and nothing here survives.
+    fn models_from_profiles(&self, running: &[RunningModel]) -> Vec<InferenceModel> {
         let in_use: BTreeSet<&str> = running
             .iter()
             .filter(|r| matches!(r.state, RunningState::Ready | RunningState::Loading))
-            .map(|r| r.recipe.as_str())
+            .map(|r| r.profile.as_str())
             .collect();
-        let mut by_name: BTreeMap<String, Vec<&Recipe>> = BTreeMap::new();
-        for recipe in self.inventory.recipes.values() {
+        let mut by_name: BTreeMap<String, Vec<&InferenceProfile>> = BTreeMap::new();
+        for profile in self.inventory.profiles.values() {
             by_name
-                .entry(recipe.model.name.trim().to_ascii_lowercase())
+                .entry(profile.model.name.trim().to_ascii_lowercase())
                 .or_default()
-                .push(recipe);
+                .push(profile);
         }
         by_name
             .into_values()
-            .filter_map(|recipes| {
-                let first = *recipes.first()?;
+            .filter_map(|profiles| {
+                let first = *profiles.first()?;
                 let name = first.model.name.trim().to_string();
                 let modalities = served::modalities(first);
-                let deployments_of = |recipe: &Recipe| -> Vec<&DeploymentId> {
+                let deployments_of = |profile: &InferenceProfile| -> Vec<&DeploymentId> {
                     self.inventory
                         .deployments
                         .values()
-                        .filter(|d| d.recipe == recipe.id)
+                        .filter(|d| d.profile == profile.id)
                         .map(|d| &d.id)
                         .collect()
                 };
-                let context_tokens = recipes
+                let context_tokens = profiles
                     .iter()
-                    .flat_map(|recipe| deployments_of(recipe))
+                    .flat_map(|profile| deployments_of(profile))
                     .filter_map(|id| self.measures.get(id)?.context_length())
                     .max();
-                let model_recipes = recipes
+                let model_profiles = profiles
                     .iter()
-                    .map(|recipe| ModelRecipe {
-                        id: recipe.id.to_string(),
+                    .map(|profile| ModelProfile {
+                        id: profile.id.to_string(),
                         quantization: None,
                         server: None,
-                        machines: recipe.requirements.machines,
+                        machines: profile.requirements.machines,
                         origin: None,
-                        in_use: in_use.contains(recipe.id.as_str()),
-                        fit: deployments_of(recipe)
+                        in_use: in_use.contains(profile.id.as_str()),
+                        fit: deployments_of(profile)
                             .into_iter()
                             .filter_map(|id| {
                                 let pool = self
                                     .inventory
                                     .pool_of_deployment(&self.inventory.deployments[id])?;
-                                let (size, per_machine) = self.size(id, recipe);
+                                let (size, per_machine) = self.size(id, profile);
                                 let latest = self.loads.get(id).and_then(|loads| loads.first());
-                                Some(RecipeFit {
+                                Some(ProfileFit {
                                     pool: pool.id.to_string(),
-                                    fits: self.fits(pool, recipe, per_machine),
+                                    fits: self.fits(pool, profile, per_machine),
                                     memory_bytes: size,
                                     load_ms: self.slowest_load_ms(id),
                                     decode_tokens_per_sec: None,
@@ -630,7 +636,7 @@ impl Sources<'_> {
                         parameters: None,
                         context_tokens,
                     },
-                    recipes: model_recipes,
+                    profiles: model_profiles,
                 })
             })
             .collect()
@@ -648,16 +654,16 @@ impl Sources<'_> {
             .flat_map(|pool| pool.running.iter().cloned())
             .collect();
         InferenceOverview {
-            models: self.models_from_recipes(&running),
+            models: self.models_from_profiles(&running),
             pools,
         }
     }
 
     pub(crate) fn running_detail(&self, deployment: &DeploymentId) -> Option<RunningDetail> {
         let record = self.inventory.deployments.get(deployment)?;
-        let recipe = self.inventory.recipes.get(&record.recipe)?;
+        let profile = self.inventory.profiles.get(&record.profile)?;
         let measure = self.measures.get(deployment);
-        let runs = match &recipe.engine {
+        let runs = match &profile.engine {
             Engine::Container(container) => Some(container.image.clone()),
             Engine::Native {
                 artifact, version, ..
@@ -666,11 +672,11 @@ impl Sources<'_> {
         };
         Some(RunningDetail {
             deployment: deployment.to_string(),
-            model: recipe.model.name.clone(),
+            model: profile.model.name.clone(),
             metrics: self.engines.get(deployment).copied(),
             config: RunningConfig {
-                recipe: recipe.id.to_string(),
-                engine: recipe.engine.kind().to_string(),
+                profile: profile.id.to_string(),
+                engine: profile.engine.kind().to_string(),
                 runs,
                 context_tokens: measure.and_then(EngineMeasure::context_length),
                 kv_cache_tokens: measure.and_then(|m| m.kv_cache_tokens),
@@ -825,7 +831,7 @@ models:
   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
   - {name: Qwen/Qwen3.6-35B-A3B}
   - {name: Qwen/Qwen3-Embedding-4B}
-recipes:
+profiles:
   - id: dsv4f-tp2
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
     servedName: deepseek-v4-flash-vision-exp
@@ -844,9 +850,9 @@ recipes:
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
 deployments:
-  - {id: dsv4f-tp2, recipe: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen36-fast, recipe: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen3-embed-4b, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: dsv4f-tp2, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen36-fast, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
 pools:
   - {id: sparks, machines: [{name: sp1}, {name: sp2}], default: [dsv4f-tp2]}
   - {id: halo, machines: [{name: fedora}], default: [qwen3-embed-4b]}
@@ -865,7 +871,7 @@ pools:
 
     fn healthy_load(ms: u64, footprint: &[(&str, u64)]) -> LoadRow {
         LoadRow {
-            recipe: String::new(),
+            profile: String::new(),
             requested_at: 0,
             sent_at: Some(0),
             finished_at: 0,
@@ -983,7 +989,7 @@ pools:
         );
         assert_eq!(sparks.warm.as_deref(), Some(DSV4));
         assert_eq!(sparks.machines[0].gpu.as_deref(), Some("NVIDIA GB10"));
-        // The running model is not offered for loading; the other recipe is.
+        // The running model is not offered for loading; the other profile is.
         assert_eq!(
             sparks
                 .loadable
@@ -1099,7 +1105,7 @@ pools:
     }
 
     #[test]
-    fn a_recipe_bigger_than_a_machine_will_not_fit() {
+    fn a_profile_bigger_than_a_machine_will_not_fit() {
         let mut world = World::new();
         world.machines.insert("sp1".into(), spark(None));
         world.machines.insert("sp2".into(), spark(None));
@@ -1113,8 +1119,8 @@ pools:
         assert!(deepseek.fits);
         assert_eq!(deepseek.size_bytes, None);
         let model = overview.models.iter().find(|m| m.name == QWEN).unwrap();
-        assert!(!model.recipes[0].fit[0].fits);
-        assert_eq!(model.recipes[0].fit[0].pool, "sparks");
+        assert!(!model.profiles[0].fit[0].fits);
+        assert_eq!(model.profiles[0].fit[0].pool, "sparks");
     }
 
     #[test]
@@ -1156,7 +1162,7 @@ pools:
     }
 
     #[test]
-    fn models_group_recipes_by_real_name_with_facts_and_measured_fit() {
+    fn models_group_profiles_by_real_name_with_facts_and_measured_fit() {
         let mut world = World::new();
         world.loads.insert(
             "dsv4f-tp2".into(),
@@ -1180,12 +1186,12 @@ pools:
         assert_eq!(deepseek.maker.as_deref(), Some("deepseek-ai"));
         assert_eq!(deepseek.facts.inputs, [Modality::Text, Modality::Image]);
         assert_eq!(deepseek.facts.context_tokens, Some(1_048_576));
-        let recipe = &deepseek.recipes[0];
-        assert_eq!(recipe.machines, 2);
-        assert!(!recipe.in_use);
+        let profile = &deepseek.profiles[0];
+        assert_eq!(profile.machines, 2);
+        assert!(!profile.in_use);
         assert_eq!(
-            recipe.fit,
-            [RecipeFit {
+            profile.fit,
+            [ProfileFit {
                 pool: "sparks".into(),
                 fits: true,
                 memory_bytes: Some(200 * GIB),

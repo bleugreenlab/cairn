@@ -391,7 +391,7 @@ mod tests {
             ("pair-a", &["b", "a"][..]),
             ("solo", &["a"][..]),
         ] {
-            crate::fixture::insert_command_recipe(&mut inventory, id, nodes.len() as u32);
+            crate::fixture::insert_command_profile(&mut inventory, id, nodes.len() as u32);
             inventory.insert_deployment(deployment(id, nodes));
         }
         inventory.insert_pool(pool("p", &["a", "b", "c"], &["wide"]));
@@ -406,7 +406,7 @@ mod tests {
     /// The sets case: qwen36-fast on sp1 together with another model on sp2.
     fn sets_inventory() -> Inventory {
         let mut inventory = test_inventory();
-        crate::fixture::insert_command_recipe(&mut inventory, "other", 1);
+        crate::fixture::insert_command_profile(&mut inventory, "other", 1);
         inventory.insert_deployment(deployment("other", &["sp2"]));
         pool_mut(&mut inventory, "sparks").default = set(&["qwen36-fast", "other"]);
         assert_eq!(inventory.validate(), Ok(()));

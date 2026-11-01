@@ -108,7 +108,7 @@ pub(crate) mod tests {
 models:
   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
   - {name: qwen/qwen3-embedding-4b}
-recipes:
+profiles:
   - id: dsv4f-tp2
     source: bginf
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
@@ -126,8 +126,8 @@ recipes:
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
 deployments:
-  - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [sp1], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: dsv4f-tp2, source: bginf, profile: dsv4f-tp2, machines: [sp1], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, source: bginf, profile: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
 pools: []
 "#,
         )

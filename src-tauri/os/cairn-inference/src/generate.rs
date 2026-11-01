@@ -1,5 +1,5 @@
-//! Generating recipes: from a model's facts, its weight sources and a pool's
-//! hardware, the candidate recipes that may run it there, best first, and why
+//! Generating profiles: from a model's facts, its weight sources and a pool's
+//! hardware, the candidate profiles that may run it there, best first, and why
 //! each other combination was not offered.
 //!
 //! Every engine is a template (`templates.yaml`): an image pinned by digest,
@@ -28,9 +28,9 @@ use serde::Deserialize;
 use crate::hf::{HfFile, HfRepo, WeightFormat};
 use crate::machine::MachineName;
 use crate::model::Model;
-use crate::recipe::{
+use crate::profile::{
     Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
-    Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, Recipe, RecipeOrigin,
+    InferenceProfile, Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, ProfileOrigin,
     Requirements, Server, SystemRamBytes, VramBytes, WeightFile,
 };
 
@@ -173,7 +173,7 @@ pub struct Predicted {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
-    pub recipe: Recipe,
+    pub profile: InferenceProfile,
     pub predicted: Predicted,
     precision: u32,
 }
@@ -193,8 +193,13 @@ pub struct Generated {
     pub rejected: Vec<Rejected>,
 }
 
-/// A recipe id from what distinguishes it: `<model>-<quant>-<server>-x<k>`.
-pub fn recipe_id(model: &str, quantization: Option<&str>, server: Server, machines: u32) -> String {
+/// A profile id from what distinguishes it: `<model>-<quant>-<server>-x<k>`.
+pub fn profile_id(
+    model: &str,
+    quantization: Option<&str>,
+    server: Server,
+    machines: u32,
+) -> String {
     let name = model.rsplit('/').next().unwrap_or(model);
     let mut id = name.to_ascii_lowercase();
     if let Some(quant) = quantization {
@@ -381,14 +386,14 @@ fn embeds(model: &Model) -> bool {
         .is_some_and(|verbs| verbs.contains(&cairn_models_types::catalog::VerbKind::Embed))
 }
 
-/// The recipe for `source` through `template` as predicted.
-fn recipe(
+/// The profile for `source` through `template` as predicted.
+fn profile(
     model: &Model,
     source: &Source<'_>,
     template: &Template,
     machine: &MachineHw,
     predicted: &Predicted,
-) -> Recipe {
+) -> InferenceProfile {
     let k = predicted.machines;
     let mut command = template.command.clone();
     let embed = embeds(model);
@@ -475,8 +480,8 @@ fn recipe(
             host: SystemRamBytes(0),
         },
     };
-    Recipe {
-        id: recipe_id(&model.name, Some(&source.quantization), template.server, k).into(),
+    InferenceProfile {
+        id: profile_id(&model.name, Some(&source.quantization), template.server, k).into(),
         source: Default::default(),
         model: ModelRef {
             name: model.name.clone(),
@@ -487,7 +492,7 @@ fn recipe(
         verbs: model.facts.verbs.clone(),
         modalities: model.facts.modalities.clone(),
         quantization: Some(source.quantization.clone()),
-        origin: RecipeOrigin::Generated {
+        origin: ProfileOrigin::Generated {
             template: template.id.clone(),
             model_revision: model.revision.clone().unwrap_or_default(),
         },
@@ -586,7 +591,7 @@ pub fn generate(model: &Model, repos: &[HfRepo], pool: &PoolHw) -> Generated {
             }
             match fit(model, &source, pool) {
                 Ok(predicted) => generated.candidates.push(Candidate {
-                    recipe: recipe(model, &source, template, machine, &predicted),
+                    profile: profile(model, &source, template, machine, &predicted),
                     precision: precision(&source.quantization),
                     predicted,
                 }),
@@ -604,7 +609,7 @@ pub fn generate(model: &Model, repos: &[HfRepo], pool: &PoolHw) -> Generated {
             .cmp(&good(a))
             .then(b.precision.cmp(&a.precision))
             .then(a.predicted.machines.cmp(&b.predicted.machines))
-            .then(a.recipe.id.cmp(&b.recipe.id))
+            .then(a.profile.id.cmp(&b.profile.id))
     });
     generated
 }
@@ -692,7 +697,7 @@ mod tests {
         generated
             .candidates
             .iter()
-            .map(|c| c.recipe.id.as_str())
+            .map(|c| c.profile.id.as_str())
             .collect()
     }
 
@@ -701,7 +706,7 @@ mod tests {
         assert_eq!(templates().len(), 4);
         assert!(templates()
             .iter()
-            .all(|t| crate::recipe::is_pinned_image(&t.image)));
+            .all(|t| crate::profile::is_pinned_image(&t.image)));
     }
 
     #[test]
@@ -721,9 +726,9 @@ mod tests {
             candidate.predicted.context, 1_048_576,
             "verification clamps it"
         );
-        let recipe = &candidate.recipe;
-        assert_eq!(recipe.problems(), vec![]);
-        let Engine::Container(container) = &recipe.engine else {
+        let profile = &candidate.profile;
+        assert_eq!(profile.problems(), vec![]);
+        let Engine::Container(container) = &profile.engine else {
             unreachable!()
         };
         assert_eq!(container.ranks.len(), 2);
@@ -756,7 +761,7 @@ mod tests {
         );
         let nvfp4 = &on_sparks.candidates[1];
         assert_eq!(
-            nvfp4.recipe.model.weights[0].repo,
+            nvfp4.profile.model.weights[0].repo,
             "nvidia/Qwen3.6-35B-A3B-NVFP4"
         );
         assert_eq!(nvfp4.predicted.context, 262_144);
@@ -778,11 +783,11 @@ mod tests {
 
         let on_bbs = generate(&model, &repos, &bbs());
         assert_eq!(
-            on_bbs.candidates[0].recipe.id.as_str(),
+            on_bbs.candidates[0].profile.id.as_str(),
             "qwen3-embedding-4b-bf16-vllm-x1"
         );
         assert!(ids(&on_bbs).contains(&"qwen3-embedding-4b-q8_0-llamacpp-x1"));
-        let Engine::Container(vllm) = &on_bbs.candidates[0].recipe.engine else {
+        let Engine::Container(vllm) = &on_bbs.candidates[0].profile.engine else {
             unreachable!()
         };
         assert!(vllm.args.windows(2).any(|w| w == ["--runner", "pooling"]));
@@ -790,8 +795,8 @@ mod tests {
         let on_halo = generate(&model, &repos, &halo());
         assert!(ids(&on_halo).contains(&"qwen3-embedding-4b-q8_0-llamacpp-x1"));
         assert!(on_halo.candidates.iter().all(|c| {
-            c.recipe.origin
-                == RecipeOrigin::Generated {
+            c.profile.origin
+                == ProfileOrigin::Generated {
                     template: "llamacpp-vulkan".into(),
                     model_revision: model.revision.clone().unwrap(),
                 }
@@ -803,10 +808,10 @@ mod tests {
         let q8 = on_halo
             .candidates
             .iter()
-            .find(|c| c.recipe.quantization.as_deref() == Some("q8_0"))
+            .find(|c| c.profile.quantization.as_deref() == Some("q8_0"))
             .unwrap();
-        assert_eq!(q8.recipe.problems(), vec![]);
-        let Engine::Container(llama) = &q8.recipe.engine else {
+        assert_eq!(q8.profile.problems(), vec![]);
+        let Engine::Container(llama) = &q8.profile.engine else {
             unreachable!()
         };
         assert!(llama.args.windows(2).any(|w| w == ["--pooling", "last"]));

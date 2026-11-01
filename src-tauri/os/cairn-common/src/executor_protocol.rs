@@ -6179,7 +6179,7 @@ pub struct LearnedResourceEstimate {
 /// Version 160 (cairn/5660) lets the runner act on inference deployments.
 /// [`ExecutorMessage::DeploymentCommand`] tells a deployment's head machine to
 /// start, stop or probe it ([`DeploymentOperation`]): the executor runs the
-/// recipe's start or stop shell as its own account in its own process group,
+/// profile's start or stop shell as its own account in its own process group,
 /// bounded by the timeout the command carries, and watches the health URL.
 /// It answers each command with one or more
 /// [`ExecutorMessage::DeploymentReport`]s carrying a [`DeploymentPhaseReport`].
@@ -6354,6 +6354,14 @@ pub struct LearnedResourceEstimate {
 /// an older executor only reports an exit up to one poll interval later. No
 /// frame, variant, field or serialized form changes, and a runner talking to
 /// an older executor gets nothing wrong.
+///
+/// cairn/5774 does not move the number. Inference recipes are renamed
+/// profiles in the runner's records and resources; on the wire only doc
+/// comments here and in the executor's deployment runner change, plus a test
+/// script's message. A deployment command still carries its start and stop
+/// scripts, health URL and timeout as before, and no frame, variant, field or
+/// serialized form names a recipe or a profile, so a runner talking to an older
+/// executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -17447,7 +17455,7 @@ pub enum McpRelayResult {
 }
 
 /// What the runner asks a deployment's head to do. Only the head acts; a
-/// multi-machine recipe's own scripts drive the other machines.
+/// multi-machine profile's own scripts drive the other machines.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum DeploymentOperation {

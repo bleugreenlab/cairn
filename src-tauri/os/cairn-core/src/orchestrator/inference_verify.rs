@@ -1,9 +1,9 @@
-//! Verifying a recipe on a pool: load it, check its health, benchmark it, and
+//! Verifying a profile on a pool: load it, check its health, benchmark it, and
 //! record what it measured, its memory per machine, load time and speed, or
 //! the stage it failed at and why.
 //!
 //! A verification runs as a background task and returns its id at once. It
-//! loads the recipe as deployment `verify-<recipe>-<pool>` on the pool's first
+//! loads the profile as deployment `verify-<profile>-<pool>` on the pool's first
 //! machines through the same act side a deployment's own page uses, so
 //! reservation, fit and drain are unchanged. A pool under the controller is
 //! held by pinning it to that deployment as `verify:<id>`; one pinned by
@@ -12,9 +12,9 @@
 //! ends with the deployment stopped, the pin released and the pool restored.
 //!
 //! A start that fails because the context does not fit the KV cache (vLLM
-//! names the cache's size) is recorded, the recipe is revised in place with
+//! names the cache's size) is recorded, the profile is revised in place with
 //! its context clamped to that size, and the revision is verified next. A pass
-//! whose measured cache is smaller than the recipe's context clamps it too.
+//! whose measured cache is smaller than the profile's context clamps it too.
 //! Cairn never changes a host's drivers: a driver or runtime mismatch is the
 //! recorded reason, not something fixed.
 //!
@@ -31,8 +31,8 @@ use cairn_inference::control::{Phase, Request, START_REPORT_BOUND_SECS, STOP_REP
 use cairn_inference::pool_control;
 use cairn_inference::verify::{self, ChatSample, EmbedSample, Speeds, Stage};
 use cairn_inference::{
-    AcceleratorFamily, Deployment, DeploymentId, Engine, Inventory, PoolId, Recipe, RecipeId,
-    RecipeOrigin, RecordSource, Server,
+    AcceleratorFamily, Deployment, DeploymentId, Engine, InferenceProfile, InferenceProfileId,
+    Inventory, PoolId, ProfileOrigin, RecordSource, Server,
 };
 use cairn_models::types::catalog::VerbKind;
 use sha2::{Digest, Sha256};
@@ -70,13 +70,13 @@ fn holder(id: &str) -> String {
     format!("verify:{id}")
 }
 
-fn deployment_id(recipe: &RecipeId, pool: &PoolId) -> DeploymentId {
-    DeploymentId::new(format!("verify-{recipe}-{pool}"))
+fn deployment_id(profile: &InferenceProfileId, pool: &PoolId) -> DeploymentId {
+    DeploymentId::new(format!("verify-{profile}-{pool}"))
 }
 
-/// The sha256 of a recipe's canonical JSON.
-pub fn digest(recipe: &Recipe) -> String {
-    Sha256::digest(verify::canonical(recipe).as_bytes())
+/// The sha256 of a profile's canonical JSON.
+pub fn digest(profile: &InferenceProfile) -> String {
+    Sha256::digest(verify::canonical(profile).as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
@@ -86,8 +86,8 @@ pub fn digest(recipe: &Recipe) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerificationRow {
     pub id: String,
-    pub recipe: String,
-    pub recipe_digest: String,
+    pub profile: String,
+    pub profile_digest: String,
     pub pool: String,
     pub deployment: String,
     pub machines: Vec<String>,
@@ -109,25 +109,25 @@ pub struct VerificationRow {
 }
 
 impl VerificationRow {
-    /// Whether its recipe has changed since it ran.
+    /// Whether its profile has changed since it ran.
     pub fn stale(&self, inventory: &Inventory) -> bool {
         inventory
-            .recipes
-            .get(&RecipeId::from(self.recipe.as_str()))
-            .is_none_or(|recipe| digest(recipe) != self.recipe_digest)
+            .profiles
+            .get(&InferenceProfileId::from(self.profile.as_str()))
+            .is_none_or(|profile| digest(profile) != self.profile_digest)
     }
 }
 
 const COLUMNS: &str =
-    "id, recipe_id, recipe_digest, pool_id, deployment_id, machines_json, requested_by,
+    "id, profile_id, profile_digest, pool_id, deployment_id, machines_json, requested_by,
     started_at, finished_at, outcome, stage, reason, load_ms, footprint_json, context_tokens,
     kv_tokens, ttft_ms, decode_tps, prefill_tps, embed_tps, engine_version";
 
 fn row_of(row: &cairn_db::turso::Row) -> Result<VerificationRow, cairn_db::storage::DbError> {
     Ok(VerificationRow {
         id: row.text(0)?,
-        recipe: row.text(1)?,
-        recipe_digest: row.text(2)?,
+        profile: row.text(1)?,
+        profile_digest: row.text(2)?,
         pool: row.text(3)?,
         deployment: row.text(4)?,
         machines: serde_json::from_str(&row.text(5)?).unwrap_or_default(),
@@ -234,13 +234,13 @@ pub struct Planned {
     /// When it began: a phase older than this belongs to an earlier run of the
     /// same deployment and says nothing about this one.
     pub started_at: i64,
-    pub recipe: RecipeId,
+    pub profile: InferenceProfileId,
     pub pool: PoolId,
     pub deployment: DeploymentId,
 }
 
-fn port_for(recipe: &Recipe) -> u16 {
-    match &recipe.engine {
+fn port_for(profile: &InferenceProfile) -> u16 {
+    match &profile.engine {
         Engine::Container(container) if container.server == Server::LlamaCpp => 8090,
         _ => 8000,
     }
@@ -250,17 +250,17 @@ fn port_for(recipe: &Recipe) -> u16 {
 /// and return what to run.
 pub async fn begin(
     db: &LocalDb,
-    recipe_id: &str,
+    profile_id: &str,
     pool_id: &str,
     requested_by: &str,
     now: i64,
 ) -> Result<Planned, String> {
     let inventory = load_inventory(db).await?;
-    let recipe = inventory
-        .recipes
-        .get(&RecipeId::from(recipe_id))
+    let profile = inventory
+        .profiles
+        .get(&InferenceProfileId::from(profile_id))
         .ok_or_else(|| {
-            format!("there is no recipe {recipe_id}; cairn://inference/recipes lists them")
+            format!("there is no profile {profile_id}; cairn://inference/profiles lists them")
         })?
         .clone();
     let pool = inventory
@@ -268,16 +268,16 @@ pub async fn begin(
         .get(&PoolId::from(pool_id))
         .ok_or_else(|| format!("there is no pool {pool_id}; cairn://inference/pools lists them"))?
         .clone();
-    if !matches!(recipe.engine, Engine::Container(_)) {
+    if !matches!(profile.engine, Engine::Container(_)) {
         return Err(format!(
-            "recipe {recipe_id} is a {} recipe; verification measures container recipes",
-            recipe.engine.kind()
+            "profile {profile_id} is a {} profile; verification measures container profiles",
+            profile.engine.kind()
         ));
     }
-    let k = recipe.requirements.machines as usize;
+    let k = profile.requirements.machines as usize;
     if pool.machines.len() < k {
         return Err(format!(
-            "recipe {recipe_id} runs on {k} machines and pool {pool_id} has {}",
+            "profile {profile_id} runs on {k} machines and pool {pool_id} has {}",
             pool.machines.len()
         ));
     }
@@ -303,12 +303,12 @@ pub async fn begin(
         .map(|m| m.name.clone())
         .collect();
     let deployment = Deployment {
-        id: deployment_id(&recipe.id, &pool.id),
+        id: deployment_id(&profile.id, &pool.id),
         source: RecordSource::Cairn,
-        recipe: recipe.id.clone(),
+        profile: profile.id.clone(),
         head: machines[0].clone(),
         machines: machines.clone(),
-        api_port: port_for(&recipe),
+        api_port: port_for(&profile),
         api_path: "/v1".into(),
         health_path: "/v1/models".into(),
     };
@@ -325,10 +325,10 @@ pub async fn begin(
     let machines_json =
         serde_json::to_string(&machines.iter().map(|m| m.to_string()).collect::<Vec<_>>())
             .expect("machine names serialize");
-    let (recipe_key, pool_key) = (recipe.id.to_string(), pool.id.to_string());
+    let (profile_key, pool_key) = (profile.id.to_string(), pool.id.to_string());
     let (row_id, digest, requester, deployment_key) = (
         id.clone(),
-        digest(&recipe),
+        digest(&profile),
         requested_by.to_string(),
         deployment.id.to_string(),
     );
@@ -336,9 +336,9 @@ pub async fn begin(
     let busy_in = std::sync::Arc::clone(&busy);
     db.write(move |conn| {
         let busy = std::sync::Arc::clone(&busy_in);
-        let (row_id, recipe_key, digest, pool_key, deployment_key, machines_json, requester) = (
+        let (row_id, profile_key, digest, pool_key, deployment_key, machines_json, requester) = (
             row_id.clone(),
-            recipe_key.clone(),
+            profile_key.clone(),
             digest.clone(),
             pool_key.clone(),
             deployment_key.clone(),
@@ -360,12 +360,12 @@ pub async fn begin(
             drop(running);
             conn.execute(
                 "INSERT INTO inference_verifications
-                   (id, recipe_id, recipe_digest, pool_id, deployment_id, machines_json,
+                   (id, profile_id, profile_digest, pool_id, deployment_id, machines_json,
                     requested_by, started_at, outcome, stage)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', 'render')",
                 params![
                     row_id,
-                    recipe_key.clone(),
+                    profile_key.clone(),
                     digest,
                     pool_key.clone(),
                     deployment_key,
@@ -377,11 +377,11 @@ pub async fn begin(
             .await?;
             conn.execute(
                 "DELETE FROM inference_verifications
-                  WHERE recipe_id = ?1 AND pool_id = ?2 AND outcome != 'running'
+                  WHERE profile_id = ?1 AND pool_id = ?2 AND outcome != 'running'
                     AND id NOT IN (SELECT id FROM inference_verifications
-                                    WHERE recipe_id = ?1 AND pool_id = ?2
+                                    WHERE profile_id = ?1 AND pool_id = ?2
                                     ORDER BY started_at DESC LIMIT ?3)",
-                params![recipe_key, pool_key, KEPT],
+                params![profile_key, pool_key, KEPT],
             )
             .await?;
             Ok(())
@@ -404,7 +404,7 @@ pub async fn begin(
     Ok(Planned {
         id,
         started_at: now,
-        recipe: recipe.id,
+        profile: profile.id,
         pool: pool.id,
         deployment: deployment.id,
     })
@@ -415,7 +415,7 @@ pub async fn begin(
 pub enum Outcome {
     Passed,
     Failed(String),
-    /// It failed because the context did not fit; the recipe was clamped and
+    /// It failed because the context did not fit; the profile was clamped and
     /// should be verified again.
     Clamped {
         reason: String,
@@ -590,15 +590,15 @@ pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome,
             let clamp = m.kv.filter(|kv| m.context.is_some_and(|c| c > *kv));
             if let Some(kv) = clamp {
                 // The pass measured the cache the clamp is cut to, so it is
-                // the measured fit of the revised recipe, not a stale one.
-                if let Some(revised) = clamp_recipe(db, &plan.recipe, kv).await? {
+                // the measured fit of the revised profile, not a stale one.
+                if let Some(revised) = clamp_profile(db, &plan.profile, kv).await? {
                     set_digest(db, &plan.id, &revised).await?;
                 }
             }
             (Outcome::Passed, None)
         }
         Err(why) => match verify::kv_limit_from_failure(&why) {
-            Some(kv) if clamp_recipe(db, &plan.recipe, kv).await?.is_some() => (
+            Some(kv) if clamp_profile(db, &plan.profile, kv).await?.is_some() => (
                 Outcome::Clamped {
                     reason: why.clone(),
                     context: kv / 1024 * 1024,
@@ -626,7 +626,7 @@ pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome,
 
 async fn set_digest(db: &LocalDb, id: &str, digest: &str) -> Result<(), String> {
     db.execute(
-        "UPDATE inference_verifications SET recipe_digest = ?2 WHERE id = ?1",
+        "UPDATE inference_verifications SET profile_digest = ?2 WHERE id = ?1",
         params![id, digest],
     )
     .await
@@ -634,20 +634,24 @@ async fn set_digest(db: &LocalDb, id: &str, digest: &str) -> Result<(), String> 
     .map_err(|error| format!("write inference_verifications: {error}"))
 }
 
-/// Clamp the recipe's context in place; the revised recipe's digest when it
+/// Clamp the profile's context in place; the revised profile's digest when it
 /// changed.
-async fn clamp_recipe(db: &LocalDb, recipe: &RecipeId, kv: u64) -> Result<Option<String>, String> {
+async fn clamp_profile(
+    db: &LocalDb,
+    profile: &InferenceProfileId,
+    kv: u64,
+) -> Result<Option<String>, String> {
     let inventory = load_inventory(db).await?;
     let Some(revised) = inventory
-        .recipes
-        .get(recipe)
+        .profiles
+        .get(profile)
         .and_then(|r| verify::clamp_context(r, kv))
     else {
         return Ok(None);
     };
     let revised_digest = digest(&revised);
     let mut records = Inventory::default();
-    records.insert_recipe(revised);
+    records.insert_profile(revised);
     write_inventory(
         db,
         &Authoring::Patch {
@@ -688,10 +692,10 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
     };
     set_stage(db, &plan.id, Stage::Health).await?;
     let inventory = load_inventory(db).await?;
-    let recipe = inventory
-        .recipes
-        .get(&plan.recipe)
-        .ok_or("the recipe is gone")?
+    let profile = inventory
+        .profiles
+        .get(&plan.profile)
+        .ok_or("the profile is gone")?
         .clone();
     let deployment = inventory
         .deployments
@@ -703,7 +707,7 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
         .ok_or_else(|| format!("the head {}'s address is unknown", deployment.head))?
         .to_string();
     let mut measured = Measured {
-        context: verify::context_of(&recipe),
+        context: verify::context_of(&profile),
         ..Measured::default()
     };
 
@@ -730,7 +734,7 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
 
     let api_base = deployment.api_base(&address);
     if let Some(models) = act.get(format!("{api_base}/models")).await {
-        measured.context = cairn_inference::served::max_model_len(&models, &recipe.served_name)
+        measured.context = cairn_inference::served::max_model_len(&models, &profile.served_name)
             .or(measured.context);
     }
     if let Some(metrics) = act.get(deployment.metrics_url(&address)).await {
@@ -747,7 +751,7 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
     record(db, &plan.id, &measured).await?;
 
     set_stage(db, &plan.id, Stage::Benchmark).await?;
-    let embeds = recipe
+    let embeds = profile
         .verbs
         .as_ref()
         .is_some_and(|verbs| verbs.contains(&VerbKind::Embed));
@@ -755,18 +759,18 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
         let mut samples = Vec::new();
         for _ in 0..3 {
             samples.push(
-                act.embed(api_base.clone(), recipe.served_name.clone())
+                act.embed(api_base.clone(), profile.served_name.clone())
                     .await?,
             );
         }
         verify::embed_speeds(&samples)?
     } else {
-        act.chat(api_base.clone(), recipe.served_name.clone())
+        act.chat(api_base.clone(), profile.served_name.clone())
             .await?;
         let mut samples = Vec::new();
         for _ in 0..3 {
             samples.push(
-                act.chat(api_base.clone(), recipe.served_name.clone())
+                act.chat(api_base.clone(), profile.served_name.clone())
                     .await?,
             );
         }
@@ -804,17 +808,17 @@ pub async fn recover(db: &LocalDb, act: &dyn Act) -> Result<Vec<String>, String>
     Ok(recovered)
 }
 
-/// The recipes of `model` to try on a pool of `family` hardware, imported
+/// The profiles of `model` to try on a pool of `family` hardware, imported
 /// first, then generated, more precise before less and fewer machines first.
 pub fn candidates(
     inventory: &Inventory,
     model: &str,
     pool: &PoolId,
     family: Option<AcceleratorFamily>,
-) -> Vec<RecipeId> {
+) -> Vec<InferenceProfileId> {
     let size = inventory.pools.get(pool).map_or(0, |p| p.machines.len());
-    let mut recipes: Vec<&Recipe> = inventory
-        .recipes
+    let mut profiles: Vec<&InferenceProfile> = inventory
+        .profiles
         .values()
         .filter(|r| r.model.name == model && matches!(r.engine, Engine::Container(_)))
         .filter(|r| r.requirements.machines as usize <= size)
@@ -823,16 +827,16 @@ pub fn candidates(
             _ => true,
         })
         .collect();
-    let rank = |r: &Recipe| match r.origin {
-        RecipeOrigin::Imported { .. } => 0,
-        RecipeOrigin::Authored => 1,
-        RecipeOrigin::Generated { .. } => 2,
+    let rank = |r: &InferenceProfile| match r.origin {
+        ProfileOrigin::Imported { .. } => 0,
+        ProfileOrigin::Authored => 1,
+        ProfileOrigin::Generated { .. } => 2,
     };
-    recipes.sort_by(|a, b| {
+    profiles.sort_by(|a, b| {
         rank(a)
             .cmp(&rank(b))
             .then_with(|| {
-                let p = |r: &Recipe| {
+                let p = |r: &InferenceProfile| {
                     cairn_inference::generate::precision(r.quantization.as_deref().unwrap_or(""))
                 };
                 p(b).cmp(&p(a))
@@ -840,15 +844,15 @@ pub fn candidates(
             .then(a.requirements.machines.cmp(&b.requirements.machines))
             .then(a.id.cmp(&b.id))
     });
-    recipes.into_iter().map(|r| r.id.clone()).collect()
+    profiles.into_iter().map(|r| r.id.clone()).collect()
 }
 
-/// Verify `recipes` in order on `pool`, each once more after a clamp, until
+/// Verify `profiles` in order on `pool`, each once more after a clamp, until
 /// one passes (or every one, with `all`). Each verification is its own row.
 pub async fn verify_in_order(
     db: &LocalDb,
     act: &dyn Act,
-    recipes: Vec<RecipeId>,
+    profiles: Vec<InferenceProfileId>,
     pool: &PoolId,
     requested_by: &str,
     all: bool,
@@ -856,14 +860,14 @@ pub async fn verify_in_order(
 ) -> Result<Vec<(String, Outcome)>, String> {
     let mut results = Vec::new();
     let mut first = first;
-    for recipe in recipes {
+    for profile in profiles {
         let mut clamps = 0;
         loop {
             let plan = match first.take() {
-                Some(plan) if plan.recipe == recipe => plan,
+                Some(plan) if plan.profile == profile => plan,
                 _ => match begin(
                     db,
-                    recipe.as_str(),
+                    profile.as_str(),
                     pool.as_str(),
                     requested_by,
                     act.now_ms(),
@@ -1087,18 +1091,18 @@ pub fn spawn_recovery(orch: super::Orchestrator) {
     });
 }
 
-/// Start verifying `recipes` on `pool` in the background, the first planned
+/// Start verifying `profiles` on `pool` in the background, the first planned
 /// now so a refusal is answered at once; return the first verification's id.
 pub async fn spawn(
     orch: &super::Orchestrator,
-    recipes: Vec<RecipeId>,
+    profiles: Vec<InferenceProfileId>,
     pool: &str,
     requested_by: &str,
     all: bool,
 ) -> Result<String, String> {
-    let first = recipes
+    let first = profiles
         .first()
-        .ok_or_else(|| format!("no recipe to verify on pool {pool}"))?
+        .ok_or_else(|| format!("no profile to verify on pool {pool}"))?
         .clone();
     let plan = begin(
         &orch.db.local,
@@ -1114,7 +1118,7 @@ pub async fn spawn(
     let db = orch.db.local.clone();
     tokio::spawn(async move {
         if let Err(error) =
-            verify_in_order(&db, &live, recipes, &pool, &requested_by, all, Some(plan)).await
+            verify_in_order(&db, &live, profiles, &pool, &requested_by, all, Some(plan)).await
         {
             log::warn!("inference: a verification on pool {pool} stopped: {error}");
         }
@@ -1127,11 +1131,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    const RECIPE: &str = r#"
+    const PROFILE: &str = r#"
 models:
   - {name: chat/Model}
   - {name: Qwen/Qwen3-Embedding-4B}
-recipes:
+profiles:
   - id: embed
     model:
       name: Qwen/Qwen3-Embedding-4B
@@ -1164,7 +1168,7 @@ recipes:
     engine: {kind: command, start: ./old.sh, stop: ./stop-old.sh}
     requirements: {machines: 1}
 deployments:
-  - {id: old, recipe: old, machines: [box], head: box, apiPort: 9000, apiPath: /v1, healthPath: /v1/models}
+  - {id: old, profile: old, machines: [box], head: box, apiPort: 9000, apiPath: /v1, healthPath: /v1/models}
 pools:
   - {id: solo, machines: [{name: box, address: 10.0.0.9}]}
 "#;
@@ -1238,7 +1242,7 @@ pools:
                     self.db
                                 .execute(
                                     "INSERT INTO inference_deployment_loads
-                                       (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+                                       (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
                                      VALUES (?1, 'r', ?2, ?2, 'healthy', 42000, '{\"box\":9663676416}')",
                                     params![deployment, now],
                                 )
@@ -1370,7 +1374,7 @@ pools:
 
     async fn seeded(name: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
-        write_inventory(&db, &Authoring::Replace(RECIPE.into()))
+        write_inventory(&db, &Authoring::Replace(PROFILE.into()))
             .await
             .unwrap();
         db
@@ -1411,7 +1415,7 @@ pools:
     }
 
     #[tokio::test]
-    async fn a_kv_failure_clamps_the_recipe_and_the_revision_passes() {
+    async fn a_kv_failure_clamps_the_profile_and_the_revision_passes() {
         let db = seeded("inference-verify-clamp").await;
         let fake = Fake::new(&db);
         fake.failures.lock().unwrap().push(
@@ -1440,7 +1444,7 @@ pools:
         );
         assert_eq!(results[1].1, Outcome::Passed);
         let inventory = load_inventory(&db).await.unwrap();
-        let chat = &inventory.recipes[&RecipeId::from("chat")];
+        let chat = &inventory.profiles[&InferenceProfileId::from("chat")];
         assert_eq!(
             verify::context_of(chat),
             Some(99_328),
@@ -1449,7 +1453,7 @@ pools:
         let rows = load_verifications(&db).await.unwrap();
         let failed = rows.iter().find(|r| r.outcome == "failed").unwrap();
         assert_eq!(failed.stage, "start");
-        assert!(failed.stale(&inventory), "the recipe changed after it ran");
+        assert!(failed.stale(&inventory), "the profile changed after it ran");
         let passed = rows.iter().find(|r| r.outcome == "passed").unwrap();
         assert!(
             !passed.stale(&inventory),
@@ -1570,14 +1574,14 @@ pools:
     }
 
     #[tokio::test]
-    async fn a_recipe_that_cannot_render_fails_before_anything_is_stopped() {
+    async fn a_profile_that_cannot_render_fails_before_anything_is_stopped() {
         let db = seeded("inference-verify-render").await;
         let mut inventory = load_inventory(&db).await.unwrap();
-        let mut linked = inventory.recipes[&RecipeId::from("chat")].clone();
+        let mut linked = inventory.profiles[&InferenceProfileId::from("chat")].clone();
         if let Engine::Container(container) = &mut linked.engine {
             container.args.push("{self.link}".into());
         }
-        inventory.insert_recipe(linked);
+        inventory.insert_profile(linked);
         write_inventory(&db, &Authoring::Replace(inventory.to_yaml()))
             .await
             .unwrap();
@@ -1612,23 +1616,23 @@ pools:
 
     #[test]
     fn candidates_take_imported_then_generated_more_precise_first() {
-        let mut inventory = Inventory::from_yaml(RECIPE).unwrap();
-        let mut generated = inventory.recipes[&RecipeId::from("chat")].clone();
+        let mut inventory = Inventory::from_yaml(PROFILE).unwrap();
+        let mut generated = inventory.profiles[&InferenceProfileId::from("chat")].clone();
         generated.id = "chat-gen".into();
-        generated.origin = RecipeOrigin::Generated {
+        generated.origin = ProfileOrigin::Generated {
             template: "vllm-openai".into(),
             model_revision: "abc".into(),
         };
-        inventory.insert_recipe(generated);
-        let mut imported = inventory.recipes[&RecipeId::from("chat")].clone();
+        inventory.insert_profile(generated);
+        let mut imported = inventory.profiles[&InferenceProfileId::from("chat")].clone();
         imported.id = "chat-imp".into();
-        imported.origin = RecipeOrigin::Imported {
+        imported.origin = ProfileOrigin::Imported {
             url: "u".into(),
             commit: "c".into(),
             compose: "c".into(),
             service: "s".into(),
         };
-        inventory.insert_recipe(imported);
+        inventory.insert_profile(imported);
         assert_eq!(
             candidates(
                 &inventory,
@@ -1636,7 +1640,11 @@ pools:
                 &"solo".into(),
                 Some(AcceleratorFamily::Nvidia)
             ),
-            vec![RecipeId::from("chat-imp"), "chat".into(), "chat-gen".into()]
+            vec![
+                InferenceProfileId::from("chat-imp"),
+                "chat".into(),
+                "chat-gen".into()
+            ]
         );
     }
 }

@@ -1,6 +1,6 @@
 //! The cairn-inference facet: which model each inference machine should run.
 //!
-//! The records ([`recipe`], [`deployment`], [`pool`]) describe how a model is
+//! The records ([`profile`], [`deployment`], [`pool`]) describe how a model is
 //! run, where it is placed, and which machines share one desired state; the
 //! [`inventory`] holds them together and validates them as a whole.
 //! [`resolve`] is the pin-over-default resolver that turns a pool and its
@@ -37,7 +37,7 @@ pub mod metrics;
 pub mod model;
 pub mod pool;
 pub mod pool_control;
-pub mod recipe;
+pub mod profile;
 pub mod render;
 pub mod resolve;
 pub mod served;
@@ -53,10 +53,11 @@ pub use inventory::{
 pub use machine::MachineName;
 pub use model::{Model, ModelFacts};
 pub use pool::{DeploymentSet, Pool, PoolId, PoolMachine, RecordSource};
-pub use recipe::{
+pub use profile::{
     Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
-    Interconnect, MemoryPerMachine, ModelRef, Mount, MountSource, Recipe, RecipeId, RecipeOrigin,
-    Requirements, Server, SourcePin, SystemRamBytes, VramBytes, WeightFile,
+    InferenceProfile, InferenceProfileId, Interconnect, MemoryPerMachine, ModelRef, Mount,
+    MountSource, ProfileOrigin, Requirements, Server, SourcePin, SystemRamBytes, VramBytes,
+    WeightFile,
 };
 pub use resolve::{resolve, Blocked, Reason, Resolution, Slot, SLOTS};
 pub use served::{served_models, EngineMeasure, ServedModel};

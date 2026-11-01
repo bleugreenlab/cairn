@@ -4,7 +4,7 @@
 //! fetches, this reads.
 //!
 //! A quantized repository (`nvidia/Qwen3.6-35B-A3B-NVFP4`, a `-GGUF` repo) is
-//! not a model of its own but weights for one of its base model's recipes.
+//! not a model of its own but weights for one of its base model's profiles.
 //! [`HfRepo::base_candidates`] names which model it quantizes, best guess
 //! first: the repository's own name without its quantization suffix (the GGUF
 //! repo of `Qwen/Qwen3-Embedding-4B` declares `Qwen/Qwen3-4B-Base` as its
@@ -17,7 +17,7 @@ use cairn_models_types::catalog::{Modalities, Modality, VerbKind};
 use serde_json::Value;
 
 use crate::model::ModelFacts;
-use crate::recipe::{is_commit_sha, is_sha256_hex};
+use crate::profile::{is_commit_sha, is_sha256_hex};
 
 /// What a weight file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

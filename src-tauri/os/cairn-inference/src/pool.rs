@@ -74,7 +74,7 @@ pub struct PoolMachine {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     /// The machine's address on the pool's fast link (the Sparks' ConnectX
-    /// cable), which a recipe spanning machines rendezvouses over. `None` is
+    /// cable), which a profile spanning machines rendezvouses over. `None` is
     /// unknown: the operator writes it until link detection reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,

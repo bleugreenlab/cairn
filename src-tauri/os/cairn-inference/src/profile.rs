@@ -1,4 +1,4 @@
-//! Recipes: how to run one model on a class of hardware.
+//! Profiles: how to run one model on a class of hardware.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,32 +9,32 @@ use crate::inventory::ValidationError;
 use crate::pool::RecordSource;
 
 crate::string_id!(
-    /// A recipe's id, unique within the inventory.
-    RecipeId
+    /// A profile's id, unique within the inventory.
+    InferenceProfileId
 );
 
 /// How to run one model: its weights, the engine that serves it, and what
 /// the hardware must provide.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Recipe {
-    pub id: RecipeId,
+pub struct InferenceProfile {
+    pub id: InferenceProfileId,
     #[serde(default)]
     pub source: RecordSource,
     pub model: ModelRef,
-    /// The model name the engine serves it under. A recipe Cairn writes
+    /// The model name the engine serves it under. A profile Cairn writes
     /// serves under the model's real name.
     pub served_name: String,
     /// The id catalog matching uses (an OpenRouter slug).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
-    /// The verbs this recipe serves. `None` is unknown, which the records
+    /// The verbs this profile serves. `None` is unknown, which the records
     /// adopted from bginf are, since its profiles never said; nothing guesses
     /// them from the engine's flags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verbs: Option<BTreeSet<VerbKind>>,
     /// What the model takes in and gives out. `None` is unknown, for the same
-    /// reason as `verbs`; what is served for an unknown recipe is
+    /// reason as `verbs`; what is served for an unknown profile is
     /// [`crate::served::modalities`]'s to say, never a guess from its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<Modalities>,
@@ -42,19 +42,19 @@ pub struct Recipe {
     /// `None` is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization: Option<String>,
-    /// Where the recipe came from.
-    #[serde(default, skip_serializing_if = "RecipeOrigin::is_authored")]
-    pub origin: RecipeOrigin,
+    /// Where the profile came from.
+    #[serde(default, skip_serializing_if = "ProfileOrigin::is_authored")]
+    pub origin: ProfileOrigin,
     pub engine: Engine,
     pub requirements: Requirements,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
 
-/// Where a recipe came from.
+/// Where a profile came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
-pub enum RecipeOrigin {
+pub enum ProfileOrigin {
     /// Written by hand.
     #[default]
     Authored,
@@ -76,7 +76,7 @@ pub enum RecipeOrigin {
     },
 }
 
-impl RecipeOrigin {
+impl ProfileOrigin {
     pub fn is_authored(&self) -> bool {
         matches!(self, Self::Authored)
     }
@@ -90,17 +90,17 @@ impl RecipeOrigin {
     }
 }
 
-/// The model a recipe serves, with its weight files pinned.
+/// The model a profile serves, with its weight files pinned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
     /// The model's real name, the Hugging Face repository id of its checkpoint
     /// (`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`): the one name every caller
     /// asks for it by (tenet 1336). A quantized repository the weights come
-    /// from is the recipe's, not the model's name.
+    /// from is the profile's, not the model's name.
     pub name: String,
-    /// Container and native recipes pin at least one weight file; command
-    /// recipes may pin none, because their shell fetches whatever it fetches.
+    /// Container and native profiles pin at least one weight file; command
+    /// profiles may pin none, because their shell fetches whatever it fetches.
     /// The files may come from a quantized derivative's repository rather
     /// than the model's own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -148,7 +148,7 @@ pub enum Engine {
         args: Vec<String>,
     },
     /// An operator's raw start and stop shell, run on the head as its
-    /// executor's account. Every recipe adopted from bginf is one;
+    /// executor's account. Every profile adopted from bginf is one;
     /// `description` is free text saying what the shell runs.
     Command {
         start: String,
@@ -169,7 +169,7 @@ impl Engine {
     }
 }
 
-/// A container recipe's complete runnable form: what
+/// A container profile's complete runnable form: what
 /// [`crate::render`] turns into the start and stop scripts its head runs.
 ///
 /// `args`, `env` and each rank's env may hold the placeholders in
@@ -195,7 +195,7 @@ pub struct Container {
     /// [`MountSource::Source`] mounts read from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<SourcePin>,
-    /// Extra env per rank, rank 0 (the head) first. On a recipe of more than
+    /// Extra env per rank, rank 0 (the head) first. On a profile of more than
     /// one machine there is exactly one entry per machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranks: Vec<BTreeMap<String, String>>,
@@ -234,7 +234,7 @@ pub struct Mount {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MountSource {
-    /// A path within the recipe's pinned [`Container::files`] checkout.
+    /// A path within the profile's pinned [`Container::files`] checkout.
     Source { path: String },
     /// The machine's Hugging Face cache (`$HF_HOME`, or
     /// `~/.cache/huggingface`).
@@ -277,7 +277,7 @@ pub struct SourcePin {
 }
 
 /// The placeholders a container's args and env may hold, filled in when it
-/// is rendered: the deployment's API port, the recipe's served name, the
+/// is rendered: the deployment's API port, the profile's served name, the
 /// weights' repository and revision, the rank and machine count, the fast-link
 /// address of the head and of the machine itself, and the in-container path of
 /// the first weight file.
@@ -341,11 +341,11 @@ impl Container {
 }
 
 /// What the hardware must provide. Each optional field is `None` when
-/// unknown, which imported recipes mostly are; renderings say "unknown".
+/// unknown, which imported profiles mostly are; renderings say "unknown".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Requirements {
-    /// How many machines one deployment of this recipe occupies (a gang).
+    /// How many machines one deployment of this profile occupies (a gang).
     pub machines: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accelerator: Option<Accelerator>,
@@ -399,7 +399,7 @@ pub enum Interconnect {
     Rdma,
 }
 
-/// A recipe's memory footprint on each machine, typed by memory kind.
+/// A profile's memory footprint on each machine, typed by memory kind.
 ///
 /// On a unified-memory machine (a GB10 Spark, a Radeon 8060S, Apple silicon)
 /// the footprint is system RAM only; on a discrete card it is VRAM plus host
@@ -459,13 +459,13 @@ pub fn is_pinned_image(image: &str) -> bool {
         .is_some_and(|(name, digest)| !name.is_empty() && is_sha256_hex(digest))
 }
 
-impl Recipe {
-    /// This recipe's own problems, independent of the rest of the inventory.
+impl InferenceProfile {
+    /// This profile's own problems, independent of the rest of the inventory.
     pub fn problems(&self) -> Vec<ValidationError> {
         let mut problems = Vec::new();
-        let recipe = || self.id.clone();
+        let profile = || self.id.clone();
         if self.requirements.machines == 0 {
-            problems.push(ValidationError::RecipeZeroMachines { recipe: recipe() });
+            problems.push(ValidationError::ProfileZeroMachines { profile: profile() });
         }
         for (index, weight) in self.model.weights.iter().enumerate() {
             let problem = if weight.repo.is_empty() {
@@ -481,7 +481,7 @@ impl Recipe {
             };
             if let Some(problem) = problem {
                 problems.push(ValidationError::BadWeightFile {
-                    recipe: recipe(),
+                    profile: profile(),
                     index,
                     problem,
                 });
@@ -493,27 +493,27 @@ impl Recipe {
             }
             Engine::Native { sha256, .. } => {
                 if !is_sha256_hex(sha256) {
-                    problems.push(ValidationError::BadArtifactSha { recipe: recipe() });
+                    problems.push(ValidationError::BadArtifactSha { profile: profile() });
                 }
             }
             Engine::Command { start, .. } => {
                 if start.trim().is_empty() {
-                    problems.push(ValidationError::EmptyStart { recipe: recipe() });
+                    problems.push(ValidationError::EmptyStart { profile: profile() });
                 }
             }
         }
         if !matches!(self.engine, Engine::Command { .. }) && self.model.weights.is_empty() {
-            problems.push(ValidationError::UnpinnedWeights { recipe: recipe() });
+            problems.push(ValidationError::UnpinnedWeights { profile: profile() });
         }
         problems
     }
 
     fn container_problems(&self, container: &Container) -> Vec<ValidationError> {
         let mut problems = Vec::new();
-        let recipe = || self.id.clone();
+        let profile = || self.id.clone();
         if !is_pinned_image(&container.image) {
             problems.push(ValidationError::BadImageDigest {
-                recipe: recipe(),
+                profile: profile(),
                 image: container.image.clone(),
             });
         }
@@ -527,7 +527,7 @@ impl Recipe {
         }
         for placeholder in unknown {
             problems.push(ValidationError::UnknownPlaceholder {
-                recipe: recipe(),
+                profile: profile(),
                 placeholder,
             });
         }
@@ -539,7 +539,7 @@ impl Recipe {
         };
         if !ranks_fit {
             problems.push(ValidationError::RanksMismatch {
-                recipe: recipe(),
+                profile: profile(),
                 ranks: container.ranks.len(),
                 machines: self.requirements.machines,
             });
@@ -547,7 +547,7 @@ impl Recipe {
         match &container.files {
             Some(pin) if !is_commit_sha(&pin.commit) => {
                 problems.push(ValidationError::BadSourceCommit {
-                    recipe: recipe(),
+                    profile: profile(),
                     commit: pin.commit.clone(),
                 });
             }
@@ -556,7 +556,7 @@ impl Recipe {
                 for mount in &container.mounts {
                     if let MountSource::Source { path } = &mount.from {
                         problems.push(ValidationError::UnpinnedSourceMount {
-                            recipe: recipe(),
+                            profile: profile(),
                             path: path.clone(),
                         });
                     }
@@ -571,8 +571,8 @@ impl Recipe {
 mod tests {
     use super::*;
 
-    fn recipe(engine: Engine, weights: Vec<WeightFile>) -> Recipe {
-        Recipe {
+    fn profile(engine: Engine, weights: Vec<WeightFile>) -> InferenceProfile {
+        InferenceProfile {
             id: "r".into(),
             source: RecordSource::Cairn,
             model: ModelRef {
@@ -584,7 +584,7 @@ mod tests {
             verbs: None,
             modalities: None,
             quantization: None,
-            origin: RecipeOrigin::Authored,
+            origin: ProfileOrigin::Authored,
             engine,
             requirements: Requirements {
                 machines: 1,
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn a_container_must_be_pinned_by_digest_and_pin_its_weights() {
-        let tagged = recipe(
+        let tagged = profile(
             Engine::Container(container("ghcr.io/org/server:latest".into())),
             vec![weight(SHA)],
         );
@@ -634,7 +634,7 @@ mod tests {
             [ValidationError::BadImageDigest { .. }]
         ));
 
-        let unweighted = recipe(
+        let unweighted = profile(
             Engine::Container(container(format!("ghcr.io/org/server@sha256:{SHA}"))),
             vec![],
         );
@@ -643,7 +643,7 @@ mod tests {
             [ValidationError::UnpinnedWeights { .. }]
         ));
 
-        let pinned = recipe(
+        let pinned = profile(
             Engine::Container(container(format!("ghcr.io/org/server@sha256:{SHA}"))),
             vec![weight(SHA)],
         );
@@ -675,16 +675,16 @@ mod tests {
             read_only: true,
         });
         engine.ranks = vec![BTreeMap::new()];
-        let mut gang = recipe(Engine::Container(engine.clone()), vec![weight(SHA)]);
+        let mut gang = profile(Engine::Container(engine.clone()), vec![weight(SHA)]);
         gang.requirements.machines = 2;
         let problems: Vec<String> = gang.problems().iter().map(ToString::to_string).collect();
         assert_eq!(
             problems,
             vec![
-                "recipe r uses unknown placeholder {gpuCount}",
-                "recipe r uses unknown placeholder {nope}",
-                "recipe r runs on 2 machines but gives env for 1 rank; give one entry per machine",
-                "recipe r mounts patches from its source files but pins no source (files: {url, commit})",
+                "profile r uses unknown placeholder {gpuCount}",
+                "profile r uses unknown placeholder {nope}",
+                "profile r runs on 2 machines but gives env for 1 rank; give one entry per machine",
+                "profile r mounts patches from its source files but pins no source (files: {url, commit})",
             ]
         );
 
@@ -707,7 +707,7 @@ mod tests {
 
     #[test]
     fn malformed_shas_are_refused() {
-        let native = recipe(
+        let native = profile(
             Engine::Native {
                 artifact: "llama-server".into(),
                 version: "b1".into(),
@@ -726,8 +726,8 @@ mod tests {
     }
 
     #[test]
-    fn a_command_recipe_may_pin_no_weights() {
-        let command = recipe(
+    fn a_command_profile_may_pin_no_weights() {
+        let command = profile(
             Engine::Command {
                 start: "./start.sh".into(),
                 stop: None,
@@ -749,8 +749,8 @@ mod tests {
             read_only: false,
         });
         engine.host.gpus = true;
-        let mut generated = recipe(Engine::Container(engine), vec![weight(SHA)]);
-        generated.origin = RecipeOrigin::Generated {
+        let mut generated = profile(Engine::Container(engine), vec![weight(SHA)]);
+        generated.origin = ProfileOrigin::Generated {
             template: "llamacpp-vulkan".into(),
             model_revision: "abc".into(),
         };
@@ -760,7 +760,10 @@ mod tests {
         assert!(yaml.contains("server: llamaCpp"), "{yaml}");
         assert!(yaml.contains("kind: hfCache"), "{yaml}");
         assert!(yaml.contains("modelRevision: abc"), "{yaml}");
-        assert_eq!(serde_yaml::from_str::<Recipe>(&yaml).unwrap(), generated);
+        assert_eq!(
+            serde_yaml::from_str::<InferenceProfile>(&yaml).unwrap(),
+            generated
+        );
     }
 
     #[test]

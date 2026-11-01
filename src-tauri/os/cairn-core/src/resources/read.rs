@@ -1945,14 +1945,14 @@ async fn render_resource_body(
         // The cairn-inference facet: the stored inventory, what the act side
         // has done to it, and the pool controller's state and request queue.
         CairnResource::Inference
-        | CairnResource::InferenceRecipes
+        | CairnResource::InferenceProfiles
         | CairnResource::InferenceDeployments
         | CairnResource::InferenceDeployment { .. }
         | CairnResource::InferencePools
         | CairnResource::InferenceRequests
         | CairnResource::InferenceModels
         | CairnResource::InferenceModel { .. }
-        | CairnResource::InferenceRecipe { .. }
+        | CairnResource::InferenceProfile { .. }
         | CairnResource::InferenceVerifications
         | CairnResource::InferenceVerification { .. } => {
             match crate::orchestrator::inference::load_view(orch).await {
@@ -1961,8 +1961,8 @@ async fn render_resource_body(
                     CairnResource::Inference => {
                         crate::resources::inference::render_index(&view, &params)
                     }
-                    CairnResource::InferenceRecipes => {
-                        crate::resources::inference::render_recipes(&view, &params)
+                    CairnResource::InferenceProfiles => {
+                        crate::resources::inference::render_profiles(&view, &params)
                     }
                     CairnResource::InferenceDeployments => {
                         crate::resources::inference::render_deployments(&view, &params)
@@ -1979,8 +1979,8 @@ async fn render_resource_body(
                     CairnResource::InferenceModel { name } => {
                         crate::resources::inference::render_model(&view, name, &params)
                     }
-                    CairnResource::InferenceRecipe { id } => {
-                        crate::resources::inference::render_recipe(&view, id, &params)
+                    CairnResource::InferenceProfile { id } => {
+                        crate::resources::inference::render_profile(&view, id, &params)
                     }
                     CairnResource::InferenceVerifications => {
                         crate::resources::inference::render_verifications(&view, &params)

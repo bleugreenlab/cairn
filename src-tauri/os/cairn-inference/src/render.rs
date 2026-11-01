@@ -1,14 +1,14 @@
-//! Rendering a recipe into the scripts its head runs.
+//! Rendering a profile into the scripts its head runs.
 //!
 //! The executor never sees an engine: it runs a start script, polls a health
 //! URL, and runs a stop script (`DeploymentOperation::{Start, Stop}`). So a
-//! container recipe is rendered here, orch-side, into those scripts, and the
+//! container profile is rendered here, orch-side, into those scripts, and the
 //! wire is unchanged.
 //!
-//! Only the head acts. For a recipe spanning machines the head's start script
+//! Only the head acts. For a profile spanning machines the head's start script
 //! reaches each peer over `ssh -o BatchMode=yes` and starts its rank there,
 //! peers first and the head (rank 0) last, so the head's rendezvous finds its
-//! peers waiting. On every machine it checks out the recipe's pinned source
+//! peers waiting. On every machine it checks out the profile's pinned source
 //! files, fetches and verifies pinned GGUF weights where the server cannot pin
 //! a revision itself, removes any stale container of the same name, and runs
 //! `cairn-<deployment>-r<rank>` detached with `--restart no`: what runs after
@@ -19,7 +19,7 @@
 //! Stop and the failed-start cleanup remove every rank's container, which is
 //! idempotent.
 //!
-//! Every value placed in a script is single-quoted by [`quote`], so no recipe
+//! Every value placed in a script is single-quoted by [`quote`], so no profile
 //! field reaches the shell as syntax. An argument or env value may span lines
 //! (a published compose command often does); a peer's script travels in a
 //! heredoc whose delimiter is lengthened until no line of the script equals
@@ -31,16 +31,16 @@ use std::fmt::Write as _;
 use crate::control::Refusal;
 use crate::deployment::Deployment;
 use crate::machine::MachineName;
-use crate::recipe::{
-    placeholders, AcceleratorFamily, AcceleratorRuntime, Container, Engine, MountSource, Recipe,
-    Server, WeightFile,
+use crate::profile::{
+    placeholders, AcceleratorFamily, AcceleratorRuntime, Container, Engine, InferenceProfile,
+    MountSource, Server, WeightFile,
 };
 
 /// What the head runs for one deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
     pub start: String,
-    /// `None` for a command recipe that names no stop command.
+    /// `None` for a command profile that names no stop command.
     pub stop: Option<String>,
     /// What runs after a failed start, on the head.
     pub cleanup: Option<String>,
@@ -79,7 +79,7 @@ pub fn container_name(deployment: &str, rank: usize) -> String {
     format!("cairn-{id}-r{rank}")
 }
 
-/// Where the renderer checks out a recipe's pinned source files, under the
+/// Where the renderer checks out a profile's pinned source files, under the
 /// executor account's home.
 const SOURCES: &str = "$HOME/.cairn/inference/sources";
 
@@ -95,26 +95,26 @@ pub fn cached_weight_path(cache: &str, weight: &WeightFile) -> String {
     )
 }
 
-/// Render `recipe` placed as `deployment`, its machines given in the
+/// Render `profile` placed as `deployment`, its machines given in the
 /// deployment's order.
 pub fn render(
-    recipe: &Recipe,
+    profile: &InferenceProfile,
     deployment: &Deployment,
     machines: &[MachineAt],
 ) -> Result<Rendered, Refusal> {
-    match &recipe.engine {
+    match &profile.engine {
         Engine::Command { start, stop, .. } => Ok(Rendered {
             start: start.clone(),
             stop: stop.clone(),
             cleanup: stop.clone(),
         }),
         Engine::Native { .. } => Err(Refusal(format!(
-            "recipe {} uses a native engine, which Cairn cannot start yet",
-            recipe.id
+            "profile {} uses a native engine, which Cairn cannot start yet",
+            profile.id
         ))),
         Engine::Container(container) => {
-            let ranks = Ranks::of(recipe, deployment, machines)?;
-            let start = start_script(recipe, container, deployment, &ranks)?;
+            let ranks = Ranks::of(profile, deployment, machines)?;
+            let start = start_script(profile, container, deployment, &ranks)?;
             let stop = stop_script(&ranks, deployment);
             Ok(Rendered {
                 start,
@@ -133,7 +133,7 @@ struct Ranks<'a> {
 
 impl<'a> Ranks<'a> {
     fn of(
-        recipe: &Recipe,
+        profile: &InferenceProfile,
         deployment: &Deployment,
         machines: &'a [MachineAt],
     ) -> Result<Self, Refusal> {
@@ -153,11 +153,11 @@ impl<'a> Ranks<'a> {
         {
             ordered.push(find(name)?);
         }
-        if ordered.len() != recipe.requirements.machines as usize {
+        if ordered.len() != profile.requirements.machines as usize {
             return Err(Refusal(format!(
-                "recipe {} runs on {} machines but deployment {} places it on {}",
-                recipe.id,
-                recipe.requirements.machines,
+                "profile {} runs on {} machines but deployment {} places it on {}",
+                profile.id,
+                profile.requirements.machines,
                 deployment.id,
                 ordered.len()
             )));
@@ -176,22 +176,22 @@ impl<'a> Ranks<'a> {
 
 /// The values placeholders fill in for one rank.
 fn values(
-    recipe: &Recipe,
+    profile: &InferenceProfile,
     container: &Container,
     deployment: &Deployment,
     ranks: &Ranks<'_>,
     rank: usize,
 ) -> BTreeMap<&'static str, Option<String>> {
-    let (model, revision) = recipe.model.weights_source();
+    let (model, revision) = profile.model.weights_source();
     let weights = container
         .mounts
         .iter()
         .find(|mount| matches!(mount.from, MountSource::HfCache))
-        .zip(recipe.model.weights.first())
+        .zip(profile.model.weights.first())
         .map(|(mount, weight)| cached_weight_path(&mount.to, weight));
     BTreeMap::from([
         ("port", Some(deployment.api_port.to_string())),
-        ("servedName", Some(recipe.served_name.clone())),
+        ("servedName", Some(profile.served_name.clone())),
         ("model", Some(model.to_string())),
         ("revision", revision.map(str::to_string)),
         ("rank", Some(rank.to_string())),
@@ -204,7 +204,7 @@ fn values(
 
 fn why_unfilled(name: &str, ranks: &Ranks<'_>, rank: usize) -> String {
     match name {
-        "revision" => "the recipe pins no weight file".into(),
+        "revision" => "the profile pins no weight file".into(),
         "head.link" => format!(
             "the head {} has no link address; set it on its pool",
             ranks.machines[0].name
@@ -213,14 +213,14 @@ fn why_unfilled(name: &str, ranks: &Ranks<'_>, rank: usize) -> String {
             "machine {} has no link address; set it on its pool",
             ranks.machines[rank].name
         ),
-        "weights" => "the recipe mounts no Hugging Face cache or pins no weight file".into(),
+        "weights" => "the profile mounts no Hugging Face cache or pins no weight file".into(),
         _ => "it has no value".into(),
     }
 }
 
 /// `text` with every placeholder filled in.
 fn fill(
-    recipe: &Recipe,
+    profile: &InferenceProfile,
     text: &str,
     values: &BTreeMap<&'static str, Option<String>>,
     ranks: &Ranks<'_>,
@@ -232,15 +232,15 @@ fn fill(
             Some(Some(value)) => value,
             Some(None) => {
                 return Err(Refusal(format!(
-                    "recipe {} uses {{{name}}}, which cannot be filled in: {}",
-                    recipe.id,
+                    "profile {} uses {{{name}}}, which cannot be filled in: {}",
+                    profile.id,
                     why_unfilled(name, ranks, rank)
                 )))
             }
             None => {
                 return Err(Refusal(format!(
-                    "recipe {} uses unknown placeholder {{{name}}}",
-                    recipe.id
+                    "profile {} uses unknown placeholder {{{name}}}",
+                    profile.id
                 )))
             }
         };
@@ -249,11 +249,11 @@ fn fill(
     Ok(out)
 }
 
-fn no_newline(recipe: &Recipe, value: &str) -> Result<(), Refusal> {
+fn no_newline(profile: &InferenceProfile, value: &str) -> Result<(), Refusal> {
     if value.contains('\n') {
         return Err(Refusal(format!(
-            "recipe {} has a value holding a newline, which Cairn does not put in a script: {value:?}",
-            recipe.id
+            "profile {} has a value holding a newline, which Cairn does not put in a script: {value:?}",
+            profile.id
         )));
     }
     Ok(())
@@ -263,14 +263,14 @@ const RUNTIME: &str = r#"if command -v docker >/dev/null 2>&1; then rt=docker; e
 
 /// The script one rank runs on its own machine.
 fn rank_script(
-    recipe: &Recipe,
+    profile: &InferenceProfile,
     container: &Container,
     deployment: &Deployment,
     ranks: &Ranks<'_>,
     rank: usize,
 ) -> Result<String, Refusal> {
-    let values = values(recipe, container, deployment, ranks, rank);
-    let fill = |text: &str| fill(recipe, text, &values, ranks, rank);
+    let values = values(profile, container, deployment, ranks, rank);
+    let fill = |text: &str| fill(profile, text, &values, ranks, rank);
     let name = container_name(deployment.id.as_str(), rank);
     let mut out = String::new();
     out.push_str("set -euo pipefail\n");
@@ -279,7 +279,7 @@ fn rank_script(
     out.push_str("hf=\"${HF_HOME:-$HOME/.cache/huggingface}\"\nmkdir -p \"$hf\"\n");
 
     if let Some(files) = &container.files {
-        no_newline(recipe, &files.url)?;
+        no_newline(profile, &files.url)?;
         let _ = writeln!(out, "src=\"{SOURCES}/{}\"", files.commit);
         let _ = writeln!(
             out,
@@ -290,9 +290,9 @@ fn rank_script(
     }
 
     if container.server == Server::LlamaCpp {
-        for weight in &recipe.model.weights {
+        for weight in &profile.model.weights {
             for value in [&weight.repo, &weight.revision, &weight.path] {
-                no_newline(recipe, value)?;
+                no_newline(profile, value)?;
             }
             let path = cached_weight_path("$hf", weight);
             let url = format!(
@@ -333,15 +333,15 @@ fn rank_script(
         flags.extend(["-p".into(), format!("{port}:{port}")]);
     }
     if let Some(size) = &host.shm_size {
-        no_newline(recipe, size)?;
+        no_newline(profile, size)?;
         flags.extend(["--shm-size".into(), quote(size)]);
     }
     let mut runtime_flags = String::new();
     if host.gpus {
-        let accelerator = recipe.requirements.accelerator.ok_or_else(|| {
+        let accelerator = profile.requirements.accelerator.ok_or_else(|| {
             Refusal(format!(
-                "recipe {} gives its container the GPUs but states no accelerator, so Cairn cannot tell how",
-                recipe.id
+                "profile {} gives its container the GPUs but states no accelerator, so Cairn cannot tell how",
+                profile.id
             ))
         })?;
         match accelerator.family {
@@ -359,19 +359,19 @@ fn rank_script(
             }
             AcceleratorFamily::Apple => {
                 return Err(Refusal(format!(
-                    "recipe {} runs a container on Apple hardware, which has no GPU passthrough",
-                    recipe.id
+                    "profile {} runs a container on Apple hardware, which has no GPU passthrough",
+                    profile.id
                 )))
             }
         }
     }
     for device in &host.devices {
-        no_newline(recipe, device)?;
+        no_newline(profile, device)?;
         flags.extend(["--device".into(), quote(device)]);
     }
     for (name, limit) in &host.ulimits {
-        no_newline(recipe, name)?;
-        no_newline(recipe, limit)?;
+        no_newline(profile, name)?;
+        no_newline(profile, limit)?;
         flags.extend(["--ulimit".into(), quote(&format!("{name}={limit}"))]);
     }
     runtime_flags.push_str(
@@ -379,12 +379,12 @@ fn rank_script(
     );
     flags.push("\"${extra[@]}\"".into());
     for mount in &container.mounts {
-        no_newline(recipe, &mount.to)?;
+        no_newline(profile, &mount.to)?;
         let ro = if mount.read_only { ":ro" } else { "" };
         let host_side = match &mount.from {
             MountSource::HfCache => "\"$hf\"".to_string(),
             MountSource::Source { path } => {
-                no_newline(recipe, path)?;
+                no_newline(profile, path)?;
                 let path = path.trim_start_matches("./");
                 if path.is_empty() || path == "." {
                     "\"$src\"".to_string()
@@ -403,7 +403,7 @@ fn rank_script(
         env.extend(rank_env.clone());
     }
     for (key, value) in &env {
-        no_newline(recipe, key)?;
+        no_newline(profile, key)?;
         flags.extend(["-e".into(), quote(&format!("{key}={}", fill(value)?))]);
     }
     let mut command: Vec<String> = Vec::new();
@@ -412,7 +412,7 @@ fn rank_script(
         Some(entrypoint) => match entrypoint.split_first() {
             None => flags.extend(["--entrypoint".into(), "''".into()]),
             Some((first, rest)) => {
-                no_newline(recipe, first)?;
+                no_newline(profile, first)?;
                 flags.extend(["--entrypoint".into(), quote(first)]);
                 for part in rest {
                     command.push(quote(&fill(part)?));
@@ -420,7 +420,7 @@ fn rank_script(
             }
         },
     }
-    no_newline(recipe, &container.image)?;
+    no_newline(profile, &container.image)?;
     for arg in &container.args {
         command.push(quote(&fill(arg)?));
     }
@@ -442,19 +442,19 @@ fn rank_script(
 const HEALTH_POLL_SECS: u32 = 5;
 
 fn start_script(
-    recipe: &Recipe,
+    profile: &InferenceProfile,
     container: &Container,
     deployment: &Deployment,
     ranks: &Ranks<'_>,
 ) -> Result<String, Refusal> {
     let mut out = format!(
-        "#!/usr/bin/env bash\n# Rendered by Cairn from recipe {} for deployment {}.\nset -euo pipefail\n",
-        recipe.id, deployment.id
+        "#!/usr/bin/env bash\n# Rendered by Cairn from profile {} for deployment {}.\nset -euo pipefail\n",
+        profile.id, deployment.id
     );
     for (rank, peer) in ranks.machines.iter().enumerate().skip(1) {
-        let script = rank_script(recipe, container, deployment, ranks, rank)?;
+        let script = rank_script(profile, container, deployment, ranks, rank)?;
         let address = peer.address.as_deref().expect("checked by Ranks::of");
-        no_newline(recipe, address)?;
+        no_newline(profile, address)?;
         let mut delimiter = format!("CAIRN_RANK_{rank}");
         while script.lines().any(|line| line == delimiter) {
             delimiter.push('_');
@@ -467,9 +467,9 @@ fn start_script(
         );
     }
     let _ = writeln!(out, "# rank 0 on {}", ranks.machines[0].name);
-    out.push_str(&rank_script(recipe, container, deployment, ranks, 0)?);
+    out.push_str(&rank_script(profile, container, deployment, ranks, 0)?);
     let name = quote(&container_name(deployment.id.as_str(), 0));
-    no_newline(recipe, &deployment.health_path)?;
+    no_newline(profile, &deployment.health_path)?;
     let health = quote(&format!(
         "http://127.0.0.1:{}{}",
         deployment.api_port, deployment.health_path
@@ -517,8 +517,8 @@ fn stop_script(ranks: &Ranks<'_>, deployment: &Deployment) -> String {
 mod tests {
     use super::*;
     use crate::pool::RecordSource;
-    use crate::recipe::{
-        Accelerator, HostOptions, ModelRef, Mount, RecipeOrigin, Requirements, SourcePin,
+    use crate::profile::{
+        Accelerator, HostOptions, ModelRef, Mount, ProfileOrigin, Requirements, SourcePin,
     };
 
     const SHA: &str = "a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8";
@@ -537,7 +537,7 @@ mod tests {
         Deployment {
             id: id.into(),
             source: RecordSource::Cairn,
-            recipe: id.into(),
+            profile: id.into(),
             machines: machines.iter().map(|m| (*m).into()).collect(),
             head: machines[0].into(),
             api_port: port,
@@ -561,14 +561,14 @@ mod tests {
         ]
     }
 
-    pub(crate) fn dspark() -> Recipe {
+    pub(crate) fn dspark() -> InferenceProfile {
         let rank = |pairs: &[(&str, &str)]| {
             pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<BTreeMap<_, _>>()
         };
-        Recipe {
+        InferenceProfile {
             id: "deepseek-v4-flash-vision-exp-dspark-x2".into(),
             source: RecordSource::Cairn,
             model: ModelRef {
@@ -583,7 +583,7 @@ mod tests {
             verbs: None,
             modalities: None,
             quantization: Some("fp8".into()),
-            origin: RecipeOrigin::Authored,
+            origin: ProfileOrigin::Authored,
             engine: Engine::Container(Container {
                 image: format!("ghcr.io/anemll/dspark-vllm-gx10@sha256:{SHA}"),
                 server: Server::Vllm,
@@ -635,23 +635,23 @@ mod tests {
         }
     }
 
-    fn embedder() -> Recipe {
-        let mut recipe = dspark();
-        recipe.id = "qwen3-embedding-4b-q8_0-llamacpp-x1".into();
-        recipe.model = ModelRef {
+    fn embedder() -> InferenceProfile {
+        let mut profile = dspark();
+        profile.id = "qwen3-embedding-4b-q8_0-llamacpp-x1".into();
+        profile.model = ModelRef {
             name: "Qwen/Qwen3-Embedding-4B".into(),
             weights: vec![weight(
                 "Qwen/Qwen3-Embedding-4B-GGUF",
                 "Qwen3-Embedding-4B-Q8_0.gguf",
             )],
         };
-        recipe.served_name = "Qwen/Qwen3-Embedding-4B".into();
-        recipe.requirements.machines = 1;
-        recipe.requirements.accelerator = Some(Accelerator {
+        profile.served_name = "Qwen/Qwen3-Embedding-4B".into();
+        profile.requirements.machines = 1;
+        profile.requirements.accelerator = Some(Accelerator {
             family: AcceleratorFamily::Amd,
             runtime: AcceleratorRuntime::Vulkan,
         });
-        recipe.engine = Engine::Container(Container {
+        profile.engine = Engine::Container(Container {
             image: format!("ghcr.io/ggml-org/llama.cpp@sha256:{SHA}"),
             server: Server::LlamaCpp,
             entrypoint: None,
@@ -681,7 +681,7 @@ mod tests {
             files: None,
             ranks: vec![],
         });
-        recipe
+        profile
     }
 
     /// Compare against a stored rendering; `CAIRN_UPDATE_SNAPSHOTS=1`
@@ -706,9 +706,9 @@ mod tests {
 
     #[test]
     fn the_dspark_gang_renders_peers_first_and_the_head_last() {
-        let recipe = dspark();
+        let profile = dspark();
         let rendered = render(
-            &recipe,
+            &profile,
             &deployment("dsv4f", &["bginf-sp1", "bginf-sp2"], 8888),
             &sparks(),
         )
@@ -741,9 +741,9 @@ mod tests {
 
     #[test]
     fn a_single_machine_llama_cpp_fetches_and_verifies_its_gguf() {
-        let recipe = embedder();
+        let profile = embedder();
         let rendered = render(
-            &recipe,
+            &profile,
             &deployment("embed", &["fedora"], 8090),
             &[MachineAt {
                 name: "fedora".into(),
@@ -782,10 +782,10 @@ mod tests {
     fn hostile_values_stay_quoted_and_newlines_are_refused() {
         assert_eq!(quote("a'b"), r#"'a'\''b'"#);
         assert_eq!(quote("$(rm -rf /)"), "'$(rm -rf /)'");
-        let mut recipe = embedder();
-        recipe.served_name = "x'; rm -rf / #".into();
+        let mut profile = embedder();
+        profile.served_name = "x'; rm -rf / #".into();
         let rendered = render(
-            &recipe,
+            &profile,
             &deployment("embed", &["fedora"], 8090),
             &[MachineAt {
                 name: "fedora".into(),
@@ -840,7 +840,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             refusal.0,
-            "recipe deepseek-v4-flash-vision-exp-dspark-x2 uses {self.link}, which cannot be filled in: machine bginf-sp2 has no link address; set it on its pool"
+            "profile deepseek-v4-flash-vision-exp-dspark-x2 uses {self.link}, which cannot be filled in: machine bginf-sp2 has no link address; set it on its pool"
         );
         machines[1].address = None;
         let refusal = render(
@@ -857,10 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn a_command_recipe_passes_through_and_native_is_refused() {
-        let recipe = crate::fixture::command_recipe("r", 1);
+    fn a_command_profile_passes_through_and_native_is_refused() {
+        let profile = crate::fixture::command_profile("r", 1);
         let rendered = render(
-            &recipe,
+            &profile,
             &deployment("r", &["sp1"], 8000),
             &[MachineAt {
                 name: "sp1".into(),
@@ -871,7 +871,7 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.start, "./start.sh");
         assert_eq!(rendered.stop.as_deref(), Some("./stop.sh"));
-        let mut native = recipe;
+        let mut native = profile;
         native.engine = Engine::Native {
             artifact: "a".into(),
             version: "1".into(),

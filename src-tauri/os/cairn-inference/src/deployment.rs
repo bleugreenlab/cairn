@@ -1,17 +1,17 @@
-//! Deployments: a recipe placed on named machines.
+//! Deployments: a profile placed on named machines.
 
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineName;
 use crate::pool::RecordSource;
-use crate::recipe::RecipeId;
+use crate::profile::InferenceProfileId;
 
 crate::string_id!(
     /// A deployment's id, unique within the inventory.
     DeploymentId
 );
 
-/// A recipe placed on named machines: a gang that runs on all of them or on
+/// A profile placed on named machines: a gang that runs on all of them or on
 /// none. The API base and health URL are derived from the head machine's
 /// address; no address is stored here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,7 +20,7 @@ pub struct Deployment {
     pub id: DeploymentId,
     #[serde(default)]
     pub source: RecordSource,
-    pub recipe: RecipeId,
+    pub profile: InferenceProfileId,
     /// The machines it occupies, in placement order.
     pub machines: Vec<MachineName>,
     /// The machine whose address serves the API; one of `machines`.
@@ -69,7 +69,7 @@ mod tests {
         let deployment = Deployment {
             id: "d".into(),
             source: RecordSource::Cairn,
-            recipe: "r".into(),
+            profile: "r".into(),
             machines: vec!["sp1".into()],
             head: "sp1".into(),
             api_port: 8001,

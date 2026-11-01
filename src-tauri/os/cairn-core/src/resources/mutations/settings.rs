@@ -252,7 +252,7 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
 fn parse_inference(section: &Value) -> Result<cairn_config::inference::InferenceSettings, String> {
     if section.get("bginf").is_some() {
         return Err(
-            "inference.bginf retired with bginf: the section takes only `recipes`, and writing it without `bginf` drops the link"
+            "inference.bginf retired with bginf: the section takes only `profiles`, and writing it without `bginf` drops the link"
                 .into(),
         );
     }
@@ -461,7 +461,7 @@ pub(super) async fn apply_settings_patch(
         summary.push(format!("build services ({count} op(s))"));
     }
 
-    // --- Inference recipe declarations (replaces the section) ---
+    // --- Inference profile declarations (replaces the section) ---
     if let Some(section) = obj.get("inference") {
         let inference = parse_inference(section)?;
         let dropped_link = settings::load_inference(&orch.config_dir).retired_bginf_link;
@@ -473,13 +473,13 @@ pub(super) async fn apply_settings_patch(
         } else {
             "inference"
         };
-        summary.push(if inference.recipes.is_empty() {
-            format!("{link}; no recipe declarations")
+        summary.push(if inference.profiles.is_empty() {
+            format!("{link}; no profile declarations")
         } else {
             format!(
-                "{link}; recipes declared: {}",
+                "{link}; profiles declared: {}",
                 inference
-                    .recipes
+                    .profiles
                     .keys()
                     .map(String::as_str)
                     .collect::<Vec<_>>()
@@ -615,12 +615,12 @@ mod tests {
     #[test]
     fn the_inference_section_parses_validates_and_clears() {
         let parsed = parse_inference(&serde_json::json!({
-            "recipes": {"dsv4f-tp2": {"verbs": ["session"]}}
+            "profiles": {"dsv4f-tp2": {"verbs": ["session"]}}
         }))
         .unwrap();
-        assert!(parsed.recipes.contains_key("dsv4f-tp2"));
+        assert!(parsed.profiles.contains_key("dsv4f-tp2"));
         assert_eq!(parse_inference(&Value::Null).unwrap(), Default::default());
-        assert!(parse_inference(&serde_json::json!({"recipes": {"r": {}}})).is_err());
+        assert!(parse_inference(&serde_json::json!({"profiles": {"r": {}}})).is_err());
         let retired =
             parse_inference(&serde_json::json!({"bginf": {"url": "http://x"}})).unwrap_err();
         assert!(retired.contains("retired with bginf"), "{retired}");

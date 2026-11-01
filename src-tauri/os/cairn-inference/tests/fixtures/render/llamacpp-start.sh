@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rendered by Cairn from recipe qwen3-embedding-4b-q8_0-llamacpp-x1 for deployment embed.
+# Rendered by Cairn from profile qwen3-embedding-4b-q8_0-llamacpp-x1 for deployment embed.
 set -euo pipefail
 # rank 0 on fedora
 set -euo pipefail

@@ -29,11 +29,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cairn_config::inference::RecipeDeclaration;
+use cairn_config::inference::InferenceProfileDeclaration;
 use cairn_inference::control::Phase;
 use cairn_inference::pool_control::{Ms, PoolControl, RequestState};
 use cairn_inference::served::{self, EngineMeasure, ServedModel};
-use cairn_inference::{Deployment, DeploymentId, Inventory, PoolId, RecipeId};
+use cairn_inference::{Deployment, DeploymentId, InferenceProfileId, Inventory, PoolId};
 use cairn_models::types::catalog::Modalities;
 
 use super::inference::load_inventory;
@@ -77,33 +77,36 @@ pub(crate) enum Asked {
 }
 
 /// The inventory as served: the stored records, with the operator's
-/// declarations (`inference.recipes` in settings) laid over each recipe.
+/// declarations (`inference.profiles` in settings) laid over each profile.
 pub(crate) async fn served_inventory(orch: &Orchestrator) -> Result<Inventory, String> {
     let mut inventory = load_inventory(&orch.db.local).await?;
     declare(
         &mut inventory,
-        &crate::config::settings::load_inference(&orch.config_dir).recipes,
+        &crate::config::settings::load_inference(&orch.config_dir).profiles,
     );
     Ok(inventory)
 }
 
-/// Lay each declaration over the recipe it names: a declared part replaces
-/// the record's own, and a declaration naming no recipe here changes nothing.
+/// Lay each declaration over the profile it names: a declared part replaces
+/// the record's own, and a declaration naming no profile here changes nothing.
 pub(crate) fn declare(
     inventory: &mut Inventory,
-    declarations: &BTreeMap<String, RecipeDeclaration>,
+    declarations: &BTreeMap<String, InferenceProfileDeclaration>,
 ) {
     for (id, declared) in declarations {
-        let Some(recipe) = inventory.recipes.get_mut(&RecipeId::from(id.as_str())) else {
+        let Some(profile) = inventory
+            .profiles
+            .get_mut(&InferenceProfileId::from(id.as_str()))
+        else {
             continue;
         };
         if let Some(verbs) = &declared.verbs {
-            recipe.verbs = Some(verbs.clone());
+            profile.verbs = Some(verbs.clone());
         }
         if let (Some(input), Some(output)) =
             (&declared.input_modalities, &declared.output_modalities)
         {
-            recipe.modalities = Some(Modalities {
+            profile.modalities = Some(Modalities {
                 input: input.clone(),
                 output: output.clone(),
             });
@@ -134,8 +137,8 @@ pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, 
             forget(&deployment.id);
             continue;
         }
-        let (Some(recipe), Some(address)) = (
-            inventory.recipes.get(&deployment.recipe),
+        let (Some(profile), Some(address)) = (
+            inventory.profiles.get(&deployment.profile),
             inventory.address_of(&deployment.head),
         ) else {
             continue;
@@ -143,7 +146,7 @@ pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, 
         let load = inventory
             .pool_of_deployment(deployment)
             .and_then(|pool| current_load(&controls, &pool.id, &deployment.id));
-        measure(deployment, address, &recipe.served_name, load).await;
+        measure(deployment, address, &profile.served_name, load).await;
     }
     Ok(served::served_models(&inventory, &measures()))
 }
@@ -153,8 +156,8 @@ pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, 
 pub(crate) async fn served_name_of(orch: &Orchestrator, model: &str) -> Option<String> {
     let inventory = served_inventory(orch).await.ok()?;
     let (deployment, _) = deployment_for(&inventory, model, None).ok()?;
-    let recipe = &inventory.deployments.get(&deployment)?.recipe;
-    Some(inventory.recipes.get(recipe)?.served_name.clone())
+    let profile = &inventory.deployments.get(&deployment)?.profile;
+    Some(inventory.profiles.get(profile)?.served_name.clone())
 }
 
 /// Ask once for `model` on behalf of `requester`.
@@ -236,10 +239,10 @@ async fn route(
         .deployments
         .get(deployment)
         .ok_or_else(|| format!("{deployment} left the inventory"))?;
-    let recipe = inventory.recipes.get(&record.recipe).ok_or_else(|| {
+    let profile = inventory.profiles.get(&record.profile).ok_or_else(|| {
         format!(
-            "{deployment}'s recipe {} is not in the inventory",
-            record.recipe
+            "{deployment}'s profile {} is not in the inventory",
+            record.profile
         )
     })?;
     let address = inventory.address_of(&record.head).ok_or_else(|| {
@@ -248,12 +251,12 @@ async fn route(
             record.head
         )
     })?;
-    let measure = measure(record, address, &recipe.served_name, load).await;
+    let measure = measure(record, address, &profile.served_name, load).await;
     Ok(Route {
         deployment: deployment.clone(),
         pool: pool.clone(),
         api_base: record.api_base(address),
-        served_name: recipe.served_name.clone(),
+        served_name: profile.served_name.clone(),
         context_length: measure.context_length(),
     })
 }
@@ -483,7 +486,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
 
-    use cairn_inference::Recipe;
+    use cairn_inference::InferenceProfile;
     use cairn_models::types::catalog::{Modality, VerbKind};
 
     use super::*;
@@ -618,12 +621,12 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_lies_over_the_record_and_one_for_no_recipe_changes_nothing() {
+    fn a_declaration_lies_over_the_record_and_one_for_no_profile_changes_nothing() {
         let mut inventory = Inventory::from_yaml(
             r#"
 models:
   - {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
-recipes:
+profiles:
   - id: dsv4f-tp2
     model: {name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp}
     servedName: deepseek-v4-flash-vision-exp
@@ -637,7 +640,7 @@ pools: []
         let declarations = BTreeMap::from([
             (
                 "dsv4f-tp2".to_string(),
-                RecipeDeclaration {
+                InferenceProfileDeclaration {
                     verbs: Some(BTreeSet::from([VerbKind::Session, VerbKind::Decide])),
                     input_modalities: Some(vec![Modality::Text, Modality::Image]),
                     output_modalities: Some(vec![Modality::Text]),
@@ -645,7 +648,7 @@ pools: []
             ),
             (
                 "gone".to_string(),
-                RecipeDeclaration {
+                InferenceProfileDeclaration {
                     verbs: Some(BTreeSet::from([VerbKind::Embed])),
                     ..Default::default()
                 },
@@ -653,19 +656,20 @@ pools: []
         ]);
         let before = inventory.clone();
         declare(&mut inventory, &declarations);
-        let recipe: &Recipe = &inventory.recipes[&RecipeId::from("dsv4f-tp2")];
+        let profile: &InferenceProfile =
+            &inventory.profiles[&InferenceProfileId::from("dsv4f-tp2")];
         assert_eq!(
-            recipe.verbs,
+            profile.verbs,
             Some(BTreeSet::from([VerbKind::Session, VerbKind::Decide]))
         );
         assert_eq!(
-            recipe
+            profile
                 .modalities
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),
             Some("text+image → text")
         );
-        assert_eq!(inventory.recipes.len(), before.recipes.len());
+        assert_eq!(inventory.profiles.len(), before.profiles.len());
     }
 }

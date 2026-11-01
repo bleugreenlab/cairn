@@ -9,7 +9,7 @@ const MIN: Ms = 60_000;
 /// sp1, `other` on sp2, and the default is `dsv4f-tp2`.
 fn inventory() -> Inventory {
     let mut inventory = test_inventory();
-    crate::fixture::insert_command_recipe(&mut inventory, "other", 1);
+    crate::fixture::insert_command_profile(&mut inventory, "other", 1);
     inventory.insert_deployment(deployment("other", &["sp2"]));
     assert_eq!(inventory.validate(), Ok(()));
     inventory
@@ -1069,9 +1069,9 @@ fn a_dismissed_deployment_leaves_the_pin_and_the_active_set() {
 #[test]
 fn only_a_models_real_name_finds_its_deployments() {
     let mut inventory = inventory();
-    let recipe = inventory.recipes.get_mut(&"dsv4f-tp2".into()).unwrap();
-    recipe.served_name = "deepseek-v4-flash".into();
-    recipe.model.name = "deepseek-ai/DeepSeek-V4-Flash".into();
+    let profile = inventory.profiles.get_mut(&"dsv4f-tp2".into()).unwrap();
+    profile.served_name = "deepseek-v4-flash".into();
+    profile.model.name = "deepseek-ai/DeepSeek-V4-Flash".into();
     assert_eq!(
         deployments_serving(&inventory, "deepseek-ai/DeepSeek-V4-Flash"),
         vec![d("dsv4f-tp2")]
@@ -1080,7 +1080,7 @@ fn only_a_models_real_name_finds_its_deployments() {
         deployments_serving(&inventory, " DEEPSEEK-AI/deepseek-v4-flash "),
         vec![d("dsv4f-tp2")]
     );
-    // The deployment id, recipe id and served name are internal keys.
+    // The deployment id, profile id and served name are internal keys.
     for internal in ["dsv4f-tp2", "deepseek-v4-flash", "deepseek", ""] {
         assert!(
             deployments_serving(&inventory, internal).is_empty(),

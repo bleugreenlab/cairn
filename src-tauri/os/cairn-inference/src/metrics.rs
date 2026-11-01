@@ -3,7 +3,7 @@
 //! One reader for both engines Cairn runs. vLLM names its series `vllm:*` and
 //! llama.cpp's server `llamacpp:*` (and serves them only when started with
 //! `--metrics`), so the dialect is read from the series themselves, never
-//! from a recipe. [`parse`] reads one scrape into an [`EngineSample`];
+//! from a profile. [`parse`] reads one scrape into an [`EngineSample`];
 //! [`summarize`] turns a window of scrapes into the rates and latencies a
 //! person reads: counters become rates by the difference between two scrapes
 //! (a counter that went down means the engine restarted, and says nothing),

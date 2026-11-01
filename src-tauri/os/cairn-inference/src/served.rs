@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use crate::deployment::DeploymentId;
 use crate::inventory::Inventory;
 use crate::pool_control::deployments_serving;
-use crate::recipe::{Recipe, RecipeId};
+use crate::profile::{InferenceProfile, InferenceProfileId};
 
 /// What an engine reported about itself once it was healthy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -72,12 +72,12 @@ pub struct ServedModel {
     /// looked up by.
     pub id: String,
     pub deployment: DeploymentId,
-    pub recipe: RecipeId,
+    pub profile: InferenceProfileId,
     /// The name the engine answers to: every request for `id` reaches the
     /// engine under this name.
     pub served_name: String,
     pub upstream_id: Option<String>,
-    /// The verbs the recipe declares; `None` when it doesn't say.
+    /// The verbs the profile declares; `None` when it doesn't say.
     pub verbs: Option<BTreeSet<VerbKind>>,
     pub modalities: Modalities,
     /// The context to advertise, when the engine has been measured.
@@ -93,10 +93,10 @@ pub fn served_models(
     let mut served = Vec::new();
     let mut named = BTreeSet::new();
     for deployment in inventory.deployments.values() {
-        let Some(recipe) = inventory.recipes.get(&deployment.recipe) else {
+        let Some(profile) = inventory.profiles.get(&deployment.profile) else {
             continue;
         };
-        let name = recipe.model.name.trim();
+        let name = profile.model.name.trim();
         if !named.insert(name.to_ascii_lowercase()) {
             continue;
         }
@@ -106,11 +106,11 @@ pub fn served_models(
         served.push(ServedModel {
             id: name.to_string(),
             deployment: deployment.id.clone(),
-            recipe: recipe.id.clone(),
-            served_name: recipe.served_name.clone(),
-            upstream_id: recipe.upstream_id.clone(),
-            verbs: recipe.verbs.clone(),
-            modalities: modalities(recipe),
+            profile: profile.id.clone(),
+            served_name: profile.served_name.clone(),
+            upstream_id: profile.upstream_id.clone(),
+            verbs: profile.verbs.clone(),
+            modalities: modalities(profile),
             context_length: measures
                 .get(&deployment.id)
                 .and_then(EngineMeasure::context_length),
@@ -119,14 +119,14 @@ pub fn served_models(
     served
 }
 
-/// What `recipe`'s model takes and gives: what it declares; else what its
+/// What `profile`'s model takes and gives: what it declares; else what its
 /// declared verbs produce, from text; else text to text, the conversation an
 /// OpenAI-compatible chat server is offered for when it says nothing.
-pub fn modalities(recipe: &Recipe) -> Modalities {
-    if let Some(declared) = &recipe.modalities {
+pub fn modalities(profile: &InferenceProfile) -> Modalities {
+    if let Some(declared) = &profile.modalities {
         return declared.clone();
     }
-    let Some(verbs) = &recipe.verbs else {
+    let Some(verbs) = &profile.verbs else {
         return Modalities {
             input: vec![Modality::Text],
             output: vec![Modality::Text],
@@ -186,7 +186,7 @@ fn listing_entry(model: &ServedModel) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::{command_recipe, deployment, test_inventory};
+    use crate::fixture::{command_profile, deployment, test_inventory};
 
     /// The same engine's own `/v1/models`, read the same day.
     const DSV4_MODELS: &str = r#"{"object":"list","data":[{"id":"deepseek-v4-flash-vision-exp","object":"model","created":1793470670,"owned_by":"vllm","root":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","parent":null,"max_model_len":1048576,"permission":[]}]}"#;
@@ -194,15 +194,15 @@ mod tests {
     const DSV4: &str = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp";
 
     /// The test inventory, with DeepSeek's real and served names as its
-    /// recipe has them.
+    /// profile has them.
     fn sparks() -> Inventory {
         let mut inventory = test_inventory();
-        let recipe = inventory
-            .recipes
-            .get_mut(&RecipeId::from("dsv4f-tp2"))
+        let profile = inventory
+            .profiles
+            .get_mut(&InferenceProfileId::from("dsv4f-tp2"))
             .unwrap();
-        recipe.served_name = "deepseek-v4-flash-vision-exp".into();
-        recipe.model.name = DSV4.into();
+        profile.served_name = "deepseek-v4-flash-vision-exp".into();
+        profile.model.name = DSV4.into();
         inventory
     }
 
@@ -266,7 +266,7 @@ mod tests {
     fn a_model_deployed_twice_is_not_served_until_something_chooses() {
         let mut inventory = sparks();
         let mut copy = deployment("dsv4f-copy", &["halo"]);
-        copy.recipe = "dsv4f-tp2".into();
+        copy.profile = "dsv4f-tp2".into();
         inventory.insert_deployment(copy);
         let served = served_models(&inventory, &BTreeMap::new());
         assert_eq!(ids(&served), ["qwen3-embed-4b", "qwen36-fast"]);
@@ -283,25 +283,25 @@ mod tests {
 
     #[test]
     fn modalities_are_declared_else_produced_by_the_verbs_else_text() {
-        let mut recipe = command_recipe("r", 1);
-        assert_eq!(modalities(&recipe).to_string(), "text → text");
-        recipe.verbs = Some(BTreeSet::from([VerbKind::Embed]));
-        assert_eq!(modalities(&recipe).to_string(), "text → embeddings");
-        recipe.verbs = Some(BTreeSet::from([VerbKind::Session, VerbKind::Decide]));
-        assert_eq!(modalities(&recipe).to_string(), "text → text");
-        recipe.modalities = Some(Modalities {
+        let mut profile = command_profile("r", 1);
+        assert_eq!(modalities(&profile).to_string(), "text → text");
+        profile.verbs = Some(BTreeSet::from([VerbKind::Embed]));
+        assert_eq!(modalities(&profile).to_string(), "text → embeddings");
+        profile.verbs = Some(BTreeSet::from([VerbKind::Session, VerbKind::Decide]));
+        assert_eq!(modalities(&profile).to_string(), "text → text");
+        profile.modalities = Some(Modalities {
             input: vec![Modality::Text, Modality::Image],
             output: vec![Modality::Text],
         });
-        assert_eq!(modalities(&recipe).to_string(), "text+image → text");
+        assert_eq!(modalities(&profile).to_string(), "text+image → text");
     }
 
     #[test]
     fn every_listing_entry_carries_architecture_under_the_real_name() {
         let mut inventory = sparks();
         inventory
-            .recipes
-            .get_mut(&RecipeId::from("dsv4f-tp2"))
+            .profiles
+            .get_mut(&InferenceProfileId::from("dsv4f-tp2"))
             .unwrap()
             .modalities = Some(Modalities {
             input: vec![Modality::Text, Modality::Image],

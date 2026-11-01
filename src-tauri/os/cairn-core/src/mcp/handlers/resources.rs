@@ -75,7 +75,26 @@ pub(crate) fn thread_db_hint(uri: &str) -> Option<String> {
 }
 
 pub(crate) fn resource_uri_hint(uri: &str) -> Option<String> {
-    thread_db_hint(uri).or_else(|| task_terminal_hint(uri))
+    thread_db_hint(uri)
+        .or_else(|| task_terminal_hint(uri))
+        .or_else(|| inference_recipes_hint(uri))
+}
+
+/// Name the address inference recipes moved to when they became profiles, so
+/// the retired `cairn://inference/recipes` is refused with its replacement
+/// rather than as an unknown URI. Workflow recipes keep `cairn://recipes`.
+fn inference_recipes_hint(uri: &str) -> Option<String> {
+    let identity = split_target_query(uri)
+        .map(|split| split.identity)
+        .unwrap_or_else(|_| uri.to_string());
+    let rest = identity.strip_prefix("cairn://inference/recipes")?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    Some(format!(
+        "Inference recipes are now called profiles: use cairn://inference/profiles{rest}. \
+         Workflow recipes are at cairn://recipes."
+    ))
 }
 
 /// Payload for read_resource request. Terminal-specific params (`new`, `full`,
@@ -962,6 +981,23 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn the_retired_inference_recipes_address_names_profiles() {
+        assert_eq!(parse_uri("cairn://inference/recipes"), None);
+        assert_eq!(
+            resource_uri_hint("cairn://inference/recipes?grep=x").as_deref(),
+            Some(
+                "Inference recipes are now called profiles: use cairn://inference/profiles. \
+                 Workflow recipes are at cairn://recipes."
+            )
+        );
+        assert!(resource_uri_hint("cairn://inference/recipes/qwen-x1")
+            .unwrap()
+            .contains("cairn://inference/profiles/qwen-x1"));
+        assert_eq!(resource_uri_hint("cairn://inference/recipesx"), None);
+        assert!(parse_uri("cairn://inference/profiles").is_some());
+    }
 
     #[test]
     fn fmt_duration_scales() {

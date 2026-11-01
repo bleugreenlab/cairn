@@ -1,13 +1,13 @@
-//! The pure half of verifying a recipe on a pool: what a benchmark's samples
-//! measure, what a failed start says about the KV cache, how a recipe's
+//! The pure half of verifying a profile on a pool: what a benchmark's samples
+//! measure, what a failed start says about the KV cache, how a profile's
 //! context is clamped to it, and the canonical form a verification pins a
-//! recipe by. The host runs the load, the health check and the requests.
+//! profile by. The host runs the load, the health check and the requests.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::recipe::{Engine, Recipe};
+use crate::profile::{Engine, InferenceProfile};
 
 /// How far a verification got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,9 +149,9 @@ pub fn kv_limit_from_failure(reason: &str) -> Option<u64> {
 
 const CONTEXT_FLAGS: &[&str] = &["--max-model-len", "-c", "--ctx-size"];
 
-/// The context a recipe's engine is told to hold.
-pub fn context_of(recipe: &Recipe) -> Option<u64> {
-    let Engine::Container(container) = &recipe.engine else {
+/// The context a profile's engine is told to hold.
+pub fn context_of(profile: &InferenceProfile) -> Option<u64> {
+    let Engine::Container(container) = &profile.engine else {
         return None;
     };
     container.args.iter().enumerate().find_map(|(i, arg)| {
@@ -166,15 +166,15 @@ pub fn context_of(recipe: &Recipe) -> Option<u64> {
     })
 }
 
-/// `recipe` with its context clamped to `tokens`, floored to a multiple of
+/// `profile` with its context clamped to `tokens`, floored to a multiple of
 /// 1024, or `None` when it states no context to clamp or already fits.
-pub fn clamp_context(recipe: &Recipe, tokens: u64) -> Option<Recipe> {
-    let current = context_of(recipe)?;
+pub fn clamp_context(profile: &InferenceProfile, tokens: u64) -> Option<InferenceProfile> {
+    let current = context_of(profile)?;
     let clamped = tokens / 1024 * 1024;
     if clamped >= current || clamped == 0 {
         return None;
     }
-    let mut revised = recipe.clone();
+    let mut revised = profile.clone();
     let Engine::Container(container) = &mut revised.engine else {
         return None;
     };
@@ -203,11 +203,11 @@ pub fn clamp_context(recipe: &Recipe, tokens: u64) -> Option<Recipe> {
     changed.then_some(revised)
 }
 
-/// The recipe as a verification pins it: its canonical JSON, whose sha256 a
-/// verification row records. A row whose digest no longer matches its recipe
-/// measured a recipe that has since changed.
-pub fn canonical(recipe: &Recipe) -> String {
-    serde_json::to_string(recipe).expect("recipes serialize")
+/// The profile as a verification pins it: its canonical JSON, whose sha256 a
+/// verification row records. A row whose digest no longer matches its profile
+/// measured a profile that has since changed.
+pub fn canonical(profile: &InferenceProfile) -> String {
+    serde_json::to_string(profile).expect("profiles serialize")
 }
 
 /// The fixed prompt of the chat benchmark: about a thousand tokens of plain
@@ -233,11 +233,11 @@ pub fn embed_batch() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{Container, HostOptions, ModelRef, RecipeOrigin, Requirements, Server};
+    use crate::profile::{Container, HostOptions, ModelRef, ProfileOrigin, Requirements, Server};
     use std::collections::BTreeMap;
 
-    fn recipe(args: Vec<&str>) -> Recipe {
-        Recipe {
+    fn profile(args: Vec<&str>) -> InferenceProfile {
+        InferenceProfile {
             id: "r".into(),
             source: Default::default(),
             model: ModelRef {
@@ -249,7 +249,7 @@ mod tests {
             verbs: None,
             modalities: None,
             quantization: None,
-            origin: RecipeOrigin::Authored,
+            origin: ProfileOrigin::Authored,
             engine: Engine::Container(Container {
                 image: "x".into(),
                 server: Server::Vllm,
@@ -310,13 +310,13 @@ mod tests {
 
     #[test]
     fn the_context_clamps_in_plain_args_and_inside_a_shell_command() {
-        let plain = recipe(vec!["vllm", "serve", "m", "--max-model-len", "262144"]);
+        let plain = profile(vec!["vllm", "serve", "m", "--max-model-len", "262144"]);
         assert_eq!(context_of(&plain), Some(262_144));
         let clamped = clamp_context(&plain, 100_000).unwrap();
         assert_eq!(context_of(&clamped), Some(99_328));
         assert_eq!(clamp_context(&plain, 300_000), None, "it already fits");
 
-        let shell = recipe(vec![
+        let shell = profile(vec![
             "bash",
             "-lc",
             "exec vllm serve {model} --max-model-len 1048576 --block-size 256",
@@ -328,21 +328,21 @@ mod tests {
         };
         assert!(container.args[2].contains("--max-model-len 711680 --block-size"));
 
-        let quoted = recipe(vec!["exec 'vllm' '--max-model-len' '40960' --nnodes 2"]);
+        let quoted = profile(vec!["exec 'vllm' '--max-model-len' '40960' --nnodes 2"]);
         let clamped = clamp_context(&quoted, 20_000).unwrap();
         assert_eq!(context_of(&clamped), Some(19_456));
 
-        let llama = recipe(vec!["/app/llama-server", "-c", "40960"]);
+        let llama = profile(vec!["/app/llama-server", "-c", "40960"]);
         assert_eq!(
             context_of(&clamp_context(&llama, 8_192).unwrap()),
             Some(8_192)
         );
-        assert_eq!(clamp_context(&recipe(vec!["serve"]), 1_000), None);
+        assert_eq!(clamp_context(&profile(vec!["serve"]), 1_000), None);
     }
 
     #[test]
-    fn a_changed_recipe_has_a_different_canonical_form() {
-        let a = recipe(vec!["--max-model-len", "1"]);
+    fn a_changed_profile_has_a_different_canonical_form() {
+        let a = profile(vec!["--max-model-len", "1"]);
         let mut b = a.clone();
         assert_eq!(canonical(&a), canonical(&b));
         b.notes = Some("changed".into());

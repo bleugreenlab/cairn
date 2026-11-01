@@ -2,7 +2,7 @@
 name = "cairn-inference"
 version.workspace = true
 edition = "2021"
-description = "The cairn-inference facet: recipe, deployment and pool records, the pin-over-default resolver, the act side and the pool controller"
+description = "The cairn-inference facet: profile, deployment and pool records, the pin-over-default resolver, the act side and the pool controller"
 license = "BUSL-1.1"
 
 # A pure library with no storage of its own: the host persists the inventory.

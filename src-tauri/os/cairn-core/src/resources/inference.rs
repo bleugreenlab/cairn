@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use cairn_common::query::QueryParam;
 use cairn_inference::pool_control::{self, RequestState};
 use cairn_inference::{
-    DeploymentSet, Engine, MachineName, MemoryPerMachine, Pool, Recipe, Requirements,
+    DeploymentSet, Engine, InferenceProfile, MachineName, MemoryPerMachine, Pool, Requirements,
 };
 
 use super::common::find_query_value;
@@ -24,12 +24,12 @@ use cairn_inference::{Deployment, DeploymentId};
 
 const INDEX: &[(&str, &str)] = &[
     (
-        "cairn://inference/recipes",
+        "cairn://inference/profiles",
         "how each model is run: weights, engine, served name, and what the hardware must provide",
     ),
     (
         "cairn://inference/deployments",
-        "recipes placed on named machines, with the API base and health URL derived from the head's address",
+        "profiles placed on named machines, with the API base and health URL derived from the head's address",
     ),
     (
         "cairn://inference/pools",
@@ -127,13 +127,13 @@ pub(crate) fn render_index(view: &InferenceView, params: &[QueryParam]) -> Strin
         Some(other) => return format!("Unknown format='{other}' for {URI}; expected yaml."),
     }
     let mut out = String::from(
-        "# cairn-inference\n\nWhich model each inference machine should run. Recipes say how a model is run, deployments place a recipe on named machines, and pools are the sets of machines that share one desired state. Every record is Cairn's own and the operator writes it here: replace this resource with a whole inventory (the document `?format=yaml` reads), or patch it to add, replace or remove records; a write is validated as a whole and refused naming every problem. A pool taken under Cairn's control is decided by the pool controller: a request loads its model, batches waiting for the pool unload an idle one, and an idle pool loads its default. The controller writes desired state; one deployment's page (`cairn://inference/deployments/<id>`) is the act side, starting or stopping it on its head and holding every machine of the gang away from batch work while it does. Cairn powers nothing.\n\n",
+        "# cairn-inference\n\nWhich model each inference machine should run. Profiles say how a model is run, deployments place a profile on named machines, and pools are the sets of machines that share one desired state. Every record is Cairn's own and the operator writes it here: replace this resource with a whole inventory (the document `?format=yaml` reads), or patch it to add, replace or remove records; a write is validated as a whole and refused naming every problem. A pool taken under Cairn's control is decided by the pool controller: a request loads its model, batches waiting for the pool unload an idle one, and an idle pool loads its default. The controller writes desired state; one deployment's page (`cairn://inference/deployments/<id>`) is the act side, starting or stopping it on its head and holding every machine of the gang away from batch work while it does. Cairn powers nothing.\n\n",
     );
     out.push_str(&retired_lines(view));
     let _ = writeln!(
         out,
-        "- records: {} recipes, {} deployments, {} pools\n",
-        view.inventory.recipes.len(),
+        "- records: {} profiles, {} deployments, {} pools\n",
+        view.inventory.profiles.len(),
         view.inventory.deployments.len(),
         view.inventory.pools.len()
     );
@@ -247,10 +247,10 @@ fn container_lines(out: &mut String, container: &cairn_inference::Container) {
     }
 }
 
-fn origin_line(out: &mut String, origin: &cairn_inference::RecipeOrigin) {
+fn origin_line(out: &mut String, origin: &cairn_inference::ProfileOrigin) {
     match origin {
-        cairn_inference::RecipeOrigin::Authored => out.push_str("- origin: authored\n"),
-        cairn_inference::RecipeOrigin::Imported {
+        cairn_inference::ProfileOrigin::Authored => out.push_str("- origin: authored\n"),
+        cairn_inference::ProfileOrigin::Imported {
             url,
             commit,
             compose,
@@ -261,7 +261,7 @@ fn origin_line(out: &mut String, origin: &cairn_inference::RecipeOrigin) {
                 "- origin: imported from {url} at {commit}, service {service} of {compose}"
             );
         }
-        cairn_inference::RecipeOrigin::Generated {
+        cairn_inference::ProfileOrigin::Generated {
             template,
             model_revision,
         } => {
@@ -273,15 +273,15 @@ fn origin_line(out: &mut String, origin: &cairn_inference::RecipeOrigin) {
     }
 }
 
-fn recipe_section(out: &mut String, recipe: &Recipe) {
-    let _ = writeln!(out, "## {}\n", recipe.id);
-    let _ = writeln!(out, "- source: {}", source_label(recipe.source));
-    let _ = writeln!(out, "- model: {}", recipe.model.name);
-    if recipe.model.weights.is_empty() {
+fn profile_section(out: &mut String, profile: &InferenceProfile) {
+    let _ = writeln!(out, "## {}\n", profile.id);
+    let _ = writeln!(out, "- source: {}", source_label(profile.source));
+    let _ = writeln!(out, "- model: {}", profile.model.name);
+    if profile.model.weights.is_empty() {
         out.push_str("- weights: none pinned\n");
     } else {
         out.push_str("- weights:\n");
-        for weight in &recipe.model.weights {
+        for weight in &profile.model.weights {
             let _ = writeln!(
                 out,
                 "  - {}@{} {} (sha256 {})",
@@ -292,16 +292,16 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
     let _ = writeln!(
         out,
         "- quantization: {}",
-        recipe.quantization.as_deref().unwrap_or("unknown")
+        profile.quantization.as_deref().unwrap_or("unknown")
     );
-    origin_line(out, &recipe.origin);
-    let _ = writeln!(out, "- served name: {}", recipe.served_name);
+    origin_line(out, &profile.origin);
+    let _ = writeln!(out, "- served name: {}", profile.served_name);
     let _ = writeln!(
         out,
         "- upstream id: {}",
-        recipe.upstream_id.as_deref().unwrap_or("unknown")
+        profile.upstream_id.as_deref().unwrap_or("unknown")
     );
-    let verbs = match &recipe.verbs {
+    let verbs = match &profile.verbs {
         Some(verbs) => verbs
             .iter()
             .map(|v| v.as_str())
@@ -310,8 +310,8 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
         None => "unknown".to_string(),
     };
     let _ = writeln!(out, "- verbs: {verbs}");
-    let _ = writeln!(out, "- engine: {}", recipe.engine.kind());
-    match &recipe.engine {
+    let _ = writeln!(out, "- engine: {}", profile.engine.kind());
+    match &profile.engine {
         Engine::Container(container) => container_lines(out, container),
         Engine::Native {
             artifact,
@@ -339,24 +339,24 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
             }
         }
     }
-    requirements_lines(out, &recipe.requirements);
-    if let Some(notes) = &recipe.notes {
+    requirements_lines(out, &profile.requirements);
+    if let Some(notes) = &profile.notes {
         let _ = writeln!(out, "- notes: {notes}");
     }
     out.push('\n');
 }
 
-pub(crate) fn render_recipes(view: &InferenceView, params: &[QueryParam]) -> String {
-    if let Some(error) = reject_params("cairn://inference/recipes", params, &[]) {
+pub(crate) fn render_profiles(view: &InferenceView, params: &[QueryParam]) -> String {
+    if let Some(error) = reject_params("cairn://inference/profiles", params, &[]) {
         return error;
     }
-    let mut out = String::from("# Inference recipes\n\n");
-    if view.inventory.recipes.is_empty() {
-        out.push_str("No recipes yet. Write them by replacing or patching cairn://inference.\n");
+    let mut out = String::from("# Inference profiles\n\n");
+    if view.inventory.profiles.is_empty() {
+        out.push_str("No profiles yet. Write them by replacing or patching cairn://inference.\n");
         return out;
     }
-    for recipe in view.inventory.recipes.values() {
-        recipe_section(&mut out, recipe);
+    for profile in view.inventory.profiles.values() {
+        profile_section(&mut out, profile);
     }
     out
 }
@@ -376,7 +376,7 @@ pub(crate) fn render_deployments(view: &InferenceView, params: &[QueryParam]) ->
     for deployment in inventory.deployments.values() {
         let _ = writeln!(out, "## {}\n", deployment.id);
         let _ = writeln!(out, "- source: {}", source_label(deployment.source));
-        let _ = writeln!(out, "- recipe: {}", deployment.recipe);
+        let _ = writeln!(out, "- profile: {}", deployment.profile);
         let pool = inventory
             .pool_of_deployment(deployment)
             .map_or("none".to_string(), |p| p.id.to_string());
@@ -555,7 +555,7 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     };
     let mut out = format!("# Inference deployment {id}\n\n");
     let _ = writeln!(out, "- source: {}", source_label(deployment.source));
-    let _ = writeln!(out, "- recipe: {}", deployment.recipe);
+    let _ = writeln!(out, "- profile: {}", deployment.profile);
     let pool = view
         .inventory
         .pool_of_deployment(deployment)
@@ -610,7 +610,7 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     }
     let _ = write!(
         out,
-        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` reserves every machine above at once, then runs the recipe's start command on the head once each has room.\n- stop: the same with `action:\"stop\"` runs the recipe's stop command on the head and waits for the health check to stop answering.\n- While it holds its machines, a write to cairn://inference may not remove it or move it to other machines; stop it first. A changed start or stop command takes effect at the next start or stop.\n"
+        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` reserves every machine above at once, then runs the profile's start command on the head once each has room.\n- stop: the same with `action:\"stop\"` runs the profile's stop command on the head and waits for the health check to stop answering.\n- While it holds its machines, a write to cairn://inference may not remove it or move it to other machines; stop it first. A changed start or stop command takes effect at the next start or stop.\n"
     );
     out
 }
@@ -872,17 +872,17 @@ fn verification_line(view: &InferenceView, row: &VerificationRow) -> String {
         parts.push(format!("reason: {reason}"));
     }
     if row.stale(&view.inventory) {
-        parts.push("stale: the recipe has changed since".into());
+        parts.push("stale: the profile has changed since".into());
     }
     format!("`{}`: {}", row.id, parts.join("; "))
 }
 
-/// The newest verification of `recipe` on each pool.
-fn latest_per_pool<'a>(view: &'a InferenceView, recipe: &str) -> Vec<&'a VerificationRow> {
+/// The newest verification of `profile` on each pool.
+fn latest_per_pool<'a>(view: &'a InferenceView, profile: &str) -> Vec<&'a VerificationRow> {
     let mut seen = std::collections::BTreeSet::new();
     view.verifications
         .iter()
-        .filter(|row| row.recipe == recipe && seen.insert(row.pool.clone()))
+        .filter(|row| row.profile == profile && seen.insert(row.pool.clone()))
         .collect()
 }
 
@@ -901,19 +901,19 @@ fn model_line(model: &cairn_inference::Model) -> String {
     )
 }
 
-fn recipe_summary(recipe: &Recipe) -> String {
-    let server = match &recipe.engine {
+fn profile_summary(profile: &InferenceProfile) -> String {
+    let server = match &profile.engine {
         Engine::Container(container) => container.server.as_str(),
         other => other.kind(),
     };
     format!(
         "{}, {server}, x{}, {}",
-        recipe
+        profile
             .quantization
             .as_deref()
             .unwrap_or("quantization unknown"),
-        recipe.requirements.machines,
-        recipe.origin.label()
+        profile.requirements.machines,
+        profile.origin.label()
     )
 }
 
@@ -927,22 +927,22 @@ pub(crate) fn render_models(view: &InferenceView, params: &[QueryParam]) -> Stri
         return out;
     }
     for model in view.inventory.models.values() {
-        let recipes: Vec<String> = view
+        let profiles: Vec<String> = view
             .inventory
-            .recipes
+            .profiles
             .values()
             .filter(|r| r.model.name == model.name)
             .map(|r| format!("`{}`", r.id))
             .collect();
         let _ = writeln!(
             out,
-            "- `{}`: {}; recipes: {}",
+            "- `{}`: {}; profiles: {}",
             model.name,
             model_line(model),
-            if recipes.is_empty() {
+            if profiles.is_empty() {
                 "none".to_string()
             } else {
-                recipes.join(", ")
+                profiles.join(", ")
             }
         );
     }
@@ -984,44 +984,46 @@ pub(crate) fn render_model(view: &InferenceView, name: &str, params: &[QueryPara
                 .into(),
         }
     );
-    out.push_str("\n## Recipes\n\n");
-    let recipes: Vec<&Recipe> = view
+    out.push_str("\n## Profiles\n\n");
+    let profiles: Vec<&InferenceProfile> = view
         .inventory
-        .recipes
+        .profiles
         .values()
         .filter(|r| r.model.name == model.name)
         .collect();
-    if recipes.is_empty() {
-        out.push_str("None yet: import one or generate candidates at cairn://inference/recipes.\n");
+    if profiles.is_empty() {
+        out.push_str(
+            "None yet: import one or generate candidates at cairn://inference/profiles.\n",
+        );
     }
-    for recipe in recipes {
-        let _ = writeln!(out, "- `{}`: {}", recipe.id, recipe_summary(recipe));
-        for row in latest_per_pool(view, recipe.id.as_str()) {
+    for profile in profiles {
+        let _ = writeln!(out, "- `{}`: {}", profile.id, profile_summary(profile));
+        for row in latest_per_pool(view, profile.id.as_str()) {
             let _ = writeln!(out, "  - {}", verification_line(view, row));
         }
     }
     out
 }
 
-pub(crate) fn render_recipe(view: &InferenceView, id: &str, params: &[QueryParam]) -> String {
-    let uri = format!("cairn://inference/recipes/{id}");
+pub(crate) fn render_profile(view: &InferenceView, id: &str, params: &[QueryParam]) -> String {
+    let uri = format!("cairn://inference/profiles/{id}");
     if let Some(error) = reject_params(&uri, params, &[]) {
         return error;
     }
-    let Some(recipe) = view
+    let Some(profile) = view
         .inventory
-        .recipes
-        .get(&cairn_inference::RecipeId::from(id))
+        .profiles
+        .get(&cairn_inference::InferenceProfileId::from(id))
     else {
-        return format!("There is no recipe {id}. cairn://inference/recipes lists them.");
+        return format!("There is no profile {id}. cairn://inference/profiles lists them.");
     };
     let mut out = String::new();
-    recipe_section(&mut out, recipe);
+    profile_section(&mut out, profile);
     for deployment in view
         .inventory
         .deployments
         .values()
-        .filter(|d| d.recipe == recipe.id)
+        .filter(|d| d.profile == profile.id)
     {
         let pool = view.inventory.pool_of_deployment(deployment);
         let machines: Vec<cairn_inference::render::MachineAt> = deployment
@@ -1034,7 +1036,7 @@ pub(crate) fn render_recipe(view: &InferenceView, id: &str, params: &[QueryParam
             })
             .collect();
         let _ = writeln!(out, "## As deployment {}\n", deployment.id);
-        match cairn_inference::render::render(recipe, deployment, &machines) {
+        match cairn_inference::render::render(profile, deployment, &machines) {
             Ok(rendered) => {
                 fenced(&mut out, "start", &rendered.start);
                 if let Some(stop) = &rendered.stop {
@@ -1050,7 +1052,7 @@ pub(crate) fn render_recipe(view: &InferenceView, id: &str, params: &[QueryParam
     let rows: Vec<&VerificationRow> = view
         .verifications
         .iter()
-        .filter(|r| r.recipe == id)
+        .filter(|r| r.profile == id)
         .collect();
     if rows.is_empty() {
         let _ = writeln!(
@@ -1070,13 +1072,13 @@ pub(crate) fn render_verifications(view: &InferenceView, params: &[QueryParam]) 
     }
     let mut out = String::from("# Inference verifications\n\n");
     if view.verifications.is_empty() {
-        out.push_str("None yet. Patch a recipe or a model with verify to load it on a pool and measure it.\n");
+        out.push_str("None yet. Patch a profile or a model with verify to load it on a pool and measure it.\n");
     }
     for row in &view.verifications {
         let _ = writeln!(
             out,
-            "- recipe `{}`: {}",
-            row.recipe,
+            "- profile `{}`: {}",
+            row.profile,
             verification_line(view, row)
         );
     }
@@ -1099,8 +1101,8 @@ pub(crate) fn render_verification(view: &InferenceView, id: &str, params: &[Quer
     let mut out = format!("# Verification {id}\n\n");
     let _ = writeln!(
         out,
-        "- recipe: `{}` (cairn://inference/recipes/{})",
-        row.recipe, row.recipe
+        "- profile: `{}` (cairn://inference/profiles/{})",
+        row.profile, row.profile
     );
     let _ = writeln!(out, "- deployment: `{}`", row.deployment);
     let _ = writeln!(out, "- requested by: {}", row.requested_by);
@@ -1125,14 +1127,14 @@ models:
   - {name: dsv4f-tp2}
   - {name: qwen36-fast}
   - {name: qwen3-embed-4b}
-recipes:
+profiles:
   - {id: dsv4f-tp2, model: {name: dsv4f-tp2}, servedName: dsv4f-tp2, engine: {kind: command, start: ./start.sh --port 8888, stop: ./stop.sh, description: vllm}, requirements: {machines: 2}}
   - {id: qwen36-fast, model: {name: qwen36-fast}, servedName: qwen36-fast, engine: {kind: command, start: ./start.sh --port 8001, stop: ./stop.sh}, requirements: {machines: 1}}
   - {id: qwen3-embed-4b, model: {name: qwen3-embed-4b}, servedName: qwen3-embed-4b, engine: {kind: command, start: ./start.sh --port 8090, stop: ./stop.sh}, requirements: {machines: 1}}
 deployments:
-  - {id: dsv4f-tp2, recipe: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen36-fast, recipe: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
-  - {id: qwen3-embed-4b, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: dsv4f-tp2, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen36-fast, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
+  - {id: qwen3-embed-4b, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
 pools:
   - {id: sparks, machines: [{name: sp1, address: 192.0.2.40}, {name: sp2}], default: [dsv4f-tp2]}
   - {id: halo, machines: [{name: fedora, address: 192.0.2.43}], default: [qwen3-embed-4b]}
@@ -1151,16 +1153,16 @@ pools:
     }
 
     #[test]
-    fn the_model_and_recipe_pages_show_facts_recipes_and_verifications() {
+    fn the_model_and_profile_pages_show_facts_profiles_and_verifications() {
         let mut view = view();
-        let recipe = view.inventory.recipes.values().next().unwrap().clone();
-        let model = recipe.model.name.clone();
+        let profile = view.inventory.profiles.values().next().unwrap().clone();
+        let model = profile.model.name.clone();
         let row = VerificationRow {
             id: "v1".into(),
-            recipe: recipe.id.to_string(),
-            recipe_digest: crate::orchestrator::inference_verify::digest(&recipe),
+            profile: profile.id.to_string(),
+            profile_digest: crate::orchestrator::inference_verify::digest(&profile),
             pool: "sparks".into(),
-            deployment: format!("verify-{}-sparks", recipe.id),
+            deployment: format!("verify-{}-sparks", profile.id),
             machines: vec!["bginf-sp1".into()],
             requested_by: "operator".into(),
             started_at: NOW - 600_000,
@@ -1181,7 +1183,7 @@ pools:
         view.verifications.push(row);
         let page = render_model(&view, &model, &[]);
         assert!(page.contains("unread: its facts are unknown"), "{page}");
-        assert!(page.contains(&format!("- `{}`: ", recipe.id)), "{page}");
+        assert!(page.contains(&format!("- `{}`: ", profile.id)), "{page}");
         assert!(page.contains("passed on pool sparks (bginf-sp1)"), "{page}");
         assert!(
             page.contains("loaded in 6m 40s; memory bginf-sp1 100.0 GiB"),
@@ -1190,14 +1192,14 @@ pools:
         assert!(page.contains("decode 41.5 tok/s"), "{page}");
         assert!(!page.contains("stale"), "{page}");
 
-        let page = render_recipe(&view, recipe.id.as_str(), &[]);
+        let page = render_profile(&view, profile.id.as_str(), &[]);
         assert!(page.contains("## Verifications"), "{page}");
         assert!(page.contains("`v1`: passed"), "{page}");
 
-        view.inventory.recipes.get_mut(&recipe.id).unwrap().notes = Some("changed".into());
+        view.inventory.profiles.get_mut(&profile.id).unwrap().notes = Some("changed".into());
         let page = render_verifications(&view, &[]);
         assert!(
-            page.contains("stale: the recipe has changed since"),
+            page.contains("stale: the profile has changed since"),
             "{page}"
         );
         assert!(render_model(&view, "nobody/Nothing", &[])
@@ -1233,7 +1235,7 @@ pools:
         );
         let index = render_index(&view, &[]);
         assert!(index.contains("- `cairn://inference/pools`"), "{index}");
-        assert!(index.contains("- records: 0 recipes"), "{index}");
+        assert!(index.contains("- records: 0 profiles"), "{index}");
     }
 
     #[test]
@@ -1255,13 +1257,16 @@ pools:
     }
 
     #[test]
-    fn recipes_and_deployments_state_their_unknowns() {
+    fn profiles_and_deployments_state_their_unknowns() {
         let view = view();
-        let recipes = render_recipes(&view, &[]);
-        assert!(recipes.contains("- verbs: unknown\n"), "{recipes}");
-        assert!(recipes.contains("- source: cairn\n"), "{recipes}");
-        assert!(recipes.contains("  - accelerator: unknown"), "{recipes}");
-        assert!(recipes.contains("    ./start.sh --port 8888"), "{recipes}");
+        let profiles = render_profiles(&view, &[]);
+        assert!(profiles.contains("- verbs: unknown\n"), "{profiles}");
+        assert!(profiles.contains("- source: cairn\n"), "{profiles}");
+        assert!(profiles.contains("  - accelerator: unknown"), "{profiles}");
+        assert!(
+            profiles.contains("    ./start.sh --port 8888"),
+            "{profiles}"
+        );
         let deployments = render_deployments(&view, &[]);
         assert!(
             deployments.contains("- API base: http://192.0.2.43:8090/v1"),
@@ -1439,7 +1444,7 @@ pools:
         view.deployment_control.loads.insert(
             "dsv4f-tp2".into(),
             vec![LoadRow {
-                recipe: "dsv4f-tp2".into(),
+                profile: "dsv4f-tp2".into(),
                 requested_at: NOW - 440_000,
                 sent_at: Some(NOW - 432_000),
                 finished_at: NOW - 120_000,

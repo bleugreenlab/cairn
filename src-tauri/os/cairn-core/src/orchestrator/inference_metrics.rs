@@ -4,7 +4,7 @@
 //!
 //! Nothing is persisted. A deployment's window starts empty at each load and
 //! is dropped when it stops being healthy, so rates never span a restart.
-//! Measured speed per recipe and pool is a verification benchmark's to
+//! Measured speed per profile and pool is a verification benchmark's to
 //! record, not a live observation's.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

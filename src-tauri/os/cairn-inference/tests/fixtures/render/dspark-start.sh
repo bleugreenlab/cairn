@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rendered by Cairn from recipe deepseek-v4-flash-vision-exp-dspark-x2 for deployment dsv4f.
+# Rendered by Cairn from profile deepseek-v4-flash-vision-exp-dspark-x2 for deployment dsv4f.
 set -euo pipefail
 # rank 1 on bginf-sp2
 ssh -o BatchMode=yes '10.20.20.41' 'bash -ls' <<'CAIRN_RANK_1'

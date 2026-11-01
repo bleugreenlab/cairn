@@ -550,7 +550,7 @@ pub(crate) fn deployment_for(
             .collect();
     if placed.is_empty() {
         return Err(format!(
-            "no deployment serves '{model}'; a model is named by its real name, and cairn://inference/recipes lists them"
+            "no deployment serves '{model}'; a model is named by its real name, and cairn://inference/profiles lists them"
         ));
     }
     let candidates: Vec<_> = match pool {
@@ -1130,7 +1130,7 @@ mod tests {
         let yaml = r#"
 models:
   - {name: DeepSeek V4 Flash}
-recipes:
+profiles:
   - id: dsv4f-tp2
     model: {name: DeepSeek V4 Flash}
     servedName: deepseek-v4-flash
@@ -1138,7 +1138,7 @@ recipes:
     requirements: {machines: 2}
 deployments:
   - id: dsv4f-tp2
-    recipe: dsv4f-tp2
+    profile: dsv4f-tp2
     machines: [sp1, sp2]
     head: sp1
     apiPort: 8888
@@ -1228,7 +1228,7 @@ pools:
             Inventory::parse_yaml(
                 r#"
 deployments:
-  - {id: dsv4f-bbs, recipe: dsv4f-tp2, machines: [bbs], head: bbs, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
+  - {id: dsv4f-bbs, profile: dsv4f-tp2, machines: [bbs], head: bbs, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
 pools:
   - {id: bbs, machines: [{name: bbs}]}
 "#,
@@ -1645,10 +1645,10 @@ pools:
             let yaml = r#"
 models:
   - {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}
-recipes:
+profiles:
   - {id: qwen3-embed-4b, model: {name: Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)}, servedName: qwen3-embedding-4b, engine: {kind: command, start: ./start-embed.sh, stop: podman rm -f bginf-embed}, requirements: {machines: 1}}
 deployments:
-  - {id: qwen3-embed-4b, recipe: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
+  - {id: qwen3-embed-4b, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
 pools:
   - {id: halo, machines: [{name: fedora, address: 10.20.20.43}], default: [qwen3-embed-4b]}
 "#;
