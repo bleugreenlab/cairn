@@ -275,6 +275,7 @@ pub(super) mod tests {
             resident_bytes: Some(1 << 30),
             measured_at_unix_ms: 9,
             quality: MeasurementQuality::Sampled,
+            quiet_window: None,
         };
         let mut index = LiveUsageIndex::default();
         assert!(index.adopt(&Measurement::measured(

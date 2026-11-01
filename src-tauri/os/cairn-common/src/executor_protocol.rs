@@ -6062,6 +6062,17 @@ pub struct LearnedResourceEstimate {
 /// which reaches nothing, until it runs a build carrying this. An older runner
 /// never mints a grant, so a newer executor never relays a resident call to it,
 /// and it logs the reattach frame, which then lists nothing, as unrecognised.
+///
+/// cairn/5672 does not move the number. [`LiveUsageSample`] gains a defaulted
+/// `quiet_window` ([`QuietWindow`]): a running command's stall-stop window,
+/// which the executor's stop authority now publishes beside the tree's live
+/// usage on the machine sample it already sends. [`DrainHold`] gains a
+/// defaulted `progressing`, the runner's account to its own surfaces. The
+/// runner's self-update drain reads work past its bound as wedged only when
+/// that window also says the work has stopped progressing. What a runner
+/// gets wrong talking to an older executor: nothing; that executor's samples
+/// carry no window, and the drain falls back to the bound alone, exactly as
+/// before. An older runner ignores the field.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -11944,6 +11955,13 @@ pub struct LiveUsageSample {
     /// Always [`MeasurementQuality::Sampled`]: work done between censuses by a
     /// process born and dead inside one is not seen.
     pub quality: MeasurementQuality,
+    /// What the command's stall stop holds about this tree at
+    /// `measured_at_unix_ms`. Absent whenever that stop cannot judge: it is
+    /// not armed (an agent's batch, a resident process), the platform cannot
+    /// read the tree's CPU and storage I/O, or its last look had no complete
+    /// reading. An absent window is never evidence of a stall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_window: Option<QuietWindow>,
 }
 
 impl LiveUsageSample {
@@ -11951,6 +11969,24 @@ impl LiveUsageSample {
     pub fn cores(&self) -> Option<f64> {
         (self.window_ms > 0).then(|| self.window_cpu_ms as f64 / self.window_ms as f64)
     }
+}
+
+/// A running command's stall-stop window, as the executor's stop authority
+/// holds it: how long the command's whole tree has gone without progress, and
+/// the bound at which that authority ends the command.
+///
+/// Progress is whatever restarts the stop's clock: a byte of output, the tree
+/// burning a meaningful amount of CPU or moving a meaningful amount of storage
+/// I/O, or the executor itself holding the command up by not reading its
+/// output. Publishing the stop's own window, rather than the raw counters,
+/// keeps one definition of "still progressing" for every reader.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuietWindow {
+    pub quiet_ms: u64,
+    /// [`ProcessBatchItem::silence_bound_ms`] for this command: the cadence's
+    /// silence interval. Never zero, since a zero bound arms no stop.
+    pub silence_bound_ms: u64,
 }
 
 /// One subject's [`LiveUsageSample`].
@@ -13001,9 +13037,16 @@ pub struct DrainHold {
     /// never been measured or has not started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_done_unix_ms: Option<u64>,
-    /// When the rollout stops waiting for it, reads the machine as wedged,
-    /// and gives it its work back.
+    /// When the rollout stops waiting for it, unless it is still progressing,
+    /// and then reads the machine as wedged and gives it its work back.
     pub deadline_unix_ms: u64,
+    /// Whether the work's process tree is still progressing, by its own stall
+    /// stop's window. `None` when nothing can say (no stop armed, or a
+    /// platform that cannot read the tree), and then the deadline alone
+    /// decides. Work past its deadline that is still progressing keeps the
+    /// turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progressing: Option<bool>,
 }
 
 /// Everything a machine continuously posts about itself, so the runner can

@@ -925,17 +925,35 @@ fn render_self_update(
 }
 
 /// How much longer a draining machine's update waits on one piece of work.
+///
+/// Work past its bound that its own stall stop still sees progressing has no
+/// remaining wait to name: it holds the turn for as long as it keeps moving.
 fn hold_remaining(
     hold: &cairn_common::executor_protocol::DrainHold,
     captured_at_unix_ms: u64,
 ) -> String {
+    let progressing = hold.progressing == Some(true);
+    if progressing && captured_at_unix_ms >= hold.deadline_unix_ms {
+        return match hold.expected_done_unix_ms {
+            Some(done) => format!(
+                "{} past its learned duration and still progressing",
+                duration_ms(captured_at_unix_ms.saturating_sub(done))
+            ),
+            None => "past its fixed hold and still progressing".to_string(),
+        };
+    }
     let bound = duration_ms(hold.deadline_unix_ms.saturating_sub(captured_at_unix_ms));
+    let longer = if progressing {
+        ", or for as long as it keeps progressing"
+    } else {
+        ""
+    };
     match hold.expected_done_unix_ms {
         Some(done) if done > captured_at_unix_ms => {
             format!("~{} left", duration_ms(done - captured_at_unix_ms))
         }
-        Some(_) => format!("past its expected finish, waited on up to {bound} more"),
-        None => format!("no expected finish, waited on up to {bound} more"),
+        Some(_) => format!("past its expected finish, waited on up to {bound} more{longer}"),
+        None => format!("no expected finish, waited on up to {bound} more{longer}"),
     }
 }
 
@@ -8729,6 +8747,7 @@ mod tests {
                 label: "`bun run test:rust:tiered` for cairn/5456".into(),
                 expected_done_unix_ms: Some(CAPTURED_AT + 9 * 60_000),
                 deadline_unix_ms: CAPTURED_AT + 19 * 60_000,
+                progressing: None,
             }],
             cycles: vec!["service `iMessage channel`".into()],
         });
@@ -8746,6 +8765,25 @@ mod tests {
                 "- Self-update: draining for update: 3 in flight, the longest `bun run test:rust:tiered` for cairn/5456, ~9.0m left; new work goes elsewhere (since 1m ago); the restart cycles service `iMessage channel`\n"
             ),
             "{rendered}"
+        );
+
+        // The fedora specimen (cairn/5672): past its bound, and still moving.
+        let slow = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 1,
+            since_unix_ms: CAPTURED_AT - 15 * 60_000,
+            holds: vec![cairn_common::executor_protocol::DrainHold {
+                label: "`rust-tests` for cairn/5456".into(),
+                expected_done_unix_ms: Some(CAPTURED_AT - 10 * 60_000),
+                deadline_unix_ms: CAPTURED_AT - 60_000,
+                progressing: Some(true),
+            }],
+            cycles: Vec::new(),
+        }));
+        assert!(
+            slow.contains(
+                "draining for update: 1 in flight, `rust-tests` for cairn/5456, 10.0m past its learned duration and still progressing; new work goes elsewhere"
+            ),
+            "{slow}"
         );
 
         let mut current = self_updating(SelfUpdatePhase::Current);

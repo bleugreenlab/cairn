@@ -17014,6 +17014,22 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
         .filter_map(|cell| cell.occupancy.command.as_ref())
         .map(|command| (command.request_id.as_str(), command))
         .collect();
+    // What the attempt's own stall stop holds about its tree, from the latest
+    // machine sample. Absent whenever that stop cannot judge, which leaves the
+    // drain to the bound alone.
+    let progress = |request_id: &str, attempt_id: &str| {
+        let subject = cairn_common::executor_protocol::LiveUsageSubject::Command {
+            request_id: request_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+        };
+        let sample = entry.live_usage.get(&subject)?;
+        let window = sample.quiet_window?;
+        Some(rollout::Progress {
+            quiet_ms: window.quiet_ms,
+            silence_bound_ms: window.silence_bound_ms,
+            measured_at_unix_ms: sample.measured_at_unix_ms,
+        })
+    };
     // Richest witness first, so the dedup below keeps its label and timing.
     let mut work: Vec<rollout::HeldWork> = Vec::new();
     for request in &snapshot.executing_requests {
@@ -17022,6 +17038,7 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
             label: held_command_label(&request.command, request.owner.as_ref()),
             started_at_unix_ms: Some(request.started_at_unix_ms),
             expected_ms: learned(request.learned_estimate.as_ref()),
+            progress: progress(&request.request_id, &request.attempt_id),
         });
     }
     for granted in &snapshot.granted_attempts {
@@ -17031,12 +17048,14 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
                 label: held_command_label(&command.command, command.owner.as_ref()),
                 started_at_unix_ms: command.started_at_unix_ms,
                 expected_ms: learned(command.learned_estimate.as_ref()),
+                progress: progress(&granted.request_id, &granted.attempt_id),
             },
             None => rollout::HeldWork {
                 key: held_request_key(&granted.request_id),
                 label: format!("request {} (preparing its cell)", granted.request_id),
                 started_at_unix_ms: None,
                 expected_ms: None,
+                progress: None,
             },
         });
     }
@@ -17046,6 +17065,7 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
             label: held_command_label(&queued.command, queued.owner.as_ref()),
             started_at_unix_ms: None,
             expected_ms: learned(queued.learned_estimate.as_ref()),
+            progress: None,
         });
     }
     for request_id in snapshot.in_flight_residency_operations.keys() {
@@ -17054,6 +17074,7 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
             label: format!("an environment being acquired (request {request_id})"),
             started_at_unix_ms: None,
             expected_ms: None,
+            progress: None,
         });
     }
     let mut services = Vec::new();
@@ -17080,6 +17101,7 @@ fn snapshot_work(entry: &ExecutorConnectionState) -> (Vec<rollout::HeldWork>, Ve
                     label: resident_process_label(kind),
                     started_at_unix_ms,
                     expected_ms: None,
+                    progress: None,
                 }),
             }
         }
@@ -17110,6 +17132,7 @@ fn join_runner_work(
             label: format!("request {request_id} (bound here, not yet reported by the machine)"),
             started_at_unix_ms: None,
             expected_ms: None,
+            progress: None,
         });
     }
     let reported = work
@@ -17124,6 +17147,7 @@ fn join_runner_work(
             label: "an environment being acquired".to_string(),
             started_at_unix_ms: None,
             expected_ms: None,
+            progress: None,
         });
     }
     let mut keys = HashSet::new();
@@ -31683,6 +31707,66 @@ mod tests {
             live_usage: None,
             build_jobs: None,
         }
+    }
+
+    /// The self-update drain judges a running attempt by the stall-stop
+    /// window its own sample carried (cairn/5672), matched by attempt: a
+    /// window for another attempt of the same request, or none, leaves it
+    /// nothing to judge by.
+    #[test]
+    fn snapshot_work_carries_each_running_attempts_stall_window() {
+        use cairn_common::executor_protocol::{
+            LiveUsage, LiveUsageSample, LiveUsageSubject, Measurement, MeasurementQuality,
+            QuietWindow,
+        };
+
+        let (_, mut entry) = fleet_entry("remote-a", "linux", 0, &[]);
+        let mut judged = executing_fixture("r1");
+        judged.attempt_id = "a1".into();
+        let mut retried = executing_fixture("r2");
+        retried.attempt_id = "a2".into();
+        Arc::make_mut(&mut entry.snapshot).executing_requests = vec![judged, retried];
+        let usage = |request_id: &str, attempt_id: &str| LiveUsage {
+            subject: LiveUsageSubject::Command {
+                request_id: request_id.into(),
+                attempt_id: attempt_id.into(),
+            },
+            sample: LiveUsageSample {
+                window_cpu_ms: 4_000,
+                window_ms: 5_000,
+                resident_bytes: None,
+                measured_at_unix_ms: 40,
+                quality: MeasurementQuality::Sampled,
+                quiet_window: Some(QuietWindow {
+                    quiet_ms: 120_000,
+                    silence_bound_ms: Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,
+                }),
+            },
+        };
+        assert!(entry.live_usage.adopt(&Measurement::measured(
+            40,
+            vec![usage("r1", "a1"), usage("r2", "a1")],
+        )));
+
+        let (work, _) = snapshot_work(&entry);
+        let progress: Vec<_> = work
+            .iter()
+            .map(|item| (item.key.as_str(), item.progress))
+            .collect();
+        assert_eq!(
+            progress,
+            vec![
+                (
+                    "request:r1",
+                    Some(rollout::Progress {
+                        quiet_ms: 120_000,
+                        silence_bound_ms: Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,
+                        measured_at_unix_ms: 40,
+                    })
+                ),
+                ("request:r2", None),
+            ]
+        );
     }
 
     fn completion_fixture(

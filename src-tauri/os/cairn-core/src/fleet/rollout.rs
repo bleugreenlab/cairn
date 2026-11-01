@@ -22,7 +22,9 @@
 //!   machine with a steady stream of work never empties. So the turn is bounded
 //!   per piece of work rather than as a whole: a command may hold it for its
 //!   own learned duration plus margin, and work with no expected end for a
-//!   fixed hold.
+//!   fixed hold. A command past that bound keeps the turn for as long as its
+//!   own stall stop still sees its tree progressing, because a slow command
+//!   on a stalled disk is busy, not wedged.
 //! - **Long-lived services are cycled, not waited on.** A service instance
 //!   never finishes, and any executor restart ends it whether the rollout waits
 //!   or not; its owner already re-places it whenever its executor is lost. So
@@ -30,7 +32,9 @@
 //!   counted as work in flight. A service's one-shot command is work, and is
 //!   waited on like any other.
 //! - **No wedged machine holds the fleet hostage.** Work that outruns its bound
-//!   gives the machine back and passes the turn to the next; a machine that
+//!   and has stopped progressing, or that outruns it with nothing able to say
+//!   whether it progresses, gives the machine back and passes the turn to the
+//!   next; a machine that
 //!   ignores a directive is excluded from that build without halting it. A
 //!   served build that moves during a drain retargets the drain rather than
 //!   ending it, so a nearly empty machine is not sent to the back of the line.
@@ -100,16 +104,65 @@ pub(crate) struct HeldWork {
     pub started_at_unix_ms: Option<u64>,
     /// Its own learned upper duration, when it has been measured.
     pub expected_ms: Option<u64>,
+    /// What its own stall stop last said about its process tree, when that
+    /// stop is judging it.
+    pub progress: Option<Progress>,
+}
+
+/// A running command's stall-stop window, as its executor last sampled it:
+/// how long its whole tree had gone without output, CPU or storage progress,
+/// against the bound that stop ends it at (the cadence's silence interval).
+///
+/// One definition of progress serves both the stop and the drain, so a
+/// command the executor would keep running is never read here as wedged, and
+/// the instruments' exclusions (the executor's own output backpressure, an
+/// incomplete reading) hold in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Progress {
+    pub quiet_ms: u64,
+    pub silence_bound_ms: u64,
+    pub measured_at_unix_ms: u64,
+}
+
+impl Progress {
+    /// How long the tree has been quiet as of `now`. The reading ages with
+    /// the sample that carried it, so one that stops being refreshed stops
+    /// being evidence that the work still moves.
+    fn quiet_at(&self, now_unix_ms: u64) -> u64 {
+        self.quiet_ms
+            .saturating_add(now_unix_ms.saturating_sub(self.measured_at_unix_ms))
+    }
+
+    /// Whether the tree has progressed within its bound, or `None` when no
+    /// bound arms the judgement: an agent's batch carries zero.
+    fn progressing(&self, now_unix_ms: u64) -> Option<bool> {
+        (self.silence_bound_ms > 0).then(|| self.quiet_at(now_unix_ms) < self.silence_bound_ms)
+    }
 }
 
 impl HeldWork {
-    /// When this work is expected to finish, and when the turn stops waiting
-    /// for it, given when the drain first saw it.
+    /// Whether this work is still progressing, by its own stall stop, or
+    /// `None` when nothing can say: no stop is armed for it, its platform
+    /// cannot read the tree, or it is not running.
+    fn progressing(&self, now_unix_ms: u64) -> Option<bool> {
+        self.progress
+            .and_then(|progress| progress.progressing(now_unix_ms))
+    }
+
+    /// Whether this work holds the turn past its bound: it is past it and
+    /// still progressing.
+    fn held_past(hold: &DrainHold, now_unix_ms: u64) -> bool {
+        now_unix_ms >= hold.deadline_unix_ms && hold.progressing == Some(true)
+    }
+
+    /// When this work is expected to finish, when the turn stops waiting for
+    /// it unless it is still progressing, and whether it is, given when the
+    /// drain first saw it.
     ///
     /// Measured from no earlier than first sight, so work that started long
     /// before the turn, or was already past its estimate when the turn began,
     /// still gets its margin rather than ending the turn on the first pass.
-    fn bound(&self, first_seen_unix_ms: u64) -> DrainHold {
+    fn hold(&self, first_seen_unix_ms: u64, now_unix_ms: u64) -> DrainHold {
         let (expected_done_unix_ms, deadline_unix_ms) = match self.expected_ms {
             Some(expected) => {
                 let margin = (expected / 2).max(COMMAND_MARGIN_MS);
@@ -135,6 +188,7 @@ impl HeldWork {
             label: self.label.clone(),
             expected_done_unix_ms,
             deadline_unix_ms,
+            progressing: self.progressing(now_unix_ms),
         }
     }
 }
@@ -273,7 +327,9 @@ impl TurnPhase {
 }
 
 /// When each piece of work was first seen (work that finished is forgotten,
-/// work new this pass is first seen now), and what bounds each, latest first.
+/// work new this pass is first seen now), and what bounds each: work held
+/// past its bound by its progress first, since nothing bounds it but that,
+/// then latest bound first.
 fn account(
     work: &[HeldWork],
     mut first_seen: HashMap<String, u64>,
@@ -282,11 +338,15 @@ fn account(
     first_seen.retain(|key, _| work.iter().any(|item| item.key == *key));
     let mut holds: Vec<DrainHold> = work
         .iter()
-        .map(|item| item.bound(*first_seen.entry(item.key.clone()).or_insert(now_unix_ms)))
+        .map(|item| {
+            let seen = *first_seen.entry(item.key.clone()).or_insert(now_unix_ms);
+            item.hold(seen, now_unix_ms)
+        })
         .collect();
     holds.sort_by(|a, b| {
-        b.deadline_unix_ms
-            .cmp(&a.deadline_unix_ms)
+        HeldWork::held_past(b, now_unix_ms)
+            .cmp(&HeldWork::held_past(a, now_unix_ms))
+            .then_with(|| b.deadline_unix_ms.cmp(&a.deadline_unix_ms))
             .then_with(|| a.label.cmp(&b.label))
     });
     (first_seen, holds)
@@ -655,19 +715,31 @@ impl Rollout {
                 let TurnPhase::Draining { first_seen, .. } = &turn.phase else {
                     unreachable!("just set to draining");
                 };
-                // The most overdue piece of work that outran its bound, if
-                // any: a machine whose work does not end is wedged, and a
-                // wedged machine does not hold the fleet.
+                // The most overdue piece of work that outran its bound and is
+                // not still progressing, if any: a machine whose work neither
+                // ends nor moves is wedged, and a wedged machine does not hold
+                // the fleet. Work that outran its bound but whose tree is still
+                // working is a slow machine doing its job, and keeps the turn.
                 let overrun = candidate
                     .work
                     .iter()
                     .map(|item| {
                         let seen = first_seen.get(&item.key).copied().unwrap_or(now_unix_ms);
-                        (item, seen, item.bound(seen))
+                        (item, seen, item.hold(seen, now_unix_ms))
                     })
-                    .filter(|(_, _, bound)| now_unix_ms >= bound.deadline_unix_ms)
-                    .min_by_key(|(_, _, bound)| bound.deadline_unix_ms);
+                    .filter(|(_, _, hold)| {
+                        now_unix_ms >= hold.deadline_unix_ms && hold.progressing != Some(true)
+                    })
+                    .min_by_key(|(_, _, hold)| hold.deadline_unix_ms);
                 if let Some((item, seen, bound)) = overrun {
+                    let silent = match item.progress {
+                        Some(progress) if bound.progressing == Some(false) => format!(
+                            ", and its tree has shown no progress for {} minutes against its own {}-minute stall bound",
+                            progress.quiet_at(now_unix_ms) / 60_000,
+                            progress.silence_bound_ms / 60_000,
+                        ),
+                        _ => String::new(),
+                    };
                     let why = match bound.expected_done_unix_ms {
                         Some(done) => format!(
                             "was expected to finish {} minutes ago, from its own learned duration of {} minutes",
@@ -684,7 +756,7 @@ impl Rollout {
                     step.transitions.push(transition(
                         TransitionKind::Deferred,
                         format!(
-                            "{}'s {} {why}, so it is read as wedged; {} takes work again and is asked after {} minutes",
+                            "{}'s {} {why}{silent}, so it is read as wedged; {} takes work again and is asked after {} minutes",
                             turn.name,
                             item.label,
                             turn.name,
@@ -839,7 +911,32 @@ mod tests {
             label: format!("`{key}`"),
             started_at_unix_ms: Some(started_at_unix_ms),
             expected_ms,
+            progress: None,
         }
+    }
+
+    const HOUR: u64 = 60 * 60_000;
+    /// A review check's silence bound, the interval its stall stop judges by.
+    const REVIEW_BOUND_MS: u64 = 30 * 60_000;
+
+    /// `item` as a sample taken at `at` reported it: its stall stop had seen
+    /// no progress for `quiet_ms` against `silence_bound_ms`.
+    fn sampled(mut item: HeldWork, quiet_ms: u64, silence_bound_ms: u64, at: u64) -> HeldWork {
+        item.progress = Some(Progress {
+            quiet_ms,
+            silence_bound_ms,
+            measured_at_unix_ms: at,
+        });
+        item
+    }
+
+    /// A machine running one whole-suite pass with a learned hour, beside a
+    /// busier one, so it takes the first turn. Its bound falls at 90 minutes.
+    fn suite_fleet() -> Vec<Candidate> {
+        let mut fleet = vec![remote("fedora", "old"), remote("busy", "old")];
+        fleet[0].work = vec![command("rust-tests", NOW, Some(HOUR))];
+        fleet[1].work = vec![command("a", NOW, None), command("b", NOW, None)];
+        fleet
     }
 
     /// `count` measured lanes that started at `NOW`.
@@ -1144,6 +1241,177 @@ mod tests {
             SelfUpdatePhase::Deferred {
                 until_unix_ms: deadline + DEFER_MS
             }
+        );
+    }
+
+    /// The fedora specimen (cairn/5672): a whole-suite pass with a learned
+    /// hour ran 170 minutes on a disk stalled 40-80%, emitting results the
+    /// whole time. Past its bound it keeps the turn for as long as its own
+    /// stall stop sees its tree progress, the drain says so, and the machine
+    /// updates the moment the pass finishes.
+    #[test]
+    fn work_past_its_bound_that_is_still_progressing_keeps_the_turn() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = suite_fleet();
+        let deadline = NOW + HOUR + HOUR / 2;
+        for minute in [0, 90, 100, 130, 169] {
+            let now = NOW + minute * 60_000;
+            fleet[0].work = vec![sampled(
+                command("rust-tests", NOW, Some(HOUR)),
+                2 * 60_000,
+                REVIEW_BOUND_MS,
+                now,
+            )];
+            let step = rollout.advance(&fleet, &artifacts, now);
+            assert_eq!(step.hold.as_deref(), Some("id-fedora"), "at {minute}");
+            assert!(
+                step.transitions.is_empty() || minute == 0,
+                "{:?}",
+                step.transitions
+            );
+            let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts)
+            else {
+                panic!("draining at {minute}");
+            };
+            assert_eq!(holds[0].progressing, Some(true));
+            assert_eq!(holds[0].deadline_unix_ms, deadline);
+        }
+
+        fleet[0].work.clear();
+        settle(&mut fleet[0]);
+        let step = rollout.advance(&fleet, &artifacts, NOW + 170 * 60_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-fedora".to_string()),
+            "it updates as soon as the pass finishes"
+        );
+    }
+
+    /// Past its bound, work whose tree has gone quiet for its whole stall
+    /// bound, by output, CPU and storage alike, is wedged, and the turn passes.
+    #[test]
+    fn work_past_its_bound_and_silent_on_its_instruments_passes_the_turn() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = suite_fleet();
+        rollout.advance(&fleet, &artifacts, NOW);
+
+        let now = NOW + 95 * 60_000;
+        fleet[0].work = vec![sampled(
+            command("rust-tests", NOW, Some(HOUR)),
+            REVIEW_BOUND_MS - 1,
+            REVIEW_BOUND_MS,
+            now,
+        )];
+        let step = rollout.advance(&fleet, &artifacts, now);
+        assert_eq!(
+            step.hold.as_deref(),
+            Some("id-fedora"),
+            "quiet, but not for its whole bound"
+        );
+
+        let now = now + 1;
+        fleet[0].work = vec![sampled(
+            command("rust-tests", NOW, Some(HOUR)),
+            REVIEW_BOUND_MS,
+            REVIEW_BOUND_MS,
+            now,
+        )];
+        let step = rollout.advance(&fleet, &artifacts, now);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(
+            step.transitions[0].cause.contains(
+                "`rust-tests` was expected to finish 35 minutes ago, from its own learned duration of 60 minutes, and its tree has shown no progress for 30 minutes against its own 30-minute stall bound, so it is read as wedged"
+            ),
+            "{}",
+            step.transitions[0].cause
+        );
+        assert_eq!(step.hold.as_deref(), Some("id-busy"));
+    }
+
+    /// A reading of progress is only as good as the sample that carried it:
+    /// one that stops being refreshed ages, and stops holding the turn once
+    /// its age makes up the bound.
+    #[test]
+    fn a_progress_reading_that_stops_being_refreshed_stops_holding_the_turn() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = suite_fleet();
+        let last_sample = NOW + 100 * 60_000;
+        fleet[0].work = vec![sampled(
+            command("rust-tests", NOW, Some(HOUR)),
+            0,
+            REVIEW_BOUND_MS,
+            last_sample,
+        )];
+        rollout.advance(&fleet, &artifacts, NOW);
+        let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS - 1);
+        assert_eq!(step.hold.as_deref(), Some("id-fedora"));
+        let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+    }
+
+    /// Where nothing can say whether the work progresses (a platform that
+    /// cannot read the tree's CPU, or a stop with no complete reading), the
+    /// progress test is off rather than half-run, and the bound alone decides,
+    /// exactly as before.
+    #[test]
+    fn work_its_stall_stop_cannot_judge_is_bounded_by_its_duration_alone() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let fleet = suite_fleet();
+        let deadline = NOW + HOUR + HOUR / 2;
+        rollout.advance(&fleet, &artifacts, NOW);
+        let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts) else {
+            panic!("draining");
+        };
+        assert_eq!(holds[0].progressing, None);
+
+        let step = rollout.advance(&fleet, &artifacts, deadline - 1);
+        assert_eq!(step.hold.as_deref(), Some("id-fedora"));
+        let step = rollout.advance(&fleet, &artifacts, deadline);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(
+            step.transitions[0]
+                .cause
+                .contains("from its own learned duration of 60 minutes, so it is read as wedged"),
+            "{}",
+            step.transitions[0].cause
+        );
+    }
+
+    /// An agent's batch carries a zero stall bound: no stop judges it, so its
+    /// progress never keeps the turn, and it holds for the fixed hour like any
+    /// work with no expected end.
+    #[test]
+    fn an_agent_batch_keeps_the_fixed_hold_and_is_never_judged_by_progress() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("a", "old");
+        let batch = |now| sampled(command("`bun run dev`", NOW, None), 0, 0, now);
+        machine.work = vec![batch(NOW)];
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+
+        let now = NOW + UNMEASURED_HOLD_MS - 1;
+        machine.work = vec![batch(now)];
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
+        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &machine, &artifacts) else {
+            panic!("draining");
+        };
+        assert_eq!(holds[0].progressing, None, "a zero bound arms nothing");
+
+        let now = NOW + UNMEASURED_HOLD_MS;
+        machine.work = vec![batch(now)];
+        let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
+        assert!(
+            step.transitions[0].cause.contains(
+                "has held the turn 60 minutes without finishing, so it is read as wedged"
+            ),
+            "{}",
+            step.transitions[0].cause
         );
     }
 
