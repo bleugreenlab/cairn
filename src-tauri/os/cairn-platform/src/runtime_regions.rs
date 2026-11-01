@@ -573,17 +573,51 @@ mod tests {
         thread.join().unwrap();
     }
 
-    /// The discriminator the watchdog exists for. A worker spinning reads as
-    /// on-CPU for its whole interval; a worker asleep reads as off-CPU for it.
+    /// The discriminator the watchdog exists for: over the same window, a
+    /// worker spinning reads clearly more CPU than a worker asleep, and the
+    /// sleeper reads almost none of its interval. The two run at once so the
+    /// host treats them alike.
+    ///
+    /// Nothing here asserts how much of a core the spinner gets. That is the
+    /// host scheduler's share to give, and on a loaded machine the sampler is
+    /// right to report a spinner that was mostly left waiting. The relative
+    /// bound holds at any load short of the spinner never being scheduled, and
+    /// is strict so a sampler that reads zero for everything fails it.
+    ///
+    /// A relative bound cannot see a reading that is uniformly mis-scaled, so
+    /// the spinner also times its own window on its own CPU clock: whatever
+    /// share the host gave it, the sampler must report at least that much, and
+    /// no more than the wall time it was unparked.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_spinning_worker_reads_on_cpu_and_a_sleeping_one_reads_off_cpu() {
-        fn measure(runtime: &'static str, spin: bool) -> (Duration, Duration) {
+        fn own_cpu() -> Duration {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: reads the calling thread's CPU clock into a local.
+            let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            assert_eq!(status, 0, "the thread's own CPU clock");
+            Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+        }
+        struct Worker {
+            runtime: &'static str,
+            thread: std::thread::JoinHandle<()>,
+            step_rx: mpsc::Receiver<Duration>,
+            go_tx: mpsc::Sender<()>,
+        }
+        fn start(runtime: &'static str, spin: bool) -> Worker {
             let (step_tx, step_rx) = mpsc::channel();
             let (go_tx, go_rx) = mpsc::channel::<()>();
             let thread = spawn_registered(runtime, move || {
                 mark_running();
-                step_tx.send(()).unwrap();
+                step_tx.send(Duration::ZERO).unwrap();
+                // The window opens only once the observer has baselined this
+                // interval, so the work it measures lies inside the interval
+                // the sampler covers however late the observer is scheduled.
+                go_rx.recv().unwrap();
+                let cpu_before = own_cpu();
                 let until = Instant::now() + Duration::from_millis(300);
                 while Instant::now() < until {
                     if spin {
@@ -592,29 +626,56 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
-                step_tx.send(()).unwrap();
+                step_tx.send(own_cpu() - cpu_before).unwrap();
                 go_rx.recv().unwrap();
             });
-            step_rx.recv().unwrap();
-            sample_cpu(runtime);
-            step_rx.recv().unwrap();
-            let report = runtime_threads(runtime).remove(0);
-            go_tx.send(()).unwrap();
-            thread.join().unwrap();
+            Worker {
+                runtime,
+                thread,
+                step_rx,
+                go_tx,
+            }
+        }
+        let spinning = start("regions-spinning", true);
+        let sleeping = start("regions-sleeping", false);
+        for worker in [&spinning, &sleeping] {
+            worker.step_rx.recv().unwrap();
+            sample_cpu(worker.runtime);
+        }
+        for worker in [&spinning, &sleeping] {
+            worker.go_tx.send(()).unwrap();
+        }
+        let read = |worker: &Worker| {
+            let own = worker.step_rx.recv().unwrap();
+            let report = runtime_threads(worker.runtime).remove(0);
             (
                 report.running_for.unwrap(),
                 report.cpu.expect("a CPU reading"),
+                own,
             )
+        };
+        let (spinning_unparked, spinning_cpu, spinning_own) = read(&spinning);
+        let (sleeping_unparked, sleeping_cpu, _) = read(&sleeping);
+        for worker in [spinning, sleeping] {
+            worker.go_tx.send(()).unwrap();
+            worker.thread.join().unwrap();
         }
-        let (unparked, cpu) = measure("regions-spinning", true);
         assert!(
-            cpu >= unparked.mul_f32(0.5),
-            "spinning: cpu {cpu:?} of {unparked:?}"
+            sleeping_cpu <= sleeping_unparked.mul_f32(0.25),
+            "sleeping: cpu {sleeping_cpu:?} of {sleeping_unparked:?}"
         );
-        let (unparked, cpu) = measure("regions-sleeping", false);
         assert!(
-            cpu <= unparked.mul_f32(0.25),
-            "sleeping: cpu {cpu:?} of {unparked:?}"
+            spinning_cpu > sleeping_cpu * 4,
+            "spinning: cpu {spinning_cpu:?} of {spinning_unparked:?}; \
+             sleeping: cpu {sleeping_cpu:?} of {sleeping_unparked:?}"
+        );
+        // The tenth of slack absorbs the two clocks' differing resolution
+        // (macOS reports thread time to the microsecond); a mis-scaled
+        // reading is off by orders of magnitude.
+        assert!(
+            spinning_cpu >= spinning_own.mul_f32(0.9) && spinning_cpu <= spinning_unparked,
+            "spinning: cpu {spinning_cpu:?} of {spinning_unparked:?}, \
+             its own clock read {spinning_own:?}"
         );
         let report = ThreadReport {
             thread_name: "w".into(),
