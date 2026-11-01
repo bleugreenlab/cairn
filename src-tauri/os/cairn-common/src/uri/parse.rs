@@ -141,6 +141,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),
         }),
+        ["models", "clients"] => Some(CairnResource::ModelsClients),
+        ["models", "clients", id] => Some(CairnResource::ModelsClient {
+            id: (*id).to_string(),
+        }),
         // Names are normalized on the way in so the address an agent reads out
         // of `cairn://executors` and the label an operator typed reach the same
         // machine.

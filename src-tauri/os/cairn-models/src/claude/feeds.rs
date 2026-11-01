@@ -704,6 +704,7 @@ mod tests {
                     None,
                     now_ms() + 8 * HOUR_MS,
                     None,
+                    None,
                     now_ms(),
                 );
                 account.auth = ProviderAuth::ClaudeProfile {

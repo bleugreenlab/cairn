@@ -61,8 +61,7 @@ pub(crate) async fn search_web(orch: &Orchestrator, query: &str) -> Result<Strin
     };
 
     let prepared = build_request(id, query, &options, api_key.expose());
-    let client = reqwest::Client::new();
-    let resp = send(&client, &prepared)
+    let resp = send(cairn_tls::client(), &prepared)
         .send()
         .await
         .map_err(|e| format!("Web search via {} failed: {e}", id.label()))?;

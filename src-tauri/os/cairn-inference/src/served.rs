@@ -1,18 +1,17 @@
-//! What Cairn serves from its deployments, and what each served name says
-//! about its model.
+//! What Cairn serves from its deployments, and what each model is.
 //!
-//! Every deployed recipe is served under its served name and each of its
-//! aliases, whether or not it is loaded, because asking for one is what loads
-//! it (tenet 1321). [`served_models`] is that list. [`listing`] renders it as
-//! an OpenAI `/v1/models` body in OpenRouter's shape, so every entry, aliases
-//! included, says what its model takes and gives in `architecture`. The
-//! models facet's offers are built from the same list, so the two never
-//! disagree.
+//! Every deployed model is served under its real name (tenet 1336), whether or
+//! not it is loaded, because asking for it is what loads it (tenet 1321).
+//! [`served_models`] is that list. [`listing`] renders it as an OpenAI
+//! `/v1/models` body in OpenRouter's shape, so every entry says what its model
+//! takes and gives in `architecture`. The models facet's offers are built from
+//! the same list, so the two never disagree. The engine's own served name is
+//! the engine boundary's detail: a request by real name reaches the engine
+//! under it.
 //!
-//! A served name must mean exactly one deployment. A name that
-//! [`deployments_serving`] would resolve to anything else (a second deployment
-//! claiming it, or another deployment's id) is not served under that name; the
-//! deployment is served under its own id instead, which always resolves to it.
+//! A served name must mean exactly one deployment. A model with deployments in
+//! several places needs a pool to say which, which a caller of the served API
+//! cannot give, so it is not served there until placement chooses for it.
 //!
 //! The context a deployment advertises is the engine's own limit clamped to
 //! the KV cache it measured at start ([`EngineMeasure`]). An advertised
@@ -51,49 +50,6 @@ impl EngineMeasure {
     }
 }
 
-/// The KV cache size in an engine's Prometheus metrics, which vLLM reports as
-/// the `kv_cache_size_tokens` label of its `vllm:cache_config_info` gauge. With
-/// several engines (one series per `engine` label) it is the smallest, since a
-/// request lands on one of them. `None` when no series reports it.
-///
-/// Nothing is derived in its absence. `num_gpu_blocks` × `block_size` beside
-/// it on the DeepSeek V4 Flash build gives 64,824 tokens against a reported
-/// 1,447,093, so the product does not measure the cache on every engine.
-pub fn kv_cache_tokens(metrics: &str) -> Option<u64> {
-    metrics
-        .lines()
-        .filter_map(|line| line.strip_prefix("vllm:cache_config_info{"))
-        .filter_map(|labels| label(labels, "kv_cache_size_tokens")?.parse::<u64>().ok())
-        .min()
-}
-
-/// The value of `key` in a Prometheus label set (`a="1",b="2"}` and whatever
-/// follows the closing brace), quotes and escapes respected.
-fn label(labels: &str, key: &str) -> Option<String> {
-    let mut rest = labels;
-    loop {
-        rest = rest.trim_start_matches([',', ' ']);
-        if rest.starts_with('}') || rest.is_empty() {
-            return None;
-        }
-        let (name, after) = rest.split_once('=')?;
-        let after = after.strip_prefix('"')?;
-        let mut value = String::new();
-        let mut chars = after.char_indices();
-        let end = loop {
-            match chars.next()? {
-                (_, '\\') => value.push(chars.next()?.1),
-                (index, '"') => break index,
-                (_, c) => value.push(c),
-            }
-        };
-        if name.trim() == key {
-            return Some(value);
-        }
-        rest = &after[end + 1..];
-    }
-}
-
 /// The context limit in an engine's own `/v1/models` body (vLLM's
 /// `max_model_len`): the entry for `served_name`, else the only entry.
 pub fn max_model_len(models: &str, served_name: &str) -> Option<u64> {
@@ -109,21 +65,17 @@ pub fn max_model_len(models: &str, served_name: &str) -> Option<u64> {
     entry.get("max_model_len")?.as_u64()
 }
 
-/// One name Cairn serves, and the deployment that answers to it.
+/// One model Cairn serves, and the deployment that answers for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedModel {
-    /// The name a caller asks for.
+    /// The model's real name, which a caller asks for and a tokenizer is
+    /// looked up by.
     pub id: String,
-    /// The served name this id stands for, when it is an alias.
-    pub alias_of: Option<String>,
     pub deployment: DeploymentId,
     pub recipe: RecipeId,
     /// The name the engine answers to: every request for `id` reaches the
     /// engine under this name.
     pub served_name: String,
-    /// The model the engine loaded (the recipe's model name, such as a
-    /// repository id), which a tokenizer is looked up by.
-    pub root: String,
     pub upstream_id: Option<String>,
     /// The verbs the recipe declares; `None` when it doesn't say.
     pub verbs: Option<BTreeSet<VerbKind>>,
@@ -132,47 +84,37 @@ pub struct ServedModel {
     pub context_length: Option<u64>,
 }
 
-/// Every name Cairn serves, by deployment id and then served name before
-/// aliases, with each deployment's measured context.
+/// Every model Cairn serves, by deployment id, each under its real name with
+/// its deployment's measured context.
 pub fn served_models(
     inventory: &Inventory,
     measures: &BTreeMap<DeploymentId, EngineMeasure>,
 ) -> Vec<ServedModel> {
     let mut served = Vec::new();
+    let mut named = BTreeSet::new();
     for deployment in inventory.deployments.values() {
         let Some(recipe) = inventory.recipes.get(&deployment.recipe) else {
             continue;
         };
-        let resolves_here = |name: &str| {
-            deployments_serving(inventory, name).as_slice() == std::slice::from_ref(&deployment.id)
-        };
-        let context_length = measures
-            .get(&deployment.id)
-            .and_then(EngineMeasure::context_length);
-        let entry = |id: &str, alias_of: Option<&str>| ServedModel {
-            id: id.to_string(),
-            alias_of: alias_of.map(str::to_string),
+        let name = recipe.model.name.trim();
+        if !named.insert(name.to_ascii_lowercase()) {
+            continue;
+        }
+        if deployments_serving(inventory, name).as_slice() != std::slice::from_ref(&deployment.id) {
+            continue;
+        }
+        served.push(ServedModel {
+            id: name.to_string(),
             deployment: deployment.id.clone(),
             recipe: recipe.id.clone(),
             served_name: recipe.served_name.clone(),
-            root: recipe.model.name.clone(),
             upstream_id: recipe.upstream_id.clone(),
             verbs: recipe.verbs.clone(),
             modalities: modalities(recipe),
-            context_length,
-        };
-        let primary = if resolves_here(&recipe.served_name) {
-            recipe.served_name.as_str()
-        } else {
-            deployment.id.as_str()
-        };
-        let mut named: BTreeSet<String> = BTreeSet::from([primary.to_ascii_lowercase()]);
-        served.push(entry(primary, None));
-        for alias in &recipe.aliases {
-            if resolves_here(alias) && named.insert(alias.to_ascii_lowercase()) {
-                served.push(entry(alias, Some(primary)));
-            }
-        }
+            context_length: measures
+                .get(&deployment.id)
+                .and_then(EngineMeasure::context_length),
+        });
     }
     served
 }
@@ -211,10 +153,10 @@ pub fn modalities(recipe: &Recipe) -> Modalities {
 }
 
 /// `models` as an OpenAI `/v1/models` body in OpenRouter's shape. Each entry
-/// carries `architecture`, `root` (the loaded model, as vLLM reports it),
-/// `alias_of` on an alias (as bgllm did), and the clamped context under both
-/// OpenRouter's `context_length` and vLLM's `max_model_len` when measured. A
-/// served name has no creation time, which `created: 0` says.
+/// carries `architecture`, `root` (the loaded model, as vLLM reports it, which
+/// is its real name), and the clamped context under both OpenRouter's
+/// `context_length` and vLLM's `max_model_len` when measured. A served model
+/// has no creation time, which `created: 0` says.
 pub fn listing(models: &[ServedModel]) -> Value {
     json!({
         "object": "list",
@@ -228,15 +170,12 @@ fn listing_entry(model: &ServedModel) -> Value {
         "object": "model",
         "created": 0,
         "owned_by": "cairn-inference",
-        "root": model.root,
+        "root": model.id,
         "architecture": {
             "input_modalities": model.modalities.input,
             "output_modalities": model.modalities.output,
         },
     });
-    if let Some(target) = &model.alias_of {
-        entry["alias_of"] = json!(target);
-    }
     if let Some(context) = model.context_length {
         entry["context_length"] = json!(context);
         entry["max_model_len"] = json!(context);
@@ -249,18 +188,12 @@ mod tests {
     use super::*;
     use crate::fixture::{command_recipe, deployment, test_inventory};
 
-    /// The live `vllm:cache_config_info` series of DeepSeek V4 Flash on the
-    /// Sparks, read 2026-10-31.
-    const DSV4_METRICS: &str = r#"# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig
-# TYPE vllm:cache_config_info gauge
-vllm:cache_config_info{_block_size_resolved="True",block_size="4",cache_dtype="nvfp4_ds_mla",calculate_kv_scales="False",enable_prefix_caching="True",engine="0",gpu_memory_utilization="0.835",hash_block_size="None",is_attention_free="False",kv_cache_dtype_skip_layers="[]",kv_cache_max_concurrency="1.3800562036958188",kv_cache_memory_bytes="None",kv_cache_size_tokens="1447093",kv_offloading_backend="native",kv_offloading_size="None",kv_sharing_fast_prefill="False",mamba_block_size="None",mamba_cache_dtype="auto",mamba_cache_mode="none",mamba_page_size_padded="None",mamba_ssm_cache_dtype="auto",num_cpu_blocks="None",num_gpu_blocks="16206",num_gpu_blocks_override="None",prefix_caching_hash_algo="sha256",skip_page_size_padded="None",sliding_window="128",user_specified_block_size="True",user_specified_mamba_block_size="False"} 1.0
-vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 0.0
-"#;
-
     /// The same engine's own `/v1/models`, read the same day.
     const DSV4_MODELS: &str = r#"{"object":"list","data":[{"id":"deepseek-v4-flash-vision-exp","object":"model","created":1793470670,"owned_by":"vllm","root":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp","parent":null,"max_model_len":1048576,"permission":[]}]}"#;
 
-    /// The test inventory, with DeepSeek's served name and aliases as its
+    const DSV4: &str = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp";
+
+    /// The test inventory, with DeepSeek's real and served names as its
     /// recipe has them.
     fn sparks() -> Inventory {
         let mut inventory = test_inventory();
@@ -269,37 +202,12 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
             .get_mut(&RecipeId::from("dsv4f-tp2"))
             .unwrap();
         recipe.served_name = "deepseek-v4-flash-vision-exp".into();
-        recipe.model.name = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp".into();
-        recipe.aliases = vec!["big".into(), "vision".into(), "dsv4-flash".into()];
+        recipe.model.name = DSV4.into();
         inventory
     }
 
     fn ids(served: &[ServedModel]) -> Vec<&str> {
         served.iter().map(|s| s.id.as_str()).collect()
-    }
-
-    #[test]
-    fn the_kv_cache_is_the_reported_label_and_nothing_derived() {
-        assert_eq!(kv_cache_tokens(DSV4_METRICS), Some(1_447_093));
-        let derivable_only =
-            "vllm:cache_config_info{block_size=\"4\",num_gpu_blocks=\"16206\"} 1.0\n";
-        assert_eq!(kv_cache_tokens(derivable_only), None);
-        assert_eq!(kv_cache_tokens(""), None);
-        assert_eq!(kv_cache_tokens("not found"), None);
-    }
-
-    #[test]
-    fn of_several_engines_the_smallest_cache_counts() {
-        let two = "vllm:cache_config_info{engine=\"0\",kv_cache_size_tokens=\"900\"} 1.0\n\
-                   vllm:cache_config_info{engine=\"1\",kv_cache_size_tokens=\"700\"} 1.0\n";
-        assert_eq!(kv_cache_tokens(two), Some(700));
-    }
-
-    #[test]
-    fn a_quoted_value_may_hold_separators_and_escapes() {
-        let tricky =
-            "vllm:cache_config_info{note=\"a,b}=c \\\"q\\\"\",kv_cache_size_tokens=\"42\"} 1.0";
-        assert_eq!(kv_cache_tokens(tricky), Some(42));
     }
 
     #[test]
@@ -335,7 +243,7 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
     }
 
     #[test]
-    fn every_deployed_recipe_is_served_by_name_and_alias_loaded_or_not() {
+    fn every_deployed_model_is_served_by_its_real_name_loaded_or_not() {
         let measures = BTreeMap::from([(
             DeploymentId::from("dsv4f-tp2"),
             EngineMeasure {
@@ -344,50 +252,24 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
             },
         )]);
         let served = served_models(&sparks(), &measures);
-        assert_eq!(
-            ids(&served),
-            [
-                "deepseek-v4-flash-vision-exp",
-                "big",
-                "vision",
-                "dsv4-flash",
-                "qwen3-embed-4b",
-                "qwen36-fast",
-            ]
-        );
-        let alias = served.iter().find(|s| s.id == "dsv4-flash").unwrap();
-        assert_eq!(
-            alias.alias_of.as_deref(),
-            Some("deepseek-v4-flash-vision-exp")
-        );
-        assert_eq!(alias.served_name, "deepseek-v4-flash-vision-exp");
-        assert_eq!(alias.deployment.as_str(), "dsv4f-tp2");
-        assert_eq!(alias.context_length, Some(1_048_576));
+        assert_eq!(ids(&served), [DSV4, "qwen3-embed-4b", "qwen36-fast"]);
+        let deepseek = &served[0];
+        assert_eq!(deepseek.served_name, "deepseek-v4-flash-vision-exp");
+        assert_eq!(deepseek.deployment.as_str(), "dsv4f-tp2");
+        assert_eq!(deepseek.context_length, Some(1_048_576));
         // An unmeasured deployment advertises no context.
         let fast = served.iter().find(|s| s.id == "qwen36-fast").unwrap();
         assert_eq!(fast.context_length, None);
     }
 
     #[test]
-    fn a_name_two_deployments_claim_is_served_by_neither_and_each_keeps_its_id() {
+    fn a_model_deployed_twice_is_not_served_until_something_chooses() {
         let mut inventory = sparks();
-        for id in ["dsv4f-tp2", "qwen36-fast"] {
-            inventory
-                .recipes
-                .get_mut(&RecipeId::from(id))
-                .unwrap()
-                .aliases
-                .push("big".into());
-        }
-        // A second deployment of DeepSeek's recipe claims its served name.
         let mut copy = deployment("dsv4f-copy", &["halo"]);
         copy.recipe = "dsv4f-tp2".into();
         inventory.insert_deployment(copy);
         let served = served_models(&inventory, &BTreeMap::new());
-        assert!(!ids(&served).contains(&"big"), "{:?}", ids(&served));
-        assert!(!ids(&served).contains(&"deepseek-v4-flash-vision-exp"));
-        assert!(ids(&served).contains(&"dsv4f-tp2"));
-        assert!(ids(&served).contains(&"dsv4f-copy"));
+        assert_eq!(ids(&served), ["qwen3-embed-4b", "qwen36-fast"]);
         // Every listed name resolves to exactly the deployment it lists.
         for model in &served {
             assert_eq!(
@@ -415,7 +297,7 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
     }
 
     #[test]
-    fn every_listing_entry_carries_architecture_and_an_alias_names_its_target() {
+    fn every_listing_entry_carries_architecture_under_the_real_name() {
         let mut inventory = sparks();
         inventory
             .recipes
@@ -434,7 +316,7 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
         )]);
         let body = listing(&served_models(&inventory, &measures));
         let data = body["data"].as_array().unwrap();
-        assert_eq!(data.len(), 6);
+        assert_eq!(data.len(), 3);
         for entry in data {
             assert!(
                 entry["architecture"]["input_modalities"].is_array(),
@@ -446,16 +328,16 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
             );
             assert_eq!(entry["object"], "model");
         }
-        let alias = data.iter().find(|e| e["id"] == "dsv4-flash").unwrap();
+        assert!(data.iter().all(|e| e.get("alias_of").is_none()));
+        let deepseek = data.iter().find(|e| e["id"] == DSV4).unwrap();
         assert_eq!(
-            alias,
+            deepseek,
             &json!({
-                "id": "dsv4-flash",
+                "id": DSV4,
                 "object": "model",
                 "created": 0,
                 "owned_by": "cairn-inference",
-                "root": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-                "alias_of": "deepseek-v4-flash-vision-exp",
+                "root": DSV4,
                 "context_length": 1_048_576,
                 "max_model_len": 1_048_576,
                 "architecture": {
@@ -466,6 +348,5 @@ vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash-vision-exp"} 
         );
         let fast = data.iter().find(|e| e["id"] == "qwen36-fast").unwrap();
         assert!(fast.get("context_length").is_none());
-        assert!(fast.get("alias_of").is_none());
     }
 }

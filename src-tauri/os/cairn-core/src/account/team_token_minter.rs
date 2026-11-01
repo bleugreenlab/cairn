@@ -58,7 +58,7 @@ impl DefaultTeamTokenMinter {
         Self {
             local,
             api,
-            client: reqwest::Client::new(),
+            client: cairn_tls::client().clone(),
         }
     }
 }

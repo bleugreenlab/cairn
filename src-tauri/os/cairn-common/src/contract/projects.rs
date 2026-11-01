@@ -211,6 +211,7 @@ pub(crate) const SETTINGS_CONTRACT: ResourceContract =
                 SETTINGS_KEYBINDS,
                 SETTINGS_BUILD_SERVICES,
                 SETTINGS_INFERENCE,
+                SETTINGS_SERVED_API,
                 SETTINGS_MAX_THINKING_TOKENS,
                 SETTINGS_ORPHAN_CLEANUP_DAYS,
                 SETTINGS_REPO_TARGET_SWEEP_DAYS,

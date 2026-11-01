@@ -1,0 +1,26 @@
+[package]
+name = "cairn-tls"
+version.workspace = true
+edition = "2021"
+description = "The process's one TLS client trust configuration: the platform root store, loaded once, and the HTTP and WebSocket client configs built on it"
+license = "BUSL-1.1"
+
+# A leaf the wire crates may depend on: it reaches no workspace crate, and adds
+# nothing to a wire crate's graph that its reqwest does not already bring.
+[dependencies]
+log = "0.4"
+# `rustls-tls-manual-roots-no-provider` is reqwest's "the caller supplies the
+# TLS config" feature: it compiles `use_preconfigured_tls` without asking
+# reqwest to load any root store of its own. `http2` because the shared config
+# advertises h2 over ALPN, which is only sound when every client built on it
+# can speak it. `blocking` for the wire crates' synchronous clients.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "rustls-tls-manual-roots-no-provider"] }
+# An explicit provider, never `ClientConfig::builder()`: Cairn's graph compiles
+# both of rustls' providers, which makes the implicit choice panic.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8"
+# `ready()` waits for the loader thread without blocking the awaiting worker.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

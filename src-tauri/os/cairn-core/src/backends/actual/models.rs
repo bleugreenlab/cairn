@@ -162,7 +162,7 @@ struct ProbeFailure {
 
 /// `GET {target}/v1/models`, classified.
 fn fetch_models(target: &Target) -> Result<Vec<(String, Option<i64>)>, ProbeFailure> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
         .build()

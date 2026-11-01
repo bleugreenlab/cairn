@@ -95,6 +95,18 @@ const INFERENCE_REMOVE: KeySpec = KeySpec::new(
 
 const INFERENCE_POOL: KeySpec = KeySpec::new("pool", KeyType::Str, "");
 
+const INFERENCE_WARM: KeySpec = KeySpec::new(
+    "warm",
+    KeyType::Str,
+    "the model (real name) the pool loads when idle, held as the pool record's default; null warms nothing",
+);
+
+const INFERENCE_REQUEST_POOL: KeySpec = KeySpec::new(
+    "pool",
+    KeyType::Str,
+    "the pool to load it on, when the model is deployed in more than one",
+);
+
 const INFERENCE_CONTROLLED: KeySpec = KeySpec::new(
     "controlled",
     KeyType::Bool,
@@ -128,7 +140,7 @@ const INFERENCE_REVOKE: KeySpec = KeySpec::new(
 const INFERENCE_MODEL: KeySpec = KeySpec::new(
     "model",
     KeyType::Str,
-    "a deployment id, or a recipe id, served name, model name or alias naming exactly one deployment",
+    "the model's real name, its Hugging Face repository id (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp); a deployment id, recipe id or served name names no model",
 );
 
 const INFERENCE_REQUESTER: KeySpec = KeySpec::new(
@@ -218,13 +230,14 @@ pub(crate) const INFERENCE_POOLS_CONTRACT: ResourceContract = ResourceContract {
         mode: ChangeMode::Patch,
         required: &[INFERENCE_POOL],
         optional: &[
+            INFERENCE_WARM,
             INFERENCE_CONTROLLED,
             INFERENCE_SETTINGS,
             INFERENCE_PIN,
             INFERENCE_RELEASE,
             INFERENCE_REVOKE,
         ],
-        label: "control a pool: take or hand back control, set its windows, pin or release it",
+        label: "set a pool's warm model, or control it: take or hand back control, set its windows, pin or release it",
         example: r#"write({changes:[{target:"cairn://inference/pools",mode:"patch",payload:{pool:"sparks",controlled:true,settings:{modelIdleSecs:1800}}}]})"#,
     }],
 };
@@ -233,7 +246,7 @@ pub(crate) const INFERENCE_REQUESTS_CONTRACT: ResourceContract = ResourceContrac
     kind: ResourceKind::InferenceRequests,
     uri_template: "cairn://inference/requests",
     name: "Inference requests",
-    description: "The pool controller's queue of model requests. Append a model to ask for it: the request names exactly one deployment, which must be in a pool under Cairn's control, and waits until that deployment is healthy, fails to load, or is cancelled; a named model is never served by another. The page lists every waiting request with the model, the pool, the requester and what it waits on (builds draining from the pool's machines, an agent turn that is never preempted, another model unloading, the load itself, a pin, a loaded model inside its idle window or minimum residency, or an earlier request for the same machines), then the requests answered in the last week.",
+    description: "The pool controller's queue of model requests. Append a model, by its real name, to ask for it: the name (and the pool, when the model is deployed in several) must mean exactly one deployment, which must be in a pool under Cairn's control, and waits until that deployment is healthy, fails to load, or is cancelled; a named model is never served by another. The page lists every waiting request with the model, the pool, the requester and what it waits on (builds draining from the pool's machines, an agent turn that is never preempted, another model unloading, the load itself, a pin, a loaded model inside its idle window or minimum residency, or an earlier request for the same machines), then the requests answered in the last week.",
     read_projections: NO_PROJECTIONS,
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,
@@ -241,9 +254,9 @@ pub(crate) const INFERENCE_REQUESTS_CONTRACT: ResourceContract = ResourceContrac
         MutationSpec {
             mode: ChangeMode::Append,
             required: &[INFERENCE_MODEL],
-            optional: &[INFERENCE_REQUESTER],
+            optional: &[INFERENCE_REQUEST_POOL, INFERENCE_REQUESTER],
             label: "request a model",
-            example: r#"write({changes:[{target:"cairn://inference/requests",mode:"append",payload:{model:"dsv4f-tp2"}}]})"#,
+            example: r#"write({changes:[{target:"cairn://inference/requests",mode:"append",payload:{model:"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"}}]})"#,
         },
         MutationSpec {
             mode: ChangeMode::Patch,

@@ -505,25 +505,7 @@ impl Orchestrator {
             .lock()
             .map_err(|_| "Identity store lock poisoned".to_string())?;
         let store = guard.as_mut().ok_or("No identity store")?;
-        let account = store
-            .accounts
-            .iter_mut()
-            .find(|account| account.id == id)
-            .ok_or_else(|| format!("Account not found: {id}"))?;
-        let now = chrono::Utc::now().timestamp();
-        let health = account
-            .health
-            .get_or_insert_with(crate::credentials::ProviderAccountHealth::default);
-        health.held = Some(crate::credentials::AccountHold {
-            since: now,
-            kind,
-            detail,
-        });
-        health.captured_at = now;
-        let label = account
-            .email
-            .clone()
-            .unwrap_or_else(|| account.label.clone());
+        let label = store.hold_account(id, kind, detail, chrono::Utc::now().timestamp())?;
         self.credential_store.persist_locked(store)?;
         drop(guard);
         self.emit_config_changed();
@@ -1112,6 +1094,9 @@ mod tests {
         fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.renew_claude_credentials(host)
         }
+        fn renew_codex_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.renew_codex_credentials(host)
+        }
         fn claude_credential_rejected(
             &self,
             host: &dyn ModelHost,
@@ -1610,15 +1595,25 @@ mod tests {
 
         await_full_catalog_refresh(&orch).await;
 
+        // The enabled providers, and the built-in one, whose discovery reads
+        // Cairn's own deployment records (this test database has none, so it
+        // may report that).
         let catalog = orch.get_model_catalog();
-        assert_eq!(
-            catalog
-                .iter()
-                .map(|entry| (entry.backend.as_str(), entry.error.as_deref()))
-                .collect::<Vec<_>>(),
-            [("claude", None), (key.as_str(), None)]
-        );
-        assert!(catalog[1]
+        let inference = crate::backends::inference::INFERENCE_BACKEND_KEY;
+        assert!(catalog.iter().any(|entry| entry.backend == inference));
+        let mut found: Vec<(&str, Option<&str>)> = catalog
+            .iter()
+            .filter(|entry| entry.backend != inference)
+            .map(|entry| (entry.backend.as_str(), entry.error.as_deref()))
+            .collect();
+        found.sort();
+        let mut expected = vec![("claude", None), (key.as_str(), None)];
+        expected.sort();
+        assert_eq!(found, expected);
+        assert!(catalog
+            .iter()
+            .find(|entry| entry.backend == key)
+            .unwrap()
             .models
             .iter()
             .any(|model| model.id == "local-model"));

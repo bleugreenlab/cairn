@@ -18,10 +18,13 @@
 //! > The whole-file restore of a path is lossless exactly when
 //! > `completion_candidate(base, ours, theirs) == ours`.
 //!
-//! Taking `ours` at every conflict reproduces the agent's own resolution, and
-//! the merge's clean regions carry the incoming hunks. So a candidate that still
-//! equals the committed tip proves the tip already holds both sides; a candidate
-//! that differs names, precisely, the incoming work the restore would drop.
+//! Where both sides changed the same lines, the candidate takes `ours`, which
+//! reproduces the agent's own resolution. Where both sides only INSERTED lines
+//! at the same spot there was nothing to choose between, so the candidate takes
+//! the union of the two insertions. The merge's clean regions carry the incoming
+//! hunks. So a candidate that still equals the committed tip proves the tip
+//! already holds both sides; a candidate that differs names, precisely, the
+//! incoming work the restore would drop.
 //!
 //! Everything here is ADVISORY, and says so wherever it is rendered. The store's
 //! replay is judged by jj's own merge, never by this one. This exists so an
@@ -223,17 +226,133 @@ pub fn merge_preview(base: &str, ours: &str, theirs: &str) -> MergePreview {
     }
 }
 
-/// The same merge with every conflict region collapsed to its `ours` side: the
-/// complete file the branch would need to commit for a whole-file restore to be
-/// lossless.
+/// The same merge with every conflict region resolved the way a committed tip
+/// holding both sides would have it: the complete file the branch would need to
+/// commit for a whole-file restore to be lossless. See
+/// [`resolve_conflict_regions`] for how each region is resolved, and
+/// [`without_reinsertions`] for the incoming blocks it declines to add twice.
 pub fn completion_candidate(base: &str, ours: &str, theirs: &str) -> String {
-    match merge_preview(base, ours, theirs) {
+    let merged = match merge_preview(base, ours, theirs) {
         MergePreview::Clean(text) => text,
-        MergePreview::Conflicted { text, .. } => collapse_conflicts_to_ours(&text),
+        MergePreview::Conflicted { text, .. } => resolve_conflict_regions(&text),
+    };
+    without_reinsertions(base, ours, theirs, merged)
+}
+
+/// The candidate minus every block it would add that the committed tip
+/// already carries somewhere else.
+///
+/// The line merge places an incoming insertion by position. A resolution that
+/// kept the incoming block but placed it elsewhere — below the branch's own
+/// additions, or on the other side of a reordered neighbour — reads to it as a
+/// tip that lacks the block, and the merge inserts a second copy: a duplicate
+/// function that does not compile, reported as incoming work the restore would
+/// drop.
+///
+/// A block the candidate adds counts as already held only on positive
+/// evidence, because reading it as held is the direction that loses work:
+///
+/// - with the blank lines at its edges set aside, it carries at least one line
+///   the base never had, so it is the incoming side's own content and not a
+///   lone `}` or blank line that any file holds;
+/// - the tip holds at least as many copies of the whole block as the incoming
+///   side does. A registration the incoming side made in two lists, of which
+///   the tip carries one, is still added to the other.
+///
+/// Only pure insertions are considered. A change that also removes lines from
+/// the tip is a modification, and is kept as the merge made it.
+fn without_reinsertions(base: &str, ours: &str, theirs: &str, candidate: String) -> String {
+    if candidate == ours {
+        return candidate;
+    }
+    // As in `union_of_insertions`, a context at least as long as both inputs
+    // folds the diff into one hunk spanning every line of each side.
+    let patch = diffy::DiffOptions::new()
+        .set_context_len(ours.len() + candidate.len())
+        .create_patch(ours, &candidate);
+    let base_lines: BTreeSet<&str> = base.split_inclusive('\n').map(bare_line).collect();
+    let ours_lines: Vec<&str> = ours.split_inclusive('\n').map(bare_line).collect();
+    let theirs_lines: Vec<&str> = theirs.split_inclusive('\n').map(bare_line).collect();
+    let already_held = |block: &[&str]| {
+        // Blank lines at a block's edges are separators, not content: the
+        // diff attaches one to whichever end its alignment chose, and the
+        // tip's copy sits beside different neighbours.
+        let blank = |line: &&str| line.trim().is_empty();
+        let start = block.iter().position(|line| !blank(line));
+        let end = block.iter().rposition(|line| !blank(line));
+        let (Some(start), Some(end)) = (start, end) else {
+            return false;
+        };
+        let block = &block[start..=end];
+        block.iter().any(|line| !base_lines.contains(line))
+            && count_block(&ours_lines, block) >= count_block(&theirs_lines, block)
+    };
+
+    let mut out = String::with_capacity(candidate.len());
+    let mut dropped_any = false;
+    for hunk in patch.hunks() {
+        let lines = hunk.lines();
+        let mut index = 0;
+        while index < lines.len() {
+            if let diffy::Line::Context(text) = lines[index] {
+                out.push_str(text);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < lines.len() && !matches!(lines[index], diffy::Line::Context(_)) {
+                index += 1;
+            }
+            let group = &lines[start..index];
+            let inserted: Vec<&str> = group
+                .iter()
+                .filter_map(|line| match line {
+                    diffy::Line::Insert(text) => Some(*text),
+                    _ => None,
+                })
+                .collect();
+            let pure_insertion = inserted.len() == group.len();
+            let block: Vec<&str> = inserted.iter().copied().map(bare_line).collect();
+            if pure_insertion && already_held(&block) {
+                dropped_any = true;
+                continue;
+            }
+            for text in inserted {
+                out.push_str(text);
+            }
+        }
+    }
+    if dropped_any {
+        out
+    } else {
+        candidate
     }
 }
 
-/// Strip every conflict region in a diff3-style merge down to its `ours` side.
+/// How many times `block` occurs in `lines` as a contiguous run.
+fn count_block(lines: &[&str], block: &[&str]) -> usize {
+    if block.is_empty() || block.len() > lines.len() {
+        return 0;
+    }
+    lines
+        .windows(block.len())
+        .filter(|window| *window == block)
+        .count()
+}
+
+/// Resolve every conflict region in a diff3-style merge, leaving a marker-free
+/// file.
+///
+/// A region where both sides changed the same original lines resolves to its
+/// `ours` side: there the agent's committed region IS their resolution, and
+/// taking it is what a whole-file restore of the committed tip does.
+///
+/// A region whose original section is EMPTY is different in kind. Both sides
+/// only inserted lines at the same spot, so there was no choice between them
+/// to make, and keeping `ours` alone would silently discard the incoming
+/// insertion — two independent declarations above the same line read as a
+/// "resolved" region whose incoming half vanished. Such a region resolves to the
+/// union of the two insertions; see [`union_of_insertions`].
 ///
 /// A state machine rather than a marker scan, deliberately: content that merely
 /// LOOKS like an opening marker cannot open a region while one is already open,
@@ -244,22 +363,29 @@ pub fn completion_candidate(base: &str, ours: &str, theirs: &str) -> String {
 /// Load-bearing beyond legibility: [`completion_candidate`] is what the loss
 /// invariant compares against, so a region read wrongly turns a safe replay into
 /// a refusal, or a lossy one into a silent drop.
-fn collapse_conflicts_to_ours(merged: &str) -> String {
+fn resolve_conflict_regions(merged: &str) -> String {
     #[derive(Clone, Copy)]
     enum Region {
         /// Outside any conflict: merged content, kept.
         Body,
-        /// Inside the `ours` side: kept, because taking ours at every conflict
-        /// is what a whole-file restore of the committed tip does.
+        /// Inside the `ours` side: buffered until the region closes.
         Ours,
-        /// Inside the `||||||| original` side: dropped.
+        /// Inside the `||||||| original` side: only whether it is empty
+        /// matters.
         Original,
-        /// Inside the `theirs` side: dropped.
+        /// Inside the `theirs` side: buffered until the region closes.
         Theirs,
     }
 
     let mut out = String::with_capacity(merged.len());
     let mut state = Region::Body;
+    let mut ours = String::new();
+    let mut theirs = String::new();
+    // Whether this region is a pure insertion on both sides: an original
+    // section was written and held nothing. The non-diff3 style writes no
+    // original section at all, and a region whose original is unknown is not
+    // read as one, which keeps that style's regions resolving to `ours`.
+    let mut insertion_only = false;
     // `split_inclusive` keeps each line's terminator, so a file with no trailing
     // newline survives the round trip unchanged.
     for line in merged.split_inclusive('\n') {
@@ -268,6 +394,9 @@ fn collapse_conflicts_to_ours(merged: &str) -> String {
             Region::Body => {
                 if is_marker(bare, '<') {
                     state = Region::Ours;
+                    ours.clear();
+                    theirs.clear();
+                    insertion_only = false;
                 } else {
                     out.push_str(line);
                 }
@@ -275,28 +404,74 @@ fn collapse_conflicts_to_ours(merged: &str) -> String {
             Region::Ours => {
                 if is_marker(bare, '|') {
                     state = Region::Original;
+                    insertion_only = true;
                 } else if is_marker(bare, '=') {
                     // Only reachable under the non-diff3 conflict style, which
-                    // has no original section. Accepted so the collapse does not
-                    // depend on which style produced its input.
+                    // has no original section. Accepted so the resolution does
+                    // not depend on which style produced its input.
                     state = Region::Theirs;
                 } else {
-                    out.push_str(line);
+                    ours.push_str(line);
                 }
             }
             Region::Original => {
                 if is_marker(bare, '=') {
                     state = Region::Theirs;
+                } else {
+                    insertion_only = false;
                 }
             }
             Region::Theirs => {
                 if is_marker(bare, '>') {
+                    if insertion_only {
+                        out.push_str(&union_of_insertions(&ours, &theirs));
+                    } else {
+                        out.push_str(&ours);
+                    }
                     state = Region::Body;
+                } else {
+                    theirs.push_str(line);
                 }
             }
         }
     }
+    // A region left open at end of input keeps what the branch wrote in it, as
+    // a malformed merge cannot be judged region by region.
+    if !matches!(state, Region::Body) {
+        out.push_str(&ours);
+    }
     out
+}
+
+/// Both sides' insertions at one spot. When `ours` already carries every line
+/// `theirs` inserted, in order, it is the union and comes back unchanged, so a
+/// tip that took the incoming insertion beside its own is lossless. Otherwise
+/// the branch's lines come first and the incoming ones follow whole, the order
+/// git's `merge=union` uses.
+///
+/// Whole blocks rather than a line-diff interleave, deliberately: two inserted
+/// functions share their closing `}`, and an interleave would emit both
+/// openings above one brace. Appending can repeat a line both sides inserted
+/// when only part of the incoming insertion is present, which shows plainly
+/// in the diff that accompanies the candidate.
+fn union_of_insertions(ours: &str, theirs: &str) -> String {
+    let mut wanted = theirs.split_inclusive('\n').map(bare_line).peekable();
+    for line in ours.split_inclusive('\n').map(bare_line) {
+        if wanted.peek() == Some(&line) {
+            wanted.next();
+        }
+    }
+    if wanted.peek().is_none() {
+        return ours.to_string();
+    }
+    let mut out = String::with_capacity(ours.len() + theirs.len());
+    out.push_str(ours);
+    out.push_str(theirs);
+    out
+}
+
+fn bare_line(line: &str) -> &str {
+    line.trim_end_matches(['\n', '\r'])
 }
 
 /// Whether a line is a conflict marker of the given kind: exactly [`MARKER_LEN`]
@@ -320,7 +495,7 @@ struct ConflictRegion<'a> {
 }
 
 /// Every conflict region in a diff3-style merge, by the same state machine as
-/// [`collapse_conflicts_to_ours`], so the two can never read a region
+/// [`resolve_conflict_regions`], so the two can never read a region
 /// differently.
 fn conflict_regions(merged: &str) -> Vec<ConflictRegion<'_>> {
     #[derive(Clone, Copy)]
@@ -405,9 +580,10 @@ fn region_holds_incoming(region: &ConflictRegion<'_>) -> bool {
 /// inside every conflicting region as well as everywhere else.
 ///
 /// Stronger than [`RestoreVerdict::Lossless`] on purpose. The loss invariant
-/// takes `ours` at every conflict, because there the agent's committed region
-/// IS the resolution; that makes an untouched, one-sided file lossless too
-/// whenever the incoming change lives entirely inside the conflict. This is the
+/// takes `ours` at every conflict where both sides changed the same lines,
+/// because there the agent's committed region IS the resolution; that makes an
+/// untouched, one-sided file lossless too whenever the incoming change lives
+/// entirely inside such a conflict. This is the
 /// question for a file nobody has committed to since the conflict was
 /// recorded: is its content already a resolution (made before the conflict was
 /// recorded, where jj's line merge could not see it), or is it just the
@@ -464,8 +640,8 @@ fn count_conflict_regions(merged: &str) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DroppedWork {
     /// The COMPLETE file that would make the restore lossless: the merge with
-    /// every conflict region taken from the committed tip. Marker-free, so it is
-    /// directly committable.
+    /// every conflict region resolved by [`resolve_conflict_regions`].
+    /// Marker-free, so it is directly committable.
     pub candidate: String,
     /// Unified diff from the committed tip to that candidate — exactly the work
     /// the restore drops, and nothing else.
@@ -976,7 +1152,7 @@ mod tests {
     /// and the block simply vanishes.
     #[test]
     fn incoming_work_outside_the_conflict_is_named_as_dropped() {
-        let base = "header\nbody\nbody\nbody\n";
+        let base = "header\ncontested\nbody\nbody\nbody\n";
         let ours = "header\nours-resolution\nbody\nbody\nbody\n";
         let theirs = "header\ntheirs-line\nbody\nbody\nbody\ntimeout_secs: 30\nretries: 3\n";
 
@@ -1043,7 +1219,7 @@ mod tests {
         let theirs = "1\nTHEIRS-A\n3\nTHEIRS-B\n5\n";
         let merged = merge_preview(base, ours, theirs);
         assert_eq!(merged.regions(), 2, "two disjoint regions: {merged:?}");
-        assert_eq!(collapse_conflicts_to_ours(merged.text()), ours);
+        assert_eq!(resolve_conflict_regions(merged.text()), ours);
     }
 
     /// A file whose own content contains conflict scaffolding — documentation,
@@ -1060,7 +1236,7 @@ mod tests {
             ">".repeat(MARKER_LEN),
         );
         assert_eq!(
-            collapse_conflicts_to_ours(&merged),
+            resolve_conflict_regions(&merged),
             format!("keep\n{scaffolding}mine\ntail\n")
         );
     }
@@ -1083,7 +1259,180 @@ mod tests {
             "=".repeat(MARKER_LEN),
             ">".repeat(MARKER_LEN),
         );
-        assert_eq!(collapse_conflicts_to_ours(&merged), "head\nmine\n");
+        assert_eq!(resolve_conflict_regions(&merged), "head\nmine\n");
+    }
+
+    /// Bug-sink #372 at its smallest: both sides insert a line above `A`. The
+    /// line merge conflicts, and keeping the branch's line alone is not a
+    /// resolution of that conflict but the loss of the incoming line. The
+    /// candidate carries both, the branch's first, and a tip carrying only its
+    /// own line is lossy with the incoming line named in the diff.
+    #[test]
+    fn a_same_spot_insertion_on_both_sides_is_never_resolved_as_ours_alone() {
+        let (base, ours, theirs) = ("A\n", "X\nA\n", "Y\nA\n");
+        assert!(
+            matches!(
+                merge_preview(base, ours, theirs),
+                MergePreview::Conflicted { regions: 1, .. }
+            ),
+            "two insertions at one spot are a conflict to the line merge"
+        );
+        assert_eq!(completion_candidate(base, ours, theirs), "X\nY\nA\n");
+
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&sides(base, ours, theirs))
+        else {
+            panic!("a tip without the incoming insertion cannot be lossless");
+        };
+        assert!(dropped.diff.contains("+Y"), "{}", dropped.diff);
+        assert_eq!((dropped.added_lines, dropped.hunks), (1, 1));
+        assert_eq!(
+            assess_whole_file_restore(&sides(base, &dropped.candidate, theirs)),
+            RestoreVerdict::Lossless,
+            "committing the candidate is the remedy, so it has to satisfy the invariant"
+        );
+        assert_eq!(
+            assess_whole_file_restore(&sides(base, "Y\nX\nA\n", theirs)),
+            RestoreVerdict::Lossless,
+            "either order of the two insertions is a resolution"
+        );
+    }
+
+    /// The specimen's own shape: a tip mid-resolution that has already taken
+    /// every incoming hunk OUTSIDE the conflict, so the file reads as resolved
+    /// and the only thing missing is the incoming declaration inserted beside
+    /// the branch's own. The checklist diff must still name that declaration.
+    #[test]
+    fn a_moved_tip_still_lacks_an_incoming_declaration_inserted_beside_its_own() {
+        let base = "mod policy;\nmod rules;\n\npub fn run() {}\n";
+        let theirs = "pub(crate) mod filing;\nmod policy;\nmod rules;\nmod verdict;\n\npub fn run() {}\npub fn answer_and_wake() {}\n";
+        let tip = "pub mod evidence;\nmod policy;\nmod rules;\nmod verdict;\n\npub fn run() {}\npub fn answer_and_wake() {}\n";
+
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&sides(base, tip, theirs))
+        else {
+            panic!("the incoming `filing` declaration is missing from the tip");
+        };
+        assert!(
+            dropped.diff.contains("+pub(crate) mod filing;"),
+            "{}",
+            dropped.diff
+        );
+        assert_eq!(dropped.added_lines, 1, "and nothing else: {}", dropped.diff);
+        assert!(
+            dropped
+                .candidate
+                .starts_with("pub mod evidence;\npub(crate) mod filing;\nmod policy;\n"),
+            "{}",
+            dropped.candidate
+        );
+        assert!(!holds_incoming_side(&sides(base, tip, theirs)));
+    }
+
+    /// A modification conflict keeps its ours-wins reading: replacing the same
+    /// line two ways is a genuine choice, and the committed region is it.
+    #[test]
+    fn a_same_line_replacement_still_resolves_to_the_committed_side() {
+        assert_eq!(
+            assess_whole_file_restore(&sides("x = 1\n", "x = 2\n", "x = 3\n")),
+            RestoreVerdict::Lossless
+        );
+    }
+
+    /// Specimen 4 (bug-sink #502): both sides insert a markdown section above
+    /// the same heading, and the tip has moved by editing the file elsewhere.
+    /// The page called that tip "contains both sides" while the incoming
+    /// section was absent from it; the candidate must carry both sections and
+    /// the diff must name the incoming one.
+    #[test]
+    fn a_same_spot_markdown_section_the_tip_lacks_is_named_as_dropped() {
+        let base = "# Design\n\nIntro.\n\n## Where the open questions landed\n\nText.\n";
+        let theirs = "# Design\n\nIntro.\n\n## D248. Incoming decision\n\nWhy D248.\n\n## Where the open questions landed\n\nText.\n";
+        let tip = "# Design\n\nIntro, revised.\n\n## D250. Branch decision\n\nWhy D250.\n\n## Where the open questions landed\n\nText.\n";
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&sides(base, tip, theirs))
+        else {
+            panic!("the incoming D248 section is missing from the tip");
+        };
+        assert!(
+            dropped.diff.contains("+## D248. Incoming decision"),
+            "{}",
+            dropped.diff
+        );
+        assert!(
+            dropped.candidate.contains("## D250.") && dropped.candidate.contains("## D248."),
+            "{}",
+            dropped.candidate
+        );
+        assert!(!holds_incoming_side(&sides(base, tip, theirs)));
+    }
+
+    /// Specimen 5 (bug-sink #504), the false-positive direction: the
+    /// resolution kept the incoming test function but placed it below about
+    /// sixty lines of the branch's own, so the line merge reads it as missing
+    /// and inserts a second copy. The tip holds every line of both sides, so
+    /// nothing is missing and the candidate is the tip.
+    #[test]
+    fn an_incoming_block_the_tip_holds_at_another_offset_is_not_inserted_again() {
+        let incoming_fn =
+            "#[test]\nfn the_uninstall_directive_is_additive() {\n    assert!(additive());\n}\n";
+        let base = "mod tests {\nfn existing() {\n}\n\nfn tail() {\n}\n}\n";
+        let theirs =
+            format!("mod tests {{\nfn existing() {{\n}}\n\n{incoming_fn}\nfn tail() {{\n}}\n}}\n");
+        let branch_lines: String = (0..60).map(|n| format!("fn branch_{n}() {{}}\n")).collect();
+        let tip = format!(
+            "mod tests {{\nfn existing() {{\n}}\n\nfn tail() {{\n}}\n{branch_lines}\n{incoming_fn}}}\n"
+        );
+        assert_eq!(
+            completion_candidate(base, &tip, &theirs),
+            tip,
+            "the candidate never re-inserts a block the tip already holds"
+        );
+        assert_eq!(
+            assess_whole_file_restore(&sides(base, &tip, &theirs)),
+            RestoreVerdict::Lossless
+        );
+    }
+
+    /// The guard on the offset-tolerant match: an incoming line the tip holds
+    /// ONCE, where the incoming side registered it in two lists, still lacks
+    /// its second copy.
+    #[test]
+    fn a_registration_the_tip_holds_in_one_list_of_two_is_still_missing_from_the_other() {
+        let base = "lineage_a![\n    one!(),\n];\nlineage_b![\n    one!(),\n];\n";
+        let theirs =
+            "lineage_a![\n    one!(),\n    two!(),\n];\nlineage_b![\n    one!(),\n    two!(),\n];\n";
+        let tip = "lineage_a![\n    one!(),\n    two!(),\n];\nlineage_b![\n    one!(),\n];\n";
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&sides(base, tip, theirs))
+        else {
+            panic!("lineage_b's registration is missing");
+        };
+        assert_eq!(dropped.candidate, theirs);
+        assert_eq!(dropped.added_lines, 1, "{}", dropped.diff);
+    }
+
+    /// A block made only of lines the base already had is never read as held
+    /// elsewhere: a lone closing brace proves nothing about where it belongs.
+    #[test]
+    fn a_block_of_lines_the_base_already_had_is_never_read_as_held_elsewhere() {
+        let base = "a\n}\nb\n";
+        let theirs = "a\n}\nb\n}\n";
+        let tip = "a\n}\nb\nmine\n";
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&sides(base, tip, theirs))
+        else {
+            panic!("the incoming brace is not proven held");
+        };
+        assert!(dropped.diff.contains("+}"), "{}", dropped.diff);
+    }
+
+    /// The union keeps each inserted block whole, so two inserted items that
+    /// share a closing line stay two well-formed items, and a side that already
+    /// carries the other's insertion in order is the union as it stands.
+    #[test]
+    fn the_union_of_two_insertions_keeps_each_block_whole() {
+        assert_eq!(
+            union_of_insertions("fn a() {\n}\n", "fn b() {\n}\n"),
+            "fn a() {\n}\nfn b() {\n}\n"
+        );
+        assert_eq!(union_of_insertions("a\nb\nc\n", "b\n"), "a\nb\nc\n");
+        assert_eq!(union_of_insertions("y\nx\n", "y\n"), "y\nx\n");
     }
 
     /// A merge with no overlap is a complete, marker-free file — the auto-merge
@@ -1144,23 +1493,23 @@ mod tests {
 
     /// The corruption that makes a failed presence probe unsafe to degrade.
     ///
-    /// With the real base, ours inserts near the top and theirs appends at the
-    /// bottom: the merge is clean, carries both, and the whole-file restore is
+    /// With the real base, ours inserts at the top and theirs deletes the last
+    /// line: the merge is clean, carries both, and the whole-file restore is
     /// LOSSY. Read the base as absent — which is exactly what an empty presence
     /// set means — and both sides look like whole-file additions, the file
-    /// becomes one conflict region, collapsing it to ours reproduces ours, and
-    /// the same restore certifies as LOSSLESS. A store hiccup would have
+    /// becomes one conflict region, ours already holds every line theirs has,
+    /// and the same restore certifies as LOSSLESS. A store hiccup would have
     /// manufactured a proof of safety.
     #[test]
     fn an_empty_base_would_falsely_certify_a_lossy_restore() {
-        let ours = "a\nMINE\nb\nc\n";
-        let theirs = "a\nb\nc\nINCOMING\n";
+        let ours = "MINE\na\nb\nc\nd\n";
+        let theirs = "a\nb\nc\n";
 
-        let truthful = assess_whole_file_restore(&sides("a\nb\nc\n", ours, theirs));
+        let truthful = assess_whole_file_restore(&sides("a\nb\nc\nd\n", ours, theirs));
         let RestoreVerdict::Lossy(dropped) = &truthful else {
-            panic!("against the real base this restore drops the appended line: {truthful:?}");
+            panic!("against the real base this restore undoes the deletion: {truthful:?}");
         };
-        assert!(dropped.diff.contains("+INCOMING"), "{}", dropped.diff);
+        assert!(dropped.diff.contains("-d"), "{}", dropped.diff);
 
         let with_lost_base = assess_whole_file_restore(&MergeSides {
             base: FileContent::Absent,
@@ -1233,12 +1582,25 @@ mod tests {
         assert!(holds_incoming_side(&sides(base, ours, theirs)));
     }
 
-    /// The case `NothingResolved` exists for: the branch's own side, untouched.
-    /// It is LOSSLESS — the incoming change lives entirely in the conflict,
-    /// which the loss invariant takes from ours — and it is not a resolution.
+    /// The branch's own side, untouched, where both sides appended at the same
+    /// spot. Keeping it whole would drop the incoming line, so it is LOSSY as
+    /// well as not a resolution: the guard refuses it on either count, whether
+    /// or not the branch has touched the file elsewhere.
     #[test]
-    fn a_one_sided_tip_is_lossless_yet_does_not_hold_both_sides() {
+    fn a_one_sided_tip_at_a_shared_insertion_point_is_lossy_and_does_not_hold_both_sides() {
         let one_sided = sides("head\n", "head\nX\n", "head\nA\n");
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&one_sided) else {
+            panic!("keeping only the branch's append drops the incoming one");
+        };
+        assert!(dropped.diff.contains("+A"), "{}", dropped.diff);
+        assert!(!holds_incoming_side(&one_sided));
+    }
+
+    /// A one-sided tip of a same-line REPLACEMENT is still lossless, since
+    /// there ours-wins is a resolution, and still not one that holds both sides.
+    #[test]
+    fn a_one_sided_tip_of_a_replacement_is_lossless_yet_does_not_hold_both_sides() {
+        let one_sided = sides("head\nv1\n", "head\nX\n", "head\nA\n");
         assert_eq!(
             assess_whole_file_restore(&one_sided),
             RestoreVerdict::Lossless
@@ -1281,17 +1643,24 @@ mod tests {
         assert_eq!(regions[0].theirs, vec!["T"]);
     }
 
-    /// A path both sides added: there is no base, so the whole file overlaps and
-    /// the branch's committed content is by definition its own resolution.
+    /// A path both sides added: there is no base, so the whole file is one
+    /// insertion on each side. Keeping only the branch's file would drop the
+    /// incoming one, so that restore is lossy; a committed file that carries
+    /// the incoming content beside its own is lossless.
     #[test]
     fn a_path_added_on_both_sides_merges_against_an_empty_base() {
-        let both_added = MergeSides {
+        let added = |ours: &str| MergeSides {
             base: FileContent::Absent,
-            ours: FileContent::Text("mine\nshared\n".into()),
+            ours: FileContent::Text(ours.into()),
             theirs: FileContent::Text("theirs\nshared\n".into()),
         };
+        let RestoreVerdict::Lossy(dropped) = assess_whole_file_restore(&added("mine\nshared\n"))
+        else {
+            panic!("the incoming file's own line would be dropped");
+        };
+        assert!(dropped.diff.contains("+theirs"), "{}", dropped.diff);
         assert_eq!(
-            assess_whole_file_restore(&both_added),
+            assess_whole_file_restore(&added("mine\ntheirs\nshared\n")),
             RestoreVerdict::Lossless
         );
     }

@@ -26,6 +26,7 @@ pub mod migration_files;
 pub mod pack_catalog;
 pub mod quarantine;
 pub mod render;
+pub mod served_api;
 
 /// Normalized team identifier. Defined here (rather than reaching up into
 /// cairn-core's `db` module) so `content_store` and `local_db` can name it

@@ -668,7 +668,9 @@ async fn cleanup_claimed_question(
         caption_guid: record.caption_guid.clone(),
         sent_at,
         original_text: record.rendered_text.clone(),
-        answer: resolution.as_ref().map(|value| value.answer.clone()),
+        answer: resolution
+            .as_ref()
+            .map(|value| question_message_answer(&record.kind, &record.binding_ref, &value.answer)),
         answering_surface: resolution.map(|value| value.winner_surface),
         multi_select,
         receipt: receipt.to_string(),
@@ -2322,7 +2324,7 @@ impl ChannelRouter {
                         .map(|(prompt, _)| prompt)
                         .unwrap_or(&gate.binding_ref);
                     db.query_opt_i64(
-                        "SELECT response IS NOT NULL FROM prompts WHERE id = ?1",
+                        "SELECT response IS NOT NULL OR withdrawn_at IS NOT NULL FROM prompts WHERE id = ?1",
                         (prompt_id.to_string(),),
                     )
                     .await
@@ -2444,16 +2446,22 @@ impl ChannelRouter {
                 .await?
                 .ok_or_else(|| format!("{kind} action has no provenance: {action_ref}"))?;
 
+            let mut question_receipt = None;
             let result = if kind == "question" {
-                let response = answers[0].1.clone();
-                crate::mcp::handlers::planning::answer_prompt_id_domain(
-                    &self.orch,
-                    &action_ref,
-                    response,
-                    winner.resolution_provenance()?,
-                )
-                .await
-                .map(|outcome| outcome.withdrawn)
+                match stored_prompt_answers(&self.orch, &action_ref, &answers[0].1).await {
+                    Ok((rendered, prompt_answers)) => {
+                        question_receipt = Some(rendered);
+                        crate::mcp::handlers::planning::answer_prompt_id_domain(
+                            &self.orch,
+                            &action_ref,
+                            prompt_answers,
+                            winner.resolution_provenance()?,
+                        )
+                        .await
+                        .map(|outcome| outcome.withdrawn)
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 let answer = answers
                     .first()
@@ -2479,10 +2487,12 @@ impl ChannelRouter {
             match result {
                 Ok(withdrawn) => {
                     let receipt = withdrawn.unwrap_or_else(|| {
-                        let receipt_answer = answers
-                            .first()
-                            .map(|(_, answer)| answer.as_str())
-                            .unwrap_or("answered");
+                        let receipt_answer = question_receipt.unwrap_or_else(|| {
+                            answers
+                                .first()
+                                .map(|(_, answer)| answer.clone())
+                                .unwrap_or_else(|| "answered".to_string())
+                        });
                         format!("✓ answered: {receipt_answer}")
                     });
                     ledger::finalize_ask_resolution(
@@ -3611,7 +3621,12 @@ impl ChannelRouter {
                         &record.conversation,
                         &format!(
                             "Already answered: {} via {}",
-                            winner.answer, winner.winner_surface
+                            question_message_answer(
+                                &record.kind,
+                                &record.binding_ref,
+                                &winner.answer
+                            ),
+                            winner.winner_surface
                         ),
                     )
                     .await?;
@@ -3624,29 +3639,21 @@ impl ChannelRouter {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
-                let answers = ledger::staged_answers_for_prompt(
+                let staged = ledger::staged_answers_for_prompt(
                     self.ledger(),
                     self.provider_id,
                     &record.conversation,
                     prompt_id,
                 )
                 .await?;
-                if answers.len() != prompt_question_count(&self.orch, prompt_id).await? {
+                let questions = prompt_questions(&self.orch, prompt_id).await?;
+                let Some(answers) = complete_staged_answers(questions.len(), staged)? else {
                     return Ok(());
-                }
-                let response = if answers.len() == 1 {
-                    answers[0].1.clone()
-                } else {
-                    answers
-                        .iter()
-                        .map(|(index, answer)| format!("Question {}: {}", index + 1, answer))
-                        .collect::<Vec<_>>()
-                        .join("\n")
                 };
                 let claim = ledger::claim_ask_resolution(
                     self.ledger(),
                     prompt_id,
-                    &response,
+                    &answers.to_stored(),
                     cairn_common::identity::AppearanceTransport::ChannelReply,
                     Some(self.provider_id),
                     Some(&record.conversation),
@@ -3663,7 +3670,12 @@ impl ChannelRouter {
                         &record.conversation,
                         &format!(
                             "Already answered: {} via {}",
-                            winner.answer, winner.winner_surface
+                            question_message_answer(
+                                &record.kind,
+                                &record.binding_ref,
+                                &winner.answer
+                            ),
+                            winner.winner_surface
                         ),
                     )
                     .await?;
@@ -4413,10 +4425,14 @@ async fn claim_gate_for_provider(
     Ok(inserted.then_some(id))
 }
 
-/// A prompt lives in whichever database holds its project, so the count that
-/// decides when a multi-question ask is complete is searched across all of them.
-/// This is the one lookup on the reply path that is NOT private-ledger state.
-async fn prompt_question_count(orch: &Orchestrator, prompt_id: &str) -> Result<usize, String> {
+/// A prompt lives in whichever database holds its project, so the questions
+/// that decide when a multi-question ask is complete, and how its answers read,
+/// are searched across all of them. This is the one lookup on the reply path
+/// that is NOT private-ledger state.
+async fn prompt_questions(
+    orch: &Orchestrator,
+    prompt_id: &str,
+) -> Result<Vec<crate::models::question::Question>, String> {
     for db in orch.db.all_dbs().await {
         let json = db
             .query_opt_text(
@@ -4426,12 +4442,64 @@ async fn prompt_question_count(orch: &Orchestrator, prompt_id: &str) -> Result<u
             .await
             .map_err(|e| e.to_string())?;
         if let Some(json) = json {
-            return serde_json::from_str::<Vec<serde_json::Value>>(&json)
-                .map(|v| v.len())
-                .map_err(|e| e.to_string());
+            return serde_json::from_str(&json)
+                .map_err(|e| format!("stored prompt questions are invalid: {e}"));
         }
     }
     Err(format!("prompt not found: {prompt_id}"))
+}
+
+/// A claimed winner read back for its domain action: the answers it stored and
+/// their rendering. A winner claimed before answers were stored by index is
+/// legacy typed text and goes back through the typed-input parser.
+async fn stored_prompt_answers(
+    orch: &Orchestrator,
+    prompt_id: &str,
+    stored: &str,
+) -> Result<(String, crate::models::question::PromptAnswers), String> {
+    let questions = prompt_questions(orch, prompt_id).await?;
+    let answers = crate::models::question::PromptAnswers::decode_stored(stored)
+        .into_answers(questions.len())?;
+    Ok((answers.render(&questions), answers))
+}
+
+/// The prompt's answers once one conversation has staged a reply to every
+/// question (each question goes out as its own message bound to
+/// `prompt:index`), or `None` while some are still unanswered.
+fn complete_staged_answers(
+    question_count: usize,
+    staged: Vec<(usize, String)>,
+) -> Result<Option<crate::models::question::PromptAnswers>, String> {
+    if staged.len() != question_count {
+        return Ok(None);
+    }
+    let answers = staged
+        .into_iter()
+        .map(|(index, answer)| crate::models::question::QuestionAnswer { index, answer })
+        .collect();
+    crate::models::question::PromptAnswers::new(question_count, answers).map(Some)
+}
+
+/// What one question's channel message shows as the answer it received: that
+/// question's own answer from the stored prompt answers. Any other stored value
+/// (a permission's `allow`, an answer from before answers were indexed) is
+/// shown verbatim.
+fn question_message_answer(kind: &str, binding_ref: &str, stored: &str) -> String {
+    let index = (kind == "question")
+        .then(|| binding_ref.rsplit_once(':'))
+        .flatten()
+        .and_then(|(_, index)| index.parse::<usize>().ok());
+    match (
+        index,
+        crate::models::question::PromptAnswers::decode_stored(stored),
+    ) {
+        (Some(index), crate::models::question::StoredAnswer::Answers(answers)) => answers
+            .answers()
+            .get(index)
+            .map(|answer| answer.answer.clone())
+            .unwrap_or_else(|| stored.to_string()),
+        _ => stored.to_string(),
+    }
 }
 
 fn question_answer(record: &ledger::OutboundRecord, text: &str) -> String {
@@ -5235,7 +5303,7 @@ mod tests {
         let mut binds: Vec<Value> = jobs.iter().cloned().map(Value::Text).collect();
         binds.push(Value::Integer(cursor));
         let new_rows = db
-            .query_all(&followed_events_sql(jobs.len()), binds, |row| row.i64(0))
+            .query_all(followed_events_sql(jobs.len()), binds, |row| row.i64(0))
             .await
             .unwrap();
         let new = new.elapsed();
@@ -7690,7 +7758,7 @@ mod tests {
         );
         assert_eq!(
             db.query_opt_text(
-                &format!(
+                format!(
                     "SELECT j.id FROM jobs j WHERE j.thread_id = 't-general' AND {}",
                     crate::threads::SESSION_JOB_SHAPE
                 ),
@@ -7724,7 +7792,7 @@ mod tests {
             .unwrap();
         assert!(
             db.query_opt_text(
-                &format!(
+                format!(
                     "SELECT j.id FROM jobs j WHERE j.thread_id = 't-perf' AND {}",
                     crate::threads::SESSION_JOB_SHAPE
                 ),
@@ -9037,6 +9105,48 @@ mod tests {
                 .store(message.multi_select, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// Staged per-question channel replies, one spanning several lines, become
+    /// one indexed claim; each question's message then shows its own answer.
+    #[test]
+    fn staged_replies_form_an_indexed_claim_and_each_message_shows_its_answer() {
+        let multi_line = "First line.\n\n1. a\n2. b";
+        assert_eq!(
+            complete_staged_answers(2, vec![(0, "Ship it".into())]).unwrap(),
+            None,
+            "an ask with an unanswered question is not complete"
+        );
+        let answers =
+            complete_staged_answers(2, vec![(0, "Ship it".into()), (1, multi_line.into())])
+                .unwrap()
+                .expect("every question staged");
+        let stored = answers.to_stored();
+        assert_eq!(
+            crate::models::question::PromptAnswers::decode_stored(&stored),
+            crate::models::question::StoredAnswer::Answers(answers)
+        );
+        assert_eq!(
+            format!(
+                "Already answered: {} via channel_reply",
+                question_message_answer("question", "prompt:1", &stored)
+            ),
+            format!("Already answered: {multi_line} via channel_reply")
+        );
+        assert_eq!(
+            question_message_answer("question", "prompt:0", &stored),
+            "Ship it"
+        );
+        // A legacy flat winner and a permission answer read verbatim.
+        let legacy = "Question 1: a\nQuestion 2: b";
+        assert_eq!(
+            question_message_answer("question", "prompt:1", legacy),
+            legacy
+        );
+        assert_eq!(
+            question_message_answer("permission", "req-1", "allow"),
+            "allow"
+        );
     }
 
     #[tokio::test]

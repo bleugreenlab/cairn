@@ -1919,8 +1919,10 @@ fn resolution_section(assessment: Option<&TipAssessment>, base: &str) -> String 
     out
 }
 
-/// Incoming hunks living inside conflicting files but outside the conflicting
-/// region — the work `take-committed-tip` discards without saying so.
+/// Incoming hunks living inside conflicting files that the committed tip does
+/// not carry — outside the conflicting region, or inserted at the same spot as
+/// one of the branch's own lines — the work `take-committed-tip` discards
+/// without saying so.
 ///
 /// Stated here, before the request is composed, because the guard on the request
 /// itself refuses rather than warns and this is what makes that refusal
@@ -1939,9 +1941,10 @@ fn dropped_work_section(assessment: Option<&TipAssessment>, base: &str) -> Strin
     for (path, reason) in &unproven {
         match reason {
             Unproven::Drops(dropped) => out.push_str(&format!(
-                "`{path}` carries {} incoming hunk(s) ({} line(s)) outside the conflicting region. \
-                 `take-committed-tip` keeps your whole file, so these arrive only if your commit \
-                 includes them. Read `{base}?view=merged&file={path}`.\n\n",
+                "`{path}` carries {} incoming hunk(s) ({} line(s)) your committed tip does not \
+                 have, outside the conflicting region or inserted at the same spot as your own \
+                 lines. `take-committed-tip` keeps your whole file, so these arrive only if your \
+                 commit includes them. Read `{base}?view=merged&file={path}`.\n\n",
                 dropped.hunks, dropped.added_lines
             )),
             Unproven::Unjudged(why) => out.push_str(&format!(
@@ -2106,10 +2109,9 @@ mod tests {
         );
     }
 
-    fn tip_assessment(moved: bool, unresolved: &[&str]) -> TipAssessment {
+    fn tip_assessment(unresolved: &[&str]) -> TipAssessment {
         TipAssessment {
             tip: "tip00000".to_string(),
-            moved,
             paths: vec![crate::jj::PathAssessment {
                 path: "migrations.rs".to_string(),
                 verdict: crate::jj::RestoreVerdict::Lossless,
@@ -2132,7 +2134,7 @@ mod tests {
     #[test]
     fn a_one_sided_tip_is_refused_on_the_page_in_the_guards_own_words() {
         use crate::orchestrator::conflict_session::{decide_replay, ReplayDecision, RestoreProof};
-        let one_sided = tip_assessment(true, &["migrations.rs"]);
+        let one_sided = tip_assessment(&["migrations.rs"]);
         let section = resolution_section(Some(&one_sided), "cairn:~/rebase");
         assert!(!section.contains("BOTH sides"), "{section}");
         assert!(section.contains("REFUSED"), "{section}");
@@ -2156,7 +2158,7 @@ mod tests {
     #[test]
     fn a_resolution_that_predates_the_session_reads_as_resolved_without_a_further_commit() {
         use crate::orchestrator::conflict_session::{decide_replay, ReplayDecision, RestoreProof};
-        let held = tip_assessment(false, &[]);
+        let held = tip_assessment(&[]);
         let section = resolution_section(Some(&held), "cairn:~/rebase");
         assert!(section.contains("BOTH sides"), "{section}");
         assert_eq!(

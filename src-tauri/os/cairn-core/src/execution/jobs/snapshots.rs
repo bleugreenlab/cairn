@@ -815,28 +815,25 @@ pub fn store_tool_result_event_with_turn(
     )
 }
 
-/// Complete a blocking write with opaque task/answer text, retaining the outer
-/// batch report that was checkpointed before the producer could yield.
+/// Complete a blocking write with its opaque task/answer payload, retaining the
+/// outer batch report that was checkpointed before the producer could yield.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn store_blocking_write_result_with_resolution(
     orch: &Orchestrator,
     run_id: &str,
     session_id: &str,
     tool_use_id: &str,
-    content: &str,
+    blocking: crate::resources::mutations::BlockingResult,
     is_error: bool,
     now: i32,
     turn_id: Option<&str>,
     resolution: Option<&cairn_db::models::ResolutionReceipt>,
 ) -> Result<(), String> {
     let db = orch.db.local.clone();
-    let (run, tool, text) = (
-        run_id.to_string(),
-        tool_use_id.to_string(),
-        content.to_string(),
-    );
+    let (run, tool) = (run_id.to_string(), tool_use_id.to_string());
     let report = crate::storage::run_db_blocking(move || async move {
-        crate::mcp::handlers::write::replay::complete_blocking_report(&db, &run, &tool, &text).await
+        crate::mcp::handlers::write::replay::complete_blocking_report(&db, &run, &tool, blocking)
+            .await
     })?;
     store_tool_result_event_with_resolution(
         orch,

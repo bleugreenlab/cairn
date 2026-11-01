@@ -238,7 +238,7 @@ fn client(stall: Duration) -> Result<reqwest::blocking::Client, SpeechWireError>
     if let Some(client) = clients.get(&stall) {
         return Ok(client.clone());
     }
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .connect_timeout(CONNECT_TIMEOUT.min(stall))
         .timeout(stall)
         .build()

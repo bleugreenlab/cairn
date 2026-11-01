@@ -1,12 +1,13 @@
 //! Cairn's own inference deployments as a provider: every model a
-//! cairn-inference deployment serves, under its served name and each alias,
+//! cairn-inference deployment serves, under its real name (tenet 1336),
 //! offered whether or not it is loaded (tenet 1321).
 //!
 //! Nothing here starts an engine. Each request asks for its model through
 //! [`crate::orchestrator::inference_route`], which loads it on a pool under
 //! Cairn's control, and is sent once the deployment is healthy, straight to the
-//! deployment head's API under the name the engine serves: `dsv4-flash` reaches
-//! the engine as `deepseek-v4-flash-vision-exp`. A named model is never served
+//! deployment head's API under the name the engine serves:
+//! `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` reaches the engine as
+//! `deepseek-v4-flash-vision-exp`. A named model is never served
 //! by another. An agent turn waits on its own thread, interruptibly, with what
 //! it waits on in the transcript; a completion waits up to its timeout; a
 //! decision does not wait, since it has no cancel signal, and is refused with
@@ -73,16 +74,13 @@ fn serves_for(served: &ServedModel) -> Option<Vec<ServedVerb>> {
     }
 }
 
-/// One served name as the catalog lists it.
+/// One served model as the catalog lists it, by its real name.
 fn discovered(served: &ServedModel) -> DiscoveredModel {
     DiscoveredModel {
         id: served.id.clone(),
         model: served.id.clone(),
         display_name: served.id.clone(),
-        description: Some(match &served.alias_of {
-            Some(target) => format!("{target} on deployment {}", served.deployment),
-            None => format!("deployment {}", served.deployment),
-        }),
+        description: None,
         hidden: false,
         is_default: false,
         default_reasoning_effort: None,
@@ -100,7 +98,7 @@ fn discovered(served: &ServedModel) -> DiscoveredModel {
         router: false,
         modalities: Some(served.modalities.clone()),
         serves: serves_for(served),
-        tokenizer: tokenizer_for(INFERENCE_BACKEND_KEY, &served.id, Some(&served.root)),
+        tokenizer: tokenizer_for(INFERENCE_BACKEND_KEY, &served.id, Some(&served.id)),
     }
 }
 
@@ -191,7 +189,7 @@ impl AgentBackend for InferenceBackend {
         model: &str,
     ) -> Result<(), String> {
         let inventory = run_db_blocking(|| inference_route::served_inventory(orch))?;
-        crate::orchestrator::pool_control::deployment_for(&inventory, model).map(|_| ())
+        crate::orchestrator::pool_control::deployment_for(&inventory, model, None).map(|_| ())
     }
 
     fn complete(
@@ -219,6 +217,37 @@ impl AgentBackend for InferenceBackend {
             &route,
             request,
         )?)
+    }
+
+    /// An outside client's request registers demand like any other: it asks
+    /// the pool controller for the model and waits while it loads, then goes
+    /// to the engine under the engine's own name.
+    fn relay_route(
+        &self,
+        orch: &Orchestrator,
+        request: crate::backends::relay::RelayRequest<'_>,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<cairn_models::interface::relay::RelayRoute, crate::backends::relay::RelayRefusal>
+    {
+        let crate::backends::relay::RelayRequest {
+            model,
+            requester,
+            wait,
+            ..
+        } = request;
+        let started = std::time::Instant::now();
+        let cancel = wait.cancel.clone();
+        let budget = wait.budget;
+        let route = ready_blocking(
+            orch,
+            model,
+            requester,
+            Some(budget),
+            || cancel.load(std::sync::atomic::Ordering::Relaxed),
+            |said| (wait.waiting)(said),
+        )
+        .map_err(|error| crate::backends::relay::RelayRefusal::of_wait(error, &wait, started))?;
+        Ok(adapter::relay_route(&route))
     }
 
     fn completion_shape(&self) -> CompletionShape {

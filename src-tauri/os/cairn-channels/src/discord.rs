@@ -12,8 +12,8 @@ use serenity::{
         EditThread, EventHandler, GatewayIntents, GetMessages, GuildId, Interaction, Message,
         MessageId, Permissions, Ready, ShardManager, UserId,
     },
-    http::Http,
-    Client,
+    client::ClientBuilder,
+    http::{Http, HttpBuilder},
 };
 use std::{
     collections::HashSet,
@@ -23,6 +23,16 @@ use std::{
     },
 };
 use tokio::sync::mpsc;
+
+/// Serenity's HTTP client on the process's shared TLS config. Its default
+/// builds a fresh reqwest client, and with it reloads the platform root store,
+/// inside whichever task constructs it. (The gateway socket is serenity's own
+/// tungstenite dial with compiled-in roots, which asks the OS nothing.)
+fn discord_http(token: &str) -> Http {
+    HttpBuilder::new(token)
+        .client(cairn_tls::client().clone())
+        .build()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordRemoteChannel {
@@ -361,7 +371,7 @@ impl DiscordProvider {
         let token = token.into();
         let (tx, rx) = mpsc::channel(128);
         Arc::new(Self {
-            http: Arc::new(Http::new(&token)),
+            http: Arc::new(discord_http(&token)),
             token,
             guild_id: GuildId::new(guild_id),
             allowed_users: allowed_user_ids.into_iter().map(UserId::new).collect(),
@@ -397,7 +407,7 @@ impl DiscordProvider {
             | GatewayIntents::GUILD_MESSAGES
             | GatewayIntents::DIRECT_MESSAGES
             | GatewayIntents::MESSAGE_CONTENT;
-        let mut client = Client::builder(&self.token, intents)
+        let mut client = ClientBuilder::new_with_http(discord_http(&self.token), intents)
             .event_handler_arc(self.clone())
             .await
             .map_err(|error| {

@@ -46,6 +46,9 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     // Which verbs each inference recipe's model is offered for, and so which
     // work is routed to it, as the model bindings above route work.
     "inference",
+    // Opens a network listener that spends this workspace's models for
+    // outside clients, and decides which names reach which model.
+    "servedApi",
     // Outward-facing message delivery and the identity commits are attributed
     // to: both let a local change speak as the operator to the outside world.
     "channels",

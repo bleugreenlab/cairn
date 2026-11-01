@@ -246,7 +246,7 @@ impl RealHttpClient {
     /// following one off GitHub.
     fn with_config(config: HttpConfig) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: cairn_tls::client_builder()
                 .timeout(config.timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()

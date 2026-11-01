@@ -1471,6 +1471,7 @@ mod tests {
                 "cairn-session",
                 "cairn-speech-wire",
                 "cairn-symbols",
+                "cairn-tls",
                 "cairn-tokenize",
                 "cairn-toks",
                 "cairn-transport",

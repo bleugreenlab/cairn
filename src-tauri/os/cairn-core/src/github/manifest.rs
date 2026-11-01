@@ -92,8 +92,7 @@ pub fn create_manifest(
 pub async fn complete_manifest_flow(code: &str) -> Result<ManifestResponse, String> {
     log::info!("Completing GitHub App manifest flow...");
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = cairn_tls::client()
         .post(format!(
             "https://api.github.com/app-manifests/{code}/conversions"
         ))

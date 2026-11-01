@@ -2324,6 +2324,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "authorization_events",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    // cairn/5712: who may spend this install's models through the served API,
+    // and the journal of what each such client spent. Same reasoning as the
+    // grants: a teammate's install never issued these keys.
+    (
+        "served_api_clients",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "model_requests",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("check_result_cache", TableScope::ProjectScoped),
     // CAIRN-4665: the durable record of which execution stopped owning an
     // issue's attempt, and the work item that interrupts its surviving agents.

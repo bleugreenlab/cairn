@@ -293,6 +293,23 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     }
     out.push_str("- the records themselves: cairn://inference\n\n");
 
+    // --- Served API ---
+    out.push_str("## Served API\n\n");
+    let served = crate::config::settings::load_served_api(&orch.config_dir);
+    match &served.bind {
+        None => out.push_str("- listener: off (no `servedApi.bind`)\n"),
+        Some(bind) => out.push_str(&format!(
+            "- listener: {bind} ({})\n",
+            if served.tls.is_some() {
+                "TLS"
+            } else {
+                "plain HTTP"
+            }
+        )),
+    }
+    out.push_str(&format!("- load wait: {}s\n", served.load_wait().as_secs()));
+    out.push_str("- clients and status: cairn://models/clients\n\n");
+
     // --- GitHub (read-only; connect/disconnect handshake stays UI-only) ---
     out.push_str("## GitHub (read-only)\n\n");
     match crate::github::credentials::get_github_credentials(&orch.db.local).await {

@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use crate::{ImageWireError, ImagesEndpoint};
 
 pub(crate) fn client(timeout: Duration) -> Result<Client, ImageWireError> {
-    Client::builder()
+    cairn_tls::blocking_client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| ImageWireError::Transport(error.to_string()))

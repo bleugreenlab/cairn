@@ -79,20 +79,14 @@ pub(crate) async fn submit_bug_report(
 
     // Fire-and-forget HTTP POST
     tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("bug_report: failed to create HTTP client: {}", e);
-                return;
-            }
-        };
-
         let bug_report_url = crate::api::ApiConfig::default().bug_report_url();
-        match client.post(&bug_report_url).json(&report).send().await {
+        match cairn_tls::client()
+            .post(&bug_report_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&report)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     log::warn!("bug_report: API returned status {}", resp.status());

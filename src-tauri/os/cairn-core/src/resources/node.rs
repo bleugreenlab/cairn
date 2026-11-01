@@ -1017,7 +1017,8 @@ pub(super) async fn read_node_questions(
                 summarize_questions_json(&question.questions_json),
             ));
             if let Some(response) = question.response.as_deref().filter(|r| !r.is_empty()) {
-                output.push_str(&format!("  → {}\n", response));
+                let answer = displayed_answer(&question.questions_json, response);
+                output.push_str(&format!("  → {}\n", answer.replace('\n', "\n    ")));
             }
             if let Some(receipt) = &question.resolution {
                 output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
@@ -1081,11 +1082,22 @@ pub(super) async fn read_node_question(
     }
 
     match question.response.as_deref().filter(|r| !r.is_empty()) {
-        Some(response) => output.push_str(&format!("## Response\n\n{}\n\n", response)),
+        Some(response) => output.push_str(&format!(
+            "## Response\n\n{}\n\n",
+            displayed_answer(&question.questions_json, response)
+        )),
         None => output.push_str("## Response\n\n(awaiting answer)\n\n"),
     }
 
     output
+}
+
+/// A stored answer as a reader sees it: indexed answers rendered against the
+/// prompt's questions, an answer stored before answers were indexed verbatim.
+fn displayed_answer(questions_json: &str, response: &str) -> String {
+    let questions: Vec<crate::models::question::Question> =
+        serde_json::from_str(questions_json).unwrap_or_default();
+    crate::models::question::PromptAnswers::decode_stored(response).render(&questions)
 }
 
 struct NodePermissionRow {

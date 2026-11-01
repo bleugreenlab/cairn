@@ -56,8 +56,8 @@ const OPENCODE_KEY: &str = "sk-oc-coverage-key";
 const TYPESAFE_KEY: &str = "ts-coverage-key";
 const WAIT: Duration = Duration::from_secs(20);
 
-/// The coverage deployment's alias, which runs name it by.
-const INFERENCE_ALIAS: &str = "coverage-chat";
+/// The coverage deployment's model, by the real name runs name it by.
+const INFERENCE_MODEL: &str = "coverage/Coverage-Chat";
 /// The name the coverage deployment's engine answers to.
 const INFERENCE_SERVED_NAME: &str = "coverage-engine-chat";
 /// The coverage deployment's chat endpoint, on the dead loopback port the
@@ -630,7 +630,7 @@ fn plan(key: &str) -> Plan {
                 chat_url: INFERENCE_CHAT_URL,
                 model: INFERENCE_SERVED_NAME,
             }),
-            ..http(INFERENCE_ALIAS, key)
+            ..http(INFERENCE_MODEL, key)
         },
         custom if custom.starts_with(CUSTOM_KEY_PREFIX) => http("qwen3.8-27b", custom),
         other => panic!(
@@ -648,6 +648,7 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     for (provider, label, auth) in [
         (
@@ -735,9 +736,10 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
     (orch, format!("{CUSTOM_KEY_PREFIX}{custom}"))
 }
 
-/// One cairn-inference deployment serving [`INFERENCE_SERVED_NAME`] under the
-/// alias [`INFERENCE_ALIAS`], on a pool Cairn controls. The provider is
-/// installed and its catalog refreshed, so a decision can be offered on it.
+/// One cairn-inference deployment of [`INFERENCE_MODEL`], whose engine answers
+/// to [`INFERENCE_SERVED_NAME`], on a pool Cairn controls. The built-in
+/// provider's catalog is refreshed, which installs it, so a decision can be
+/// offered on it without the workspace enabling anything.
 async fn seed_inference(orch: &Orchestrator) {
     use crate::orchestrator::pool_control::{patch_pool, PoolPatch};
     use cairn_db::turso::params;
@@ -751,7 +753,6 @@ recipes:
     servedName: coverage-engine-chat
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
-    aliases: [coverage-chat]
 deployments:
   - {id: coverage-deployment, source: cairn, recipe: coverage-recipe, machines: [coverage-box], head: coverage-box, apiPort: 9, apiPath: /v1, healthPath: /v1/models}
 pools:
@@ -794,13 +795,8 @@ pools:
         .unwrap();
     }
 
-    let mut enabled = orch.enabled_providers();
-    enabled.push(crate::backends::inference::INFERENCE_BACKEND_KEY.to_string());
-    orch.update_settings(crate::models::UpdateSettings {
-        enabled_providers: Some(enabled),
-        ..Default::default()
-    })
-    .unwrap();
+    // Built in: nothing enables it, and what discovery finds installs it.
+    assert!(!orch.provider_enabled(crate::backends::inference::INFERENCE_BACKEND_KEY));
     patch_pool(
         orch,
         &PoolPatch {
@@ -1084,7 +1080,7 @@ async fn every_catalog_provider_launches_through_the_facet() {
         );
     }
     for stored in &requests {
-        assert_eq!(stored.request.model, INFERENCE_ALIAS);
+        assert_eq!(stored.request.model, INFERENCE_MODEL);
         assert_eq!(stored.request.deployment.as_str(), "coverage-deployment");
         assert!(
             matches!(
@@ -1276,6 +1272,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1518,6 +1515,7 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());
@@ -1647,6 +1645,7 @@ async fn a_terms_refused_claude_one_shot_is_served_on_the_next_account() {
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        relay: Arc::new(cairn_models::complete::HttpComplete),
     };
 
     let served = complete_on(&orch, "claude", one_shot_request("haiku", None))
@@ -1691,6 +1690,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         codex: Arc::new(RecordingCodex(recorder.clone())),
         host: Arc::new(InertHost),
         codex_cli: Arc::new(cairn_models::session::codex::ManagedCodex::for_host()),
+        relay: Arc::new(cairn_models::complete::HttpComplete),
     };
     let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
     orch.subscriptions = Arc::new(homes.clone());

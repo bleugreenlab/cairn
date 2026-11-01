@@ -153,7 +153,7 @@ pub fn post_chat_completion(
     timeout: Duration,
 ) -> Result<ChatResponse, crate::CompletionError> {
     use crate::CompletionError;
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| CompletionError::Upstream(error.to_string()))?;
@@ -300,7 +300,7 @@ pub fn post_chat_completion_streaming(
     cancel: &Arc<AtomicBool>,
     sink: &mut dyn StreamSink,
 ) -> Result<ChatResponse, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(STREAM_ABSOLUTE_TIMEOUT)
         .build()
         .map_err(|error| {

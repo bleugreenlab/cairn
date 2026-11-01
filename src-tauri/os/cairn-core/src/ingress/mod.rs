@@ -19,6 +19,8 @@ pub mod endpoints;
 pub mod sync;
 pub mod ws;
 
+use std::sync::OnceLock;
+
 use cairn_db::turso::params;
 
 use crate::storage::{LocalDb, RowExt};
@@ -27,6 +29,29 @@ use crate::storage::{LocalDb, RowExt};
 /// `CAIRN_API_URL`, so a dev instance can be pointed at a local api.
 pub fn relay_url() -> String {
     crate::api::ApiConfig::default().relay_url()
+}
+
+/// The one HTTP client every relay call goes through: sync, registration, key
+/// repair, and endpoint minting all talk to the same host with the same bearer
+/// scheme, so they share one connection pool for the life of the process.
+///
+/// It carries no client-level timeout; each caller bounds its own requests
+/// with `RequestBuilder::timeout`. Awaiting the shared TLS config first means
+/// no relay task ever occupies a runtime worker while the platform root store
+/// loads (see `cairn_tls`).
+pub(crate) async fn relay_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    if CLIENT.get().is_none() {
+        cairn_tls::ready().await;
+    }
+    CLIENT
+        .get_or_init(|| {
+            cairn_tls::client_builder()
+                .build()
+                .map_err(|error| format!("could not build the relay client: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Longest body an `ingress_events` row keeps, the api's largest per-endpoint

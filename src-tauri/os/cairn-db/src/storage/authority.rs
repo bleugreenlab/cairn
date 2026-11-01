@@ -822,6 +822,7 @@ mod tests {
             turn_id: Some("turn-1".to_string()),
             session_id: Some("sess-1".to_string()),
             request_id: None,
+            actor: None,
         }
     }
 

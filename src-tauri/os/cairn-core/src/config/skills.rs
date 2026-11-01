@@ -492,7 +492,7 @@ mod tests {
     /// `cairn://skills/<id>`. Guard that each shipped package parses, and that
     /// the `workflows` skill is present and well-formed. Verifying the shipped
     /// file directly beats dogfooding through the running host, which serves a
-    /// stale binary and a stale synced copy. The `pack-skills` check in
+    /// stale binary and a stale synced copy. The `rust-write-pins` check in
     /// `.cairn/config.yaml` runs this test by name on every pack SKILL.md change.
     #[test]
     fn bundled_skills_load_and_include_workflows() {

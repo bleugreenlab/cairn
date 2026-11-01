@@ -158,7 +158,16 @@ async fn author(
         crate::authorization::WORKSPACE_ID,
     );
     crate::resources::mutations::authorize_account_change(orch, request, &authority).await?;
-    write_inventory(&orch.db.local, authoring).await
+    let written = write_inventory(&orch.db.local, authoring).await?;
+    refresh_offers(orch);
+    Ok(written)
+}
+
+/// Rediscover what Cairn inference offers, now that its records changed.
+fn refresh_offers(orch: &Orchestrator) {
+    orch.spawn_provider_model_catalog_refresh(vec![
+        crate::backends::inference::INFERENCE_BACKEND_KEY.to_string(),
+    ]);
 }
 
 async fn actor(orch: &Orchestrator, request: &McpCallbackRequest, named: Option<&str>) -> String {
@@ -195,7 +204,9 @@ pub(super) async fn dispatch(
                             source.as_str()
                         )));
                     }
-                    adopt(&orch.db.local, source).await.map(Some).map_err(fail)
+                    let adopted = adopt(&orch.db.local, source).await.map_err(fail)?;
+                    refresh_offers(orch);
+                    Ok(Some(adopted))
                 }
                 InventoryPatch::Author(authoring) => author(orch, request, &authoring, dry_run)
                     .await
@@ -234,13 +245,17 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| fail("mode=append requires payload".into()))?;
-            let model = payload_str(payload, "model", &[])
-                .ok_or_else(|| fail("payload.model must name the model to load".into()))?;
+            let model = payload_str(payload, "model", &[]).ok_or_else(|| {
+                fail("payload.model must name the model to load by its real name".into())
+            })?;
+            let pool = payload_str(payload, "pool", &[]).map(cairn_inference::PoolId::from);
             if dry_run {
                 return Ok(Some(format!("Would request {model}")));
             }
             let requester = actor(orch, request, payload_str(payload, "requester", &[])).await;
-            let handle = request_model(orch, model, &requester).await.map_err(fail)?;
+            let handle = request_model(orch, model, pool.as_ref(), &requester)
+                .await
+                .map_err(fail)?;
             let status = handle.status(orch).await.map_err(fail)?;
             Ok(Some(format!(
                 "Request #{} for {} on pool {}: {}. Read cairn://inference/requests for the queue.",

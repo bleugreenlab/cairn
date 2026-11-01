@@ -253,9 +253,6 @@ fn recipe_section(out: &mut String, recipe: &Recipe) {
         }
     }
     requirements_lines(out, &recipe.requirements);
-    if !recipe.aliases.is_empty() {
-        let _ = writeln!(out, "- aliases: {}", recipe.aliases.join(", "));
-    }
     if let Some(notes) = &recipe.notes {
         let _ = writeln!(out, "- notes: {notes}");
     }
@@ -406,12 +403,16 @@ fn load_line(view: &InferenceView, load: &LoadRow) -> String {
         .unwrap_or_default();
     match (load.healthy, load.load_ms) {
         (true, Some(ms)) => format!(
-            "- {}: healthy after {}{waited}; settled footprint {}",
+            "- {}: healthy after {}{waited}; settled footprint {}{}",
             at(view, load.finished_at),
             duration(ms),
             load.footprint
                 .as_ref()
-                .map_or("not recorded yet".to_string(), footprint_line)
+                .map_or("not recorded yet".to_string(), footprint_line),
+            load.reason
+                .as_deref()
+                .map(|late| format!("; its start script then ended badly: {late}"))
+                .unwrap_or_default()
         ),
         _ => format!(
             "- {}: failed{waited}: {}",

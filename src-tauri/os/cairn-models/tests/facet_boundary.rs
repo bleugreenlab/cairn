@@ -42,6 +42,10 @@ const PUBLIC_EDGES: &[(&str, &str, Option<&str>)] = &[
     ("cairn-credentials", "cairn-models-types", None),
     ("cairn-credentials", "cairn-domain", None),
     ("cairn-inference", "cairn-models-types", None),
+    ("cairn-llm-wire", "cairn-tls", None),
+    ("cairn-image-wire", "cairn-tls", None),
+    ("cairn-speech-wire", "cairn-tls", None),
+    ("cairn-models", "cairn-tls", None),
 ];
 
 fn members_under(root: &str) -> Vec<(&'static str, String)> {
@@ -54,6 +58,7 @@ fn members_under(root: &str) -> Vec<(&'static str, String)> {
         "cairn-credentials",
         "cairn-domain",
         "cairn-inference",
+        "cairn-tls",
         "cairn-core",
     ]
     .into_iter()
@@ -181,6 +186,33 @@ fn a_wire_leaf_reaching_the_session_runtime_is_refused() {
             .iter()
             .any(|v| v
                 .starts_with("cairn-llm-wire must reach no workspace crate, but reaches cairn-db")),
+        "{found:?}"
+    );
+}
+
+/// A wire leaf may reach the shared TLS crate (the ordinary edges above pass),
+/// but only while that crate is a leaf itself: once it reaches a workspace
+/// crate, the leaf reaching it is refused through it too.
+#[test]
+fn leaf_infrastructure_must_stay_a_leaf() {
+    let mut members = members_under("/repo/src-tauri/os");
+    members.push((
+        "cairn-common",
+        "/repo/src-tauri/os/cairn-common".to_string(),
+    ));
+    let mut edges = PUBLIC_EDGES.to_vec();
+    edges.push(("cairn-tls", "cairn-common", None));
+    let found = violations("/repo/src-tauri", &members, &edges);
+    assert!(
+        found
+            .iter()
+            .any(|v| v
+                .starts_with("cairn-tls must reach no workspace crate, but reaches cairn-common")),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().any(|v| v
+            .starts_with("cairn-llm-wire must reach no workspace crate, but reaches cairn-common")),
         "{found:?}"
     );
 }

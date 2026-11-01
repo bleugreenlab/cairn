@@ -417,17 +417,17 @@ pub(crate) async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<()
     let app_slug = crate::github::credentials::get_github_credentials(&orch.db.local)
         .await?
         .app_slug;
-    let client = reqwest::Client::builder()
-        .timeout(SYNC_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client = super::relay_client().await?;
     let events_url = format!("{}/events/{channel_id}", relay_url.trim_end_matches('/'));
     let mut cursor = channel.last_event_sync.clone();
     let mut horizon_checked = false;
 
     loop {
         let requested_at = chrono::Utc::now().to_rfc3339();
-        let mut request = client.get(&events_url).bearer_auth(secret);
+        let mut request = client
+            .get(&events_url)
+            .timeout(SYNC_REQUEST_TIMEOUT)
+            .bearer_auth(secret);
         if let Some(cursor) = cursor.as_deref() {
             let (since, after_id) = decode_cursor(cursor);
             request = request.query(&[("since", since)]);

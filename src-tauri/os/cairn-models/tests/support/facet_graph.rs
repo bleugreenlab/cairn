@@ -37,6 +37,11 @@ pub const LEAF_ROOTS: &[&str] = &[
     "cairn-models-types",
 ];
 
+/// Workspace crates a leaf may still reach: infrastructure shared by every
+/// crate that speaks TLS, adding nothing to a leaf's graph that its own reqwest
+/// does not already bring. Each must itself reach no workspace crate.
+pub const LEAF_INFRASTRUCTURE: &[&str] = &["cairn-tls"];
+
 /// The runtime, the work layer, heavy configuration, and the private crate.
 pub const PUBLIC_FORBIDDEN: &[&str] = &[
     "cairn-core",
@@ -292,8 +297,9 @@ impl Graph {
                     continue;
                 }
                 let name = &self.packages[id.as_str()].name;
-                // 2. The leaves reach no workspace crate at all.
-                if LEAF_ROOTS.contains(root) {
+                // 2. The leaves reach no workspace crate but shared
+                //    infrastructure, which is itself a leaf (below).
+                if LEAF_ROOTS.contains(root) && !LEAF_INFRASTRUCTURE.contains(&name.as_str()) {
                     violations.push(format!(
                         "{root} must reach no workspace crate, but reaches {name}: {}",
                         self.chain(&reached, id)
@@ -306,6 +312,23 @@ impl Graph {
                         self.chain(&reached, id)
                     ));
                 }
+            }
+        }
+        // 2a. Leaf infrastructure reaches no workspace crate at all.
+        for infrastructure in LEAF_INFRASTRUCTURE {
+            let Some(infrastructure_id) = self.id_of(infrastructure) else {
+                continue;
+            };
+            let reached = self.closure(infrastructure_id);
+            for id in reached
+                .keys()
+                .filter(|id| id.as_str() != infrastructure_id && self.members.contains(*id))
+            {
+                violations.push(format!(
+                    "{infrastructure} must reach no workspace crate, but reaches {}: {}",
+                    self.packages[id.as_str()].name,
+                    self.chain(&reached, id)
+                ));
             }
         }
         // 4. Nothing under os/, tests included, reaches the private crate.
@@ -328,6 +351,7 @@ impl Graph {
         // must exist, so a rename cannot quietly turn a rule into a no-op.
         for name in PUBLIC_ROOTS
             .iter()
+            .chain(LEAF_INFRASTRUCTURE)
             .chain(PUBLIC_FORBIDDEN)
             .chain(PRIVATE_FORBIDDEN)
             .chain(std::iter::once(&PRIVATE_CRATE))

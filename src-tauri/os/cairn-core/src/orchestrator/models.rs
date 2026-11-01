@@ -50,6 +50,8 @@ pub struct ModelRuntime {
     /// The Codex CLI the local host launches, installed and kept on the
     /// published pin by Cairn.
     pub codex_cli: Arc<ManagedCodex>,
+    /// Every outside client's request the served API relays.
+    pub relay: Arc<dyn cairn_models::interface::relay::Relay>,
 }
 
 impl ModelRuntime {
@@ -75,6 +77,7 @@ impl ModelRuntime {
                 })),
             ),
             codex_cli,
+            relay: Arc::new(HttpComplete),
         }
     }
 }
@@ -262,8 +265,33 @@ impl Orchestrator {
             project_id,
             &presets,
             &self.provider_catalog(),
-            self.provider_enabled(key),
+            self.provider_installed(key),
         )
+    }
+
+    /// The providers that serve this workspace: the ones it installed, then
+    /// Cairn inference whenever its deployments serve a model, which is what
+    /// installs a built-in provider.
+    pub(crate) fn installed_providers(&self) -> Vec<String> {
+        let mut installed = self.enabled_providers();
+        let inference = crate::backends::inference::INFERENCE_BACKEND_KEY;
+        if !installed.iter().any(|key| key == inference) && self.serves_any(inference) {
+            installed.push(inference.to_string());
+        }
+        installed
+    }
+
+    pub(crate) fn provider_installed(&self, key: &str) -> bool {
+        self.installed_providers().iter().any(|entry| entry == key)
+    }
+
+    /// Whether `key`'s last discovery found any model.
+    fn serves_any(&self, key: &str) -> bool {
+        self.model_catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.get(key).map(|entry| !entry.models.is_empty()))
+            .unwrap_or(false)
     }
 
     /// Rediscover `backend`'s models and answer with that provider as the
@@ -336,7 +364,7 @@ impl Models for Orchestrator {
     fn catalog(&self, scope: &ModelScope) -> Result<Catalog, String> {
         let presets = self.models_presets(scope)?;
         let descriptors = self.provider_catalog();
-        let enabled = self.enabled_providers();
+        let enabled = self.installed_providers();
 
         let mut providers: Vec<CatalogProvider> = enabled
             .iter()
@@ -391,6 +419,71 @@ impl Models for Orchestrator {
             .into_iter()
             .map(|key| self.provider_usage_pool(key, scope.project_id.as_deref()))
             .collect())
+    }
+
+    fn requests(
+        &self,
+        query: &cairn_models::interface::RequestsQuery,
+    ) -> Result<Vec<cairn_models::interface::RequestRecord>, String> {
+        use cairn_db::storage::served_api as store;
+        let db = self.db.local.clone();
+        let query = query.clone();
+        run_db_blocking(move || async move {
+            let clients = store::list_served_api_clients(&db, crate::authorization::WORKSPACE_ID)
+                .await
+                .map_err(|error| error.to_string())?;
+            let client_id = match &query.client {
+                None => None,
+                Some(wanted) => Some(
+                    clients
+                        .iter()
+                        .filter(|client| &client.id == wanted || &client.name == wanted)
+                        .max_by_key(|client| client.revoked_at.is_none())
+                        .map(|client| client.id.clone())
+                        .ok_or_else(|| format!("no served-API client is named {wanted}"))?,
+                ),
+            };
+            let since =
+                chrono::Utc::now().timestamp_millis() - i64::from(query.hours) * 60 * 60 * 1000;
+            let rows = store::list_model_requests(
+                &db,
+                since,
+                client_id.as_deref(),
+                i64::try_from(query.limit).unwrap_or(i64::MAX),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(rows
+                .into_iter()
+                .map(|row| cairn_models::interface::RequestRecord {
+                    client: row.client_id.as_ref().and_then(|id| {
+                        clients
+                            .iter()
+                            .find(|client| &client.id == id)
+                            .map(|client| client.name.clone())
+                    }),
+                    id: row.id,
+                    at: row.ts,
+                    door: row.door,
+                    client_id: row.client_id,
+                    model_asked: row.model_asked,
+                    model: row.model,
+                    provider: row.provider,
+                    account_id: row.account_id,
+                    status: row.status,
+                    stream: row.stream,
+                    input_tokens: row.input_tokens,
+                    output_tokens: row.output_tokens,
+                    cached_tokens: row.cached_tokens,
+                    cost: row.cost,
+                    latency_ms: row.latency_ms,
+                    wait_ms: row.wait_ms,
+                    outcome: row.outcome,
+                    grant_id: row.grant_id,
+                    detail: row.detail,
+                })
+                .collect())
+        })
     }
 
     fn sessions(&self) -> Vec<SessionView> {

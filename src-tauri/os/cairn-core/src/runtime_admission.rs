@@ -522,9 +522,28 @@ pub trait RuntimeAdmissionClient: Send + Sync {
 /// HTTP implementation for team workspaces. The credential is the scoped token
 /// returned by `POST /runners/register`, not a device or organization token.
 pub struct TeamAdmissionClient {
-    http: reqwest::Client,
     api: ApiConfig,
     runner_token: String,
+}
+
+/// The HTTP client every admission request goes through, one per process.
+/// Admission builds a `TeamAdmissionClient` per decision, including from
+/// synchronous boot recovery, so the client is resolved here, on the async
+/// request path, where waiting for the root load holds no worker.
+async fn admission_http() -> Result<&'static reqwest::Client, AdmissionClientError> {
+    static HTTP: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
+    if HTTP.get().is_none() {
+        cairn_tls::ready().await;
+    }
+    HTTP.get_or_init(|| {
+        cairn_tls::client_builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(|error| AdmissionClientError::Unavailable(error.clone()))
 }
 
 impl TeamAdmissionClient {
@@ -542,16 +561,7 @@ impl TeamAdmissionClient {
                 "runner credential is missing".into(),
             ));
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| AdmissionClientError::Unavailable(error.to_string()))?;
-        Ok(Self {
-            http,
-            api,
-            runner_token,
-        })
+        Ok(Self { api, runner_token })
     }
 
     async fn send<T: DeserializeOwned>(
@@ -560,8 +570,8 @@ impl TeamAdmissionClient {
         url: String,
         body: Option<Value>,
     ) -> Result<Option<T>, AdmissionClientError> {
-        let mut request = self
-            .http
+        let mut request = admission_http()
+            .await?
             .request(method, url)
             .bearer_auth(&self.runner_token);
         if let Some(body) = body {

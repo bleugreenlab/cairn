@@ -25,7 +25,7 @@ use tokio_tungstenite::{
         http::{header::AUTHORIZATION, HeaderValue},
         Error as WsError, Message,
     },
-    MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 
 use super::channel;
@@ -109,7 +109,13 @@ async fn connect(url: &str, secret: &str) -> Result<RelaySocket, ConnectError> {
         ConnectError::Failed("the relay channel secret is not a valid header value".to_string())
     })?;
     request.headers_mut().insert(AUTHORIZATION, authorization);
-    match tokio_tungstenite::connect_async(request).await {
+    // The shared config, not tungstenite's default: that one reloads the
+    // platform root store on every `wss://` dial, inside this task's poll.
+    cairn_tls::ready().await;
+    let connector = Connector::Rustls(cairn_tls::websocket_config());
+    match tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector))
+        .await
+    {
         Ok((socket, _)) => Ok(socket),
         Err(WsError::Http(response)) if matches!(response.status().as_u16(), 401 | 404) => {
             Err(ConnectError::Rejected)

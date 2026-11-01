@@ -1530,6 +1530,8 @@ impl CairnResource {
             Self::ModelsEmbeddings => "cairn://models/embeddings".to_string(),
             Self::ModelsSessions => "cairn://models/sessions".to_string(),
             Self::ModelsSession { id } => format!("cairn://models/sessions/{id}"),
+            Self::ModelsClients => "cairn://models/clients".to_string(),
+            Self::ModelsClient { id } => format!("cairn://models/clients/{id}"),
             Self::Inference => "cairn://inference".to_string(),
             Self::InferenceRecipes => "cairn://inference/recipes".to_string(),
             Self::InferenceDeployments => "cairn://inference/deployments".to_string(),

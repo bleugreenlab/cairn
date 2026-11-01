@@ -108,7 +108,7 @@ pub(crate) fn post_whole(
     body: &Value,
     timeout: Duration,
 ) -> Result<WholeReply, CompletionError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| CompletionError::Upstream(error.to_string()))?;

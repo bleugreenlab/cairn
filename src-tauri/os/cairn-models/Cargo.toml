@@ -16,6 +16,7 @@ cairn-credentials = { path = "../cairn-credentials" }
 cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-common = { path = "../cairn-common" }
+cairn-tls = { path = "../cairn-tls" }
 base64 = "0.22"
 chrono = "0.4"
 crossbeam-channel = "0.5"

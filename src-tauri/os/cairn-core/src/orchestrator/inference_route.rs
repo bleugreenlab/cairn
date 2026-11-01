@@ -152,7 +152,7 @@ pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, 
 /// it.
 pub(crate) async fn served_name_of(orch: &Orchestrator, model: &str) -> Option<String> {
     let inventory = served_inventory(orch).await.ok()?;
-    let (deployment, _) = deployment_for(&inventory, model).ok()?;
+    let (deployment, _) = deployment_for(&inventory, model, None).ok()?;
     let recipe = &inventory.deployments.get(&deployment)?.recipe;
     Some(inventory.recipes.get(recipe)?.served_name.clone())
 }
@@ -164,7 +164,7 @@ pub(crate) async fn ask(
     requester: &str,
 ) -> Result<Asked, String> {
     let inventory = served_inventory(orch).await?;
-    let (deployment, pool) = deployment_for(&inventory, model)?;
+    let (deployment, pool) = deployment_for(&inventory, model, None)?;
     let db = &orch.db.local;
     let controls = load_controls(db).await?;
     let controlled = controls
@@ -191,7 +191,7 @@ pub(crate) async fn ask(
             pool: stored.pool,
             deployment,
         },
-        None => request_model(orch, model, requester).await?,
+        None => request_model(orch, model, Some(&pool), requester).await?,
     };
     answer(orch, &inventory, handle).await
 }
@@ -443,18 +443,21 @@ async fn measure(
 /// Read the engine's own model listing and metrics, and whether it answered
 /// either.
 async fn probe(deployment: &Deployment, address: &str, served_name: &str) -> (EngineMeasure, bool) {
-    let Ok(client) = reqwest::Client::builder().timeout(MEASURE_TIMEOUT).build() else {
-        return (EngineMeasure::default(), false);
-    };
+    let client = cairn_tls::client();
     async fn body(client: &reqwest::Client, url: String) -> Result<Option<String>, ()> {
-        let response = client.get(url).send().await.map_err(|_| ())?;
+        let response = client
+            .get(url)
+            .timeout(MEASURE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| ())?;
         if !response.status().is_success() {
             return Ok(None);
         }
         Ok(response.text().await.ok())
     }
-    let models = body(&client, format!("{}/models", deployment.api_base(address))).await;
-    let metrics = body(&client, deployment.metrics_url(address)).await;
+    let models = body(client, format!("{}/models", deployment.api_base(address))).await;
+    let metrics = body(client, deployment.metrics_url(address)).await;
     let answered = models.is_ok() || metrics.is_ok();
     let measure = EngineMeasure {
         max_model_len: models
@@ -464,7 +467,7 @@ async fn probe(deployment: &Deployment, address: &str, served_name: &str) -> (En
         kv_cache_tokens: metrics
             .ok()
             .flatten()
-            .and_then(|body| served::kv_cache_tokens(&body)),
+            .and_then(|body| cairn_inference::metrics::kv_cache_tokens(&body)),
     };
     if answered && measure.kv_cache_tokens.is_none() {
         log::info!(

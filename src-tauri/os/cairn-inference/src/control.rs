@@ -11,6 +11,14 @@
 //! machines (the dspark recipe does that over ssh). Cairn reserves every machine
 //! of the gang while it is reserving, starting, healthy or stopping, so nothing
 //! else is placed on a machine whose memory the model is about to take or holds.
+//!
+//! Health is the deployment's health URL answering, never its start script
+//! ending. A start is healthy as soon as either the head or a probe sees the
+//! URL answer; the script runs on to its own end, which may be never (a
+//! foreground server). While starting or healthy, a deployment whose health
+//! stops answering, or whose GPU memory falls from its footprint to nearly
+//! nothing ([`AllocationWatch`]), has lost its engine: it fails with that
+//! reason and frees its machines on its own.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -82,10 +90,11 @@ pub enum Phase {
     },
     Healthy {
         since_ms: i64,
-        /// How long the start command took to bring it to health, from the
-        /// head receiving it. `None` when Cairn found it already answering
-        /// (started before Cairn acted on it, or brought back by a power
-        /// cycle).
+        /// How long the start took to bring it to health: from the start
+        /// being sent to its health check first answering, whether or not
+        /// the start script had ended. `None` when Cairn found it already
+        /// answering (started before Cairn acted on it, or brought back by a
+        /// power cycle).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         load_ms: Option<u64>,
     },
@@ -135,8 +144,8 @@ impl Phase {
         }
     }
 
-    /// Whether a command the head is running decides what happens next, so a
-    /// probe has nothing to add.
+    /// Whether the phase waits on a start or stop the head is running, whose
+    /// report decides what happens next unless health decides first.
     pub fn command_in_flight(&self) -> bool {
         matches!(self, Self::Starting { .. } | Self::Stopping { .. })
     }
@@ -207,8 +216,9 @@ pub fn request(current: Option<&Phase>, request: Request, now_ms: i64) -> Result
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Report {
     Starting,
-    /// The health check answers. `ran_start` is false when it already answered
-    /// before the start command ran, so the command was not run at all.
+    /// The health check answers, though the start script may still be
+    /// running. `ran_start` is false when it already answered before the
+    /// start command ran, so the command was not run at all.
     Healthy {
         ran_start: bool,
     },
@@ -228,8 +238,11 @@ pub enum Observation {
     NotSent { reason: String },
     /// The head reported on the command the orch holds as current.
     Report(Report),
-    /// A probe of the health URL, sent while no command was in flight.
+    /// A probe of the health URL.
     Probed { healthy: bool },
+    /// The engine is gone by a measure other than the health check: its GPU
+    /// memory fell from the footprint it had reached ([`AllocationWatch`]).
+    Lost { reason: String },
     /// Waiting while reserving, with what it is waiting on.
     Waiting { on: String },
     /// The command in flight outlived its bound with no report.
@@ -277,6 +290,19 @@ pub fn observe(current: &Phase, observation: Observation, now_ms: i64) -> Option
                 load_ms: ran_start.then(|| now_ms.saturating_sub(*since_ms).max(0) as u64),
             })
         }
+        // Health is the probe answering, not the start script ending: a
+        // script that warms the model up, or serves in the foreground, is
+        // still running when the model is ready.
+        (Phase::Starting { since_ms, .. }, O::Probed { healthy: true }) => Some(Phase::Healthy {
+            since_ms: now_ms,
+            load_ms: Some(now_ms.saturating_sub(*since_ms).max(0) as u64),
+        }),
+        (Phase::Starting { .. } | Phase::Healthy { .. }, O::Lost { reason }) => {
+            Some(Phase::Failed {
+                at_ms: now_ms,
+                reason,
+            })
+        }
         (Phase::Starting { .. } | Phase::Stopping { .. }, O::Report(Report::Failed { reason })) => {
             Some(Phase::Failed {
                 at_ms: now_ms,
@@ -299,6 +325,88 @@ pub fn observe(current: &Phase, observation: Observation, now_ms: i64) -> Option
             reason: "it stopped answering its health check".into(),
         }),
         _ => None,
+    }
+}
+
+/// Whether the start stays the row's command across this change: health
+/// answered while the start script may still be running, so the script's own
+/// end is still to be reported (see [`late_start_failure`]).
+pub fn keeps_start_command(before: &Phase, after: &Phase) -> bool {
+    matches!(
+        (before, after),
+        (Phase::Starting { .. }, Phase::Healthy { .. })
+    )
+}
+
+/// A start script that ended badly after its deployment was already healthy.
+/// It never moves the phase, since health decides that and a deployment
+/// whose health also stops answering fails on the probe; the reason is kept
+/// on the load as a note.
+pub fn late_start_failure<'a>(current: &Phase, report: &'a Report) -> Option<&'a str> {
+    match (current, report) {
+        (Phase::Healthy { .. }, Report::Failed { reason }) => Some(reason),
+        _ => None,
+    }
+}
+
+/// How much of its footprint a machine's GPU memory must reach before a fall
+/// counts, as a fraction `numerator / denominator`: a load that never got this
+/// far has nothing to lose yet.
+pub const LOADED_SHARE: (u64, u64) = (1, 2);
+/// How little of its footprint a loaded machine's GPU memory must fall to for
+/// its engine to count as gone.
+pub const GONE_SHARE: (u64, u64) = (1, 10);
+
+/// One gang machine's GPU memory against what the deployment settles at there.
+/// `None` is unmeasured, which never counts either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Allocation {
+    pub held_bytes: Option<u64>,
+    pub footprint_bytes: Option<u64>,
+}
+
+/// Watches a starting or healthy deployment's GPU memory for its engine dying
+/// under it. A machine counts once its GPU memory has climbed to
+/// [`LOADED_SHARE`] of its footprint; a counted machine whose GPU memory then
+/// falls below [`GONE_SHARE`] of it has lost its engine. The host keeps one
+/// watch per deployment for as long as it is starting or healthy, and starts
+/// a fresh one for the next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllocationWatch {
+    /// The most each counted machine has held.
+    peaks: BTreeMap<MachineName, u64>,
+}
+
+impl AllocationWatch {
+    /// Take one reading of every gang machine. Returns why the engine is gone
+    /// when a counted machine's GPU memory has collapsed.
+    pub fn observe(&mut self, allocations: &BTreeMap<MachineName, Allocation>) -> Option<String> {
+        let share = |bytes: u64, (num, den): (u64, u64)| bytes / den * num;
+        for (machine, allocation) in allocations {
+            let (Some(held), Some(footprint)) = (allocation.held_bytes, allocation.footprint_bytes)
+            else {
+                continue;
+            };
+            if footprint == 0 {
+                continue;
+            }
+            if held >= share(footprint, LOADED_SHARE) {
+                let peak = self.peaks.entry(machine.clone()).or_default();
+                *peak = (*peak).max(held);
+                continue;
+            }
+            if let Some(peak) = self.peaks.get(machine) {
+                if held < share(footprint, GONE_SHARE) {
+                    return Some(format!(
+                        "its engine is gone: {machine}'s GPU memory fell to {} after reaching {} (its footprint is {})",
+                        gib(held),
+                        gib(*peak),
+                        gib(footprint)
+                    ));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -929,6 +1037,172 @@ mod tests {
         assert_eq!(
             observe(&back, Observation::Probed { healthy: true }, T0 + 3),
             None
+        );
+    }
+
+    #[test]
+    fn health_answering_before_the_start_script_ends_is_healthy() {
+        let healthy = observe(
+            &starting(),
+            Observation::Probed { healthy: true },
+            T0 + 5_000 + 401_000,
+        )
+        .unwrap();
+        assert_eq!(
+            healthy,
+            Phase::Healthy {
+                since_ms: T0 + 406_000,
+                load_ms: Some(401_000)
+            },
+            "the load is timed to health answering, not to the script's warm-up ending"
+        );
+        assert_eq!(
+            finished_load(&starting(), &healthy),
+            Some(LoadOutcome::Healthy { load_ms: 401_000 })
+        );
+        assert!(keeps_start_command(&starting(), &healthy));
+        assert_eq!(
+            observe(
+                &starting(),
+                Observation::Probed { healthy: false },
+                T0 + 6_000
+            ),
+            None,
+            "a model still loading does not answer yet"
+        );
+
+        // The script's own end, once healthy, never moves the phase.
+        let late = Report::Failed {
+            reason: "the start command exited 1 after its health check had answered".into(),
+        };
+        assert_eq!(
+            observe(&healthy, Observation::Report(late.clone()), T0 + 500_000),
+            None
+        );
+        assert_eq!(
+            late_start_failure(&healthy, &late),
+            Some("the start command exited 1 after its health check had answered")
+        );
+        assert_eq!(late_start_failure(&starting(), &late), None);
+        assert_eq!(
+            late_start_failure(&healthy, &Report::Healthy { ran_start: true }),
+            None
+        );
+    }
+
+    #[test]
+    fn an_engine_lost_while_starting_or_healthy_fails_and_frees_its_machines() {
+        let lost = || Observation::Lost {
+            reason: "its engine is gone".into(),
+        };
+        let failed = observe(&starting(), lost(), T0 + 9_000).unwrap();
+        assert_eq!(
+            failed,
+            Phase::Failed {
+                at_ms: T0 + 9_000,
+                reason: "its engine is gone".into()
+            }
+        );
+        assert!(!failed.reserves());
+        assert_eq!(
+            finished_load(&starting(), &failed),
+            Some(LoadOutcome::Failed {
+                reason: "its engine is gone".into()
+            })
+        );
+        let healthy = Phase::Healthy {
+            since_ms: T0,
+            load_ms: Some(1),
+        };
+        let failed = observe(&healthy, lost(), T0 + 9_000).unwrap();
+        assert!(!failed.reserves());
+        assert_eq!(
+            finished_load(&healthy, &failed),
+            None,
+            "its load already finished healthy"
+        );
+        for phase in [
+            reserving(),
+            Phase::Stopping { since_ms: T0 },
+            Phase::Stopped { since_ms: T0 },
+        ] {
+            assert_eq!(observe(&phase, lost(), T0 + 1), None, "{phase:?}");
+        }
+    }
+
+    fn allocations(
+        readings: &[(&str, Option<u64>, Option<u64>)],
+    ) -> BTreeMap<MachineName, Allocation> {
+        readings
+            .iter()
+            .map(|(machine, held, footprint)| {
+                (
+                    MachineName::from(*machine),
+                    Allocation {
+                        held_bytes: held.map(|gib| gib << 30),
+                        footprint_bytes: footprint.map(|gib| gib << 30),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gpu_memory_that_collapses_after_loading_means_the_engine_is_gone() {
+        let mut watch = AllocationWatch::default();
+        let fp = Some(100);
+        // Climbing: nothing to lose yet, even from zero.
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(0), fp), ("sp2", Some(0), fp)])),
+            None
+        );
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(30), fp), ("sp2", Some(5), fp)])),
+            None
+        );
+        assert_eq!(
+            watch.observe(&allocations(&[
+                ("sp1", Some(82), fp),
+                ("sp2", Some(82), fp)
+            ])),
+            None
+        );
+        // A dip that is not a collapse, and an unmeasured reading, count for
+        // nothing.
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(40), fp), ("sp2", None, fp)])),
+            None
+        );
+        let reason = watch
+            .observe(&allocations(&[("sp1", Some(0), fp), ("sp2", Some(82), fp)]))
+            .expect("sp1 fell from 82 GiB to nothing");
+        assert_eq!(
+            reason,
+            "its engine is gone: sp1's GPU memory fell to 0.0 GiB after reaching 82.0 GiB (its footprint is 100.0 GiB)"
+        );
+    }
+
+    #[test]
+    fn gpu_memory_with_no_footprint_or_no_load_says_nothing() {
+        let mut watch = AllocationWatch::default();
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(90), None)])),
+            None
+        );
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(0), None)])),
+            None,
+            "nothing to compare against"
+        );
+        let mut watch = AllocationWatch::default();
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(20), Some(100))])),
+            None
+        );
+        assert_eq!(
+            watch.observe(&allocations(&[("sp1", Some(0), Some(100))])),
+            None,
+            "it never got far enough to have lost anything"
         );
     }
 

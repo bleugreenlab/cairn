@@ -73,6 +73,7 @@ impl AgentBackend for OllamaBackend {
     fn name(&self) -> &str {
         OLLAMA_BACKEND_NAME
     }
+
     fn is_available(&self) -> Result<(), String> {
         Ok(())
     }

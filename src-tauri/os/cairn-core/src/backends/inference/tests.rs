@@ -22,17 +22,15 @@ recipes:
     upstreamId: deepseek/deepseek-v4-flash-vision-exp
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 2}
-    aliases: [big, vision, dsv4-flash]
   - id: qwen3-embed-4b
     source: bginf
-    model: {name: Qwen/Qwen3-Embedding-4B-GGUF}
+    model: {name: Qwen/Qwen3-Embedding-4B}
     servedName: qwen3-embedding-4b
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
-    aliases: [embed]
   - id: qwen36-fast
     source: bginf
-    model: {name: qwen36-fast}
+    model: {name: Qwen/Qwen3.6-35B-A3B}
     servedName: qwen36-fast
     engine: {kind: command, start: ./start.sh}
     requirements: {machines: 1}
@@ -100,31 +98,25 @@ fn provider() -> CatalogProvider {
     }
 }
 
+const DSV4: &str = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp";
+
 #[test]
-fn deepseek_is_offered_by_served_name_and_alias_for_what_its_declaration_names() {
+fn deepseek_is_offered_by_its_real_name_for_what_its_declaration_names() {
     let provider = provider();
-    for name in [
-        "deepseek-v4-flash-vision-exp",
-        "dsv4-flash",
-        "big",
-        "vision",
-    ] {
-        for verb in [VerbKind::Complete, VerbKind::Session, VerbKind::Decide] {
-            assert!(provider.admit(name, verb).is_ok(), "{name} {verb}");
-        }
-        assert!(provider.admit(name, VerbKind::Embed).is_err(), "{name}");
+    for verb in [VerbKind::Complete, VerbKind::Session, VerbKind::Decide] {
+        assert!(provider.admit(DSV4, verb).is_ok(), "{verb}");
     }
-    let alias = provider
-        .listed(None)
-        .catalog
-        .unwrap()
-        .models
-        .into_iter()
-        .find(|model| model.id == "dsv4-flash")
-        .unwrap();
-    assert_eq!(alias.context_window, Some(1_048_576));
+    assert!(provider.admit(DSV4, VerbKind::Embed).is_err());
+    let listed = provider.listed(None).catalog.unwrap().models;
     assert_eq!(
-        alias
+        listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        [DSV4, "Qwen/Qwen3-Embedding-4B", "Qwen/Qwen3.6-35B-A3B"]
+    );
+    let deepseek = listed.into_iter().find(|model| model.id == DSV4).unwrap();
+    assert_eq!(deepseek.display_name, DSV4);
+    assert_eq!(deepseek.context_window, Some(1_048_576));
+    assert_eq!(
+        deepseek
             .modalities
             .as_ref()
             .map(ToString::to_string)
@@ -132,26 +124,40 @@ fn deepseek_is_offered_by_served_name_and_alias_for_what_its_declaration_names()
         Some("text+image → text")
     );
     assert_eq!(
-        alias.canonical_slug.as_deref(),
+        deepseek.canonical_slug.as_deref(),
         Some("deepseek/deepseek-v4-flash-vision-exp")
     );
-    assert_eq!(
-        alias.description.as_deref(),
-        Some("deepseek-v4-flash-vision-exp on deployment dsv4f-tp2")
-    );
+}
+
+#[test]
+fn no_old_alias_served_name_or_id_names_a_model() {
+    let inventory = inventory();
+    let listed: Vec<_> = served().into_iter().map(|model| model.id).collect();
+    for name in [
+        "dsv4-flash",
+        "big",
+        "vision",
+        "deepseek-v4-flash-vision-exp",
+        "dsv4f-tp2",
+    ] {
+        assert!(!listed.iter().any(|id| id == name), "{name}");
+        assert!(
+            crate::orchestrator::pool_control::deployment_for(&inventory, name, None).is_err(),
+            "{name}"
+        );
+    }
 }
 
 #[test]
 fn an_embedder_is_listed_and_serves_nothing_here_until_its_route_exists() {
     let provider = provider();
-    for name in ["qwen3-embedding-4b", "embed"] {
-        assert!(provider.serves_for(name).is_empty(), "{name}");
-        let refusal = provider.admit(name, VerbKind::Session).unwrap_err();
-        assert!(
-            refusal.to_string().contains("serves nothing Cairn runs"),
-            "{refusal}"
-        );
-    }
+    let name = "Qwen/Qwen3-Embedding-4B";
+    assert!(provider.serves_for(name).is_empty());
+    let refusal = provider.admit(name, VerbKind::Session).unwrap_err();
+    assert!(
+        refusal.to_string().contains("serves nothing Cairn runs"),
+        "{refusal}"
+    );
 }
 
 #[test]
@@ -159,11 +165,14 @@ fn an_undeclared_recipe_takes_the_providers_claim() {
     let provider = provider();
     let fast = served()
         .into_iter()
-        .find(|model| model.id == "qwen36-fast")
+        .find(|model| model.id == "Qwen/Qwen3.6-35B-A3B")
         .unwrap();
     assert_eq!(serves_for(&fast), None);
     for verb in [VerbKind::Complete, VerbKind::Session, VerbKind::Decide] {
-        assert!(provider.admit("qwen36-fast", verb).is_ok(), "{verb}");
+        assert!(
+            provider.admit("Qwen/Qwen3.6-35B-A3B", verb).is_ok(),
+            "{verb}"
+        );
     }
     // An unmeasured engine advertises no context.
     assert_eq!(discovered(&fast).context_window, None);
@@ -173,7 +182,7 @@ fn an_undeclared_recipe_takes_the_providers_claim() {
 fn a_recipe_that_outputs_no_text_and_names_no_verbs_serves_nothing() {
     let mut model = served()
         .into_iter()
-        .find(|model| model.id == "qwen36-fast")
+        .find(|model| model.id == "Qwen/Qwen3.6-35B-A3B")
         .unwrap();
     model.modalities = Modalities {
         input: vec![Modality::Text],

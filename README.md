@@ -58,6 +58,7 @@ not published; `cairn-models` defines the `Subscriptions` seam a host implements
 | `cairn-cell` | Shared build-cell policy and filesystem primitives |
 | `cairn-sandbox` | OS-level filesystem sandbox applied where commands are spawned |
 | `cairn-platform` | Filesystem and process support shared by Cairn hosts |
+| `cairn-tls` | The process's one TLS client trust configuration: the platform root store, loaded once, and the HTTP and WebSocket client configs built on it |
 | `cairn-checkenv` | Check execution provenance and source-sensitive implementation identity |
 
 ## Using these crates

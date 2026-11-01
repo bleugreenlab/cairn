@@ -941,7 +941,7 @@ impl Fetch for HttpFetch {
         let url = url.to_string();
         let dest = dest.to_path_buf();
         off_runtime(move || {
-            let client = reqwest::blocking::Client::builder()
+            let client = cairn_tls::blocking_client_builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(30))
                 .timeout(Duration::from_secs(60 * 60))
@@ -980,7 +980,7 @@ impl PinSource for PublishedPin {
         let url = self.url.clone();
         let etag = etag.map(str::to_string);
         off_runtime(move || {
-            let client = reqwest::blocking::Client::builder()
+            let client = cairn_tls::blocking_client_builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(60))

@@ -35,6 +35,16 @@ impl Orchestrator {
         self.claude_feeds.sweep(self, self.subscriptions());
     }
 
+    /// Renew every ChatGPT login idle long enough that its refresh token could
+    /// lapse unspent. Codex sessions ask for renewals themselves, so there is
+    /// no live process to push to. Blocking.
+    pub(crate) fn keep_codex_logins_alive(&self) {
+        let renewed = self.subscriptions().renew_codex_credentials(self);
+        if !renewed.is_empty() {
+            log::info!("Kept idle Codex logins alive: {}", renewed.join(", "));
+        }
+    }
+
     /// A credential was published in this process. Never blocks.
     pub(crate) fn claude_credentials_published(&self) {
         self.claude_feeds.published();

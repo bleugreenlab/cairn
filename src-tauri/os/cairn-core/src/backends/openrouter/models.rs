@@ -285,7 +285,7 @@ fn listing(
     );
     headers.insert("X-OpenRouter-Title", HeaderValue::from_static("Cairn"));
 
-    let mut client = reqwest::blocking::Client::builder();
+    let mut client = cairn_tls::blocking_client_builder();
     if let Some(timeout) = timeout {
         client = client.timeout(timeout);
     }

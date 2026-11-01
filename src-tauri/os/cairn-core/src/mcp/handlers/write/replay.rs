@@ -105,10 +105,12 @@ impl SettlementGate {
     }
 }
 
+/// Settlement gates keyed by `(run_id, tool_use_id)`.
 #[cfg(feature = "test-utils")]
-static SETTLEMENT_GATES: OnceLock<
-    Mutex<std::collections::HashMap<(String, String), Arc<SettlementGate>>>,
-> = OnceLock::new();
+type SettlementGates = Mutex<std::collections::HashMap<(String, String), Arc<SettlementGate>>>;
+
+#[cfg(feature = "test-utils")]
+static SETTLEMENT_GATES: OnceLock<SettlementGates> = OnceLock::new();
 
 /// Install a one-call gate used by process fixtures; production deliveries never register one.
 #[cfg(feature = "test-utils")]
@@ -526,7 +528,7 @@ pub(crate) async fn complete_blocking_report(
     db: &LocalDb,
     run_id: &str,
     tool_use_id: &str,
-    text: &str,
+    blocking: crate::resources::mutations::BlockingResult,
 ) -> Result<String, String> {
     let original = db
         .query_opt_text(
@@ -535,7 +537,7 @@ pub(crate) async fn complete_blocking_report(
         )
         .await
         .map_err(|e| e.to_string())?;
-    replace_blocking_payload(original.as_deref(), text)
+    replace_blocking_payload(original.as_deref(), blocking)
 }
 
 /// The checkpoint contains completed nonblocking effects even while the group
@@ -548,7 +550,10 @@ pub(crate) fn blocking_checkpoint_report(report: &str) -> Option<&str> {
     (!report.is_empty()).then_some(report)
 }
 
-fn replace_blocking_payload(original: Option<&str>, text: &str) -> Result<String, String> {
+fn replace_blocking_payload(
+    original: Option<&str>,
+    blocking: crate::resources::mutations::BlockingResult,
+) -> Result<String, String> {
     let original = original.and_then(blocking_checkpoint_report);
     let (mut report, suffix) = match original {
         Some(original) => {
@@ -578,10 +583,7 @@ fn replace_blocking_payload(original: Option<&str>, text: &str) -> Result<String
             "",
         ),
     };
-    report["blocking"] = serde_json::to_value(crate::resources::mutations::BlockingResult::from(
-        text.to_string(),
-    ))
-    .map_err(|e| e.to_string())?;
+    report["blocking"] = serde_json::to_value(blocking).map_err(|e| e.to_string())?;
     Ok(format!(
         "{}{suffix}",
         serde_json::to_string(&report).map_err(|e| e.to_string())?
@@ -1045,9 +1047,10 @@ mod tests {
         let saved = recorded_report(&db, &call).await.unwrap();
         assert_eq!(blocking_checkpoint_report(&saved), Some(prior.as_str()));
         let child = r#"{"applied":[],"blocking":{"text":"Delegated task 'inner' suspended; the parent run will resume from the real child result(s)."}} "#;
-        let result = complete_blocking_report(&db, &call.run_id, &call.id, child)
-            .await
-            .unwrap();
+        let result =
+            complete_blocking_report(&db, &call.run_id, &call.id, child.to_string().into())
+                .await
+                .unwrap();
         assert!(result.ends_with(suffix));
         let mut decoded: serde_json::Value = serde_json::Deserializer::from_str(&result)
             .into_iter()
@@ -1101,11 +1104,11 @@ mod tests {
     #[test]
     fn blocking_completion_keeps_child_data_opaque_without_a_prior_report() {
         let child = r#"{"applied":[],"blocking":{"text":"Prompt suspended"}}"#;
-        let encoded = replace_blocking_payload(None, child).unwrap();
+        let encoded = replace_blocking_payload(None, child.to_string().into()).unwrap();
         let report: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(report["blocking"]["text"], child);
         assert_eq!(report["applied"], json!([]));
-        assert!(replace_blocking_payload(Some("not a report"), child).is_err());
+        assert!(replace_blocking_payload(Some("not a report"), child.to_string().into()).is_err());
     }
 
     #[tokio::test]

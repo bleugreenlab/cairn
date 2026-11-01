@@ -19,7 +19,7 @@ pub struct NewOutbound<'a> {
 
 pub async fn get_by_id(db: &LocalDb, id: &str) -> Result<Option<OutboundRecord>, String> {
     db.query_opt(
-        &format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE id = ?1"),
+        format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE id = ?1"),
         (id.to_string(),),
         OutboundRecord::from_row,
     )
@@ -441,7 +441,7 @@ fn current_failure() -> String {
 /// [`current_failure`]).
 pub async fn latest_send_error(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
     db.query_opt(
-        &format!(
+        format!(
             "SELECT last_error FROM channel_outbound WHERE channel = ?1 AND last_error IS NOT NULL AND {} ORDER BY {FAILED_AT} DESC, rowid DESC LIMIT 1",
             current_failure()
         ),
@@ -1499,7 +1499,7 @@ pub struct UndeliveredCounts {
 /// Queued rows, and the failed rows that are current (see [`current_failure`]).
 pub async fn undelivered_counts(db: &LocalDb, channel: &str) -> Result<UndeliveredCounts, String> {
     db.query_one(
-        &format!(
+        format!(
             "SELECT COUNT(*) FILTER (WHERE status = 'pending'), COUNT(*) FILTER (WHERE {}) FROM channel_outbound WHERE channel = ?1 AND status IN ('pending', 'failed')",
             current_failure()
         ),
@@ -2039,8 +2039,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_multi_question_submissions_share_one_complete_winner() {
         let db = migrated_test_db("multi-question-answer-race.db").await;
-        let desktop_response = "Question 1: Desktop A\nQuestion 2: Desktop B";
-        let resource_response = "Question 1: Resource A\nQuestion 2: Resource B";
+        let desktop_response = &stored_answers("Desktop A", "Desktop B");
+        let resource_response = &stored_answers("Resource A", "Resource B");
 
         let (desktop, resource) = tokio::join!(
             claim_ask_resolution(
@@ -2077,7 +2077,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(winners[0].answer, winners[1].answer);
-        assert!(winners[0].answer == desktop_response || winners[0].answer == resource_response);
+        assert!(&winners[0].answer == desktop_response || &winners[0].answer == resource_response);
         assert_eq!(winners[0].resolution_id, winners[1].resolution_id);
         assert_eq!(winners[0].winner_surface, winners[1].winner_surface);
         assert!(matches!(
@@ -2090,8 +2090,8 @@ mod tests {
     #[tokio::test]
     async fn desktop_and_channel_share_one_complete_prompt_winner() {
         let db = migrated_test_db("desktop-channel-prompt-race.db").await;
-        let desktop = "Question 1: Desktop A\nQuestion 2: Desktop B";
-        let channel = "Question 1: Channel A\nQuestion 2: Channel B";
+        let desktop = &stored_answers("Desktop A", "Desktop B");
+        let channel = &stored_answers("Channel A", "Channel B");
 
         let (desktop_claim, channel_claim) = tokio::join!(
             claim_ask_resolution(
@@ -2126,14 +2126,32 @@ mod tests {
 
         assert_eq!(winners[0].resolution_id, winners[1].resolution_id);
         assert_eq!(winners[0].answer, winners[1].answer);
-        assert!(winners[0].answer == desktop || winners[0].answer == channel);
+        assert!(&winners[0].answer == desktop || &winners[0].answer == channel);
+    }
+
+    /// A two-question prompt's answers in their stored, index-keyed form: what
+    /// every surface claims with.
+    fn stored_answers(first: &str, second: &str) -> String {
+        crate::models::question::PromptAnswers::new(
+            2,
+            [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(index, answer)| crate::models::question::QuestionAnswer {
+                    index,
+                    answer: answer.to_string(),
+                })
+                .collect(),
+        )
+        .unwrap()
+        .to_stored()
     }
 
     #[tokio::test]
     async fn two_channels_cannot_form_a_hybrid_multi_question_winner() {
         let db = migrated_test_db("two-channel-prompt-race.db").await;
-        let imessage = "Question 1: iMessage A\nQuestion 2: iMessage B";
-        let discord = "Question 1: Discord A\nQuestion 2: Discord B";
+        let imessage = &stored_answers("iMessage A", "iMessage B");
+        let discord = &stored_answers("Discord A", "Discord B");
 
         let (imessage_claim, discord_claim) = tokio::join!(
             claim_ask_resolution(
@@ -2168,7 +2186,7 @@ mod tests {
 
         assert_eq!(winners[0].resolution_id, winners[1].resolution_id);
         assert_eq!(winners[0].answer, winners[1].answer);
-        assert!(winners[0].answer == imessage || winners[0].answer == discord);
+        assert!(&winners[0].answer == imessage || &winners[0].answer == discord);
     }
 
     #[tokio::test]

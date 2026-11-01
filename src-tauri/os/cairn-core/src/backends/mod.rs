@@ -35,6 +35,7 @@ mod openai_compat;
 mod openai_responses;
 pub mod opencode;
 pub mod openrouter;
+pub mod relay;
 mod run_state;
 pub(crate) use run_state::is_task_spawned_run;
 pub mod stdin;
@@ -334,6 +335,24 @@ pub trait AgentBackend: Send + Sync {
         _admitted: crate::backends::Admitted,
     ) -> Result<CompletionOutcome, CompletionFailure> {
         Err(CompletionError::BackendUnavailable.into())
+    }
+
+    /// Where an outside client's request for `request.model` goes: this
+    /// backend's OpenAI base URL and credentials, and the name the provider is
+    /// sent. A backend that must load the model first waits here, within
+    /// `request.wait`. Only [`launch::relay_route`] can supply `admitted`, so
+    /// every relayed request passes the verb gate first. Backends that are not
+    /// OpenAI-compatible HTTP servers keep the refusal.
+    fn relay_route(
+        &self,
+        _orch: &Orchestrator,
+        _request: relay::RelayRequest<'_>,
+        _admitted: Admitted,
+    ) -> Result<cairn_models::interface::relay::RelayRoute, relay::RelayRefusal> {
+        Err(relay::RelayRefusal::Unavailable(format!(
+            "{} is not served to outside clients",
+            self.name()
+        )))
     }
 
     fn completion_shape(&self) -> CompletionShape {

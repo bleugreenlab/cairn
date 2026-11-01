@@ -447,14 +447,26 @@ impl TokenResponseBody {
     }
 }
 
-/// Build the shared HTTP client for OAuth calls. Redirects are disabled — token
-/// and discovery endpoints must not bounce the client to another origin.
-fn oauth_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(OAUTH_HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("Failed to build OAuth HTTP client: {e}"))
+/// The shared HTTP client for OAuth calls, built once for the process.
+/// Redirects are disabled — token and discovery endpoints must not bounce the
+/// client to another origin. Async because a token refresh can run at boot,
+/// possibly before the root store has loaded.
+async fn oauth_http_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    if CLIENT.get().is_none() {
+        cairn_tls::ready().await;
+    }
+    CLIENT
+        .get_or_init(|| {
+            cairn_tls::client_builder()
+                .timeout(OAUTH_HTTP_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| format!("Failed to build OAuth HTTP client: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Exchange an authorization code for tokens, binding the RFC8707 `resource`.
@@ -471,7 +483,7 @@ pub async fn exchange_code(
     if !is_secure_endpoint(token_endpoint) {
         return Err(format!("Token endpoint must be HTTPS: {token_endpoint}"));
     }
-    let client = oauth_http_client()?;
+    let client = oauth_http_client().await?;
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
         ("code", code.to_string()),
@@ -485,7 +497,7 @@ pub async fn exchange_code(
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret.to_string()));
     }
-    post_token_request(&client, token_endpoint, &form, None).await
+    post_token_request(client, token_endpoint, &form, None).await
 }
 
 /// Refresh an access token via the refresh-token grant, re-binding `resource`.
@@ -500,7 +512,7 @@ pub(crate) async fn refresh_access_token(
     if !is_secure_endpoint(token_endpoint) {
         return Err(format!("Token endpoint must be HTTPS: {token_endpoint}"));
     }
-    let client = oauth_http_client()?;
+    let client = oauth_http_client().await?;
     let mut form = vec![
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
@@ -516,7 +528,7 @@ pub(crate) async fn refresh_access_token(
         form.push(("scope", scope.to_string()));
     }
     post_token_request(
-        &client,
+        client,
         token_endpoint,
         &form,
         Some(refresh_token.to_string()),
@@ -569,12 +581,12 @@ const DISCOVER_PROBE_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"server/di
 /// that challenge on the stream open). Returns the first response that demands
 /// authorization; otherwise the POST result.
 pub async fn probe_endpoint(url: &str) -> Result<Probe, String> {
-    let client = oauth_http_client()?;
-    let post = probe_request(&client, url, true).await;
+    let client = oauth_http_client().await?;
+    let post = probe_request(client, url, true).await;
     if matches!(post, Some(ref p) if p.requires_auth) {
         return Ok(post.unwrap());
     }
-    if let Some(get) = probe_request(&client, url, false).await {
+    if let Some(get) = probe_request(client, url, false).await {
         if get.requires_auth {
             return Ok(get);
         }
@@ -620,18 +632,14 @@ impl ProbeOutcome {
 /// [`ProbeOutcome::Unknown`] (NOT a definitive "no auth"), so the caller can
 /// still offer authorization for a server it otherwise cannot use.
 pub async fn probe_requires_auth_quick(url: &str) -> ProbeOutcome {
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    else {
+    let Ok(client) = oauth_http_client().await else {
         return ProbeOutcome::Unknown;
     };
-    let post = probe_request(&client, url, true).await;
+    let post = probe_request(client, url, true).await;
     if matches!(post, Some(ref p) if p.requires_auth) {
         return ProbeOutcome::RequiresAuth;
     }
-    let get = probe_request(&client, url, false).await;
+    let get = probe_request(client, url, false).await;
     if matches!(get, Some(ref p) if p.requires_auth) {
         return ProbeOutcome::RequiresAuth;
     }
@@ -662,7 +670,12 @@ async fn probe_request(client: &reqwest::Client, url: &str, post: bool) -> Optio
             "application/json, text/event-stream",
         )
     };
-    let resp = builder.send().await.ok()?;
+    // Short, so the settings page never waits on a slow or unreachable server.
+    let resp = builder
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
     let requires_auth = resp.status() == reqwest::StatusCode::UNAUTHORIZED
         || resp.status() == reqwest::StatusCode::FORBIDDEN;
     let challenge = resp
@@ -682,10 +695,10 @@ async fn probe_request(client: &reqwest::Client, url: &str, post: bool) -> Optio
 pub async fn fetch_protected_resource_metadata(
     candidate_urls: &[String],
 ) -> Result<ProtectedResourceMetadata, String> {
-    let client = oauth_http_client()?;
+    let client = oauth_http_client().await?;
     let mut last_err = String::from("no PRM candidate URLs");
     for url in candidate_urls {
-        match fetch_json(&client, url).await {
+        match fetch_json(client, url).await {
             Ok(body) => match parse_protected_resource_metadata(&body) {
                 Ok(prm) => return Ok(prm),
                 Err(e) => last_err = e,
@@ -701,10 +714,10 @@ pub async fn fetch_protected_resource_metadata(
 /// Discover authorization-server metadata for an issuer, trying the spec's
 /// priority-ordered well-known URLs and requiring PKCE `S256`.
 pub async fn fetch_auth_server_metadata(issuer: &str) -> Result<AuthServerMetadata, String> {
-    let client = oauth_http_client()?;
+    let client = oauth_http_client().await?;
     let mut last_err = String::from("no AS metadata candidate URLs");
     for url in as_metadata_urls(issuer) {
-        match fetch_json(&client, &url).await {
+        match fetch_json(client, &url).await {
             Ok(body) => match parse_auth_server_metadata(&body) {
                 Ok(meta) if meta.authorization_endpoint.is_empty() => {
                     last_err = format!("AS metadata at {url} has no authorization_endpoint");
@@ -803,7 +816,7 @@ pub async fn register_client(
             "Registration endpoint must be HTTPS: {registration_endpoint}"
         ));
     }
-    let client = oauth_http_client()?;
+    let client = oauth_http_client().await?;
     let req = RegistrationRequest {
         client_name,
         application_type: "native",

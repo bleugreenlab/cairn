@@ -186,7 +186,7 @@ pub(crate) fn discover_models_blocking(
 /// full Go line-up, so the catalog is browsable before a key is pasted; the key
 /// rides along when there is one so the answer is scoped to the account.
 fn fetch_subscription_model_ids(api_key: Option<&str>) -> Result<Vec<String>, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(DISCOVERY_TIMEOUT)
         .build()
         .map_err(|error| format!("OpenCode Go discovery client failed: {error}"))?;
@@ -217,7 +217,7 @@ fn fetch_subscription_model_ids(api_key: Option<&str>) -> Result<Vec<String>, St
 /// timer: there is no per-provider endpoint to ask instead (the per-provider
 /// paths redirect to the site root).
 fn fetch_published_metadata() -> Result<HashMap<String, PublishedModel>, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(DISCOVERY_TIMEOUT)
         .build()
         .map_err(|error| format!("OpenCode Go metadata client failed: {error}"))?;

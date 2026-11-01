@@ -68,6 +68,10 @@ const INDEX: &[(&str, &str)] = &[
         "cairn://models/sessions",
         "live model sessions on this host; stop one at cairn://models/sessions/<id>",
     ),
+    (
+        "cairn://models/clients",
+        "outside clients of the served OpenAI-compatible API: their keys and remote grants",
+    ),
 ];
 
 /// Refuse any query key a resource does not read, naming the ones it does.
@@ -885,6 +889,9 @@ fn account_block(
         let _ = write!(out, " · last used {}", when(used));
     }
     out.push('\n');
+    if let Some(line) = sign_in_line(account, now) {
+        let _ = writeln!(out, "  - {line}");
+    }
     let health = &account["health"];
     if health.is_object() {
         let captured = health["capturedAt"].as_i64();
@@ -933,6 +940,72 @@ fn account_block(
     }
 }
 
+/// The sign-in deadline a serialized [`AccountInfo`] carries.
+///
+/// [`AccountInfo`]: cairn_models::accounts::AccountInfo
+fn sign_in_expiry(account: &Value) -> Option<crate::credentials::SignInExpiry> {
+    serde_json::from_value(account["signInExpiry"].clone()).ok()
+}
+
+/// Where an account's sign-in stands against its deadline, naming the act
+/// that keeps it in rotation once one is due.
+fn sign_in_line(account: &Value, now: i64) -> Option<String> {
+    use crate::credentials::{SignInExpirySource, SignInStage};
+    let expiry = sign_in_expiry(account)?;
+    let deadline = crate::credentials::sign_in::utc(expiry.expires_at);
+    let source = match expiry.source {
+        SignInExpirySource::Provider => "declared by the provider",
+        SignInExpirySource::SignIn => "recorded at sign-in",
+        SignInExpirySource::Inferred => "inferred: none was declared, so 30 days is assumed",
+    };
+    let left = crate::orchestrator::sign_in_time_left(now, expiry.expires_at);
+    Some(match expiry.stage(now) {
+        SignInStage::Current => format!("sign-in renewable until {deadline} ({left}; {source})"),
+        SignInStage::Expiring | SignInStage::ExpiringSoon => format!(
+            "reconnect by {deadline}: its sign-in expires {left} ({source}). Reconnect from Settings → Providers to keep it in rotation"
+        ),
+        SignInStage::Lapsed => format!(
+            "sign-in expired at {deadline} ({source}): nothing is routed to it. Reconnect from Settings → Providers"
+        ),
+    })
+}
+
+/// The headline over every account: who needs reconnecting soonest. A lapsed
+/// or refused account outranks any deadline still ahead.
+fn reconnect_headline(accounts: &[Value], now: i64) -> Option<String> {
+    let name = |account: &Value| {
+        account["email"]
+            .as_str()
+            .or(account["label"].as_str())
+            .unwrap_or("(unnamed)")
+            .to_string()
+    };
+    let refused: Vec<String> = accounts
+        .iter()
+        .filter(|account| {
+            account["health"]["held"]["kind"].as_str() == Some("sign_in_expired")
+                || sign_in_expiry(account).is_some_and(|expiry| expiry.is_lapsed(now))
+        })
+        .map(name)
+        .collect();
+    if !refused.is_empty() {
+        return Some(format!(
+            "**Reconnect now:** {}. Their sign-ins can no longer be renewed, so nothing is routed to them.",
+            refused.join(", ")
+        ));
+    }
+    let (account, expiry) = accounts
+        .iter()
+        .filter_map(|account| sign_in_expiry(account).map(|expiry| (account, expiry)))
+        .min_by_key(|(_, expiry)| expiry.expires_at)?;
+    Some(format!(
+        "**Next reconnect:** {} by {} ({}).",
+        name(account),
+        crate::credentials::sign_in::utc(expiry.expires_at),
+        crate::orchestrator::sign_in_time_left(now, expiry.expires_at)
+    ))
+}
+
 pub(crate) fn render_accounts(
     facet: &dyn Models,
     params: &[QueryParam],
@@ -950,8 +1023,12 @@ pub(crate) fn render_accounts(
     let only = find_query_value(params, "provider");
     let now = chrono::Utc::now().timestamp();
     let resets = account_resets(facet, &scope);
-    let mut out = String::from(
-        "# Model accounts\n\nGrouped by installed provider, in priority order. A credential is described, never shown. Append {provider: claude|codex} here to start a subscription sign-in, or use Settings → Providers, or `cairn auth login claude` for a managed Claude account.\n",
+    let mut out = String::from("# Model accounts\n\n");
+    if let Some(headline) = reconnect_headline(&accounts, now) {
+        let _ = writeln!(out, "{headline}\n");
+    }
+    out.push_str(
+        "Grouped by installed provider, in priority order. A credential is described, never shown. Append {provider: claude|codex} here to start a subscription sign-in, or use Settings → Providers, or `cairn auth login claude` for a managed Claude account.\n",
     );
     let mut placed = vec![false; accounts.len()];
     let mut shown = 0;
@@ -1373,19 +1450,177 @@ fn vibe_progress(progress: &crate::embeddings::VibeAxesProgress) -> String {
     }
 }
 
+/// The served API's clients, or one client with its grants and recent
+/// requests. A key hash is never rendered.
+pub(crate) async fn render_clients(
+    orch: &crate::orchestrator::Orchestrator,
+    one: Option<&str>,
+) -> String {
+    use crate::orchestrator::served_api::{clients, listener_status};
+    let db = &orch.db.local;
+    let all = match clients::list(db).await {
+        Ok(all) => all,
+        Err(error) => return format!("Served-API clients are unavailable: {error}"),
+    };
+    let last_used: HashMap<String, i64> =
+        cairn_db::storage::served_api::last_model_request_by_client(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let shown: Vec<_> = match one {
+        None => all.iter().collect(),
+        Some(id) => all.iter().filter(|client| client.id == id).collect(),
+    };
+    if let (Some(id), true) = (one, shown.is_empty()) {
+        return format!(
+            "No served-API client `{id}`. Clients are listed at cairn://models/clients."
+        );
+    }
+    let mut out = match one {
+        None => format!(
+            "# Served API clients\n\nListener: {}. Clients call it with `Authorization: Bearer <key>`; requests are at cairn://models/usage?view=requests.\n\n",
+            listener_status()
+        ),
+        Some(_) => String::new(),
+    };
+    if shown.is_empty() {
+        out.push_str("No clients. Append {name} to mint a key, or {import:[{name, keyHash}]} to keep existing keys.\n");
+        return out;
+    }
+    for client in shown {
+        let grants = clients::remote_grants(db, client).await.unwrap_or_default();
+        let remote = if grants.is_empty() {
+            "local-only".to_string()
+        } else {
+            grants
+                .iter()
+                .map(|grant| format!("{} (grant {})", grant.scope.shorthand(), grant.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "{}## {} — `{}`\n\n- state: {}\n- key: {}{}\n- remote: {}\n- last request: {}\n- created: {}\n",
+            if one.is_some() { "#" } else { "" },
+            client.name,
+            client.id,
+            match client.revoked_at {
+                Some(at) => format!("revoked {} by {}", when(at), client.revoked_by.as_deref().unwrap_or("?")),
+                None => "live".to_string(),
+            },
+            client.source,
+            client
+                .key_hint
+                .as_deref()
+                .map(|hint| format!(", ends …{hint}"))
+                .unwrap_or_default(),
+            remote,
+            last_used
+                .get(&client.id)
+                .map(|ms| when(ms / 1000))
+                .unwrap_or_else(|| "never".to_string()),
+            when(client.created_at),
+        );
+    }
+    out
+}
+
+/// The served API's requests: per-client totals, then the rows newest first.
+fn render_requests(
+    query: &cairn_models::interface::RequestsQuery,
+    rows: &[cairn_models::interface::RequestRecord],
+) -> String {
+    let mut out = format!(
+        "# Model requests\n\nRequests outside clients made through Cairn's served API in the last {}h{}: {} row(s), newest first, capped at {}. Prompts and replies are never recorded. Clients: cairn://models/clients.\n\n",
+        query.hours,
+        query
+            .client
+            .as_deref()
+            .map(|client| format!(" by {client}"))
+            .unwrap_or_default(),
+        rows.len(),
+        query.limit
+    );
+    if rows.is_empty() {
+        return out;
+    }
+    let mut totals: std::collections::BTreeMap<String, (usize, i64, i64, f64)> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let name = row
+            .client
+            .clone()
+            .or_else(|| row.client_id.clone())
+            .unwrap_or_else(|| "(unauthenticated)".into());
+        let total = totals.entry(name).or_default();
+        total.0 += 1;
+        total.1 += row.input_tokens.unwrap_or(0);
+        total.2 += row.output_tokens.unwrap_or(0);
+        total.3 += row.cost.unwrap_or(0.0);
+    }
+    out.push_str(
+        "## Per client\n\n| client | requests | in | out | cost |\n|---|---|---|---|---|\n",
+    );
+    for (client, (count, input, output, cost)) in &totals {
+        let _ = writeln!(
+            out,
+            "| {client} | {count} | {input} | {output} | ${cost:.4} |"
+        );
+    }
+    out.push_str("\n## Requests\n\n| at | client | door | asked | model | provider | status | outcome | in | out | cost | latency | wait |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    let dash = || "—".to_string();
+    for row in rows {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {}{} | {} | {} | {} | {} | {} | {} | {} | {} | {}ms | {} |",
+            chrono::DateTime::from_timestamp_millis(row.at)
+                .map(|at| at.format("%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| row.at.to_string()),
+            row.client
+                .as_deref()
+                .or(row.client_id.as_deref())
+                .unwrap_or("—"),
+            row.door,
+            if row.stream { " (stream)" } else { "" },
+            row.model_asked.as_deref().unwrap_or("—"),
+            row.model.as_deref().unwrap_or("—"),
+            row.provider.as_deref().unwrap_or("—"),
+            row.status,
+            row.outcome,
+            row.input_tokens.map_or_else(dash, |n| n.to_string()),
+            row.output_tokens.map_or_else(dash, |n| n.to_string()),
+            row.cost.map_or_else(dash, |cost| format!("${cost:.4}")),
+            row.latency_ms,
+            row.wait_ms.map_or_else(dash, |ms| format!("{ms}ms")),
+        );
+    }
+    out
+}
+
 pub(crate) fn render_usage(facet: &dyn Models, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://models/usage";
-    if let Some(error) = unsupported(URI, params, &["provider", "view"]) {
+    if let Some(error) = unsupported(URI, params, &["provider", "view", "client", "hours"]) {
         return error;
     }
     let scope = ModelScope::workspace();
     match find_query_value(params, "view") {
         None | Some("card") => {}
         Some("requests") => {
-            return match facet.requests(&scope) {
-                Ok(rows) => format!("# Model requests\n\n{} row(s).", rows.len()),
-                Err(unavailable) => unavailable.to_string(),
+            let mut query = cairn_models::interface::RequestsQuery {
+                client: find_query_value(params, "client").map(str::to_string),
+                ..Default::default()
+            };
+            if let Some(hours) = find_query_value(params, "hours") {
+                match hours.parse::<u32>() {
+                    Ok(hours) if hours > 0 => query.hours = hours,
+                    _ => return format!("hours must be a positive whole number (got '{hours}')."),
+                }
             }
+            return match facet.requests(&query) {
+                Ok(rows) => render_requests(&query, &rows),
+                Err(error) => format!("Per-request rows are unavailable: {error}"),
+            };
         }
         Some(other) => {
             return format!("Unknown view '{other}' for {URI}; expected card or requests.")
@@ -1497,7 +1732,6 @@ mod tests {
         seeded_orchestrator, API_KEY_SECRET, CUSTOM_KEY_SECRET, HEADER_SECRET, OAUTH_SECRET,
     };
     use crate::orchestrator::Orchestrator;
-    use cairn_models::interface::RequestsUnavailable;
 
     const READS: &[&str] = &[
         "cairn://models",
@@ -2107,10 +2341,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn per_request_usage_is_the_instructive_refusal() {
+    async fn per_request_usage_lists_each_clients_rows_and_totals() {
         let orch = seeded_orchestrator().await;
         let out = read(&orch, "cairn://models/usage?view=requests").await;
-        assert!(out.contains(&RequestsUnavailable.to_string()), "{out}");
+        assert!(out.contains("0 row(s)"), "{out}");
+
+        let (dig, _) = crate::orchestrator::served_api::clients::mint(&orch.db.local, "dig")
+            .await
+            .unwrap();
+        let db = orch.db.local.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut ledger = crate::orchestrator::served_api::requests::RequestLedger::begin(
+                db,
+                cairn_models::interface::relay::RelayDoor::ChatCompletions,
+                Some(&dig),
+                false,
+                Some("big".into()),
+            );
+            ledger.resolved("deepseek/deepseek-v4-flash-vision-exp");
+            ledger.finish(
+                200,
+                crate::orchestrator::served_api::requests::Outcome::Answered,
+                Some(&cairn_models::interface::relay::RelayUsage {
+                    input_tokens: Some(40),
+                    output_tokens: Some(9),
+                    ..Default::default()
+                }),
+                None,
+            );
+        })
+        .await
+        .unwrap();
+        let out = read(&orch, "cairn://models/usage?view=requests&client=dig").await;
+        assert!(out.contains("1 row(s)"), "{out}");
+        assert!(out.contains("| dig | 1 | 40 | 9 |"), "{out}");
+        assert!(
+            out.contains("| big | deepseek/deepseek-v4-flash-vision-exp |"),
+            "{out}"
+        );
+        let out = read(&orch, "cairn://models/usage?view=requests&client=nobody").await;
+        assert!(
+            out.contains("no served-API client is named nobody"),
+            "{out}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2127,5 +2400,50 @@ mod tests {
                 assert!(!out.contains(secret), "{uri} reveals {secret}:\n{out}");
             }
         }
+    }
+
+    fn signed_in(email: &str, expires_at: i64, source: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("acc_{email}"),
+            "label": email,
+            "email": email,
+            "signInExpiry": {"expiresAt": expires_at, "source": source},
+        })
+    }
+
+    #[test]
+    fn the_soonest_reconnect_heads_the_accounts_and_a_lapsed_one_outranks_it() {
+        const DAY: i64 = 24 * 60 * 60;
+        let now = 1_000 * DAY;
+        let mut accounts = vec![
+            signed_in("later@example.com", now + 20 * DAY, "sign_in"),
+            signed_in("soon@example.com", now + 5 * DAY, "provider"),
+            serde_json::json!({"id": "acc_key", "label": "API key"}),
+        ];
+        let headline = super::reconnect_headline(&accounts, now).unwrap();
+        assert!(
+            headline.starts_with("**Next reconnect:** soon@example.com by "),
+            "{headline}"
+        );
+        assert!(headline.contains("in 5 days"), "{headline}");
+
+        let line = super::sign_in_line(&accounts[1], now).unwrap();
+        assert!(line.contains("renewable until"), "{line}");
+        assert!(line.contains("declared by the provider"), "{line}");
+        let due = super::sign_in_line(&accounts[1], now + 3 * DAY).unwrap();
+        assert!(due.starts_with("reconnect by "), "{due}");
+        assert!(super::sign_in_line(&accounts[2], now).is_none());
+
+        accounts.push(signed_in("gone@example.com", now - 1, "inferred"));
+        let headline = super::reconnect_headline(&accounts, now).unwrap();
+        assert!(
+            headline.starts_with("**Reconnect now:** gone@example.com."),
+            "{headline}"
+        );
+        let gone = super::sign_in_line(&accounts[3], now).unwrap();
+        assert!(gone.contains("nothing is routed to it"), "{gone}");
+        assert!(gone.contains("inferred"), "{gone}");
+
+        assert!(super::reconnect_headline(&accounts[2..3], now).is_none());
     }
 }

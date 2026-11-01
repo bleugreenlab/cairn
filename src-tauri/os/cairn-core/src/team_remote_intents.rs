@@ -409,7 +409,9 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 exec_seq,
                 &node_id,
                 &segment,
-                &json!({"response": payload.response}),
+                // A phone reply is typed text: the `answer` shorthand parses it
+                // against the prompt's question count.
+                &json!({"answer": payload.response}),
                 crate::turns::queries::ResolutionProvenance::new(
                     cairn_common::identity::AppearanceTransport::RemoteIntent,
                     None,

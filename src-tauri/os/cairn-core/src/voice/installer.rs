@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -189,7 +190,7 @@ impl ComponentInstaller {
             release_base: release_base.into().trim_end_matches('/').to_owned(),
             app_version: app_version.into(),
             build_identity: build_identity.into(),
-            client: reqwest::Client::new(),
+            client: cairn_tls::client().clone(),
             events: Arc::new(events),
             install_lock: Arc::new(Mutex::new(())),
             #[cfg(test)]
@@ -603,11 +604,9 @@ impl ComponentInstaller {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            target: if kind == "engine" {
-                super::current_target().map(str::to_owned)
-            } else {
-                None
-            },
+            // An engine's target is stamped by `publish_engine`, the one way an
+            // engine becomes current; a model has none.
+            target: None,
             size_bytes: downloaded,
             sha256: digest.into(),
             path: destination.to_owned(),
@@ -1030,11 +1029,21 @@ struct DistributionInfo {
 }
 
 pub(crate) async fn probe_engine(path: &Path, version: &str) -> VoiceResult<()> {
-    let output = Command::new(path)
+    let probe_failed = |error: std::io::Error| {
+        VoiceError::Install(format!("engine identity probe failed: {error}"))
+    };
+    let mut command = Command::new(path);
+    command
         .arg("--distribution-info")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = super::supervisor::spawn_engine(&mut command)
         .await
-        .map_err(|error| VoiceError::Install(format!("engine identity probe failed: {error}")))?;
+        .map_err(probe_failed)?
+        .wait_with_output()
+        .await
+        .map_err(probe_failed)?;
     if !output.status.success() {
         return Err(VoiceError::Install("engine identity probe failed".into()));
     }
@@ -1187,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn installing_an_already_current_engine_does_not_download_again() {
         let directory = tempfile::tempdir().unwrap();
-        let target = super::super::current_target().expect("voice tests run on a supported target");
+        let target = crate::voice::catalog::TEST_TARGET;
         let version = "1.2.3";
         let asset = engine_asset_name(version, target);
         let path = directory.path().join(&asset);
@@ -1437,8 +1446,7 @@ mod tests {
             async fn new() -> Fixture {
                 let directory = tempfile::tempdir().unwrap();
                 let root = directory.path();
-                let target =
-                    crate::voice::current_target().expect("voice tests run on a supported target");
+                let target = crate::voice::catalog::TEST_TARGET;
                 let asset = engine_asset_name(VERSION, target);
                 let installer = ComponentInstaller::new(
                     root.to_path_buf(),

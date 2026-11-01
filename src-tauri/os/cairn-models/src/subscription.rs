@@ -122,6 +122,9 @@ pub trait Subscriptions: Send + Sync {
     /// accounts whose generation advanced; the runtime pushes each one's new
     /// token into its live processes.
     fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String>;
+    /// Renew every managed ChatGPT login idle long enough that its refresh
+    /// token could lapse unspent. Answers with the accounts renewed.
+    fn renew_codex_credentials(&self, host: &dyn ModelHost) -> Vec<String>;
     /// A process on `account_id`, fed `generation`, was refused with a 401.
     /// Answers with the credential to push to it: the current one if the
     /// account has moved on, a renewed one if `generation` is still current.
@@ -255,6 +258,10 @@ impl Subscriptions for Unsubscribed {
     }
 
     fn renew_claude_credentials(&self, _host: &dyn ModelHost) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn renew_codex_credentials(&self, _host: &dyn ModelHost) -> Vec<String> {
         Vec::new()
     }
 
@@ -452,6 +459,7 @@ pub mod testing {
                         None,
                         now + 8 * 60 * 60 * 1000,
                         None,
+                        None,
                         now,
                     );
                     account.auth = ProviderAuth::ClaudeProfile {
@@ -515,6 +523,10 @@ pub mod testing {
                 Self::rotate(host, account_id);
             }
             self.due.clone()
+        }
+
+        fn renew_codex_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.renew_codex_credentials(host)
         }
 
         fn claude_credential_rejected(
@@ -680,6 +692,10 @@ pub mod testing {
 
         fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.renew_claude_credentials(host)
+        }
+
+        fn renew_codex_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.renew_codex_credentials(host)
         }
 
         fn claude_credential_rejected(
@@ -961,6 +977,10 @@ pub mod testing {
 
         fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.renew_claude_credentials(host)
+        }
+
+        fn renew_codex_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.renew_codex_credentials(host)
         }
 
         fn claude_credential_rejected(

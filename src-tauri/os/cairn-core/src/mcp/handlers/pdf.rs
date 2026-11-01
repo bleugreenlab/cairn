@@ -56,7 +56,9 @@ async fn local_extract(
         std::fs::read(resolved_target)
             .map_err(|e| format!("Failed to read `{original_target}`: {e}"))?
     } else {
-        let resp = reqwest::get(resolved_target)
+        let resp = cairn_tls::client()
+            .get(resolved_target)
+            .send()
             .await
             .map_err(|e| format!("Failed to download `{original_target}`: {e}"))?;
         if !resp.status().is_success() {

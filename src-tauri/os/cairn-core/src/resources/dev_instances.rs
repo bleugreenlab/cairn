@@ -273,13 +273,9 @@ pub(crate) async fn query_db(
     };
     let url = format!("http://127.0.0.1:{}/api/mcp", instance.runner_port);
 
-    let client = reqwest::Client::builder()
-        .timeout(DEV_DB_HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| format!("Failed to build HTTP client: {error}"))?;
-
-    let response = client
+    let response = cairn_tls::client()
         .post(&url)
+        .timeout(DEV_DB_HTTP_TIMEOUT)
         .header("Authorization", format!("Bearer {token}"))
         .json(&request)
         .send()
@@ -348,13 +344,9 @@ async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
     };
     let url = format!("http://127.0.0.1:{}/api/mcp", instance.runner_port);
 
-    let client = reqwest::Client::builder()
-        .timeout(DEV_DB_HTTP_TIMEOUT)
-        .build()
-        .map_err(|error| format!("could not build HTTP client: {error}"))?;
-
-    let response = client
+    let response = cairn_tls::client()
         .post(&url)
+        .timeout(DEV_DB_HTTP_TIMEOUT)
         .header("Authorization", format!("Bearer {token}"))
         .json(&request)
         .send()

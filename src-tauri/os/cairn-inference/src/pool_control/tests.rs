@@ -1040,22 +1040,51 @@ fn check_set_refuses_overlaps_and_strangers() {
 }
 
 #[test]
-fn a_model_name_finds_its_deployments_and_never_another_model() {
+fn a_dismissed_deployment_leaves_the_pin_and_the_active_set() {
+    let inventory = inventory();
+    let pool = &inventory.pools[&PoolId::from("sparks")];
+    let mut control = PoolControl::begin(pool, &inventory.deployments, &BTreeMap::new(), 0);
+    control
+        .active
+        .members
+        .insert(d("dsv4f-tp2"), Member::chosen(0));
+    control
+        .pin(BTreeSet::from([d("dsv4f-tp2")]), "agent", 0)
+        .unwrap();
+    assert!(control.dismiss(&d("dsv4f-tp2"), "operator", 5));
+    assert_eq!(control.pin, None);
+    assert!(control.active.members.is_empty());
+    assert_eq!(
+        control.active.why,
+        Why::Dismissed {
+            deployment: d("dsv4f-tp2"),
+            by: "operator".into()
+        }
+    );
+    assert_eq!(desired(&control), Some(BTreeSet::new()));
+    // Nothing wanted it a second time.
+    assert!(!control.dismiss(&d("dsv4f-tp2"), "operator", 6));
+}
+
+#[test]
+fn only_a_models_real_name_finds_its_deployments() {
     let mut inventory = inventory();
     let recipe = inventory.recipes.get_mut(&"dsv4f-tp2".into()).unwrap();
     recipe.served_name = "deepseek-v4-flash".into();
-    recipe.aliases = vec!["DeepSeek V4 Flash".into()];
+    recipe.model.name = "deepseek-ai/DeepSeek-V4-Flash".into();
     assert_eq!(
-        deployments_serving(&inventory, "dsv4f-tp2"),
+        deployments_serving(&inventory, "deepseek-ai/DeepSeek-V4-Flash"),
         vec![d("dsv4f-tp2")]
     );
     assert_eq!(
-        deployments_serving(&inventory, "deepseek-v4-flash"),
+        deployments_serving(&inventory, " DEEPSEEK-AI/deepseek-v4-flash "),
         vec![d("dsv4f-tp2")]
     );
-    assert_eq!(
-        deployments_serving(&inventory, " deepseek v4 flash "),
-        vec![d("dsv4f-tp2")]
-    );
-    assert!(deployments_serving(&inventory, "deepseek").is_empty());
+    // The deployment id, recipe id and served name are internal keys.
+    for internal in ["dsv4f-tp2", "deepseek-v4-flash", "deepseek", ""] {
+        assert!(
+            deployments_serving(&inventory, internal).is_empty(),
+            "{internal}"
+        );
+    }
 }

@@ -337,7 +337,7 @@ fn decode_listing(body: &str) -> Result<Vec<ModelEntry>, String> {
 
 /// The body of `GET {base}/models`, with the provider's own headers.
 fn listing(config: &CustomProviderConfig) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
         .build()
@@ -546,8 +546,8 @@ mod tests {
     }
 
     /// cairn-inference's served `/v1/models` is the listing shape this decoder
-    /// reads, so a provider pointed at it describes every model, aliases
-    /// included, exactly as the served list does.
+    /// reads, so a provider pointed at it describes every model exactly as the
+    /// served list does.
     #[test]
     fn a_cairn_inference_listing_decodes_as_its_served_list_describes_it() {
         use cairn_inference::served::{listing, served_models};
@@ -562,7 +562,6 @@ mod tests {
      modalities: {input: [text, image], output: [text]}
      engine: {kind: command, start: ./start.sh}
      requirements: {machines: 1}
-     aliases: [dsv4-flash]
    - id: qwen3-embed-4b
      source: bginf
      model: {name: qwen/qwen3-embedding-4b}
@@ -570,7 +569,6 @@ mod tests {
      verbs: [embed]
      engine: {kind: command, start: ./start.sh}
      requirements: {machines: 1}
-     aliases: [embed]
  deployments:
    - {id: dsv4f-tp2, source: bginf, recipe: dsv4f-tp2, machines: [sp1], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
    - {id: qwen3-embed-4b, source: bginf, recipe: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
@@ -586,7 +584,7 @@ mod tests {
             },
         )]);
         let served = served_models(&inventory, &measures);
-        assert_eq!(served.len(), 4);
+        assert_eq!(served.len(), 2);
         let config = undeclared();
         let decoded = discovered_from(&config, &listing(&served).to_string());
         for model in &served {
@@ -605,17 +603,41 @@ mod tests {
             );
         }
         // The clamp reaches the reader: the cache, not the engine's limit.
-        assert_eq!(find(&decoded, "dsv4-flash").context_window, Some(681_280));
-        for chat in ["deepseek-v4-flash-vision-exp", "dsv4-flash"] {
-            assert_eq!(find(&decoded, chat).serves, None, "{chat}");
+        let deepseek = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp";
+        assert_eq!(find(&decoded, deepseek).context_window, Some(681_280));
+        assert_eq!(find(&decoded, deepseek).serves, None);
+        assert_eq!(
+            offered(&config, find(&decoded, "qwen/qwen3-embedding-4b")),
+            [VerbKind::Embed]
+        );
+    }
+
+    /// The served API's composed listing (each local model under its real
+    /// name) decodes the same way: every entry says what it takes and gives.
+    #[test]
+    fn the_served_apis_composed_listing_decodes() {
+        use crate::orchestrator::served_api::listing::compose;
+        use crate::orchestrator::served_api::listing::tests::lab_served;
+        let listing = compose(
+            &lab_served(),
+            &cairn_models::interface::Catalog {
+                providers: Vec::new(),
+            },
+            |_| false,
+        );
+        let config = undeclared();
+        let decoded = discovered_from(&config, &listing.to_string());
+        for entry in listing["data"].as_array().unwrap() {
+            let id = entry["id"].as_str().unwrap();
+            assert!(find(&decoded, id).modalities.is_some(), "{id}");
         }
-        for embedder in ["qwen3-embedding-4b", "embed"] {
-            assert_eq!(
-                offered(&config, find(&decoded, embedder)),
-                [VerbKind::Embed],
-                "{embedder}"
-            );
-        }
+        let dsv4 = find(&decoded, "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp");
+        assert_eq!(dsv4.context_window, Some(681_280));
+        assert_eq!(dsv4.serves, None);
+        assert_eq!(
+            offered(&config, find(&decoded, "qwen/qwen3-embedding-4b")),
+            [VerbKind::Embed]
+        );
     }
 
     #[test]

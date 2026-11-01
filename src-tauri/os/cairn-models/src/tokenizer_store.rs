@@ -144,7 +144,7 @@ impl TokenizerStore {
             "{}/{}/resolve/{}/{}",
             self.base_url, pin.repo, pin.revision, file.path
         );
-        let client = reqwest::blocking::Client::builder()
+        let client = cairn_tls::blocking_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build()

@@ -23,6 +23,7 @@ pub mod complete;
 pub mod decide;
 pub mod embed;
 pub mod image;
+pub mod relay;
 pub mod session;
 pub mod speak;
 
@@ -640,6 +641,43 @@ impl Catalog {
         out
     }
 
+    /// Every offer of the model `name` names exactly: its catalog id, a
+    /// provider's native id, or `provider/native-id` for that provider's offer
+    /// alone. Unlike [`Self::offer_for`], a tier is never a name here: tiers
+    /// are Cairn's own vocabulary for its agents, and an outside client that
+    /// sent `big` must not reach whatever a tier called `big` is bound to.
+    pub fn named_offers(&self, name: &str) -> Vec<CatalogOffer> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let models = self.models();
+        if let Some((key, native)) = name.split_once('/') {
+            let qualified: Vec<CatalogOffer> = models
+                .iter()
+                .flat_map(|model| &model.offers)
+                .filter(|offer| offer.provider == key && offer.model == native)
+                .cloned()
+                .collect();
+            if !qualified.is_empty() {
+                return qualified;
+            }
+        }
+        models
+            .into_iter()
+            .filter(|model| {
+                model.catalog_id == name || model.offers.iter().any(|offer| offer.model == name)
+            })
+            .flat_map(|model| model.offers)
+            .collect()
+    }
+
+    /// The installed provider whose key is `key`.
+    pub fn provider(&self, key: &str) -> Option<&CatalogProvider> {
+        self.installed()
+            .find(|provider| provider.descriptor.key.as_ref() == key)
+    }
+
     /// Every offer serving `verb`, best first: by its wire's preference, then
     /// in the workspace's provider order.
     pub fn offers_serving(&self, verb: VerbKind) -> Vec<SelectedOffer> {
@@ -979,22 +1017,60 @@ pub enum SessionState {
     Warm,
 }
 
-/// Per-request usage rows do not exist yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestsUnavailable;
+/// Which per-request rows to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestsQuery {
+    /// One client, by name or id.
+    pub client: Option<String>,
+    /// How far back, in hours.
+    pub hours: u32,
+    pub limit: usize,
+}
 
-impl fmt::Display for RequestsUnavailable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            "Per-request usage rows are not recorded yet. What exists today is the provider \
-             card: pooled windows and per-account usage at `cairn://models/usage`, and each \
-             account's windows at `cairn://models/accounts`. Per-request rows arrive with the \
-             provider-payload capture work tracked in the llm thread (cairn://p/cairn/llm).",
-        )
+impl Default for RequestsQuery {
+    fn default() -> Self {
+        Self {
+            client: None,
+            hours: 24,
+            limit: 200,
+        }
     }
 }
 
-impl std::error::Error for RequestsUnavailable {}
+/// One request an outside client made through the served API. Never holds a
+/// prompt or a reply.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestRecord {
+    pub id: String,
+    /// Unix milliseconds.
+    pub at: i64,
+    /// `chat`, `completions`, `responses` or `embeddings`.
+    pub door: String,
+    pub client_id: Option<String>,
+    /// The client's name now, when it still has a record.
+    pub client: Option<String>,
+    /// The name the client sent.
+    pub model_asked: Option<String>,
+    /// The model it resolved to.
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
+    pub status: i64,
+    pub stream: bool,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub cost: Option<f64>,
+    pub latency_ms: i64,
+    /// How long it waited for a local model to load.
+    pub wait_ms: Option<i64>,
+    /// `answered`, `refused`, `upstream_error` or `client_closed`.
+    pub outcome: String,
+    /// The standing grant that allowed a remote provider.
+    pub grant_id: Option<String>,
+    pub detail: Option<String>,
+}
 
 /// What the facet answers, read side.
 ///
@@ -1026,10 +1102,8 @@ pub trait Models: Send + Sync {
         provider: Option<&str>,
     ) -> Result<Vec<ProviderPoolSnapshot>, String>;
 
-    /// Per-request usage rows.
-    fn requests(&self, _scope: &ModelScope) -> Result<Vec<Value>, RequestsUnavailable> {
-        Err(RequestsUnavailable)
-    }
+    /// The served API's per-request rows, newest first.
+    fn requests(&self, query: &RequestsQuery) -> Result<Vec<RequestRecord>, String>;
 
     /// Every live session on this host.
     fn sessions(&self) -> Vec<SessionView>;
@@ -1147,6 +1221,46 @@ mod tests {
             serves: Vec::new(),
             unable: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_name_reaches_offers_by_catalog_id_native_id_or_qualifier_but_never_a_tier() {
+        let catalog = Catalog {
+            providers: vec![
+                provider(
+                    "openrouter",
+                    Some(vec![model(
+                        "deepseek/deepseek-v4-flash",
+                        Some("deepseek/deepseek-v4-flash-20260901"),
+                    )]),
+                    vec![binding("big", "deepseek/deepseek-v4-flash")],
+                ),
+                custom("acc_hub", &["deepseek/deepseek-v4-flash"], vec![]),
+            ],
+        };
+        let providers = |name: &str| {
+            catalog
+                .named_offers(name)
+                .into_iter()
+                .map(|offer| offer.provider)
+                .collect::<Vec<_>>()
+        };
+        // The native id reaches both, though their catalog ids differ.
+        assert_eq!(
+            providers("deepseek/deepseek-v4-flash"),
+            ["openrouter", "custom:acc_hub"]
+        );
+        assert_eq!(
+            providers("deepseek/deepseek-v4-flash-20260901"),
+            ["openrouter"]
+        );
+        assert_eq!(
+            providers("openrouter/deepseek/deepseek-v4-flash"),
+            ["openrouter"]
+        );
+        assert!(providers("big").is_empty());
+        assert!(providers("openrouter/big").is_empty());
+        assert!(providers(" ").is_empty());
     }
 
     fn subscription_only() -> Catalog {
@@ -1858,14 +1972,6 @@ mod tests {
         assert_eq!(json["backendSessionId"], "thread-1");
         assert!(view.is_addressed_by("s1") && view.is_addressed_by("r1"));
         assert!(!view.is_addressed_by("r2"));
-    }
-
-    #[test]
-    fn the_requests_refusal_points_at_what_exists() {
-        let text = RequestsUnavailable.to_string();
-        assert!(text.contains("cairn://models/usage"));
-        assert!(text.contains("cairn://models/accounts"));
-        assert!(text.contains("cairn://p/cairn/llm"));
     }
 
     /// A custom provider whose models each serve `speak` over `wire`, with

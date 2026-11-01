@@ -33,7 +33,6 @@ pub(crate) fn command_recipe(id: &str, machines: u32) -> Recipe {
             interconnect: None,
             memory: None,
         },
-        aliases: Vec::new(),
         notes: None,
     }
 }

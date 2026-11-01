@@ -2606,15 +2606,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
         let encoded = answer.to_string();
+        let answers = crate::models::question::PromptAnswers::new(
+            1,
+            vec![crate::models::question::QuestionAnswer {
+                index: 0,
+                answer: encoded.clone(),
+            }],
+        )
+        .unwrap();
         orch.db
             .local
             .execute(
                 "UPDATE prompts SET response=?1, answered_at=1 WHERE id=?2",
-                (encoded.clone(), prompt_id.clone()),
+                (answers.to_stored(), prompt_id.clone()),
             )
             .await
             .unwrap();
-        let _ = orch.prompt_responses.send((prompt_id.clone(), encoded));
+        let _ = orch.prompt_responses.send((
+            prompt_id.clone(),
+            crate::mcp::handlers::planning::AnsweredPrompt {
+                answers,
+                rendered: encoded,
+            },
+        ));
         prompt_id
     }
 

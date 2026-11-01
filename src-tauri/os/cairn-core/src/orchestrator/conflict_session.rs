@@ -513,9 +513,6 @@ fn replay_state(pass: &ReplayPass, requested_at: i64) -> ReplayState {
 pub(crate) struct TipAssessment {
     /// The branch's current tip.
     pub(crate) tip: String,
-    /// Whether it has moved off the session's `ours` — i.e. whether the agent
-    /// has committed anything since the conflict was recorded.
-    pub(crate) moved: bool,
     pub(crate) paths: Vec<PathAssessment>,
     /// Conflicting paths beyond the cap, not looked at. Always zero for an
     /// exhaustive assessment, which is the only kind the mutation boundary may
@@ -774,7 +771,6 @@ fn assess_against_basis(
         .map(|file| file.path.clone())
         .collect();
     TipAssessment {
-        moved: session.ours.as_deref() != Some(tip.as_str()),
         paths: assessed
             .iter()
             .filter_map(|path| verdicts.remove(path))
@@ -886,13 +882,16 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
         for (path, dropped) in &drops {
             out.push_str(&format!(
                 "- `{path}` — {} hunk(s), {} line(s). Read \
-                 `cairn:~/rebase?view=merged&file={path}`.\n",
-                dropped.hunks, dropped.added_lines
+                 `cairn:~/rebase?view=merged&file={path}`.\n\n```diff\n{}\n```\n\n",
+                dropped.hunks,
+                dropped.added_lines,
+                refusal_excerpt(&dropped.diff)
             ));
         }
         out.push_str(
-            "\nEach of those reads gives you the COMPLETE merged file: your resolution kept inside \
-             the conflicting region, the incoming hunks carried everywhere else, and no conflict \
+            "Each of those reads gives you the COMPLETE merged file: your resolution kept where \
+             both sides changed the same lines, both sides' lines kept where each only inserted \
+             at the same spot, the incoming hunks carried everywhere else, and no conflict \
              markers. Commit it and request the replay again — it is accepted then, because your \
              tip genuinely contains both sides and the whole-file restore is exactly right.\n\n",
         );
@@ -921,6 +920,23 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
          `drop_incoming_reason:\"…\"` to this payload. The reason is recorded.",
     );
     out
+}
+
+/// The most of one path's dropped-work diff a refusal quotes. The refusal
+/// names the lines so the requester sees what is missing without a second
+/// read; the merged view it points at carries every one of them.
+const REFUSAL_DIFF_LINES: usize = 24;
+
+fn refusal_excerpt(diff: &str) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    if lines.len() <= REFUSAL_DIFF_LINES {
+        return lines.join("\n");
+    }
+    format!(
+        "{}\n… {} more line(s) in the merged view",
+        lines[..REFUSAL_DIFF_LINES].join("\n"),
+        lines.len() - REFUSAL_DIFF_LINES
+    )
 }
 
 /// Persist the diagnostic captured before the rollback onto the reconcile item
@@ -1361,7 +1377,6 @@ mod tests {
     fn assessment(verdicts: Vec<(&str, RestoreVerdict)>, truncated: usize) -> TipAssessment {
         TipAssessment {
             tip: "tip".to_string(),
-            moved: true,
             truncated,
             unresolved: Vec::new(),
             conflicting: verdicts.len() + truncated,
@@ -1536,6 +1551,47 @@ mod tests {
             "the remedy is one read away: {refusal}"
         );
         assert!(refusal.contains("drop_incoming_reason"), "{refusal}");
+    }
+
+    /// Bug-sink #372: the guard read a tip that kept only its own insertion at
+    /// a spot where the incoming side inserted too as lossless, so the replay
+    /// landed without the incoming line. Run through the real merge, the
+    /// refusal must name the dropped line itself, not only count it.
+    #[test]
+    fn a_tip_lacking_a_same_spot_incoming_insertion_is_refused_naming_the_line() {
+        let sides = crate::jj::MergeSides {
+            base: crate::jj::FileContent::Text("A\n".to_string()),
+            ours: crate::jj::FileContent::Text("X\nA\n".to_string()),
+            theirs: crate::jj::FileContent::Text("Y\nA\n".to_string()),
+        };
+        let verdict = crate::jj::assess_whole_file_restore(&sides);
+        let refusal = refusal(&RestoreProof::Assessed(assessment(
+            vec![("mod.rs", verdict)],
+            0,
+        )));
+        assert!(refusal.contains("`mod.rs`"), "{refusal}");
+        assert!(
+            refusal.contains("\n+Y\n"),
+            "the dropped line is quoted: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_long_dropped_diff_is_quoted_up_to_its_cap_and_says_how_much_more() {
+        let diff = (0..40)
+            .map(|n| format!("+line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let excerpt = refusal_excerpt(&diff);
+        assert!(
+            excerpt.contains("+line 23") && !excerpt.contains("+line 24"),
+            "{excerpt}"
+        );
+        assert!(
+            excerpt.ends_with("16 more line(s) in the merged view"),
+            "{excerpt}"
+        );
+        assert_eq!(refusal_excerpt("+one\n+two"), "+one\n+two");
     }
 
     #[test]

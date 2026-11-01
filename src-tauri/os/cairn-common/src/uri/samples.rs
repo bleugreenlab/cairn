@@ -457,6 +457,8 @@ resource_samples! {
     ModelsEmbeddings {} => Parser,
     ModelsSessions {} => Parser,
     ModelsSession { id: "954588b6-c77d-47e6-b466-b48841cc52cb".to_string() } => Parser,
+    ModelsClients {} => Parser,
+    ModelsClient { id: "cli_0011223344556677".to_string() } => Parser,
     Inference {} => Parser,
     InferenceRecipes {} => Parser,
     InferenceDeployments {} => Parser,

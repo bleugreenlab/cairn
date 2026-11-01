@@ -6,12 +6,14 @@ pub mod crypto;
 mod handle;
 pub mod lease;
 mod plan;
+pub mod sign_in;
 pub mod store;
 
 pub use cairn_models_types::usage::{AccountHold, AccountHoldKind};
 pub use cairn_models_types::ApiProvider;
 pub use handle::CredentialStoreHandle;
 pub use plan::{jwt_claims, subscription_plan};
+pub use sign_in::{SignInExpiry, SignInExpirySource, SignInStage};
 
 use cairn_models_types::image::ImageCapabilities;
 use serde::{Deserialize, Serialize};
@@ -937,12 +939,13 @@ pub struct ProviderAccount {
 
 impl ProviderAccount {
     fn is_available_for_model(&self, requested_model: Option<&str>, now: i64) -> bool {
-        self.health.as_ref().is_none_or(|health| {
-            !health.is_blocked(now)
-                && health
-                    .live_headroom(requested_model, now)
-                    .is_none_or(|headroom| headroom > 0.0)
-        })
+        !self.sign_in_lapsed(now)
+            && self.health.as_ref().is_none_or(|health| {
+                !health.is_blocked(now)
+                    && health
+                        .live_headroom(requested_model, now)
+                        .is_none_or(|headroom| headroom > 0.0)
+            })
     }
 
     /// Which agent backends can consume this credential.
@@ -1149,6 +1152,13 @@ impl CredentialStore {
                     Some(format!(
                         "account is not compatible with backend '{backend}'"
                     ))
+                } else if let Some(expiry) = account
+                    .sign_in_expiry()
+                    .filter(|expiry| expiry.is_lapsed(now))
+                {
+                    let signed_in_as = account.email.as_deref().unwrap_or(&account.label);
+                    // Unterminated: callers punctuate the reasons they join.
+                    Some(expiry.describe_lapse(signed_in_as))
                 } else if let Some(hold) = account
                     .health
                     .as_ref()
@@ -1306,6 +1316,12 @@ impl CredentialStore {
             account.email = login.email;
             account.plan = login.plan;
             account.last_used_at = Some(now);
+            // A fresh sign-in is what lifts a dead one's hold.
+            if let Some(health) = account.health.as_mut() {
+                health
+                    .held
+                    .take_if(|hold| hold.kind == AccountHoldKind::SignInExpired);
+            }
             return AccountInfo::from(&*account);
         }
         let account = ProviderAccount {
@@ -1350,6 +1366,47 @@ impl CredentialStore {
             account.label = email;
         }
         Ok(AccountInfo::from(&*account))
+    }
+
+    /// Lift `id`'s hold if it is of `kind`. Answers whether one was lifted.
+    /// The caller persists the store.
+    pub fn lift_account_hold(&mut self, id: &str, kind: AccountHoldKind) -> bool {
+        self.accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .and_then(|account| account.health.as_mut())
+            .and_then(|health| health.held.take_if(|hold| hold.kind == kind))
+            .is_some()
+    }
+
+    /// Hold an account out of rotation for a refusal no clock heals, as of
+    /// `now` (Unix seconds). Answers the name its owner signs in with. The
+    /// caller persists the store.
+    pub fn hold_account(
+        &mut self,
+        id: &str,
+        kind: AccountHoldKind,
+        detail: String,
+        now: i64,
+    ) -> Result<String, String> {
+        let account = self
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        let health = account
+            .health
+            .get_or_insert_with(ProviderAccountHealth::default);
+        health.held = Some(AccountHold {
+            since: now,
+            kind,
+            detail,
+        });
+        health.captured_at = now;
+        Ok(account
+            .email
+            .clone()
+            .unwrap_or_else(|| account.label.clone()))
     }
 
     /// Remove an account, and every project override that selected it.
@@ -1526,6 +1583,9 @@ impl CredentialStore {
 
         self.routed_candidates(provider, project_id)
             .filter(|account| excluded_id != Some(account.id.as_str()))
+            // The provider refuses every renewal past the deadline, so a
+            // launch on it would die at spawn rather than fall to the next.
+            .filter(|account| !account.sign_in_lapsed(now))
             .filter_map(|account| {
                 let (headroom, since) = match account.health.as_ref() {
                     Some(health) => {
@@ -1593,6 +1653,11 @@ impl CredentialStore {
             .filter(|account| explicit_account.is_none_or(|id| account.id == id))
             .inspect(|_| candidates += 1)
             .filter_map(|account| {
+                // A lapsed sign-in has no clock that heals it; only a
+                // reconnect does.
+                if account.sign_in_lapsed(now) {
+                    return None;
+                }
                 let at = match account.health.as_ref() {
                     Some(health) => health.available_at(requested_model, now)?,
                     None => now,
@@ -1788,6 +1853,10 @@ pub struct AccountInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subscription: Option<cairn_models_types::subscription::AccountPlan>,
     health: Option<ProviderAccountHealth>,
+    /// When this account's sign-in stops being renewable and must be
+    /// reconnected. Absent for an account whose provider declares no deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sign_in_expiry: Option<SignInExpiry>,
 }
 
 impl AccountInfo {
@@ -1877,6 +1946,7 @@ impl From<&ProviderAccount> for AccountInfo {
             plan: account.plan.clone(),
             subscription: account.account_plan(),
             health: account.health.clone(),
+            sign_in_expiry: account.sign_in_expiry(),
         }
     }
 }
@@ -2161,6 +2231,111 @@ mod tests {
             captured_at,
         });
         account
+    }
+
+    /// A managed Claude account whose stored credential declares its sign-in
+    /// deadline at `expires_at` (Unix seconds).
+    fn signed_in_until(id: &str, expires_at: i64) -> ProviderAccount {
+        let mut account = healthy_claude_account(id, 80.0, 100);
+        account.email = Some(format!("{id}@example.com"));
+        account.auth = ProviderAuth::ClaudeProfile {
+            oauth: Some(
+                serde_json::json!({
+                    "accessToken": "at",
+                    "refreshToken": "rt",
+                    sign_in::CLAUDE_REFRESH_EXPIRES_AT_FIELD: expires_at * 1000,
+                })
+                .to_string(),
+            ),
+        };
+        account
+    }
+
+    #[test]
+    fn a_lapsed_sign_in_is_never_selected_and_the_next_account_is() {
+        let now = 1_000_000;
+        let mut store = test_store();
+        let mut lapsed = signed_in_until("lapsed", now - 1);
+        // Highest priority and the most headroom: only the deadline rules it out.
+        lapsed.sort_order = 0;
+        lapsed.health.as_mut().unwrap().windows[0].remaining_percent = 100.0;
+        let mut next = signed_in_until("next", now + 10 * 24 * 60 * 60);
+        next.sort_order = 1;
+        store.accounts = vec![lapsed, next];
+
+        let chosen = store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, None, &[], now)
+            .map(|account| account.id.as_str());
+        assert_eq!(chosen, Some("next"));
+        assert!(!store.routed_account_is_available(
+            RoutedProvider::Claude,
+            None,
+            "lapsed",
+            None,
+            now
+        ));
+        assert_eq!(
+            store.routed_availability(RoutedProvider::Claude, None, Some("lapsed"), None, now),
+            RoutedAvailability::Unknown
+        );
+        // An explicit override names an account that cannot launch, so it
+        // resolves to nothing rather than to a launch that dies at spawn.
+        assert!(store
+            .select_routed_account(
+                RoutedProvider::Claude,
+                None,
+                Some("lapsed"),
+                None,
+                None,
+                &[],
+                now
+            )
+            .is_none());
+
+        let diagnostics =
+            store.routed_account_diagnostics(RoutedProvider::Claude, None, None, None, None, now);
+        let why = diagnostics
+            .iter()
+            .find(|d| d.account_id == "lapsed")
+            .and_then(|d| d.rejection.clone())
+            .expect("a lapsed account names why it was passed over");
+        assert!(why.contains("sign-in expired"), "{why}");
+        assert!(why.contains("Reconnect lapsed@example.com"), "{why}");
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.account_id == "next" && d.rejection.is_none()));
+
+        let info = serde_json::to_value(AccountInfo::from(&store.accounts[1])).unwrap();
+        assert_eq!(
+            info["signInExpiry"]["expiresAt"],
+            serde_json::json!(now + 10 * 24 * 60 * 60)
+        );
+        assert_eq!(info["signInExpiry"]["source"], "sign_in");
+    }
+
+    #[test]
+    fn a_sign_in_expired_hold_names_the_reconnect() {
+        let mut store = test_store();
+        store.accounts = vec![signed_in_until("dead", i64::MAX / 1000)];
+        let label = store
+            .hold_account(
+                "dead",
+                AccountHoldKind::SignInExpired,
+                "Refresh token expired".to_string(),
+                50,
+            )
+            .unwrap();
+        assert_eq!(label, "dead@example.com");
+        assert!(store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, None, &[], 60)
+            .is_none());
+        let why =
+            store.routed_account_diagnostics(RoutedProvider::Claude, None, None, None, None, 60)[0]
+                .rejection
+                .clone()
+                .unwrap();
+        assert!(why.contains("no longer renew its sign-in"), "{why}");
+        assert!(why.contains("Reconnect dead@example.com"), "{why}");
     }
 
     /// `id` with its five-hour window exhausted until `window_reset` and, when

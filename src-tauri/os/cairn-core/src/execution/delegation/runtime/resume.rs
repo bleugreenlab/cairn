@@ -888,7 +888,7 @@ fn resume_parent_after_task_settled(
                 &tool_result.run_id,
                 &tool_result.session_id,
                 &tool_result.tool_use_id,
-                &tool_result.content,
+                crate::resources::mutations::BlockingResult::from(tool_result.content.clone()),
                 tool_result.is_error,
                 now,
                 Some(&resume.parent_turn_id),

@@ -917,6 +917,7 @@ name = "cairn-channels"
 version = "0.13.6"
 dependencies = [
  "async-trait",
+ "cairn-tls",
  "chrono",
  "futures-util",
  "log",
@@ -1052,6 +1053,7 @@ dependencies = [
  "cairn-sandbox",
  "cairn-session",
  "cairn-symbols",
+ "cairn-tls",
  "cairn-tokenize",
  "cairn-vcs",
  "cairn-workflow",
@@ -1178,6 +1180,7 @@ name = "cairn-image-wire"
 version = "0.13.6"
 dependencies = [
  "base64 0.22.1",
+ "cairn-tls",
  "imagesize",
  "log",
  "reqwest 0.12.28",
@@ -1201,6 +1204,7 @@ name = "cairn-llm-wire"
 version = "0.13.6"
 dependencies = [
  "base64 0.22.1",
+ "cairn-tls",
  "log",
  "reqwest 0.12.28",
  "serde",
@@ -1239,6 +1243,7 @@ dependencies = [
  "cairn-models-types",
  "cairn-platform",
  "cairn-speech-wire",
+ "cairn-tls",
  "chrono",
  "crossbeam-channel",
  "flate2",
@@ -1352,10 +1357,10 @@ name = "cairn-speech-wire"
 version = "0.13.6"
 dependencies = [
  "base64 0.22.1",
+ "cairn-tls",
  "log",
  "reqwest 0.12.28",
  "rustls 0.23.46",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1375,6 +1380,17 @@ dependencies = [
  "log",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "cairn-tls"
+version = "0.13.6"
+dependencies = [
+ "log",
+ "reqwest 0.12.28",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "tokio",
 ]
 
 [[package]]

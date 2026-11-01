@@ -6142,6 +6142,21 @@ pub struct LearnedResourceEstimate {
 /// runner, so this reaches only machines that run a carrying build before they
 /// are removed; the build-hash rollout delivers it to every attached machine.
 /// An older runner never sets the flag.
+///
+/// cairn/5725 does not move the number. No frame or field changes. A head now
+/// polls a start's health URL while the start script runs and sends
+/// [`DeploymentPhaseReport::Healthy`] as soon as it answers, then lets the
+/// script run to its own end with no bound; a script that ends badly after
+/// that sends [`DeploymentPhaseReport::Failed`] for the same command and runs
+/// no cleanup. What a runner gets wrong talking to an older executor: nothing
+/// it decodes differently. That executor reports healthy only once the script
+/// has exited, but the runner now also probes a starting deployment and calls
+/// it healthy when the probe answers, so only the head's own report comes
+/// late. A foreground script there is still killed at the start's bound with
+/// its cleanup run, which the runner reads as the health check no longer
+/// answering. An older runner talking to a newer executor takes the first
+/// `Healthy` as before and, holding no command once healthy, ignores a
+/// `Failed` that follows it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -17095,11 +17110,14 @@ pub enum McpRelayResult {
 #[serde(tag = "operation", rename_all = "camelCase")]
 pub enum DeploymentOperation {
     /// Probe `health_url` first, and report healthy without running anything
-    /// if it already answers. Otherwise run `script`, then poll `health_url`
-    /// until it answers. The script and the wait for health together are
-    /// bounded by `timeout_secs` from receipt. A start that fails runs
-    /// `cleanup`, when there is one, before it reports, so what the start left
-    /// behind does not hold the machines' memory once they are released.
+    /// if it already answers. Otherwise run `script`, polling `health_url`
+    /// while it runs and after it exits, and report healthy as soon as it
+    /// answers. The wait for health is bounded by `timeout_secs` from receipt;
+    /// once health has answered the script runs to its own end unbounded, and
+    /// a bad end is then reported as `Failed` without running anything else.
+    /// A start that fails before health answers runs `cleanup`, when there is
+    /// one, before it reports, so what the start left behind does not hold
+    /// the machines' memory once they are released.
     Start {
         script: String,
         timeout_secs: u64,
@@ -17133,8 +17151,9 @@ pub struct DeploymentScript {
 #[serde(tag = "phase", rename_all = "camelCase")]
 pub enum DeploymentPhaseReport {
     Starting,
-    /// The health URL answers 2xx. `ran_start` is false when it already
-    /// answered, so the start script was not run.
+    /// The health URL answers 2xx, though the start script may still be
+    /// running. `ran_start` is false when it already answered, so the start
+    /// script was not run.
     Healthy {
         #[serde(default)]
         ran_start: bool,

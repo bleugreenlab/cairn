@@ -60,13 +60,18 @@ pub(crate) const OPENROUTER_BACKEND_KEY: &str = "openrouter";
 pub struct OpenRouterBackend;
 
 pub(crate) fn openrouter_api_key(orch: &Orchestrator) -> Option<String> {
+    openrouter_api_account(orch).map(|(_, key)| key)
+}
+
+/// The workspace's OpenRouter key and the account it belongs to.
+pub(crate) fn openrouter_api_account(orch: &Orchestrator) -> Option<(String, String)> {
     orch.get_credential_store().and_then(|store| {
         store
             .accounts_for_provider(ApiProvider::OpenRouter, None)
             .into_iter()
             .find(|account| account.serves_backend(OPENROUTER_BACKEND_KEY))
             .and_then(|account| match &account.auth {
-                ProviderAuth::ApiKey { value } => Some(value.clone()),
+                ProviderAuth::ApiKey { value } => Some((account.id.clone(), value.clone())),
                 _ => None,
             })
     })
@@ -75,6 +80,31 @@ pub(crate) fn openrouter_api_key(orch: &Orchestrator) -> Option<String> {
 impl AgentBackend for OpenRouterBackend {
     fn name(&self) -> &str {
         OPENROUTER_BACKEND_NAME
+    }
+
+    /// The client's body goes as it was sent: Cairn's own provider-routing
+    /// object is for Cairn's requests, and a client that wants routing says so
+    /// in its body.
+    fn relay_route(
+        &self,
+        orch: &Orchestrator,
+        request: crate::backends::relay::RelayRequest<'_>,
+        _admitted: crate::backends::Admitted,
+    ) -> Result<cairn_models::interface::relay::RelayRoute, crate::backends::relay::RelayRefusal>
+    {
+        let (account_id, api_key) = openrouter_api_account(orch).ok_or_else(|| {
+            crate::backends::relay::RelayRefusal::Unavailable(
+                "OpenRouter has no API key in this workspace".to_string(),
+            )
+        })?;
+        Ok(cairn_models::interface::relay::RelayRoute {
+            base_url: OPENROUTER_API_BASE.to_string(),
+            headers: http::openrouter_headers(&api_key),
+            backend_key: OPENROUTER_BACKEND_KEY.to_string(),
+            provider_name: OPENROUTER_BACKEND_NAME.to_string(),
+            sent_model: request.model.to_string(),
+            account_id: Some(account_id),
+        })
     }
 
     fn response_completion_availability(

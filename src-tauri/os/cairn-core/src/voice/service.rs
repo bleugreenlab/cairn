@@ -36,6 +36,7 @@ enum StreamState {
 
 async fn engine_component_state(
     installer: &ComponentInstaller,
+    target: Option<&str>,
     components: &[super::ManagedComponent],
 ) -> ComponentState {
     let Some(component) = components
@@ -44,7 +45,7 @@ async fn engine_component_state(
     else {
         return ComponentState::Missing;
     };
-    let Some(target) = current_target() else {
+    let Some(target) = target else {
         return ComponentState::Incompatible;
     };
     if !installer.engine_is_current(component, target) {
@@ -74,6 +75,11 @@ struct VoiceServiceInner {
     installer: ComponentInstaller,
     config_dir: PathBuf,
     app_version: String,
+    /// The release target whose engine this service installs and runs, or
+    /// `None` where no engine is published. Held rather than read from the
+    /// host, so the target-independent logic that names an engine by it can be
+    /// exercised on any host.
+    target: Option<&'static str>,
     engine_override: Option<PathBuf>,
     enabled: AtomicBool,
     preferred_file_model: Mutex<VoiceModel>,
@@ -125,12 +131,13 @@ impl VoiceService {
             build_identity,
             emitter,
             RELEASE_BASE,
+            current_target(),
             engine_override,
         )
     }
 
-    /// The same service with its release server and engine binary named
-    /// directly.
+    /// The same service with its release server, target, and engine binary
+    /// named directly.
     ///
     /// A test drives a scripted engine through this rather than through the
     /// environment variable, which is shared by every test in the binary and so
@@ -141,6 +148,7 @@ impl VoiceService {
         build_identity: impl Into<String>,
         emitter: Arc<dyn EventEmitter>,
         release_base: &str,
+        target: Option<&'static str>,
         engine_override: Option<PathBuf>,
     ) -> Self {
         let app_version = app_version.into();
@@ -189,6 +197,7 @@ impl VoiceService {
                 installer,
                 config_dir: data_dir,
                 app_version,
+                target,
                 engine_override,
                 enabled: AtomicBool::new(preferences.enabled),
                 preferred_file_model: Mutex::new(preferences.preferred_file_model),
@@ -246,7 +255,7 @@ impl VoiceServiceHandle {
         if self.0.engine_override.is_some() {
             return;
         }
-        let Some(target) = current_target() else {
+        let Some(target) = self.0.target else {
             return;
         };
         let stale = match self.0.installer.manifest().await {
@@ -369,7 +378,7 @@ impl VoiceServiceHandle {
         if self.0.engine_override.is_some() {
             return true;
         }
-        let Some(target) = current_target() else {
+        let Some(target) = self.0.target else {
             return false;
         };
         find_component(&manifest.components, "engine")
@@ -418,7 +427,7 @@ impl VoiceServiceHandle {
                 Err(_) => ComponentState::Incompatible,
             }
         } else {
-            engine_component_state(&self.0.installer, &manifest.components).await
+            engine_component_state(&self.0.installer, self.0.target, &manifest.components).await
         };
         // Only while the engine is not usable: a refused handoff leaves the
         // current engine in place, and nothing would ever clear its failure.
@@ -434,7 +443,7 @@ impl VoiceServiceHandle {
         let realtime_model =
             component_state(&self.0.installer, &manifest.components, "model:realtime").await;
         Ok(VoiceStatus {
-            supported: current_target().is_some(),
+            supported: self.0.target.is_some(),
             enabled: self.0.enabled.load(Ordering::Acquire),
             engine,
             engine_state: self.0.engine_state.lock().await.clone(),
@@ -451,7 +460,7 @@ impl VoiceServiceHandle {
 
     pub async fn enable(&self) -> VoiceResult<VoiceStatus> {
         self.ensure_available()?;
-        let target = current_target().ok_or(VoiceError::UnsupportedTarget)?;
+        let target = self.0.target.ok_or(VoiceError::UnsupportedTarget)?;
         if let Some(path) = &self.0.engine_override {
             super::installer::probe_engine(path, &self.0.app_version).await?;
         } else {
@@ -884,7 +893,7 @@ impl VoiceServiceHandle {
                 super::installer::probe_engine(path, &self.0.app_version).await?;
                 path.clone()
             } else {
-                let target = current_target().ok_or(VoiceError::UnsupportedTarget)?;
+                let target = self.0.target.ok_or(VoiceError::UnsupportedTarget)?;
                 let engine = find_component(&manifest.components, "engine")?;
                 let engine = if !adopt_handoff && self.0.installer.engine_is_current(engine, target)
                 {
@@ -1082,6 +1091,7 @@ fn forward_protocol_event(emitter: &dyn EventEmitter, event: ProtocolEvent) {
 /// arriving mid-dictation decides whether the next dictation works at all.
 #[cfg(all(test, unix))]
 mod tests {
+    use super::super::catalog::TEST_TARGET;
     use super::*;
     use crate::internal::services::testing::CapturingEmitter;
     use sha2::{Digest, Sha256};
@@ -1096,7 +1106,7 @@ mod tests {
     /// A managed install whose engine belongs to an earlier app version, beside
     /// models that are still valid — what an app update leaves behind.
     fn write_stale_install(root: &Path) -> Vec<super::super::ManagedComponent> {
-        let target = current_target().expect("voice tests run on a supported target");
+        let target = TEST_TARGET;
         let make_component = |kind: &str, id: &str, bytes: &[u8]| {
             let path = root.join(id);
             std::fs::write(&path, bytes).unwrap();
@@ -1173,6 +1183,7 @@ mod tests {
             BUILD_IDENTITY,
             Arc::new(CapturingEmitter::new()),
             OFFLINE_RELEASES,
+            Some(TEST_TARGET),
             None,
         );
         let status = service.handle().status().await.unwrap();
@@ -1215,11 +1226,11 @@ mod tests {
             BUILD_IDENTITY,
             emitter.clone(),
             &release_base,
+            Some(TEST_TARGET),
             None,
         );
         let voice = service.handle();
-        let target = current_target().expect("voice tests run on a supported target");
-        let asset = super::super::engine_asset_name(APP_VERSION, target);
+        let asset = super::super::engine_asset_name(APP_VERSION, TEST_TARGET);
 
         voice.refresh_engine().await;
 
@@ -1266,6 +1277,44 @@ mod tests {
                 component.id
             );
         }
+    }
+
+    /// A host with no published engine (linux/aarch64, where only the executor
+    /// ships) says so and refuses Enable, rather than reaching for a release
+    /// asset that cannot exist. The startup refresh does nothing at all.
+    #[tokio::test]
+    async fn a_target_without_an_engine_is_unsupported_and_refuses_enable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        write_stale_install(root);
+        let (release_base, requested) = unpublished_release_server().await;
+        let service = VoiceService::with_engine(
+            root.to_path_buf(),
+            APP_VERSION,
+            BUILD_IDENTITY,
+            Arc::new(CapturingEmitter::new()),
+            &release_base,
+            None,
+            None,
+        );
+        let voice = service.handle();
+
+        voice.refresh_engine().await;
+        let status = voice.status().await.unwrap();
+        assert!(!status.supported);
+        assert_eq!(status.engine, ComponentState::Incompatible);
+
+        let error = voice
+            .enable()
+            .await
+            .expect_err("Enable has no engine to install");
+        assert!(matches!(error, VoiceError::UnsupportedTarget), "{error:?}");
+        assert!(
+            requested.lock().unwrap().is_empty(),
+            "nothing asks the release server for an engine: {:?}",
+            requested.lock().unwrap()
+        );
+        assert!(!voice.status().await.unwrap().enabled);
     }
 
     /// The engine every script starts from: it identifies itself, greets, logs
@@ -1381,7 +1430,7 @@ done
         fn managed(script: &str) -> Harness {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
-            let target = current_target().expect("voice tests run on a supported target");
+            let target = TEST_TARGET;
             let asset = super::super::engine_asset_name(APP_VERSION, target);
             let engine_path = root.join("voice/engine").join(&asset);
             std::fs::create_dir_all(engine_path.parent().unwrap()).unwrap();
@@ -1431,6 +1480,7 @@ done
                     BUILD_IDENTITY,
                     Arc::new(CapturingEmitter::new()),
                     OFFLINE_RELEASES,
+                    Some(TEST_TARGET),
                     engine_override,
                 ),
                 directory,
@@ -1442,8 +1492,7 @@ done
         /// served a command is visible.
         fn hand_off(&self, script: &str) {
             let root = self.directory.path();
-            let target = current_target().expect("voice tests run on a supported target");
-            let asset = super::super::engine_asset_name(APP_VERSION, target);
+            let asset = super::super::engine_asset_name(APP_VERSION, TEST_TARGET);
             let dir = root.join("voice/local-engine");
             std::fs::create_dir_all(&dir).unwrap();
             let body = engine_script(&root.join("adopted.log"), script);

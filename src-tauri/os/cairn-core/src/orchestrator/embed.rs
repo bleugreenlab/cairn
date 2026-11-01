@@ -402,17 +402,23 @@ impl Orchestrator {
         })?;
         let (offer, capabilities) = catalog.embedding_offer(Some(model), request)?;
         let route = self.embed_route(scope, &offer)?;
-        embed(
+        // An inference engine answers to its own name for the model; the
+        // vectors still carry the name the caller asked by.
+        let sent =
+            crate::backends::backend_for_name(Some(&offer.provider)).sent_model(self, &offer.model);
+        let mut embeddings = embed(
             self.models_runtime.complete.as_ref(),
             EmbedCall {
                 route: &route,
-                model: &offer.model,
+                model: &sent,
                 capabilities: &capabilities,
                 request,
                 timeout: EMBED_TIMEOUT,
                 cancel,
             },
-        )
+        )?;
+        embeddings.model = offer.model.clone();
+        Ok(embeddings)
     }
 
     /// [`Self::embed_blocking`], off the async runtime. Dropping the future
@@ -563,6 +569,26 @@ impl Orchestrator {
             return self
                 .ollama_embed_route(scope, &offer.model)
                 .map_err(unavailable);
+        }
+        if provider == crate::backends::inference::INFERENCE_BACKEND_KEY {
+            // Asking is demand: an unloaded embedder loads, within the
+            // embedding's own timeout.
+            let route = super::inference_route::ready_blocking(
+                self,
+                &offer.model,
+                "an embedding",
+                Some(EMBED_TIMEOUT),
+                || false,
+                |_| {},
+            )
+            .map_err(EmbedError::Unsupported)?;
+            return Ok(openai::route_for(
+                crate::backends::inference::INFERENCE_BACKEND_KEY,
+                crate::backends::inference::INFERENCE_BACKEND_NAME,
+                &route.api_base,
+                None,
+                &[],
+            ));
         }
         if let Some(account_id) = catalog::custom_account_id(provider) {
             let config =

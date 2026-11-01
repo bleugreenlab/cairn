@@ -130,7 +130,7 @@ fn error_with_causes(context: &str, error: &dyn Error) -> String {
 }
 
 fn discover_host(account_id: &str, base_url: &str) -> Result<HostModels, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
         .timeout(DISCOVERY_TIMEOUT)
         .build()

@@ -12,6 +12,10 @@
 
 use serde_json::{Map, Value};
 
+use crate::accounts::sign_in::{
+    SignInExpiry, SignInExpirySource, CLAUDE_REFRESH_EXPIRES_AT_FIELD,
+    CLAUDE_REFRESH_EXPIRY_SOURCE_FIELD, INFERRED_SIGN_IN_LIFETIME_SECS,
+};
 use crate::accounts::{ApiProvider, ProviderAccount, ProviderAuth};
 use crate::interface::session::SecretEnv;
 
@@ -126,6 +130,44 @@ impl ClaudeOAuth {
         self.0.get(PUBLISHED_AT_FIELD).and_then(Value::as_i64)
     }
 
+    /// When the sign-in this credential belongs to stops being renewable.
+    /// Rotating the refresh token does not move it.
+    pub fn sign_in_expiry(&self) -> Option<SignInExpiry> {
+        SignInExpiry::from_claude_object(&self.0)
+    }
+
+    fn set_sign_in_expiry(&mut self, expires_at_ms: i64, source: SignInExpirySource) {
+        self.0.insert(
+            CLAUDE_REFRESH_EXPIRES_AT_FIELD.into(),
+            Value::from(expires_at_ms),
+        );
+        self.0.insert(
+            CLAUDE_REFRESH_EXPIRY_SOURCE_FIELD.into(),
+            Value::from(source.as_str()),
+        );
+    }
+
+    /// This credential as Cairn takes it over from a sign-in at `now_ms`, with
+    /// the sign-in's deadline recorded and attributed: the CLI's own record
+    /// where it kept one, or else the 30 days the CLI itself assumes, marked
+    /// as Cairn's inference.
+    pub fn with_sign_in_expiry_recorded(mut self, now_ms: i64) -> Self {
+        match self
+            .0
+            .get(CLAUDE_REFRESH_EXPIRES_AT_FIELD)
+            .and_then(Value::as_i64)
+        {
+            Some(expires_at_ms) => {
+                self.set_sign_in_expiry(expires_at_ms, SignInExpirySource::SignIn)
+            }
+            None => self.set_sign_in_expiry(
+                now_ms.saturating_add(INFERRED_SIGN_IN_LIFETIME_SECS * 1000),
+                SignInExpirySource::Inferred,
+            ),
+        }
+        self
+    }
+
     /// Milliseconds of validity left at `now_ms`. `None` when the credential
     /// does not say when it expires, which callers treat as "renew".
     pub fn remaining_ms(&self, now_ms: i64) -> Option<i64> {
@@ -144,12 +186,15 @@ impl ClaudeOAuth {
     /// The next rotation of this credential: the provider's new tokens laid
     /// over the durable object, so every field the CLI or an earlier Cairn
     /// wrote survives. A response without a refresh token keeps the current
-    /// one, because the provider is keeping it alive.
+    /// one, because the provider is keeping it alive. A response that declares
+    /// `refresh_token_expires_in` replaces the sign-in deadline with the
+    /// provider's own; one that declares none keeps the deadline already held.
     pub fn rotated(
         &self,
         access_token: &str,
         refresh_token: Option<&str>,
         expires_at_ms: i64,
+        refresh_expires_in_secs: Option<i64>,
         scopes: Option<Vec<String>>,
         now_ms: i64,
     ) -> Self {
@@ -161,6 +206,12 @@ impl ClaudeOAuth {
         }
         next.0
             .insert("expiresAt".into(), Value::from(expires_at_ms));
+        if let Some(secs) = refresh_expires_in_secs.filter(|secs| *secs > 0) {
+            next.set_sign_in_expiry(
+                now_ms.saturating_add(secs.saturating_mul(1000)),
+                SignInExpirySource::Provider,
+            );
+        }
         if let Some(scopes) = scopes.filter(|s| !s.is_empty()) {
             next.0.insert("scopes".into(), Value::from(scopes));
         }
@@ -247,15 +298,47 @@ mod tests {
         let oauth = ClaudeOAuth::from_cli_credentials(CLI_FILE)
             .unwrap()
             .stamped(3, 0);
-        let next = oauth.rotated("at-2", None, 9000, None, 50);
+        let next = oauth.rotated("at-2", None, 9000, None, None, 50);
         assert_eq!(next.access_token(), "at-2");
         assert_eq!(next.refresh_token(), Some("rt-1"));
         assert_eq!(next.expires_at_ms(), Some(9000));
         assert_eq!(next.generation(), 4);
         assert_eq!(next.published_at_ms(), Some(50));
         assert!(next.to_json().contains("subscriptionType"));
-        let next = next.rotated("at-3", Some("rt-3"), 10_000, None, 60);
+        let next = next.rotated("at-3", Some("rt-3"), 10_000, None, None, 60);
         assert_eq!(next.refresh_token(), Some("rt-3"));
+    }
+
+    /// The sign-in deadline is the provider's, not the rotation's: a rotation
+    /// that declares none carries the held one forward unchanged, and one that
+    /// declares it replaces it with the provider's word.
+    #[test]
+    fn a_rotation_keeps_the_sign_in_deadline_unless_the_provider_restates_it() {
+        const CLI_WITH_DEADLINE: &str = r#"{"claudeAiOauth":{"accessToken":"at-1","refreshToken":"rt-1","expiresAt":1000,"refreshTokenExpiresAt":1795050241877}}"#;
+        let harvested = ClaudeOAuth::from_cli_credentials(CLI_WITH_DEADLINE)
+            .unwrap()
+            .with_sign_in_expiry_recorded(0);
+        let expiry = harvested.sign_in_expiry().unwrap();
+        assert_eq!(expiry.expires_at, 1_795_050_241);
+        assert_eq!(expiry.source, SignInExpirySource::SignIn);
+
+        let rotated = harvested.rotated("at-2", Some("rt-2"), 9000, None, None, 50_000);
+        assert_eq!(rotated.sign_in_expiry(), Some(expiry));
+
+        let restated = rotated.rotated("at-3", Some("rt-3"), 9000, Some(3600), None, 60_000);
+        let restated = restated.sign_in_expiry().unwrap();
+        assert_eq!(restated.expires_at, 60 + 3600);
+        assert_eq!(restated.source, SignInExpirySource::Provider);
+    }
+
+    #[test]
+    fn a_sign_in_that_recorded_no_deadline_is_assumed_to_last_thirty_days() {
+        let harvested = ClaudeOAuth::from_cli_credentials(CLI_FILE)
+            .unwrap()
+            .with_sign_in_expiry_recorded(1_000);
+        let expiry = harvested.sign_in_expiry().unwrap();
+        assert_eq!(expiry.source, SignInExpirySource::Inferred);
+        assert_eq!(expiry.expires_at, 1 + INFERRED_SIGN_IN_LIFETIME_SECS);
     }
 
     #[test]

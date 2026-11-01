@@ -427,7 +427,14 @@ async fn cold_compact_withdraws_permission_and_question() {
     let late_question = cairn_core::internal::mcp::handlers::planning::answer_prompt_id(
         &orch,
         "q-1",
-        "the first one".to_string(),
+        cairn_core::models::question::PromptAnswers::new(
+            1,
+            vec![cairn_core::models::question::QuestionAnswer {
+                index: 0,
+                answer: "the first one".to_string(),
+            }],
+        )
+        .unwrap(),
         cairn_core::turns::queries::ResolutionProvenance::new(
             cairn_common::identity::AppearanceTransport::LocalInvoke,
             None,

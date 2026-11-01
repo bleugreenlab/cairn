@@ -341,6 +341,11 @@ pub struct SettingsFile {
     /// through `cairn://settings` and preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<crate::inference::InferenceSettings>,
+    /// Cairn's OpenAI-compatible API for outside clients: its listener and the
+    /// model aliases it accepts. Config-only (YAML, not in the Settings DTO);
+    /// written through `cairn://settings` and preserved across saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_api: Option<crate::served_api::ServedApiSettings>,
     /// Typed web-fetch provider options, keyed by provider id
     /// (`bmd`/`jina`/`firecrawl`) then option key. Config-only (YAML, not in the
     /// Settings DTO). Validated against the per-provider descriptor in
@@ -608,6 +613,8 @@ impl SettingsFile {
             tier_defaults: presets.tier_defaults,
             tiers: presets.tiers,
             backends: presets.backends,
+            // A built-in provider is never one a workspace installed, even
+            // where an older file still names it.
             enabled_providers: match &self.enabled_providers {
                 Some(enabled) => cairn_models_types::catalog::in_catalog_order(enabled),
                 // Un-migrated: every shipped provider, which is the surface this
@@ -615,7 +622,10 @@ impl SettingsFile {
                 None => cairn_models_types::catalog::supported_keys()
                     .map(str::to_string)
                     .collect(),
-            },
+            }
+            .into_iter()
+            .filter(|key| !cairn_models_types::catalog::is_built_in(key))
+            .collect(),
             decision_model: non_blank(&self.decision_model),
             image_model: non_blank(&self.image_model),
             speech_model: non_blank(&self.speech_model),
@@ -728,6 +738,7 @@ impl SettingsFile {
             build_services: None,
             fleet: None,
             inference: None,
+            served_api: None,
             accepted_fence_commands: None,
             event_log: None,
             web_fetch: None,
@@ -1037,6 +1048,39 @@ fn mutate_build_services<T>(
     })
 }
 
+const SERVED_API_KEY: &str = "servedApi";
+
+/// The workspace's `servedApi` section, or an empty one (listener off) when
+/// unset.
+pub fn load_served_api(config_dir: &std::path::Path) -> crate::served_api::ServedApiSettings {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.served_api)
+        .unwrap_or_default()
+}
+
+/// Replace the `servedApi` section. Surgical: no other key is touched, and an
+/// empty section removes the key.
+pub fn set_served_api(
+    config_dir: &std::path::Path,
+    served_api: &crate::served_api::ServedApiSettings,
+) -> Result<(), String> {
+    served_api.validate()?;
+    mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+        let key = serde_yaml::Value::String(SERVED_API_KEY.to_string());
+        if *served_api == crate::served_api::ServedApiSettings::default() {
+            root.remove(&key);
+        } else {
+            root.insert(
+                key,
+                serde_yaml::to_value(served_api)
+                    .map_err(|error| format!("Failed to serialize servedApi settings: {error}"))?,
+            );
+        }
+        Ok(())
+    })
+}
+
 const INFERENCE_KEY: &str = "inference";
 
 /// The workspace's `inference` section, or an empty one when unset.
@@ -1252,6 +1296,27 @@ pub fn migrate_enabled_providers(
     })
 }
 
+/// Take every provider Cairn provides itself out of `enabledProviders` and say
+/// which: a workspace never installs one (Cairn inference lists its models
+/// whenever it has a deployment), so naming it there says something untrue.
+pub fn retire_built_in_providers(config_dir: &std::path::Path) -> Result<Vec<String>, String> {
+    mutate_workspace_settings(config_dir, "cairn: retire built-in providers", |root| {
+        let key = serde_yaml::Value::String("enabledProviders".to_string());
+        let Some(serde_yaml::Value::Sequence(enabled)) = root.get_mut(&key) else {
+            return Ok(Vec::new());
+        };
+        let mut retired = Vec::new();
+        enabled.retain(|entry| match entry.as_str() {
+            Some(provider) if cairn_models_types::catalog::is_built_in(provider) => {
+                retired.push(provider.to_string());
+                false
+            }
+            _ => true,
+        });
+        Ok(retired)
+    })
+}
+
 /// Refuse an enablement change that would leave configuration pointing at a
 /// provider the workspace no longer has.
 ///
@@ -1313,6 +1378,19 @@ fn validate_enabled_providers(
             "Unknown provider '{unknown}'. This version of Cairn ships: {}.",
             catalog::supported_keys().collect::<Vec<_>>().join(", ")
         ));
+    }
+
+    if enablement_changed {
+        if let Some(built_in) = settings
+            .enabled_providers
+            .iter()
+            .find(|key| catalog::is_built_in(key))
+        {
+            return Err(format!(
+                "{} is built in: Cairn lists its models whenever it has something to serve, so a workspace never adds or removes it.",
+                provider_names.label(built_in)
+            ));
+        }
     }
 
     let label = |key: &str| provider_names.label(key);
@@ -2307,6 +2385,32 @@ buildServices:
             load_settings_file(dir).unwrap().log_level,
             Some(LogLevel::Verbose)
         );
+    }
+
+    #[test]
+    fn served_api_settings_are_surgical_and_survive_a_general_save() {
+        let dir = tempfile::tempdir().unwrap();
+        save_settings(dir.path(), &test_settings()).unwrap();
+        let served = crate::served_api::ServedApiSettings {
+            bind: Some("0.0.0.0:80".into()),
+            load_wait_secs: Some(600),
+            ..Default::default()
+        };
+        set_served_api(dir.path(), &served).unwrap();
+        save_settings(dir.path(), &test_settings()).unwrap();
+        assert_eq!(load_served_api(dir.path()), served);
+
+        set_served_api(dir.path(), &Default::default()).unwrap();
+        let text = std::fs::read_to_string(get_settings_path(dir.path())).unwrap();
+        assert!(!text.contains("servedApi"), "{text}");
+        assert!(set_served_api(
+            dir.path(),
+            &crate::served_api::ServedApiSettings {
+                bind: Some("nowhere".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -3495,6 +3599,7 @@ mod enabled_provider_tests {
         // migration has actually looked at the workspace's evidence.
         let file: SettingsFile = serde_yaml::from_str("tiers: [sm, md, lg]\n").unwrap();
         let expected: Vec<String> = cairn_models_types::catalog::supported_keys()
+            .filter(|key| !cairn_models_types::catalog::is_built_in(key))
             .map(str::to_string)
             .collect();
         assert_eq!(file.to_settings().enabled_providers, expected);
@@ -3581,6 +3686,33 @@ routeCallsViaOpenRouter: true
         let second = migrate_enabled_providers(temp.path(), &["ollama".to_string()]).unwrap();
         assert!(second.is_none(), "the migration must not run twice");
         assert_eq!(recorded(temp.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn a_built_in_provider_leaves_enabled_providers_and_is_never_added() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders:\n  - claude\n  - inference\n",
+        );
+        assert_eq!(
+            retire_built_in_providers(temp.path()).unwrap(),
+            vec!["inference"]
+        );
+        assert_eq!(recorded(temp.path()).unwrap(), vec!["claude"]);
+        assert!(retire_built_in_providers(temp.path()).unwrap().is_empty());
+
+        let error = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string(), "inference".to_string()]),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("built in"), "{error}");
+        assert_eq!(recorded(temp.path()).unwrap(), vec!["claude"]);
     }
 
     #[test]

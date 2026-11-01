@@ -531,8 +531,8 @@ impl AuthorityConstraintSet {
 /// concurrently, and the journal would record an allow attributed to a principal
 /// the operator never saw.
 ///
-/// A `Standing` grant is deliberately NOT principal-bound — see
-/// [`AuthorityLifetime::Standing`].
+/// A `Standing` grant is NOT bound to a run — see [`AuthorityLifetime::Standing`]
+/// — but one whose `actor` is set is bound to that actor.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AuthorityPrincipal {
     /// Canonical node URI, when the request came from a node.
@@ -621,6 +621,11 @@ pub enum AuthorityLifetime {
     /// — an operator choosing "always" is answering "stop asking me about this",
     /// not "allow this one agent" — and it is why standing is the only lifetime
     /// that is listed and revocable rather than expiring on its own.
+    ///
+    /// The one binding a standing grant may carry is its principal's `actor`
+    /// (tenet 1334): with `actor = Some(P)` it authorizes only an asking actor
+    /// exactly equal to the durable subject P, such as one served-API client;
+    /// with `None` it keeps the workspace-wide meaning above.
     Standing,
 }
 
@@ -734,6 +739,11 @@ pub struct AuthorityContext {
     /// The permission request being adjudicated, if this authorization is the
     /// redispatch of an answered prompt.
     pub request_id: Option<String>,
+    /// The typed principal asking, when the request comes from an
+    /// authenticated actor rather than a run (a served-API client). Compared
+    /// against an actor-bound standing grant; it is carried from the verified
+    /// appearance, never inferred from a key, a name or a place.
+    pub actor: Option<crate::identity::PrincipalRef>,
 }
 
 /// Why a grant did not match. Returned rather than a bare `bool` so a denial is
@@ -821,10 +831,21 @@ impl AuthorityGrant {
     /// principal check two runs racing for the same scope could have one
     /// consume the other's single-use approval.
     ///
-    /// `Standing` is exempt by definition; see [`AuthorityLifetime::Standing`].
+    /// `Standing` is exempt from the run binding by definition; see
+    /// [`AuthorityLifetime::Standing`]. A standing grant bound to an actor
+    /// matches only that actor, and a bound actor that is not a valid durable
+    /// subject matches nothing.
     fn principal_matches(&self, context: &AuthorityContext) -> bool {
         if matches!(self.lifetime, AuthorityLifetime::Standing) {
-            return true;
+            return match &self.principal.actor {
+                None => true,
+                Some(bound) => {
+                    bound
+                        .validate_at(crate::identity::PrincipalPosition::DurableSubject)
+                        .is_ok()
+                        && context.actor.as_ref() == Some(bound)
+                }
+            };
         }
         match (self.principal.run_id.as_deref(), context.run_id.as_deref()) {
             (Some(granted), Some(asking)) => granted == asking,
@@ -902,6 +923,9 @@ pub enum AuthorityReason {
     /// provider that Cairn cannot undo, such as spending a usage-reset credit,
     /// which the provider does not refund.
     ExternalAccountWrite,
+    /// An outside client of Cairn's served API spending a remote provider's
+    /// account. Only a standing grant bound to that client allows it.
+    ServedApiRemoteUse,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -918,6 +942,7 @@ impl AuthorityReason {
             }
             AuthorityReason::WorkspaceToolCapability => "workspace_tool_capability",
             AuthorityReason::ExternalAccountWrite => "external_account_write",
+            AuthorityReason::ServedApiRemoteUse => "served_api_remote_use",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }
@@ -1085,7 +1110,53 @@ mod tests {
             turn_id: Some("turn-1".to_string()),
             session_id: Some("session-1".to_string()),
             request_id: None,
+            actor: None,
         }
+    }
+
+    fn client(id: &str) -> crate::identity::PrincipalRef {
+        crate::identity::PrincipalRef::External {
+            provider: "cairn-api".into(),
+            namespace: "default".into(),
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn an_actor_bound_standing_grant_authorizes_only_that_actor() {
+        let scope = AuthorityScope::new(
+            AuthorityPlace::ExternalAccount {
+                provider: "openrouter".into(),
+                account_id: "acc_or".into(),
+            },
+            AuthorityAction::Run,
+        );
+        let req = request(scope.clone(), AuthorityMutation::Update);
+        let mut bound = grant(scope, AuthorityLifetime::Standing);
+        bound.principal = AuthorityPrincipal {
+            actor: Some(client("cli_dig")),
+            ..Default::default()
+        };
+        let asking = |actor: Option<crate::identity::PrincipalRef>| AuthorityContext {
+            run_id: None,
+            turn_id: None,
+            session_id: None,
+            actor,
+            ..context()
+        };
+        assert!(bound.matches(&req, &asking(Some(client("cli_dig"))), 100));
+        assert_eq!(
+            bound.check(&req, &asking(Some(client("cli_sitrep"))), 100),
+            Err(GrantMismatch::Principal)
+        );
+        assert_eq!(
+            bound.check(&req, &asking(None), 100),
+            Err(GrantMismatch::Principal)
+        );
+        // Unbound, it keeps the workspace-wide meaning.
+        bound.principal = AuthorityPrincipal::default();
+        assert!(bound.matches(&req, &asking(Some(client("cli_sitrep"))), 100));
+        assert!(bound.matches(&req, &asking(None), 100));
     }
 
     // ── Scope identity ──────────────────────────────────────────────────────

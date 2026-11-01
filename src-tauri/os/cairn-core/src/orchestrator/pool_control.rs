@@ -494,19 +494,21 @@ impl RequestHandle {
     }
 }
 
-/// Ask for the model `model` on behalf of `requester`. The name must mean
+/// Ask for the model `model`, by its real name, on behalf of `requester`; a
+/// `pool` narrows which of its deployments is meant. The name must then mean
 /// exactly one deployment, in a pool under Cairn's control; the controller
 /// decides at once, so the returned handle's status already says what the
 /// request waits on.
 pub async fn request_model(
     orch: &Orchestrator,
     model: &str,
+    pool: Option<&PoolId>,
     requester: &str,
 ) -> Result<RequestHandle, String> {
     let model = model.trim();
     let db = &orch.db.local;
     let inventory = load_inventory(db).await?;
-    let (deployment, pool) = deployment_for(&inventory, model)?;
+    let (deployment, pool) = deployment_for(&inventory, model, pool)?;
     let id = {
         let _held = CONTROL.lock().await;
         let controls = load_controls(db).await?;
@@ -523,39 +525,67 @@ pub async fn request_model(
     })
 }
 
-/// The one deployment `model` names and the pool it is in, or why there is
-/// none: the name must mean exactly one deployment, and that deployment must be
-/// in a pool for anything to load it.
+/// The one deployment of the model named `model` (its real name), in `pool`
+/// when one is given, and the pool it is in; or why there is none. The name and
+/// pool must mean exactly one deployment, and that deployment must be in a pool
+/// for anything to load it.
 pub(crate) fn deployment_for(
     inventory: &Inventory,
     model: &str,
+    pool: Option<&PoolId>,
 ) -> Result<(DeploymentId, PoolId), String> {
     let model = model.trim();
     if model.is_empty() {
         return Err("name the model to load".to_string());
     }
-    let deployment = match control::deployments_serving(inventory, model).as_slice() {
-        [] => {
-            return Err(format!(
-                "no deployment serves '{model}'; cairn://inference/deployments lists them"
-            ))
-        }
-        [one] => one.clone(),
-        many => {
-            return Err(format!(
-                "'{model}' is served by {}; name the deployment you need",
-                many.iter()
-                    .map(DeploymentId::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        }
+    let placed: Vec<(DeploymentId, Option<PoolId>)> =
+        control::deployments_serving(inventory, model)
+            .into_iter()
+            .map(|id| {
+                let pool = inventory
+                    .pool_of_deployment(&inventory.deployments[&id])
+                    .map(|p| p.id.clone());
+                (id, pool)
+            })
+            .collect();
+    if placed.is_empty() {
+        return Err(format!(
+            "no deployment serves '{model}'; a model is named by its real name, and cairn://inference/recipes lists them"
+        ));
+    }
+    let candidates: Vec<_> = match pool {
+        Some(wanted) => placed
+            .into_iter()
+            .filter(|(_, pool)| pool.as_ref() == Some(wanted))
+            .collect(),
+        None => placed,
     };
-    let pool = inventory
-        .pool_of_deployment(&inventory.deployments[&deployment])
-        .map(|p| p.id.clone())
-        .ok_or_else(|| format!("{deployment} is in no pool, so nothing can load it"))?;
-    Ok((deployment, pool))
+    match candidates.as_slice() {
+        [] => Err(format!(
+            "no deployment of '{model}' is in pool {}",
+            pool.map(PoolId::as_str).unwrap_or_default()
+        )),
+        [(deployment, Some(pool))] => Ok((deployment.clone(), pool.clone())),
+        [(deployment, None)] => Err(format!(
+            "{deployment} is in no pool, so nothing can load it"
+        )),
+        many => {
+            let pools: BTreeSet<&str> = many
+                .iter()
+                .map(|(_, pool)| pool.as_ref().map_or("no pool", PoolId::as_str))
+                .collect();
+            Err(match pool {
+                Some(pool) => format!(
+                    "'{model}' has {} deployments in pool {pool}; remove all but one",
+                    many.len()
+                ),
+                None => format!(
+                    "'{model}' is deployed in {}; name the pool",
+                    pools.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+            })
+        }
+    }
 }
 
 /// Why a request for `deployment` cannot load it: Cairn does not decide what
@@ -648,11 +678,15 @@ pub async fn cancel_request(
     Ok(format!("Cancelled request #{id}"))
 }
 
-/// A patch to one pool's control: any of taking or handing back control, the
-/// settings, a pin, a release or revocation, applied in that order.
+/// A patch to one pool: its warm model, then its control (taking or handing
+/// back control, the settings, a pin, a release or revocation), applied in
+/// that order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolPatch {
     pub pool: PoolId,
+    /// The model, by real name, the pool loads when idle; `Some(None)` warms
+    /// nothing. Held in the pool record's `default`.
+    pub warm: Option<Option<String>>,
     pub controlled: Option<bool>,
     /// Each key present sets a setting; `None` derives it again.
     pub settings: Vec<(SettingKey, Option<u64>)>,
@@ -665,12 +699,25 @@ impl Default for PoolPatch {
     fn default() -> Self {
         Self {
             pool: PoolId::from(""),
+            warm: None,
             controlled: None,
             settings: Vec::new(),
             pin: None,
             release: false,
             revoke: false,
         }
+    }
+}
+
+impl PoolPatch {
+    /// Whether the patch touches the controller's record, not only the pool's
+    /// warm model.
+    fn changes_control(&self) -> bool {
+        self.controlled.is_some()
+            || !self.settings.is_empty()
+            || self.pin.is_some()
+            || self.release
+            || self.revoke
     }
 }
 
@@ -715,6 +762,19 @@ impl PoolPatch {
                         .trim()
                         .into();
                 }
+                "warm" => {
+                    patch.warm = Some(match value {
+                        serde_json::Value::Null => None,
+                        value => Some(
+                            value
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or("warm must be a model's real name, or null for none")?
+                                .to_string(),
+                        ),
+                    })
+                }
                 "controlled" => {
                     patch.controlled = Some(value.as_bool().ok_or("controlled must be true or false")?)
                 }
@@ -758,7 +818,7 @@ impl PoolPatch {
                 }
                 other => {
                     return Err(format!(
-                        "unknown key '{other}'; a pool patch takes pool, controlled, settings, pin, release and revoke"
+                        "unknown key '{other}'; a pool patch takes pool, warm, controlled, settings, pin, release and revoke"
                     ))
                 }
             }
@@ -773,6 +833,143 @@ impl PoolPatch {
     }
 }
 
+/// Unload `deployment` for `actor`: take it out of what its pool wants (its
+/// pin included, whoever holds it), cancel the requests still waiting for it,
+/// and stop it. A pool's warm model comes back after the pool's idle window,
+/// as the warm rule says.
+pub async fn unload(
+    orch: &Orchestrator,
+    deployment: &DeploymentId,
+    actor: &str,
+) -> Result<String, String> {
+    let db = &orch.db.local;
+    let inventory = load_inventory(db).await?;
+    let record = inventory
+        .deployments
+        .get(deployment)
+        .ok_or_else(|| format!("there is no deployment {deployment}"))?;
+    if let Some(pool) = inventory.pool_of_deployment(record).map(|p| p.id.clone()) {
+        let _held = CONTROL.lock().await;
+        let now = now_ms();
+        let mut controls = load_controls(db).await?;
+        if let Some(control) = controls.get_mut(&pool) {
+            let before = control::desired(control);
+            if control.dismiss(deployment, actor, now) {
+                control.advance_generation(&before);
+                save_control(db, control, now).await?;
+            }
+        }
+        db.execute(
+            "UPDATE inference_requests SET state = 'cancelled', state_at = ?2, reason = ?3
+              WHERE deployment = ?1 AND state = 'waiting'",
+            params![deployment.to_string(), now, format!("unloaded by {actor}")],
+        )
+        .await
+        .map_err(|error| format!("write inference_requests: {error}"))?;
+    }
+    inference_control::request_deployment(
+        orch,
+        deployment.as_str(),
+        cairn_inference::control::Request::Stop,
+    )
+    .await
+}
+
+/// One step [`set_pinned`] takes, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinStep {
+    /// Release the pin whoever holds it.
+    Revoke,
+    /// Release the actor's own pin.
+    Release,
+    Pin(DeploymentSet),
+}
+
+/// What pinning or unpinning `deployment` takes, for `actor`, the operator.
+///
+/// A pin is the pool's whole wanted set while it stands, so pinning starts
+/// from what is pinned, else from what the pool wants now, and nothing running
+/// is stopped by it. Unpinning releases the whole pin: its set carries over to
+/// the controller, which unloads each member when idle, where taking one
+/// member out of a standing pin would stop it at once. A pin another holder
+/// placed is revoked first, since the operator outranks it. No steps means
+/// nothing to change.
+fn pin_steps(
+    control: Option<&PoolControl>,
+    deployment: &DeploymentId,
+    pinned: bool,
+    actor: &str,
+) -> Vec<PinStep> {
+    let pin = control.and_then(|control| control.pin.as_ref());
+    let theirs = pin.is_some_and(|pin| pin.holder != actor);
+    if pinned {
+        let mut set = match pin {
+            Some(pin) => pin.set.clone(),
+            None => control.and_then(control::desired).unwrap_or_default(),
+        };
+        if !set.insert(deployment.clone()) && !theirs && pin.is_some() {
+            return Vec::new();
+        }
+        let mut steps = Vec::new();
+        if theirs {
+            steps.push(PinStep::Revoke);
+        }
+        steps.push(PinStep::Pin(set));
+        steps
+    } else if pin.is_some_and(|pin| pin.set.contains(deployment)) {
+        vec![if theirs {
+            PinStep::Revoke
+        } else {
+            PinStep::Release
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Pin `deployment` against idle unload, or unpin it, for `actor`, the
+/// operator; see [`pin_steps`] for what that takes.
+pub async fn set_pinned(
+    orch: &Orchestrator,
+    deployment: &DeploymentId,
+    pinned: bool,
+    actor: &str,
+) -> Result<String, String> {
+    let db = &orch.db.local;
+    let inventory = load_inventory(db).await?;
+    let record = inventory
+        .deployments
+        .get(deployment)
+        .ok_or_else(|| format!("there is no deployment {deployment}"))?;
+    let pool = inventory
+        .pool_of_deployment(record)
+        .map(|p| p.id.clone())
+        .ok_or_else(|| format!("{deployment} is in no pool, so there is nothing to pin"))?;
+    let control = load_controls(db).await?.remove(&pool);
+    let steps = pin_steps(control.as_ref(), deployment, pinned, actor);
+    if steps.is_empty() {
+        return Ok(format!(
+            "{deployment} is {}pinned",
+            if pinned { "already " } else { "not " }
+        ));
+    }
+    let mut lines = Vec::new();
+    for step in steps {
+        let patch = PoolPatch {
+            pool: pool.clone(),
+            release: step == PinStep::Release,
+            revoke: step == PinStep::Revoke,
+            pin: match step {
+                PinStep::Pin(set) => Some(set),
+                _ => None,
+            },
+            ..PoolPatch::default()
+        };
+        lines.push(patch_pool(orch, &patch, actor).await?);
+    }
+    Ok(lines.join("\n"))
+}
+
 /// Apply `patch` for `actor` and report what changed, one line each.
 pub async fn patch_pool(
     orch: &Orchestrator,
@@ -780,7 +977,11 @@ pub async fn patch_pool(
     actor: &str,
 ) -> Result<String, String> {
     let db = &orch.db.local;
-    let lines = {
+    let mut lines = Vec::new();
+    if let Some(warm) = &patch.warm {
+        lines.push(super::inference::set_pool_warm(db, &patch.pool, warm.as_deref()).await?);
+    }
+    if patch.warm.is_none() || patch.changes_control() {
         let _held = CONTROL.lock().await;
         let now = now_ms();
         let inventory = load_inventory(db).await?;
@@ -798,7 +999,7 @@ pub async fn patch_pool(
         );
         let mut controls = load_controls(db).await?;
         let existing = controls.remove(&patch.pool);
-        let (control, lines) = apply_patch(
+        let (control, control_lines) = apply_patch(
             pool, &inventory, existing, patch, actor, &phases, slowest, now,
         )?;
         save_control(db, &control, now).await?;
@@ -812,8 +1013,8 @@ pub async fn patch_pool(
             .await
             .map_err(|error| format!("write inference_requests: {error}"))?;
         }
-        lines
-    };
+        lines.extend(control_lines);
+    }
     tick(orch).await?;
     Ok(lines.join("\n"))
 }
@@ -953,6 +1154,98 @@ pools:
         &inventory.pools[&PoolId::from("sparks")]
     }
 
+    #[test]
+    fn the_operator_pins_from_what_runs_unpins_whole_and_outranks_another_holder() {
+        use cairn_inference::pool_control::{Member, Pin};
+        let inventory = inventory();
+        let id = |s: &str| DeploymentId::from(s);
+        let set = |ids: &[&str]| ids.iter().map(|s| id(s)).collect::<DeploymentSet>();
+        let mut control = PoolControl::begin(
+            sparks(&inventory),
+            &inventory.deployments,
+            &BTreeMap::new(),
+            0,
+        );
+        control.active.members.insert(id("a"), Member::chosen(0));
+        control.active.members.insert(id("b"), Member::chosen(0));
+
+        // Pinning one of two running models pins both, so neither stops.
+        assert_eq!(
+            pin_steps(Some(&control), &id("a"), true, "operator"),
+            [PinStep::Pin(set(&["a", "b"]))]
+        );
+        // Nothing pinned: nothing to unpin.
+        assert!(pin_steps(Some(&control), &id("a"), false, "operator").is_empty());
+
+        control.pin = Some(Pin {
+            set: set(&["a", "b"]),
+            holder: "operator".into(),
+            at: 0,
+        });
+        // Unpinning one releases the whole pin; its set carries over, and
+        // nothing is stopped at once.
+        assert_eq!(
+            pin_steps(Some(&control), &id("a"), false, "operator"),
+            [PinStep::Release]
+        );
+        assert!(pin_steps(Some(&control), &id("a"), true, "operator").is_empty());
+
+        // An agent's pin is revoked, never a refusal.
+        control.pin.as_mut().unwrap().holder = "cairn://p/cairn/1/1/builder".into();
+        assert_eq!(
+            pin_steps(Some(&control), &id("a"), false, "operator"),
+            [PinStep::Revoke]
+        );
+        assert_eq!(
+            pin_steps(Some(&control), &id("c"), true, "operator"),
+            [PinStep::Revoke, PinStep::Pin(set(&["a", "b", "c"]))]
+        );
+        assert_eq!(
+            pin_steps(Some(&control), &id("a"), true, "operator"),
+            [PinStep::Revoke, PinStep::Pin(set(&["a", "b"]))]
+        );
+    }
+
+    #[test]
+    fn a_request_names_a_model_by_its_real_name_and_a_pool_narrows_it() {
+        let mut inventory = inventory();
+        let found = |inventory: &Inventory, model: &str, pool: Option<&str>| {
+            deployment_for(inventory, model, pool.map(PoolId::from).as_ref())
+        };
+        assert_eq!(
+            found(&inventory, "deepseek v4 flash", None),
+            Ok(("dsv4f-tp2".into(), "sparks".into()))
+        );
+        for internal in ["dsv4f-tp2", "deepseek-v4-flash"] {
+            assert!(found(&inventory, internal, None)
+                .unwrap_err()
+                .starts_with("no deployment serves"));
+        }
+        // A second deployment of the model, in another pool.
+        inventory.upsert(
+            Inventory::parse_yaml(
+                r#"
+deployments:
+  - {id: dsv4f-bbs, recipe: dsv4f-tp2, machines: [bbs], head: bbs, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
+pools:
+  - {id: bbs, machines: [{name: bbs}]}
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            found(&inventory, "DeepSeek V4 Flash", None),
+            Err("'DeepSeek V4 Flash' is deployed in bbs, sparks; name the pool".into())
+        );
+        assert_eq!(
+            found(&inventory, "DeepSeek V4 Flash", Some("bbs")),
+            Ok(("dsv4f-bbs".into(), "bbs".into()))
+        );
+        assert!(found(&inventory, "DeepSeek V4 Flash", Some("halo"))
+            .unwrap_err()
+            .starts_with("no deployment of"));
+    }
+
     fn parse(value: serde_json::Value) -> Result<PoolPatch, String> {
         PoolPatch::parse(&value)
     }
@@ -985,6 +1278,12 @@ pools:
             parse(serde_json::json!({"pool": "sparks", "settings": {"poolIdleSecs": 0}})).is_err()
         );
         assert!(parse(serde_json::json!({"pool": "sparks", "holder": "me"})).is_err());
+        let warm = parse(serde_json::json!({"pool": "sparks", "warm": " org/Model "})).unwrap();
+        assert_eq!(warm.warm, Some(Some("org/Model".to_string())));
+        assert!(!warm.changes_control());
+        let cold = parse(serde_json::json!({"pool": "sparks", "warm": null})).unwrap();
+        assert_eq!(cold.warm, Some(None));
+        assert!(parse(serde_json::json!({"pool": "sparks", "warm": ""})).is_err());
         assert!(parse(serde_json::json!({"controlled": true})).is_err());
         assert!(
             parse(serde_json::json!({"pool": "sparks", "release": true, "revoke": true})).is_err()

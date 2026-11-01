@@ -889,6 +889,11 @@ pub(crate) const SETTINGS_INFERENCE: KeySpec = KeySpec::new(
     KeyType::Object,
     "{recipes?{recipeId:{verbs?[complete|session|decide|embed|image|speak], inputModalities?, outputModalities?}}} replaces the section; recipes declare what a recipe's model serves and takes, over the record; the records themselves are written at cairn://inference",
 );
+pub(crate) const SETTINGS_SERVED_API: KeySpec = KeySpec::new(
+    "servedApi",
+    KeyType::Object,
+    "{bind?:\"addr:port\", tls?:{certPath,keyPath}, loadWaitSecs?}|null replaces the section; the OpenAI-compatible listener for outside clients (off without bind; a restart applies a changed bind), and how long a request waits for a local model to load; clients name models by their real names; client keys live at cairn://models/clients",
+);
 pub(crate) const SETTINGS_MAX_THINKING_TOKENS: KeySpec = KeySpec::new(
     "maxThinkingTokens",
     KeyType::Int,

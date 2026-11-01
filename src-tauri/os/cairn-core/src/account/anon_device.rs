@@ -117,13 +117,9 @@ impl AnonDeviceManager {
         }
 
         // Register (or re-register) an anonymous token, reusing the stable id.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
-
-        let resp = client
+        let resp = cairn_tls::client()
             .post(self.api_config.anon_device_url())
+            .timeout(std::time::Duration::from_secs(10))
             .json(&serde_json::json!({ "device_id": device_id }))
             .send()
             .await

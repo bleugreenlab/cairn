@@ -355,6 +355,49 @@ pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<Stri
     ))
 }
 
+/// Set `pool`'s warm model, the one it loads when idle: the one deployment of
+/// `model` (by real name) in the pool, or nothing. The pool record's `default`
+/// holds it.
+pub async fn set_pool_warm(
+    db: &LocalDb,
+    pool: &PoolId,
+    model: Option<&str>,
+) -> Result<String, String> {
+    let _held = INVENTORY.lock().await;
+    let current = load_inventory(db).await?;
+    let record = current
+        .pools
+        .get(pool)
+        .ok_or_else(|| format!("there is no pool {pool}; cairn://inference/pools lists them"))?;
+    if record.source != RecordSource::Cairn {
+        return Err(format!(
+            "pool {pool} is still mirrored from {} and read-only; adopt it first: patch cairn://inference {{adopt:\"{}\"}}",
+            record.source.as_str(),
+            record.source.as_str()
+        ));
+    }
+    let set: cairn_inference::DeploymentSet = match model {
+        None => Default::default(),
+        Some(model) => {
+            let (deployment, _) = super::pool_control::deployment_for(&current, model, Some(pool))?;
+            [deployment].into()
+        }
+    };
+    let mut next = current.clone();
+    if let Some(record) = next.pools.get_mut(pool) {
+        record.default = set;
+    }
+    let problems = next.problems();
+    if !problems.is_empty() {
+        return Err(refused(problems.iter().map(ToString::to_string).collect()));
+    }
+    save_rows(db, diff_rows(&current, &next), now_ms()).await?;
+    Ok(match model {
+        Some(model) => format!("pool {pool} warms {model} when idle"),
+        None => format!("pool {pool} warms nothing"),
+    })
+}
+
 /// Everything the `cairn://inference` pages render.
 #[derive(Debug, Clone)]
 pub struct InferenceView {
@@ -455,6 +498,70 @@ pools:
             );
         }
         sources
+    }
+
+    #[tokio::test]
+    async fn a_stored_recipe_that_still_names_aliases_loads_without_them() {
+        let db = crate::storage::migrated_test_db("inference-aliases").await;
+        db.execute(
+            "INSERT INTO inference_recipes (id, source, body_json, created_at, updated_at)
+             VALUES ('r', 'cairn', ?1, 0, 0)",
+            params![r#"{"id":"r","source":"cairn","model":{"name":"org/Model"},"servedName":"m","engine":{"kind":"command","start":"./s"},"requirements":{"machines":1},"aliases":["big"]}"#],
+        )
+        .await
+        .unwrap();
+        let inventory = load_inventory(&db).await.unwrap();
+        assert_eq!(
+            inventory.recipes[&RecipeId::from("r")].model.name,
+            "org/Model"
+        );
+        assert!(
+            !serde_json::to_string(&inventory.recipes[&RecipeId::from("r")])
+                .unwrap()
+                .contains("aliases")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_warms_one_deployment_of_a_model_named_by_its_real_name() {
+        let db = seeded("inference-warm").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let sparks = PoolId::from("sparks");
+        let said = set_pool_warm(&db, &sparks, None).await.unwrap();
+        assert_eq!(said, "pool sparks warms nothing");
+        assert!(load_inventory(&db).await.unwrap().pools[&sparks]
+            .default
+            .is_empty());
+        set_pool_warm(
+            &db,
+            &sparks,
+            Some("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            load_inventory(&db).await.unwrap().pools[&sparks].default,
+            [DeploymentId::from("dsv4f-tp2")].into()
+        );
+        // The embedder is not deployed in the Sparks, and an id names no model.
+        assert!(
+            set_pool_warm(&db, &sparks, Some("Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)"))
+                .await
+                .unwrap_err()
+                .starts_with("no deployment of")
+        );
+        assert!(set_pool_warm(&db, &sparks, Some("dsv4f-tp2"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_mirrored_pool_is_not_warmed_until_adopted() {
+        let db = seeded("inference-warm-mirrored").await;
+        assert!(set_pool_warm(&db, &PoolId::from("sparks"), None)
+            .await
+            .unwrap_err()
+            .contains("adopt it first"));
     }
 
     #[tokio::test]

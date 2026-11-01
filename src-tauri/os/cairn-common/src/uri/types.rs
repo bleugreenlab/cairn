@@ -1034,8 +1034,15 @@ pub enum CairnResource {
     ModelsSession {
         id: String,
     },
-    /// The cairn-inference facet's index: the record counts, one line per
-    /// `cairn://inference/*` collection, and where the records are written.
+    /// The served API's client keys: who may call Cairn's OpenAI-compatible
+    /// API from outside, and whether each may use remote providers.
+    ModelsClients,
+    /// One served-API client, by its immutable id.
+    ModelsClient {
+        id: String,
+    },
+    /// The cairn-inference facet's index: the bginf link's status and one line
+    /// per `cairn://inference/*` collection.
     Inference,
     /// How each model is run.
     InferenceRecipes,
@@ -1187,6 +1194,8 @@ impl CairnResource {
             Self::ModelsEmbeddings => ResourceKind::ModelsEmbeddings,
             Self::ModelsSessions => ResourceKind::ModelsSessions,
             Self::ModelsSession { .. } => ResourceKind::ModelsSession,
+            Self::ModelsClients => ResourceKind::ModelsClients,
+            Self::ModelsClient { .. } => ResourceKind::ModelsClient,
             Self::Inference => ResourceKind::Inference,
             Self::InferenceRecipes => ResourceKind::InferenceRecipes,
             Self::InferenceDeployments => ResourceKind::InferenceDeployments,

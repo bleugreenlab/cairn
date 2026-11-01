@@ -54,6 +54,12 @@ pub fn current_target() -> Option<&'static str> {
     }
 }
 
+/// The target voice tests name their engines by. It is only a name in an asset
+/// filename, so tests fix it rather than ask the host, which may be a target
+/// voice does not ship on. Not Windows, whose `.exe` suffix is beside the point.
+#[cfg(test)]
+pub(super) const TEST_TARGET: &str = "x86_64-unknown-linux-gnu";
+
 pub fn engine_asset_name(version: &str, target: &str) -> String {
     let suffix = if target == "x86_64-pc-windows-msvc" {
         ".exe"

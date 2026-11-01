@@ -892,12 +892,6 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     stop_session_internal(orch, run_id, StopReason::OperatorStop)
 }
 
-/// Marker recorded as the response of an `ask_user` prompt cancelled by a
-/// job-level stop, so the pending prompt no longer counts toward the issue's
-/// NeedsInput attention. The agent never reads it — the turn is terminalized and
-/// the user starts a fresh turn with a follow-up (CAIRN-1907, Option A).
-const STOP_CANCELLED_PROMPT_RESPONSE: &str = "[cancelled by stop]";
-
 /// Job-level stop for a suspended/waiting job that has no live run attached.
 ///
 /// Run-scoped [`stop_session`] needs a `run_id` to interrupt and park warm, but a
@@ -909,7 +903,7 @@ const STOP_CANCELLED_PROMPT_RESPONSE: &str = "[cancelled by stop]";
 /// 1. A live run IS attached -> defer entirely to the run-scoped path, leaving the
 ///    existing warm-park behavior unchanged.
 /// 2. Otherwise fully idle the job (Option A): cascade-stop every descendant child
-///    run, cancel any open prompt, and terminalize the live
+///    run, withdraw any open question, and terminalize the live
 ///    (`pending`/`running`/`yielded`) turns — which drops a pending delegated
 ///    successor and ends the yielded work turn — then recompute so the projection
 ///    reflects a steerable, no-longer-waiting state. The user can immediately send
@@ -1013,11 +1007,14 @@ fn cancel_provider_holds(orch: &Orchestrator, job_id: &str) -> Result<(), String
     })
 }
 
-/// Cancel any open `ask_user` prompt on the job and terminalize its live
-/// (`pending`/`running`/`yielded`) turns in one write. Cancelling the open prompt
-/// clears the issue's NeedsInput attention; terminalizing the live turns drops a
-/// pending delegated successor and ends the yielded work turn so the job's latest
-/// turn is no longer live and it recomputes to a steerable state.
+/// Withdraw any open `ask_user` question on the job and terminalize its live
+/// (`pending`/`running`/`yielded`) turns in one write. A withdrawn question is
+/// pending nowhere, which clears the issue's NeedsInput attention, and a late
+/// answer is refused with the stop as its cause rather than recorded (no
+/// answer was ever given, so none is written). Terminalizing the live turns
+/// drops a pending delegated successor and ends the yielded work turn, so
+/// nothing is left waiting on the question: the job recomputes to a steerable
+/// state and the user starts a fresh turn with a follow-up (CAIRN-1907).
 fn cancel_open_input_and_live_turns_for_job(
     orch: &Orchestrator,
     job_id: &str,
@@ -1033,13 +1030,11 @@ fn cancel_open_input_and_live_turns_for_job(
             let job_id = job_id.clone();
             Box::pin(async move {
                 let now = chrono::Utc::now().timestamp();
-                conn.execute(
-                    "UPDATE prompts
-                     SET response = ?1, answered_at = ?2
-                     WHERE response IS NULL
-                       AND withdrawn_at IS NULL
-                       AND turn_id IN (SELECT id FROM turns WHERE job_id = ?3)",
-                    (STOP_CANCELLED_PROMPT_RESPONSE, now, job_id.as_str()),
+                crate::mcp::handlers::planning::withdraw_job_prompts_conn(
+                    conn,
+                    &job_id,
+                    crate::mcp::handlers::permission::WithdrawalCause::OperatorStop,
+                    now,
                 )
                 .await?;
                 conn.execute(

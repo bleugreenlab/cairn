@@ -72,6 +72,36 @@ pub(crate) fn complete(
         .map_err(LaunchError::Completion)
 }
 
+/// Why a relayed request got no route.
+#[derive(Debug)]
+pub(crate) enum RelayLaunchError {
+    /// The model does not serve the door's verb; nothing was asked of the
+    /// backend.
+    Unserved(NoOffer),
+    Refused(super::relay::RelayRefusal),
+}
+
+/// The route for an outside client's `request` on `backend`, which serves
+/// `provider`, once its model is admitted for the door's verb.
+pub(crate) fn relay_route(
+    orch: &Orchestrator,
+    provider: &str,
+    backend: &dyn AgentBackend,
+    request: super::relay::RelayRequest<'_>,
+) -> Result<cairn_models::interface::relay::RelayRoute, RelayLaunchError> {
+    let admitted = admit(
+        orch,
+        provider,
+        Some(request.model),
+        request.door.verb(),
+        None,
+    )
+    .map_err(RelayLaunchError::Unserved)?;
+    backend
+        .relay_route(orch, request, admitted)
+        .map_err(RelayLaunchError::Refused)
+}
+
 /// Admit a launch of `model` on `provider` for `verb`.
 ///
 /// A launch that names no model runs the backend's own default, which is

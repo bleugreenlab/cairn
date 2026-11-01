@@ -3,6 +3,7 @@ use crate::execution::delegation::{
     SpawnTaskPacketsInput, TaskSpawnOutcome,
 };
 use crate::execution::jobs::{CallBranchPolicy, CreateChildTaskInput};
+use crate::mcp::handlers::planning::QuestionsOutcome;
 #[cfg(test)]
 use crate::mcp::handlers::tool_use_correlation::claim_from_events;
 use crate::mcp::handlers::tool_use_correlation::{claim_tool_use_id, Claim};
@@ -10,6 +11,7 @@ use crate::mcp::types::{
     AskUserPayload, CallBranchMode, CallPayload, ChangeItem, ChangeMode, McpCallbackRequest,
     TaskPayload, TaskSessionMode,
 };
+use crate::models::question::QuestionAnswer;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use cairn_common::protocol::CallbackResponse;
@@ -93,6 +95,10 @@ pub(crate) struct BlockingResult {
     pub(crate) text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) artifact_uri: Option<String>,
+    /// A question's answers keyed by question index, beside the rendered
+    /// `text`, so a caller reads each answer without parsing the rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) answers: Option<Vec<QuestionAnswer>>,
 }
 
 impl From<String> for BlockingResult {
@@ -100,6 +106,7 @@ impl From<String> for BlockingResult {
         Self {
             text,
             artifact_uri: None,
+            answers: None,
         }
     }
 }
@@ -109,6 +116,17 @@ impl From<CallbackResponse> for BlockingResult {
         Self {
             text: response.result,
             artifact_uri: response.artifact_uri,
+            answers: None,
+        }
+    }
+}
+
+impl From<QuestionsOutcome> for BlockingResult {
+    fn from(outcome: QuestionsOutcome) -> Self {
+        Self {
+            text: outcome.text,
+            artifact_uri: None,
+            answers: outcome.answers,
         }
     }
 }
@@ -235,14 +253,16 @@ pub(crate) async fn run_blocking_group(
                 .tool_use_id
                 .as_deref()
                 .or(resolved_tool_use_id.as_deref());
-            crate::mcp::handlers::planning::ask_questions(
-                orch,
-                request,
-                ask,
-                background,
-                tool_use_id,
+            BlockingResult::from(
+                crate::mcp::handlers::planning::ask_questions(
+                    orch,
+                    request,
+                    ask,
+                    background,
+                    tool_use_id,
+                )
+                .await,
             )
-            .await
             .into()
         }
     }

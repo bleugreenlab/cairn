@@ -245,6 +245,9 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
             }
             continue;
         }
+        // The provider builds its client on the shared TLS config; wait for
+        // the boot-time root load here rather than inside the constructor.
+        cairn_tls::ready().await;
         let provider = discord::DiscordProvider::new(
             token.unwrap().expose().to_string(),
             config
@@ -1255,6 +1258,9 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             .chat_id
             .parse::<i64>()
             .expect("validated Telegram chat ID");
+        // The provider builds its client on the shared TLS config; wait for
+        // the boot-time root load here rather than inside the constructor.
+        cairn_tls::ready().await;
         let provider = telegram::TelegramProvider::new(
             token.unwrap().expose().to_string(),
             chat_id,

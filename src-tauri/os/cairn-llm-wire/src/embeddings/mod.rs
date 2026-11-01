@@ -67,7 +67,7 @@ fn post(
     timeout: Duration,
     hint: fn(u16) -> Option<&'static str>,
 ) -> Result<String, CompletionError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(timeout)
         .build()
         .map_err(|error| CompletionError::Upstream(error.to_string()))?;

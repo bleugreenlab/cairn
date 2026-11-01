@@ -6123,7 +6123,7 @@ mod tests {
         crate::jj::tests::git(project.path(), &["checkout", "-q", "main"]);
 
         let db = Arc::new(migrated_db().await);
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
               VALUES ('proj-1', 'default', 'Project', 'proj', '{repo}', 'main', 1, 1);
@@ -9424,7 +9424,7 @@ mod real_store_collision_tests {
 
         let db = Arc::new(crate::storage::migrated_test_db(name).await);
         let repo = fx.repo.to_string_lossy().replace('\'', "''");
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
                VALUES ('proj-1', 'default', 'Project', 'proj', '{repo}', 'main', 1, 1);
              INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
@@ -9961,6 +9961,97 @@ mod real_store_collision_tests {
             "{refused_with_reason}"
         );
         assert_eq!(branch_tip(&r), moved, "a refused request moves nothing");
+    }
+
+    /// cairn/5051, bug-sink #372: both sides insert a module declaration above
+    /// the same line, and D1 also appends a function further down. The agent
+    /// commits every incoming hunk the old checklist listed — the function,
+    /// not D1's declaration — which touches the file, so the session counts it
+    /// resolved. The guard must still refuse, quoting the missing declaration,
+    /// and once the agent commits the merged view's candidate the replay lands
+    /// both declarations.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_same_spot_insertion_the_tip_lacks_is_refused_by_name_then_lands_with_both() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        const MODS: &str = "mod.rs";
+        let base = "mod policy;\nmod rules;\n\npub fn run() {}\n";
+        let r = replay_harness(&bin, "replay-same-spot-insert.db", &[(MODS, base)]).await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(
+                MODS,
+                "pub mod evidence;\nmod policy;\nmod rules;\n\npub fn run() {}\n",
+            )],
+            "branch declares evidence",
+        );
+        let incoming =
+            "pub(crate) mod filing;\nmod policy;\nmod rules;\n\npub fn run() {}\n\npub fn answer_and_wake() {}\n";
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(MODS, incoming)],
+            "D1 declares filing and adds answer_and_wake",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("the shared insertion point conflicts");
+        assert_eq!(
+            session
+                .conflicting()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![MODS]
+        );
+
+        let partial = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(
+                MODS,
+                "pub mod evidence;\nmod policy;\nmod rules;\n\npub fn run() {}\n\npub fn answer_and_wake() {}\n",
+            )],
+            "take the listed hunks",
+        );
+        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .expect_err("a tip missing D1's declaration would drop it");
+        assert!(
+            refusal.contains("+pub(crate) mod filing;"),
+            "the refusal quotes the dropped line: {refusal}"
+        );
+        assert_eq!(branch_tip(&r), partial, "a refused request moves nothing");
+
+        let both =
+            "pub mod evidence;\npub(crate) mod filing;\nmod policy;\nmod rules;\n\npub fn run() {}\n\npub fn answer_and_wake() {}\n";
+        assert_eq!(
+            crate::jj::completion_candidate(base, &text_at(&r.fx, BRANCH, MODS), incoming),
+            both,
+            "the merged view's candidate is the union"
+        );
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(MODS, both)],
+            "commit the candidate",
+        );
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d1),
+            "the replay landed: {:?}",
+            open_session(&r).await.map(|session| session.fingerprint())
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, MODS), both);
+        assert!(open_session(&r).await.is_none());
     }
 
     /// Scenario 2, the specimen's own file: the branch resolved D1's migration

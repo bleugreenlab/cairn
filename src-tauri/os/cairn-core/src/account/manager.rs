@@ -132,29 +132,28 @@ impl AccountManager {
         if let Ok(Some(jwt)) = get_jwt_from_db(&self.db).await {
             if let Ok(Some(connection)) = get_account_connection(&self.db).await {
                 let url = self.api_config.device_url(&connection.device_id);
-                let client = reqwest::Client::builder()
+                match cairn_tls::client()
+                    .delete(&url)
                     .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .ok();
-
-                if let Some(client) = client {
-                    match client.delete(&url).bearer_auth(&jwt).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            log::info!("Device deactivated on server: {}", connection.device_id);
-                        }
-                        Ok(resp) => {
-                            log::warn!(
-                                "Device deactivation returned {}: {}",
-                                resp.status(),
-                                resp.text().await.unwrap_or_default()
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "Device deactivation request failed (proceeding with local disconnect): {}",
-                                e
-                            );
-                        }
+                    .bearer_auth(&jwt)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        log::info!("Device deactivated on server: {}", connection.device_id);
+                    }
+                    Ok(resp) => {
+                        log::warn!(
+                            "Device deactivation returned {}: {}",
+                            resp.status(),
+                            resp.text().await.unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Device deactivation request failed (proceeding with local disconnect): {}",
+                            e
+                        );
                     }
                 }
             }
@@ -249,7 +248,9 @@ async fn refresh_loop(
     // local account state rather than the soft log-and-retry that transient
     // network/parse failures get.
     let mut consecutive_401s: u32 = 0;
-    let client = reqwest::Client::new();
+    // Started at boot: wait for the root load without holding a worker.
+    cairn_tls::ready().await;
+    let client = cairn_tls::client().clone();
     const MAX_FAILURES: u32 = 3;
 
     loop {

@@ -8,7 +8,8 @@
 //! (`inference_deployment_state`) and one per finished load
 //! (`inference_deployment_loads`), and a single background task owns every
 //! command after a request: it sends a reserving start once the gang fits,
-//! applies the head's reports, probes deployments Cairn controls, fails a
+//! applies the head's reports, probes deployments Cairn controls, watches a
+//! starting or healthy deployment's GPU memory for its engine dying, fails a
 //! command that outlives its bound, and restates the fleet's holds. A request
 //! itself only moves the stored phase (and sends a stop, which needs no wait),
 //! inside one database transaction, so a request and the task never act on
@@ -28,9 +29,10 @@ use cairn_common::executor_protocol::{
 };
 use cairn_db::turso::params;
 use cairn_inference::control::{
-    self, Drain, GangMachine, LoadOutcome, Observation, Phase, Report, Request, Room, RunningBatch,
-    START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
+    self, Allocation, AllocationWatch, Drain, GangMachine, LoadOutcome, Observation, Phase, Report,
+    Request, Room, RunningBatch, START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
+use cairn_inference::MachineName;
 use cairn_inference::{Deployment, DeploymentId, Inventory};
 
 use super::inference::load_inventory;
@@ -177,7 +179,9 @@ impl Heads for Fleet {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateRow {
     pub phase: Phase,
-    /// The start or stop its head is running, while one is.
+    /// The start or stop its head is running, while one is. A deployment
+    /// that became healthy while its start script was still running keeps the
+    /// start's, so the script's own end can still be matched to it.
     pub command_id: Option<String>,
     pub updated_at: i64,
 }
@@ -384,6 +388,24 @@ async fn record_load(
     .map_err(|error| format!("write inference_deployment_loads: {error}"))
 }
 
+/// Note on the load that made this healthy phase how its start script ended,
+/// when it ended badly after health had answered.
+async fn record_late_exit(
+    db: &LocalDb,
+    id: &DeploymentId,
+    finished_at: i64,
+    reason: &str,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE inference_deployment_loads SET reason = ?3
+          WHERE deployment_id = ?1 AND finished_at = ?2 AND outcome = 'healthy'",
+        params![id.as_str(), finished_at, reason],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("write inference_deployment_loads: {error}"))
+}
+
 /// Record the settled footprint on the load that made this healthy phase.
 async fn record_footprint(
     db: &LocalDb,
@@ -498,8 +520,6 @@ enum Matching {
     Any,
     /// The head's report on this start or stop.
     Command(String),
-    /// A probe, which says nothing while a command runs.
-    Probe,
 }
 
 /// Apply an observation, record the load it finished, and restate the holds.
@@ -529,17 +549,15 @@ async fn apply(
                         return None;
                     }
                 }
-                Matching::Probe => {
-                    if row.phase.command_in_flight() {
-                        return None;
-                    }
-                }
             }
             let next = control::observe(&row.phase, observation.clone(), now_ms)?;
-            let command_id = next
-                .command_in_flight()
-                .then(|| command.clone().or_else(|| row.command_id.clone()))
-                .flatten();
+            let command_id = if next.command_in_flight() {
+                command.clone().or_else(|| row.command_id.clone())
+            } else if control::keeps_start_command(&row.phase, &next) {
+                row.command_id.clone()
+            } else {
+                None
+            };
             Some((next, command_id))
         }),
     )
@@ -734,11 +752,15 @@ pub(crate) async fn on_report(
             Observation::Probed {
                 healthy: matches!(report.phase, DeploymentPhaseReport::Healthy { .. }),
             },
-            Matching::Probe,
+            Matching::Any,
         )
     } else {
+        let phase = report_of(report.phase);
+        if note_late_start_failure(db, &id, &report.command_id, &phase, now_ms).await? {
+            return Ok(());
+        }
         (
-            Observation::Report(report_of(report.phase)),
+            Observation::Report(phase),
             Matching::Command(report.command_id),
         )
     };
@@ -756,10 +778,53 @@ pub(crate) async fn on_report(
     Ok(())
 }
 
-/// The task's own state between ticks: when each deployment was last probed.
+/// A start script that ended badly after its deployment was already healthy:
+/// noted on the load, and the row lets go of the start, while the phase stays
+/// as health has it. Returns whether the report was that.
+async fn note_late_start_failure(
+    db: &LocalDb,
+    id: &DeploymentId,
+    command_id: &str,
+    report: &Report,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let noted: Arc<Mutex<Option<(i64, String)>>> = Arc::default();
+    {
+        let noted = Arc::clone(&noted);
+        let command_id = command_id.to_string();
+        let report = report.clone();
+        transition(
+            db,
+            id,
+            now_ms,
+            Arc::new(move |current| {
+                let row = current?;
+                if row.command_id.as_deref() != Some(command_id.as_str()) {
+                    return None;
+                }
+                let reason = control::late_start_failure(&row.phase, &report)?;
+                *noted.lock().unwrap() = Some((row.phase.since_ms(), reason.to_string()));
+                Some((row.phase.clone(), None))
+            }),
+        )
+        .await?;
+    }
+    let Some((healthy_since, reason)) = noted.lock().unwrap().take() else {
+        return Ok(false);
+    };
+    log::warn!(
+        "inference: deployment {id}'s start script ended badly after it was healthy; it stays healthy while its health check answers: {reason}"
+    );
+    record_late_exit(db, id, healthy_since, &reason).await?;
+    Ok(true)
+}
+
+/// The task's own state between ticks: when each deployment was last probed,
+/// and how far each starting or healthy deployment's GPU memory has climbed.
 #[derive(Debug, Default)]
 pub(crate) struct Probes {
     last: HashMap<DeploymentId, i64>,
+    allocations: HashMap<DeploymentId, AllocationWatch>,
 }
 
 impl Probes {
@@ -796,6 +861,36 @@ fn probe(
     ) {
         log::debug!("inference: could not probe {}: {why}", deployment.id);
     }
+}
+
+/// Each gang machine's GPU memory against the deployment's footprint there:
+/// the newest measured load's, or else what its recipe states.
+fn allocations_of(
+    inventory: &Inventory,
+    deployment: &Deployment,
+    readings: &BTreeMap<String, MachineReading>,
+    history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
+) -> BTreeMap<MachineName, Allocation> {
+    let footprint = last_footprint(history.get(&deployment.id));
+    let stated = inventory
+        .recipes
+        .get(&deployment.recipe)
+        .and_then(control::stated_need);
+    deployment
+        .machines
+        .iter()
+        .map(|machine| {
+            (
+                machine.clone(),
+                Allocation {
+                    held_bytes: readings
+                        .get(machine.as_str())
+                        .and_then(|reading| reading.gpu_allocated_bytes),
+                    footprint_bytes: footprint.get(machine.as_str()).copied().or(stated),
+                },
+            )
+        })
+        .collect()
 }
 
 /// One pass over every deployment Cairn controls.
@@ -846,6 +941,9 @@ pub(crate) async fn tick(
                 continue;
             }
         };
+        if !matches!(row.phase, Phase::Starting { .. } | Phase::Healthy { .. }) {
+            probes.allocations.remove(id);
+        }
         match &row.phase {
             Phase::Reserving { since_ms, .. } => {
                 dispatch(
@@ -854,8 +952,34 @@ pub(crate) async fn tick(
                 )
                 .await?;
             }
-            Phase::Healthy { since_ms, .. } => {
+            Phase::Starting { .. } | Phase::Healthy { .. } => {
+                // Probed while starting too: health answering is what makes
+                // it healthy, whether or not the start script has ended.
                 probe(heads, probes, deployment, &plan, &readings, now_ms);
+                let allocations = allocations_of(&inventory, deployment, &readings, &history);
+                let lost = probes
+                    .allocations
+                    .entry(id.clone())
+                    .or_default()
+                    .observe(&allocations);
+                if let Some(reason) = lost {
+                    probes.allocations.remove(id);
+                    apply(
+                        db,
+                        heads,
+                        &inventory,
+                        id,
+                        Observation::Lost { reason },
+                        Matching::Any,
+                        None,
+                        now_ms,
+                    )
+                    .await?;
+                    continue;
+                }
+                let Phase::Healthy { since_ms, .. } = &row.phase else {
+                    continue;
+                };
                 let unrecorded =
                     history
                         .get(id)
@@ -882,7 +1006,7 @@ pub(crate) async fn tick(
             Phase::Stopped { .. } | Phase::Failed { .. } => {
                 probe(heads, probes, deployment, &plan, &readings, now_ms);
             }
-            Phase::Starting { .. } | Phase::Stopping { .. } => {}
+            Phase::Stopping { .. } => {}
         }
     }
     refresh_holds(db, heads).await
@@ -1219,7 +1343,6 @@ pub(crate) mod tests {
                 interconnect: None,
                 memory: None,
             },
-            aliases: Vec::new(),
             notes: None,
         }
     }
@@ -1496,6 +1619,268 @@ pub(crate) mod tests {
             (loads[0].healthy, loads[0].reason.as_deref()),
             (false, Some("the start command exited 127: not found"))
         );
+    }
+
+    /// Start dsv4f-tp2 on two attached Sparks and return the start's id.
+    async fn started(db: &LocalDb, heads: &FakeHeads, probes: &mut Probes) -> String {
+        request(db, heads, DSV4F, Request::Start, 1_000)
+            .await
+            .unwrap();
+        tick(db, heads, probes, 2_000).await.unwrap();
+        let (_, start_id, _, operation) = heads.last_sent();
+        assert!(matches!(operation, DeploymentOperation::Start { .. }));
+        on_report(
+            db,
+            heads,
+            report(&start_id, DeploymentPhaseReport::Starting),
+            3_000,
+        )
+        .await
+        .unwrap();
+        start_id
+    }
+
+    async fn insert_footprint(db: &LocalDb, gib: u64) {
+        db.execute(
+            "INSERT INTO inference_deployment_loads
+               (deployment_id, recipe_id, requested_at, finished_at, outcome, load_ms, footprint_json)
+             VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
+            params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", gib << 30, gib << 30)],
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The dspark script warms the model up before it exits: the model is
+    /// healthy when its probe answers, the load is timed to that, and the
+    /// script's own late failure is noted without unloading a working model.
+    #[tokio::test]
+    async fn health_answering_before_the_start_script_exits_is_healthy() {
+        let db = sparks_db("inference-control-health-first").await;
+        let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let mut probes = Probes::default();
+        let start_id = started(&db, &heads, &mut probes).await;
+
+        tick(&db, &heads, &mut probes, 40_000).await.unwrap();
+        let (_, probe_id, _, operation) = heads.last_sent();
+        assert!(
+            matches!(operation, DeploymentOperation::Probe { .. }),
+            "a starting deployment is probed"
+        );
+        on_report(
+            &db,
+            &heads,
+            report(
+                &probe_id,
+                DeploymentPhaseReport::Healthy { ran_start: false },
+            ),
+            403_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            phase(&db, DSV4F).await,
+            Phase::Healthy {
+                since_ms: 403_000,
+                load_ms: Some(401_000)
+            }
+        );
+        assert_eq!(heads.held(), [SP1, SP2]);
+        let states = load_states(&db).await.unwrap();
+        assert_eq!(
+            states[&DeploymentId::from(DSV4F)].command_id.as_deref(),
+            Some(start_id.as_str()),
+            "the start script is still running"
+        );
+
+        // The head's own sighting of health, then the script's bad exit.
+        on_report(
+            &db,
+            &heads,
+            report(
+                &start_id,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+            ),
+            404_000,
+        )
+        .await
+        .unwrap();
+        let late = "the start command exited 1 after its health check had answered: warm-up request timed out";
+        on_report(
+            &db,
+            &heads,
+            report(
+                &start_id,
+                DeploymentPhaseReport::Failed {
+                    reason: late.into(),
+                },
+            ),
+            450_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            phase(&db, DSV4F).await,
+            Phase::Healthy {
+                since_ms: 403_000,
+                load_ms: Some(401_000)
+            },
+            "health decides, not the script"
+        );
+        assert_eq!(heads.held(), [SP1, SP2]);
+        let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
+        assert_eq!(loads.len(), 1);
+        assert_eq!(
+            (
+                loads[0].healthy,
+                loads[0].load_ms,
+                loads[0].reason.as_deref()
+            ),
+            (true, Some(401_000), Some(late))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_script_that_never_exits_is_healthy_and_stays_so() {
+        let db = sparks_db("inference-control-foreground").await;
+        let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let mut probes = Probes::default();
+        let start_id = started(&db, &heads, &mut probes).await;
+        on_report(
+            &db,
+            &heads,
+            report(
+                &start_id,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+            ),
+            302_000,
+        )
+        .await
+        .unwrap();
+        let past_every_bound = 2_000 + (control::START_REPORT_BOUND_SECS as i64 + 60) * 1_000;
+        tick(&db, &heads, &mut probes, past_every_bound)
+            .await
+            .unwrap();
+        assert_eq!(
+            phase(&db, DSV4F).await,
+            Phase::Healthy {
+                since_ms: 302_000,
+                load_ms: Some(300_000)
+            }
+        );
+        assert_eq!(heads.held(), [SP1, SP2]);
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_stops_answering_fails_and_frees_its_machines() {
+        let db = sparks_db("inference-control-health-lost").await;
+        let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let mut probes = Probes::default();
+        let start_id = started(&db, &heads, &mut probes).await;
+        on_report(
+            &db,
+            &heads,
+            report(
+                &start_id,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+            ),
+            400_000,
+        )
+        .await
+        .unwrap();
+        tick(&db, &heads, &mut probes, 440_000).await.unwrap();
+        let (_, probe_id, _, operation) = heads.last_sent();
+        assert!(matches!(operation, DeploymentOperation::Probe { .. }));
+        on_report(
+            &db,
+            &heads,
+            report(&probe_id, DeploymentPhaseReport::Stopped),
+            441_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            phase(&db, DSV4F).await,
+            Phase::Failed {
+                at_ms: 441_000,
+                reason: "it stopped answering its health check".into()
+            }
+        );
+        assert!(heads.held().is_empty(), "both Sparks are released");
+    }
+
+    /// bginf's agent killed the engine on 10-31 while Cairn read `starting`
+    /// and held both Sparks: GPU memory that falls from the footprint to
+    /// nothing now fails the start, and a healthy model, on its own.
+    #[tokio::test]
+    async fn gpu_memory_collapsing_under_a_start_or_a_healthy_model_fails_it() {
+        let db = sparks_db("inference-control-collapse").await;
+        let heads = FakeHeads::default();
+        insert_footprint(&db, 100).await;
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let mut probes = Probes::default();
+        started(&db, &heads, &mut probes).await;
+
+        heads.attach(SP1, 28, 82);
+        heads.attach(SP2, 28, 82);
+        tick(&db, &heads, &mut probes, 10_000).await.unwrap();
+        assert_eq!(phase(&db, DSV4F).await.label(), "starting");
+        heads.attach(SP1, 110, 0);
+        tick(&db, &heads, &mut probes, 15_000).await.unwrap();
+        let Phase::Failed { at_ms, reason } = phase(&db, DSV4F).await else {
+            panic!("the start failed");
+        };
+        assert_eq!(at_ms, 15_000);
+        assert_eq!(
+            reason,
+            "its engine is gone: bginf-sp1's GPU memory fell to 0.0 GiB after reaching 82.0 GiB (its footprint is 100.0 GiB)"
+        );
+        assert!(heads.held().is_empty());
+        let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
+        assert_eq!(
+            (loads[0].healthy, loads[0].reason.as_deref()),
+            (false, Some(reason.as_str()))
+        );
+
+        // Healthy, then the worker on sp2 dies.
+        heads.attach(SP2, 110, 0);
+        request(&db, &heads, DSV4F, Request::Start, 20_000)
+            .await
+            .unwrap();
+        tick(&db, &heads, &mut probes, 21_000).await.unwrap();
+        let (_, start_id, _, _) = heads.last_sent();
+        on_report(
+            &db,
+            &heads,
+            report(
+                &start_id,
+                DeploymentPhaseReport::Healthy { ran_start: true },
+            ),
+            100_000,
+        )
+        .await
+        .unwrap();
+        heads.attach(SP1, 10, 100);
+        heads.attach(SP2, 10, 100);
+        tick(&db, &heads, &mut probes, 101_000).await.unwrap();
+        assert_eq!(phase(&db, DSV4F).await.label(), "healthy");
+        heads.attach(SP2, 110, 1);
+        tick(&db, &heads, &mut probes, 106_000).await.unwrap();
+        let Phase::Failed { reason, .. } = phase(&db, DSV4F).await else {
+            panic!("the healthy model failed");
+        };
+        assert!(
+            reason.contains("bginf-sp2's GPU memory fell to 1.0 GiB"),
+            "{reason}"
+        );
+        assert!(heads.held().is_empty());
     }
 
     #[tokio::test]

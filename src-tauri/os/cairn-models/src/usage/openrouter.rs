@@ -20,12 +20,9 @@ const CREDITS_TIMEOUT: Duration = Duration::from_secs(8);
 pub async fn fetch_openrouter_credits(
     api_key: &str,
 ) -> (Option<ProviderCreditsSnapshot>, Option<Value>) {
-    let client = match reqwest::Client::builder().timeout(CREDITS_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(_) => return (None, None),
-    };
-    let response = match client
+    let response = match cairn_tls::client()
         .get(OPENROUTER_CREDITS_URL)
+        .timeout(CREDITS_TIMEOUT)
         .bearer_auth(api_key)
         .header("HTTP-Referer", "https://cairn.computer")
         .header("X-OpenRouter-Title", "Cairn")

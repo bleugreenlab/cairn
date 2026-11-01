@@ -118,6 +118,7 @@ pub async fn resolve_actor(
             turn_id,
             session_id,
             request_id: None,
+            actor: None,
         },
         db: orch.db.local.clone(),
     })
@@ -149,8 +150,98 @@ pub fn page_write_actor(orch: &Orchestrator, origin: &PageWriteOrigin) -> Author
             turn_id: None,
             session_id: None,
             request_id: None,
+            actor: None,
         },
         db: orch.db.local.clone(),
+    }
+}
+
+/// The actor behind a served-API request: the authenticated client's External
+/// principal, with no run and no anchors. Only a standing grant bound to that
+/// principal answers for it.
+pub fn served_api_actor(
+    db: Arc<LocalDb>,
+    client: cairn_common::identity::PrincipalRef,
+) -> AuthorityActor {
+    AuthorityActor {
+        principal: AuthorityPrincipal {
+            actor: Some(client.clone()),
+            ..Default::default()
+        },
+        audience: AuthorityAudience::workspace(WORKSPACE_ID),
+        context: AuthorityContext {
+            audience: Some(AuthorityAudience::workspace(WORKSPACE_ID)),
+            actor: Some(client),
+            ..Default::default()
+        },
+        db,
+    }
+}
+
+/// Whether a served-API client may spend `scope` (a remote provider's account):
+/// allowed by a live standing grant bound to the client, else refused pending
+/// the operator's grant. Policy is not consulted: using an account's credential
+/// is direct for Cairn's own runs, and the served API asks a narrower question,
+/// whether the operator granted this client remote use at all.
+///
+/// Not journaled here; the caller decides which outcomes reach the journal
+/// ([`journal_served_api_decision`]).
+pub async fn served_api_use(
+    actor: &AuthorityActor,
+    scope: &AuthorityScope,
+) -> Result<AuthorityDecision, String> {
+    let request = AuthorityRequest::new(scope.clone(), AuthorityMutation::Update, String::new());
+    let reason = AuthorityReason::ServedApiRemoteUse;
+    let at = now();
+    let candidates =
+        store::candidate_grants(&actor.db, &actor.audience.workspace_id, &scope.shorthand())
+            .await
+            .map_err(|e| format!("could not read authority grants: {e}"))?;
+    Ok(candidates
+        .into_iter()
+        .find(|grant| {
+            matches!(grant.lifetime, AuthorityLifetime::Standing)
+                && grant.principal.actor.is_some()
+                && grant.matches(&request, &actor.context, at)
+        })
+        .map(|grant| AuthorityDecision::AllowedByGrant {
+            grant_id: grant.id,
+            reason,
+        })
+        .unwrap_or(AuthorityDecision::ApprovalRequired(reason)))
+}
+
+/// Journal one served-API remote-use decision, with the client's appearance.
+pub async fn journal_served_api_decision(
+    actor: &AuthorityActor,
+    scope: &AuthorityScope,
+    summary: &str,
+    decision: &AuthorityDecision,
+    appearance: &AppearanceSnapshot,
+) {
+    let Some(reason) = decision.reason() else {
+        return;
+    };
+    let event = NewAuthorizationEvent {
+        scope: scope.clone(),
+        mutation: AuthorityMutation::Update.as_str().to_string(),
+        summary: summary.to_string(),
+        outcome: decision.as_str().to_string(),
+        reason: reason.as_str().to_string(),
+        principal: actor.principal.clone(),
+        audience: actor.audience.clone(),
+        run_id: None,
+        request_uri: None,
+        grant_id: match decision {
+            AuthorityDecision::AllowedByGrant { grant_id, .. } => Some(grant_id.clone()),
+            _ => None,
+        },
+        decision_actor: actor.principal.actor.clone(),
+        appearance_snapshot: Some(appearance.clone()),
+        decided_at: now(),
+    };
+    if let Err(error) = store::append_event(&actor.db, event).await {
+        log::warn!("failed to journal a served-API decision ({summary}): {error}");
     }
 }
 
@@ -589,6 +680,7 @@ mod tests {
                 turn_id: Some("turn-1".to_string()),
                 session_id: Some("sess-1".to_string()),
                 request_id: None,
+                actor: None,
             },
             db: std::sync::Arc::new(db),
         }

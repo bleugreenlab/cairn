@@ -123,6 +123,11 @@ pub enum Why {
     },
     /// `deployment` left the inventory or the pool.
     Removed { deployment: DeploymentId },
+    /// `by` unloaded `deployment`.
+    Dismissed {
+        deployment: DeploymentId,
+        by: String,
+    },
 }
 
 /// The controller's chosen set.
@@ -270,6 +275,30 @@ impl PoolControl {
             now,
         );
         Ok(pin)
+    }
+
+    /// Take `deployment` out of everything the pool wants, its pin included
+    /// whoever holds it, so nothing loads it again until it is asked for.
+    /// Whether anything wanted it.
+    pub fn dismiss(&mut self, deployment: &DeploymentId, by: &str, now: Ms) -> bool {
+        let mut wanted = false;
+        if let Some(pin) = &mut self.pin {
+            wanted |= pin.set.remove(deployment);
+            if pin.set.is_empty() {
+                self.pin = None;
+            }
+        }
+        wanted |= self.active.members.remove(deployment).is_some();
+        if wanted {
+            self.active.change(
+                Why::Dismissed {
+                    deployment: deployment.clone(),
+                    by: by.to_string(),
+                },
+                now,
+            );
+        }
+        wanted
     }
 }
 
@@ -566,25 +595,22 @@ pub fn check_set(
     Ok(())
 }
 
-/// The deployments a caller's model name can mean: a deployment id names
-/// exactly that deployment; otherwise every deployment of a recipe whose id,
-/// served name, model name or alias matches, case-insensitively.
+/// The deployments of the model a caller names: every deployment of a recipe
+/// whose model has that real name, case-insensitively. A deployment id, recipe
+/// id or served name is an internal key and names no model (tenet 1336).
 pub fn deployments_serving(inventory: &Inventory, name: &str) -> Vec<DeploymentId> {
     let name = name.trim();
-    if let Some(deployment) = inventory.deployments.get(&DeploymentId::from(name)) {
-        return vec![deployment.id.clone()];
+    if name.is_empty() {
+        return Vec::new();
     }
-    let matches = |candidate: &str| candidate.eq_ignore_ascii_case(name);
     inventory
         .deployments
         .values()
         .filter(|d| {
-            inventory.recipes.get(&d.recipe).is_some_and(|r| {
-                matches(r.id.as_str())
-                    || matches(&r.served_name)
-                    || matches(&r.model.name)
-                    || r.aliases.iter().any(|a| matches(a))
-            })
+            inventory
+                .recipes
+                .get(&d.recipe)
+                .is_some_and(|r| r.model.name.trim().eq_ignore_ascii_case(name))
         })
         .map(|d| d.id.clone())
         .collect()
@@ -1257,6 +1283,9 @@ impl ControlReason {
                     }
                     Why::Removed { deployment } => {
                         format!("{deployment} left the pool {when}")
+                    }
+                    Why::Dismissed { deployment, by } => {
+                        format!("{by} unloaded {deployment} {when}")
                     }
                 }
             }

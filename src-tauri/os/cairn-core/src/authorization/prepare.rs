@@ -93,6 +93,20 @@ pub async fn prepare_batch(
                 },
             ));
         }
+        // Minting, importing or granting remote use to a served-API client
+        // widens who may spend this workspace's models: the `servedApi`
+        // boundary, whichever carrier reaches it.
+        if let Some(request) =
+            crate::resources::mutations::models_clients::models_client_authority(item)
+        {
+            prepared.push((
+                index,
+                match request {
+                    Ok(request) => Prepared::Authority(request),
+                    Err(error) => Prepared::Invalid(error),
+                },
+            ));
+        }
         for request in crate::resources::mutations::workspace_settings_authority(item) {
             prepared.push((
                 index,

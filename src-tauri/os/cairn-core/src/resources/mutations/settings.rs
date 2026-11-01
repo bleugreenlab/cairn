@@ -60,6 +60,7 @@ pub(crate) const SECTION_KEYS: &[&str] = &[
     "keybinds",
     "buildServices",
     "inference",
+    "servedApi",
 ];
 
 /// True when `item` is a `cairn://settings` patch.
@@ -262,6 +263,18 @@ fn parse_inference(section: &Value) -> Result<cairn_config::inference::Inference
     };
     inference.validate()?;
     Ok(inference)
+}
+
+fn parse_served_api(
+    section: &Value,
+) -> Result<cairn_config::served_api::ServedApiSettings, String> {
+    let served: cairn_config::served_api::ServedApiSettings = match section {
+        Value::Null => Default::default(),
+        other => serde_json::from_value(other.clone())
+            .map_err(|error| format!("invalid servedApi settings: {error}"))?,
+    };
+    served.validate()?;
+    Ok(served)
 }
 
 pub(super) async fn apply_settings_patch(
@@ -475,6 +488,22 @@ pub(super) async fn apply_settings_patch(
         });
     }
 
+    // --- Served API listener and aliases (replaces the section) ---
+    if let Some(section) = obj.get("servedApi") {
+        let served = parse_served_api(section)?;
+        if !dry_run {
+            settings::set_served_api(&orch.config_dir, &served)?;
+        }
+        let listener = match &served.bind {
+            Some(bind) => format!("served API on {bind} (applies at the next orch start)"),
+            None => "served API off".to_string(),
+        };
+        summary.push(format!(
+            "{listener}; load wait {}s",
+            served.load_wait().as_secs()
+        ));
+    }
+
     if summary.is_empty() {
         return Err("payload contained no recognized settings sections".to_string());
     }
@@ -597,6 +626,27 @@ mod tests {
         assert!(retired.contains("retired with bginf"), "{retired}");
         assert!(parse_inference(&serde_json::json!({"bginf": null})).is_err());
         assert!(parse_provider("bginf").is_err());
+    }
+
+    #[test]
+    fn the_served_api_section_parses_validates_and_asks() {
+        let parsed = parse_served_api(&serde_json::json!({
+            "bind": "0.0.0.0:80",
+            "loadWaitSecs": 600
+        }))
+        .unwrap();
+        assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0:80"));
+        assert_eq!(parse_served_api(&Value::Null).unwrap(), Default::default());
+        assert!(parse_served_api(&serde_json::json!({"bind": "lan"})).is_err());
+        let request = crate::authorization::normalize::workspace_settings_write(
+            crate::authorization::WORKSPACE_ID,
+            "servedApi",
+        )
+        .unwrap();
+        assert!(!matches!(
+            crate::authorization::policy::classify(&request.scope, false),
+            cairn_common::authorization::AuthorityPolicy::Direct
+        ));
     }
 
     #[test]

@@ -15,8 +15,11 @@ serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["time", "rt", "macros", "sync"] }
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
+# Both bot libraries build their own reqwest client unless handed one; they are
+# handed clients on the process's one TLS trust configuration instead.
+cairn-tls = { path = "../cairn-tls" }
+reqwest = { version = "0.12", default-features = false }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false }
 serde_json = "1.0"
 tokio = { version = "1", features = ["test-util", "net", "io-util"] }

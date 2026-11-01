@@ -16,6 +16,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     OnceLock,
 };
+use std::time::Duration;
 
 use cairn_db::turso::params;
 use serde::Deserialize;
@@ -28,6 +29,10 @@ static RELAY_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static RELAY_REPAIR_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static RELAY_REPAIR_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CHANNEL_CHANGED: OnceLock<Notify> = OnceLock::new();
+
+/// Registration and key repair run under the relay operation lock, which
+/// minting and every sync wait on, so neither request may hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Serializes relay polling, channel registration, and key rotation for the
 /// lifetime of this process.
@@ -372,8 +377,10 @@ async fn register(relay_url: &str) -> Result<Registration, String> {
     let (public_key, private_key) = crypto::generate_keypair();
     let private_key_encrypted =
         crypto::encrypt_private_key(&private_key, &crypto::get_machine_id())?;
-    let response = reqwest::Client::new()
+    let response = super::relay_client()
+        .await?
         .post(format!("{}/channels", relay_url.trim_end_matches('/')))
+        .timeout(REQUEST_TIMEOUT)
         .json(&serde_json::json!({ "publicKey": public_key }))
         .send()
         .await
@@ -470,11 +477,13 @@ async fn repair_locked(db: &LocalDb, relay_url: &str) -> Result<(), String> {
             }
         },
     };
-    let response = reqwest::Client::new()
+    let response = super::relay_client()
+        .await?
         .put(format!(
             "{}/channels/{channel_id}/public-key",
             relay_url.trim_end_matches('/')
         ))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(secret)
         .json(&serde_json::json!({ "publicKey": public_key }))
         .send()

@@ -131,6 +131,34 @@ pub enum ProtocolEvent {
 
 type EventSink = Arc<dyn Fn(ProtocolEvent) + Send + Sync>;
 
+/// How many times, and how far apart, an engine spawn waits out a busy
+/// executable. See [`spawn_engine`].
+const BUSY_EXECUTABLE_RETRIES: u32 = 50;
+const BUSY_EXECUTABLE_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Spawn an engine, waiting out a moment in which its file is busy.
+///
+/// Linux refuses to execute a file that any process holds open for writing
+/// (ETXTBSY). An engine is executed moments after it is written (a handoff is
+/// copied and then probed), and any thread of this process that forks during
+/// that write gives its child the descriptor until the child execs. The window
+/// is a fork's length and closes on its own, so a short retry is the remedy.
+pub(super) async fn spawn_engine(command: &mut Command) -> std::io::Result<Child> {
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempts < BUSY_EXECUTABLE_RETRIES =>
+            {
+                attempts += 1;
+                tokio::time::sleep(BUSY_EXECUTABLE_BACKOFF).await;
+            }
+            spawned => return spawned,
+        }
+    }
+}
+
 /// One verified child whose stdout is drained for its entire lifetime. Commands
 /// subscribe before writing, so responses cannot race their waiter.
 pub struct VoiceProcess {
@@ -164,8 +192,8 @@ impl VoiceProcess {
         // process-wide; the engine has piped stdio and no terminal to leave.
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command
-            .spawn()
+        let mut child = spawn_engine(&mut command)
+            .await
             .map_err(|e| VoiceError::Transport(format!("engine spawn failed: {e}")))?;
         let stdin = child
             .stdin
@@ -499,6 +527,37 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
+    }
+
+    /// A spawn that meets an engine still open for writing, as a fork elsewhere
+    /// in the process leaves it, waits for the writer to let go.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_engine_still_open_for_writing_spawns_once_released() {
+        let engine = fake_engine("exit 0");
+        let executable = engine.path().join("fake-voice-engine");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .unwrap();
+        let mut command = Command::new(&executable);
+        let refused = command
+            .spawn()
+            .expect_err("Linux refuses to execute a file open for writing");
+        assert_eq!(refused.kind(), std::io::ErrorKind::ExecutableFileBusy);
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(writer);
+        });
+        let status = spawn_engine(&mut command)
+            .await
+            .expect("the spawn waits out the writer")
+            .wait()
+            .await
+            .unwrap();
+        assert!(status.success());
+        release.await.unwrap();
     }
 
     #[test]

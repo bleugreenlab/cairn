@@ -114,6 +114,21 @@ pub struct TelegramProvider {
     last_error: Mutex<Option<String>>,
 }
 
+/// teloxide's own client settings, on the process's shared TLS config.
+/// `Bot::new` would build a fresh reqwest client, and with it reload the
+/// platform root store, inside whichever task constructs the provider.
+fn telegram_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            teloxide::net::default_reqwest_settings()
+                .use_preconfigured_tls(cairn_tls::http_config())
+                .build()
+                .expect("reqwest builds the Telegram client on the shared TLS config")
+        })
+        .clone()
+}
+
 impl TelegramProvider {
     pub fn new(
         token: impl Into<String>,
@@ -122,7 +137,7 @@ impl TelegramProvider {
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(128);
         Arc::new(Self {
-            bot: Bot::new(token),
+            bot: Bot::with_client(token, telegram_client()),
             chat_id: ChatId(chat_id),
             allowed_users: allowed_user_ids.into_iter().map(UserId).collect(),
             tx,

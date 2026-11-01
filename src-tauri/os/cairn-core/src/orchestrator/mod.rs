@@ -34,6 +34,8 @@ pub(crate) mod generation_cache;
 pub mod identity;
 pub mod inference;
 pub mod inference_control;
+pub mod inference_metrics;
+pub mod inference_overview;
 pub mod inference_route;
 pub(crate) mod landing;
 pub mod lifecycle;
@@ -45,8 +47,11 @@ pub mod pool_control;
 pub mod provider_pool;
 pub mod recipes;
 pub mod replay_base;
+pub mod served_api;
 pub mod session;
 mod settings;
+mod sign_in_notices;
+pub(crate) use sign_in_notices::time_left as sign_in_time_left;
 pub mod skills;
 pub mod startup_readiness;
 pub use startup_readiness::StartupReadiness;
@@ -108,7 +113,7 @@ pub struct OrchestratorBuilder {
     repl_state: Arc<crate::mcp::handlers::repl::ReplState>,
     permission_responses: broadcast::Sender<(String, String)>,
     run_completions: broadcast::Sender<String>,
-    prompt_responses: broadcast::Sender<(String, String)>,
+    prompt_responses: broadcast::Sender<(String, crate::mcp::handlers::planning::AnsweredPrompt)>,
     browser_bridge_responses: broadcast::Sender<(String, String)>,
     browser_nav_events: broadcast::Sender<crate::browsers::BrowserNavEvent>,
     trigger_events: broadcast::Sender<TriggerEvent>,
@@ -485,7 +490,10 @@ impl OrchestratorBuilder {
 
     pub fn prompt_responses(
         mut self,
-        prompt_responses: broadcast::Sender<(String, String)>,
+        prompt_responses: broadcast::Sender<(
+            String,
+            crate::mcp::handlers::planning::AnsweredPrompt,
+        )>,
     ) -> Self {
         self.prompt_responses = prompt_responses;
         self
@@ -618,6 +626,11 @@ impl OrchestratorBuilder {
         // (CAIRN-2196). Idempotent and `Once`-guarded; see
         // `storage::install_crypto_provider`.
         crate::storage::install_crypto_provider();
+
+        // Load the platform root store now, on its own thread, so no task ever
+        // has to: building a TLS client otherwise asks the OS trust store from
+        // whichever runtime worker polls the build (see `cairn_tls`).
+        cairn_tls::preload();
 
         // Register the archived-file renderer so archival reconstruction (in
         // `storage`, below the mcp read layer) can reproduce archived reads
@@ -1128,9 +1141,11 @@ pub struct Orchestrator {
     /// Run completion broadcast: run_id
     /// Emitted when a run finishes (used by sub-agent handlers to unblock).
     pub(crate) run_completions: broadcast::Sender<String>,
-    /// Prompt response broadcast: (prompt_id, response_text)
-    /// Hosts send on this channel when a user responds to an ask_user prompt.
-    pub prompt_responses: broadcast::Sender<(String, String)>,
+    /// Prompt response broadcast: (prompt_id, the recorded answers and their
+    /// rendering). Sent when a user answers an ask_user prompt; an inline
+    /// waiter returns both to the asking call.
+    pub prompt_responses:
+        broadcast::Sender<(String, crate::mcp::handlers::planning::AnsweredPrompt)>,
 
     /// Inline-browser bridge response broadcast: (request_id, payload_json).
     /// The app-side `browser_bridge_message` command sends on this channel when
@@ -2135,12 +2150,11 @@ impl Orchestrator {
                     "Cloud object grants require a connected runner account".into(),
                 )
             })?;
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|error| CloudObjectGrantMintError::Unavailable(error.to_string()))?;
+        let client = crate::account::team_sync::team_api_client()
+            .await
+            .map_err(CloudObjectGrantMintError::Unavailable)?;
         crate::account::mint_cloud_object_grant(
-            &client,
+            client,
             &device_jwt,
             &team_id,
             &request.content_hash,
@@ -2172,6 +2186,7 @@ impl Orchestrator {
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
         crate::orchestrator::pool_control::spawn_pool_controller(self.clone());
+        crate::orchestrator::inference_metrics::spawn_engine_metrics(self.clone());
         // A machine that reconnects holding replicas of closed scratches is
         // told to delete them, whether or not any work has asked for one yet.
         crate::node_scratch::lifecycle::ensure_subscribed(self);
@@ -2986,12 +3001,9 @@ impl Orchestrator {
             None => return Ok(TeamConnectStatus::NotAuthenticated),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = crate::account::team_sync::team_api_client().await?;
 
-        match fetch_team_sync_config(&client, &device_jwt, team_id, &self.api_config).await? {
+        match fetch_team_sync_config(client, &device_jwt, team_id, &self.api_config).await? {
             SyncConfigStatus::NotConfigured => Ok(TeamConnectStatus::NotConfigured),
             SyncConfigStatus::Provisioning => Ok(TeamConnectStatus::Provisioning),
             SyncConfigStatus::Active(cfg) => {
@@ -3075,12 +3087,9 @@ impl Orchestrator {
             }
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?;
+        let client = crate::account::team_sync::team_api_client().await?;
 
-        Ok(probe_team_sync_status(&client, &device_jwt, &team_ids, &self.api_config).await)
+        Ok(probe_team_sync_status(client, &device_jwt, &team_ids, &self.api_config).await)
     }
 
     /// Auto-connect every team the account belongs to: a fail-soft fan-out over
@@ -3335,6 +3344,10 @@ impl Orchestrator {
     pub fn spawn_process_sweep(&self) {
         const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
         let orch = self.clone();
+        let sign_in_notices = Arc::new(sign_in_notices::SignInExpiryNotices::new(
+            self.credential_store.clone(),
+        ));
+        self.register_hold_source(sign_in_notices.clone());
         tokio::spawn(async move {
             {
                 let orch = orch.clone();
@@ -3356,7 +3369,17 @@ impl Orchestrator {
                     // Not awaited: a renewal can wait on a provider round trip,
                     // and the reaping below must not wait with it.
                     let orch = orch.clone();
-                    tokio::task::spawn_blocking(move || orch.sweep_claude_credentials());
+                    let sign_in_notices = sign_in_notices.clone();
+                    tokio::task::spawn_blocking(move || {
+                        orch.sweep_claude_credentials();
+                        orch.keep_codex_logins_alive();
+                        // A deadline crossing a warning stage changes the
+                        // center with no write to announce it.
+                        if sign_in_notices.changed(chrono::Utc::now().timestamp()) {
+                            orch.operator_notifications_cache
+                                .invalidate_matching("sign-in-expiry", |_| true);
+                        }
+                    });
                 }
                 for db in orch.db.all_dbs().await {
                     match crate::runs::watchdog_reconciler::reconcile_watchdog_leases(
@@ -3700,7 +3723,14 @@ impl Orchestrator {
         // Only what this workspace installed. A provider it never enabled has
         // no models anyone can choose, so discovering them would be an
         // unprompted network call on a credential the user did not offer.
-        for backend_name in self.enabled_providers() {
+        // Cairn inference is built in: its discovery reads Cairn's own
+        // deployment records, and what it finds is what installs it.
+        let mut backends = self.enabled_providers();
+        let inference = crate::backends::inference::INFERENCE_BACKEND_KEY;
+        if !backends.iter().any(|key| key == inference) {
+            backends.push(inference.to_string());
+        }
+        for backend_name in backends {
             self.refresh_provider_model_catalog_blocking(&backend_name);
         }
         let _ = self.services.emitter.emit(
@@ -3717,7 +3747,8 @@ impl Orchestrator {
         if !cairn_models::types::catalog::is_supported(&backend) {
             return Err(format!("Unsupported backend: {backend}"));
         }
-        if !self.provider_enabled(&backend) {
+        if !self.provider_enabled(&backend) && !cairn_models::types::catalog::is_built_in(&backend)
+        {
             return Err(format!(
                 "{backend} is not enabled in this workspace. Add it from Settings → Providers first."
             ));
@@ -3740,6 +3771,24 @@ impl Orchestrator {
         let orch = self.clone();
         std::thread::spawn(move || {
             orch.refresh_model_catalog();
+        });
+    }
+
+    /// Rediscover only `backends`, on a dedicated thread for the same reason
+    /// as [`Self::spawn_model_catalog_refresh`], and say so when it lands.
+    pub(crate) fn spawn_provider_model_catalog_refresh(&self, backends: Vec<String>) {
+        if !self.catalog_rediscovery {
+            return;
+        }
+        let orch = self.clone();
+        std::thread::spawn(move || {
+            for backend in &backends {
+                orch.refresh_provider_model_catalog_blocking(backend);
+            }
+            let _ = orch.services.emitter.emit(
+                "config-changed",
+                serde_json::json!({"entity_type": "model_catalog"}),
+            );
         });
     }
 }

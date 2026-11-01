@@ -228,6 +228,11 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "newest 5,000 rows per service",
     ),
     owned_by(
+        "model_requests",
+        "cairn-db storage::served_api",
+        "rows older than MODEL_REQUEST_RETENTION_MS (90 days), on each insert",
+    ),
+    owned_by(
         "response_invocations",
         "cairn-db storage::response_invocations",
         "newest RESPONSE_INVOCATION_RETENTION per response",
@@ -444,6 +449,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("account_credential_events", IDENTITY),
     keep("authority_grants", IDENTITY),
     keep("authorization_events", IDENTITY),
+    keep("served_api_clients", IDENTITY),
     keep("subscription_periods", IDENTITY),
     keep("github_app", IDENTITY),
     keep("github_installations", IDENTITY),

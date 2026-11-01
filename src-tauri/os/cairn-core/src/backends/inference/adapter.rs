@@ -35,6 +35,19 @@ pub(super) fn endpoint(route: &Route) -> Endpoint {
     }
 }
 
+/// The relay route to `route`'s deployment: its API base, no credential, and
+/// the engine's own name for the model, whatever name the client asked by.
+pub(super) fn relay_route(route: &Route) -> cairn_models::interface::relay::RelayRoute {
+    cairn_models::interface::relay::RelayRoute {
+        base_url: route.api_base.clone(),
+        headers: Vec::new(),
+        backend_key: INFERENCE_BACKEND_KEY.to_string(),
+        provider_name: INFERENCE_BACKEND_NAME.to_string(),
+        sent_model: route.served_name.clone(),
+        account_id: None,
+    }
+}
+
 /// The chat family every generation on `route` is built from, an agent turn
 /// and a one-shot completion alike. The output cap is the one a custom
 /// provider defaults to, for the same reason: without one an OpenAI-compatible

@@ -135,7 +135,7 @@ pub fn model_capabilities(
     let mut backends = Vec::new();
     // Enabled, not supported: a response is authored to run next, so it may
     // only offer providers this workspace installed.
-    let enabled = orch.enabled_providers();
+    let enabled = orch.installed_providers();
     // Names come from the workspace's provider inventory rather than from the
     // backend adapter, which is the one place that knows what an operator
     // called a provider they defined themselves.
@@ -795,6 +795,7 @@ pub async fn invoke(
 /// it under `response_id` as any response is: the door behind
 /// `run cairn://models/complete`. `definition` contributes only what it governs
 /// on this path: the output contract and the per-request timeout.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn invoke_prepared(
     orch: &Orchestrator,
     definition: &ResponseDefinition,
@@ -965,7 +966,7 @@ fn completion_executor(orch: &Orchestrator) -> CompletionExecutor {
         // installed, an account can serve it, and (at the launch door) the
         // model serves completions. Catalog membership is an authoring
         // concern and is not checked.
-        if !orch.provider_enabled(&backend_name) {
+        if !orch.provider_installed(&backend_name) {
             return Err(ResponseError::BackendUnavailable(format!(
                 "the {backend_name} provider isn't enabled in this workspace; enable it in Settings → Providers"
             ))

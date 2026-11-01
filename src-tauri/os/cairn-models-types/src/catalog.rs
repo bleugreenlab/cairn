@@ -98,6 +98,9 @@ pub struct ProviderDescriptor {
     pub catalog_driven: bool,
     /// Whether Cairn's MCP server can be installed into this provider's CLI.
     pub supports_mcp_install: bool,
+    /// Whether Cairn provides it itself, so a workspace never adds or removes
+    /// it: it is installed whenever it has something to serve.
+    pub built_in: bool,
     /// Extra search terms for the Add-provider catalog, beyond the display name
     /// and key (which are always searched).
     pub keywords: &'static [&'static str],
@@ -115,6 +118,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Sign in to a Claude account or add an Anthropic API key.",
         catalog_driven: false,
         supports_mcp_install: true,
+        built_in: false,
         keywords: &["claude", "anthropic", "opus", "sonnet", "haiku"],
     },
     ProviderDescriptor {
@@ -127,6 +131,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Sign in to a ChatGPT account or add an OpenAI API key.",
         catalog_driven: false,
         supports_mcp_install: true,
+        built_in: false,
         keywords: &["codex", "openai", "chatgpt", "gpt"],
     },
     ProviderDescriptor {
@@ -139,6 +144,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Add an OpenRouter API key.",
         catalog_driven: true,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &["openrouter", "router", "metered"],
     },
     ProviderDescriptor {
@@ -151,6 +157,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Add an OpenCode Zen API key.",
         catalog_driven: true,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &["opencode", "zen", "go", "deepseek", "kimi", "glm"],
     },
     ProviderDescriptor {
@@ -163,6 +170,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Add a TypeSafe API key.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &["typesafe", "jev", "decisions", "system one"],
     },
     ProviderDescriptor {
@@ -175,6 +183,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Add the base URL of an Ollama host.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &["ollama", "local", "self-hosted", "private"],
     },
     ProviderDescriptor {
@@ -187,6 +196,7 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         setup_requirement: "Install Actual and authorize the device against an Actual account, then add its local address or a Private Relay credential.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &[
             "actual",
             "local",
@@ -205,9 +215,10 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         api_provider: ApiProvider::Custom,
         summary: "The models Cairn's own inference deployments serve, loaded on demand: asking for one that is not loaded loads it.",
         setup_action: "Open inference",
-        setup_requirement: "Cairn holds no inference deployments yet. Write them at cairn://inference, which lists them.",
+        setup_requirement: "Cairn holds no inference deployments yet. Write them at cairn://inference, which lists them. Its models are listed whenever a recipe is deployed; nothing installs it.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: true,
         keywords: &[
             "inference",
             "local",
@@ -302,6 +313,7 @@ pub fn custom_descriptor(provider: &CustomProvider) -> ProviderDescriptor {
         setup_requirement: "Give this provider a reachable endpoint URL.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &[],
     }
 }
@@ -323,6 +335,7 @@ pub fn cairn_gateway_descriptor() -> ProviderDescriptor {
         setup_requirement: "This device has no Cairn token yet. Sign in to Cairn, or let it reach Cairn's API once to register.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: true,
         keywords: &[],
     }
 }
@@ -344,8 +357,14 @@ pub fn unknown_descriptor(key: &str) -> ProviderDescriptor {
         setup_requirement: "This version of Cairn does not ship this provider. Update Cairn, or remove it from this workspace.",
         catalog_driven: false,
         supports_mcp_install: false,
+        built_in: false,
         keywords: &[],
     }
+}
+
+/// Whether Cairn provides `key` itself, so no workspace installs it.
+pub fn is_built_in(key: &str) -> bool {
+    descriptor(key).is_some_and(|descriptor| descriptor.built_in)
 }
 
 /// The provider inventory for one workspace: everything Cairn ships, then the

@@ -428,6 +428,12 @@ pub(crate) async fn dispatch_resource_change(
         off_frame(|| models::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
+    } else if let Some(summary) = off_frame(|| {
+        super::models_clients::dispatch(orch, request, index, item, dry_run, &resource)
+    })
+    .await?
+    {
+        summary
     } else if let Some(summary) =
         off_frame(|| inference::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {

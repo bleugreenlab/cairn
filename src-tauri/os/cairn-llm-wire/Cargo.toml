@@ -12,3 +12,5 @@ thiserror = "2"
 base64 = "0.22"
 log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "charset", "http2", "macos-system-configuration", "rustls-tls-native-roots"] }
+# The process's one TLS trust configuration: every client here is built on it.
+cairn-tls = { path = "../cairn-tls" }

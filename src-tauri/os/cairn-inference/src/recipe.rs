@@ -39,8 +39,6 @@ pub struct Recipe {
     pub modalities: Option<Modalities>,
     pub engine: Engine,
     pub requirements: Requirements,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 }
@@ -49,6 +47,10 @@ pub struct Recipe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
+    /// The model's real name, the Hugging Face repository id of its checkpoint
+    /// (`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`): the one name every caller
+    /// asks for it by (tenet 1336). A quantized repository the weights come
+    /// from is the recipe's, not the model's name.
     pub name: String,
     /// Container and native recipes pin at least one weight file; command
     /// recipes may pin none, because their shell fetches whatever it fetches.
@@ -282,7 +284,6 @@ mod tests {
                 interconnect: None,
                 memory: None,
             },
-            aliases: Vec::new(),
             notes: None,
         }
     }

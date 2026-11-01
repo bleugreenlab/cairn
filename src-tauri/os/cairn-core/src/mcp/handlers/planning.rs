@@ -5,6 +5,7 @@
 use crate::agent_process::process::GoalPauseOwner;
 use crate::execution::jobs::GoalReactivation;
 use crate::mcp::types::{AskUserPayload, McpCallbackRequest, Question};
+use crate::models::question::{PromptAnswers, QuestionAnswer};
 
 use crate::execution::jobs::{continue_job_impl, ResumeContext};
 use crate::models::{TurnStartReason, TurnState, TurnYieldReason};
@@ -49,41 +50,41 @@ pub async fn ask_questions(
     payload: AskUserPayload,
     background: bool,
     tool_use_id: Option<&str>,
-) -> String {
+) -> QuestionsOutcome {
     ask_questions_owned(orch, request, payload, background, tool_use_id, None).await
 }
 
-fn canonical_prompt_answers(
-    prompt_id: &str,
-    response: &str,
-) -> Result<Vec<(String, String)>, String> {
-    let lines = response.lines().collect::<Vec<_>>();
-    if lines.len() == 1 && !response.starts_with("Question 1: ") {
-        return Ok(vec![(format!("{prompt_id}:0"), response.to_string())]);
-    }
-    lines
-        .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = format!("Question {}: ", index + 1);
-            let answer = line.strip_prefix(&prefix).ok_or_else(|| {
-                "multi-question responses must use canonical `Question N: answer` lines".to_string()
-            })?;
-            Ok((format!("{prompt_id}:{index}"), answer.to_string()))
-        })
-        .collect()
+/// What asking returns to the asking call: the text the agent reads and, when
+/// the answer arrived inline, the answers keyed by question index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionsOutcome {
+    pub text: String,
+    pub answers: Option<Vec<QuestionAnswer>>,
 }
 
-fn render_canonical_prompt_answers(answers: &[String]) -> String {
-    if answers.len() == 1 {
-        answers[0].clone()
-    } else {
-        answers
-            .iter()
-            .enumerate()
-            .map(|(index, answer)| format!("Question {}: {answer}", index + 1))
-            .collect::<Vec<_>>()
-            .join("\n")
+impl From<String> for QuestionsOutcome {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            answers: None,
+        }
+    }
+}
+
+/// A recorded answer as broadcast to an inline waiter: the answers keyed by
+/// question index and their one rendering for the agent to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredPrompt {
+    pub answers: PromptAnswers,
+    pub rendered: String,
+}
+
+impl From<AnsweredPrompt> for QuestionsOutcome {
+    fn from(answered: AnsweredPrompt) -> Self {
+        Self {
+            text: answered.rendered,
+            answers: Some(answered.answers.into_answers()),
+        }
     }
 }
 
@@ -95,7 +96,7 @@ pub(crate) async fn ask_mcp_questions(
     request: &McpCallbackRequest,
     payload: AskUserPayload,
     mcp_wait_id: &str,
-) -> String {
+) -> QuestionsOutcome {
     ask_questions_owned(orch, request, payload, true, None, Some(mcp_wait_id)).await
 }
 
@@ -106,13 +107,20 @@ async fn ask_questions_owned(
     background: bool,
     tool_use_id: Option<&str>,
     mcp_wait_id: Option<&str>,
-) -> String {
+) -> QuestionsOutcome {
     log::info!(
         "Prompting user for cwd={} with {} questions (background={})",
         request.cwd,
         payload.questions.len(),
         background
     );
+    // Every answer is keyed by its question's index, so a prompt with no
+    // questions could never be answered.
+    if payload.questions.is_empty() {
+        return "A questions append needs at least one question in payload.questions"
+            .to_string()
+            .into();
+    }
 
     let services = &orch.services;
 
@@ -126,7 +134,7 @@ async fn ask_questions_owned(
     // bare (local) run resolves to the private DB byte-for-byte unchanged.
     let (ctx, owning_db) = match super::run_context::lookup_run_routed(&orch.db, request).await {
         Ok(pair) => pair,
-        Err(e) => return e,
+        Err(e) => return e.into(),
     };
 
     // Look up the run and store prompt in DB
@@ -285,7 +293,7 @@ async fn ask_questions_owned(
             Ok(tuple) => tuple,
             Err(e) => {
                 log::error!("Failed to insert prompt: {}", e);
-                return format!("Failed to store prompt: {}", e);
+                return format!("Failed to store prompt: {}", e).into();
             }
         };
 
@@ -418,7 +426,8 @@ async fn ask_questions_owned(
                 uri_segment, uri
             ),
             None => format!("Question '{}' recorded.", uri_segment),
-        };
+        }
+        .into();
     }
 
     // Emit run-paused event for frontend to show prompt UI
@@ -434,7 +443,7 @@ async fn ask_questions_owned(
     if owns_turn_loop {
         orch.process_state
             .request_suspend(&run_id, cairn_models::turn::SuspendKind::Prompt);
-        return PROMPT_SUSPENDED_OWNED_LOOP_MARKER.to_string();
+        return PROMPT_SUSPENDED_OWNED_LOOP_MARKER.to_string().into();
     }
 
     // Block waiting for user response (like the permission wait does)
@@ -448,9 +457,9 @@ async fn ask_questions_owned(
         async {
             loop {
                 match rx.recv().await {
-                    Ok((resp_prompt_id, response_text)) => {
+                    Ok((resp_prompt_id, answered)) => {
                         if resp_prompt_id == prompt_id_clone {
-                            return Ok(response_text);
+                            return Ok(answered);
                         }
                         // Not our prompt, keep waiting
                     }
@@ -468,7 +477,7 @@ async fn ask_questions_owned(
     .await;
 
     match result {
-        Ok(Ok(response)) => {
+        Ok(Ok(answered)) => {
             // Create successor turn for the prompt response and transition run back to Running
             if let Some(ref pred_turn_id) = current_turn_id {
                 match ensure_and_start_successor_turn(
@@ -520,7 +529,7 @@ async fn ask_questions_owned(
                     .emit("db-change", crate::notify::issue_db_change(issue, "update"));
             }
 
-            response
+            answered.into()
         }
         Ok(Err(msg)) => {
             log::warn!("Prompt wait channel ended for run {}: {}", run_id, msg);
@@ -532,7 +541,7 @@ async fn ask_questions_owned(
                     request_id: prompt_id.clone(),
                 },
             );
-            PROMPT_SUSPENDED_MARKER.to_string()
+            PROMPT_SUSPENDED_MARKER.to_string().into()
         }
         Err(_) => {
             crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
@@ -543,7 +552,7 @@ async fn ask_questions_owned(
                     request_id: prompt_id.clone(),
                 },
             );
-            PROMPT_SUSPENDED_MARKER.to_string()
+            PROMPT_SUSPENDED_MARKER.to_string().into()
         }
     }
 }
@@ -589,10 +598,7 @@ pub(crate) async fn withdraw_prompt_conn(
     cause: WithdrawalCause,
     now: i64,
 ) -> DbResult<bool> {
-    let cause = serde_json::to_value(cause)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .ok_or_else(|| DbError::internal("withdrawal cause did not serialize to a string"))?;
+    let cause = withdrawal_cause_text(cause)?;
     let changed = conn
         .execute(
             "UPDATE prompts SET withdrawn_at = ?2, withdrawn_cause = ?3
@@ -601,6 +607,32 @@ pub(crate) async fn withdraw_prompt_conn(
         )
         .await?;
     Ok(changed > 0)
+}
+
+/// Withdraw every pending question raised on one of `job_id`'s turns. A
+/// question owned by an MCP wait has no turn and is left to that wait.
+pub(crate) async fn withdraw_job_prompts_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    cause: WithdrawalCause,
+    now: i64,
+) -> DbResult<u64> {
+    let cause = withdrawal_cause_text(cause)?;
+    Ok(conn
+        .execute(
+            "UPDATE prompts SET withdrawn_at = ?2, withdrawn_cause = ?3
+              WHERE response IS NULL AND withdrawn_at IS NULL
+                AND turn_id IN (SELECT id FROM turns WHERE job_id = ?1)",
+            params![job_id, now, cause],
+        )
+        .await?)
+}
+
+fn withdrawal_cause_text(cause: WithdrawalCause) -> DbResult<String> {
+    serde_json::to_value(cause)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .ok_or_else(|| DbError::internal("withdrawal cause did not serialize to a string"))
 }
 
 /// The withdrawal recorded on a question: `None` when it is not withdrawn,
@@ -686,12 +718,19 @@ struct PromptAnswerItem {
     text: Option<String>,
 }
 
+fn parse_prompt_questions(questions_json: &str) -> Result<Vec<Question>, String> {
+    serde_json::from_str(questions_json)
+        .map_err(|e| format!("stored prompt questions are invalid: {e}"))
+}
+
+/// Normalize an answer payload into one answer per question. `answers[]` items
+/// are validated against their question's options; the `answer` shorthand is
+/// typed text, parsed against the prompt's question count. Answer text is kept
+/// byte for byte.
 fn normalize_prompt_answer_payload(
-    questions_json: &str,
+    questions: &[Question],
     payload: &Value,
-) -> Result<String, String> {
-    let questions: Vec<Question> = serde_json::from_str(questions_json)
-        .map_err(|e| format!("stored prompt questions are invalid: {e}"))?;
+) -> Result<PromptAnswers, String> {
     if questions.is_empty() {
         return Err("stored prompt has no questions".to_string());
     }
@@ -699,16 +738,8 @@ fn normalize_prompt_answer_payload(
     let payload: PromptAnswerPayload = serde_json::from_value(payload.clone())
         .map_err(|e| format!("invalid answer payload: {e}"))?;
 
-    if let Some(answer) = payload
-        .answer
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if questions.len() != 1 {
-            return Err("payload.answer shorthand is only valid for single-question prompts; use payload.answers with indices".to_string());
-        }
-        return Ok(answer.to_string());
+    if let Some(answer) = payload.answer.as_deref().filter(|s| !s.trim().is_empty()) {
+        return PromptAnswers::parse_typed(questions.len(), answer);
     }
 
     let answers = payload
@@ -718,33 +749,32 @@ fn normalize_prompt_answer_payload(
         return Err("payload.answers must contain at least one answer".to_string());
     }
 
-    let mut seen = std::collections::HashSet::new();
-    let mut rendered = Vec::new();
+    let mut collected = Vec::with_capacity(answers.len());
     for (position, entry) in answers.into_iter().enumerate() {
-        let answer = entry.into_item(position);
-        if answer.index >= questions.len() {
-            return Err(format!(
-                "answer index {} is out of range for {} question(s)",
-                answer.index,
-                questions.len()
-            ));
-        }
-        if !seen.insert(answer.index) {
-            return Err(format!("duplicate answer index {}", answer.index));
-        }
-        if let Some(header) = answer.header.as_deref() {
-            if questions[answer.index].header.as_deref() != Some(header) {
-                return Err(format!(
-                    "answer index {} header mismatch: expected {:?}, got {:?}",
-                    answer.index, questions[answer.index].header, header
-                ));
+        let item = entry.into_item(position);
+        // An index with no question has nothing to validate against; it is
+        // carried through so `PromptAnswers::new` refuses it by name.
+        let answer = match questions.get(item.index) {
+            Some(question) => {
+                if let Some(header) = item.header.as_deref() {
+                    if question.header.as_deref() != Some(header) {
+                        return Err(format!(
+                            "answer index {} header mismatch: expected {:?}, got {:?}",
+                            item.index, question.header, header
+                        ));
+                    }
+                }
+                render_answer_item(question, &item)?
             }
-        }
-        let value = render_answer_item(&questions[answer.index], &answer)?;
-        rendered.push(format!("Question {}: {}", answer.index + 1, value));
+            None => String::new(),
+        };
+        collected.push(QuestionAnswer {
+            index: item.index,
+            answer,
+        });
     }
 
-    Ok(rendered.join("\n"))
+    PromptAnswers::new(questions.len(), collected)
 }
 
 fn render_answer_item(question: &Question, answer: &PromptAnswerItem) -> Result<String, String> {
@@ -783,12 +813,7 @@ fn render_answer_item(question: &Question, answer: &PromptAnswerItem) -> Result<
             parts.push(selection.to_string());
         }
     }
-    if let Some(text) = answer
-        .text
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(text) = answer.text.as_deref().filter(|s| !s.trim().is_empty()) {
         parts.push(text.to_string());
     }
     if parts.is_empty() {
@@ -831,7 +856,7 @@ pub async fn answer_node_question(
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<PromptAnswerOutcome, String> {
-    let (prompt_id, response, home_uri) = resolve_node_question(
+    let (prompt_id, answers, home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
@@ -854,7 +879,7 @@ pub async fn answer_node_question(
     answer_prompt_id(
         orch,
         &prompt_id,
-        response,
+        answers,
         crate::turns::queries::ResolutionProvenance::new(
             cairn_common::identity::AppearanceTransport::ResourcePatch,
             Some(actor),
@@ -863,8 +888,8 @@ pub async fn answer_node_question(
     .await
 }
 
-/// Resolve a node-coordinate question to its prompt, its normalized answer, and
-/// the answering job's canonical home URI.
+/// Resolve a node-coordinate question to its prompt, its normalized answers,
+/// and the answering job's canonical home URI.
 async fn resolve_node_question(
     orch: &Orchestrator,
     project_key: &str,
@@ -873,7 +898,7 @@ async fn resolve_node_question(
     node_segment: &str,
     prompt_segment: &str,
     payload: &Value,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<(String, PromptAnswers, Option<String>), String> {
     let (prompt_id, questions_json, home_uri) = lookup_prompt_for_node_question(
         orch,
         project_key,
@@ -883,8 +908,9 @@ async fn resolve_node_question(
         prompt_segment,
     )
     .await?;
-    let response = normalize_prompt_answer_payload(&questions_json, payload)?;
-    Ok((prompt_id, response, home_uri))
+    let questions = parse_prompt_questions(&questions_json)?;
+    let answers = normalize_prompt_answer_payload(&questions, payload)?;
+    Ok((prompt_id, answers, home_uri))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,7 +924,7 @@ pub async fn answer_node_question_with_provenance(
     payload: &Value,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    let (prompt_id, response, _home_uri) = resolve_node_question(
+    let (prompt_id, answers, _home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
@@ -908,31 +934,90 @@ pub async fn answer_node_question_with_provenance(
         payload,
     )
     .await?;
-    answer_prompt_id(orch, &prompt_id, response, provenance).await
+    answer_prompt_id(orch, &prompt_id, answers, provenance).await
+}
+
+/// Answer a prompt by id from an answer payload (`answer` or `answers[]`), the
+/// shape every answer surface sends. Normalized against the prompt's own
+/// questions, read from the database that owns it.
+pub async fn answer_prompt_payload(
+    orch: &Orchestrator,
+    prompt_id: &str,
+    payload: &Value,
+    provenance: crate::turns::queries::ResolutionProvenance,
+) -> Result<PromptAnswerOutcome, String> {
+    let db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let questions = load_prompt_questions(&db, prompt_id).await?;
+    let answers = normalize_prompt_answer_payload(&questions, payload)?;
+    answer_prompt_id(orch, prompt_id, answers, provenance).await
 }
 
 pub async fn answer_prompt_id(
     orch: &Orchestrator,
     prompt_id: &str,
-    response: String,
+    answers: PromptAnswers,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    answer_prompt_id_impl(orch, prompt_id, response, provenance, true).await
+    answer_prompt_id_impl(orch, prompt_id, answers, provenance, true).await
 }
 
 pub(crate) async fn answer_prompt_id_domain(
     orch: &Orchestrator,
     prompt_id: &str,
-    response: String,
+    answers: PromptAnswers,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    answer_prompt_id_impl(orch, prompt_id, response, provenance, false).await
+    answer_prompt_id_impl(orch, prompt_id, answers, provenance, false).await
+}
+
+/// A prompt's questions, as stored when it was asked.
+pub(crate) async fn load_prompt_questions_conn(
+    conn: &cairn_db::turso::Connection,
+    prompt_id: &str,
+) -> DbResult<Vec<Question>> {
+    let mut rows = conn
+        .query(
+            "SELECT questions FROM prompts WHERE id = ?1",
+            params![prompt_id],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::internal(format!("prompt not found: {prompt_id}")))?;
+    parse_prompt_questions(&row.text(0)?).map_err(DbError::internal)
+}
+
+async fn load_prompt_questions(
+    db: &crate::storage::LocalDb,
+    prompt_id: &str,
+) -> Result<Vec<Question>, String> {
+    db.read(|conn| {
+        let prompt_id = prompt_id.to_string();
+        Box::pin(async move { load_prompt_questions_conn(conn, &prompt_id).await })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+fn check_answers_fit(answers: &PromptAnswers, questions: &[Question]) -> Result<(), String> {
+    if answers.question_count() == questions.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "these answers cover {} question(s), but this prompt has {}",
+            answers.question_count(),
+            questions.len()
+        ))
+    }
 }
 
 async fn answer_prompt_id_impl(
     orch: &Orchestrator,
     prompt_id: &str,
-    response: String,
+    answers: PromptAnswers,
     provenance: crate::turns::queries::ResolutionProvenance,
     use_gate: bool,
 ) -> Result<PromptAnswerOutcome, String> {
@@ -942,21 +1027,27 @@ async fn answer_prompt_id_impl(
             .map_err(|error| error.to_string())?;
         // Ahead of the claim: a withdrawn question has no winner to record, and
         // claiming one would leave the ledger naming an answer nothing took.
-        let withdrawn = gate_db
+        let gate = gate_db
             .read(|conn| {
                 let prompt_id = prompt_id.to_string();
-                Box::pin(async move { prompt_withdrawal_conn(conn, &prompt_id).await })
+                Box::pin(async move {
+                    if let Some(cause) = prompt_withdrawal_conn(conn, &prompt_id).await? {
+                        return Ok(Err(cause));
+                    }
+                    Ok(Ok(load_prompt_questions_conn(conn, &prompt_id).await?))
+                })
             })
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(cause) = withdrawn {
-            return Ok(PromptAnswerOutcome::withdrawn(cause));
-        }
-        canonical_prompt_answers(prompt_id, &response)?;
+        let questions = match gate {
+            Ok(questions) => questions,
+            Err(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
+        };
+        check_answers_fit(&answers, &questions)?;
         let claim = crate::channels::ledger::claim_ask_resolution(
             &gate_db,
             prompt_id,
-            &response,
+            &answers.to_stored(),
             provenance.surface,
             provenance.provider.as_deref(),
             provenance.conversation.as_deref(),
@@ -970,11 +1061,10 @@ async fn answer_prompt_id_impl(
             crate::channels::ledger::AskClaim::Won(winner) => (winner, false),
             crate::channels::ledger::AskClaim::Existing(winner) => (winner, true),
         };
-        let winners = canonical_prompt_answers(prompt_id, &winner.answer)?
-            .into_iter()
-            .map(|(_, answer)| answer)
-            .collect::<Vec<_>>();
-        let winning_response = render_canonical_prompt_answers(&winners);
+        // The ledger holds the stored form. A winner claimed before answers
+        // were stored by index reads back as legacy text.
+        let winning = PromptAnswers::decode_stored(&winner.answer);
+        let winning_response = winning.render(&questions);
         // The claim winner and the domain-action lease winner are independent.
         // Always execute with the persisted claim winner's identity, even when
         // this caller acquired the lease after losing the claim.
@@ -989,14 +1079,23 @@ async fn answer_prompt_id_impl(
                 withdrawn: None,
             });
         };
-        let result = Box::pin(answer_prompt_id_impl(
-            orch,
-            prompt_id,
-            winning_response.clone(),
-            winning_provenance,
-            false,
-        ))
-        .await;
+        // A legacy winner still to run was typed text, so the typed-input
+        // parser recovers it; one it cannot read is an ordinary action failure.
+        let result = match winning.into_answers(questions.len()) {
+            Ok(winning) => {
+                Box::pin(answer_prompt_id_impl(
+                    orch,
+                    prompt_id,
+                    winning,
+                    winning_provenance,
+                    false,
+                ))
+                .await
+            }
+            Err(error) => Err(format!(
+                "the recorded answer to this question cannot be read: {error}"
+            )),
+        };
         return match result {
             Ok(outcome) if outcome.withdrawn.is_some() => Ok(outcome),
             Ok(mut outcome) => {
@@ -1023,9 +1122,6 @@ async fn answer_prompt_id_impl(
             }
         };
     }
-    let now = chrono::Utc::now().timestamp();
-    let prompt_id_owned = prompt_id.to_string();
-    let response_for_db = response.clone();
     // Resolve the owning database ONCE (fail-closed, CAIRN-2227): a team
     // execution's `prompts` row — with the successor turn and issue-status
     // recompute `record_prompt_response_conn` performs in the same write — lives
@@ -1036,14 +1132,23 @@ async fn answer_prompt_id_impl(
     let owning_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
         .await
         .map_err(|e| e.to_string())?;
+    let questions = load_prompt_questions(&owning_db, prompt_id).await?;
+    check_answers_fit(&answers, &questions)?;
+    let answered = AnsweredPrompt {
+        rendered: answers.render(&questions),
+        answers,
+    };
+    let response = answered.rendered.clone();
+    let now = chrono::Utc::now().timestamp();
+    let prompt_id_owned = prompt_id.to_string();
     let record = owning_db
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
-            let response = response_for_db.clone();
+            let answers = answered.answers.clone();
             let provenance = provenance.clone();
             Box::pin(
                 async move {
-                    let result = match record_prompt_response_conn(conn, &prompt_id, &response, now).await? {
+                    let result = match record_prompt_response_conn(conn, &prompt_id, &answers, now).await? {
                         PromptRecord::Recorded(result) => result,
                         withdrawn @ PromptRecord::Withdrawn(_) => return Ok(withdrawn),
                     };
@@ -1068,7 +1173,7 @@ async fn answer_prompt_id_impl(
     if !resume.duplicate {
         let _ = orch
             .prompt_responses
-            .send((prompt_id_owned.clone(), response.clone()));
+            .send((prompt_id_owned.clone(), answered.clone()));
     }
 
     if let Some(ref issue_id) = resume.issue_id {
@@ -1143,7 +1248,9 @@ async fn answer_prompt_id_impl(
                 &resume.run_id,
                 session_id,
                 tool_use_id,
-                &response,
+                crate::resources::mutations::BlockingResult::from(QuestionsOutcome::from(
+                    answered.clone(),
+                )),
                 false,
                 now,
                 resume.predecessor_turn_id.as_deref(),
@@ -1262,7 +1369,7 @@ async fn lookup_prompt_for_node_question(
 async fn record_prompt_response_conn(
     conn: &cairn_db::turso::Connection,
     prompt_id: &str,
-    response: &str,
+    answers: &PromptAnswers,
     answered_at: i64,
 ) -> DbResult<PromptRecord> {
     // First, before an MCP continuation can claim the answer: a withdrawn
@@ -1273,7 +1380,7 @@ async fn record_prompt_response_conn(
     let mcp_claim = super::mcp_continuation::record_and_claim_answer_conn(
         conn,
         prompt_id,
-        response,
+        answers,
         answered_at.saturating_mul(1000),
     )
     .await?;
@@ -1323,7 +1430,7 @@ async fn record_prompt_response_conn(
             SET response = ?1, answered_at = ?2
             WHERE id = ?3 AND response IS NULL AND withdrawn_at IS NULL
             ",
-            params![response, answered_at, prompt_id],
+            params![answers.to_stored(), answered_at, prompt_id],
         )
         .await?
             == 0
@@ -1469,8 +1576,8 @@ mod prompt_answer_tests {
         }
     }
 
-    fn questions_json() -> String {
-        serde_json::to_string(&vec![
+    fn questions() -> Vec<Question> {
+        vec![
             Question {
                 question: "Continue?".to_string(),
                 header: Some("Confirm".to_string()),
@@ -1483,90 +1590,128 @@ mod prompt_answer_tests {
                 options: vec![option("A"), option("B")],
                 multi_select: true,
             },
-        ])
-        .unwrap()
+        ]
+    }
+
+    fn normalized(payload: Value) -> Result<Vec<(usize, String)>, String> {
+        normalize_prompt_answer_payload(&questions(), &payload).map(|answers| {
+            answers
+                .into_answers()
+                .into_iter()
+                .map(|answer| (answer.index, answer.answer))
+                .collect()
+        })
+    }
+
+    fn pair(index: usize, answer: &str) -> (usize, String) {
+        (index, answer.to_string())
     }
 
     #[test]
-    fn normalizes_single_question_shorthand() {
-        let questions = serde_json::to_string(&vec![Question {
+    fn normalizes_single_question_shorthand_verbatim() {
+        let questions = vec![Question {
             question: "Continue?".to_string(),
             header: None,
             options: vec![],
             multi_select: false,
-        }])
-        .unwrap();
-        assert_eq!(
-            normalize_prompt_answer_payload(&questions, &json!({"answer":"Yes"})).unwrap(),
-            "Yes"
-        );
+        }];
+        let text = "  Yes.\n\n1. a\n2. b\n";
+        let answers =
+            normalize_prompt_answer_payload(&questions, &json!({ "answer": text })).unwrap();
+        assert_eq!(answers.answers()[0].answer, text);
     }
 
     #[test]
     fn normalizes_multi_question_answers() {
         assert_eq!(
-            normalize_prompt_answer_payload(
-                &questions_json(),
-                &json!({"answers":[{"index":0,"selection":"Yes"},{"index":1,"text":"custom"}]})
+            normalized(
+                json!({"answers":[{"index":0,"selection":"Yes"},{"index":1,"text":"custom"}]})
             )
             .unwrap(),
-            "Question 1: Yes\nQuestion 2: custom"
+            vec![pair(0, "Yes"), pair(1, "custom")]
         );
     }
 
     #[test]
     fn normalizes_multi_select_answers() {
         assert_eq!(
-            normalize_prompt_answer_payload(
-                &questions_json(),
-                &json!({"answers":[{"index":1,"selections":["A","B"]}]})
+            normalized(
+                json!({"answers":[{"index":1,"selections":["A","B"]},{"index":0,"selection":"No"}]})
             )
             .unwrap(),
-            "Question 2: A, B"
+            vec![pair(0, "No"), pair(1, "A, B")]
         );
     }
 
     #[test]
-    fn normalizes_free_text_only_answer() {
+    fn refuses_answers_that_leave_a_question_unanswered() {
+        let error =
+            normalized(json!({"answers":[{"index":1,"selections":["A","B"]}]})).unwrap_err();
+        assert!(
+            error.starts_with("question index 0 (Question 1) has no answer"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn keeps_free_text_byte_for_byte() {
+        let text = "\nSomething else\n\n- with a list\n";
         assert_eq!(
-            normalize_prompt_answer_payload(
-                &questions_json(),
-                &json!({"answers":[{"index":0,"text":"Something else"}]})
-            )
-            .unwrap(),
-            "Question 1: Something else"
+            normalized(json!({"answers":[{"index":0,"text":text},{"index":1,"selection":"A"}]}))
+                .unwrap(),
+            vec![pair(0, text), pair(1, "A")]
         );
     }
 
     #[test]
     fn normalizes_bare_string_shorthand_items() {
         assert_eq!(
-            normalize_prompt_answer_payload(
-                &questions_json(),
-                &json!({"answers":[{"index":0,"selection":"Yes"},"free text for q2"]})
-            )
-            .unwrap(),
-            "Question 1: Yes\nQuestion 2: free text for q2"
+            normalized(json!({"answers":[{"index":0,"selection":"Yes"},"free text for q2"]}))
+                .unwrap(),
+            vec![pair(0, "Yes"), pair(1, "free text for q2")]
+        );
+    }
+
+    #[test]
+    fn answer_shorthand_on_several_questions_takes_canonical_lines() {
+        assert_eq!(
+            normalized(json!({"answer":"Question 1: Yes\nand why\nQuestion 2: A"})).unwrap(),
+            vec![pair(0, "Yes\nand why"), pair(1, "A")]
+        );
+        let error = normalized(json!({"answer":"Yes\nA"})).unwrap_err();
+        assert!(
+            error.starts_with("line 1 must begin \"Question 1: \""),
+            "{error}"
         );
     }
 
     #[test]
     fn rejects_invalid_selection() {
-        let error = normalize_prompt_answer_payload(
-            &questions_json(),
-            &json!({"answers":[{"index":1,"selection":"C"}]}),
-        )
-        .unwrap_err();
+        let error = normalized(json!({"answers":[{"index":1,"selection":"C"}]})).unwrap_err();
         assert!(error.contains("invalid selection"));
     }
 
     #[test]
     fn rejects_invalid_index() {
-        let error = normalize_prompt_answer_payload(
-            &questions_json(),
-            &json!({"answers":[{"index":2,"text":"oops"}]}),
+        let error = normalized(
+            json!({"answers":[{"index":0,"selection":"Yes"},{"index":2,"text":"oops"}]}),
         )
         .unwrap_err();
-        assert!(error.contains("out of range"));
+        assert!(
+            error.contains("answer index 2 (Question 3) is out of range"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_index() {
+        let error = normalized(
+            json!({"answers":[{"index":0,"selection":"Yes"},{"index":0,"selection":"No"}]}),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("question index 0 (Question 1) is answered more than once"),
+            "{error}"
+        );
     }
 }

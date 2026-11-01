@@ -76,7 +76,8 @@ async fn import_rulings(db: &LocalDb) {
 async fn register_anonymous_device() -> String {
     let base =
         std::env::var("CAIRN_API_URL").unwrap_or_else(|_| "https://api.cairn.computer".to_string());
-    let body: serde_json::Value = reqwest::Client::new()
+    let body: serde_json::Value = cairn_tls::client()
+        .clone()
         .post(format!("{base}/tokens/device/anonymous"))
         .json(&serde_json::json!({ "device_id": uuid::Uuid::new_v4().to_string() }))
         .send()

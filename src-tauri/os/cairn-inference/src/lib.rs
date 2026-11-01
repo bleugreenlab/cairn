@@ -9,8 +9,11 @@
 //! controller, which loads on request, unloads for waiting builds and loads
 //! the default when the pool is idle, and writes the result as desired state.
 //! [`served`] is what Cairn offers from its deployments: every deployed
-//! recipe under its served name and aliases, loaded or not, with what each
-//! model takes and gives and the context its engine can actually hold.
+//! model under its real name, loaded or not, with what each model takes and
+//! gives and the context its engine can actually hold.
+//!
+//! [`metrics`] reads what a running engine says about itself in its
+//! Prometheus metrics, vLLM's or llama.cpp's, into rates and latencies.
 //!
 //! [`control`] is the act side: a deployment's phase as the orch holds it, the
 //! transitions start and stop requests and the head's reports move it through,
@@ -27,6 +30,7 @@ pub mod control;
 pub mod deployment;
 pub mod inventory;
 pub mod machine;
+pub mod metrics;
 pub mod pool;
 pub mod pool_control;
 pub mod recipe;

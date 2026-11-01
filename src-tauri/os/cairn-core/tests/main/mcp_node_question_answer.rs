@@ -7,6 +7,7 @@ use cairn_core::internal::mcp::handlers::read::handle_read_file;
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_core::models::question::{PromptAnswers, StoredAnswer};
 use cairn_db::turso::params;
 use serde_json::json;
 
@@ -171,6 +172,224 @@ async fn a_thread_answering_its_question_records_the_canonical_thread_actor() {
     );
 }
 
+/// An answer body that carries every structure an answer must survive:
+/// paragraphs, a numbered list at line starts, a bulleted list, and a fenced
+/// code block (cairn/4560).
+const STRUCTURED_BODY: &str = "First paragraph of the decision.\n\nSecond paragraph, with a numbered list:\n\n1. a\n2. b\n\n- bullet one\n- bullet two\n\n```rust\nfn main() {\n    println!(\"Question 2: not a boundary\");\n}\n```\n\nClosing line.";
+
+const SECOND_BODY: &str = "Another answer.\n\nIt also spans\nseveral lines.";
+
+const FREE_ONE: &str =
+    r#"[{"question":"Which path, and why?","header":null,"options":[],"multiSelect":false}]"#;
+const FREE_TWO: &str = r#"[{"question":"Which path?","header":null,"options":[],"multiSelect":false},{"question":"What risks?","header":null,"options":[],"multiSelect":false}]"#;
+
+/// Add free-text prompts beside the base question fixture: two one-question
+/// prompts (`q-2`, `q-3`) and one two-question prompt (`q-4`).
+async fn insert_free_text_prompts(db: &LocalDb) {
+    db.write(|conn| {
+        Box::pin(async move {
+            for (id, segment, questions) in [
+                ("prompt-free-a", "q-2", FREE_ONE),
+                ("prompt-free-b", "q-3", FREE_ONE),
+                ("prompt-free-two", "q-4", FREE_TWO),
+            ] {
+                conn.execute(
+                    "INSERT INTO prompts(id, run_id, job_id, questions, response, created_at, answered_at, uri_segment)
+                     VALUES (?1, 'run-1', 'job-1', ?2, NULL, 1, NULL, ?3)",
+                    params![id, questions, segment],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn stored_response(db: &LocalDb, prompt_id: &str) -> Option<String> {
+    let prompt_id = prompt_id.to_string();
+    db.read(|conn| {
+        let prompt_id = prompt_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT response FROM prompts WHERE id = ?1",
+                    params![prompt_id.as_str()],
+                )
+                .await?;
+            rows.next().await?.map(|row| row.opt_text(0)).transpose()
+        })
+    })
+    .await
+    .unwrap()
+    .flatten()
+}
+
+/// A multi-paragraph, list- and code-bearing answer is accepted on a
+/// one-question prompt through both payload shapes, and inside one answer of a
+/// two-question prompt.
+#[tokio::test]
+async fn structured_multi_line_answers_are_accepted() {
+    use cairn_core::internal::mcp::handlers::planning::answer_node_question;
+
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_question_fixture(&db).await;
+    insert_free_text_prompts(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let indexed = answer_node_question(
+        &orch,
+        "tqa",
+        1,
+        1,
+        "builder",
+        "q-2",
+        &json!({"answers": [{"index": 0, "text": STRUCTURED_BODY}]}),
+    )
+    .await;
+    assert!(
+        indexed.is_ok(),
+        "answers:[{{index:0,text}}] on one question: {indexed:?}"
+    );
+
+    let shorthand = answer_node_question(
+        &orch,
+        "tqa",
+        1,
+        1,
+        "builder",
+        "q-3",
+        &json!({"answer": STRUCTURED_BODY}),
+    )
+    .await;
+    assert!(
+        shorthand.is_ok(),
+        "answer shorthand on one question: {shorthand:?}"
+    );
+
+    let two = answer_node_question(
+        &orch,
+        "tqa",
+        1,
+        1,
+        "builder",
+        "q-4",
+        &json!({"answers": [
+            {"index": 0, "text": STRUCTURED_BODY},
+            {"index": 1, "text": SECOND_BODY}
+        ]}),
+    )
+    .await;
+    assert!(two.is_ok(), "two questions with multi-line bodies: {two:?}");
+
+    // What is stored is the indexed form, and every body comes back byte for
+    // byte: no flattening into lines and no trimming.
+    for (prompt_id, expected) in [
+        ("prompt-free-a", vec![STRUCTURED_BODY]),
+        ("prompt-free-b", vec![STRUCTURED_BODY]),
+        ("prompt-free-two", vec![STRUCTURED_BODY, SECOND_BODY]),
+    ] {
+        let stored = stored_response(&db, prompt_id)
+            .await
+            .unwrap_or_else(|| panic!("{prompt_id} has no stored answer"));
+        let StoredAnswer::Answers(answers) = PromptAnswers::decode_stored(&stored) else {
+            panic!("{prompt_id} stored a non-indexed answer: {stored}");
+        };
+        let bodies = answers
+            .answers()
+            .iter()
+            .map(|answer| answer.answer.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, expected, "{prompt_id} bodies");
+    }
+}
+
+/// The typed line format still parses on a two-question prompt, and a
+/// two-answer claim on a one-question prompt is refused naming the extra index.
+#[tokio::test]
+async fn typed_lines_parse_and_phantom_answers_are_refused() {
+    use cairn_core::internal::mcp::handlers::planning::answer_node_question;
+
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_question_fixture(&db).await;
+    insert_free_text_prompts(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let phantom = answer_node_question(
+        &orch,
+        "tqa",
+        1,
+        1,
+        "builder",
+        "q-2",
+        &json!({"answers": [{"index": 0, "text": "a"}, {"index": 1, "text": "b"}]}),
+    )
+    .await
+    .expect_err("a second answer on a one-question prompt must be refused");
+    assert!(
+        phantom.contains("answer index 1 (Question 2) is out of range"),
+        "{phantom}"
+    );
+    assert_eq!(stored_response(&db, "prompt-free-a").await, None);
+
+    let typed = format!("Question 1: {STRUCTURED_BODY}\nQuestion 2: {SECOND_BODY}");
+    answer_node_question(
+        &orch,
+        "tqa",
+        1,
+        1,
+        "builder",
+        "q-4",
+        &json!({"answer": typed}),
+    )
+    .await
+    .expect("canonical typed lines answer a two-question prompt");
+    let stored = stored_response(&db, "prompt-free-two").await.unwrap();
+    let StoredAnswer::Answers(answers) = PromptAnswers::decode_stored(&stored) else {
+        panic!("typed answer stored a non-indexed value: {stored}");
+    };
+    assert_eq!(answers.answers()[0].answer, STRUCTURED_BODY);
+    assert_eq!(answers.answers()[1].answer, SECOND_BODY);
+}
+
+/// A prompt with no questions could never be answered by index, so asking one
+/// is refused before anything is stored.
+#[tokio::test]
+async fn asking_no_questions_is_refused() {
+    use cairn_core::internal::mcp::handlers::planning::ask_questions;
+    use cairn_core::internal::mcp::types::AskUserPayload;
+
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let orch = orchestrator(&temp, db.clone());
+    let outcome = ask_questions(
+        &orch,
+        &change_request(json!({})),
+        AskUserPayload { questions: vec![] },
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        outcome.text.contains("at least one question"),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.answers, None);
+    let stored = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query("SELECT COUNT(*) FROM prompts", ()).await?;
+                rows.next().await?.map(|row| row.i64(0)).transpose()
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, Some(0));
+}
+
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
         answer_bound_ms: None,
@@ -217,7 +436,8 @@ async fn node_question_patch_answers_prompt_once() {
         result.contains("Answered question q-1"),
         "unexpected result: {result}"
     );
-    assert_eq!(prompt_response(&db).await.as_deref(), Some("Yes"));
+    let yes = r#"[{"index":0,"answer":"Yes"}]"#;
+    assert_eq!(prompt_response(&db).await.as_deref(), Some(yes));
 
     let duplicate = handle_write(
         &orch,
@@ -230,7 +450,7 @@ async fn node_question_patch_answers_prompt_once() {
         duplicate.contains("already answered"),
         "unexpected duplicate result: {duplicate}"
     );
-    assert_eq!(prompt_response(&db).await.as_deref(), Some("Yes"));
+    assert_eq!(prompt_response(&db).await.as_deref(), Some(yes));
 }
 
 #[tokio::test]

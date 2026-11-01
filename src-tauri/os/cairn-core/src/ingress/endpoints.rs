@@ -130,13 +130,6 @@ async fn refusal(response: reqwest::Response) -> String {
     format!("the relay refused the request ({status}): {detail}")
 }
 
-fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())
-}
-
 /// What to mint.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MintSpec<'a> {
@@ -270,12 +263,14 @@ pub async fn mint(
     if let Some(secret) = spec.provider_secret {
         body["secret"] = json!(secret);
     }
-    let response = client()?
+    let response = super::relay_client()
+        .await?
         .post(format!(
             "{}/channels/{}/endpoints",
             relay_url.trim_end_matches('/'),
             channel.id
         ))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&channel.secret)
         .json(&body)
         .send()
@@ -314,13 +309,15 @@ pub async fn rotate(
         Some(secret) => json!({ "secret": secret }),
         None => json!({}),
     };
-    let response = client()?
+    let response = super::relay_client()
+        .await?
         .post(format!(
             "{}/channels/{}/endpoints/{}/rotate",
             relay_url.trim_end_matches('/'),
             channel.id,
             endpoint.id
         ))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&channel.secret)
         .json(&body)
         .send()
@@ -360,13 +357,15 @@ pub async fn revoke(
     let channel = existing_channel(orch).await?.ok_or_else(|| {
         "This install has no relay channel, so it has no endpoint to revoke".to_string()
     })?;
-    let response = client()?
+    let response = super::relay_client()
+        .await?
         .delete(format!(
             "{}/channels/{}/endpoints/{}",
             relay_url.trim_end_matches('/'),
             channel.id,
             endpoint.id
         ))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&channel.secret)
         .send()
         .await
@@ -402,7 +401,8 @@ pub async fn refresh(
     let Some(channel) = existing_channel(orch).await? else {
         return Ok(());
     };
-    let response = client()?
+    let response = super::relay_client()
+        .await?
         .get(format!(
             "{}/channels/{}/endpoints",
             relay_url.trim_end_matches('/'),

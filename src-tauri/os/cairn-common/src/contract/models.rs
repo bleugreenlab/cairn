@@ -212,6 +212,7 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
         RelatedSpec { label: "the embedding model and how far history is embedded in it", kind: ResourceKind::ModelsEmbeddings, actions: false },
         RelatedSpec { label: "live model sessions", kind: ResourceKind::ModelsSessions, actions: false },
+        RelatedSpec { label: "outside clients of the served OpenAI-compatible API and their keys", kind: ResourceKind::ModelsClients, actions: false },
     ],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
@@ -330,7 +331,9 @@ pub(crate) const MODELS_USAGE_CONTRACT: ResourceContract = ResourceContract {
     description: "Each installed provider's capacity, as Settings → Analytics shows it: every usage window the provider measures, each account's remaining share of it, and the pooled total (remaining out of total, next reset); what the pool is currently exhausted on; each account's usage resets; credits or recorded cost where the provider has them; when it was measured; and the last probe error. A pure read of what was already measured; it never probes a provider.",
     read_projections: &[
         ProjectionSpec { key: "provider", values: "KEY — one installed provider" },
-        ProjectionSpec { key: "view", values: "card (default) | requests — per-request usage rows (not recorded yet; says what exists instead)" },
+        ProjectionSpec { key: "view", values: "card (default) | requests — the served API's per-request rows (outside clients), with per-client totals" },
+        ProjectionSpec { key: "client", values: "NAME|ID — with view=requests: one served-API client's rows" },
+        ProjectionSpec { key: "hours", values: "N — with view=requests: how far back (default 24)" },
     ],
     related: &[RelatedSpec { label: "each account's windows", kind: ResourceKind::ModelsAccounts, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
@@ -381,5 +384,67 @@ pub(crate) const MODELS_SESSION_CONTRACT: ResourceContract = ResourceContract {
         optional: &[],
         label: "stop a session",
         example: r#"write({changes:[{target:"cairn://models/sessions/SESSION_ID",mode:"patch",payload:{action:"stop"}}]})"#,
+    }],
+};
+
+const MODELS_CLIENT_NAME: KeySpec = KeySpec::new(
+    "name",
+    KeyType::Str,
+    "the client's name (letters, digits, - _ .), unique among live keys; an alias, never its identity",
+);
+const MODELS_CLIENT_REMOTE: KeySpec = KeySpec::new(
+    "remote",
+    KeyType::Bool,
+    "true grants the client use of the workspace's OpenRouter account (a standing grant bound to the client); false, the default, keeps it to Cairn's own inference deployments",
+);
+const MODELS_CLIENT_IMPORT: KeySpec = KeySpec::new(
+    "import",
+    KeyType::Array,
+    "[{name, keyHash, remote?}]: clients whose existing keys are kept by hash (lowercase hex SHA-256 of the key, bgllm's scheme), all or none",
+);
+const MODELS_CLIENT_ORIGIN: KeySpec = KeySpec::new(
+    "origin",
+    KeyType::Str,
+    "where imported keys were issued; default bgllm",
+);
+const MODELS_CLIENT_REVOKE: KeySpec = KeySpec::new(
+    "revoke",
+    KeyType::Bool,
+    "true revokes the key and every remote grant bound to it",
+);
+
+pub(crate) const MODELS_CLIENTS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsClients,
+    uri_template: "cairn://models/clients",
+    name: "Served API clients",
+    description: "Who may call Cairn's served OpenAI-compatible API (/v1/models, chat, completions, responses, embeddings) from outside: each client's name, where its key came from, the last four characters of a key Cairn minted, whether it is live, whether it may use remote providers (the grant that allows it, or local-only), and when it last made a request. A key hash is never shown. Append {name} to mint a key, shown once; append {import:[...]} to keep existing keys by hash. Minting, importing and granting remote use ask the operator when an agent writes them. Requests are at cairn://models/usage?view=requests; the listener is the servedApi section of cairn://settings.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "each client's requests", kind: ResourceKind::ModelsUsage, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[],
+            optional: &[MODELS_CLIENT_NAME, MODELS_CLIENT_REMOTE, MODELS_CLIENT_IMPORT, MODELS_CLIENT_ORIGIN],
+            label: "mint a client key (name), or import existing keys by hash (import)",
+            example: r#"write({changes:[{target:"cairn://models/clients",mode:"append",payload:{name:"dig"}}]})"#,
+        },
+    ],
+};
+
+pub(crate) const MODELS_CLIENT_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsClient,
+    uri_template: "cairn://models/clients/{id}",
+    name: "Served API client",
+    description: "One outside client of the served API, by its immutable id: its name, key provenance and hint, whether it is live, its remote grants, and its recent requests. Patch {remote:true|false} to grant or withdraw use of the workspace's OpenRouter account, or {revoke:true} to revoke the key with its grants.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "every served-API client", kind: ResourceKind::ModelsClients, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[],
+        optional: &[MODELS_CLIENT_REMOTE, MODELS_CLIENT_REVOKE],
+        label: "grant or withdraw remote use, or revoke the key",
+        example: r#"write({changes:[{target:"cairn://models/clients/CLIENT_ID",mode:"patch",payload:{remote:true}}]})"#,
     }],
 };

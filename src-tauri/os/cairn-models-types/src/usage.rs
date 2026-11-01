@@ -78,6 +78,10 @@ pub enum AccountHoldKind {
     /// The account's owner must accept the provider's updated Consumer Terms
     /// (Anthropic answers every request with an HTTP 400 until they do).
     TermsAcceptance,
+    /// The provider will no longer renew the account's sign-in (its refresh
+    /// token expired or was revoked). Only signing the account in again
+    /// brings it back, and doing so replaces the credential and clears this.
+    SignInExpired,
 }
 
 /// A provider refusal that holds one account out of rotation until an
@@ -102,6 +106,7 @@ impl AccountHoldKind {
             AccountHoldKind::TermsAcceptance => {
                 "the account must accept the provider's updated Consumer Terms"
             }
+            AccountHoldKind::SignInExpired => "the provider will no longer renew its sign-in",
         }
     }
 
@@ -112,6 +117,9 @@ impl AccountHoldKind {
             AccountHoldKind::Credits => "Cairn cannot detect a top-up automatically; add credits, then mark the account available in Settings → Providers.".to_string(),
             AccountHoldKind::TermsAcceptance => format!(
                 "Accept the updated Consumer Terms at claude.ai signed in as {signed_in_as}, then refresh this provider's usage (or mark the account available in Settings → Providers) to try it again."
+            ),
+            AccountHoldKind::SignInExpired => format!(
+                "Reconnect {signed_in_as} from Settings → Providers."
             ),
         }
     }

@@ -126,6 +126,26 @@ pub enum TeamSyncReadiness {
     NotAuthenticated,
 }
 
+/// The client the orchestrator's team routes share: ten seconds per request,
+/// built once for the process on the shared TLS config. Async because team
+/// auto-connect runs at boot, possibly before the root store has loaded.
+pub async fn team_api_client() -> Result<&'static reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    if CLIENT.get().is_none() {
+        cairn_tls::ready().await;
+    }
+    CLIENT
+        .get_or_init(|| {
+            cairn_tls::client_builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 /// Fetch a team's sync config, distinguishing 200/404/503. Any other status (or
 /// a transport failure) is a hard error the caller surfaces.
 pub async fn fetch_team_sync_config(
@@ -352,7 +372,7 @@ mod tests {
     async fn fetch_sync_config_200_is_active() {
         let body = r#"{"teamId":"t1","syncUrl":"http://broker/teams/t1/sync","dbName":"db1","status":"active"}"#;
         let base = mock_server("HTTP/1.1 200 OK", body);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         match fetch_team_sync_config(&client, "jwt", "t1", &api(base))
             .await
             .unwrap()
@@ -369,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sync_config_404_is_not_configured() {
         let base = mock_server("HTTP/1.1 404 Not Found", r#"{"error":"x"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         assert!(matches!(
             fetch_team_sync_config(&client, "jwt", "t1", &api(base))
                 .await
@@ -381,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sync_config_503_is_provisioning() {
         let base = mock_server("HTTP/1.1 503 Service Unavailable", r#"{"error":"x"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         assert!(matches!(
             fetch_team_sync_config(&client, "jwt", "t1", &api(base))
                 .await
@@ -393,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sync_config_500_is_err() {
         let base = mock_server("HTTP/1.1 500 Internal Server Error", r#"{"error":"boom"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         assert!(fetch_team_sync_config(&client, "jwt", "t1", &api(base))
             .await
             .is_err());
@@ -403,7 +423,7 @@ mod tests {
     async fn mint_token_parses_token_and_expiry() {
         let body = r#"{"token":"sync-tok","expiresAt":"2099-01-01T00:00:00Z"}"#;
         let base = mock_server("HTTP/1.1 200 OK", body);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         let (token, expires_at) = mint_team_sync_token(&client, "jwt", "t1", &api(base))
             .await
             .unwrap();
@@ -414,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn mint_token_error_status_is_err() {
         let base = mock_server("HTTP/1.1 403 Forbidden", r#"{"error":"nope"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         assert!(mint_team_sync_token(&client, "jwt", "t1", &api(base))
             .await
             .is_err());
@@ -426,7 +446,7 @@ mod tests {
             "HTTP/1.1 403 Forbidden",
             r#"{"error":"Not a member of this team"}"#,
         );
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         let error = mint_cloud_object_grant(
             &client,
             "jwt",
@@ -447,7 +467,7 @@ mod tests {
     async fn probe_maps_200_to_active() {
         let body = r#"{"teamId":"t1","syncUrl":"http://broker/teams/t1/sync","dbName":"db1","status":"active"}"#;
         let base = mock_server("HTTP/1.1 200 OK", body);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         let out = probe_team_sync_status(&client, "jwt", &["t1".to_string()], &api(base)).await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].team_id, "t1");
@@ -457,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn probe_maps_404_to_not_configured() {
         let base = mock_server("HTTP/1.1 404 Not Found", r#"{"error":"x"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         let out = probe_team_sync_status(&client, "jwt", &["t1".to_string()], &api(base)).await;
         assert_eq!(out[0].status, TeamSyncReadiness::NotConfigured);
     }
@@ -465,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn probe_maps_503_to_provisioning() {
         let base = mock_server("HTTP/1.1 503 Service Unavailable", r#"{"error":"x"}"#);
-        let client = reqwest::Client::new();
+        let client = cairn_tls::client().clone();
         let out = probe_team_sync_status(&client, "jwt", &["t1".to_string()], &api(base)).await;
         assert_eq!(out[0].status, TeamSyncReadiness::Provisioning);
     }
@@ -475,7 +495,7 @@ mod tests {
         // Point at an unroutable port: the underlying fetch errors, and the probe
         // must map that to NotConfigured rather than propagating the failure so
         // one unreachable team never sinks the whole list.
-        let client = reqwest::Client::builder()
+        let client = cairn_tls::client_builder()
             .timeout(Duration::from_millis(200))
             .build()
             .unwrap();

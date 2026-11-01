@@ -72,6 +72,12 @@ impl Orchestrator {
         let migrated = settings::migrate_enabled_providers(&self.config_dir, &credentialed)?;
         if let Some(enabled) = &migrated {
             log::info!("Recorded installed providers for this workspace: {enabled:?}");
+        }
+        let retired = settings::retire_built_in_providers(&self.config_dir)?;
+        if !retired.is_empty() {
+            log::info!("Built-in providers left enabledProviders: {retired:?}");
+        }
+        if migrated.is_some() || !retired.is_empty() {
             let _ = self.services.emitter.emit(
                 "config-changed",
                 serde_json::json!({"entity_type": "settings"}),
@@ -109,8 +115,21 @@ impl Orchestrator {
                 "validate Telegram channel settings",
             )
         })?;
-        let embedding_before = self.get_settings().embedding_model;
+        let before = self.get_settings();
+        let embedding_before = before.embedding_model;
         let current = settings::update_settings(&self.config_dir, input, &self.provider_names())?;
+
+        // A provider just enabled has no models yet: discover them now, not at
+        // the next periodic refresh, so it can be chosen at once.
+        let added: Vec<String> = current
+            .enabled_providers
+            .iter()
+            .filter(|key| !before.enabled_providers.contains(key))
+            .cloned()
+            .collect();
+        if !added.is_empty() {
+            self.spawn_provider_model_catalog_refresh(added);
+        }
 
         // A new embedding model is a new vector space: bring the stores into
         // it now rather than at the sweep's next loop, so search stops

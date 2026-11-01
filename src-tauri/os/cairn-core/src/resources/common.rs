@@ -1814,16 +1814,24 @@ mod tests {
         assert!(index.contains("(cairn://models/decide)"), "{index}");
     }
 
-    /// The mirrored records are read-only, the index offers its YAML export as
-    /// a projection, and the pool controller's two surfaces carry its writes.
+    /// Recipes and deployments are written only at the index, whose writes
+    /// their pages carry; the index offers its YAML export as a projection,
+    /// and the pool controller's two surfaces carry its writes.
     #[test]
     fn affordance_for_inference_kinds() {
         for kind in [
             ResourceKind::InferenceRecipes,
             ResourceKind::InferenceDeployments,
         ] {
+            let spec = affordance_spec_for_kind(kind, None).unwrap();
+            assert!(
+                spec.actions
+                    .iter()
+                    .all(|action| action.uri_template == "cairn://inference"),
+                "{kind:?}: {:?}",
+                spec.actions
+            );
             let output = affordance_for_kind(kind);
-            assert!(!output.contains("### actions"), "{kind:?}:\n{output}");
             assert!(output.contains("cairn://inference"), "{kind:?}:\n{output}");
         }
         let index = affordance_for_kind(ResourceKind::Inference);
@@ -1832,7 +1840,8 @@ mod tests {
         assert!(index.contains("cairn://inference/requests"), "{index}");
 
         let pools = affordance_for_kind(ResourceKind::InferencePools);
-        assert!(pools.contains("control a pool"), "{pools}");
+        assert!(pools.contains("warm model"), "{pools}");
+        assert!(pools.contains("`warm(str, "), "{pools}");
         assert!(pools.contains("`pool(str)`"), "{pools}");
         let requests = affordance_for_kind(ResourceKind::InferenceRequests);
         assert!(requests.contains("request a model"), "{requests}");

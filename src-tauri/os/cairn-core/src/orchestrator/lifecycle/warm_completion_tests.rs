@@ -1192,17 +1192,60 @@ async fn stop_job_idles_runless_suspended_job_and_stops_children() {
 
     stop_job(&orch, "j-sj-parent").unwrap();
 
-    // The open prompt is cancelled (no longer counts toward NeedsInput).
-    assert!(
+    // The open question is withdrawn with the stop as its cause: pending
+    // nowhere, and no fake answer is recorded.
+    assert_eq!(
         scalar_text(
             &orch,
             "SELECT response FROM prompts WHERE id = ?1",
             "sj-prompt"
         )
-        .await
-        .is_some(),
-        "open prompt should be answered/cancelled"
+        .await,
+        None,
+        "a stopped question has no answer"
     );
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT withdrawn_cause FROM prompts WHERE id = ?1",
+            "sj-prompt"
+        )
+        .await
+        .as_deref(),
+        Some("operator_stop")
+    );
+    // The predicate every pending-question check shares.
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT id FROM prompts WHERE id = ?1 AND response IS NULL AND withdrawn_at IS NULL",
+            "sj-prompt"
+        )
+        .await,
+        None,
+        "a withdrawn question no longer counts as needing input"
+    );
+    // A late answer is refused with the stop named, not recorded.
+    let late = crate::mcp::handlers::planning::answer_prompt_id(
+        &orch,
+        "sj-prompt",
+        crate::models::question::PromptAnswers::new(
+            1,
+            vec![crate::models::question::QuestionAnswer {
+                index: 0,
+                answer: "too late".to_string(),
+            }],
+        )
+        .unwrap(),
+        crate::turns::queries::ResolutionProvenance::new(
+            cairn_common::identity::AppearanceTransport::LocalInvoke,
+            None,
+        ),
+    )
+    .await
+    .expect("a late answer is refused, not an error");
+    let notice = late.withdrawn.expect("the refusal names the withdrawal");
+    assert!(notice.contains("the operator stopped the work"), "{notice}");
     // The yielded work turn and the pending successor are both terminalized,
     // so the job's latest turn is no longer live (drops the pending successor).
     assert_eq!(turn_state(&orch, "sj-anchor").await, "cancelled");

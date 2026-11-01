@@ -409,6 +409,8 @@ impl CairnResource {
             | Self::ModelsEmbeddings
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::ModelsClients
+            | Self::ModelsClient { .. }
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments
@@ -620,6 +622,8 @@ impl CairnResource {
             | Self::ModelsEmbeddings
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::ModelsClients
+            | Self::ModelsClient { .. }
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments
@@ -799,6 +803,8 @@ impl CairnResource {
             | Self::ModelsEmbeddings
             | Self::ModelsSessions
             | Self::ModelsSession { .. }
+            | Self::ModelsClients
+            | Self::ModelsClient { .. }
             | Self::Inference
             | Self::InferenceRecipes
             | Self::InferenceDeployments

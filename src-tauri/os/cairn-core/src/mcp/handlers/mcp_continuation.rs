@@ -7,6 +7,7 @@
 use crate::config::mcp_servers::McpServerConfig;
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::mcp::gateway::McpCallOutcome;
+use crate::models::question::{PromptAnswers, StoredAnswer};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
@@ -230,10 +231,27 @@ pub(crate) async fn store(
     .map_err(|error| error.to_string())
 }
 
+/// What an MCP tool receives for a stored question answer. The MCP input
+/// prompt has exactly one question, so its single answer is the input: as JSON
+/// when it parses as JSON, otherwise as a string. A legacy stored value is
+/// taken whole as that single answer.
+fn mcp_input_value(stored: &str) -> serde_json::Value {
+    let answer = match PromptAnswers::decode_stored(stored) {
+        StoredAnswer::Answers(answers) if answers.question_count() == 1 => {
+            answers.into_answers().remove(0).answer
+        }
+        StoredAnswer::Answers(answers) => {
+            return serde_json::to_value(answers.answers()).unwrap_or_default()
+        }
+        StoredAnswer::Legacy(text) => text,
+    };
+    serde_json::from_str(&answer).unwrap_or(serde_json::Value::String(answer))
+}
+
 pub(crate) async fn record_and_claim_answer_conn(
     conn: &cairn_db::turso::Connection,
     prompt_id: &str,
-    response: &str,
+    answers: &PromptAnswers,
     now_ms: i64,
 ) -> Result<Option<AnswerClaim>, DbError> {
     let mut rows = conn
@@ -251,10 +269,11 @@ pub(crate) async fn record_and_claim_answer_conn(
     if row.opt_text(1)?.is_some() || row.opt_i64(2)?.is_some() {
         return Ok(Some(AnswerClaim::AlreadyConsumed { wait_id }));
     }
+    let stored = answers.to_stored();
     let changed = conn
         .execute(
             "UPDATE prompts SET response=?2,answered_at=?3,mcp_consumed_at=?3 WHERE id=?1 AND response IS NULL AND withdrawn_at IS NULL AND mcp_consumed_at IS NULL",
-            params![prompt_id, response, now_ms],
+            params![prompt_id, stored.as_str(), now_ms],
         )
         .await?;
     if changed == 0 {
@@ -262,7 +281,7 @@ pub(crate) async fn record_and_claim_answer_conn(
     }
     Ok(Some(AnswerClaim::Claimed {
         wait_id,
-        answer: serde_json::Value::String(response.to_string()),
+        answer: mcp_input_value(&stored),
     }))
 }
 
@@ -643,9 +662,7 @@ async fn load_answer(db: &LocalDb, prompt_id: &str) -> Result<Option<serde_json:
         })
         .await
         .map_err(|e| e.to_string())?;
-    stored
-        .map(|answer| serde_json::from_str(&answer).or(Ok(serde_json::Value::String(answer))))
-        .transpose()
+    Ok(stored.map(|answer| mcp_input_value(&answer)))
 }
 
 fn apply_call_outcome(
@@ -900,20 +917,49 @@ mod tests {
         .await
         .unwrap();
 
+        let one = |text: &str| {
+            PromptAnswers::new(
+                1,
+                vec![crate::models::question::QuestionAnswer {
+                    index: 0,
+                    answer: text.to_string(),
+                }],
+            )
+            .unwrap()
+        };
+        let (yes, no, json_answer) = (one("yes"), one("no"), one(r#"{"approval":true}"#));
         let first = db
             .write(|conn| {
-                Box::pin(
-                    async move { record_and_claim_answer_conn(conn, "owned", "yes", 10).await },
-                )
+                let yes = yes.clone();
+                Box::pin(async move { record_and_claim_answer_conn(conn, "owned", &yes, 10).await })
             })
             .await
             .unwrap();
         assert!(
             matches!(first, Some(AnswerClaim::Claimed { wait_id, answer }) if wait_id == "w" && answer == serde_json::json!("yes"))
         );
+        // The stored value is the indexed form, and the MCP input read back
+        // from it is the same single answer the claim reported.
+        let stored = db
+            .query_opt_text("SELECT response FROM prompts WHERE id='owned'", ())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored, yes.to_stored());
+        assert_eq!(mcp_input_value(&stored), serde_json::json!("yes"));
+        assert_eq!(
+            mcp_input_value(&json_answer.to_stored()),
+            serde_json::json!({"approval": true})
+        );
+        assert_eq!(
+            mcp_input_value(r#"{"approval":true}"#),
+            serde_json::json!({"approval": true}),
+            "a legacy stored value is the single answer"
+        );
         let duplicate = db
             .write(|conn| {
-                Box::pin(async move { record_and_claim_answer_conn(conn, "owned", "no", 11).await })
+                let no = no.clone();
+                Box::pin(async move { record_and_claim_answer_conn(conn, "owned", &no, 11).await })
             })
             .await
             .unwrap();
@@ -925,8 +971,9 @@ mod tests {
         );
         let ordinary = db
             .write(|conn| {
+                let yes = yes.clone();
                 Box::pin(
-                    async move { record_and_claim_answer_conn(conn, "ordinary", "yes", 12).await },
+                    async move { record_and_claim_answer_conn(conn, "ordinary", &yes, 12).await },
                 )
             })
             .await

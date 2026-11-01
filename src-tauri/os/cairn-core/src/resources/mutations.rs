@@ -10,6 +10,7 @@ mod labels;
 mod mcp;
 mod memories;
 mod models_accounts;
+pub(crate) mod models_clients;
 pub mod packs;
 mod projects;
 mod recipes;

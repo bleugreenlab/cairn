@@ -153,7 +153,7 @@ pub fn parse_usage_windows(body: &str) -> Result<Vec<ProviderUsageWindow>, Strin
 /// that does not match the captured contract — returns `Err` and leaves the
 /// caller with no windows. None of them may invent a number.
 pub fn fetch_usage_windows(api_key: &str) -> Result<Vec<ProviderUsageWindow>, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = cairn_tls::blocking_client_builder()
         .timeout(USAGE_TIMEOUT)
         .build()
         .map_err(|error| format!("OpenCode Go usage client failed: {error}"))?;

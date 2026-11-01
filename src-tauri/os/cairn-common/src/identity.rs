@@ -111,6 +111,9 @@ enum AddressWire {
     Ingress {
         source_id: String,
     },
+    ServedApi {
+        service: String,
+    },
     None,
 }
 impl TryFrom<AddressWire> for Address {
@@ -141,6 +144,7 @@ impl TryFrom<AddressWire> for Address {
             AddressWire::Resource { node } => Self::Resource { node },
             AddressWire::Invoke { origin } => Self::Invoke { origin },
             AddressWire::Ingress { source_id } => Self::Ingress { source_id },
+            AddressWire::ServedApi { service } => Self::ServedApi { service },
             AddressWire::None => Self::None,
         };
         address.validate()?;
@@ -327,6 +331,9 @@ pub enum AppearanceTransport {
     /// An event an external system delivered through an ingress endpoint,
     /// authenticated by that endpoint's credential.
     Ingress,
+    /// A request to an API Cairn serves to outside clients (the models API),
+    /// authenticated by the calling client's own credential.
+    ServedApi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +367,11 @@ pub enum Address {
     /// The ingress endpoint (`src_…`) an event arrived through.
     Ingress {
         source_id: String,
+    },
+    /// The served API a request arrived through (`models`). The client is the
+    /// appearance's principal, so it is not repeated here.
+    ServedApi {
+        service: String,
     },
     None,
 }
@@ -402,6 +414,7 @@ impl Address {
                 }
             }
             Self::Ingress { source_id } => metadata(source_id, "source_id")?,
+            Self::ServedApi { service } => metadata(service, "service")?,
             Self::None => {}
         }
         Ok(())
@@ -424,6 +437,13 @@ pub enum VerificationMethod {
     /// HMAC additionally binds the payload bytes; a bearer token does not.
     /// None of them vouches for the person behind the account.
     SourceCredential,
+    /// A served-API client's own credential authenticated the request: the
+    /// presented key matched the client record it was issued or imported for.
+    /// `issuer` names the API (`cairn-api`), `subject` the immutable client id,
+    /// and `credential_ref` the client record (`served-api-client:<id>`),
+    /// never the key or its hash. Unlike [`Self::SourceCredential`], it
+    /// authenticates the mapped client principal, not a delivery boundary.
+    ApiClientCredential,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,7 +645,7 @@ impl VerificationRecord {
                         && session.is_some()
                         && credential_ref.is_none()
                 }
-                VerificationMethod::SourceCredential => {
+                VerificationMethod::SourceCredential | VerificationMethod::ApiClientCredential => {
                     issuer.is_some()
                         && subject.is_some()
                         && session.is_none()
@@ -956,6 +976,9 @@ mod tests {
             Address::Ingress {
                 source_id: "src_0123456789abcdefghijkl".into(),
             },
+            Address::ServedApi {
+                service: "models".into(),
+            },
             Address::None,
         ] {
             let decoded: Address =
@@ -963,6 +986,59 @@ mod tests {
             assert_eq!(decoded, value);
             decoded.validate().unwrap();
         }
+    }
+
+    /// A served-API client's appearance: the External principal, through the
+    /// models API, verified by its own credential with an opaque record ref.
+    #[test]
+    fn a_served_api_client_appearance_validates_and_its_ref_never_holds_a_hash() {
+        let verification = VerificationRecord::new(
+            VerificationMethod::ApiClientCredential,
+            VerificationStatus::Verified,
+            Some("cairn-api".into()),
+            Some("cli_0123456789abcdef".into()),
+            None,
+            Some(CredentialRef::new("served-api-client:cli_0123456789abcdef").unwrap()),
+            VerificationStrength::new("client-key").unwrap(),
+            10,
+        )
+        .unwrap();
+        let snapshot = AppearanceSnapshot::new(
+            PrincipalRef::External {
+                provider: "cairn-api".into(),
+                namespace: "default".into(),
+                id: "cli_0123456789abcdef".into(),
+            },
+            AppearanceEvidence::new(
+                AppearanceTransport::ServedApi,
+                Address::ServedApi {
+                    service: "models".into(),
+                },
+                verification,
+                11,
+                None,
+            )
+            .unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let decoded: AppearanceSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(decoded, snapshot);
+        // A session is not part of a client-key verification.
+        assert!(VerificationRecord::new(
+            VerificationMethod::ApiClientCredential,
+            VerificationStatus::Verified,
+            Some("cairn-api".into()),
+            Some("cli_0123456789abcdef".into()),
+            Some("session".into()),
+            Some(CredentialRef::new("served-api-client:cli_0123456789abcdef").unwrap()),
+            VerificationStrength::new("client-key").unwrap(),
+            10,
+        )
+        .is_err());
+        assert!(CredentialRef::new(format!("served-api-client:{}", "ab".repeat(32))).is_err());
     }
 
     #[test]
@@ -977,6 +1053,7 @@ mod tests {
             AppearanceTransport::AuthenticatedOperator,
             AppearanceTransport::AuthenticatedDesktop,
             AppearanceTransport::Ingress,
+            AppearanceTransport::ServedApi,
         ] {
             assert_eq!(
                 serde_json::from_str::<AppearanceTransport>(
@@ -993,6 +1070,7 @@ mod tests {
             VerificationMethod::ChannelAllowlist,
             VerificationMethod::NodeSession,
             VerificationMethod::SourceCredential,
+            VerificationMethod::ApiClientCredential,
         ] {
             assert_eq!(
                 serde_json::from_str::<VerificationMethod>(&serde_json::to_string(&value).unwrap())
@@ -1011,6 +1089,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AppearanceTransport::Ingress).unwrap(),
             "\"ingress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AppearanceTransport::ServedApi).unwrap(),
+            "\"served_api\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VerificationMethod::ApiClientCredential).unwrap(),
+            "\"api_client_credential\""
         );
         assert!(serde_json::from_str::<AppearanceTransport>("\"carrier_pigeon\"").is_err());
         assert!(serde_json::from_str::<VerificationMethod>("\"remote_intent\"").is_err());

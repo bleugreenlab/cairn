@@ -97,6 +97,8 @@ pub enum WithdrawalCause {
     ContextDropped,
     /// The operator compacted the session that raised the ask.
     OperatorCompact,
+    /// The operator stopped the job whose turn raised the ask.
+    OperatorStop,
 }
 
 impl From<HandoffClosed> for WithdrawalCause {
@@ -124,6 +126,7 @@ impl WithdrawalCause {
             Self::OperatorCompact => {
                 "the operator compacted the session that raised it, which stopped that session"
             }
+            Self::OperatorStop => "the operator stopped the work that raised it",
         }
     }
 }
@@ -150,6 +153,7 @@ mod withdrawal_cause_tests {
             ("batch_settled", WithdrawalCause::BatchSettled),
             ("context_dropped", WithdrawalCause::ContextDropped),
             ("operator_compact", WithdrawalCause::OperatorCompact),
+            ("operator_stop", WithdrawalCause::OperatorStop),
         ] {
             let row = format!(r#"{{"withdrawn":{{"cause":"{stored}"}}}}"#);
             assert_eq!(withdrawn_cause(Some(&row)), Some(cause));
@@ -1292,6 +1296,9 @@ impl AnswerSurface {
             )),
             AppearanceTransport::Ingress => {
                 Err("an ingress delivery never answers a permission".to_string())
+            }
+            AppearanceTransport::ServedApi => {
+                Err("a served-API request never answers a permission".to_string())
             }
         }
     }

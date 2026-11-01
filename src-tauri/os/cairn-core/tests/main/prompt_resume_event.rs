@@ -138,7 +138,7 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
             conn.execute(
                 "INSERT INTO prompts(id, run_id, job_id, turn_id, questions, created_at, tool_use_id)
                  VALUES ('prompt-1', 'run-1', 'job-1', 'turn-1',
-                         '[{\"question\":\"Which approach?\"}]', 1, 'toolu_question')",
+                         '[{\"question\":\"Which approach?\",\"options\":[]}]', 1, 'toolu_question')",
                 (),
             ).await?;
             conn.execute(
@@ -155,7 +155,17 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
         })
     }).await.unwrap();
 
-    let answer = r#"{"applied":[],"blocking":{"text":"This is answer data, not another host report","artifact_uri":"cairn://child"}}"#;
+    // Answer data that looks like a host report, spanning several lines with
+    // a list: it must reach the agent opaque and byte for byte.
+    let answer = "{\"applied\":[],\"blocking\":{\"text\":\"This is answer data, not another host report\",\"artifact_uri\":\"cairn://child\"}}\n\n1. a\n2. b\n";
+    let answers = cairn_core::models::question::PromptAnswers::new(
+        1,
+        vec![cairn_core::models::question::QuestionAnswer {
+            index: 0,
+            answer: answer.to_string(),
+        }],
+    )
+    .unwrap();
     let provenance = ResolutionProvenance {
         id: "answer-resolution".to_string(),
         surface: AppearanceTransport::ChannelReply,
@@ -163,7 +173,7 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
         conversation: Some("test-conversation".to_string()),
         actor: Some("test-actor".to_string()),
     };
-    let outcome = answer_prompt_id(&orch, "prompt-1", answer.to_string(), provenance).await;
+    let outcome = answer_prompt_id(&orch, "prompt-1", answers.clone(), provenance).await;
     // This fixture has no launchable execution. Dispatch may fail only after the
     // real answer producer has durably written its synthetic transcript event.
     if let Err(error) = outcome {
@@ -189,12 +199,16 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
     let report = stream.next().unwrap().unwrap();
     assert_eq!(&result[stream.byte_offset()..], suffix);
     let mut expected = original;
-    expected["blocking"] = json!({"text": answer});
+    expected["blocking"] = json!({"text": answer, "answers": [{"index": 0, "answer": answer}]});
     assert_eq!(
         report, expected,
         "only the host blocking payload may change"
     );
     assert_eq!(report["blocking"]["text"], answer);
+    assert_eq!(
+        report["blocking"]["answers"][0]["answer"], answer,
+        "the structured answer carries the same bytes"
+    );
 
     assert_eq!(
         common::scalar_text_by_id(
@@ -212,9 +226,8 @@ async fn answered_write_question_preserves_report_and_opaque_answer() {
             "SELECT response FROM prompts WHERE id = ?1",
             "prompt-1",
         )
-        .await
-        .as_deref(),
-        Some(answer),
+        .await,
+        Some(answers.to_stored()),
     );
     let receipt: cairn_db::models::ResolutionReceipt =
         serde_json::from_value(event["raw"]["resolution"].clone()).unwrap();

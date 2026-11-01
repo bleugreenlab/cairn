@@ -1960,14 +1960,16 @@ async fn resolve_subjects(
             let mut any_question = HashSet::new();
             if !question_ids.is_empty() {
                 let sql = format!(
-                    "SELECT r.issue_id, p.response FROM runs r JOIN prompts p ON p.run_id = r.id
+                    "SELECT r.issue_id, p.response IS NULL AND p.withdrawn_at IS NULL
+                       FROM runs r JOIN prompts p ON p.run_id = r.id
                       WHERE r.issue_id IN ({})",
                     placeholders(question_ids.len())
                 );
                 let mut rows = conn.query(&sql, text_params(&question_ids)).await?;
                 while let Some(row) = rows.next().await? {
                     let issue_id = row.text(0)?;
-                    if row.opt_text(1)?.is_none() {
+                    // A withdrawn question is closed: nobody can answer it.
+                    if row.i64(1)? != 0 {
                         open_question.insert(issue_id.clone());
                     }
                     any_question.insert(issue_id);
@@ -3337,6 +3339,15 @@ mod tests {
         db.execute_script("UPDATE prompts SET response='answered' WHERE id='q';")
             .await
             .unwrap();
+        assert!(!lazy_resolve_live(&db, &p).await.unwrap());
+
+        // A withdrawn question resolves the push too: it has no answer and
+        // never will.
+        db.execute_script(
+            "UPDATE prompts SET response=NULL, withdrawn_at=2, withdrawn_cause='operator_stop' WHERE id='q';",
+        )
+        .await
+        .unwrap();
         assert!(!lazy_resolve_live(&db, &p).await.unwrap());
     }
 

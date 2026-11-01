@@ -45,7 +45,7 @@ impl BrokeredContentStore {
             api,
             minter,
             local,
-            client: reqwest::Client::new(),
+            client: cairn_tls::client().clone(),
         }
     }
 

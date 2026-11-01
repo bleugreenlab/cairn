@@ -46,6 +46,7 @@ pub mod embed;
 pub mod image;
 pub mod interface;
 pub mod openrouter;
+pub mod relay;
 pub mod session;
 pub mod sign_in;
 pub mod speak;

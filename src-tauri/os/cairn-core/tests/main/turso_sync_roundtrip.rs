@@ -2106,12 +2106,12 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     };
     let ask_result = ask_questions(&orch, &request, payload, true, None).await;
     assert!(
-        !ask_result.contains("No run found"),
-        "ask_questions must route to the replica, not fail with the live `No run found` bug: {ask_result}"
+        !ask_result.text.contains("No run found"),
+        "ask_questions must route to the replica, not fail with the live `No run found` bug: {ask_result:?}"
     );
     assert!(
-        ask_result.contains("recorded"),
-        "background ask_questions records the prompt: {ask_result}"
+        ask_result.text.contains("recorded"),
+        "background ask_questions records the prompt: {ask_result:?}"
     );
 
     // The prompt row landed in the REPLICA, addressable at q-1...
@@ -2164,7 +2164,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
             .await
             .unwrap()
             .as_deref(),
-        Some("Proceed"),
+        Some(r#"[{"index":0,"answer":"Proceed"}]"#),
         "the answer is recorded in the team replica"
     );
     // No prompt — answered or otherwise — leaked to the private database.
@@ -2223,8 +2223,8 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     ));
     let local_ask = ask_questions(&orch, &local_request, local_payload, true, None).await;
     assert!(
-        local_ask.contains("recorded"),
-        "a local background ask records the prompt in the private DB: {local_ask}"
+        local_ask.text.contains("recorded"),
+        "a local background ask records the prompt in the private DB: {local_ask:?}"
     );
     answer_node_question(
         &orch,
@@ -2247,7 +2247,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
             .await
             .unwrap()
             .as_deref(),
-        Some("Local"),
+        Some(r#"[{"index":0,"answer":"Local"}]"#),
         "a local question is asked and answered in the private DB unchanged"
     );
 }

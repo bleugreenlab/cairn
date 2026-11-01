@@ -501,7 +501,7 @@ pub(crate) fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<Fetc
             ref_and_path,
             is_blob_skill_md,
         } => {
-            let client = reqwest::blocking::Client::builder()
+            let client = cairn_tls::blocking_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

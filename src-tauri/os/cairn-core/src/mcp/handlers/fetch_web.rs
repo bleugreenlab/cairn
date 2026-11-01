@@ -41,7 +41,9 @@ pub(crate) async fn read_fetch_markdown(
 /// The built-in plain-HTTP fetch: an async reqwest GET with content-type-aware
 /// conversion.
 async fn regular_fetch(target: &str) -> Result<String, String> {
-    let resp = reqwest::get(target)
+    let resp = cairn_tls::client()
+        .get(target)
+        .send()
         .await
         .map_err(|e| format!("Failed to fetch `{target}`: {e}"))?;
     read_markdown_response(resp, target).await
@@ -55,8 +57,7 @@ async fn jina_fetch(target: &str) -> Result<String, String> {
         None => return Ok(missing_key_message(FetchProviderId::Jina)),
     };
     let url = format!("https://r.jina.ai/{target}");
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = cairn_tls::client()
         .get(&url)
         .header("Authorization", format!("Bearer {}", key.expose()))
         .header("X-Return-Format", "markdown")
@@ -85,8 +86,7 @@ async fn firecrawl_fetch(
         "formats": ["markdown"],
         "onlyMainContent": only_main,
     });
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = cairn_tls::client()
         .post("https://api.firecrawl.dev/v1/scrape")
         .header("Authorization", format!("Bearer {}", key.expose()))
         .header("Content-Type", "application/json")
@@ -145,7 +145,7 @@ async fn cloudflare_fetch(
     let Some(request) = cloudflare_request(target, options) else {
         return Ok(cloudflare_setup_message());
     };
-    let response = reqwest::Client::new()
+    let response = cairn_tls::client()
         .post(&request.url)
         .bearer_auth(token.expose())
         .json(&request.body)

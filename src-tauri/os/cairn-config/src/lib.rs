@@ -18,6 +18,7 @@ pub mod presets;
 pub mod project_reference;
 pub mod project_settings;
 pub mod providers;
+pub mod served_api;
 pub mod settings;
 pub mod voice;
 pub mod yaml_edit;

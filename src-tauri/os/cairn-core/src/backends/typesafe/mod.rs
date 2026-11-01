@@ -216,7 +216,7 @@ pub(crate) fn assemble(
 fn list_models(api_key: &str) -> Result<String, String> {
     let bearer = HeaderValue::from_str(&format!("Bearer {api_key}"))
         .map_err(|error| format!("invalid TypeSafe API key header: {error}"))?;
-    let response = reqwest::blocking::Client::builder()
+    let response = cairn_tls::blocking_client_builder()
         .timeout(LISTING_TIMEOUT)
         .build()
         .map_err(|error| format!("TypeSafe model listing client failed: {error}"))?

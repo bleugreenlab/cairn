@@ -2022,6 +2022,18 @@ async fn render_resource_body(
                 None => crate::resources::models::render_sessions(orch),
             }
         }
+        CairnResource::ModelsClients => {
+            match reject_query_params("cairn://models/clients", &params) {
+                Some(error) => error,
+                None => crate::resources::models::render_clients(orch, None).await,
+            }
+        }
+        CairnResource::ModelsClient { id } => {
+            match reject_query_params("cairn://models/clients/{id}", &params) {
+                Some(error) => error,
+                None => crate::resources::models::render_clients(orch, Some(&id)).await,
+            }
+        }
         CairnResource::ModelsSession { id } => {
             match reject_query_params("cairn://models/sessions/{id}", &params) {
                 Some(error) => error,
