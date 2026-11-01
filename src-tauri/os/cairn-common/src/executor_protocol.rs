@@ -6080,6 +6080,18 @@ pub struct LearnedResourceEstimate {
 /// gets wrong talking to an older executor: nothing; that executor's samples
 /// carry no window, and the drain falls back to the bound alone, exactly as
 /// before. An older runner ignores the field.
+///
+/// cairn/5049 does not move the number. [`admission_provisions`] stops
+/// counting a batch inside a residency live on the machine as provisioning
+/// when that machine receives managed objects, because managed preparation now
+/// serializes itself per repository and no longer needs the project's
+/// provisioning hold. No frame or field changes. What a runner gets wrong
+/// talking to an older executor: it reads such a batch as free of the hold
+/// while that executor still takes and waits on it, so the batch is offered
+/// and declined `ProjectProvisioning` as before, and the decline is waited out
+/// as any other. An older runner talking to a newer executor still reads the
+/// batch as held, but work inside a residency is bound to its machine and is
+/// offered there regardless, where the newer executor admits it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -15877,43 +15889,27 @@ impl ResidencyFence {
 /// Whether admitting work provisions a cell, and so must take, or wait on, its
 /// project's provisioning hold.
 ///
-/// The hold guards materialization: managed object preparation, cell
-/// provisioning, and the checkout a slot gets before its lease. Only work
-/// whose admission skips all of it is exempt:
+/// The hold guards materialization: cell provisioning and the checkout a slot
+/// gets before its lease. Only work whose admission skips both is exempt:
 ///
 /// - work against an existing checkout, which the executor never provisions;
-/// - work bound to a residency active on the machine (`resident_here`) that
-///   does not prepare managed objects, which runs in the cell its residency
-///   already holds.
+/// - work bound to a residency active on the machine (`resident_here`), which
+///   runs in the cell its residency already holds.
 ///
-/// Everything else provisions. That includes a detached batch that will reuse
-/// a warm cell, because preparing that slot is materialization, and a resident
-/// batch on a machine that receives managed objects (see
-/// [`resident_work_provisions`]).
+/// Everything else provisions, including a detached batch that will reuse a
+/// warm cell, because preparing that slot is materialization.
+///
+/// Managed object preparation, which every `ManagedObjects` request runs,
+/// resident or not, is not what the hold guards. It serializes itself per
+/// repository inside the executor's object cache, so a resident batch on a
+/// machine that receives managed objects waits only for another preparation
+/// of the same repository, and only when its commit is not already resident.
 ///
 /// The one answer for the executor's admission and for the runner reading a
 /// machine's posted state before it offers: two copies would be free to
 /// disagree about exactly which work the hold delays.
 pub fn admission_provisions(repository: &RepositoryLocator, resident_here: bool) -> bool {
-    if matches!(repository, RepositoryLocator::ExistingCheckout { .. }) {
-        return false;
-    }
-    if resident_here {
-        return resident_work_provisions(repository);
-    }
-    true
-}
-
-/// Whether work inside a live residency still provisions.
-///
-/// The executor prepares managed objects for every `ManagedObjects` request,
-/// resident or not: the batch needs the prepared repository and its cache pin
-/// to publish its delta. That preparation initializes the shared object
-/// database, rewrites the cache manifest, and can fetch and evict packs, and
-/// the hold is what serializes it per project. Keep this in step with the
-/// preparation match in the executor's `run_admission`.
-pub fn resident_work_provisions(repository: &RepositoryLocator) -> bool {
-    matches!(repository, RepositoryLocator::ManagedObjects { .. })
+    !resident_here && !matches!(repository, RepositoryLocator::ExistingCheckout { .. })
 }
 
 /// A bounded, read-only request against an already-live resident materialization.
@@ -17591,6 +17587,42 @@ pub enum RunnerCallbackResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work inside a residency live on the machine provisions nothing, however
+    /// its objects arrive: a remote machine is offered managed objects, and
+    /// their preparation serializes itself rather than taking the hold.
+    /// Outside a residency only an existing checkout is exempt.
+    #[test]
+    fn only_fresh_work_outside_an_existing_checkout_provisions() {
+        let managed = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "r".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        let colocated = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "r".into(),
+            absolute_path: "/repo".into(),
+        };
+        let checkout = RepositoryLocator::ExistingCheckout {
+            project_id: "p".into(),
+            repository_id: "r".into(),
+            absolute_path: "/checkout".into(),
+        };
+        let scratch = RepositoryLocator::ScratchOnly {
+            owner_id: "o".into(),
+        };
+        for repository in [&managed, &colocated, &checkout, &scratch] {
+            assert!(
+                !admission_provisions(repository, true),
+                "resident work provisions nothing: {repository:?}"
+            );
+        }
+        assert!(admission_provisions(&managed, false));
+        assert!(admission_provisions(&colocated, false));
+        assert!(admission_provisions(&scratch, false));
+        assert!(!admission_provisions(&checkout, false));
+    }
 
     /// The derived constant took over from a literal 157 (cairn/5222). It can
     /// only grow from there, it is the ledger's own reading of this file, and
