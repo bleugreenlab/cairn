@@ -6302,6 +6302,20 @@ pub struct LearnedResourceEstimate {
 /// explains that 401 as it explains any failed call. An older runner quotes
 /// the new stages as it quotes every other.
 ///
+/// cairn/5784 does not move the number. No frame, variant, field or
+/// serialized form changes. An executor's periodic write-back pass now also
+/// sends the node scratch replica a live terminal or REPL holds, as that
+/// process's writer, through the same `scratch/*` calls and per-path merge
+/// every write-back uses, instead of leaving it until the process exits. The
+/// runner stops refusing a terminal or REPL because another live process of
+/// the node runs on another machine, and draws a batch that names no machine
+/// to a holder's machine only when that machine is connected and not drained,
+/// through the `executor` selector it already sends. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently; that
+/// executor's live process writes back only at exit, so a batch elsewhere sees
+/// its writes later, and the run result already names writes a machine holds
+/// that have not been written back.
+///
 /// Version 161 (cairn/5709) lets a page's service call run code. It adds
 /// [`ProcessSandboxMode::PageCall`], [`PolicyMode::PageCall`], the containment
 /// edges [`EdgeId::PageCallFilesystemRead`] and [`EdgeId::PageCallEgress`],

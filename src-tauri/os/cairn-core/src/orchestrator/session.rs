@@ -1172,7 +1172,7 @@ fn build_orientation_block(
         // that moves it, what never travels, and that a host path is a fact
         // about one machine.
         out.push_str(
-            "- Scratch: `$TMPDIR` \u{2014} this node's scratch and the one place for data you produce. It is shared with your sub-agent tasks (a task's scratch is its parent's), brought current on whichever machine a batch, terminal, or REPL lands on, written back when each batch ends (the run result reports bytes and seconds), and kept until this issue resolves (or this thread closes). It is working space, not a record: a write-back can be delayed or refused and the scratch ends with its node, so a task's results belong in what it returns. Up to the project's ceiling travels (512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`); a write-back past it is refused by name and leaves your files where they are on that machine until you shrink the scratch. `node_modules`, `.venv`, `target` and nested git repositories inside it do not travel. A path outside the repository and `$TMPDIR` is a fact about one host that no other machine sees\n",
+            "- Scratch: `$TMPDIR` \u{2014} this node's scratch and the one place for data you produce. It is shared with your sub-agent tasks (a task's scratch is its parent's), brought current on whichever machine a batch, terminal, or REPL lands on, written back when each batch ends and, from a live terminal or REPL, every two minutes and when it exits (the run result reports bytes and seconds), and kept until this issue resolves (or this thread closes). It is working space, not a record: a write-back can be delayed or refused and the scratch ends with its node, so a task's results belong in what it returns. Up to the project's ceiling travels (512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`); a write-back past it is refused by name and leaves your files where they are on that machine until you shrink the scratch. `node_modules`, `.venv`, `target` and nested git repositories inside it do not travel. A path outside the repository and `$TMPDIR` is a fact about one host that no other machine sees\n",
         );
     }
     out.push_str(
@@ -3063,6 +3063,7 @@ mod tests {
         );
         assert!(block.contains("so a task's results belong in what it returns"));
         assert!(block.contains("brought current on whichever machine"));
+        assert!(block.contains("from a live terminal or REPL, every two minutes and when it exits"));
         assert!(block.contains("kept until this issue resolves (or this thread closes)"));
         assert!(block.contains("512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`"));
         assert!(block.contains("refused by name"));

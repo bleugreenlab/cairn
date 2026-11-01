@@ -4311,53 +4311,46 @@ async fn prepare_and_run_batch(
     }
 
     // The node scratch: this batch's `$TMPDIR` wherever it lands. Resolved
-    // before residence, because a live terminal or REPL holding it is the one
-    // thing that decides where a batch with no selector of its own runs: on
-    // that process's machine, exactly as if the batch had named it. An
-    // explicit selector still wins, and the result then says what the holder
-    // has not yet written back.
+    // before residence, because a live terminal or REPL holding it draws a
+    // batch with no selector of its own to that process's machine, as if the
+    // batch had named it, when that machine can take it. Affinity, never a
+    // pin: when no holder's machine can, the batch is placed as it otherwise
+    // would be. An explicit selector always wins, and the result then says
+    // what a holder elsewhere has not yet written back.
     let node_scratch = match (has_process, run_context.as_ref(), run_db.as_deref()) {
         (true, Some(ctx), Some(db)) if !page_call => {
             crate::node_scratch::grant_for_job(orch, db, &ctx.job_id).await
         }
         _ => None,
     };
-    // Why this batch went where it did, when the pin chose for it. Carried to
-    // every outcome, so a refusal on the holder's machine names the holder
-    // rather than reading as a selector the agent passed.
-    let mut scratch_pin: Option<String> = None;
-    if let (Some((_, resolved)), Some(db)) = (node_scratch.as_ref(), run_db.as_deref()) {
+    // What the holders' affinity did with this batch. Carried to every
+    // outcome, so a refusal on a holder's machine names the holder rather than
+    // reading as a selector the agent passed.
+    let mut scratch_affinity: Option<String> = None;
+    if let (Some((_, resolved)), Some(db), Some(ctx)) = (
+        node_scratch.as_ref(),
+        run_db.as_deref(),
+        run_context.as_ref(),
+    ) {
         let unselected = payload
             .executor
             .as_ref()
             .is_none_or(|selector| selector.is_empty());
         if unselected {
-            if let Some((executor_id, holders)) =
-                crate::node_scratch::holders::pin(orch, db, resolved).await
+            if let Some(affinity) =
+                crate::node_scratch::holders::affinity(orch, db, resolved, &ctx.job_id).await
             {
-                match orch.fleet.executor_display_name(&executor_id) {
-                    Some(name) => {
-                        scratch_pin = Some(crate::node_scratch::holders::pin_note(
-                            &holders,
-                            &orch.fleet.executor_name_for_text(&executor_id),
-                        ));
-                        payload.executor = Some(ExecutorSelector {
-                            name: Some(name),
-                            ..ExecutorSelector::default()
-                        })
-                    }
-                    None => {
-                        let processes = crate::node_scratch::holders::named(&holders);
-                        return run_envelope(
-                            RunFailure::NotExecuted(format!(
-                                "this node's scratch is held by {processes} running on {}, which is not connected and cannot hold this batch. Stop {processes}, or pass `executor` to run elsewhere against the scratch as last synced.",
-                                orch.fleet.executor_name_for_text(&executor_id)
-                            ))
-                            .text(),
-                            Vec::new(),
-                        );
-                    }
+                if let Some(name) = affinity
+                    .executor_id
+                    .as_deref()
+                    .and_then(|executor_id| orch.fleet.executor_display_name(executor_id))
+                {
+                    payload.executor = Some(ExecutorSelector {
+                        name: Some(name),
+                        ..ExecutorSelector::default()
+                    });
                 }
+                scratch_affinity = Some(affinity.note);
             }
         }
     }
@@ -4378,8 +4371,8 @@ async fn prepare_and_run_batch(
     } {
         Ok(residence) => residence,
         Err(refusal) => {
-            let detail = match scratch_pin.as_deref() {
-                Some(pin) => format!("{refusal}.\n\n{pin}"),
+            let detail = match scratch_affinity.as_deref() {
+                Some(note) => format!("{refusal}.\n\n{note}"),
                 None => format!("{refusal}."),
             };
             return run_envelope(RunFailure::NotExecuted(detail).text(), Vec::new());
@@ -4647,7 +4640,7 @@ async fn prepare_and_run_batch(
             };
             let settlement = RunBatchSettlement {
                 node_scratch: node_scratch.map(|(_, resolved)| resolved.scratch),
-                scratch_pin,
+                scratch_affinity,
                 request: request.clone(),
                 run_context,
                 commit_msg: payload.commit_msg,
@@ -4703,7 +4696,7 @@ async fn prepare_and_run_batch(
         marker_escape,
         // Host items (MCP calls, REPL sends, model calls) have no `$TMPDIR`.
         node_scratch: None,
-        scratch_pin: None,
+        scratch_affinity: None,
     };
     let suspendable = batch.may_outlive_grace();
     off_frame(|| run_host_batch(orch, settlement, batch, control, deadlines, suspendable)).await
@@ -5365,9 +5358,9 @@ struct RunBatchSettlement {
     marker_escape: Option<String>,
     /// The node scratch as its authority stood when the batch was granted.
     node_scratch: Option<crate::node_scratch::NodeScratch>,
-    /// Why placement put this batch beside the live process holding its
-    /// node's scratch, when it named no machine of its own.
-    scratch_pin: Option<String>,
+    /// What the node scratch's holders' affinity did with this batch, when it
+    /// named no machine of its own.
+    scratch_affinity: Option<String>,
 }
 
 impl RunBatchSettlement {
@@ -5585,17 +5578,18 @@ struct PlacementNotes {
     /// What the node scratch's write-back reported. Only a batch that ran
     /// writes back, so it is true only of an outcome that executed.
     scratch: Option<String>,
-    /// The batch named no machine and was placed beside the live process
-    /// holding its node's scratch. True of the placement, so it rides on every
-    /// outcome: a batch that cannot run there must say why it was there.
-    scratch_pin: Option<String>,
+    /// The batch named no machine, and a live process holding its node's
+    /// scratch drew it to that machine, or could not. True of the placement,
+    /// so it rides on every outcome: a batch that cannot run there must say
+    /// why it was there.
+    scratch_affinity: Option<String>,
 }
 
 impl PlacementNotes {
     /// Everything, for an outcome that executed.
     fn executed(&self) -> Option<String> {
         [
-            self.scratch_pin.clone(),
+            self.scratch_affinity.clone(),
             self.drained_home.clone(),
             self.ran_elsewhere.clone(),
             self.above_ceiling.clone(),
@@ -5609,7 +5603,7 @@ impl PlacementNotes {
     /// Only what a claim makes true, for an outcome that may not have run.
     fn claimed(&self) -> Option<String> {
         [
-            self.scratch_pin.clone(),
+            self.scratch_affinity.clone(),
             self.drained_home.clone(),
             self.above_ceiling.clone(),
         ]
@@ -5953,8 +5947,8 @@ async fn place_and_run_attempts(
                 above_ceiling: above_ceiling.map(|above| above.note()),
                 drained_home,
                 scratch: None,
-                // Filled at settlement, which holds why the batch was pinned.
-                scratch_pin: None,
+                // Filled at settlement, which holds what the affinity did.
+                scratch_affinity: None,
             };
             return PlacedBatch::Cell(Box::new(outcome), residence, notes);
         }
@@ -7128,8 +7122,8 @@ async fn settle_joined_batch(
     };
     let commits = settlement.commit_msg.is_some();
     let refused = |detail: String| {
-        let detail = match settlement.scratch_pin.as_deref() {
-            Some(pin) => format!("{detail}\n\n{pin}"),
+        let detail = match settlement.scratch_affinity.as_deref() {
+            Some(note) => format!("{detail}\n\n{note}"),
             None => detail,
         };
         SettledRunBatch::failure(
@@ -7139,7 +7133,7 @@ async fn settle_joined_batch(
     match placed {
         PlacedBatch::Cell(outcome, residence, notes) => {
             let notes = PlacementNotes {
-                scratch_pin: settlement.scratch_pin.clone(),
+                scratch_affinity: settlement.scratch_affinity.clone(),
                 ..notes
             };
             off_frame(|| {
@@ -8126,17 +8120,17 @@ mod tests {
         };
         assert_eq!(notes.executed().as_deref(), Some(sentence));
         assert_eq!(notes.claimed().as_deref(), Some(sentence));
-        let pinned = PlacementNotes {
-            scratch_pin: Some("placed beside terminal `dev`".into()),
+        let beside = PlacementNotes {
+            scratch_affinity: Some("placed beside terminal `dev`".into()),
             ..PlacementNotes::default()
         };
         assert_eq!(
-            pinned.claimed().as_deref(),
+            beside.claimed().as_deref(),
             Some("placed beside terminal `dev`"),
-            "a pinned batch that never ran still says why it was there"
+            "a batch placed beside a holder that never ran still says why it was there"
         );
         assert_eq!(
-            pinned.executed().as_deref(),
+            beside.executed().as_deref(),
             Some("placed beside terminal `dev`")
         );
         let unavailable = settled_failure_text(
@@ -8444,7 +8438,7 @@ mod tests {
             above_ceiling: Some("Note: no executor can hold this batch's measured ~9.6 GiB (largest ceiling 7.7 GiB on bgsrv-ub); it was placed on **bgsrv-ub** at the clamp.".into()),
             drained_home: None,
             scratch: None,
-            scratch_pin: None,
+            scratch_affinity: None,
         }
     }
 
@@ -9773,7 +9767,7 @@ mod host_batch_tests {
             status_before: None,
             marker_escape: None,
             node_scratch: None,
-            scratch_pin: None,
+            scratch_affinity: None,
         };
         let batch = HostBatch {
             request: request.clone(),

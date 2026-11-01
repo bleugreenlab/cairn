@@ -722,37 +722,16 @@ pub async fn process_spec(
         crate::fleet::residency::runner_callback_url(orch),
         orch.mcp_auth.get_secret_for_mcp().ok(),
     );
-    // A REPL makes its node's scratch its `$TMPDIR` and, while it lives, holds
-    // the scratch's writer on its machine: a second live process of the same
-    // node on another machine is refused, by name.
-    let node_scratch = match crate::node_scratch::grant_for_run(
+    // A REPL makes its node's scratch its `$TMPDIR`, wherever it runs. Another
+    // live process of the node on another machine is no reason to refuse it:
+    // their write-backs merge per path (`node_scratch::merge`).
+    let node_scratch = crate::node_scratch::grant_for_run(
         orch,
         run_context.map(|ctx| ctx.run_id.as_str()),
         job_id,
     )
     .await
-    {
-        Some((grant, resolved, db)) => {
-            let here = orch
-                .fleet
-                .predicted_job_home(&cairn_common::executor_protocol::ResidencyHolder::Job {
-                    job_id: job_id.to_owned(),
-                })
-                .map(|home| home.executor_id);
-            {
-                crate::node_scratch::holders::refuse_second_writer(
-                    orch,
-                    &db,
-                    &resolved.owner_job_id,
-                    here.as_deref(),
-                    "REPL",
-                )
-                .await?;
-            }
-            Some(grant)
-        }
-        None => None,
-    };
+    .map(|(grant, _, _)| grant);
     Ok(ResidentProcessSpec {
         runtime_packages,
         program,

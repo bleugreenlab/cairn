@@ -1,5 +1,6 @@
-//! Portable node scratch, end to end across two physically separate machines
-//! (cairn/5253), one test per acceptance item of the issue.
+//! Portable node scratch, end to end across physically separate machines
+//! (cairn/5253), one test per acceptance item of the issue, and a holder's
+//! machine as affinity rather than a lock (cairn/5784).
 //!
 //! Every machine here is a real, non-colocated `ExecutorRuntime` with its own
 //! home, reaching the runner only over an HTTP object channel. The object
@@ -48,6 +49,8 @@ use tempfile::TempDir;
 
 pub(crate) const MACHINE_A: &str = "scratch-a";
 pub(crate) const MACHINE_B: &str = "scratch-b";
+/// Attached only by the tests that need a machine neither of the others is.
+const MACHINE_C: &str = "scratch-c";
 const OWNER: &str = "cairn://p/nsc/1/1/builder";
 const BRANCH: &str = "agent/NSC-1-builder-0";
 
@@ -66,6 +69,8 @@ pub(crate) struct TwoMachines {
     pub base: String,
     pub homes: [PathBuf; 2],
     pub object_url: String,
+    /// Each machine's executor, in `homes` order.
+    pub pools: Vec<cairn_exec::Fleet>,
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -135,15 +140,19 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let object_url = format!("http://{address}");
     let homes = [temp.path().join("home-a"), temp.path().join("home-b")];
-    for (machine, home) in [MACHINE_A, MACHINE_B].into_iter().zip(&homes) {
-        common::attach_isolated_test_executor_as(
-            &orch,
-            machine,
-            home.clone(),
-            object_url.clone(),
-            project_id.clone(),
-        );
-    }
+    let pools = [MACHINE_A, MACHINE_B]
+        .into_iter()
+        .zip(&homes)
+        .map(|(machine, home)| {
+            common::attach_isolated_test_executor_as(
+                &orch,
+                machine,
+                home.clone(),
+                object_url.clone(),
+                project_id.clone(),
+            )
+        })
+        .collect();
     TwoMachines {
         temp,
         orch,
@@ -153,6 +162,7 @@ async fn two_machines_with(config: Option<&str>) -> TwoMachines {
         base,
         homes,
         object_url,
+        pools,
     }
 }
 
@@ -529,25 +539,82 @@ impl Node {
     }
 
     pub(crate) async fn start_terminal(&self, slug: &str, script: &str) -> String {
+        self.start_terminal_of("r-1", OWNER, slug, None, script)
+            .await
+    }
+
+    /// A terminal of the job behind `run_id`, whose node is `node_uri`, on
+    /// `machine` when one is named.
+    async fn start_terminal_of(
+        &self,
+        run_id: &str,
+        node_uri: &str,
+        slug: &str,
+        machine: Option<&str>,
+        script: &str,
+    ) -> String {
         assert!(!script.contains('\''), "terminal scripts are single-quoted");
+        let mut create = json!({ "command": format!("sh -c '{script}'"), "wake": "exit" });
+        if let Some(machine) = machine {
+            create["executor"] = json!({ "name": machine });
+        }
         handle_write(
             self.orch(),
             &McpCallbackRequest {
                 answer_bound_ms: None,
                 thread_id: None,
                 cwd: String::new(),
-                run_id: Some("r-1".to_string()),
+                run_id: Some(run_id.to_string()),
                 tool: "write".to_string(),
                 payload: json!({ "changes": [{
-                    "target": format!("{OWNER}/terminal/{slug}"),
+                    "target": format!("{node_uri}/terminal/{slug}"),
                     "mode": "create",
-                    "payload": { "command": format!("sh -c '{script}'"), "wake": "exit" }
+                    "payload": create
                 }]}),
                 tool_use_id: None,
                 origin: None,
             },
         )
         .await
+    }
+
+    /// Attach a third machine, neither of the node's first two.
+    async fn attach_third(&self) -> PathBuf {
+        let home = self.machines.temp.path().join("home-c");
+        let (orch, url, project, attached) = (
+            self.orch().clone(),
+            self.machines.object_url.clone(),
+            self.machines.project_id.clone(),
+            home.clone(),
+        );
+        // Opening an executor runtime reads and writes its home, which the
+        // executor's blocking guard admits only inside its own offload.
+        cairn_exec::blocking::offload(move || {
+            common::attach_isolated_test_executor_as(&orch, MACHINE_C, attached, url, project);
+        })
+        .await;
+        home
+    }
+
+    /// How many times the scratch's head has advanced.
+    async fn head_seq(&self) -> i64 {
+        self.machines
+            .db
+            .query_opt_i64("SELECT MAX(head_seq) FROM node_scratches", ())
+            .await
+            .unwrap()
+            .unwrap_or(0)
+    }
+
+    /// Wait for the scratch's head to have advanced `seq` times.
+    async fn head_reaches(&self, seq: i64) {
+        for _ in 0..400 {
+            if self.head_seq().await >= seq {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the scratch head never advanced {seq} times");
     }
 
     fn disconnect(&self, machine: &str) {
@@ -782,12 +849,14 @@ async fn a_write_back_past_the_ceiling_is_refused_by_name_and_resumes_once_it_fi
     assert!(shrunk.contains("wrote back"), "{shrunk}");
 }
 
-/// Acceptance 5: a live terminal on a machine pins the node's next batch with
-/// no selector there, and when that machine cannot take it the refusal names
-/// the terminal.
+/// Acceptance 5 (cairn/5784): a live terminal on a machine draws the node's
+/// next batch with no selector there by affinity, and when that machine cannot
+/// take it the batch runs elsewhere, never refused, and says why.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_live_terminal_pins_unselected_batches_and_a_refusal_names_it() {
-    if common::skip_if_fenced("a_live_terminal_pins_unselected_batches_and_a_refusal_names_it") {
+async fn a_live_terminal_draws_unselected_batches_by_affinity_and_never_refuses_them() {
+    if common::skip_if_fenced(
+        "a_live_terminal_draws_unselected_batches_by_affinity_and_never_refuses_them",
+    ) {
         return;
     }
     let node = node().await;
@@ -798,7 +867,7 @@ async fn a_live_terminal_pins_unselected_batches_and_a_refusal_names_it() {
         .await;
     node.drain(MACHINE_B, false).await;
     node.drain(MACHINE_A, false).await;
-    // A task's own home could be anywhere; the terminal decides.
+    // A task's own home could be anywhere; the terminal draws it.
     let task = node.add_task("probe").await;
     let where_ran = node.shell(&task, None, "echo \"tmp=$TMPDIR\"").await;
     let home_a = node.machines.homes[0].display().to_string();
@@ -806,10 +875,222 @@ async fn a_live_terminal_pins_unselected_batches_and_a_refusal_names_it() {
         where_ran.contains(&format!("tmp={home_a}")),
         "the batch ran beside the terminal: {where_ran}"
     );
+    assert!(
+        where_ran.contains("beside terminal `dev`") && where_ran.contains("affinity, not a pin"),
+        "{where_ran}"
+    );
     node.disconnect(MACHINE_A);
-    let refused = node.shell(&task, None, "true").await;
-    assert!(refused.contains("terminal `dev`"), "{refused}");
-    assert!(refused.contains("pass `executor`"), "{refused}");
+    let elsewhere = node.shell(&task, None, "echo \"tmp=$TMPDIR\"").await;
+    let home_b = node.machines.homes[1].display().to_string();
+    assert!(
+        elsewhere.contains(&format!("tmp={home_b}")),
+        "the batch ran on the machine that could take it: {elsewhere}"
+    );
+    assert!(elsewhere.contains("terminal `dev` on"), "{elsewhere}");
+    assert!(
+        elsewhere.contains("placed without that affinity"),
+        "{elsewhere}"
+    );
+}
+
+/// cairn/5784: two terminals of one node on two machines both start, each
+/// writing a file of its own and both writing one path. Once both have
+/// exited, a batch on a third machine sees both files, and the shared path as
+/// one winner plus the other's `~conflict-<writer>` copy.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_terminals_on_two_machines_both_start_and_their_writes_merge() {
+    if common::skip_if_fenced("two_terminals_on_two_machines_both_start_and_their_writes_merge") {
+        return;
+    }
+    let node = node().await;
+    node.attach_third().await;
+    let task = node.add_task("side").await;
+    // Both wait for one go-file, so each has synced before either writes back.
+    let go = node.machines.temp.path().join("go");
+    let script = |own: &str, from: &str| {
+        format!(
+            "while [ ! -f {go} ]; do sleep 0.1; done; echo {from} > \"$TMPDIR/{own}\"; echo {from} > \"$TMPDIR/shared.txt\"",
+            go = go.display()
+        )
+    };
+    let on_a = node
+        .start_terminal_of(
+            "r-1",
+            OWNER,
+            "left",
+            Some(MACHINE_A),
+            &script("a.txt", "from-a"),
+        )
+        .await;
+    let on_b = node
+        .start_terminal_of(
+            &task,
+            &format!("{OWNER}/task/side"),
+            "right",
+            Some(MACHINE_B),
+            &script("b.txt", "from-b"),
+        )
+        .await;
+    for started in [&on_a, &on_b] {
+        assert!(
+            !started.contains("held by") && !started.contains("two machines at once"),
+            "a live process never refuses another: {started}"
+        );
+    }
+    let holders = cairn_core::internal::node_scratch::holders::holders(
+        node.orch(),
+        &node.machines.db,
+        "job-1",
+    )
+    .await;
+    assert_eq!(
+        holders.len(),
+        2,
+        "both terminals hold the scratch: {holders:?}"
+    );
+    assert_ne!(holders[0].executor_id, holders[1].executor_id);
+
+    std::fs::write(&go, "").unwrap();
+    node.head_reaches(2).await;
+    let read = node
+        .shell(
+            "r-1",
+            Some(MACHINE_C),
+            "cd \"$TMPDIR\" && cat a.txt b.txt && for f in shared.txt*; do echo \"$f=$(cat \"$f\")\"; done",
+        )
+        .await;
+    assert!(read.contains("from-a") && read.contains("from-b"), "{read}");
+    let shared: Vec<&str> = read
+        .lines()
+        .filter(|line| line.starts_with("shared.txt"))
+        .collect();
+    assert_eq!(shared.len(), 2, "one winner and one conflict copy: {read}");
+    assert!(
+        shared.iter().any(|line| line.starts_with("shared.txt=")),
+        "{read}"
+    );
+    assert!(
+        shared
+            .iter()
+            .any(|line| line.starts_with("shared.txt~conflict-")),
+        "{read}"
+    );
+    assert!(
+        shared.iter().any(|line| line.ends_with("=from-a"))
+            && shared.iter().any(|line| line.ends_with("=from-b")),
+        "nothing dropped: {read}"
+    );
+}
+
+/// cairn/5784: with live terminals on two machines, a batch that names no
+/// machine goes to the warmer holder when both can take it, even past its own
+/// job's environment, and elsewhere when neither can, naming the affinity
+/// either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_prefers_the_warmer_of_two_holders_and_goes_elsewhere_when_neither_can_take_it() {
+    if common::skip_if_fenced(
+        "a_batch_prefers_the_warmer_of_two_holders_and_goes_elsewhere_when_neither_can_take_it",
+    ) {
+        return;
+    }
+    let node = node().await;
+    let task = node.add_task("side").await;
+    node.start_terminal_of("r-1", OWNER, "left", Some(MACHINE_A), "sleep 120")
+        .await;
+    node.start_terminal_of(
+        &task,
+        &format!("{OWNER}/task/side"),
+        "right",
+        Some(MACHINE_B),
+        "sleep 120",
+    )
+    .await;
+    // A write-back from b moves the head past what a holds.
+    node.shell(
+        &task,
+        Some(MACHINE_B),
+        "head -c 200000 /dev/zero > \"$TMPDIR/warm-on-b\"",
+    )
+    .await;
+
+    // The builder's own environment is on a, but b is warmer.
+    let warmer = node
+        .shell(
+            "r-1",
+            None,
+            "echo \"tmp=$TMPDIR\"; wc -c < \"$TMPDIR/warm-on-b\"",
+        )
+        .await;
+    let home_b = node.machines.homes[1].display().to_string();
+    assert!(
+        warmer.contains(&format!("tmp={home_b}")),
+        "placed on the warmer holder: {warmer}"
+    );
+    assert!(warmer.contains("200000"), "{warmer}");
+    assert!(
+        warmer.contains(&format!("placed on {MACHINE_B} beside terminal `right`")),
+        "{warmer}"
+    );
+
+    // Neither holder's machine can take work now: a third machine does.
+    let home_c = node.attach_third().await;
+    node.drain(MACHINE_A, true).await;
+    node.drain(MACHINE_B, true).await;
+    let probe = node.add_task("probe").await;
+    let elsewhere = node.shell(&probe, None, "echo \"tmp=$TMPDIR\"").await;
+    assert!(
+        elsewhere.contains(&format!("tmp={}", home_c.display())),
+        "placed where it could be held: {elsewhere}"
+    );
+    for named in [
+        "terminal `left` on",
+        "terminal `right` on",
+        "placed without that affinity",
+    ] {
+        assert!(elsewhere.contains(named), "{named}: {elsewhere}");
+    }
+}
+
+/// cairn/5784: what a live terminal writes reaches a batch on another machine
+/// on its executor's periodic write-back pass, while the terminal still runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_terminals_writes_reach_another_machine_without_stopping_it() {
+    if common::skip_if_fenced("a_live_terminals_writes_reach_another_machine_without_stopping_it") {
+        return;
+    }
+    let node = node().await;
+    let written = node.machines.temp.path().join("written");
+    node.start_terminal_of(
+        "r-1",
+        OWNER,
+        "server",
+        Some(MACHINE_A),
+        &format!(
+            "echo serving > \"$TMPDIR/live.txt\"; touch {}; sleep 120",
+            written.display()
+        ),
+    )
+    .await;
+    eventually("the terminal's write", || written.is_file()).await;
+    // What the executor's timer runs; a pass already under way makes one call
+    // a no-op, so call until the head moves.
+    for _ in 0..100 {
+        node.machines.pools[0]
+            .retry_node_scratch_write_backs()
+            .await;
+        if node.head_seq().await >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        node.head_seq().await >= 1,
+        "the pass sent the live terminal's replica"
+    );
+    let read = node
+        .shell("r-1", Some(MACHINE_B), "cat \"$TMPDIR/live.txt\"")
+        .await;
+    assert!(read.contains("serving"), "{read}");
 }
 
 /// Acceptance 6: resolving the issue removes the runner store and every

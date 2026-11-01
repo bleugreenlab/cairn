@@ -1,13 +1,15 @@
-//! Who holds a node scratch's writer: the node's live terminals and REPLs.
+//! Who holds a node scratch: the node's live terminals and REPLs.
 //!
-//! A live terminal or REPL makes the scratch on its machine its `$TMPDIR` and
-//! writes it back only when it exits, so while one lives its machine holds the
-//! scratch's newest state. That is the only pin: every batch of every job that
-//! shares the scratch, and names no machine of its own, runs beside it, and a
-//! second live process on another machine is refused. Refusals name the
-//! process, never a "home" (tenet #314).
+//! A live terminal or REPL makes the scratch on its machine its `$TMPDIR`. Its
+//! writes reach the head when it exits and, while it lives, on the executor's
+//! periodic write-back pass, so its machine usually holds the newest state.
+//! That is affinity, never a lock (tenets #290, #314): a batch that names no
+//! machine is placed beside a holder whose machine can take it, and anywhere
+//! else otherwise. No live process ever refuses another: concurrent residents
+//! on two machines merge per path at write-back, exactly as concurrent batches
+//! do (`node_scratch::merge`).
 
-use cairn_common::executor_protocol::ResidencyHolder;
+use cairn_common::executor_protocol::{ResidencyHolder, ScratchSyncEstimate};
 
 use super::owner;
 use crate::orchestrator::Orchestrator;
@@ -116,78 +118,136 @@ pub fn named(holders: &[ScratchHolder]) -> String {
     }
 }
 
-/// Refuse a new live process (`starting`, e.g. "terminal") when another
-/// machine already holds the scratch's writer. `executor_id` is where the new
-/// process will run: its job's home, or `None` when the job has none yet.
-pub async fn refuse_second_writer(
-    orch: &Orchestrator,
-    db: &LocalDb,
-    owner_job_id: &str,
-    executor_id: Option<&str>,
-    starting: &str,
-) -> Result<(), String> {
-    let elsewhere: Vec<ScratchHolder> = holders(orch, db, owner_job_id)
-        .await
-        .into_iter()
-        .filter(|holder| Some(holder.executor_id.as_str()) != executor_id)
-        .collect();
-    second_writer_refusal(
-        &elsewhere,
-        executor_id.map(|id| orch.fleet.executor_name_for_text(id)),
-        |id| orch.fleet.executor_name_for_text(id),
-        starting,
-    )
+/// The live processes on each machine, machines in the order their first
+/// process was found.
+fn by_machine(holders: Vec<ScratchHolder>) -> Vec<(String, Vec<ScratchHolder>)> {
+    let mut machines: Vec<(String, Vec<ScratchHolder>)> = Vec::new();
+    for holder in holders {
+        match machines
+            .iter_mut()
+            .find(|(executor_id, _)| *executor_id == holder.executor_id)
+        {
+            Some((_, on_machine)) => on_machine.push(holder),
+            None => machines.push((holder.executor_id.clone(), vec![holder])),
+        }
+    }
+    machines
 }
 
-/// The refusal for a new live process given the holders on other machines.
-/// A job with no machine yet cannot say where its process would land, so it
-/// is refused too, with the way to land beside the holder: any batch of the
-/// node is placed there, and that places the job.
-fn second_writer_refusal(
-    elsewhere: &[ScratchHolder],
-    here: Option<String>,
+/// The holder machine a batch prefers, among those that can take it: the one
+/// whose replica is cheapest to bring current (the placement price, bytes
+/// missing over measured sync throughput), then the machine holding the
+/// batch's own job environment, which spares the batch a detached cell, then
+/// the first found.
+fn preferred<'a>(
+    machines: &'a [(String, Vec<ScratchHolder>)],
+    can_take: impl Fn(&str) -> bool,
+    price_ms: impl Fn(&str) -> u64,
+    own_home: Option<&str>,
+) -> Option<&'a (String, Vec<ScratchHolder>)> {
+    machines
+        .iter()
+        .enumerate()
+        .filter(|(_, (executor_id, _))| can_take(executor_id))
+        .min_by_key(|(order, (executor_id, _))| {
+            (
+                price_ms(executor_id),
+                Some(executor_id.as_str()) != own_home,
+                *order,
+            )
+        })
+        .map(|(_, machine)| machine)
+}
+
+/// Where a batch that named no machine goes for its node's scratch, and the
+/// note its result carries saying so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Affinity {
+    /// The holder machine the batch is placed on, when one can take it.
+    pub executor_id: Option<String>,
+    /// Why it went there, or why it did not. Rides on every outcome, refusals
+    /// included, so a batch that cannot run beside a holder says why it was
+    /// sent there.
+    pub note: String,
+}
+
+fn affinity_among(
+    machines: &[(String, Vec<ScratchHolder>)],
+    can_take: impl Fn(&str) -> bool,
+    price_ms: impl Fn(&str) -> u64,
+    own_home: Option<&str>,
     machine_name: impl Fn(&str) -> String,
-    starting: &str,
-) -> Result<(), String> {
-    let Some(first) = elsewhere.first() else {
-        return Ok(());
-    };
-    let machine = machine_name(&first.executor_id);
-    let holding = named(elsewhere);
-    Err(match here {
-        Some(here) => format!(
-            "this node's scratch is held by {holding} running on {machine}, and a second live process on {here} would write it from two machines at once. Stop {holding} first, or start this {starting} beside it"
-        ),
-        None => format!(
-            "this node's scratch is held by {holding} running on {machine}, and this job has no machine yet, so a {starting} started now could land elsewhere and write the scratch from two machines at once. Run any batch first (it is placed beside {holding}), then start this {starting}; or stop {holding}"
+) -> Option<Affinity> {
+    if machines.is_empty() {
+        return None;
+    }
+    if let Some((executor_id, on_machine)) = preferred(machines, can_take, price_ms, own_home) {
+        let machine = machine_name(executor_id);
+        let holding = named(on_machine);
+        return Some(Affinity {
+            executor_id: Some(executor_id.clone()),
+            note: format!(
+                "This batch named no machine and was placed on {machine} beside {holding}, which holds this node's scratch there. That is affinity, not a pin: pass `executor` to run elsewhere, against the scratch as last written back."
+            ),
+        });
+    }
+    let holding = machines
+        .iter()
+        .map(|(executor_id, on_machine)| {
+            format!("{} on {}", named(on_machine), machine_name(executor_id))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(Affinity {
+        executor_id: None,
+        note: format!(
+            "This node's scratch is held by {holding}, and no machine holding it can take this batch now, so the batch was placed without that affinity and ran against the scratch as last written back."
         ),
     })
 }
 
-/// The note a batch that named no machine carries when it was placed beside
-/// the live process holding its node's scratch. It rides on every outcome,
-/// refusals included, so a batch that cannot run there says why it was there.
-pub fn pin_note(holders: &[ScratchHolder], machine: &str) -> String {
-    let holding = named(holders);
-    format!(
-        "This batch named no machine and was placed on {machine} because {holding} holds this node's scratch there. Pass `executor` to run elsewhere against the scratch as last synced, or stop {holding} to release the pin."
-    )
-}
-
-/// The machine a batch with no selector of its own is pinned to, if a live
-/// process holds the scratch somewhere.
-pub async fn pin(
+/// Where a batch of `job_id` that named no machine of its own should go for
+/// its node's scratch, when a live process holds the scratch anywhere. A
+/// holder's machine can take the batch when it is connected and not drained;
+/// beyond that, placement decides as it would for any batch.
+pub async fn affinity(
     orch: &Orchestrator,
     db: &LocalDb,
     scratch: &owner::ResolvedScratch,
-) -> Option<(String, Vec<ScratchHolder>)> {
-    let holders = holders(orch, db, &scratch.owner_job_id).await;
-    let executor_id = holders.first()?.executor_id.clone();
-    let on_machine = holders
+    job_id: &str,
+) -> Option<Affinity> {
+    let machines = by_machine(holders(orch, db, &scratch.owner_job_id).await);
+    if machines.is_empty() {
+        return None;
+    }
+    let connected: Vec<String> = orch
+        .fleet
+        .connected_executors()
         .into_iter()
-        .filter(|holder| holder.executor_id == executor_id)
+        .map(|(executor_id, _)| executor_id)
         .collect();
-    Some((executor_id, on_machine))
+    // Only priced when two machines compete; one holder needs no estimate.
+    let estimate = match machines.len() {
+        1 => ScratchSyncEstimate::default(),
+        _ => super::placement::estimate(orch, scratch).await,
+    };
+    let own_home = orch
+        .fleet
+        .predicted_job_home(&ResidencyHolder::Job {
+            job_id: job_id.to_owned(),
+        })
+        .map(|home| home.executor_id);
+    affinity_among(
+        &machines,
+        |executor_id| {
+            connected.iter().any(|id| id == executor_id)
+                && !orch.fleet.is_drained(executor_id)
+                && orch.fleet.executor_display_name(executor_id).is_some()
+        },
+        |executor_id| estimate.ms_for(executor_id),
+        own_home.as_deref(),
+        |executor_id| orch.fleet.executor_name_for_text(executor_id),
+    )
 }
 
 #[cfg(test)]
@@ -202,35 +262,76 @@ mod tests {
         }
     }
 
+    fn name(id: &str) -> String {
+        format!("**{id}**")
+    }
+
+    fn machines() -> Vec<(String, Vec<ScratchHolder>)> {
+        by_machine(vec![
+            holder("terminal `dev`", "a"),
+            holder("terminal `test`", "b"),
+            holder("REPL `py`", "a"),
+        ])
+    }
+
     #[test]
-    fn a_job_with_no_machine_yet_is_refused_beside_a_holder_and_told_how_to_land_there() {
-        let name = |id: &str| format!("**{id}**");
-        let holders = [holder("terminal `dev`", "a")];
-        assert_eq!(second_writer_refusal(&[], None, name, "terminal"), Ok(()));
-        let refusal = second_writer_refusal(&holders, None, name, "REPL").unwrap_err();
+    fn holders_group_by_machine_in_the_order_found() {
+        let machines = machines();
+        assert_eq!(machines.len(), 2);
+        assert_eq!(machines[0].0, "a");
+        assert_eq!(named(&machines[0].1), "terminal `dev`, REPL `py`");
+        assert_eq!(named(&machines[1].1), "terminal `test`");
+    }
+
+    #[test]
+    fn no_holder_means_no_affinity() {
+        assert_eq!(affinity_among(&[], |_| true, |_| 0, None, name), None);
+    }
+
+    #[test]
+    fn the_warmer_holder_wins_when_both_can_take_the_batch() {
+        let machines = machines();
+        let price = |id: &str| if id == "a" { 900 } else { 0 };
+        let chosen = affinity_among(&machines, |_| true, price, None, name).unwrap();
+        assert_eq!(chosen.executor_id.as_deref(), Some("b"));
         assert!(
-            refusal.contains("terminal `dev` running on **a**"),
-            "{refusal}"
+            chosen
+                .note
+                .contains("placed on **b** beside terminal `test`, which holds"),
+            "{}",
+            chosen.note
         );
-        assert!(refusal.contains("Run any batch first"), "{refusal}");
-        let refusal =
-            second_writer_refusal(&holders, Some("**b**".into()), name, "terminal").unwrap_err();
         assert!(
-            refusal.contains("a second live process on **b**"),
-            "{refusal}"
+            chosen.note.contains("affinity, not a pin"),
+            "{}",
+            chosen.note
         );
     }
 
     #[test]
-    fn the_pin_note_names_the_holding_process_and_the_way_out() {
-        let note = pin_note(
-            &[holder("terminal `dev`", "a"), holder("REPL `py`", "a")],
-            "**a**",
-        );
-        assert!(
-            note.contains("placed on **a** because terminal `dev`, REPL `py` holds"),
-            "{note}"
-        );
-        assert!(note.contains("Pass `executor`"), "{note}");
+    fn equally_warm_holders_prefer_the_batchs_own_environment_then_the_first_found() {
+        let machines = machines();
+        let own = affinity_among(&machines, |_| true, |_| 0, Some("b"), name).unwrap();
+        assert_eq!(own.executor_id.as_deref(), Some("b"));
+        let first = affinity_among(&machines, |_| true, |_| 0, None, name).unwrap();
+        assert_eq!(first.executor_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_holder_that_cannot_take_the_batch_is_passed_over_never_a_refusal() {
+        let machines = machines();
+        let price = |id: &str| if id == "a" { 0 } else { 900 };
+        let colder = affinity_among(&machines, |id| id == "b", price, None, name).unwrap();
+        assert_eq!(colder.executor_id.as_deref(), Some("b"));
+
+        let neither = affinity_among(&machines, |_| false, price, None, name).unwrap();
+        assert_eq!(neither.executor_id, None);
+        for named in [
+            "terminal `dev`, REPL `py` on **a**",
+            "terminal `test` on **b**",
+            "placed without that affinity",
+        ] {
+            assert!(neither.note.contains(named), "{named}: {}", neither.note);
+        }
     }
 }
