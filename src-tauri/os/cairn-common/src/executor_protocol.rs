@@ -6346,6 +6346,14 @@ pub struct LearnedResourceEstimate {
 /// own child. What a runner gets wrong talking to an older executor: nothing
 /// it decodes differently; that executor still runs a plain `cargo test`
 /// binary at one test thread per logical core whatever the grant.
+///
+/// cairn/5772 does not move the number. The executor's command poll loop stops
+/// polling its output channel once both pipe readers have finished, and checks
+/// for the child's exit as that channel closes rather than at the next tick.
+/// The same process events and exit report cross the link, in the same order;
+/// an older executor only reports an exit up to one poll interval later. No
+/// frame, variant, field or serialized form changes, and a runner talking to
+/// an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
