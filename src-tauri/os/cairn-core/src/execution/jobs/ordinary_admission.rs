@@ -3795,6 +3795,106 @@ mod tests {
         assert_eq!(started(&starts), 2, "each held launch starts once");
     }
 
+    /// The fixture's job `j` and run `cold` with no admission row, before
+    /// readiness, with `session_backend` recorded on session `s`, a counting
+    /// session backend installed, and an attention delivery on turn `t`.
+    async fn held_launch_fixture(
+        name: &str,
+        session_backend: &str,
+    ) -> (
+        Orchestrator,
+        Arc<std::sync::atomic::AtomicUsize>,
+        impl Sized,
+    ) {
+        let (mut orch, _, _) = lifecycle_fixture(name).await;
+        orch.startup_readiness = crate::orchestrator::StartupReadiness::pending();
+        orch.db
+            .local
+            .execute_script(format!(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req';
+                 UPDATE sessions SET backend='{session_backend}' WHERE id='s';"
+            ))
+            .await
+            .unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = starts.clone();
+        let backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            &orch,
+            move || Box::new(CountingBackend(counted.clone())),
+        );
+        brief(&orch, "cold", "t", "j").await;
+        (orch, starts, backend)
+    }
+
+    /// Defer an OpenRouter launch of the fixture's run `cold` before readiness,
+    /// asserting that it holds its launch claim, that the stale-run reaper
+    /// spares it, and that nothing has started.
+    async fn defer_stateless_launch(orch: &Orchestrator, starts: &std::sync::atomic::AtomicUsize) {
+        let mut prepared = super::PreparedJob {
+            job_id: "j".into(),
+            project_id: "p".into(),
+            run_id: "cold".into(),
+            session_id: "s".into(),
+            session_start: crate::backends::SessionStart::New {
+                session_id: "s".into(),
+            },
+            prompt: "queued hello".into(),
+            // A slash-qualified model resolves to OpenRouter, a stateless HTTP
+            // backend.
+            job_model: Some(crate::models::Model::from("openrouter/auto")),
+            agent_config: None,
+            artifact_schema_info: None,
+            execution_id: Some("e".into()),
+            turn_id: "t".into(),
+            launch_event_id: "ev".into(),
+            start_reason: crate::models::TurnStartReason::FollowUp,
+            origin: crate::storage::LaunchOrigin::Background,
+            launch_claim: Some(orch.claim_job_launch("j", "cold")),
+        };
+        assert!(
+            !super::enqueue_or_start(orch, &mut prepared, None).unwrap(),
+            "a deferred launch reports that no process holds its prompt yet"
+        );
+        drop(prepared);
+        assert_held_before_readiness(orch, starts).await;
+    }
+
+    /// A launch with no durable row is held by its in-memory claim alone: the
+    /// claim is taken, the stale-run reaper spares the run, nothing started.
+    async fn assert_held_before_readiness(
+        orch: &Orchestrator,
+        starts: &std::sync::atomic::AtomicUsize,
+    ) {
+        assert_eq!(
+            orch.claimed_launch_run("j").as_deref(),
+            Some("cold"),
+            "the deferral keeps the launch claim"
+        );
+        let reaper = orch.clone();
+        tokio::task::spawn_blocking(move || crate::runs::reap::reap_stale_runs(&reaper))
+            .await
+            .unwrap();
+        assert_eq!(
+            text(orch, "SELECT status FROM runs WHERE id='cold'").await,
+            "starting",
+            "the reaper spares a claimed launch"
+        );
+        assert_eq!(started(starts), 0, "nothing starts before readiness");
+    }
+
+    /// Open readiness and wait for the deferred launch to act, which it
+    /// signals by releasing its claim last.
+    async fn open_readiness_and_await_release(orch: &Orchestrator) {
+        orch.mark_startup_recovery_ready();
+        for _ in 0..3000 {
+            if orch.claimed_launch_run("j").is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the deferral never released its claim after readiness");
+    }
+
     /// cairn/4758: a stateless launch has no durable admission row, so before
     /// readiness it waits in the background holding its launch claim, which the
     /// stale-run reaper reads as a launch in flight. Readiness starts it once. A
@@ -3803,66 +3903,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stateless_launch_before_readiness_waits_holding_its_claim_then_starts_once() {
         for settle_while_held in [false, true] {
-            let (mut orch, _, _) =
-                lifecycle_fixture(&format!("stateless-deferral-{settle_while_held}.db")).await;
-            orch.startup_readiness = crate::orchestrator::StartupReadiness::pending();
-            orch.db
-                .local
-                .execute(
-                    "DELETE FROM runtime_admission_requests WHERE request_id='req'",
-                    (),
-                )
-                .await
-                .unwrap();
-            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counted = starts.clone();
-            let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
-                &orch,
-                move || Box::new(CountingBackend(counted.clone())),
-            );
-            brief(&orch, "cold", "t", "j").await;
-            let mut prepared = super::PreparedJob {
-                job_id: "j".into(),
-                project_id: "p".into(),
-                run_id: "cold".into(),
-                session_id: "s".into(),
-                session_start: crate::backends::SessionStart::New {
-                    session_id: "s".into(),
-                },
-                prompt: "queued hello".into(),
-                // A slash-qualified model resolves to OpenRouter, a stateless
-                // HTTP backend.
-                job_model: Some(crate::models::Model::from("openrouter/auto")),
-                agent_config: None,
-                artifact_schema_info: None,
-                execution_id: Some("e".into()),
-                turn_id: "t".into(),
-                launch_event_id: "ev".into(),
-                start_reason: crate::models::TurnStartReason::FollowUp,
-                origin: crate::storage::LaunchOrigin::Background,
-                launch_claim: Some(orch.claim_job_launch("j", "cold")),
-            };
-
-            assert!(
-                !super::enqueue_or_start(&orch, &mut prepared, None).unwrap(),
-                "a deferred launch reports that no process holds its prompt yet"
-            );
-            drop(prepared);
-            assert_eq!(
-                orch.claimed_launch_run("j").as_deref(),
-                Some("cold"),
-                "the deferral keeps the launch claim"
-            );
-            let reaper = orch.clone();
-            tokio::task::spawn_blocking(move || crate::runs::reap::reap_stale_runs(&reaper))
-                .await
-                .unwrap();
-            assert_eq!(
-                text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
-                "starting",
-                "the reaper spares a claimed launch"
-            );
-            assert_eq!(started(&starts), 0, "nothing starts before readiness");
+            // The session must already record the provider the launch spawns:
+            // `start_agent_session` refuses to start under a session row that
+            // names another one.
+            let (orch, starts, _backend) = held_launch_fixture(
+                &format!("stateless-deferral-{settle_while_held}.db"),
+                "openrouter",
+            )
+            .await;
+            defer_stateless_launch(&orch, &starts).await;
             if settle_while_held {
                 orch.db
                     .local
@@ -3871,24 +3920,130 @@ mod tests {
                     .unwrap();
             }
 
-            orch.mark_startup_recovery_ready();
-            for _ in 0..500 {
-                if orch.claimed_launch_run("j").is_none() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(
-                orch.claimed_launch_run("j").is_none(),
-                "the deferral releases its claim once it has acted"
-            );
+            open_readiness_and_await_release(&orch).await;
             if settle_while_held {
                 assert_eq!(started(&starts), 0, "a settled run is not started");
                 assert!(delivery_returned(&orch, "j", "t").await);
             } else {
                 assert_eq!(started(&starts), 1, "readiness starts the launch once");
+                assert_eq!(orch.process_state.has_process("cold"), Some(true));
                 assert!(!delivery_returned(&orch, "j", "t").await);
             }
+        }
+    }
+
+    /// cairn/5700: a deferred stateless start that fails after readiness settles
+    /// the launch as a failed promoted start does (the run crashed as
+    /// `session_start_failed`, its turn failed, the attention delivery
+    /// returned) before it releases its claim. Nothing is lost silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_stateless_start_that_fails_settles_its_run_and_returns_its_delivery() {
+        // The session still records Claude, so the authoritative-backend guard
+        // in `start_agent_session` refuses the OpenRouter start.
+        let (orch, starts, _backend) =
+            held_launch_fixture("stateless-deferral-start-fails.db", "claude").await;
+        defer_stateless_launch(&orch, &starts).await;
+
+        open_readiness_and_await_release(&orch).await;
+        assert_eq!(started(&starts), 0, "the refused start reached no backend");
+        let run = orch
+            .db
+            .local
+            .query_opt(
+                "SELECT status, exit_reason, error_message FROM runs WHERE id='cold'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (run.0.as_str(), run.1.as_deref()),
+            ("crashed", Some("session_start_failed"))
+        );
+        assert!(
+            run.2
+                .as_deref()
+                .is_some_and(|error| error.contains("authoritative backend")),
+            "the run carries the start's own error: {:?}",
+            run.2
+        );
+        assert_eq!(
+            text(&orch, "SELECT state FROM turns WHERE id='t'").await,
+            "failed"
+        );
+        assert!(delivery_returned(&orch, "j", "t").await);
+        assert_eq!(
+            orch.process_state.has_process("cold"),
+            Some(false),
+            "no process is left registered"
+        );
+    }
+
+    /// cairn/4758 review: a call with no durable admission row (a stateless
+    /// HTTP call, or a Codex call whose app-server pool key is not yet known)
+    /// waits for readiness in the background holding its launch claim, which the
+    /// stale-run reaper reads as a launch in flight, and starts once after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyless_call_before_readiness_waits_holding_its_claim_then_starts_once() {
+        for (model, backend) in [("openrouter/auto", "openrouter"), ("gpt-5", "codex")] {
+            let (orch, starts, _backend) =
+                held_launch_fixture(&format!("call-deferral-{backend}.db"), backend).await;
+            let call = crate::execution::jobs::PreparedCallRun {
+                job_id: "j".into(),
+                run_id: "cold".into(),
+                session_id: "s".into(),
+                agent_config: crate::models::AgentConfig {
+                    id: "Explore".into(),
+                    name: "Explore".into(),
+                    description: String::new(),
+                    prompt: String::new(),
+                    tools: Vec::new(),
+                    tier: None,
+                    workspace_id: None,
+                    project_id: None,
+                    created_at: 0,
+                    updated_at: 0,
+                    disallowed_tools: None,
+                    skills: None,
+                    fence: None,
+                    backend_preference: None,
+                    icon: None,
+                    selection: None,
+                    extras: None,
+                },
+                selected_model: Some(crate::models::Model::from(model)),
+                prompt: "do the thing".into(),
+                output_schema: crate::models::OutputSchemaInfo {
+                    schema: crate::models::OutputSchema::Preset("return".into()),
+                    artifact_name: Some("return".into()),
+                    confirm_policy: crate::models::ConfirmPolicy::default(),
+                    tool_name: None,
+                    description: None,
+                },
+                execution_id: None,
+            };
+
+            crate::execution::jobs::start_call_run(&orch, &call).unwrap();
+            assert_held_before_readiness(&orch, &starts).await;
+            assert_eq!(
+                text(
+                    &orch,
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM runtime_admission_requests"
+                )
+                .await,
+                "0",
+                "a {backend} call waits without a durable row"
+            );
+
+            open_readiness_and_await_release(&orch).await;
+            assert_eq!(started(&starts), 1, "readiness starts the {backend} call");
+            assert_eq!(orch.process_state.has_process("cold"), Some(true));
+            let pass = orch.clone();
+            tokio::task::spawn_blocking(move || crate::execution::jobs::promote_call_lanes(&pass))
+                .await
+                .unwrap();
+            assert_eq!(started(&starts), 1, "the {backend} call starts once");
         }
     }
 

@@ -2227,7 +2227,11 @@ enum Spread {
 ///
 /// The timeout is vitest's (`Error: Test timed out in 5000ms.`). On a loaded
 /// host it lands in a rotating set of I/O-bound files, main's included, so the
-/// same files pass on the same host one tip earlier.
+/// same files pass on the same host one tip earlier. The frontend runner
+/// rewrites every vitest timeout row to open with its `VITEST_TIMEOUT_EXCERPT`
+/// (`scripts/lib/structured-test-result.ts`), because vitest 4's JSON report
+/// carries a timeout only as `Error: STACK_TRACE_ERROR`; that excerpt is the
+/// second spelling, and the two must change together.
 const HOST_CONDITIONS: &[HostCondition] = &[
     HostCondition {
         face: "No space left on device",
@@ -2246,7 +2250,7 @@ const HOST_CONDITIONS: &[HostCondition] = &[
     },
     HostCondition {
         face: "Test timed out",
-        spellings: &["test timed out in "],
+        spellings: &["test timed out in ", "timeout: vitest terminated this test"],
         spread: Spread::Files,
     },
 ];
@@ -4260,11 +4264,23 @@ mod tests {
     /// in 5000ms`, and main failed the same way on the same host.
     #[test]
     fn vitest_timeouts_across_files_are_one_host_condition_but_one_file_stays_red() {
-        let timeout = || {
-            failed(
-                "Error: Test timed out in 5000ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".\n    at scripts/lib/pinned-sources.test.ts:41:3",
-            )
-        };
+        timeouts_group_only_across_files(
+            "Error: Test timed out in 5000ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with \"testTimeout\".\n    at scripts/lib/pinned-sources.test.ts:41:3",
+        );
+    }
+
+    /// Specimen cairn/5583: vitest 4's JSON report carries a timeout only as
+    /// `Error: STACK_TRACE_ERROR`, and the frontend runner rewrites that row to
+    /// open with its `VITEST_TIMEOUT_EXCERPT`. It is the same host condition.
+    #[test]
+    fn the_frontend_runners_timeout_excerpt_is_the_same_host_condition() {
+        timeouts_group_only_across_files(
+            "TIMEOUT: vitest terminated this test at its timeout bound (testTimeout/hookTimeout in vitest.config.ts, or the test's own)\nran 14991 ms before termination\n    at /slot/src/components/chat/minimapCompositing.test.tsx:88:3",
+        );
+    }
+
+    fn timeouts_group_only_across_files(excerpt: &str) {
+        let timeout = || failed(excerpt);
         let names = [
             "scripts/check-executor-protocol.test.ts > protocol > matches the schema",
             "scripts/check-executor-protocol.test.ts > protocol > rejects drift",
