@@ -172,6 +172,8 @@ pub(crate) struct FakeSource {
     /// An `on_demand` idle stop shorter than a manifest may declare, so a
     /// test can watch one happen.
     idle: StdMutex<Option<Duration>>,
+    /// A thread whose source reads wait until the test adds a permit.
+    held: StdMutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
 }
 
 impl FakeSource {
@@ -236,6 +238,17 @@ impl SourceProvider for FakeProvider {
         project_id: &str,
         owner: &ServiceOwner,
     ) -> Result<Arc<dyn ServiceSource>, String> {
+        let held = self
+            .0
+            .held
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(thread, _)| owner.thread_id() == Some(thread.as_str()))
+            .map(|(_, gate)| gate.clone());
+        if let Some(gate) = held {
+            let _ = gate.acquire().await;
+        }
         match owner {
             ServiceOwner::Project => Ok(self.0.clone()),
             // A thread's services come from the real store, so a test writes
@@ -1918,6 +1931,108 @@ async fn a_thread_schedule_fires_at_boot_without_the_catch_up() {
         0
     );
     assert_eq!(started(&tutor_log(&h).await), 1);
+}
+
+/// One owner's boot pass cannot finish (its source read never answers), and
+/// another owner's due occurrence still fires: boot applies each owner on its
+/// own and resumes schedules without waiting for any source. Once the held
+/// read answers, its `launch` service starts and boot ends.
+#[tokio::test]
+async fn a_held_owner_at_boot_holds_neither_another_owners_schedule_nor_its_services() {
+    let h = thread_harness().await;
+    let french = ServiceOwner::Thread {
+        id: "t-2".into(),
+        name: "french".into(),
+    };
+    let write =
+        |owner: ServiceOwner, service: &'static str, writer: &'static str, payload: Value| {
+            let db = h.orch.db.local.clone();
+            async move {
+                let uri = owner.home("cairn", service);
+                crate::project_services::thread_store::write(
+                    &db,
+                    "p",
+                    &owner,
+                    service,
+                    &uri,
+                    &crate::project_services::thread_store::ServiceWriter {
+                        job_id: writer.into(),
+                    },
+                    &payload,
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            }
+        };
+    // Written first, so a serial boot would reach it before `spanish`.
+    write(
+        french.clone(),
+        "clock",
+        "french-session",
+        json!({"files": {"main.ts": "serve({})"}, "manifest": {"start": "launch"}}),
+    )
+    .await;
+    let payload = scheduled("echo");
+    write(spanish(), "tutor", "spanish-session", payload.clone()).await;
+    let entries = crate::project_services::thread_store::package("tutor", TUTOR, &payload)
+        .unwrap()
+        .declaration
+        .schedule;
+    recorded_earlier(&h, &spanish(), "tutor", &entries).await;
+    assert_eq!(
+        crate::project_services::thread_store::owners(&h.orch.db.local)
+            .await
+            .unwrap()
+            .first()
+            .and_then(|(_, owner)| owner.thread_id().map(str::to_string))
+            .as_deref(),
+        Some("t-2"),
+        "the held owner is first in boot order"
+    );
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *h.source.held.lock().unwrap() = Some(("t-2".into(), gate.clone()));
+    let orch = h.orch.clone();
+    let boot = tokio::spawn(async move { start_at_boot(&orch).await });
+
+    eventually("spanish's due occurrence while french is held", || {
+        h.host.frames_of("call").len() == 1
+    })
+    .await;
+    let frame = h.host.frames_of("call").remove(0);
+    assert_eq!(frame["caller"]["kind"], "schedule");
+    assert_eq!(frame["caller"]["actingFor"], "cairn://p/cairn/spanish");
+    assert_eq!(
+        settled(&h, &spanish(), "tutor")
+            .await
+            .last_status
+            .as_deref(),
+        Some("ok")
+    );
+    assert!(!boot.is_finished(), "french's pass is still held");
+    assert_eq!(
+        h.host.launches.load(Ordering::Acquire),
+        1,
+        "only tutor runs"
+    );
+
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), boot)
+        .await
+        .expect("boot ends once the held read answers")
+        .unwrap();
+    assert_eq!(
+        h.orch
+            .project_services
+            .supervisor
+            .status("p", &french, "clock")
+            .expect("french's launch service has a cell")
+            .state,
+        ServiceState::Running
+    );
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 2);
 }
 
 const SCHEDULED_WATCHER: &str =

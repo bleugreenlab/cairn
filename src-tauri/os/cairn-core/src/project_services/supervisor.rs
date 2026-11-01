@@ -2090,25 +2090,57 @@ pub(crate) fn note_base_advance(orch: &Orchestrator, project_id: &str) {
 }
 
 /// Runner start, at boot and independent of the startup catch-up: finalize
-/// what a predecessor left live, start every thread's `launch` services, and
-/// resume every schedule whose rows exist. A thread's services come from its
+/// what a predecessor left live, resume every schedule whose rows exist, and
+/// start every thread's `launch` services. A thread's services come from its
 /// own store, which no repository catch-up touches, so nothing here waits on
 /// one. Placement is the only precondition, and the colocated executor's
 /// pending attach holds a lease request rather than refusing it.
+///
+/// Schedules resume before any source is applied, and each owner's source is
+/// applied on its own task: one owner whose source is slow to read or whose
+/// `launch` service is slow to place holds neither another owner's services
+/// nor any cadence. Answers once every owner's pass has ended.
 pub(crate) async fn start_at_boot(orch: &Orchestrator) {
     let db = orch.db.local.clone();
     if let Err(error) = rows::finalize_orphaned_runs(&db).await {
         tracing::warn!(%error, "could not finalize orphaned service runs");
     }
-    match super::thread_store::owners(&db).await {
-        Ok(owners) => {
-            for (project_id, owner) in owners {
-                apply_source(orch, &project_id, &owner, "runner start", None).await;
-            }
-        }
-        Err(error) => tracing::warn!(%error, "could not list thread-owned services"),
-    }
     resume_schedules(orch).await;
+    let owners = match super::thread_store::owners(&db).await {
+        Ok(owners) => owners,
+        Err(error) => {
+            tracing::warn!(%error, "could not list thread-owned services");
+            return;
+        }
+    };
+    let passes: Vec<_> = owners
+        .into_iter()
+        .map(|(project_id, owner)| {
+            let orch = orch.clone();
+            tokio::spawn(async move { apply_owner_at_boot(&orch, &project_id, &owner).await })
+        })
+        .collect();
+    for pass in passes {
+        let _ = pass.await;
+    }
+}
+
+/// One thread owner's boot-time source pass, logged as it begins and with how
+/// long it took, so a slow boot names the owner that held it.
+async fn apply_owner_at_boot(orch: &Orchestrator, project_id: &str, owner: &ServiceOwner) {
+    let thread = match owner {
+        ServiceOwner::Thread { name, .. } => name.as_str(),
+        ServiceOwner::Project => "",
+    };
+    tracing::info!(project_id, thread, "boot: applying a thread's services");
+    let began = Instant::now();
+    apply_source(orch, project_id, owner, "runner start", None).await;
+    tracing::info!(
+        project_id,
+        thread,
+        duration_ms = began.elapsed().as_millis() as u64,
+        "boot: applied a thread's services"
+    );
 }
 
 /// Start a schedule task for every service with schedule rows, whatever its
