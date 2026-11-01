@@ -2843,22 +2843,6 @@ impl Orchestrator {
         });
     }
 
-    /// Reconcile in-flight default-branch workspaces once at startup for remote
-    /// advances that landed while the app was closed. Live advances reach the
-    /// store through `base_branch_sync`: the GitHub `push` webhook, Cairn's
-    /// own merge path, and a polling floor that `spawn_default_advance_reconcile`
-    /// starts after this catch-up, which bounds the lag when the relay is absent.
-    ///
-    /// Must be called from within a tokio runtime context.
-    pub async fn run_default_advance_reconcile(&self) {
-        crate::projects::crud::reconcile_project_repositories(&self.db.local).await;
-        crate::projects::crud::reconcile_default_branches(&self.db.local).await;
-        crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(self).await;
-        crate::execution::checks_main::origin_observed(self).await;
-        crate::orchestrator::base_advance::sweep_reconcile_intents(self).await;
-        crate::project_services::supervisor::start_project_launch_services(self).await;
-    }
-
     /// Start thread-owned services and every schedule at boot. Both boot
     /// schedules call this outside any maintenance gate: a thread's services
     /// come from its own store, so they have no reason to wait for the
@@ -2870,6 +2854,17 @@ impl Orchestrator {
         });
     }
 
+    /// Reconcile in-flight default-branch workspaces once at startup for remote
+    /// advances that landed while the app was closed, then start the polling
+    /// floor. Live advances reach the store through `base_branch_sync`: the
+    /// GitHub `push` webhook, Cairn's own merge path, and the polling floor
+    /// started here, which bounds the lag when the relay is absent.
+    ///
+    /// The durable reconcile retry sweep is not started here: each host's
+    /// startup schedule starts it once on its own, so it never waits on this
+    /// catch-up.
+    ///
+    /// Must be called from within a tokio runtime context.
     pub fn spawn_default_advance_reconcile(&self) {
         let orch = self.clone();
         tokio::spawn(async move {
@@ -2888,7 +2883,6 @@ impl Orchestrator {
             // base tip the runner has just brought current. Thread-owned
             // services started at boot (`spawn_services_boot`).
             crate::project_services::supervisor::start_project_launch_services(&orch).await;
-            orch.spawn_reconcile_intent_sweep();
             crate::orchestrator::base_branch_sync::spawn_base_branch_poll(&orch);
         });
     }
