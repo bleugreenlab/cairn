@@ -1520,6 +1520,8 @@ pub(super) mod tests {
               VALUES ('merge-delete', 'job-delete', 'project-delete', 'issue-delete', 'MR', 'source', 'main', 1, 1);
             INSERT INTO merge_attempt_events(event_id, attempt_id, sequence, project_id, merge_request_id, job_id, state, target_ref, source_ref, policy_json, created_at)
               VALUES ('merge-event-delete', 'attempt', 1, 'project-delete', 'merge-delete', 'job-delete', 'succeeded', 'main', 'source', '{}', 1);
+            INSERT INTO human_base_merge_policy_events(event_id, project_id, prior_policy_json, policy_json, actor_principal_json, appearance_snapshot_json, created_at)
+              VALUES ('merge-policy-event-delete', 'project-delete', '{}', '{}', '{}', '{}', 1);
             INSERT INTO pack_catalog(content_hash, project_id, repository_id, object_format, byte_count, pack_checksum, object_count, kind, tip_commit, created_at, publication_state)
               VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'project-delete', 'repo', 'sha1', 1, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 1, 'reachable', 'tip', 1, 'published');
             INSERT INTO pack_catalog_references(content_hash, project_id, repository_id, object_format, owner_kind, owner_id, created_at)
