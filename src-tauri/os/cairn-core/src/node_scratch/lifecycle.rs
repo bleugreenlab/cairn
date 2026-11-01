@@ -55,6 +55,27 @@ pub fn ensure_subscribed(orch: &Orchestrator) {
     let lifecycle = Lifecycle::of(orch);
     orch.fleet
         .subscribe_node_scratch_events(move |fleet, event| {
+            // Granted as the event is emitted, not in the reconcile spawned
+            // below: an attach emits it before the runner sends `Ready`, and
+            // the executor retries the write-backs it owes the moment Ready's
+            // credential arrives, which a spawned grant could trail. A grant
+            // for a closed or unknown scratch confers nothing, because every
+            // scratch route refuses one, and the reconcile tells the machine
+            // to delete it.
+            if let NodeScratchEvent::Advertised {
+                executor_id,
+                generation,
+                replicas,
+            } = &event
+            {
+                for replica in replicas {
+                    lifecycle.plane.scratch.authorize(
+                        executor_id,
+                        *generation,
+                        &replica.scratch_id,
+                    );
+                }
+            }
             let Ok(runtime) = tokio::runtime::Handle::try_current() else {
                 log::warn!("node scratch event arrived outside a runtime; dropped: {event:?}");
                 return;
@@ -84,9 +105,10 @@ async fn handle_event(lifecycle: &Lifecycle, fleet: &Fleet, event: NodeScratchEv
 
 /// Bring the authority in line with what a machine says it holds.
 ///
-/// A replica of an open scratch is authorized for this connection (so a dirty
-/// replica can finish its write-back after a link bounce) and its state is
-/// recorded. A replica of a closed or unknown scratch is told to go.
+/// A replica of an open scratch has its state recorded; the connection was
+/// granted it when the advertisement arrived (see [`ensure_subscribed`]), so a
+/// dirty replica can finish its write-back after a link bounce. A replica of a
+/// closed or unknown scratch is told to go.
 async fn reconcile_advertised(
     lifecycle: &Lifecycle,
     fleet: &Fleet,
@@ -115,10 +137,6 @@ async fn reconcile_advertised(
             );
             continue;
         };
-        lifecycle
-            .plane
-            .scratch
-            .authorize(executor_id, generation, &scratch.id);
         let known = owner::replicas(local, &scratch.id)
             .await
             .unwrap_or_default()

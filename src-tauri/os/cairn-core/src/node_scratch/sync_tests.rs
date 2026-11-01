@@ -8,10 +8,13 @@
 //! merge, and the ceiling, with nothing simulated.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cairn_common::executor_protocol::{
-    NodeScratchGrant, ScratchSyncReport, ScratchWriteBackOutcome,
+    ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, NodeScratchGrant,
+    NodeScratchReplica, ObjectChannelCredential, ScratchSyncReport, ScratchWriteBackOutcome,
+    SCRATCH_STAGE_CREDENTIAL_REFUSED,
 };
 use cairn_exec::node_scratch::{self as replica, Replicas, ScratchTransport};
 
@@ -30,6 +33,7 @@ struct Machine {
 struct World {
     _temp: tempfile::TempDir,
     orch: Orchestrator,
+    base_url: String,
     scratch_id: String,
     a: Machine,
     b: Machine,
@@ -128,10 +132,53 @@ async fn world(config: Option<&str>) -> World {
     let b = machine("machine-b", "wb", temp.path().join("b/node-scratch"));
     World {
         scratch_id: scratch.id,
+        base_url: format!("http://{address}"),
         _temp: temp,
         orch,
         a,
         b,
+    }
+}
+
+impl World {
+    /// What one attach of `executor_id` leaves the runner holding: a fresh
+    /// object-channel credential for that connection generation, and the
+    /// scratch granted to it, as its advertisement grants a replica.
+    fn attach(&self, executor_id: &str, generation: u64) -> ObjectChannelCredential {
+        let (bearer_token, expires_at_unix_ms) = self.orch.object_plane.issue_credential(
+            executor_id,
+            &format!("{executor_id}-device"),
+            "runner",
+            generation,
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
+        self.orch
+            .object_plane
+            .scratch
+            .authorize(executor_id, generation, &self.scratch_id);
+        ObjectChannelCredential {
+            base_url: self.base_url.clone(),
+            bearer_token,
+            expires_at_unix_ms,
+        }
+    }
+
+    /// What a runner restart does to one machine's connection: every token
+    /// and grant it was issued is gone with the process.
+    fn restart_runner(&self, executor_id: &str, generation: u64) {
+        self.orch.object_plane.revoke(executor_id, generation);
+    }
+
+    /// A machine whose transport presents whatever `held` holds when each call
+    /// goes out, as an executor presents the credential its link last set.
+    fn live_machine(&self, held: Arc<Mutex<ObjectChannelCredential>>) -> Machine {
+        Machine {
+            replicas: Replicas::new(self._temp.path().join("c/node-scratch")),
+            transport: ScratchTransport::live(reqwest::Client::new(), move || {
+                Some(held.lock().unwrap().clone())
+            }),
+            writer: "wc",
+        }
     }
 }
 
@@ -311,4 +358,157 @@ async fn a_replica_is_never_moved_back_to_an_older_head() {
     assert_eq!(read(&late.tree, "state").as_deref(), Some("two\n"));
     let report = world.a.finish(late).await;
     assert!(report.materialize.is_none(), "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_back_after_a_runner_restart_presents_the_credential_the_reattach_issued() {
+    let world = world(None).await;
+    let held = Arc::new(Mutex::new(world.attach("machine-c", 1)));
+    let c = world.live_machine(held.clone());
+    let on_c = c.prepare(&world.grant().await).await;
+    std::fs::write(on_c.tree.join("result.txt"), "kept\n").unwrap();
+
+    // The runner restarts while the batch runs, and the machine re-attaches
+    // before the batch ends.
+    world.restart_runner("machine-c", 1);
+    *held.lock().unwrap() = world.attach("machine-c", 2);
+
+    let report = c.finish(on_c).await;
+    assert!(
+        matches!(applied(&report), ScratchWriteBackOutcome::Applied { .. }),
+        "{report:?}"
+    );
+    assert!(!report.dirty);
+    let on_a = world.a.prepare(&world.grant().await).await;
+    assert_eq!(read(&on_a.tree, "result.txt").as_deref(), Some("kept\n"));
+    world.a.finish(on_a).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_credential_is_named_and_the_first_retry_after_reattach_lands() {
+    let world = world(None).await;
+    let held = Arc::new(Mutex::new(world.attach("machine-c", 1)));
+    let c = world.live_machine(held.clone());
+    let on_c = c.prepare(&world.grant().await).await;
+    std::fs::write(on_c.tree.join("result.txt"), "owed\n").unwrap();
+
+    // The runner restarts and the batch ends before the machine re-attaches.
+    world.restart_runner("machine-c", 1);
+    let report = c.finish(on_c).await;
+    let ScratchWriteBackOutcome::Failed { stage, detail } = applied(&report) else {
+        panic!("a refused credential fails the write-back: {report:?}");
+    };
+    assert_eq!(stage, SCRATCH_STAGE_CREDENTIAL_REFUSED, "{detail}");
+    assert!(detail.contains("401"), "{detail}");
+    assert!(report.dirty, "the writes stay owed on this machine");
+    assert_eq!(world.scratch().await.head_commit, None, "nothing landed");
+
+    // The re-attach brings a new credential, and the retry it triggers is
+    // the one that lands.
+    *held.lock().unwrap() = world.attach("machine-c", 2);
+    assert_eq!(
+        replica::retry_write_backs(&c.replicas, &c.transport, "resync").await,
+        1
+    );
+    let scratch = world.scratch().await;
+    assert_eq!(scratch.head_executor_id.as_deref(), Some("machine-c"));
+    let on_a = world.a.prepare(&world.grant().await).await;
+    assert_eq!(read(&on_a.tree, "result.txt").as_deref(), Some("owed\n"));
+    world.a.finish(on_a).await;
+    assert_eq!(
+        replica::retry_write_backs(&c.replicas, &c.transport, "resync").await,
+        0,
+        "nothing is owed once it lands"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_refused_while_a_newer_credential_arrived_is_sent_once_more() {
+    let world = world(None).await;
+    let stale = world.attach("machine-c", 1);
+    world.restart_runner("machine-c", 1);
+    let fresh = world.attach("machine-c", 2);
+    // The first call goes out with the credential the work began with; a
+    // newer one has arrived by the time its 401 comes back.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let c = Machine {
+        replicas: Replicas::new(world._temp.path().join("c/node-scratch")),
+        transport: ScratchTransport::live(reqwest::Client::new(), {
+            let reads = reads.clone();
+            move || {
+                Some(if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    stale.clone()
+                } else {
+                    fresh.clone()
+                })
+            }
+        }),
+        writer: "wc",
+    };
+    let on_c = c.prepare(&world.grant().await).await;
+    std::fs::write(on_c.tree.join("result.txt"), "renewed\n").unwrap();
+    let report = c.finish(on_c).await;
+    assert!(
+        matches!(applied(&report), ScratchWriteBackOutcome::Applied { .. }),
+        "{report:?}"
+    );
+    assert!(
+        reads.load(Ordering::SeqCst) >= 2,
+        "the credential was read again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
+    let world = world(None).await;
+    super::lifecycle::ensure_subscribed(&world.orch);
+    let identity = ExecutorIdentity {
+        device_id: "machine-d-device".into(),
+        executor_id: "machine-d".into(),
+        display_name: "machine-d".into(),
+    };
+    let advertisement = ExecutorAdvertisement {
+        identity,
+        capabilities: ExecutorCapabilities {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            logical_cores: 4,
+            concurrency_capacity: None,
+            toolchains: Vec::new(),
+            projects_served: Vec::new(),
+            disk_budget_bytes: None,
+            memory_budget_bytes: None,
+            sandbox: None,
+            toolchain_detection: None,
+            build_prerequisites: None,
+            containment: None,
+        },
+        current_load: 0,
+        warm_roots: Vec::new(),
+        observed_at_unix_ms: 0,
+        liveness_observed_at_unix_ms: Some(0),
+        facts_stale_refresh_blocked: None,
+        last_refresh: None,
+        node_scratches: vec![NodeScratchReplica {
+            scratch_id: world.scratch_id.clone(),
+            synced_commit: None,
+            bytes: 5,
+            dirty: true,
+            in_use: false,
+        }],
+    };
+    let (sender, _frames) = tokio::sync::mpsc::unbounded_channel();
+    let generation = world
+        .orch
+        .fleet
+        .attach_advertised_executor(advertisement, sender, true, None, None)
+        .unwrap();
+    // Checked before this task yields once: the caller sends `Ready` as soon
+    // as attach returns, and the executor retries what it owes the moment
+    // Ready's credential arrives.
+    assert!(world
+        .orch
+        .object_plane
+        .scratch
+        .authorizes("machine-d", generation, &world.scratch_id));
 }

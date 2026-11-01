@@ -14,6 +14,7 @@
 
 use cairn_common::executor_protocol::{
     ScratchEntrySize, ScratchRefusal, ScratchSyncReport, ScratchWriteBackOutcome,
+    SCRATCH_STAGE_CREDENTIAL_REFUSED, SCRATCH_STAGE_NO_CREDENTIAL,
 };
 
 use super::owner::{self, NodeScratch, Replica};
@@ -90,6 +91,24 @@ fn refusal_text(refusal: &ScratchRefusal, machine: &str) -> String {
         " Nothing was synced: your files stay in `$TMPDIR` on {machine}, and every later batch there is refused the same way until you delete enough to fit."
     ));
     text
+}
+
+/// A failed write-back, said by what decides when it lands: a re-attach, when
+/// the machine has no credential or the runner refused the newest it holds;
+/// otherwise the executor's own retry.
+fn failed_text(stage: &str, detail: &str, machine: &str) -> String {
+    let stranded = format!("The changes exist only on {machine} until they reach the runner");
+    match stage {
+        SCRATCH_STAGE_NO_CREDENTIAL => format!(
+            "Scratch write-back failed: {machine} holds no object-channel credential, so it is not attached to the runner. {stranded}; {machine} sends them as soon as it attaches."
+        ),
+        SCRATCH_STAGE_CREDENTIAL_REFUSED => format!(
+            "Scratch write-back failed: the runner refused the newest object-channel credential {machine} holds ({detail}), because the runner restarted or that credential lapsed since {machine} last attached. {stranded}; {machine} sends them as soon as its re-attach brings a new credential."
+        ),
+        _ => format!(
+            "Scratch write-back failed ({stage}: {detail}). {stranded}; {machine} retries every two minutes, and at once when its link returns."
+        ),
+    }
 }
 
 /// The paths that do not travel, the sized ones first and largest first, so
@@ -195,9 +214,9 @@ pub fn compose(
                 }
             }
             ScratchWriteBackOutcome::Refused(refusal) => lines.push(refusal_text(refusal, machine)),
-            ScratchWriteBackOutcome::Failed { stage, detail } => lines.push(format!(
-                "Scratch write-back failed ({stage}: {detail}). The changes exist only on {machine} until they reach the runner; it retries on its own when its link returns and every few minutes."
-            )),
+            ScratchWriteBackOutcome::Failed { stage, detail } => {
+                lines.push(failed_text(stage, detail, machine))
+            }
         }
     }
     if let Some(reason) = report
@@ -514,6 +533,77 @@ mod tests {
         );
         assert!(text.contains("87% of its ceiling"), "{text}");
         assert!(text.contains("`rs.duckdb`"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_write_back_says_what_it_waits_for() {
+        let failed = |stage: &str, detail: &str| ScratchSyncReport {
+            write_back: Some(ScratchWriteBackReport {
+                bytes: 0,
+                ms: 40,
+                outcome: ScratchWriteBackOutcome::Failed {
+                    stage: stage.into(),
+                    detail: detail.into(),
+                },
+            }),
+            bytes: 31_100_000,
+            dirty: true,
+            ..ScratchSyncReport::default()
+        };
+        let refused = compose(
+            &failed(
+                SCRATCH_STAGE_CREDENTIAL_REFUSED,
+                "scratch write-back answered 401 Unauthorized: invalid object-channel credential",
+            ),
+            "fedora",
+            None,
+            512 * MIB,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            refused.contains("write-back failed; 31.1 MB of 512 MiB."),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("the runner refused the newest object-channel credential fedora holds (scratch write-back answered 401"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("as soon as its re-attach brings a new credential"),
+            "{refused}"
+        );
+        assert!(!refused.contains("every two minutes"), "{refused}");
+
+        let unattached = compose(
+            &failed(SCRATCH_STAGE_NO_CREDENTIAL, "no credential"),
+            "bbs",
+            None,
+            512 * MIB,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            unattached.contains("bbs holds no object-channel credential, so it is not attached"),
+            "{unattached}"
+        );
+
+        let unreachable = compose(
+            &failed("upload", "scratch upload: connection reset"),
+            "bgsrv-ub",
+            None,
+            512 * MIB,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            unreachable.contains("(upload: scratch upload: connection reset)"),
+            "{unreachable}"
+        );
+        assert!(
+            unreachable.contains("retries every two minutes"),
+            "{unreachable}"
+        );
     }
 
     #[test]

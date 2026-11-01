@@ -6177,6 +6177,22 @@ pub struct LearnedResourceEstimate {
 /// executor-local teardown of a process whose link is already ending. What a
 /// runner gets wrong talking to an older executor: nothing it did not already
 /// get wrong; that executor can still hang at shutdown with an admission held.
+///
+/// cairn/5577 does not move the number. No frame, variant, field or
+/// serialized form changes. An executor now reads its object-channel
+/// credential as each node scratch call goes out, instead of keeping the one
+/// it held when the work began, and sends a call the runner answered 401 once
+/// more when a newer credential has arrived meanwhile. A write-back still
+/// refused is reported under [`SCRATCH_STAGE_CREDENTIAL_REFUSED`], and one with
+/// no credential under [`SCRATCH_STAGE_NO_CREDENTIAL`], whichever call met it:
+/// new values of the free-text `stage` that [`ScratchWriteBackOutcome::Failed`]
+/// already carried. The runner now grants a connection the scratches it
+/// advertises as the advertisement arrives, which for an attach is before it
+/// sends `Ready`. What a runner gets wrong talking to an older executor:
+/// nothing it decodes differently; that executor still sends a long batch's
+/// write-back with the credential the batch began with, and the run result
+/// explains that 401 as it explains any failed call. An older runner quotes
+/// the new stages as it quotes every other.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -16763,10 +16779,23 @@ pub enum ScratchWriteBackOutcome {
     },
     Refused(ScratchRefusal),
     Failed {
+        /// The call that failed, unless the credential decided it, when it is
+        /// [`SCRATCH_STAGE_NO_CREDENTIAL`] or [`SCRATCH_STAGE_CREDENTIAL_REFUSED`].
         stage: String,
         detail: String,
     },
 }
+
+/// The [`ScratchWriteBackOutcome::Failed`] stage of a write-back whose machine
+/// held no object-channel credential: it is not attached to the runner, and it
+/// sends the write-back as soon as it attaches.
+pub const SCRATCH_STAGE_NO_CREDENTIAL: &str = "channel";
+
+/// The [`ScratchWriteBackOutcome::Failed`] stage of a write-back the runner
+/// refused under the newest credential its machine held. The runner restarted
+/// (or the credential lapsed) since that machine last attached, and it sends
+/// the write-back as soon as a re-attach brings a new credential.
+pub const SCRATCH_STAGE_CREDENTIAL_REFUSED: &str = "credential";
 
 /// One replica a machine holds, as its advertisement reports it. Built from
 /// each replica's state file, never by walking a tree, so its cost is the
