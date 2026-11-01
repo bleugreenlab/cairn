@@ -363,6 +363,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: sandbox::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         apply_safe_jj_workspace_refresh_status_carveout(
             &mut policy,
@@ -394,6 +395,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: sandbox::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         apply_safe_jj_workspace_refresh_status_carveout(
             &mut policy,

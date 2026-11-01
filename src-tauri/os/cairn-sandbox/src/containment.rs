@@ -10,7 +10,7 @@
 //! anywhere at all reports exactly what a working sandbox reports.
 
 #[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cairn_common::executor_protocol::{
     ContainmentObservations, EdgeDisposition, EdgeFingerprint, EdgeId, EffectClass, Fingerprint,
@@ -121,6 +121,7 @@ fn input_value(input: InvalidationInput, build_id: &str, boot: &str) -> Option<S
         InvalidationInput::BootGeneration => Some(boot.to_string()),
         InvalidationInput::SandboxProfile => crate::enforcement_description(),
         InvalidationInput::MountTopology => mount_topology(),
+        InvalidationInput::PageCallPolicy => crate::page_call::policy_input(),
         // The remaining inputs have no closed, readable form on this machine
         // yet: a network policy that is not expressed anywhere cannot be read,
         // and the build-service set is user-configured and open. Their edges
@@ -255,6 +256,9 @@ pub fn probe_batch_spawn_filesystem(mode: PolicyMode) -> Result<ProbeWitness, St
         PolicyMode::NotApplicable => {
             return Err("the filesystem seam always runs under a policy mode".to_string())
         }
+        PolicyMode::PageCall => {
+            return Err("the page-call policy is measured by its own probe".to_string())
+        }
     };
     let script = format!(
         "printf probe > {} 2>/dev/null; printf probe > {} 2>/dev/null; exit 0",
@@ -306,6 +310,7 @@ pub const fn batch_filesystem_edge(mode: PolicyMode) -> EdgeId {
     match mode {
         PolicyMode::Confined => EdgeId::BatchSpawnFilesystemConfined,
         PolicyMode::ReadOnlyCheckout => EdgeId::BatchSpawnFilesystemReadOnlyCheckout,
+        PolicyMode::PageCall => EdgeId::PageCallFilesystemRead,
         PolicyMode::Unconfined | PolicyMode::NotApplicable => {
             EdgeId::BatchSpawnFilesystemUnconfined
         }
@@ -421,6 +426,9 @@ pub fn probe_host_socket(
         PolicyMode::Unconfined => None,
         PolicyMode::NotApplicable => {
             return Err("the host-socket seam always runs under a policy mode".to_string())
+        }
+        PolicyMode::PageCall => {
+            return Err("the page-call policy is measured by its own probe".to_string())
         }
     }
     .map(|mut policy| {
@@ -849,6 +857,615 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// What one probe crossing saw, kept so the page-call measurement can answer
+/// for two edges from one run; only this module turns it into a witness.
+#[derive(Debug, Clone)]
+struct Crossing {
+    positive_control_passed: bool,
+    crossing_permitted: bool,
+    detail: String,
+}
+
+/// The page-call policy as this machine measured it, once per process: the
+/// read edge, the egress edge, and each program it ran.
+#[derive(Debug, Clone)]
+struct PageCallMeasurement {
+    filesystem: Result<Crossing, String>,
+    egress: Result<Crossing, String>,
+    programs: Vec<cairn_common::executor_protocol::PageCallProgramEvidence>,
+}
+
+fn page_call_measurement() -> &'static PageCallMeasurement {
+    static MEASURED: std::sync::OnceLock<PageCallMeasurement> = std::sync::OnceLock::new();
+    MEASURED.get_or_init(measure_page_call)
+}
+
+/// Each program the page-call probe ran under the page-call policy, and
+/// whether it ran. Measured with the page-call edges, so it is current
+/// exactly while they are.
+pub fn page_call_programs() -> Vec<cairn_common::executor_protocol::PageCallProgramEvidence> {
+    page_call_measurement().programs.clone()
+}
+
+/// Spawn `program` under `policy` the way a page-call batch item is spawned:
+/// through the policy's wrapping, with the environment cleared to `env`, in
+/// `dir`, killed if it outlasts a bound a trivial program never approaches.
+#[cfg(unix)]
+fn run_page_call_spawn(
+    policy: &SandboxPolicy,
+    env: &[(String, String)],
+    dir: &Path,
+    program: &str,
+    args: &[String],
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let (wrapped, wrapped_args) = crate::wrap_argv(program, args, policy);
+    let mut command = std::process::Command::new(&wrapped);
+    command
+        .args(&wrapped_args)
+        .env_clear()
+        .envs(env.iter().cloned())
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::install_pre_exec(&mut command, policy);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn {program} under the page-call policy: {error}"))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{program} did not finish within 20 s under the page-call policy"
+                ));
+            }
+            Err(error) => return Err(format!("wait for {program}: {error}")),
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(unix)]
+fn first_words(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return "no output".to_string();
+    }
+    text.chars().take(240).collect()
+}
+
+/// Attempt every crossing the page-call policy is supposed to refuse, through
+/// exactly the wrapping and environment a page-call batch gets, beside the
+/// controls it is supposed to allow.
+///
+/// Refused: a planted `mcp_auth_secret` and `cairn.db` in a Cairn home beside
+/// the user's own, the same in every Cairn home an interpreter root sits in
+/// (so admitting a pinned toolchain tree is shown not to expose its home), a
+/// file directly in the user's home, and a file in a sibling of the batch
+/// directory. Allowed: a file in the batch directory, and each program
+/// running a trivial line under its own roots. Egress is attempted with the
+/// first interpreter that ran: a connection to a stand-in relay port must
+/// succeed and one to a second loopback port must not.
+#[cfg(unix)]
+fn measure_page_call() -> PageCallMeasurement {
+    use cairn_common::executor_protocol::PageCallProgramEvidence;
+    let unmeasured = |reason: String| PageCallMeasurement {
+        filesystem: Err(reason.clone()),
+        egress: Err(reason),
+        programs: Vec::new(),
+    };
+    let mut programs = Vec::new();
+    let mut resolved = Vec::new();
+    for program in crate::page_call::PAGE_CALL_PROGRAMS {
+        match crate::page_call::resolve_program(program) {
+            Ok(found) => resolved.push(found),
+            Err(detail) => programs.push(PageCallProgramEvidence {
+                program: program.to_string(),
+                passed: false,
+                resolved: None,
+                detail,
+            }),
+        }
+    }
+    let Some(os_home) = crate::home_dir() else {
+        return unmeasured("no home directory to plant a Cairn home in".to_string());
+    };
+    let base = match tempfile::Builder::new().prefix("pc").tempdir_in("/tmp") {
+        Ok(base) => base,
+        Err(error) => return unmeasured(format!("create the page-call probe directory: {error}")),
+    };
+    let base_path = base
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| base.path().into());
+    let dir = base_path.join("d");
+    let sibling = base_path.join("s");
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let probe_home = os_home.join(format!(".cairn-page-call-probe-{id}"));
+    let outside = os_home.join(format!("cairn-page-call-probe-{id}"));
+    let homes = crate::OperatorCredentialFloor::for_this_machine()
+        .known_homes()
+        .unwrap_or_default();
+    let interpreter_homes: Vec<PathBuf> = homes
+        .iter()
+        .filter(|home| {
+            resolved
+                .iter()
+                .flat_map(|program| program.roots.iter())
+                .any(|root| root.starts_with(home))
+        })
+        .map(|home| home.join(format!(".page-call-probe-{id}")))
+        .collect();
+    let mut targets: Vec<(String, PathBuf)> = vec![
+        (
+            "a planted mcp_auth_secret in a Cairn home".into(),
+            probe_home.join("mcp_auth_secret"),
+        ),
+        (
+            "a planted cairn.db in a Cairn home".into(),
+            probe_home.join("cairn.db"),
+        ),
+        ("a file in the user's home".into(), outside.clone()),
+        (
+            "a file in a sibling of the batch directory".into(),
+            sibling.join("f"),
+        ),
+    ];
+    for planted in &interpreter_homes {
+        let home = planted
+            .parent()
+            .map(Path::display)
+            .map(|d| d.to_string())
+            .unwrap_or_default();
+        targets.push((
+            format!("a planted mcp_auth_secret in {home}, beside an admitted interpreter"),
+            planted.join("mcp_auth_secret"),
+        ));
+        targets.push((
+            format!("a planted cairn.db in {home}, beside an admitted interpreter"),
+            planted.join("cairn.db"),
+        ));
+    }
+    let planted = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        crate::page_call::prepare_dir(&dir)?;
+        std::fs::write(dir.join("control"), "pc-control")?;
+        std::fs::create_dir_all(&sibling)?;
+        std::fs::create_dir_all(&probe_home)?;
+        for planted in &interpreter_homes {
+            std::fs::create_dir_all(planted)?;
+        }
+        std::fs::write(&outside, "pc-outside")?;
+        for (_, target) in &targets {
+            std::fs::write(target, "pc-planted")?;
+        }
+        Ok(())
+    })();
+    let relay = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+    let other = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+    let measured = match (planted, &relay, &other) {
+        (Err(error), _, _) => unmeasured(format!("plant the page-call probe files: {error}")),
+        (_, Err(error), _) | (_, _, Err(error)) => unmeasured(format!(
+            "bind the page-call probe's loopback ports: {error}"
+        )),
+        (Ok(()), Ok(relay), Ok(other)) => {
+            let relay_port = relay.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            let other_port = other.local_addr().map(|addr| addr.port()).unwrap_or(0);
+            measure_page_call_crossings(&dir, &resolved, &targets, relay_port, other_port, programs)
+        }
+    };
+    // Removed by this unconfined process whatever happened.
+    let _ = std::fs::remove_dir_all(&probe_home);
+    let _ = std::fs::remove_file(&outside);
+    for planted in &interpreter_homes {
+        let _ = std::fs::remove_dir_all(planted);
+    }
+    drop(base);
+    measured
+}
+
+#[cfg(unix)]
+fn measure_page_call_crossings(
+    dir: &Path,
+    resolved: &[crate::page_call::ResolvedProgram],
+    targets: &[(String, PathBuf)],
+    relay_port: u16,
+    other_port: u16,
+    mut programs: Vec<cairn_common::executor_protocol::PageCallProgramEvidence>,
+) -> PageCallMeasurement {
+    use cairn_common::executor_protocol::PageCallProgramEvidence;
+    let all_roots: Vec<PathBuf> = resolved
+        .iter()
+        .flat_map(|program| program.roots.iter().cloned())
+        .collect();
+    let widest = SandboxPolicy::for_page_call(dir, &all_roots, relay_port);
+    let env = crate::page_call::base_env(dir, resolved);
+
+    // A pathname unix socket bound outside the batch directory, so the egress
+    // crossing proves the hard-required `ResolveUnix` actually refuses a host
+    // socket (`/run/user/<uid>/bus`, a tmux server, the ssh agent) on a
+    // kernel that claims ABI 9, not only that a kernel below it fails to build
+    // the ruleset. Linux only: on macOS a socket path outside the read
+    // allow-list is unreadable, so the filesystem crossing already covers it.
+    #[cfg(target_os = "linux")]
+    let unix_guard = probe_unix_listener();
+    #[cfg(target_os = "linux")]
+    let unix_path = unix_guard.as_ref().map(|(_, _, path)| path.clone());
+    #[cfg(not(target_os = "linux"))]
+    let unix_path: Option<String> = None;
+
+    let mut script = String::new();
+    for (index, (_, target)) in targets.iter().enumerate() {
+        script.push_str(&format!(
+            "cat {} >/dev/null 2>&1 && echo leak:{index}\n",
+            shell_quote(target)
+        ));
+    }
+    script.push_str(&format!("cat {}\n", shell_quote(&dir.join("control"))));
+    let filesystem = run_page_call_spawn(&widest, &env, dir, "/bin/sh", &["-c".to_string(), script])
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let positive_control_passed = stdout.contains("pc-control");
+            let leaked: Vec<&str> = stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix("leak:")?.parse::<usize>().ok())
+                .filter_map(|index| targets.get(index).map(|(label, _)| label.as_str()))
+                .collect();
+            let detail = match (positive_control_passed, leaked.is_empty()) {
+                (false, _) => format!(
+                    "the batch directory's own file could not be read under the page-call policy, so this probe could not exercise the seam: {}",
+                    first_words(&output.stderr)
+                ),
+                (true, true) => format!(
+                    "read the batch directory's own file and was refused {}",
+                    targets.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>().join("; ")
+                ),
+                (true, false) => format!("the page-call policy let a batch read {}", leaked.join("; ")),
+            };
+            Crossing {
+                positive_control_passed,
+                crossing_permitted: !leaked.is_empty(),
+                detail,
+            }
+        });
+
+    // On macOS the page-call profile closes the process table by denying
+    // `process-info*`, the `kern.procargs2`/`kern.procargs` sysctls, and
+    // `signal` for other processes. Which Seatbelt operation actually gates
+    // `KERN_PROCARGS2` is a fact about the OS, not an assumption the profile
+    // text can make, so a crossing proves it per machine: a sibling carries a
+    // marker only another process's environment read could see, and the
+    // page-call child must fail both to read it and to signal that sibling. A
+    // leak, or an inability to run the crossing at all, folds into the
+    // filesystem witness so the edge is Ambient or Unmeasured and the machine
+    // is never a candidate. Linux is not exposed on this axis: `/proc/<pid>/
+    // environ` is outside the read allow-list and signals are scoped (ABI 6).
+    #[cfg(target_os = "macos")]
+    let filesystem = filesystem
+        .map(|crossing| macos_fold_process_table(crossing, dir, resolved, relay_port, &env));
+
+    let mut connect_with: Option<(&crate::page_call::ResolvedProgram, Vec<String>)> = None;
+    for program in resolved {
+        let args: Vec<String> = match program.program.as_str() {
+            "bun" => vec!["-e".into(), "console.log('pc-' + 'ok')".into()],
+            "python3" => vec!["-c".into(), "print('pc-' + 'ok')".into()],
+            _ => vec!["-c".into(), "echo pc-ok".into()],
+        };
+        let policy = SandboxPolicy::for_page_call(dir, &program.roots, relay_port);
+        let path = program.path.to_string_lossy().into_owned();
+        let (passed, detail) = match run_page_call_spawn(&policy, &env, dir, &path, &args) {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("pc-ok") =>
+            {
+                (true, "ran under the page-call policy".to_string())
+            }
+            Ok(output) => (
+                false,
+                format!(
+                    "exited {} under the page-call policy: {}",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "by signal".to_string(), |code| code.to_string()),
+                    first_words(&output.stderr)
+                ),
+            ),
+            Err(error) => (false, error),
+        };
+        if passed && connect_with.is_none() {
+            let connect = match program.program.as_str() {
+                "python3" => {
+                    let unix = unix_path.as_ref().map_or(String::new(), |path| format!(
+                        "\ntry:\n    s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect({path:?}); s.close(); print('unix-open')\nexcept Exception:\n    print('unix-shut')\n"
+                    ));
+                    Some(vec![
+                        "-c".to_string(),
+                        format!(
+                            "import socket\nfor port, label in (({relay_port}, 'relay'), ({other_port}, 'other')):\n    try:\n        socket.create_connection(('127.0.0.1', port), 2).close()\n        print(label + '-open')\n    except Exception:\n        print(label + '-shut')\n{unix}"
+                        ),
+                    ])
+                }
+                "bun" => Some(vec![
+                    "-e".to_string(),
+                    format!(
+                        "const net = require('net'); for (const [port, label] of [[{relay_port}, 'relay'], [{other_port}, 'other']]) {{ await new Promise((done) => {{ const socket = net.connect(port, '127.0.0.1'); const end = (state) => {{ console.log(label + '-' + state); socket.destroy(); done(); }}; socket.on('connect', () => end('open')); socket.on('error', () => end('shut')); setTimeout(() => end('shut'), 2000); }}); }}"
+                    ),
+                ]),
+                _ => None,
+            };
+            if let Some(args) = connect {
+                connect_with = Some((program, args));
+            }
+        }
+        programs.push(PageCallProgramEvidence {
+            program: program.program.clone(),
+            passed,
+            resolved: Some(program.path.to_string_lossy().into_owned()),
+            detail,
+        });
+    }
+
+    let egress = match connect_with {
+        None => Err(
+            "no interpreter ran under the page-call policy, so no connection could be attempted"
+                .to_string(),
+        ),
+        Some((program, args)) => {
+            let policy = SandboxPolicy::for_page_call(dir, &program.roots, relay_port);
+            let path = program.path.to_string_lossy().into_owned();
+            run_page_call_spawn(&policy, &env, dir, &path, &args).map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let positive_control_passed = stdout.contains("relay-open");
+                let tcp_leaked = stdout.contains("other-open");
+                let unix_leaked = stdout.contains("unix-open");
+                let crossing_permitted = tcp_leaked || unix_leaked;
+                let detail = match (positive_control_passed, tcp_leaked, unix_leaked) {
+                    (false, _, _) => format!(
+                        "{} could not reach the stand-in relay port, so this probe could not exercise the seam: {}",
+                        program.program,
+                        first_words(&output.stderr)
+                    ),
+                    (true, false, false) => format!(
+                        "{} reached the relay port and was refused a second loopback port and a host unix socket",
+                        program.program
+                    ),
+                    (true, true, _) => format!(
+                        "{} reached a loopback port other than the relay, so this platform cannot confine a page-call batch's TCP egress here; the runner's refusal of every request without a valid credential is the bound",
+                        program.program
+                    ),
+                    (true, false, true) => format!(
+                        "{} reached a host pathname unix socket outside its allow-list, so this platform cannot confine a page-call batch's socket egress here",
+                        program.program
+                    ),
+                };
+                Crossing {
+                    positive_control_passed,
+                    crossing_permitted,
+                    detail,
+                }
+            })
+        }
+    };
+    #[cfg(target_os = "linux")]
+    drop(unix_guard);
+    PageCallMeasurement {
+        filesystem,
+        egress,
+        programs,
+    }
+}
+
+/// Bind a listening pathname unix socket in a short directory beneath `/tmp`,
+/// outside any page-call batch directory and so outside its socket-resolvable
+/// set. The returned guard keeps it listening until the egress crossing has
+/// run; the path is where a confined child must be refused a `connect`.
+#[cfg(target_os = "linux")]
+fn probe_unix_listener() -> Option<(tempfile::TempDir, std::os::unix::net::UnixListener, String)> {
+    let dir = socket_probe::short_tempdir().ok()?;
+    let path = dir.path().join("host.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).ok()?;
+    let path = path.to_string_lossy().into_owned();
+    Some((dir, listener, path))
+}
+
+/// A page-call child's attempt to read another same-uid process's environment
+/// through `KERN_PROCARGS2` and to signal it. Prints `PROC <env|noenv>
+/// <sig|nosig>`; stdlib only, so it reads nothing outside the allow-list.
+#[cfg(target_os = "macos")]
+const PROCESS_TABLE_SNIPPET: &str = r#"import ctypes, os, signal, sys
+pid = int(sys.argv[1]); marker = sys.argv[2].encode()
+libc = ctypes.CDLL(None, use_errno=True)
+mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid
+size = ctypes.c_size_t(0)
+env_leaked = False
+if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) == 0 and size.value:
+    buf = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0:
+        env_leaked = marker in buf.raw
+try:
+    os.kill(pid, signal.SIGCONT); sig = True
+except OSError:
+    sig = False
+print('PROC', 'env' if env_leaked else 'noenv', 'sig' if sig else 'nosig')
+"#;
+
+/// Fold the process-table crossing into the filesystem witness. Only called
+/// once the filesystem positive control has passed, so a false here is a real
+/// boundary failure rather than a broken harness.
+#[cfg(target_os = "macos")]
+fn macos_fold_process_table(
+    mut crossing: Crossing,
+    dir: &Path,
+    resolved: &[crate::page_call::ResolvedProgram],
+    relay_port: u16,
+    env: &[(String, String)],
+) -> Crossing {
+    if !crossing.positive_control_passed {
+        return crossing;
+    }
+    let Some(python) = resolved.iter().find(|program| program.program == "python3") else {
+        crossing.positive_control_passed = false;
+        crossing.detail = "no python3 resolved to prove a page batch cannot read another process's environment, so the process-table boundary is unproven".into();
+        return crossing;
+    };
+    let marker = format!("pc-env-{}", uuid::Uuid::new_v4().simple());
+    let mut sibling = match std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("PC_PROBE_MARKER", &marker)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            crossing.positive_control_passed = false;
+            crossing.detail =
+                format!("could not plant a sibling to probe the process-table boundary: {error}");
+            return crossing;
+        }
+    };
+    let policy = SandboxPolicy::for_page_call(dir, &python.roots, relay_port);
+    let outcome = run_page_call_spawn(
+        &policy,
+        env,
+        dir,
+        &python.path.to_string_lossy(),
+        &[
+            "-c".to_string(),
+            PROCESS_TABLE_SNIPPET.to_string(),
+            sibling.id().to_string(),
+            marker,
+        ],
+    );
+    let _ = sibling.kill();
+    let _ = sibling.wait();
+    match outcome {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let tokens: Vec<&str> = stdout.split_whitespace().collect();
+            if !tokens.contains(&"PROC") {
+                crossing.positive_control_passed = false;
+                crossing.detail = format!(
+                    "the process-table probe did not run under the page-call policy, so the boundary is unproven: {}",
+                    first_words(&output.stderr)
+                );
+            } else if tokens.contains(&"env") || tokens.contains(&"sig") {
+                crossing.crossing_permitted = true;
+                crossing.detail = format!(
+                    "the page-call policy let a batch {} another same-uid process (exposing its relay capability or letting it be signalled)",
+                    if tokens.contains(&"env") {
+                        "read the environment of"
+                    } else {
+                        "signal"
+                    }
+                );
+            }
+            crossing
+        }
+        Err(error) => {
+            crossing.positive_control_passed = false;
+            crossing.detail = format!(
+                "the process-table probe could not spawn under the page-call policy: {error}"
+            );
+            crossing
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn measure_page_call() -> PageCallMeasurement {
+    let reason = format!(
+        "no page-call policy exists on {}: no sandbox primitive confines its reads",
+        std::env::consts::OS
+    );
+    PageCallMeasurement {
+        filesystem: Err(reason.clone()),
+        egress: Err(reason),
+        programs: Vec::new(),
+    }
+}
+
+/// A page-call edge as this machine can currently report it.
+pub fn observe_page_call(
+    edge: EdgeId,
+    build_id: &str,
+    boot: &str,
+    platform: Option<RemotePlatform>,
+) -> EdgeDisposition {
+    let Some(platform) = platform else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine is not one of the published executor platforms, so its measurements have no closed platform identity to bind to".into(),
+        };
+    };
+    let Some(invalidation_fingerprint) = fingerprint(edge, build_id, boot) else {
+        return EdgeDisposition::Unmeasured {
+            reason: "this machine cannot currently read every input that could widen the page-call policy, so no positive disposition is constructible".into(),
+        };
+    };
+    let measurement = page_call_measurement();
+    let (crossing, effect) = match edge {
+        EdgeId::PageCallFilesystemRead => (&measurement.filesystem, EffectClass::Read),
+        EdgeId::PageCallEgress => (&measurement.egress, EffectClass::Invoke),
+        other => {
+            return EdgeDisposition::Unmeasured {
+                reason: format!("{other:?} is not a page-call edge"),
+            }
+        }
+    };
+    let crossing = match crossing {
+        Ok(crossing) => crossing.clone(),
+        Err(reason) => {
+            return EdgeDisposition::Unmeasured {
+                reason: reason.clone(),
+            }
+        }
+    };
+    let definition = edge.definition();
+    ProbeWitness {
+        edge,
+        effect,
+        positive_control_passed: crossing.positive_control_passed,
+        crossing_permitted: crossing.crossing_permitted,
+        detail: crossing.detail,
+    }
+    .into_disposition(PositiveScope {
+        executor_build_id: build_id.to_string(),
+        boot_generation: boot.to_string(),
+        platform,
+        process_class: definition.key.process_class,
+        carrier: definition.key.carrier,
+        policy_mode: definition.key.policy_mode,
+        probe_version: ProbeVersion::V1,
+        claim_revision: definition.claim_revision,
+        invalidation_fingerprint,
+    })
+}
+
 /// The batch-spawn filesystem edge as this machine can currently report it.
 ///
 /// Every failure path yields `Unmeasured` naming its cause rather than a weaker
@@ -948,6 +1565,9 @@ fn probe_evidence(
                     ),
                     EdgeId::OperatorCredentialRead => {
                         observe_operator_credential_read(build_id, boot, platform)
+                    }
+                    EdgeId::PageCallFilesystemRead | EdgeId::PageCallEgress => {
+                        observe_page_call(edge, build_id, boot, platform)
                     }
                     socket if host_socket_class(socket).is_some() => {
                         let (class, mode) = host_socket_class(socket).expect("guarded");
@@ -1079,6 +1699,98 @@ mod tests {
                 matches!(disposition, EdgeDisposition::Ambient { .. }),
                 "a platform that cannot enforce the boundary must say so: {disposition:?}"
             );
+        }
+    }
+
+    /// Live: through the real page-call wrapping, a planted secret, database,
+    /// home file and sibling stay unreadable while the batch's own file reads,
+    /// `sh` runs, and wherever the probe could try a connection the second
+    /// loopback port is refused on macOS and on Linux from Landlock ABI 4.
+    /// A confined macOS process cannot apply the page-call profile, so a test
+    /// lane inside a Seatbelt fence cannot exercise the probe; the executor
+    /// that measures it in production never is. Keyed to one reason so the
+    /// skip census resolves it (the test passes its own name as a literal).
+    #[cfg(target_os = "macos")]
+    fn skip_page_call_probe_when_confined(test: &str) -> bool {
+        if crate::current_process_is_confined() {
+            eprintln!("skipping {test}: a confined process cannot apply the page-call profile");
+            cairn_common::skip_ledger::record_skip(test, "nested-sandbox-exec");
+            return true;
+        }
+        false
+    }
+
+    /// A fenced test process cannot plant a probe home in `$HOME`. The
+    /// production probe runs unconfined, so this is a test-lane gap only.
+    #[cfg(unix)]
+    fn skip_page_call_probe_when_home_unplantable(
+        test: &str,
+        measured: &PageCallMeasurement,
+    ) -> bool {
+        if matches!(&measured.filesystem, Err(reason) if reason.starts_with("plant the page-call probe files"))
+        {
+            eprintln!("skipping {test}: a fenced process cannot plant a probe home");
+            cairn_common::skip_ledger::record_skip(test, "worktree-fence");
+            return true;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_page_call_probe_refuses_every_planted_crossing_live() {
+        #[cfg(target_os = "macos")]
+        if skip_page_call_probe_when_confined(
+            "the_page_call_probe_refuses_every_planted_crossing_live",
+        ) {
+            return;
+        }
+        let measured = measure_page_call();
+        // A page-call policy hard-requires Landlock ABI 9 (for `ResolveUnix`),
+        // so a kernel below it cannot build the ruleset and the machine is
+        // excluded. That exclusion is the correct outcome, asserted here as a
+        // real fact (the policy could not be applied) rather than skipped; the
+        // policy's shape is covered by the unit tests. Every current Linux
+        // host is ABI 8, so this is the branch they take today.
+        #[cfg(target_os = "linux")]
+        if crate::linux::kernel_abi().is_none_or(|abi| abi < crate::linux::RESOLVE_UNIX_ABI) {
+            assert!(
+                measured.filesystem.is_err(),
+                "a kernel below Landlock ABI 9 must not be able to apply the page-call policy"
+            );
+            return;
+        }
+        if skip_page_call_probe_when_home_unplantable(
+            "the_page_call_probe_refuses_every_planted_crossing_live",
+            &measured,
+        ) {
+            return;
+        }
+        let filesystem = match &measured.filesystem {
+            Ok(crossing) => crossing.clone(),
+            Err(reason) => panic!("the page-call probe runs on unix: {reason}"),
+        };
+        assert!(filesystem.positive_control_passed, "{}", filesystem.detail);
+        assert!(!filesystem.crossing_permitted, "{}", filesystem.detail);
+        let sh = measured
+            .programs
+            .iter()
+            .find(|program| program.program == "sh")
+            .expect("sh is probed");
+        assert!(
+            sh.passed,
+            "sh must run under the page-call policy: {}",
+            sh.detail
+        );
+        if let Ok(egress) = &measured.egress {
+            if egress.positive_control_passed {
+                #[cfg(target_os = "macos")]
+                let confined = true;
+                #[cfg(target_os = "linux")]
+                let confined =
+                    crate::linux::kernel_abi().is_some_and(|abi| abi >= crate::linux::NET_TCP_ABI);
+                assert_eq!(!egress.crossing_permitted, confined, "{}", egress.detail);
+            }
         }
     }
 

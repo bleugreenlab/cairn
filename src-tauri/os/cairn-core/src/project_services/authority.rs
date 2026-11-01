@@ -20,8 +20,11 @@
 //!   For an agent caller in the same project that intersection is
 //!   representable: project resources, under the service's `deny` fence, with
 //!   every `run` batch verdict-only and nothing committed. A page caller's
-//!   grants cannot be intersected yet, so a page call carries no delegated run
-//!   at all and the service can answer it but not act for it.
+//!   viewer grants never enter it: a page's call reaches its owning thread's
+//!   database and may run code only as a page-call batch, which the run tool
+//!   places under the page-call sandbox policy (no checkout, reads confined to
+//!   the system, the interpreter, and its own scratch; see
+//!   `docs/worktree-fence.md`).
 //!
 //! The intersection is enforced here, at the one dispatch door every tool call
 //! passes (`crate::dispatch::dispatch_tool`), and it is narrower than the
@@ -67,9 +70,13 @@ pub(crate) enum DelegatedScope {
     /// a prompt, so one that would prompt is refused instead (tenet 1313's
     /// ruling on cairn/5624).
     Owner { thread: String },
-    /// A page's call: the owning thread's database, read and written, and
-    /// nothing else.
-    ThreadDb { thread: String },
+    /// A page's call: the owning thread's database, read and written, plus
+    /// verdict-only `command` and `code` batches, which the run tool places
+    /// only as page-call batches (scratch-only, read-allowlisted, relay-only,
+    /// on an executor that has proven that policy). Nothing else: no files,
+    /// no other resource, no tool targets, no commit, branch, or placement
+    /// choice ([`classify_page_call`]).
+    PageCall { thread: String },
     /// Nothing. The call may still be served; any Cairn request made for it
     /// is refused with `reason`.
     Empty { reason: String },
@@ -80,7 +87,7 @@ impl DelegatedScope {
     pub(crate) fn writable_thread(&self) -> Option<&str> {
         match self {
             DelegatedScope::ProjectAgent { thread } => thread.as_deref(),
-            DelegatedScope::Owner { thread } | DelegatedScope::ThreadDb { thread } => Some(thread),
+            DelegatedScope::Owner { thread } | DelegatedScope::PageCall { thread } => Some(thread),
             DelegatedScope::Empty { .. } => None,
         }
     }
@@ -135,14 +142,18 @@ pub(crate) fn admit_caller(
 }
 
 /// The authority a call executes under. The one place that decision is made,
-/// for every kind of caller.
+/// for every kind of caller, and it has three answers: the owning thread's own
+/// call ([`DelegatedScope::Owner`]), another agent's call
+/// ([`DelegatedScope::ProjectAgent`]), and a page's call
+/// ([`DelegatedScope::PageCall`]).
 ///
 /// The thread a call acts for owns the call's data: a page's service reads
 /// and writes the page's thread database, and an agent's service writes the
 /// agent's own thread database. That a page's call reaches its owning
 /// thread's database without the viewer's grants entering into it is the
-/// operator's decision on cairn/5518; nothing else a page's call can reach
-/// comes from the owner.
+/// operator's decision on cairn/5518; that it may also run code, only as a
+/// page-call batch, is the operator's ruling on cairn/5709 (tenet 1330).
+/// Nothing else a page's call can reach comes from the owner.
 pub(crate) fn delegation_for(
     owner: &super::ServiceOwner,
     caller: &super::protocol::CallerFrame,
@@ -166,7 +177,7 @@ pub(crate) fn delegation_for(
         // agent scope.
         CallerKind::Agent | CallerKind::Schedule => DelegatedScope::ProjectAgent { thread },
         CallerKind::Page => match thread {
-            Some(thread) => DelegatedScope::ThreadDb { thread },
+            Some(thread) => DelegatedScope::PageCall { thread },
             None => DelegatedScope::Empty {
                 reason: "a page's call reaches only its owning thread's database, and this page \
                          is a draft with no owning thread"
@@ -210,6 +221,47 @@ pub(crate) struct ServiceRuns {
     /// A prompt a live delegated run would have raised, refused instead. The
     /// call it belongs to fails with it whatever the method answered.
     prompts: RwLock<HashMap<String, String>>,
+    /// The `run` batches each live delegated run has in flight, so the call's
+    /// end stops them rather than letting them run to their item timeout.
+    in_flight: RwLock<HeldBatches>,
+    /// Every batch each live delegated run started, so the call's logs name
+    /// the code it ran: its request id, and the refusal it settled with when
+    /// it never ran.
+    started: RwLock<HashMap<String, Vec<(String, Option<String>)>>>,
+    /// Runs whose call has begun ending. A batch that reaches `hold_batch`
+    /// after this is not held but refused, so the gap between `stop_batches`
+    /// and `remove` cannot leak a batch that runs to its own timeout.
+    ended: RwLock<std::collections::HashSet<String>>,
+}
+
+/// A `run` batch a service run started, as the call's end needs it: a way to
+/// stop it. Defined here so `project_services` does not depend on the run
+/// handler's internals.
+pub(crate) trait BatchStop: Send + Sync {
+    /// Interrupt the batch's items and cancel its placement and its fleet
+    /// request. A verdict-only batch publishes nothing, so it settles through
+    /// the ordinary cancelled outcome.
+    fn stop(&self, orch: &Orchestrator);
+}
+
+/// The in-flight batches of each live delegated run, by request id.
+#[derive(Default)]
+struct HeldBatches(HashMap<String, Vec<(String, std::sync::Arc<dyn BatchStop>)>>);
+
+impl std::fmt::Debug for HeldBatches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(run, batches)| {
+                (
+                    run,
+                    batches
+                        .iter()
+                        .map(|(request, _)| request)
+                        .collect::<Vec<_>>(),
+                )
+            }))
+            .finish()
+    }
 }
 
 /// Ordinary runs remembered before the set is cleared and relearned.
@@ -224,6 +276,10 @@ impl ServiceRuns {
     }
 
     pub(crate) fn remove(&self, run_id: &str) -> Option<ServiceRun> {
+        self.ended
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(run_id);
         self.runs
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -269,6 +325,124 @@ impl ServiceRuns {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(run_id)
+    }
+
+    /// Hold a batch `run_id` started until it settles or the call ends.
+    /// Nothing is held for a run the supervisor does not hold: an ordinary
+    /// run's batches are not a call's.
+    /// Hold a batch until it settles or the call ends, returning whether it
+    /// was held. `false` means the call has ended (or was never a held run):
+    /// its caller must stop the batch itself rather than leave it running,
+    /// because nothing else now will.
+    pub(crate) fn hold_batch(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        batch: std::sync::Arc<dyn BatchStop>,
+    ) -> bool {
+        if self.get(run_id).is_none()
+            || self
+                .ended
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(run_id)
+        {
+            return false;
+        }
+        self.in_flight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .entry(run_id.to_string())
+            .or_default()
+            .push((request_id.to_string(), batch));
+        let mut started = self
+            .started
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = started.entry(run_id.to_string()).or_default();
+        if entry.len() < 64 {
+            entry.push((request_id.to_string(), None));
+        }
+        true
+    }
+
+    /// Let go of a batch that settled on its own, keeping the refusal it
+    /// settled with when it never ran, so the call's logs can say why in the
+    /// words the fleet used.
+    pub(crate) fn release_batch(&self, run_id: &str, request_id: &str, refusal: Option<String>) {
+        if let Some(refusal) = refusal {
+            if let Some(entry) = self
+                .started
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_mut(run_id)
+                .and_then(|batches| batches.iter_mut().find(|(held, _)| held == request_id))
+            {
+                entry.1 = Some(refusal);
+            }
+        }
+        let mut in_flight = self
+            .in_flight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(batches) = in_flight.0.get_mut(run_id) {
+            batches.retain(|(held, _)| held != request_id);
+            if batches.is_empty() {
+                in_flight.0.remove(run_id);
+            }
+        }
+    }
+
+    /// Stop every batch `run_id` still has in flight. The handles are taken
+    /// out under the lock and stopped after it is dropped, because stopping
+    /// takes the fleet's locks and may emit events.
+    pub(crate) fn stop_batches(&self, orch: &Orchestrator, run_id: &str) -> usize {
+        // Mark the call ended first, so a batch that reaches `hold_batch`
+        // between here and `remove` is refused rather than held unstopped.
+        self.ended
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_string());
+        let batches = self
+            .in_flight
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0
+            .remove(run_id)
+            .unwrap_or_default();
+        // Record why each stopped batch did not run, before its own task's
+        // `release_batch` would: the call's log is taken (`take_batches`)
+        // right after this, and a batch the call cancelled must read as
+        // stopped, never as "ran".
+        if !batches.is_empty() {
+            let mut started = self
+                .started
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = started.get_mut(run_id) {
+                for (request_id, _) in &batches {
+                    if let Some(held) = entry.iter_mut().find(|(held, _)| held == request_id) {
+                        held.1
+                            .get_or_insert_with(|| "the call ended before it finished".to_string());
+                    }
+                }
+            }
+        }
+        for (_, batch) in &batches {
+            batch.stop(orch);
+        }
+        batches.len()
+    }
+
+    /// Every batch `run_id` started, with the refusal of each that never ran,
+    /// forgotten as it is taken.
+    pub(crate) fn take_batches(&self, run_id: &str) -> Vec<(String, Option<String>)> {
+        self.started
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(run_id)
+            .unwrap_or_default()
     }
 
     /// What `run_id` wrote, forgotten as it is taken.
@@ -430,9 +604,23 @@ pub(crate) fn classify(run: &ServiceRun, tool: &str, payload: &Value) -> Result<
             ..
         } => classify_delegated(run, Some(thread), true, tool, payload),
         ServiceRunRole::Delegated {
-            scope: DelegatedScope::ThreadDb { thread },
+            scope: DelegatedScope::PageCall { thread },
             ..
-        } => classify_thread_db(run, thread, tool, payload),
+        } => classify_page_call(run, thread, tool, payload),
+    }
+}
+
+impl ServiceRun {
+    /// Whether this run is a page's call, whose `run` batches the run tool
+    /// must place only as page-call batches.
+    pub(crate) fn is_page_call(&self) -> bool {
+        matches!(
+            self.role,
+            ServiceRunRole::Delegated {
+                scope: DelegatedScope::PageCall { .. },
+                ..
+            }
+        )
     }
 }
 
@@ -460,7 +648,12 @@ fn thread_db_writable(resource: &CairnResource, thread: &str, mode: &str) -> boo
     }
 }
 
-fn classify_thread_db(
+/// The interpreters a page-call batch may name. Each must be one the executor
+/// has proven runs under the page-call policy, which placement checks.
+pub(crate) const PAGE_CALL_INTERPRETERS: [&str; 6] =
+    ["python", "py", "typescript", "ts", "javascript", "js"];
+
+fn classify_page_call(
     run: &ServiceRun,
     thread: &str,
     tool: &str,
@@ -473,11 +666,12 @@ fn classify_thread_db(
     let refused = |what: String| {
         format!(
             "service `{}` serving a page may not {what}: a page's call reads and writes only its \
-             owning thread's database ({root}). Running code for a page waits on cairn/5564",
+             owning thread's database ({root}) and runs code only as a verdict-only page-call batch",
             run.service
         )
     };
     match tool {
+        "run" => classify_run(RunCaller::Page, payload, &refused),
         "read_batch" => {
             let paths = string_list(payload, "paths");
             if paths.is_empty() {
@@ -685,53 +879,132 @@ fn classify_delegated(
             }
             Ok(())
         }
-        "run" => {
-            if payload
-                .get("commit_msg")
-                .is_some_and(|value| !value.is_null())
-                || payload
-                    .get("commitMsg")
-                    .is_some_and(|value| !value.is_null())
-            {
-                return Err(refused(
-                    "commit: a service's run batches are verdict-only".to_string(),
-                ));
-            }
-            let commands = payload
-                .get("commands")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for item in &commands {
-                for key in ["repl", "waitFor", "wait_for"] {
-                    if item.get(key).is_some_and(|value| !value.is_null()) {
-                        return Err(refused(format!(
-                            "run an item with `{key}`: only `command`, `code`, and the owning \
-                             thread's tool targets run for a call"
-                        )));
-                    }
-                }
-                if let Some(target) = item.get("target").and_then(Value::as_str) {
-                    if !owner_targets {
-                        return Err(refused(format!(
-                            "run `{target}`: only `command` and `code` items run for a call that \
-                             is not the owning thread's own"
-                        )));
-                    }
-                    if !is_owner_target(target) {
-                        return Err(refused(format!(
-                            "run `{target}`: a call may invoke an MCP tool \
-                             (cairn://mcp/<server>/<tool>), a skill script \
-                             (cairn://skills/<id>/scripts/<name>), or an executor verb \
-                             (cairn://executors/<name>/<verb>), and nothing else"
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        }
+        "run" => classify_run(
+            if owner_targets {
+                RunCaller::Owner
+            } else {
+                RunCaller::Agent
+            },
+            payload,
+            &refused,
+        ),
         other => Err(refused(format!("use `{other}`"))),
     }
+}
+
+/// Which delegated caller a `run` payload is judged for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunCaller {
+    /// Another agent's call: `command` and `code` items.
+    Agent,
+    /// The owning thread's own call: also its MCP tools, skill scripts, and
+    /// executor verbs.
+    Owner,
+    /// A page's call: `command` and `code` items only, with nothing that
+    /// chooses where or against what they run, since placement does that.
+    Page,
+}
+
+/// The batch keys a page's `run` may carry. Anything else (a commit, a
+/// branch, an executor pin, a conflict-marker reason, a key this list has
+/// not met) is refused rather than ignored.
+const PAGE_RUN_KEYS: [&str; 3] = ["commands", "sequential", "stop_on_error"];
+/// The item keys a page's `run` item may carry.
+const PAGE_ITEM_KEYS: [&str; 5] = ["command", "code", "interpreter", "timeout", "description"];
+
+/// The one `run` grammar for a delegated call. Every caller's batch is
+/// verdict-only; the callers differ only in what items they may name.
+fn classify_run(
+    caller: RunCaller,
+    payload: &Value,
+    refused: &dyn Fn(String) -> String,
+) -> Result<(), String> {
+    let present = |value: &Value, key: &str| value.get(key).is_some_and(|value| !value.is_null());
+    if present(payload, "commit_msg") || present(payload, "commitMsg") {
+        return Err(refused(
+            "commit: a service's run batches are verdict-only".to_string(),
+        ));
+    }
+    if caller == RunCaller::Page {
+        if let Some(fields) = payload.as_object() {
+            for (key, value) in fields {
+                if !value.is_null() && !PAGE_RUN_KEYS.contains(&key.as_str()) {
+                    return Err(refused(format!(
+                        "run a batch with `{key}`: where a page's batch runs, and against what, \
+                         is the page-call placement rule's to decide"
+                    )));
+                }
+            }
+        }
+    }
+    let commands = payload
+        .get("commands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for item in &commands {
+        for key in ["repl", "waitFor", "wait_for"] {
+            if present(item, key) {
+                return Err(refused(format!(
+                    "run an item with `{key}`: only `command`, `code`, and the owning \
+                     thread's tool targets run for a call"
+                )));
+            }
+        }
+        if let Some(target) = item.get("target").and_then(Value::as_str) {
+            if caller != RunCaller::Owner {
+                return Err(refused(format!(
+                    "run `{target}`: only `command` and `code` items run for a call that \
+                     is not the owning thread's own"
+                )));
+            }
+            if !is_owner_target(target) {
+                return Err(refused(format!(
+                    "run `{target}`: a call may invoke an MCP tool \
+                     (cairn://mcp/<server>/<tool>), a skill script \
+                     (cairn://skills/<id>/scripts/<name>), or an executor verb \
+                     (cairn://executors/<name>/<verb>), and nothing else"
+                )));
+            }
+        }
+        if caller == RunCaller::Page {
+            classify_page_item(item, refused)?;
+        }
+    }
+    Ok(())
+}
+
+fn classify_page_item(item: &Value, refused: &dyn Fn(String) -> String) -> Result<(), String> {
+    let Some(fields) = item.as_object() else {
+        return Err(refused("run an item that is not an object".to_string()));
+    };
+    for (key, value) in fields {
+        if !value.is_null() && !PAGE_ITEM_KEYS.contains(&key.as_str()) {
+            return Err(refused(format!(
+                "run an item with `{key}`: a page's batch runs only `command` and `code` items"
+            )));
+        }
+    }
+    let has = |key: &str| fields.get(key).is_some_and(|value| !value.is_null());
+    if !has("command") && !has("code") {
+        return Err(refused(
+            "run an item with neither `command` nor `code`".to_string(),
+        ));
+    }
+    if has("code") {
+        let interpreter = fields
+            .get("interpreter")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !PAGE_CALL_INTERPRETERS.contains(&interpreter.as_str()) {
+            return Err(refused(format!(
+                "run `{interpreter}` code: a page's batch runs python, typescript, or javascript"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -859,7 +1132,7 @@ mod tests {
         let project = crate::project_services::ServiceOwner::Project;
         assert_eq!(
             delegation_for(&project, &caller(CallerKind::Page, "cairn://p/cairn/prep")),
-            DelegatedScope::ThreadDb {
+            DelegatedScope::PageCall {
                 thread: "prep".into()
             }
         );
@@ -915,7 +1188,7 @@ mod tests {
                 &spanish(),
                 &caller(CallerKind::Page, "cairn://p/cairn/spanish")
             ),
-            DelegatedScope::ThreadDb {
+            DelegatedScope::PageCall {
                 thread: "spanish".into()
             }
         );
@@ -940,7 +1213,7 @@ mod tests {
         let agent = delegated_as(DelegatedScope::ProjectAgent {
             thread: Some("spanish".into()),
         });
-        let page = delegated_as(DelegatedScope::ThreadDb {
+        let page = delegated_as(DelegatedScope::PageCall {
             thread: "spanish".into(),
         });
         let target = |target: &str| json!({"commands": [{"target": target}]});
@@ -1000,15 +1273,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_page_call_reads_and_writes_its_owning_threads_database_and_nothing_else() {
-        let page = run(ServiceRunRole::Delegated {
+    fn page_call() -> ServiceRun {
+        run(ServiceRunRole::Delegated {
             caller_kind: CallerKind::Page,
             acting_for: "cairn://p/cairn/prep".into(),
-            scope: DelegatedScope::ThreadDb {
+            scope: DelegatedScope::PageCall {
                 thread: "prep".into(),
             },
-        });
+        })
+    }
+
+    #[test]
+    fn a_page_call_reads_and_writes_its_owning_threads_database_and_nothing_else() {
+        let page = page_call();
+        assert!(page.is_page_call());
+        assert!(!delegated().is_page_call());
         assert!(classify(
             &page,
             "read_batch",
@@ -1053,15 +1332,119 @@ mod tests {
                 "read_batch",
                 json!({"paths": ["cairn://p/cairn/other/db?sql=SELECT 1"]}),
             ),
-            ("run", json!({"commands": [{"code": "print(1)"}]})),
+            ("read_batch", json!({"paths": ["file:src/lib.rs"]})),
+            ("read_batch", json!({"paths": ["https://example.com"]})),
+            ("read_batch", json!({"paths": ["cairn://p/cairn/12"]})),
             ("read_web", json!({})),
+            ("check_run", json!({})),
         ] {
             let refusal = classify(&page, tool, &payload).unwrap_err();
-            assert!(refusal.contains("owning thread's database"), "{refusal}");
+            assert_page_bound(&refusal);
         }
-        let run_refusal =
-            classify(&page, "run", &json!({"commands": [{"code": "1"}]})).unwrap_err();
-        assert!(run_refusal.contains("cairn/5564"), "{run_refusal}");
+    }
+
+    #[derive(Default)]
+    struct CountingStop(std::sync::atomic::AtomicUsize);
+
+    impl BatchStop for CountingStop {
+        fn stop(&self, _orch: &Orchestrator) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A delegated run's batches are held until they settle or the call ends;
+    /// an ordinary run's are never held.
+    #[tokio::test]
+    async fn a_call_holds_its_batches_and_its_end_stops_what_is_in_flight() {
+        let orch = crate::mcp::handlers::permission::tests::test_orchestrator().await;
+        let runs = ServiceRuns::default();
+        runs.insert("run-1", page_call());
+        let settled = std::sync::Arc::new(CountingStop::default());
+        let running = std::sync::Arc::new(CountingStop::default());
+        assert!(runs.hold_batch("run-1", "settled", settled.clone()));
+        assert!(runs.hold_batch("run-1", "running", running.clone()));
+        // An ordinary (non-service) run holds nothing: its caller is told so.
+        assert!(!runs.hold_batch("ordinary-run", "ignored", running.clone()));
+        // One batch settled on its own, with a placement refusal.
+        runs.release_batch(
+            "run-1",
+            "settled",
+            Some(
+                "This run could not execute: local: containment: PageCallFilesystemRead unmeasured"
+                    .into(),
+            ),
+        );
+
+        assert_eq!(runs.stop_batches(&orch, "run-1"), 1);
+        assert_eq!(running.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(settled.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The call has ended: a batch that reaches hold_batch now is refused.
+        assert!(!runs.hold_batch("run-1", "late", running.clone()));
+        assert_eq!(runs.stop_batches(&orch, "run-1"), 0, "stopped once");
+        // The settled batch keeps its own refusal; the stopped one is logged
+        // as stopped, never as "ran".
+        assert_eq!(
+            runs.take_batches("run-1"),
+            vec![
+                (
+                    "settled".to_string(),
+                    Some("This run could not execute: local: containment: PageCallFilesystemRead unmeasured".to_string())
+                ),
+                (
+                    "running".to_string(),
+                    Some("the call ended before it finished".to_string())
+                ),
+            ]
+        );
+        assert!(runs.take_batches("run-1").is_empty());
+    }
+
+    fn assert_page_bound(refusal: &str) {
+        assert!(
+            refusal.starts_with("service `judge` serving a page may not ")
+                && refusal.contains("owning thread's database (cairn://p/cairn/prep/db)")
+                && refusal.contains("verdict-only page-call batch")
+                && !refusal.contains("5564"),
+            "{refusal}"
+        );
+    }
+
+    /// A page's call runs `command` and `code` items, and nothing that
+    /// commits, picks a branch or a machine, invokes a tool, or holds a turn.
+    #[test]
+    fn a_page_call_runs_only_verdict_only_command_and_code_items() {
+        let page = page_call();
+        for admitted in [
+            json!({"commands": [{"code": "print(1)", "interpreter": "python", "timeout": 20000}]}),
+            json!({"commands": [{"code": "console.log(1)", "interpreter": "typescript", "description": "tests"}]}),
+            json!({"commands": [{"command": "echo hi"}], "sequential": true, "stop_on_error": false}),
+            json!({"commands": [{"command": "true", "timeout": null, "code": null}]}),
+        ] {
+            assert!(classify(&page, "run", &admitted).is_ok(), "{admitted}");
+        }
+        let refused = [
+            json!({"commands": [{"command": "true"}], "commit_msg": "x"}),
+            json!({"commands": [{"command": "true"}], "commitMsg": "x"}),
+            json!({"commands": [{"command": "true"}], "branch": "main"}),
+            json!({"commands": [{"command": "true"}], "executor": {"name": "local"}}),
+            json!({"commands": [{"command": "true"}], "conflict_markers_reason": "x"}),
+            json!({"commands": [{"target": "cairn://mcp/cairn-bugs/list_reports"}]}),
+            json!({"commands": [{"target": "cairn://executors/local/look"}]}),
+            json!({"commands": [{"target": "cairn://skills/testing/scripts/run-coverage"}]}),
+            json!({"commands": [{"target": "cairn://workflows/release", "background": true}]}),
+            json!({"commands": [{"code": "1", "interpreter": "python", "repl": "py"}]}),
+            json!({"commands": [{"waitFor": {"duration": "1m"}}]}),
+            json!({"commands": [{"command": "true", "background": true}]}),
+            json!({"commands": [{"command": "true", "payload": {"args": []}}]}),
+            json!({"commands": [{"description": "nothing to run"}]}),
+            json!({"commands": [{"code": "disp(1)", "interpreter": "matlab"}]}),
+            json!({"commands": [{"code": "1"}]}),
+            json!({"commands": ["echo hi"]}),
+        ];
+        for payload in refused {
+            let refusal = classify(&page, "run", &payload).expect_err(&payload.to_string());
+            assert_page_bound(&refusal);
+        }
     }
 
     #[test]

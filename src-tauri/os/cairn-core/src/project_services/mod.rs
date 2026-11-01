@@ -140,7 +140,7 @@ pub(crate) async fn note_refusal(
             "scope": match scope {
                 authority::DelegatedScope::ProjectAgent { .. } => "project_agent",
                 authority::DelegatedScope::Owner { .. } => "owner",
-                authority::DelegatedScope::ThreadDb { .. } => "thread_db",
+                authority::DelegatedScope::PageCall { .. } => "page_call",
                 authority::DelegatedScope::Empty { .. } => "empty",
             },
         }),

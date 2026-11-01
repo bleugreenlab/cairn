@@ -185,7 +185,7 @@ impl IsolatedChild {
     fn read_allow(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.program.clone(), self.scratch.clone()];
         paths.extend(self.readable.iter().cloned());
-        paths.extend(system_read_paths());
+        paths.extend(crate::system_read_roots());
         paths
     }
 
@@ -227,48 +227,6 @@ impl IsolatedChild {
         out.push_str(&floor.sbpl_rules());
         out
     }
-}
-
-/// The system paths a dynamically linked program reads to start: the loader,
-/// its shared cache, the system libraries, and the time-zone database. Nothing
-/// here holds user data.
-fn system_read_paths() -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
-    let paths: &[&str] = &[
-        "/usr/lib",
-        "/System/Library",
-        "/System/Cryptexes",
-        "/System/Volumes/Preboot/Cryptexes",
-        "/Library/Apple/usr/lib",
-        "/private/var/db/dyld",
-        "/private/var/db/timezone",
-        "/usr/share/zoneinfo",
-        // The system ICU's locale data: without it `Intl` cannot format a number.
-        "/usr/share/icu",
-        "/private/etc/localtime",
-        "/dev/null",
-        "/dev/random",
-        "/dev/urandom",
-    ];
-    #[cfg(not(target_os = "macos"))]
-    let paths: &[&str] = &[
-        "/lib",
-        "/lib64",
-        "/usr/lib",
-        "/usr/lib64",
-        "/etc/ld.so.cache",
-        "/etc/localtime",
-        "/usr/share/zoneinfo",
-        "/dev/null",
-        "/dev/random",
-        "/dev/urandom",
-        // The runtime sizes its heap and thread pool from these.
-        "/proc/meminfo",
-        "/proc/cpuinfo",
-        "/sys/devices/system/cpu",
-        "/sys/fs/cgroup",
-    ];
-    paths.iter().map(PathBuf::from).collect()
 }
 
 #[cfg(any(test, target_os = "macos"))]

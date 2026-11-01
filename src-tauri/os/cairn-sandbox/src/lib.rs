@@ -33,6 +33,7 @@ mod linux;
 pub mod macos;
 mod nested;
 pub mod operator_credential;
+pub mod page_call;
 mod setuid_refusal;
 mod write_refusal;
 
@@ -147,6 +148,47 @@ pub struct SandboxPolicy {
     pub socket_resolvable: Vec<PathBuf>,
     /// The marker this spawn's denials carry into the macOS violation log.
     pub violation_tag: ViolationTag,
+    /// How far reads and the network reach. Broad and ambient for every fence
+    /// but the page-call policy ([`SandboxPolicy::for_page_call`]), which
+    /// narrows both.
+    pub reach: PolicyReach,
+}
+
+/// What a fenced spawn may read, and which sockets it may reach, beyond the
+/// writes [`SandboxPolicy`] confines.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyReach {
+    pub reads: ReadScope,
+    pub network: NetworkScope,
+}
+
+/// Which reads a fenced spawn keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReadScope {
+    /// Everything except [`SandboxPolicy::deny_read`]: the toolchain reads
+    /// widely, so an ordinary fence confines writes and denies only a narrow
+    /// set of secrets.
+    #[default]
+    Broad,
+    /// Nothing but these roots, the writable set, and `/dev`. On macOS the
+    /// metadata of every path stays visible (the loader resolves paths by
+    /// stat), and the root directory node itself is readable (bun opens `/` at
+    /// startup); nothing beneath an unlisted directory is.
+    Allowlist { roots: Vec<PathBuf> },
+}
+
+/// Which sockets a fenced spawn may reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NetworkScope {
+    /// Whatever the host allows.
+    #[default]
+    Ambient,
+    /// A TCP connection to this loopback port and nothing else: the executor's
+    /// relay, the one door to Cairn a page-call batch holds a capability for.
+    /// On macOS every other socket and every Mach service lookup is refused;
+    /// on Linux, TCP connect and bind are confined from Landlock ABI 4 and the
+    /// rest of the network is not.
+    RelayOnly { port: u16 },
 }
 
 /// A marker the macOS profile attaches to each fence deny rule with SBPL's
@@ -332,6 +374,7 @@ impl SandboxPolicy {
             worktree_writable: true,
             socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
+            reach: Default::default(),
         }
     }
 
@@ -375,6 +418,7 @@ impl SandboxPolicy {
             worktree_writable: false,
             socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
+            reach: Default::default(),
         }
     }
 
@@ -411,6 +455,45 @@ impl SandboxPolicy {
             worktree_writable: true,
             socket_resolvable: Vec::new(),
             violation_tag: ViolationTag::fresh(),
+            reach: Default::default(),
+        }
+    }
+
+    /// Build the **page-call** policy: what code a page hands its service runs
+    /// under (see `docs/worktree-fence.md`).
+    ///
+    /// `dir` is the batch's own directory, its cwd, `HOME` and `TMPDIR`, and
+    /// the only place it writes. Reads are confined to the system roots every
+    /// process needs to start ([`system_read_roots`]), the shell roots a
+    /// `command` item needs ([`shell_read_roots`]), the resolved interpreters'
+    /// own trees (`interpreter_roots`, already checked by
+    /// [`page_call::validate_root`]), and `dir`. Nothing is granted for temp
+    /// directories, toolchain caches, or session crossings, so nothing here
+    /// grows with the host. The network reaches only `relay_port`.
+    ///
+    /// One family with every other fence: the same profile generator and
+    /// ruleset, narrower on two axes, closed by the same operator credential
+    /// floor.
+    pub fn for_page_call(dir: &Path, interpreter_roots: &[PathBuf], relay_port: u16) -> Self {
+        let mut roots = system_read_roots();
+        roots.extend(shell_read_roots());
+        for root in interpreter_roots {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        Self {
+            worktree: dir.to_path_buf(),
+            writable_extra: Vec::new(),
+            deny_read: Vec::new(),
+            writable_regex: Vec::new(),
+            worktree_writable: true,
+            socket_resolvable: Vec::new(),
+            violation_tag: ViolationTag::fresh(),
+            reach: PolicyReach {
+                reads: ReadScope::Allowlist { roots },
+                network: NetworkScope::RelayOnly { port: relay_port },
+            },
         }
     }
 
@@ -522,6 +605,61 @@ impl SandboxPolicy {
         paths.extend(self.writable_extra.iter().cloned());
         paths
     }
+}
+
+/// The system paths a dynamically linked program reads to start: the loader,
+/// its shared cache, the system libraries, and the time-zone and locale data.
+/// Nothing here holds user data. Measured by `IsolatedChild`'s live tests and
+/// shared with the page-call policy, so there is one answer to what the
+/// loader and runtime need.
+pub(crate) fn system_read_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let paths: &[&str] = &[
+        "/usr/lib",
+        "/System/Library",
+        "/System/Cryptexes",
+        "/System/Volumes/Preboot/Cryptexes",
+        "/Library/Apple/usr/lib",
+        "/private/var/db/dyld",
+        "/private/var/db/timezone",
+        "/usr/share/zoneinfo",
+        // The system ICU's locale data: without it `Intl` cannot format a number.
+        "/usr/share/icu",
+        "/private/etc/localtime",
+        "/dev/null",
+        "/dev/random",
+        "/dev/urandom",
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let paths: &[&str] = &[
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+        "/etc/localtime",
+        "/usr/share/zoneinfo",
+        "/dev/null",
+        "/dev/random",
+        "/dev/urandom",
+        // The runtime sizes its heap and thread pool from these.
+        "/proc/meminfo",
+        "/proc/cpuinfo",
+        "/sys/devices/system/cpu",
+        "/sys/fs/cgroup",
+    ];
+    paths.iter().map(PathBuf::from).collect()
+}
+
+/// What a `command` item's shell and the ordinary utilities it runs read:
+/// the system binary directories. Separate from [`system_read_roots`] because
+/// an isolated child execs only its own program and needs none of them.
+pub(crate) fn shell_read_roots() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let paths: &[&str] = &["/bin", "/usr/bin", "/usr/libexec"];
+    #[cfg(not(target_os = "macos"))]
+    let paths: &[&str] = &["/bin", "/usr/bin", "/usr/libexec", "/proc/self"];
+    paths.iter().map(PathBuf::from).collect()
 }
 
 /// The default read denylist, anchored at the user's home directory.

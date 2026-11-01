@@ -3726,6 +3726,7 @@ impl Fleet {
                 // process has measured nothing, and every envelope refuses
                 // until the machine speaks for itself.
                 containment: None,
+                page_call_programs: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),
@@ -6796,14 +6797,25 @@ impl Fleet {
             }
             (None, platforms) => format!("work on {}", platforms.join(" or ")),
         };
+        // A containment or page-call requirement is invisible in a machine's
+        // OS and toolchains, so each machine then also says which edge or
+        // program it failed: the line an operator needs to know which machine
+        // to fix.
+        let measured_requirement = selector.filter(|selector| {
+            selector.containment.is_some() || !selector.page_call_programs.is_empty()
+        });
         let mut known: Vec<String> = connections
             .values()
             .map(|entry| {
                 let capabilities = &entry.advertisement.capabilities;
                 let mut toolchains = capabilities.toolchains.clone();
                 toolchains.sort();
+                let shortfall = measured_requirement
+                    .and_then(|selector| selector_shortfall(entry, selector))
+                    .map(|shortfall| format!("; {}", shortfall.describe()))
+                    .unwrap_or_default();
                 format!(
-                    "{} ({}; {})",
+                    "{} ({}; {}{shortfall})",
                     executor_public_name(entry),
                     capabilities.os,
                     if toolchains.is_empty() {
@@ -11244,23 +11256,37 @@ impl Fleet {
                 },
             ),
         );
-        let resolved_fence =
-            match crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request).await {
-                crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => Some(fence),
-                crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
-                crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
-                    self.runner_contexts
-                        .lock()
-                        .unwrap()
-                        .remove(&runner_context_id);
-                    return CellOutcome::Unavailable {
-                        reason: CellUnavailableReason::RunnerContext,
-                        diagnostic,
+        // A page-call envelope decides the mode by itself: page-call work runs
+        // only under the page-call policy, whatever a fence would say, and the
+        // policy is the one its machine proved.
+        let page_call = request
+            .executor
+            .as_ref()
+            .and_then(|selector| selector.containment.as_ref())
+            .is_some_and(cairn_common::executor_protocol::WorkloadEnvelope::is_page_call);
+        let sandbox_mode = if page_call {
+            ProcessSandboxMode::PageCall
+        } else {
+            let resolved_fence =
+                match crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request).await {
+                    crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => {
+                        Some(fence)
                     }
-                    .into();
-                }
-            };
-        let sandbox_mode = Self::batch_sandbox_mode(resolved_fence, &request.repository);
+                    crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
+                    crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
+                        self.runner_contexts
+                            .lock()
+                            .unwrap()
+                            .remove(&runner_context_id);
+                        return CellOutcome::Unavailable {
+                            reason: CellUnavailableReason::RunnerContext,
+                            diagnostic,
+                        }
+                        .into();
+                    }
+                };
+            Self::batch_sandbox_mode(resolved_fence, &request.repository)
+        };
         let node_scratch = batch.node_scratch.clone();
         let mut batch = match serialize_process_batch(
             batch,
@@ -17617,6 +17643,10 @@ enum SelectorShortfall {
     NestedSandbox(String),
     /// The edge [`containment_deficiency`] names.
     Containment(String),
+    /// A program a page-call batch runs that this machine's page-call probe
+    /// did not run, in the sentence
+    /// [`ExecutorCapabilities::page_call_program_shortfall`] states.
+    PageCallProgram(String),
     /// The machine has sent no evidence at all for a capability the selector
     /// needs measured. Distinct from evidence that reads absent: the colocated
     /// executor runs its host probes after its first Ready, so for the first
@@ -17636,6 +17666,7 @@ impl SelectorShortfall {
             Self::Toolchains { missing } => format!("does not advertise {}", missing.join(", ")),
             Self::NestedSandbox(sentence) => sentence.clone(),
             Self::Containment(edge) => format!("containment: {edge}"),
+            Self::PageCallProgram(sentence) => sentence.clone(),
             Self::Unreported {
                 capability,
                 advertised_at_unix_ms,
@@ -17702,7 +17733,17 @@ fn selector_shortfall(
     if selector.containment.is_some() && capabilities.containment.is_none() {
         return Some(unreported("containment probes"));
     }
-    containment_deficiency(capabilities, selector).map(SelectorShortfall::Containment)
+    if let Some(deficiency) = containment_deficiency(capabilities, selector) {
+        return Some(SelectorShortfall::Containment(deficiency));
+    }
+    // Asked after containment, because the program evidence is current only
+    // while the page-call edges are: their fingerprint covers every program's
+    // real path and digest.
+    selector
+        .page_call_programs
+        .iter()
+        .find_map(|program| capabilities.page_call_program_shortfall(program))
+        .map(SelectorShortfall::PageCallProgram)
 }
 
 /// Why a macOS machine whose sandbox evidence is in hand cannot take a check
@@ -20952,6 +20993,42 @@ mod tests {
         CheckResultIdentity::new("project", "check", "input")
     }
 
+    /// A machine whose page-call probe did not run a program a page-call batch
+    /// needs is passed over, and says which program and why.
+    #[test]
+    fn a_page_call_program_the_probe_did_not_run_is_refused_by_name() {
+        use cairn_common::executor_protocol::PageCallProgramEvidence;
+        let mut capabilities = capabilities_with_cores(8);
+        let selector = ExecutorSelector {
+            page_call_programs: vec!["python3".into()],
+            ..ExecutorSelector::default()
+        };
+        assert_eq!(
+            capabilities
+                .page_call_program_shortfall("python3")
+                .as_deref(),
+            Some("page-call policy has not been measured running python3")
+        );
+        capabilities.page_call_programs = Some(vec![PageCallProgramEvidence {
+            program: "python3".into(),
+            passed: false,
+            resolved: Some("/usr/bin/python3".into()),
+            detail: "exited 1 under the page-call policy: Permission denied".into(),
+        }]);
+        assert_eq!(
+            capabilities.page_call_program_shortfall("python3").as_deref(),
+            Some("page-call policy cannot run python3: exited 1 under the page-call policy: Permission denied")
+        );
+        capabilities.page_call_programs.as_mut().unwrap()[0].passed = true;
+        assert_eq!(capabilities.page_call_program_shortfall("python3"), None);
+        assert_eq!(
+            capabilities.page_call_program_shortfall("bun").as_deref(),
+            Some("page-call policy has not been measured running bun")
+        );
+        assert!(!selector.is_empty());
+        assert!(selector.describe().contains("page-call programs python3"));
+    }
+
     fn capabilities_with_cores(logical_cores: usize) -> ExecutorCapabilities {
         ExecutorCapabilities {
             os: "macos".into(),
@@ -20966,6 +21043,7 @@ mod tests {
             toolchain_detection: None,
             build_prerequisites: None,
             containment: None,
+            page_call_programs: None,
         }
     }
 
@@ -21098,6 +21176,7 @@ mod tests {
             toolchain_detection: None,
             build_prerequisites: None,
             containment,
+            page_call_programs: None,
         }
     }
 
@@ -23931,6 +24010,7 @@ mod tests {
                         toolchain_detection: None,
                         build_prerequisites: None,
                         containment: None,
+                        page_call_programs: None,
                     },
                     current_load: load,
                     warm_roots: warm
@@ -25424,6 +25504,7 @@ mod tests {
                     toolchain_detection: None,
                     build_prerequisites: None,
                     containment: None,
+                    page_call_programs: None,
                 },
             ),
             None,

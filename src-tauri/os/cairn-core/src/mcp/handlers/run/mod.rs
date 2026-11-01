@@ -3084,6 +3084,109 @@ mod slot_publication_tests {
 }
 
 #[cfg(test)]
+mod page_call_tests {
+    use super::*;
+
+    fn script(program: &str, args: &[&str], stdin: Option<&str>) -> RunSpec {
+        RunSpec::Script {
+            program: program.into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            timeout: Some(20_000),
+            stdin: stdin.map(str::to_string),
+        }
+    }
+
+    /// Python reaches a page as `python3 -c`, never through uv; bun and shell
+    /// pass; nothing else is a page-call program.
+    #[test]
+    fn a_page_call_runs_python_on_stdin_without_uv_and_nothing_but_its_programs() {
+        // Both the uv form and the `python3 -c` fallback become `python3 -`
+        // with the program on stdin, so a large submission never rides a
+        // single argument.
+        for input in [
+            script("uv", &["run", "-"], Some("print(1)")),
+            script("python3", &["-c", "print(1)"], None),
+        ] {
+            match page_call_spec(input).unwrap() {
+                RunSpec::Script {
+                    program,
+                    args,
+                    stdin,
+                    timeout,
+                } => {
+                    assert_eq!(program, "python3");
+                    assert_eq!(args, ["-"]);
+                    assert_eq!(stdin.as_deref(), Some("print(1)"));
+                    assert_eq!(timeout, Some(20_000));
+                }
+                _ => panic!("a python item stays a script"),
+            }
+        }
+        assert!(page_call_spec(script("bun", &["-e", "1"], None)).is_ok());
+        for refused in [
+            script("uv", &["run", "script.py"], None),
+            script("matlab", &["-batch", "1"], None),
+            script("node", &["-e", "1"], None),
+        ] {
+            assert!(page_call_spec(refused).is_err());
+        }
+    }
+
+    #[test]
+    fn a_page_call_asks_for_both_page_call_edges_and_its_programs() {
+        let resolved = vec![
+            ("a".to_string(), Ok(script("python3", &["-c", "1"], None))),
+            (
+                "b".to_string(),
+                Ok(RunSpec::Shell {
+                    command: "echo hi".into(),
+                    timeout: None,
+                    args: Vec::new(),
+                }),
+            ),
+            ("c".to_string(), Ok(script("python3", &["-c", "2"], None))),
+            ("d".to_string(), Err("unresolved".to_string())),
+        ];
+        let selector = page_call_selector(&resolved);
+        assert_eq!(selector.page_call_programs, ["python3", "sh"]);
+        assert_eq!(selector.name, None);
+        let envelope = selector
+            .containment
+            .expect("a page call names its containment");
+        assert!(envelope.is_page_call());
+        let edges: Vec<_> = envelope.edges.iter().map(|edge| edge.edge).collect();
+        assert_eq!(
+            edges,
+            [
+                cairn_common::executor_protocol::EdgeId::PageCallFilesystemRead,
+                cairn_common::executor_protocol::EdgeId::PageCallEgress
+            ]
+        );
+        assert!(envelope.edges.iter().all(|edge| edge.maximum_disposition
+            == cairn_common::executor_protocol::MaximumDisposition::Refused));
+        envelope
+            .matches_policy_mode(cairn_common::executor_protocol::PolicyMode::of(
+                cairn_common::executor_protocol::ProcessSandboxMode::PageCall,
+            ))
+            .expect("the envelope describes the mode it runs under");
+        assert!(envelope
+            .matches_policy_mode(cairn_common::executor_protocol::PolicyMode::Confined)
+            .is_err());
+        assert_eq!(envelope.validate(), Ok(()));
+    }
+
+    /// A page call's batch carries its run and nothing that names a tree, a
+    /// home, or a transcript.
+    #[test]
+    fn a_page_call_batch_env_is_its_run_alone() {
+        assert_eq!(
+            placed_process_env(Some("run-7"), None, None, None, None),
+            vec![("CAIRN_RUN_ID".to_string(), "run-7".to_string())]
+        );
+    }
+}
+
+#[cfg(test)]
 mod publication_mode_tests {
     use super::*;
 
@@ -3678,7 +3781,10 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // gate already refuses a commit; this is the batch's own guarantee. Which
     // tree the batch runs on waits for its items: only a tree-bound batch has
     // one ([`BatchCoordinate::decide`]).
-    let service_branch = match orch.project_services.runs.for_request(request) {
+    // A page's call runs only as a page-call batch: placed on a machine that
+    // proved the page-call policy, against no checkout. Decided here, from the
+    // run's delegation, never from anything the payload says.
+    let (service_branch, page_call) = match orch.project_services.runs.for_request(request) {
         Some(service) => {
             if commit_present {
                 return run_input_refusal(format!(
@@ -3686,9 +3792,10 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     service.service
                 ));
             }
-            Some(service.default_branch)
+            let page_call = service.is_page_call();
+            (Some(service.default_branch), page_call)
         }
-        None => None,
+        None => (None, false),
     };
 
     // A thread writes no tracked files, and a thread runs ON the base branch: a
@@ -3776,6 +3883,21 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // network, so it runs on the batch's own task, through publication. The
     // call's future only waits for it, and always answers by its deadline.
     let control = BatchControl::new(commit_present);
+    // A service call's batches end with the call: its supervisor stops what
+    // is still in flight when the call ends (`project_services::end_run`).
+    let held_run = request.run_id.clone().filter(|_| service_branch.is_some());
+    if let Some(run_id) = held_run.as_deref() {
+        // If the call has already ended, the batch is not held, and nothing
+        // else will stop it: cancel it here before it is placed.
+        if !orch
+            .project_services
+            .runs
+            .hold_batch(run_id, &control.request_id, control.clone())
+        {
+            control.interrupt(Interruption::Cancelled("the call ended".into()));
+            control.stop(orch);
+        }
+    }
     let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
     let (task_orch, task_request, task_control) = (orch.clone(), request.clone(), control.clone());
     tokio::spawn(async move {
@@ -3784,11 +3906,22 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             &task_request,
             payload,
             service_branch,
+            page_call,
             commit_present,
             &task_control,
             deadlines,
         )
         .await;
+        if let Some(run_id) = held_run.as_deref() {
+            let text = serde_json::from_str::<cairn_common::read::RunBatchEnvelope>(&envelope)
+                .map_or_else(|_| envelope.clone(), |parsed| parsed.text);
+            let refusal = envelope_reports_run_failure(&text).then(|| text.trim().to_string());
+            task_orch.project_services.runs.release_batch(
+                run_id,
+                &task_control.request_id,
+                refusal,
+            );
+        }
         if let Err(answer) = answer_tx.send(BatchAnswer::from_envelope(envelope)) {
             log::warn!(
                 "run answer lost; batch {} settled: {}",
@@ -3798,6 +3931,86 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         }
     });
     answer_call(orch, request, deadlines, control, answer_rx).await
+}
+
+/// A page-call item's spec: a shell command, or code run by `bun` or by
+/// `python3 -c`. Python never runs through `uv` for a page: the batch is
+/// offline with no dependencies to resolve, and `uv` would add its binary,
+/// cache and managed interpreters to what the page-call policy must admit.
+fn page_call_spec(spec: RunSpec) -> Result<RunSpec, String> {
+    const REFUSAL: &str =
+        "a page-call batch runs only shell commands and python, typescript, or javascript code";
+    match spec {
+        RunSpec::Shell { .. } => Ok(spec),
+        RunSpec::Script {
+            program,
+            args,
+            timeout,
+            stdin,
+        } => {
+            // Python reaches a page as `python3 -` reading the program on
+            // stdin, never `python3 -c <program>` and never `uv`. Stdin keeps
+            // the no-uv decision (an offline batch resolves no dependencies,
+            // and uv would widen the allow-list) and avoids `MAX_ARG_STRLEN`:
+            // the judge's 64K-character limit can exceed Linux's 128 KiB cap
+            // on a single argument once encoded.
+            let python_code = if program == "uv" && args == ["run", "-"] {
+                stdin.clone()
+            } else if program == "python3" && args.first().map(String::as_str) == Some("-c") {
+                args.get(1).cloned()
+            } else if program == "python3" && args == ["-"] {
+                stdin.clone()
+            } else {
+                None
+            };
+            if let Some(code) = python_code {
+                Ok(RunSpec::Script {
+                    program: "python3".to_string(),
+                    args: vec!["-".to_string()],
+                    timeout,
+                    stdin: Some(code),
+                })
+            } else if program == "bun" {
+                Ok(RunSpec::Script {
+                    program,
+                    args,
+                    timeout,
+                    stdin,
+                })
+            } else {
+                Err(REFUSAL.to_string())
+            }
+        }
+        _ => Err(REFUSAL.to_string()),
+    }
+}
+
+/// What a page-call batch asks of its machine: both page-call edges measured
+/// refused, and a probe that ran every program its items execute.
+fn page_call_selector(resolved: &[(String, Result<RunSpec, String>)]) -> ExecutorSelector {
+    let mut programs: Vec<String> = Vec::new();
+    for (_, spec) in resolved {
+        let program = match spec {
+            Ok(RunSpec::Shell { .. }) => "sh",
+            Ok(RunSpec::Script { program, .. }) => program.as_str(),
+            _ => continue,
+        };
+        if !programs.iter().any(|known| known == program) {
+            programs.push(program.to_string());
+        }
+    }
+    ExecutorSelector {
+        containment: Some(cairn_common::executor_protocol::WorkloadEnvelope::page_call()),
+        page_call_programs: programs,
+        ..ExecutorSelector::default()
+    }
+}
+
+impl crate::project_services::authority::BatchStop for BatchControl {
+    fn stop(&self, orch: &Orchestrator) {
+        self.interrupt(Interruption::Cancelled("the call ended".into()));
+        BatchControl::stop(self, orch);
+    }
 }
 
 /// Which tree a batch runs against, decided once its items are classified.
@@ -3848,6 +4061,7 @@ async fn prepare_and_run_batch(
     request: &McpCallbackRequest,
     mut payload: RunPayload,
     service_branch: Option<String>,
+    page_call: bool,
     commit_present: bool,
     control: &std::sync::Arc<BatchControl>,
     deadlines: CallDeadlines,
@@ -3898,6 +4112,12 @@ async fn prepare_and_run_batch(
     for item in &payload.commands {
         resolved.push(resolve_run_item(orch, request, run_context.as_ref(), item).await);
     }
+    if page_call {
+        for (_, spec) in resolved.iter_mut() {
+            let taken = std::mem::replace(spec, Err(String::new()));
+            *spec = taken.and_then(page_call_spec);
+        }
+    }
 
     // Executor containment and the logical fence adjudicate filesystem crossings.
     // Placement is a preflight batch invariant. A call may contain exactly one
@@ -3927,11 +4147,30 @@ async fn prepare_and_run_batch(
             Vec::new(),
         );
     }
-    let coordinate =
+    let coordinate = if page_call {
+        // The dispatch gate already refused these; the batch's own guarantee
+        // is that nothing in the payload chooses a tree or a machine for it.
+        if payload.branch.is_some() || payload.executor.is_some() {
+            return run_envelope(
+                RunFailure::NotExecuted(
+                    "a page-call batch runs against no branch and on no machine its caller names."
+                        .to_string(),
+                )
+                .text(),
+                Vec::new(),
+            );
+        }
+        BatchCoordinate {
+            branch: None,
+            verdict_only: true,
+            own_coordinate: false,
+        }
+    } else {
         match BatchCoordinate::decide(payload.branch.take(), service_branch, has_process) {
             Ok(coordinate) => coordinate,
             Err(refusal) => return run_envelope(refusal.to_string(), Vec::new()),
-        };
+        }
+    };
     if payload
         .executor
         .as_ref()
@@ -4010,8 +4249,9 @@ async fn prepare_and_run_batch(
     // is served here: after the head coordinate is known, so it reads the same
     // content `read ?grep=` reads, and before any lease or slot admission
     // exists, so it never enters the scheduler. A branch-scoped run is a verdict
-    // about another coordinate and executes for real.
-    if branch_target.is_none() {
+    // about another coordinate and executes for real, and a page call's command
+    // is never served against the project's content.
+    if branch_target.is_none() && !page_call {
         if let Some(outcomes) = search::try_run_search_batch(
             orch,
             request,
@@ -4077,7 +4317,7 @@ async fn prepare_and_run_batch(
     // explicit selector still wins, and the result then says what the holder
     // has not yet written back.
     let node_scratch = match (has_process, run_context.as_ref(), run_db.as_deref()) {
-        (true, Some(ctx), Some(db)) => {
+        (true, Some(ctx), Some(db)) if !page_call => {
             crate::node_scratch::grant_for_job(orch, db, &ctx.job_id).await
         }
         _ => None,
@@ -4121,16 +4361,21 @@ async fn prepare_and_run_batch(
             }
         }
     }
-    let batch_residence = match BatchResidence::for_job_batch(
-        orch,
-        run_db.as_deref(),
-        logical_resolution.as_ref(),
-        run_context.as_ref(),
-        payload.executor.as_ref(),
-        commit_present,
-    )
-    .await
-    {
+    let batch_residence = match if page_call {
+        // A page call has no execution home: it runs wherever the page-call
+        // policy is proven, in a directory of its own.
+        Ok(BatchResidence::Detached)
+    } else {
+        BatchResidence::for_job_batch(
+            orch,
+            run_db.as_deref(),
+            logical_resolution.as_ref(),
+            run_context.as_ref(),
+            payload.executor.as_ref(),
+            commit_present,
+        )
+        .await
+    } {
         Ok(residence) => residence,
         Err(refusal) => {
             let detail = match scratch_pin.as_deref() {
@@ -4140,7 +4385,21 @@ async fn prepare_and_run_batch(
             return run_envelope(RunFailure::NotExecuted(detail).text(), Vec::new());
         }
     };
-    let slot_target = if let Some(target) = branch_target.as_ref() {
+    let slot_target = if page_call {
+        // No checkout and no object transfer: a scratch cell, owned by the
+        // project's page calls, in which the executor makes each batch a
+        // fresh directory of its own and removes it when the batch ends.
+        run_context.as_ref().filter(|_| has_process).map(|ctx| {
+            (
+                RepositoryLocator::ScratchOnly {
+                    owner_id: format!("page-calls-{}", ctx.project_id),
+                },
+                String::new(),
+                String::new(),
+                MutationPolicy::PureVerdict,
+            )
+        })
+    } else if let Some(target) = branch_target.as_ref() {
         log::info!(
             "resolved branch run rev {} to commit {} in project {}",
             target.rev,
@@ -4228,6 +4487,22 @@ async fn prepare_and_run_batch(
             let project_id = repository.project_id().to_string();
             let (command, command_class) = build_slot_command_parts(&resolved);
             let ceiling_horizon_unix_ms = batch_ceiling_horizon_unix_ms();
+            // A page call's environment is its run and nothing else; the
+            // executor adds its relay and the batch's own capability. Its
+            // machine is any one that proved the page-call policy and ran
+            // every program the items execute.
+            let page_call_env = page_call.then(|| {
+                placed_process_env(
+                    run_context.as_ref().map(|ctx| ctx.run_id.as_str()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            });
+            if page_call {
+                payload.executor = Some(page_call_selector(&resolved));
+            }
             let mut template = CellRequest {
                 // Minted when the call arrived, so the call's durable record
                 // and its cancellation name the request before placement.
@@ -4255,36 +4530,40 @@ async fn prepare_and_run_batch(
                     }
                 }),
                 cwd: relative_cwd,
-                env: placed_process_env(
-                    run_context.as_ref().map(|ctx| ctx.run_id.as_str()),
-                    match (run_context.as_ref(), run_db.as_deref()) {
-                        (Some(ctx), Some(db)) => {
-                            crate::jobs::queries::home_uri_for_job(db, &ctx.job_id)
-                                .await
-                                .unwrap_or_else(|error| {
-                                    log::warn!(
-                                        "Could not resolve home URI for job {}: {error}",
-                                        ctx.job_id
-                                    );
-                                    None
-                                })
+                env: if let Some(env) = page_call_env {
+                    env
+                } else {
+                    placed_process_env(
+                        run_context.as_ref().map(|ctx| ctx.run_id.as_str()),
+                        match (run_context.as_ref(), run_db.as_deref()) {
+                            (Some(ctx), Some(db)) => {
+                                crate::jobs::queries::home_uri_for_job(db, &ctx.job_id)
+                                    .await
+                                    .unwrap_or_else(|error| {
+                                        log::warn!(
+                                            "Could not resolve home URI for job {}: {error}",
+                                            ctx.job_id
+                                        );
+                                        None
+                                    })
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    }
-                    .as_deref(),
-                    branch_target.as_ref().map(|target| target.rev.as_str()),
-                    logical_resolution
-                        .as_ref()
-                        .map(|resolution| resolution.rev.as_str()),
-                    payload.executor.as_ref(),
-                )
-                .into_iter()
-                .chain(
-                    transcript_event_uri
-                        .clone()
-                        .map(|uri| ("CAIRN_TRANSCRIPT_EVENT_URI".into(), uri)),
-                )
-                .collect(),
+                        .as_deref(),
+                        branch_target.as_ref().map(|target| target.rev.as_str()),
+                        logical_resolution
+                            .as_ref()
+                            .map(|resolution| resolution.rev.as_str()),
+                        payload.executor.as_ref(),
+                    )
+                    .into_iter()
+                    .chain(
+                        transcript_event_uri
+                            .clone()
+                            .map(|uri| ("CAIRN_TRANSCRIPT_EVENT_URI".into(), uri)),
+                    )
+                    .collect()
+                },
                 priority: CellPriority::AgentInteractive,
                 // The ceiling until the batch starts waiting for room, when
                 // `BatchPlacement::begin_waiting_for_room` narrows it to the

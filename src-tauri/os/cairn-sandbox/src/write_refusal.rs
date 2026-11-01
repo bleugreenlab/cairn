@@ -215,6 +215,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         })
     }
 

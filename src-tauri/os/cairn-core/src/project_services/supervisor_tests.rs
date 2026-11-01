@@ -803,22 +803,62 @@ async fn a_page_call_reaches_only_its_threads_database_and_its_refusals_are_logg
     assert!(matches!(
         delegated.role,
         ServiceRunRole::Delegated {
-            scope: DelegatedScope::ThreadDb { .. },
+            scope: DelegatedScope::PageCall { .. },
             ..
         }
     ));
-    // What `judge` would do with a page's submission: a run, refused.
-    let attempt = McpCallbackRequest {
-        tool: "run".into(),
-        payload: json!({"commands": [{"code": "print(1)", "interpreter": "python"}]}),
-        run_id: Some(run_id),
+    // What `judge` does with a page's submission: a code batch, admitted at
+    // the gate (placement then decides where it may run).
+    let attempt = |tool: &str, payload: Value| McpCallbackRequest {
+        tool: tool.into(),
+        payload,
+        run_id: Some(run_id.clone()),
         ..Default::default()
     };
-    let refusal = authority::refuse(&h.orch, &attempt).await.unwrap();
-    assert!(refusal.contains("cairn/5564"), "{refusal}");
+    assert_eq!(
+        authority::refuse(
+            &h.orch,
+            &attempt(
+                "run",
+                json!({"commands": [{"code": "print(1)", "interpreter": "python"}]})
+            )
+        )
+        .await,
+        None
+    );
+    // The same code reaching for a file is refused, naming the page bound.
+    let refusal = authority::refuse(
+        &h.orch,
+        &attempt("read_batch", json!({"paths": ["file:src/lib.rs"]})),
+    )
+    .await
+    .unwrap();
+    assert!(
+        refusal.contains("serving a page may not read `file:src/lib.rs`")
+            && refusal.contains("verdict-only page-call batch"),
+        "{refusal}"
+    );
+    let committing = authority::refuse(
+        &h.orch,
+        &attempt(
+            "run",
+            json!({"commands": [{"command": "true"}], "commit_msg": "x"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        committing.contains("serving a page may not commit"),
+        "{committing}"
+    );
     h.host.release_slow.notify_waiters();
     assert!(in_flight.await.unwrap().is_ok());
     let log = log_texts(&h, "echo").await;
+    assert!(
+        log.iter()
+            .any(|text| text.starts_with("refused `read_batch`")),
+        "{log:?}"
+    );
     assert!(
         log.iter().any(|text| text.starts_with("refused `run`")),
         "{log:?}"
@@ -1172,7 +1212,7 @@ async fn a_boot_error_keeps_the_previous_generation_serving() {
 
 /// Only the owning thread writes its service, and only callers acting for
 /// that thread call it; a call's delegation is bounded to the owner's
-/// database, and running code for a page is still refused (cairn/5564).
+/// database, and a page's call runs code only as a page-call batch.
 #[tokio::test]
 async fn a_thread_service_serves_only_its_thread_and_each_call_acts_for_it() {
     let h = thread_harness().await;
@@ -1225,7 +1265,7 @@ async fn a_thread_service_serves_only_its_thread_and_each_call_acts_for_it() {
     assert!(matches!(
         &delegated.role,
         ServiceRunRole::Delegated {
-            scope: DelegatedScope::ThreadDb { thread },
+            scope: DelegatedScope::PageCall { thread },
             ..
         } if thread == "spanish"
     ));
@@ -1235,13 +1275,19 @@ async fn a_thread_service_serves_only_its_thread_and_each_call_acts_for_it() {
         run_id: Some(run_id.clone()),
         ..Default::default()
     };
-    let run = authority::refuse(
+    let pinned = authority::refuse(
         &h.orch,
-        &attempt("run", json!({"commands": [{"code": "print(1)"}]})),
+        &attempt(
+            "run",
+            json!({"commands": [{"code": "print(1)", "interpreter": "python"}], "executor": {"name": "local"}}),
+        ),
     )
     .await
     .unwrap();
-    assert!(run.contains("cairn/5564"), "{run}");
+    assert!(
+        pinned.contains("serving a page may not run a batch with `executor`"),
+        "{pinned}"
+    );
     assert!(authority::refuse(
         &h.orch,
         &attempt(

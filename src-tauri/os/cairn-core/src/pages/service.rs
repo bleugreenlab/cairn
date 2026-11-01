@@ -180,6 +180,13 @@ pub async fn page_service(
     // service wrote into the thread's database for it.
     let mut targets = vec![target];
     targets.extend(outcome.writes);
+    // And the code it ran: each batch the service started for the page, under
+    // the call's own run.
+    let ran: String = outcome
+        .batches
+        .iter()
+        .map(|batch| format!("; {}", batch.describe()))
+        .collect();
     match outcome.result {
         Ok(mut value) => {
             // The service's answer becomes the page's data, and through a
@@ -198,7 +205,7 @@ pub async fn page_service(
                     PageCallVerb::Service,
                     &targets,
                     PageCallOutcome::Error,
-                    &format!("result_too_large: {message} ({millis} ms)"),
+                    &format!("result_too_large: {message} ({millis} ms){ran}"),
                 )
                 .await;
                 return Ok(answer_error("result_too_large", &message));
@@ -210,7 +217,7 @@ pub async fn page_service(
                 PageCallVerb::Service,
                 &targets,
                 PageCallOutcome::Ok,
-                &format!("{millis} ms"),
+                &format!("{millis} ms{ran}"),
             )
             .await;
             Ok(json!({ "ok": true, "value": value }))
@@ -228,7 +235,7 @@ pub async fn page_service(
                 PageCallVerb::Service,
                 &targets,
                 outcome,
-                &format!("{}: {} ({millis} ms)", error.code, error.message),
+                &format!("{}: {} ({millis} ms){ran}", error.code, error.message),
             )
             .await;
             Ok(answer_error(&error.code, &error.message))

@@ -13272,6 +13272,7 @@ fi
             required_toolchains: vec!["rust".to_string()],
             requires_macos_nested_sandbox_write: false,
             containment: None,
+            page_call_programs: Vec::new(),
         });
         assert_ne!(
             key,

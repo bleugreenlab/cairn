@@ -164,6 +164,24 @@ impl OperatorCredentialFloor {
         self.family_members().is_ok()
     }
 
+    /// Every Cairn home this floor covers that exists or is named: the
+    /// family's members, their relocated targets, and every home this process
+    /// was told about. `Err` when the family cannot be listed, since a caller
+    /// asking "is this path clear of every home" must not hear yes then.
+    pub fn known_homes(&self) -> std::io::Result<Vec<PathBuf>> {
+        let mut homes: Vec<PathBuf> = self
+            .family_members()?
+            .into_iter()
+            .map(|member| resolve(&member))
+            .collect();
+        for home in self.homes.iter().chain(self.named.iter()) {
+            if !homes.iter().any(|known| same_path(known, home)) {
+                homes.push(home.clone());
+            }
+        }
+        Ok(homes)
+    }
+
     pub fn holds_a_credential(&self) -> bool {
         let has_credential = |home: &PathBuf| home.join(OPERATOR_SECRET_FILE).exists();
         if self.named.iter().any(has_credential) {

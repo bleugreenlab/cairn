@@ -26,20 +26,31 @@
 //! socket boundary does not exist, and the containment probe measures it as
 //! `Ambient` rather than letting the write fence imply it.
 //!
-//! Not enforced on Linux: the sensitive-read denylist (landlock would require
-//! allowlisting every readable root minus the denylist), and signal scoping
-//! (`LANDLOCK_SCOPE_SIGNAL`), which would stop a batch signalling its own
-//! job's processes from earlier batches and terminals.
+//! A page-call policy ([`SandboxPolicy::for_page_call`]) narrows two more
+//! axes in the same ruleset. Its read scope is an allowlist, so the ruleset
+//! also handles the read rights and grants them only beneath the allowlist
+//! and the writable set. Its network scope is the relay port, so from ABI 4
+//! the ruleset handles TCP connect and bind and grants connect to that port
+//! alone; below ABI 4 it cannot, and the containment probe measures egress
+//! as ambient there. UDP is never confined by Landlock.
+//!
+//! Not enforced on Linux: the sensitive-read denylist of a broad-read policy
+//! (landlock would require allowlisting every readable root minus the
+//! denylist), and signal scoping (`LANDLOCK_SCOPE_SIGNAL`), which would stop a
+//! batch signalling its own job's processes from earlier batches and terminals.
 
-use super::SandboxPolicy;
+use super::{NetworkScope, ReadScope, SandboxPolicy};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
 use landlock::{
-    AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
-    ABI,
+    Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, Scope, ABI,
 };
+
+/// The first ABI that can confine TCP connect and bind.
+pub(crate) const NET_TCP_ABI: i32 = 4;
 
 /// The ABI every fenced spawn requires. ABI 1 cannot grant REFER, so it
 /// rejects cross-directory rename/link with EXDEV and breaks package managers
@@ -149,8 +160,30 @@ pub(crate) fn enforcement_description(policy: &SandboxPolicy) -> String {
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     resolvable.sort();
+    let reads = match &policy.reach.reads {
+        ReadScope::Broad => "broad".to_string(),
+        ReadScope::Allowlist { roots } => {
+            let mut roots: Vec<String> = roots
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            roots.sort();
+            format!(
+                "allow=[{}] handled={:?}",
+                roots.join(","),
+                AccessFs::from_read(abi_from_kernel(version.unwrap_or(0)))
+            )
+        }
+    };
+    let network = match policy.reach.network {
+        NetworkScope::Ambient => "ambient".to_string(),
+        NetworkScope::RelayOnly { port } => format!(
+            "tcp-connect-only={port} enforced={}",
+            version.is_some_and(|v| v >= NET_TCP_ABI)
+        ),
+    };
     format!(
-        "landlock kernel-abi={} floor={FLOOR_ABI:?} handled={rights:?} scopes=[{}] available={} write-allow=[{}] resolve-unix-allow=[{}]",
+        "landlock kernel-abi={} floor={FLOOR_ABI:?} handled={rights:?} scopes=[{}] available={} write-allow=[{}] resolve-unix-allow=[{}] reads={reads} network={network}",
         version.map_or_else(|| "none".to_string(), |v| v.to_string()),
         if abstract_scoped { "AbstractUnixSocket" } else { "" },
         is_available(),
@@ -182,12 +215,20 @@ pub fn is_available() -> bool {
 /// without a Linux-specific branch.
 pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy) {
     let (writable, resolvable) = rule_paths(policy);
+    let readable = match &policy.reach.reads {
+        ReadScope::Broad => None,
+        ReadScope::Allowlist { roots } => Some(roots.clone()),
+    };
+    let relay = match policy.reach.network {
+        NetworkScope::Ambient => None,
+        NetworkScope::RelayOnly { port } => Some(port),
+    };
 
     // SAFETY: the closure runs in the forked child before exec. It only calls
     // landlock syscalls and allocates — no shared-state mutation that would be
     // unsafe across the fork.
     unsafe {
-        cmd.pre_exec(move || restrict(&writable, &resolvable));
+        cmd.pre_exec(move || restrict(&writable, &resolvable, readable.as_deref(), relay));
     }
 }
 
@@ -201,32 +242,85 @@ fn rule_paths(policy: &SandboxPolicy) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (writable, policy.socket_resolvable_paths())
 }
 
-fn restrict(writable: &[PathBuf], resolvable: &[PathBuf]) -> io::Result<()> {
-    // The floor is a hard requirement: a kernel below ABI 2 fails the spawn.
-    // Everything above it (TRUNCATE, IOCTL_DEV, RESOLVE_UNIX, the abstract
-    // socket scope) is best effort, so an older kernel drops what it cannot
-    // enforce instead of refusing to run fenced work; the probe then measures
-    // the socket boundary as absent on that kernel rather than assuming it.
-    let ruleset = Ruleset::default()
-        .set_compatibility(CompatLevel::HardRequirement)
-        .handle_access(AccessFs::from_write(FLOOR_ABI))
-        .map_err(to_io)?
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(handled_rights())
-        .map_err(to_io)?
-        .scope(Scope::AbstractUnixSocket)
-        .map_err(to_io)?
-        .create()
-        .map_err(to_io)?;
+fn restrict(
+    writable: &[PathBuf],
+    resolvable: &[PathBuf],
+    readable: Option<&[PathBuf]>,
+    relay: Option<u16>,
+) -> io::Result<()> {
+    // An ordinary fence makes only the write floor (ABI 2) a hard requirement
+    // and takes everything above it (TRUNCATE, IOCTL_DEV, RESOLVE_UNIX, the
+    // abstract-socket scope, TCP) best effort, so an older kernel drops what
+    // it cannot enforce rather than refusing to run fenced work.
+    //
+    // A page-call policy (a read allow-list) makes the whole target ABI a hard
+    // requirement instead. Its reads, its pathname-socket confinement
+    // (`RESOLVE_UNIX`, ABI 9) and its TCP confinement (ABI 4) are the boundary,
+    // not best-effort hardening: a kernel that cannot enforce one of them must
+    // refuse the spawn, because the containment probe measures the edge as
+    // refused and placement would otherwise admit a machine where a page
+    // batch reaches `/run/user/<uid>/bus`, a tmux server, or the ssh agent.
+    let handled = match readable {
+        None => handled_rights(),
+        Some(_) => AccessFs::from_all(TARGET_ABI),
+    };
+    let ruleset = if readable.is_some() {
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(TARGET_ABI))
+            .map_err(to_io)?
+            .handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)
+            .map_err(to_io)?
+            .scope(Scope::AbstractUnixSocket | Scope::Signal)
+            .map_err(to_io)?
+            .create()
+            .map_err(to_io)?
+    } else {
+        let mut ruleset = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_write(FLOOR_ABI))
+            .map_err(to_io)?
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(handled)
+            .map_err(to_io)?;
+        if relay.is_some() {
+            ruleset = ruleset
+                .handle_access(AccessNet::ConnectTcp | AccessNet::BindTcp)
+                .map_err(to_io)?;
+        }
+        ruleset
+            .scope(Scope::AbstractUnixSocket)
+            .map_err(to_io)?
+            .create()
+            .map_err(to_io)?
+    };
 
     // A missing path yields no fd and is skipped: nothing can be written or
     // bound there anyway. On a kernel without RESOLVE_UNIX the resolvable
     // rules carry no right it knows, and best effort drops them.
-    let ruleset = ruleset
-        .add_rules(landlock::path_beneath_rules(writable, writable_grant()))
+    // With reads handled, the writable set must also keep its reads.
+    let write_grant = match readable {
+        None => writable_grant(),
+        Some(_) => handled & !AccessFs::ResolveUnix,
+    };
+    let mut ruleset = ruleset
+        .add_rules(landlock::path_beneath_rules(writable, write_grant))
         .map_err(to_io)?
         .add_rules(landlock::path_beneath_rules(resolvable, resolvable_grant()))
         .map_err(to_io)?;
+    if let Some(readable) = readable {
+        ruleset = ruleset
+            .add_rules(landlock::path_beneath_rules(
+                readable,
+                AccessFs::from_read(TARGET_ABI),
+            ))
+            .map_err(to_io)?;
+    }
+    if let Some(port) = relay {
+        ruleset = ruleset
+            .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+            .map_err(to_io)?;
+    }
 
     ruleset.restrict_self().map_err(to_io)?;
     Ok(())
@@ -269,6 +363,35 @@ mod tests {
         for shared in ["/tmp", "/dev"] {
             assert!(!resolvable.contains(&PathBuf::from(shared)), "{shared}");
         }
+    }
+
+    #[test]
+    fn a_page_call_policy_describes_its_read_and_network_scope() {
+        let policy = SandboxPolicy::for_page_call(
+            Path::new("/b/pc/1"),
+            &[PathBuf::from("/opt/python/3.12")],
+            4321,
+        );
+        let described = enforcement_description(&policy);
+        assert!(described.contains("reads=allow=["), "{described}");
+        assert!(described.contains("/opt/python/3.12"), "{described}");
+        assert!(described.contains("/usr/lib"), "{described}");
+        assert!(
+            described.contains("network=tcp-connect-only=4321"),
+            "{described}"
+        );
+        let (writable, resolvable) = rule_paths(&policy);
+        assert_eq!(
+            writable,
+            vec![PathBuf::from("/b/pc/1"), PathBuf::from("/dev")]
+        );
+        assert_eq!(resolvable, vec![PathBuf::from("/b/pc/1")]);
+        let broad = enforcement_description(&SandboxPolicy::for_run(
+            Path::new("/work/wt"),
+            &[],
+            Vec::new(),
+        ));
+        assert!(broad.contains("reads=broad network=ambient"), "{broad}");
     }
 
     #[test]

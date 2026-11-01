@@ -1314,6 +1314,18 @@ async fn execute_process(
     stdin: Option<&str>,
     sandbox_enabled: bool,
 ) -> Result<ExecOutput, String> {
+    // A project service's batch is always placed, never spawned here: a host
+    // spawn carries the machine secret, which accepts any claimed run. The
+    // run tool already places every process item; this makes a service batch
+    // reaching the host path a refusal rather than an escape.
+    if let Some(ctx) = run_context {
+        if orch.project_services.runs.get(&ctx.run_id).is_some() {
+            return Err(format!(
+                "refusing to spawn on the host for run {}: a project service's batches run only on an executor, under the run's own relay",
+                ctx.run_id
+            ));
+        }
+    }
     let services = &orch.services;
     let tool_use_id = tool_use_id.to_string();
     let inline_command_id = Uuid::new_v4().to_string();

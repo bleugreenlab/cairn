@@ -1527,6 +1527,7 @@ mod tests {
             toolchain_detection: None,
             build_prerequisites: None,
             containment: None,
+            page_call_programs: None,
         }
     }
 

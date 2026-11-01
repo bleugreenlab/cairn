@@ -136,26 +136,77 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
         out.push_str(&format!("(allow file-write* {})\n", writable_rules));
     }
 
-    // Hard-deny reads of the sensitive denylist.
-    let deny_rules = subpath_rules(&policy.deny_read);
-    if !deny_rules.is_empty() {
-        out.push_str(&format!("(deny file-read* {deny_rules} {report})\n"));
+    match &policy.reach.reads {
+        crate::ReadScope::Broad => {
+            // Hard-deny reads of the sensitive denylist.
+            let deny_rules = subpath_rules(&policy.deny_read);
+            if !deny_rules.is_empty() {
+                out.push_str(&format!("(deny file-read* {deny_rules} {report})\n"));
+            }
+
+            // Re-allow reads of the readable set LAST (last-match-wins) so a
+            // denylist entry (e.g. a user-configured one covering a prefix of
+            // the worktree) can never block the agent from reading its own
+            // source. The readable set keeps the worktree even for a
+            // read-only-checkout policy, whose writable set drops it — so a
+            // non-worktree live checkout stays readable while its writes are
+            // denied. Regex write scopes are re-allowed for reads too.
+            let mut readable: Vec<PathBuf> = policy.readable_paths();
+            readable.push(PathBuf::from("/dev"));
+            let read_allow_rules = join_rules(
+                &subpath_rules(&readable),
+                &regex_rules(&policy.writable_regex),
+            );
+            if !read_allow_rules.is_empty() {
+                out.push_str(&format!("(allow file-read* {})\n", read_allow_rules));
+            }
+        }
+        crate::ReadScope::Allowlist { roots } => {
+            // Closed by default; metadata stays visible so the loader can
+            // resolve paths, and the root node itself is readable because
+            // bun opens `/` at startup and aborts when refused (measured by
+            // `bun_starts_under_the_isolated_profile_live`). It shows the
+            // names of the top-level directories and nothing in them.
+            out.push_str(&format!("(deny file-read* (subpath \"/\") {report})\n"));
+            out.push_str("(allow file-read-metadata)\n");
+            out.push_str("(allow file-read* (literal \"/\"))\n");
+            let mut readable: Vec<PathBuf> = roots.clone();
+            readable.extend(policy.writable_paths());
+            readable.push(PathBuf::from("/dev"));
+            out.push_str(&format!(
+                "(allow file-read* {})\n",
+                subpath_rules(&readable)
+            ));
+        }
     }
 
-    // Re-allow reads of the readable set LAST (last-match-wins) so a denylist
-    // entry (e.g. a user-configured one covering a prefix of the worktree) can
-    // never block the agent from reading its own source. The readable set keeps
-    // the worktree even for a read-only-checkout policy, whose writable set drops
-    // it — so a non-worktree live checkout stays readable while its writes are
-    // denied. Regex write scopes are re-allowed for reads too.
-    let mut readable: Vec<PathBuf> = policy.readable_paths();
-    readable.push(PathBuf::from("/dev"));
-    let read_allow_rules = join_rules(
-        &subpath_rules(&readable),
-        &regex_rules(&policy.writable_regex),
-    );
-    if !read_allow_rules.is_empty() {
-        out.push_str(&format!("(allow file-read* {})\n", read_allow_rules));
+    if let crate::NetworkScope::RelayOnly { port } = policy.reach.network {
+        // One socket: a TCP connection to the executor's relay. Every other
+        // socket, unix ones included, and every Mach service lookup is refused,
+        // which is what keeps the runner's loopback API out of reach.
+        out.push_str(&format!("(deny network* {report})\n"));
+        out.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+        out.push_str(&format!("(deny mach-lookup {report})\n"));
+    }
+
+    // A page-call batch shares its uid with every other batch and resident on
+    // the machine, and each of those carries its own relay capability in its
+    // environment. `(allow default)` leaves the process table open, so the
+    // fence must close the three ways one process reads or disturbs another:
+    // `process-info*` (enumeration and `proc_pidinfo`), the `kern.procargs2`
+    // / `kern.procargs` sysctls (which return a process's whole argument and
+    // environment block), and `signal`. Scoped to the allow-list read shape,
+    // which is the page-call policy and nothing else; a runtime that needs
+    // its own procargs fails the probe's positive control and its machine is
+    // refused rather than admitted, so denying it even for self is fail-closed.
+    if matches!(policy.reach.reads, crate::ReadScope::Allowlist { .. }) {
+        out.push_str(&format!("(deny process-info* (target others) {report})\n"));
+        out.push_str(&format!(
+            "(deny sysctl-read (sysctl-name \"kern.procargs2\") (sysctl-name \"kern.procargs\") {report})\n"
+        ));
+        out.push_str(&format!("(deny signal (target others) {report})\n"));
     }
 
     // The operator credential boundary goes after every allow above, so no
@@ -805,6 +856,7 @@ fn recover_a_canary_denial(access: ViolationStreamAccess) -> ViolationRecoveryOu
         worktree_writable: true,
         socket_resolvable: Vec::new(),
         violation_tag: crate::ViolationTag::fresh(),
+        reach: Default::default(),
     };
     let since = SystemTime::now();
     let (program, args) = wrap_argv(
@@ -956,6 +1008,78 @@ mod tests {
     use std::process::Command;
     use tempfile::tempdir;
 
+    /// The page-call profile closes reads by default and opens only its roots,
+    /// its own directory and `/dev`; it permits one socket, the relay; and the
+    /// credential floor still closes it. An ordinary fence does none of that.
+    #[test]
+    fn a_page_call_profile_reads_only_its_allowlist_and_reaches_only_the_relay() {
+        let policy = SandboxPolicy::for_page_call(
+            Path::new("/b/scratch/pc-1"),
+            &[PathBuf::from(
+                "/Library/Frameworks/Python.framework/Versions/3.12",
+            )],
+            4321,
+        );
+        let profile = sbpl_profile(&policy, &test_floor());
+        let report = format!("(with message \"{}\")", policy.violation_tag.as_str());
+        let read_deny = format!("(deny file-read* (subpath \"/\") {report})");
+        assert!(profile.contains(&read_deny), "{profile}");
+        assert!(profile.contains("(allow file-read-metadata)"));
+        assert!(profile.contains("(allow file-read* (literal \"/\"))"));
+        let reads = profile
+            .lines()
+            .find(|line| line.starts_with("(allow file-read* (subpath"))
+            .expect("an allow-list of reads");
+        for root in [
+            "/usr/lib",
+            "/System/Library",
+            "/bin",
+            "/Library/Frameworks/Python.framework/Versions/3.12",
+            "/b/scratch/pc-1",
+            "/dev",
+        ] {
+            assert!(
+                reads.contains(&format!("(subpath \"{root}\")")),
+                "{root}: {reads}"
+            );
+        }
+        assert!(
+            !reads.contains("/Users") && !reads.contains(".cairn"),
+            "{reads}"
+        );
+        let writes = profile
+            .lines()
+            .find(|line| line.starts_with("(allow file-write*"))
+            .expect("a write allow");
+        assert_eq!(
+            writes,
+            "(allow file-write* (subpath \"/b/scratch/pc-1\") (subpath \"/dev\"))"
+        );
+        assert!(profile.contains(&format!("(deny network* {report})")));
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:4321\"))"));
+        assert!(profile.contains(&format!("(deny mach-lookup {report})")));
+        // The process table is closed to other processes: no page batch reads
+        // a sibling batch's environment (and its relay capability) through
+        // `process-info*` or `kern.procargs2`, and none signals another.
+        assert!(profile.contains(&format!("(deny process-info* (target others) {report})")));
+        assert!(profile.contains("(sysctl-name \"kern.procargs2\")"));
+        assert!(profile.contains(&format!("(deny signal (target others) {report})")));
+        // The read deny precedes the allow-list, and the floor is last.
+        let deny_at = profile.find(&read_deny).unwrap();
+        assert!(deny_at < profile.find(reads).unwrap());
+        assert!(profile
+            .trim_end()
+            .ends_with(test_floor().sbpl_rules().trim_end()));
+
+        let ordinary = sbpl_profile(
+            &SandboxPolicy::for_run(Path::new("/work/wt"), &[], Vec::new()),
+            &test_floor(),
+        );
+        assert!(!ordinary.contains("(deny file-read* (subpath \"/\")"));
+        assert!(!ordinary.contains("network"));
+        assert!(!ordinary.contains("mach-lookup"));
+    }
+
     #[test]
     fn profile_has_expected_structure() {
         let policy = SandboxPolicy {
@@ -966,6 +1090,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let profile = sbpl_profile(&policy, &test_floor());
         assert!(profile.starts_with("(version 1)\n(allow default)\n"));
@@ -1027,6 +1152,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let (program, args) = wrap_argv("bash", &["-c".into(), "echo hi".into()], &policy);
         assert_eq!(program, "/usr/bin/sandbox-exec");
@@ -1192,6 +1318,7 @@ mod tests {
                 worktree_writable: true,
                 socket_resolvable: vec![],
                 violation_tag: crate::ViolationTag::fresh(),
+                reach: Default::default(),
             };
             let probe = dir.path().join("probe");
             let (program, args) = wrap_argv(
@@ -1238,6 +1365,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
 
         let run = |cmd: &str| -> std::process::Output {
@@ -1297,6 +1425,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -1344,6 +1473,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -1498,6 +1628,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         }
     }
 
@@ -1867,6 +1998,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -2206,6 +2338,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let profile = sbpl_profile(&policy, &fixture.floor);
         let out = fixture.run(&profile, &format!("cat {}", fixture.dev_secret().display()));
@@ -2248,6 +2381,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);

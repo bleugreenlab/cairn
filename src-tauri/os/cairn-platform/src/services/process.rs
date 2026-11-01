@@ -571,6 +571,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let cfg = SpawnConfig::new("/bin/bash")
             .args(["-c".to_string(), format!("echo x > {}", escape.display())])
@@ -600,6 +601,7 @@ mod tests {
             worktree_writable: true,
             socket_resolvable: vec![],
             violation_tag: cairn_sandbox::ViolationTag::fresh(),
+            reach: Default::default(),
         };
         let cfg = SpawnConfig::new("echo")
             .env("SCCACHE_SERVER_PORT", "4226")

@@ -625,6 +625,7 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
                     toolchain_detection: None,
                     build_prerequisites: None,
                     containment: None,
+                    page_call_programs: None,
                 },
                 current_load: 0,
                 warm_roots: Vec::new(),

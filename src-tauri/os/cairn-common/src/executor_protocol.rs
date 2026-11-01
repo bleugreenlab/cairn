@@ -825,6 +825,11 @@ pub enum PolicyMode {
     /// profile is applied, and an executor-side control surface has no guest
     /// policy in the first place.
     NotApplicable,
+    /// A page's call running code ([`ProcessSandboxMode::PageCall`]): reads
+    /// confined to an allowlist, writes to its own scratch, and egress only to
+    /// the executor's relay. Its own mode because it makes claims no other
+    /// policy makes, about reads and about the network.
+    PageCall,
 }
 
 impl PolicyMode {
@@ -841,6 +846,7 @@ impl PolicyMode {
             ProcessSandboxMode::Unconfined
             | ProcessSandboxMode::CredentialFloor
             | ProcessSandboxMode::BranchCode => Self::Unconfined,
+            ProcessSandboxMode::PageCall => Self::PageCall,
         }
     }
 }
@@ -922,9 +928,15 @@ pub enum EdgeId {
     DevInstanceHostSocketConfined,
     DevInstanceHostSocketReadOnlyCheckout,
     DevInstanceHostSocketUnconfined,
+    /// A page-call batch reading outside its allowlist: a Cairn home's secrets
+    /// and databases, a checkout, a sibling scratch. Required before any
+    /// machine takes a page's code.
+    PageCallFilesystemRead,
+    /// A page-call batch reaching any socket but its executor's relay.
+    PageCallEgress,
 }
 impl EdgeId {
-    pub const COUNT: usize = 74;
+    pub const COUNT: usize = 76;
     pub const fn definition(self) -> &'static EdgeDefinition {
         &CONTAINMENT_EDGE_DEFINITIONS[self as usize]
     }
@@ -1038,6 +1050,10 @@ pub enum InvalidationInput {
     EnvironmentAssemblyPolicy,
     DevInstanceIngressPolicy,
     DesktopAutomationConfiguration,
+    /// What the page-call policy admits: its system read roots, and the real
+    /// path and digest of every interpreter its probe ran. A toolchain update
+    /// moves it, so evidence about the old binary stops placing work.
+    PageCallPolicy,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1146,6 +1162,15 @@ const LISTENER_INPUTS: &[InvalidationInput] = &[
     InvalidationInput::BootGeneration,
     InvalidationInput::ExecutorLinkPolicy,
     InvalidationInput::NetworkPolicy,
+];
+/// A page-call batch's reach is the profile the executor builds for it and
+/// the interpreters that profile admits, so either moving could widen it.
+const PAGE_CALL_INPUTS: &[InvalidationInput] = &[
+    InvalidationInput::ExecutorBuild,
+    InvalidationInput::BootGeneration,
+    InvalidationInput::SandboxProfile,
+    InvalidationInput::MountTopology,
+    InvalidationInput::PageCallPolicy,
 ];
 // CONTAINMENT_INVENTORY_BEGIN
 pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
@@ -2902,6 +2927,61 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         claim_revision: 1,
         supported_probe_versions: PROBE_VERSIONS,
     },
+    // A page's code reading outside the page-call allowlist. The executor home
+    // (its secret, its database), a checkout, and a sibling cell's scratch are
+    // what it must not reach; the allowlist is the system roots, the probed
+    // interpreters' own trees, and the batch's own scratch.
+    EdgeDefinition {
+        id: EdgeId::PageCallFilesystemRead,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::ExecutorHost,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Filesystem,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Read,
+            policy_mode: PolicyMode::PageCall,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: CELL_FILESYSTEM_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Batch,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::FilesystemProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: PAGE_CALL_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
+    // A page's code connecting anywhere but its executor's relay: the runner's
+    // loopback API above all. Reported, not required: where the platform has
+    // no primitive to bound it, the runner's own refusal of anything but a
+    // valid credential is the bound, and a page batch holds no credential but
+    // its per-batch relay capability.
+    EdgeDefinition {
+        id: EdgeId::PageCallEgress,
+        key: EdgeKey {
+            source: TrustDomain::Cell,
+            destination: TrustDomain::Runner,
+            direction: Direction::GuestToDest,
+            carrier: Carrier::Socket,
+            process_class: ProcessClass::BatchSpawn,
+            effect: EffectClass::Invoke,
+            policy_mode: PolicyMode::PageCall,
+        },
+        authentication: Authentication::None,
+        declared_envelopes: NO_ENVELOPES,
+        mediation: MediationPoint::SandboxProfile,
+        scoping: EdgeScoping::Batch,
+        mutability: Mutability::Mutable,
+        persistence: Persistence::Process,
+        audit_evidence: AuditEvidence::NetworkProbe,
+        revocation: Revocation::ProcessExit,
+        invalidation_inputs: PAGE_CALL_INPUTS,
+        claim_revision: 1,
+        supported_probe_versions: PROBE_VERSIONS,
+    },
 ];
 // CONTAINMENT_INVENTORY_END
 
@@ -2984,6 +3064,8 @@ pub const CONTAINMENT_EDGE_IDS: [EdgeId; EdgeId::COUNT] = [
     EdgeId::DevInstanceHostSocketConfined,
     EdgeId::DevInstanceHostSocketReadOnlyCheckout,
     EdgeId::DevInstanceHostSocketUnconfined,
+    EdgeId::PageCallFilesystemRead,
+    EdgeId::PageCallEgress,
 ];
 const _: () = assert!(CONTAINMENT_EDGE_IDS.len() == EdgeId::COUNT);
 
@@ -3429,6 +3511,32 @@ pub struct WorkloadEnvelope {
 }
 
 impl WorkloadEnvelope {
+    /// What a page-call batch requires of its machine: both page-call edges
+    /// measured refused. The read edge keeps a Cairn home's secrets and
+    /// databases out of reach; the egress edge keeps the runner's loopback
+    /// API out of reach, because that API serves anonymous callers on a runner
+    /// with no JWT key (cairn/5709).
+    pub fn page_call() -> Self {
+        Self {
+            process_class: ProcessClass::BatchSpawn,
+            edges: [EdgeId::PageCallFilesystemRead, EdgeId::PageCallEgress]
+                .into_iter()
+                .map(|edge| EdgeRequirement {
+                    edge,
+                    maximum_disposition: MaximumDisposition::Refused,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether this envelope places page-call work, which then runs only
+    /// under [`ProcessSandboxMode::PageCall`].
+    pub fn is_page_call(&self) -> bool {
+        self.edges.iter().any(|requirement| {
+            requirement.edge.definition().key.policy_mode == PolicyMode::PageCall
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.edges.is_empty() {
             return Err("a workload containment envelope must state at least one edge".into());
@@ -6193,7 +6301,21 @@ pub struct LearnedResourceEstimate {
 /// write-back with the credential the batch began with, and the run result
 /// explains that 401 as it explains any failed call. An older runner quotes
 /// the new stages as it quotes every other.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
+///
+/// Version 161 (cairn/5709) lets a page's service call run code. It adds
+/// [`ProcessSandboxMode::PageCall`], [`PolicyMode::PageCall`], the containment
+/// edges [`EdgeId::PageCallFilesystemRead`] and [`EdgeId::PageCallEgress`],
+/// [`InvalidationInput::PageCallPolicy`], the selector requirement
+/// `pageCallPrograms`, and the defaulted capability `pageCallPrograms`
+/// ([`PageCallProgramEvidence`]). The variants are new to every older peer, in
+/// the observation matrix an executor advertises and in the mode and envelope
+/// a runner sends, so the number moves as it did for 154 and 159. It is also a
+/// version for safety: an older executor builds no page-call policy at all,
+/// so a runner must never read its silence about these edges as their
+/// absence. What a runner gets wrong talking to an older executor: nothing;
+/// that executor reports neither edge, so no page-call batch is ever placed
+/// on it, and it is updated by build hash before it takes other work.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -6919,6 +7041,13 @@ pub struct ExecutorSelector {
     /// Maximum edge authority this workload permits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<WorkloadEnvelope>,
+    /// Programs the machine's page-call probe must have run under the
+    /// page-call policy (`bun`, `uv`, `python3`, `sh`): what a page-call batch's
+    /// items execute. A machine whose probe could not run one is never a
+    /// candidate, so the toolchain is refused at placement by name rather than
+    /// failing inside the sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_call_programs: Vec<String>,
 }
 
 impl ExecutorSelector {
@@ -6928,6 +7057,7 @@ impl ExecutorSelector {
             && self.required_toolchains.is_empty()
             && !self.requires_macos_nested_sandbox_write
             && self.containment.is_none()
+            && self.page_call_programs.is_empty()
     }
 
     /// Reject a selector that asks for nothing, or for two contradictory things.
@@ -6978,6 +7108,12 @@ impl ExecutorSelector {
         if let Some(containment) = &self.containment {
             parts.push(containment.describe());
         }
+        if !self.page_call_programs.is_empty() {
+            parts.push(format!(
+                "page-call programs {}",
+                self.page_call_programs.join(", ")
+            ));
+        }
         if parts.is_empty() {
             "any executor".to_string()
         } else {
@@ -7004,6 +7140,7 @@ impl ExecutorSelector {
         if !self.required_toolchains.is_empty()
             || self.requires_macos_nested_sandbox_write
             || self.containment.is_some()
+            || !self.page_call_programs.is_empty()
         {
             return Err(
                 "a check placement selector states only name or os: what a check needs from a machine is its configuration's to declare"
@@ -7320,9 +7457,48 @@ pub struct ExecutorCapabilities {
     /// have to be torn out when that producer lands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_prerequisites: Option<BuildPrerequisiteCheck>,
+    /// Each program the page-call probe ran under the page-call policy, and
+    /// whether it ran. Measured with [`EdgeId::PageCallFilesystemRead`] and
+    /// current only while that edge is: the edge's fingerprint covers every
+    /// program's real path and digest. Absent from an executor that predates
+    /// page calls or has not probed yet; absence places no page-call batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_call_programs: Option<Vec<PageCallProgramEvidence>>,
+}
+
+/// One program a page-call probe ran under the page-call policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageCallProgramEvidence {
+    /// The name a batch item executes (`bun`, `uv`, `python3`, `sh`).
+    pub program: String,
+    /// Whether a trivial program ran to a clean exit under the policy.
+    pub passed: bool,
+    /// Where the name resolved, after following shims, when it resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// What the probe saw: on failure, what refused it.
+    pub detail: String,
 }
 
 impl ExecutorCapabilities {
+    /// Whether this machine's page-call probe ran `program`, or why not.
+    pub fn page_call_program_shortfall(&self, program: &str) -> Option<String> {
+        match self
+            .page_call_programs
+            .as_ref()
+            .and_then(|programs| programs.iter().find(|entry| entry.program == program))
+        {
+            Some(entry) if entry.passed => None,
+            Some(entry) => Some(format!(
+                "page-call policy cannot run {program}: {}",
+                entry.detail
+            )),
+            None => Some(format!(
+                "page-call policy has not been measured running {program}"
+            )),
+        }
+    }
     /// The machine-wide concurrency budget this executor admits against.
     pub const fn admission_concurrency_budget(&self) -> u32 {
         match self.concurrency_capacity {
@@ -16349,6 +16525,15 @@ pub enum ProcessSandboxMode {
     /// otherwise, so a suite that starts its own sandbox keeps working where
     /// there is no credential to protect.
     BranchCode,
+    /// Code a page's service call runs. The executor gives it a per-batch
+    /// directory under its build root as cwd, `HOME` and `TMPDIR`, clears the
+    /// environment to a fixed set, and spawns it under the page-call policy:
+    /// reads only the system roots, the resolved interpreter's own tree, and
+    /// that directory; writes only that directory; on macOS no socket but the
+    /// relay. It is only ever sent with an envelope requiring
+    /// [`EdgeId::PageCallFilesystemRead`], so it reaches no machine that has
+    /// not proven the policy (see `docs/worktree-fence.md`).
+    PageCall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19347,6 +19532,7 @@ mod tests {
                 containment: None,
                 toolchain_detection: None,
                 build_prerequisites: None,
+                page_call_programs: None,
             },
             current_load: 1,
             warm_roots: vec![VerifiedWarmRoot {

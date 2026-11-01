@@ -365,6 +365,7 @@ fn test_executor_advertisement(
             toolchain_detection: None,
             build_prerequisites: None,
             containment: None,
+            page_call_programs: None,
         },
         current_load: 0,
         warm_roots: pool.map(ExecutorPool::warm_roots).unwrap_or_default(),

@@ -642,6 +642,19 @@ fn mint_bearer(
 /// service run ends.
 async fn end_run(orch: &Orchestrator, project_id: &str, run_id: &str, reason: &str) {
     orch.run_bearers.revoke_run(run_id, reason);
+    // A batch the call started ends with it, rather than running to its own
+    // item timeout after its run's authority is gone (cairn/5564). Stopped
+    // after the bearer is revoked, so nothing it does from here reaches Cairn,
+    // and before the row is final, so it settles as the call's own.
+    let stopped = orch.project_services.runs.stop_batches(orch, run_id);
+    if stopped > 0 {
+        tracing::info!(
+            run_id,
+            stopped,
+            reason,
+            "stopped a service call's in-flight batches"
+        );
+    }
     let finalized =
         match crate::execution::routing::owning_db_for_project(&orch.db, project_id).await {
             Ok(db) => rows::finalize_run(&db, run_id, reason).await,
@@ -2274,6 +2287,39 @@ pub(crate) async fn call(orch: &Orchestrator, request: CallRequest) -> Result<Va
 pub(crate) struct CallOutcome {
     pub result: Result<Value, CallError>,
     pub writes: Vec<String>,
+    /// Every `run` batch the service started for the call, by request id.
+    pub batches: Vec<CallBatch>,
+}
+
+/// A `run` batch a call started: its request and the delegated run it ran
+/// under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallBatch {
+    pub request: String,
+    pub run: String,
+    /// Why the batch never ran (a placement refusal names each machine and
+    /// the edge or program it lacked), verbatim; `None` when it ran.
+    pub refusal: Option<String>,
+}
+
+impl CallBatch {
+    /// The batch as one clause of a call's log line.
+    pub(crate) fn describe(&self) -> String {
+        match &self.refusal {
+            None => format!("ran batch {} under run {}", self.request, self.run),
+            Some(refusal) => format!(
+                "batch {} under run {} did not run: {refusal}",
+                self.request, self.run
+            ),
+        }
+    }
+}
+
+/// What a call touched, for its logs.
+#[derive(Debug, Default)]
+struct CallTouched {
+    writes: Vec<String>,
+    batches: Vec<CallBatch>,
 }
 
 /// [`call`], also reporting what the call wrote, for a caller that records
@@ -2283,13 +2329,15 @@ pub(crate) async fn call_recording(orch: &Orchestrator, request: CallRequest) ->
     let outcome =
         detached(async move { Ok::<_, CallError>(call_attached(&task_orch, request).await) }).await;
     match outcome {
-        Ok((result, writes)) => CallOutcome {
+        Ok((result, touched)) => CallOutcome {
             result: result.map_err(|error| sanitized(orch, error)),
-            writes,
+            writes: touched.writes,
+            batches: touched.batches,
         },
         Err(error) => CallOutcome {
             result: Err(sanitized(orch, error)),
             writes: Vec::new(),
+            batches: Vec::new(),
         },
     }
 }
@@ -2320,17 +2368,17 @@ fn sanitized(orch: &Orchestrator, error: CallError) -> CallError {
 async fn call_attached(
     orch: &Orchestrator,
     request: CallRequest,
-) -> (Result<Value, CallError>, Vec<String>) {
+) -> (Result<Value, CallError>, CallTouched) {
     match call_body(orch, request).await {
         Ok(done) => done,
-        Err(error) => (Err(error), Vec::new()),
+        Err(error) => (Err(error), CallTouched::default()),
     }
 }
 
 async fn call_body(
     orch: &Orchestrator,
     request: CallRequest,
-) -> Result<(Result<Value, CallError>, Vec<String>), CallError> {
+) -> Result<(Result<Value, CallError>, CallTouched), CallError> {
     let params_bytes = serde_json::to_vec(&request.params)
         .map(|bytes| bytes.len())
         .unwrap_or(0);
@@ -2395,8 +2443,9 @@ async fn call_body(
         Ok(delegation) => delegation,
         Err(error) => {
             let result = Err(error);
-            record_call(orch, &cell, &first, &request, &result, &[], started).await;
-            return Ok((result, Vec::new()));
+            let touched = CallTouched::default();
+            record_call(orch, &cell, &first, &request, &result, &touched, started).await;
+            return Ok((result, touched));
         }
     };
 
@@ -2474,9 +2523,25 @@ async fn call_body(
     {
         result = Err(CallError::new("prompt_refused", prompt));
     }
-    let writes = orch.project_services.runs.take_writes(&delegation.run_id);
-    record_call(orch, &cell, &served_by, &request, &result, &writes, started).await;
-    Ok((result, writes))
+    let touched = CallTouched {
+        writes: orch.project_services.runs.take_writes(&delegation.run_id),
+        batches: orch
+            .project_services
+            .runs
+            .take_batches(&delegation.run_id)
+            .into_iter()
+            .map(|(request, refusal)| CallBatch {
+                request,
+                run: delegation.run_id.clone(),
+                refusal,
+            })
+            .collect(),
+    };
+    record_call(
+        orch, &cell, &served_by, &request, &result, &touched, started,
+    )
+    .await;
+    Ok((result, touched))
 }
 
 /// A call counted against its cell's idle stop from admission to its end.
@@ -2670,7 +2735,7 @@ async fn record_call(
     incarnation: &Incarnation,
     request: &CallRequest,
     result: &Result<Value, CallError>,
-    writes: &[String],
+    touched: &CallTouched,
     started: Instant,
 ) {
     let millis = started.elapsed().as_millis() as u64;
@@ -2716,7 +2781,12 @@ async fn record_call(
             "outcome": outcome,
             "code": code,
             "ms": millis,
-            "writes": writes,
+            "writes": touched.writes,
+            "batches": touched
+                .batches
+                .iter()
+                .map(|batch| json!({"request": batch.request, "run": batch.run, "refusal": batch.refusal}))
+                .collect::<Vec<_>>(),
         }),
     )
     .await;
