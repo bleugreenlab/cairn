@@ -698,7 +698,7 @@ struct OperatorMessage {
 }
 
 /// Collapse a message to one line of at most [`CATCHUP_DIGEST_CHARS`].
-fn one_line_excerpt(content: &str) -> String {
+pub fn one_line_excerpt(content: &str) -> String {
     let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if flattened.chars().count() <= CATCHUP_DIGEST_CHARS {
         return flattened;
@@ -786,28 +786,50 @@ async fn resolved_issue_confirmation(
     .flatten()
 }
 
-/// The newest frozen message behind a keyed system direct push. Every system
-/// direct push records its message id as the push fingerprint
-/// ([`crate::direct::insert_system_direct_push_with_message_id_conn`]), and a
-/// stable key (`schedule:`, `tenet-verdict:`, `gate:`, ...) supersedes in place,
-/// so the fingerprint, not the key, names the message the push currently
-/// carries. `None` for a push whose fingerprint is not a direct message: review
-/// and resolution pushes use the same column for a source-state fingerprint.
-async fn keyed_direct_message(
+/// The frozen message a push carries, for every reader that needs it: the
+/// agent's prompt and the composer's pending list must name the same message.
+///
+/// An unkeyed direct push names its message in the key (`direct:{message_id}`).
+/// A system direct push records its message id as the push fingerprint
+/// ([`crate::direct::insert_system_direct_push_with_message_id_conn`]), and one
+/// under a stable key (`schedule:`, `tenet-verdict:`, `gate:`, ...) supersedes
+/// in place, so there the fingerprint, not the key, names the message the push
+/// currently carries. The fingerprint only counts when it names a direct-channel
+/// message: review and resolution pushes use the same column for a source-state
+/// fingerprint. `message` reads a message row by id from `db`, the database the
+/// push lives in.
+pub async fn direct_push_message<F, Fut>(
+    db: &LocalDb,
+    push: &crate::push::Push,
+    message: F,
+) -> Option<cairn_domain::Message>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<cairn_domain::Message>>,
+{
+    if let Some(message_id) = crate::push::direct_message_id_from_key(&push.key) {
+        if let Some(msg) = message(message_id.to_string()).await {
+            return Some(msg);
+        }
+    }
+    let message_id = crate::push::latest_push_fingerprint(db, &push.recipient, &push.key)
+        .await
+        .ok()
+        .flatten()
+        .flatten()?;
+    message(message_id)
+        .await
+        .filter(|msg| msg.channel_type == crate::models::ChannelType::Direct)
+}
+
+async fn pushed_direct_message(
     runtime: &AttentionRuntime,
     push: &crate::push::Push,
 ) -> Option<cairn_domain::Message> {
-    let message_id =
-        crate::push::latest_push_fingerprint(&runtime.private_db, &push.recipient, &push.key)
-            .await
-            .ok()
-            .flatten()
-            .flatten()?;
-    runtime
-        .host
-        .message(&runtime.private_db, &message_id)
-        .await
-        .filter(|msg| msg.channel_type == crate::models::ChannelType::Direct)
+    direct_push_message(&runtime.private_db, push, move |message_id| async move {
+        runtime.host.message(&runtime.private_db, &message_id).await
+    })
+    .await
 }
 
 /// Render a drained attention push as a compact, reference-first update.
@@ -839,7 +861,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     // Name that reason in the headline: naming only the referent tells the reader
     // nothing they did not already know.
     if push.key.starts_with("schedule:") {
-        if let Some(msg) = keyed_direct_message(runtime, push).await {
+        if let Some(msg) = pushed_direct_message(runtime, push).await {
             let reason = msg.content.lines().find_map(|line| {
                 let line = line.trim();
                 (!line.is_empty()).then_some(line)
@@ -907,12 +929,12 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     }
 
     // A `direct:` push carries frozen message content, not an idempotent
-    // resolvable referent. Resolve it from the durable `messages` row by the
-    // message id in the key (`direct:{message_id}`) rather than from
-    // `content_ref` (which is the conversation surface the wake card links to).
-    // Falls back to the header line if the row is missing (CAIRN-1900).
-    if let Some(message_id) = crate::push::direct_message_id_from_key(&push.key) {
-        return match runtime.host.message(&runtime.private_db, message_id).await {
+    // resolvable referent. Resolve it from the durable `messages` row rather
+    // than from `content_ref` (which is the conversation surface the wake card
+    // links to). Falls back to the header line if the row is missing
+    // (CAIRN-1900).
+    if push.key.starts_with("direct:") {
+        return match pushed_direct_message(runtime, push).await {
             Some(msg) => {
                 let body = crate::message_render::render_direct_message(&msg);
                 format!("{header}\n\n{body}")
@@ -942,7 +964,7 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     // nothing; the whole fact is the frozen message. It is recognized by what it
     // carries, not by a list of prefixes: a list missed every producer added
     // after it, and each of those reached its recipient as a pointer home.
-    if let Some(msg) = keyed_direct_message(runtime, push).await {
+    if let Some(msg) = pushed_direct_message(runtime, push).await {
         let body = crate::message_render::render_direct_message(&msg);
         return format!("{header}\n\n{body}");
     }
