@@ -494,10 +494,25 @@ fn lane_unit_holders(orch: &Orchestrator, lane: &str) -> Result<HashSet<String>,
 pub(crate) async fn private_lane_budgets(
     orch: &Orchestrator,
 ) -> crate::storage::DbResult<Vec<LaneBudget>> {
-    let occupancy = crate::storage::lane_occupancy(&orch.db.local, WORKSPACE).await?;
-    let current_ceiling = orch.get_settings().private_dedicated_process_capacity;
-    // Warm-up is one host's, so every lane reports the same window.
-    let boot_ramp = boot_ramp_active(orch).then(|| orch.private_lanes.spawn_window());
+    private_lane_budgets_from(
+        &orch.db.local,
+        &orch.private_lanes,
+        orch.get_settings().private_dedicated_process_capacity,
+        orch.boot_at,
+    )
+    .await
+}
+
+pub(crate) async fn private_lane_budgets_from(
+    db: &crate::storage::LocalDb,
+    ledger: &PrivateLaneLedger,
+    current_ceiling: Option<u32>,
+    boot_at: i64,
+) -> crate::storage::DbResult<Vec<LaneBudget>> {
+    let occupancy = crate::storage::lane_occupancy(db, WORKSPACE).await?;
+    let boot_ramp = (chrono::Utc::now().timestamp()
+        < boot_at.saturating_add(BOOT_RAMP_HORIZON.as_secs() as i64))
+    .then(|| ledger.spawn_window());
     // Memory is one host, so every lane's headroom nets out spawns in flight on
     // all of them, as the lease does.
     let host_in_flight = occupancy
@@ -507,7 +522,7 @@ pub(crate) async fn private_lane_budgets(
     Ok(occupancy
         .into_iter()
         .map(|lane| {
-            let decision = orch.private_lanes.decision(&lane.lane);
+            let decision = ledger.decision(&lane.lane);
             let memory = decision
                 .as_ref()
                 .and_then(|decision| decision.budget.memory);
@@ -622,14 +637,12 @@ pub(crate) fn describe_shortfall(shortfall: &LaneShortfall) -> String {
 /// Render a job's in-flight ordinary launch from its admission projection, or
 /// `None` when the launch is not waiting on admission.
 pub(crate) fn render_launch_line(
-    projection: &crate::storage::OrdinaryAdmissionProjection,
-    now: i64,
+    projection: &crate::storage::ProviderAdmissionRecord,
 ) -> Option<String> {
     use crate::storage::RuntimeAdmissionState as State;
-    let lane = projection.lane_budget.as_ref();
-    let lane_name = lane.map_or("the team workspace", |budget| budget.lane.as_str());
+    let lane_name = &projection.resource_lane;
     match projection.state {
-        State::Queued => {
+        Some(State::Queued) => {
             let mut line = match (projection.position, projection.behind_count) {
                 (Some(position), Some(behind)) => format!(
                     "Launch: queued for a session slot on {lane_name}, position {position} of {}",
@@ -638,24 +651,17 @@ pub(crate) fn render_launch_line(
                 _ => format!("Launch: queued for a session slot on {lane_name}"),
             };
             line.push_str(".\n");
-            if let Some(budget) = lane {
-                line.push_str(&format!("Lane: {}.\n", describe_lane(budget, now)));
-                // Most shortfalls describe the head; startup recovery holds the
-                // whole queue, so every position names it.
-                let applies = |shortfall: &LaneShortfall| {
-                    projection.position == Some(1)
-                        || matches!(shortfall, LaneShortfall::StartupRecovery)
-                };
-                if let Some(shortfall) = budget.shortfall.as_ref().filter(|s| applies(s)) {
-                    line.push_str(&format!(
-                        "Waiting because {}.\n",
-                        describe_shortfall(shortfall)
-                    ));
-                }
+            if projection.reason
+                == Some(crate::storage::RuntimeAdmissionReason::WaitingForStartupRecovery)
+            {
+                line.push_str(&format!(
+                    "Waiting because {}.\n",
+                    describe_shortfall(&LaneShortfall::StartupRecovery)
+                ));
             }
             Some(line)
         }
-        State::Leased | State::Starting => Some(format!(
+        Some(State::Leased | State::Starting) => Some(format!(
             "Launch: admitted on {lane_name}; its process is starting.\n"
         )),
         _ => None,
@@ -664,25 +670,20 @@ pub(crate) fn render_launch_line(
 
 /// The launch line for `job_id`, if its latest launch is in ordinary admission.
 pub(crate) async fn describe_job_launch(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    let now = chrono::Utc::now().timestamp();
-    let budgets = private_lane_budgets(orch).await.ok()?;
-    let local = crate::storage::ordinary_admission_projections(&orch.db.local, now, &budgets)
+    let published = crate::runtime_admission::published_provider_admission(orch)
         .await
-        .ok()?
-        .into_iter()
-        .find(|projection| projection.job_id == job_id)?;
-    let projection = if local.workspace_key.starts_with("team:") {
-        // A team mirror stays queued locally after launch and carries only local
-        // rank. Postgres says where the request really is, team-wide.
-        let client = super::team_admission_lifecycle::team_client(orch).ok()?;
-        let status = tokio::time::timeout(Duration::from_secs(5), client.status(&local.request_id))
-            .await
-            .ok()?;
-        crate::runtime_admission::authoritative_team_projection(local, status)?
-    } else {
-        local
-    };
-    render_launch_line(&projection, now)
+        .ok()?;
+    let projection = published
+        .snapshot
+        .records
+        .iter()
+        .find(|record| record.owner.job_id.as_deref() == Some(job_id))?;
+    if projection.state.is_none() {
+        return Some(
+            "Launch: provider admission authority unavailable; live state is unknown.\n".into(),
+        );
+    }
+    render_launch_line(projection)
 }
 
 /// Promote every private lane that holds admission rows. The process sweep runs
@@ -787,6 +788,7 @@ pub(crate) fn withdraw_orphaned_ordinary_admissions(orch: &Orchestrator) -> usiz
             )
         };
         if retired {
+            orch.db.local.provider_admission_changed();
             withdrawn += 1;
         }
     }
@@ -873,55 +875,41 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_launch_names_its_position_lane_and_why_the_head_waits() {
-        let projection = |position, shortfall| crate::storage::OrdinaryAdmissionProjection {
-            workspace_key: WORKSPACE.into(),
+    fn a_queued_launch_names_its_position_and_lane_without_host_telemetry() {
+        let projection = |position, reason| crate::storage::ProviderAdmissionRecord {
+            authority_key: "private".into(),
+            workspace_id: WORKSPACE.into(),
+            resource_lane: "claude-cli".into(),
             request_id: "req".into(),
-            job_id: "job".into(),
-            run_id: "run".into(),
-            state: crate::storage::RuntimeAdmissionState::Queued,
-            reason: None,
+            owner: Default::default(),
+            enqueue_sequence: Some(position),
+            enqueued_at_unix_ms: Some(0),
+            lane_order: Some(position),
+            state: Some(crate::storage::RuntimeAdmissionState::Queued),
+            reason,
             position: Some(position),
             behind_count: Some(3 - position),
-            enqueue_age_ms: 0,
             runtime_class: crate::storage::PreparedRuntimeClass::DedicatedProcess,
             effective_claim: None,
             effective_capacity: None,
-            lane_budget: Some(budget(Some(9), shortfall)),
             runtime_host: None,
-            host_constraint: crate::storage::PreparedRuntimeHostRequirement::None,
+            host_constraint: Some(crate::storage::PreparedRuntimeHostRequirement::None),
         };
-        let head = render_launch_line(
-            &projection(
-                1,
-                Some(LaneShortfall::Units {
-                    active: 9,
-                    ceiling: 9,
-                }),
-            ),
-            112,
-        )
-        .unwrap();
-        assert!(
-            head.starts_with("Launch: queued for a session slot on claude-cli, position 1 of 3.\nLane: claude-cli: 9 active"),
-            "{head}"
+        assert_eq!(
+            render_launch_line(&projection(1, None)).unwrap(),
+            "Launch: queued for a session slot on claude-cli, position 1 of 3.\n"
         );
-        assert!(
-            head.ends_with("Waiting because the operator ceiling of 9 resident processes is full (9 active).\n"),
-            "{head}"
+        assert_eq!(
+            render_launch_line(&projection(2, None)).unwrap(),
+            "Launch: queued for a session slot on claude-cli, position 2 of 3.\n"
         );
-        // Only the head is waiting on the shortfall; the rest wait on the head.
-        let behind = render_launch_line(
-            &projection(
+        assert_eq!(
+            render_launch_line(&projection(
                 2,
-                Some(LaneShortfall::Units {
-                    active: 9,
-                    ceiling: 9,
-                }),
-            ),
-            112,
-        )
-        .unwrap();
-        assert!(!behind.contains("Waiting because"), "{behind}");
+                Some(crate::storage::RuntimeAdmissionReason::WaitingForStartupRecovery),
+            ))
+            .unwrap(),
+            "Launch: queued for a session slot on claude-cli, position 2 of 3.\nWaiting because the host is still finishing startup recovery, and its agent callback gateway refuses calls until it does.\n"
+        );
     }
 }

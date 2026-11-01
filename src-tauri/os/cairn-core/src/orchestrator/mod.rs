@@ -645,6 +645,16 @@ impl OrchestratorBuilder {
         // reconstructs archived events before the orchestrator is built.
         crate::mcp::handlers::read::register_archived_file_renderer();
 
+        let private_lanes = Arc::new(crate::execution::jobs::PrivateLaneLedger::default());
+        let provider_admission_cache = crate::runtime_admission::provider_admission_cache(
+            &self.db,
+            &private_lanes,
+            &self.process_state,
+            self.config_dir.clone(),
+            self.boot_at,
+            self.api_config.clone(),
+            self.services.emitter.clone(),
+        );
         let anon_device_manager = Arc::new(AnonDeviceManager::new(
             self.db.clone(),
             self.api_config.clone(),
@@ -688,7 +698,8 @@ impl OrchestratorBuilder {
                 crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
             ),
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
-            private_lanes: Arc::new(crate::execution::jobs::PrivateLaneLedger::default()),
+            private_lanes,
+            provider_admission_cache,
             startup_readiness: self.startup_readiness,
             fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
@@ -793,6 +804,23 @@ impl OrchestratorBuilder {
                 .bind_runtime(handle.clone());
             orchestrator.issue_status_cache.bind_runtime(handle.clone());
             orchestrator.issue_list_cache.bind_runtime(handle.clone());
+            orchestrator
+                .provider_admission_cache
+                .bind_runtime(handle.clone());
+            let mut provider_admission_changes =
+                orchestrator.db.local.subscribe_provider_admission_changes();
+            let provider_admission_cache = Arc::downgrade(&orchestrator.provider_admission_cache);
+            handle.spawn(async move {
+                while provider_admission_changes.changed().await.is_ok() {
+                    let Some(cache) = provider_admission_cache.upgrade() else {
+                        break;
+                    };
+                    cache.invalidate(
+                        crate::runtime_admission::PROVIDER_ADMISSION_KEY,
+                        "provider-admission-commit",
+                    );
+                }
+            });
             orchestrator
                 .operator_notifications_cache
                 .bind_runtime(handle.clone());
@@ -1134,6 +1162,7 @@ pub struct Orchestrator {
     /// The last admission decision each private ordinary-session lane made:
     /// the budget it measured and why its queue head waits, if it does.
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
+    pub(crate) provider_admission_cache: Arc<crate::runtime_admission::ProviderAdmissionCache>,
     /// Whether startup recovery has finished: the one authority both the
     /// callback gateway's 503 hold and the admission promoters read. See
     /// [`startup_readiness`].
@@ -3864,6 +3893,37 @@ mod tests {
     /// machine with no PATH install every such test failed `jj git init
     /// --git-repo: No such file or directory`, and on one with an install it
     /// passed, so the verdict described the machine's PATH rather than the tree.
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_commit_signal_invalidates_the_orchestrator_cache() {
+        let db = test_db().await;
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch =
+            OrchestratorBuilder::new(db.clone(), services, tempfile::tempdir().unwrap().keep())
+                .build();
+        let key = crate::runtime_admission::PROVIDER_ADMISSION_KEY;
+
+        orch.provider_admission_cache.get(key).await.unwrap();
+        orch.provider_admission_cache.settle(key).await;
+        let generation = orch.provider_admission_cache.generation(key);
+        let rebuilds = orch.provider_admission_cache.rebuilds();
+
+        db.local.provider_admission_changed();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while orch.provider_admission_cache.generation(key) == generation {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the database signal must reach the cache listener");
+        orch.provider_admission_cache.settle(key).await;
+
+        assert_eq!(
+            orch.provider_admission_cache.rebuilds(),
+            rebuilds + 1,
+            "the listener must drive one fresh admission snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn a_default_test_orchestrator_drives_the_provisioned_jj() {
         let services = Arc::new(TestServicesBuilder::new().build());

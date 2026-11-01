@@ -455,6 +455,8 @@ mod tests {
             let mut request = remote_request(1, "host-1");
             request.state = self.remote_state.lock().unwrap().clone();
             Ok(AdmissionStatus {
+                enqueue_sequence: Some(1),
+                enqueued_at_unix_ms: Some(1_000),
                 request,
                 reason: None,
                 position: None,

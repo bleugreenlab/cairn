@@ -104,6 +104,7 @@ pub async fn enqueue_prepared_ordinary_launch(
         })
     }).await?;
 
+    db.provider_admission_changed();
     launch.request_id = resolved_id.clone();
     let persisted = get_prepared_ordinary_launch(db, &resolved_id)
         .await?
@@ -164,7 +165,9 @@ pub async fn persist_team_ordinary_lease(
             Ok(())
         })
     })
-    .await
+    .await?;
+    db.provider_admission_changed();
+    Ok(())
 }
 
 /// Record a team mirror's local launch phase as `starting` or `active`. Not
@@ -189,6 +192,9 @@ pub async fn advance_team_mirror_phase(
             params![request_id.to_string(), to.to_string(), now],
         )
         .await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
@@ -206,6 +212,9 @@ pub async fn retire_team_mirror(
             params![request_id.to_string(), detail.to_string(), now],
         )
         .await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
@@ -224,6 +233,9 @@ pub async fn queue_team_ordinary_terminal(
         "UPDATE team_ordinary_admission_authority SET pending_terminal_action=?3,pending_terminal_detail=?4,updated_at=?5 WHERE request_id=?1 AND lease_generation=?2",
         params![request_id.to_string(), generation, action.to_string(), detail.map(str::to_string), now],
     ).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
@@ -233,7 +245,7 @@ pub async fn clear_team_ordinary_terminal(
     generation: i64,
 ) -> DbResult<bool> {
     let request_id = request_id.to_string();
-    db.write(move |conn| {
+    let changed = db.write(move |conn| {
         let request_id = request_id.clone();
         Box::pin(async move {
             let mut rows = conn.query(
@@ -252,7 +264,11 @@ pub async fn clear_team_ordinary_terminal(
             ).await?;
             Ok(true)
         })
-    }).await
+    }).await?;
+    if changed {
+        db.provider_admission_changed();
+    }
+    Ok(changed)
 }
 
 pub async fn list_pending_team_ordinary_terminals(
@@ -444,6 +460,7 @@ pub async fn persist_prepared_ordinary_launch(
         "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
         params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
     ).await?;
+    db.provider_admission_changed();
     Ok(())
 }
 
@@ -490,7 +507,7 @@ pub async fn requeue_orphaned_admissions(
 ) -> DbResult<u64> {
     let workspace = workspace.to_string();
     let current_owner = current_owner.map(str::to_string);
-    db.write(move |conn| {
+    let changed = db.write(move |conn| {
         let workspace = workspace.clone();
         let current_owner = current_owner.clone();
         Box::pin(async move {
@@ -505,7 +522,11 @@ pub async fn requeue_orphaned_admissions(
                 ).await?,
             })
         })
-    }).await
+    }).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
+    Ok(changed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,11 +541,23 @@ pub async fn persist_prepared_runtime_call(
     call: PreparedRuntimeCall,
     now: i64,
 ) -> DbResult<()> {
-    db.execute(
-        "INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(request_id) DO UPDATE SET run_id=excluded.run_id,prepared_json=excluded.prepared_json",
-        params![call.request_id, call.run_id, call.prepared_json, now],
+    let changed = db.execute(
+        "INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(request_id) DO NOTHING",
+        params![call.request_id.clone(), call.run_id.clone(), call.prepared_json.clone(), now],
     )
     .await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
+    if get_prepared_runtime_call(db, &call.request_id)
+        .await?
+        .as_ref()
+        != Some(&call)
+    {
+        return Err(DbError::internal(
+            "prepared call identity conflicts with its durable admission",
+        ));
+    }
     Ok(())
 }
 
@@ -606,6 +639,7 @@ pub struct AdmissionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeAdmissionReason {
     WaitingForRuntimeCapacity,
+    WaitingForStartupRecovery,
     AdmissionAuthorityUnavailable,
 }
 
@@ -616,6 +650,7 @@ pub enum RuntimeAdmissionState {
     Leased,
     Starting,
     Active,
+    RetainedWarm,
     Released,
     Cancelled,
     Failed,
@@ -628,6 +663,7 @@ impl RuntimeAdmissionState {
             "leased" => Ok(Self::Leased),
             "starting" => Ok(Self::Starting),
             "active" => Ok(Self::Active),
+            "retained_warm" => Ok(Self::RetainedWarm),
             "released" => Ok(Self::Released),
             "cancelled" => Ok(Self::Cancelled),
             "failed" => Ok(Self::Failed),
@@ -645,85 +681,133 @@ pub struct RuntimeHostIdentity {
     pub id: String,
 }
 
-/// Canonical projection of one ordinary launch's durable admission row.
-/// Queue rank is computed at this read boundary, never by a rendered subset.
+/// Immutable owner coordinates. Missing replica data remains unknown rather than
+/// being inferred from a provider, executor, or a timestamp.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAdmissionOwner {
+    pub project_id: Option<String>,
+    pub issue_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub job_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+/// One durable provider claim. Position is the current scheduler candidate order
+/// within its authority/lane, not a promise of FIFO admission: resource fit and
+/// the urgent burst cursor can change which candidate is leased next.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct OrdinaryAdmissionProjection {
-    #[serde(skip)]
-    pub workspace_key: String,
+pub struct ProviderAdmissionRecord {
     pub request_id: String,
-    pub job_id: String,
-    pub run_id: String,
-    pub state: RuntimeAdmissionState,
+    pub owner: ProviderAdmissionOwner,
+    pub authority_key: String,
+    pub workspace_id: String,
+    pub resource_lane: String,
+    pub lane_order: Option<i64>,
+    pub enqueue_sequence: Option<i64>,
+    pub enqueued_at_unix_ms: Option<i64>,
+    pub state: Option<RuntimeAdmissionState>,
     pub reason: Option<RuntimeAdmissionReason>,
     pub position: Option<i64>,
     pub behind_count: Option<i64>,
-    pub enqueue_age_ms: i64,
     pub runtime_class: PreparedRuntimeClass,
     pub effective_claim: Option<RuntimeResourceClaim>,
     pub effective_capacity: Option<RuntimeResourceCapacity>,
-    /// The private lane's measured budget. Absent for team rows, whose
-    /// capacity is Postgres's to report.
-    #[serde(default)]
-    pub lane_budget: Option<LaneBudget>,
     pub runtime_host: Option<RuntimeHostIdentity>,
-    pub host_constraint: PreparedRuntimeHostRequirement,
+    pub host_constraint: Option<PreparedRuntimeHostRequirement>,
 }
 
-/// Project every non-terminal ordinary admission. Private rows carry the
-/// budget of their lane from `private_budgets`, so what a surface displays is
-/// what the promoter decided against.
-pub async fn ordinary_admission_projections(
+/// Read only the public admission facts from reconstruction records. In
+/// particular, prepared call JSON is never copied into the projection.
+pub async fn provider_admission_records(
     db: &LocalDb,
-    now: i64,
     private_budgets: &[LaneBudget],
-) -> DbResult<Vec<OrdinaryAdmissionProjection>> {
+) -> DbResult<Vec<ProviderAdmissionRecord>> {
     let private_budgets = private_budgets.to_vec();
     db.query_all(
-        "SELECT r.request_id,p.job_id,p.run_id,r.state,r.claim_json,r.lease_owner,r.created_at,p.runtime_capability_json,\
-         CASE WHEN r.state='queued' THEN 1+(SELECT COUNT(*) FROM runtime_admission_requests q WHERE q.workspace_key=r.workspace_key AND q.resource_lane=r.resource_lane AND q.state='queued' AND q.enqueue_seq<r.enqueue_seq) END,\
-         CASE WHEN r.state='queued' THEN (SELECT COUNT(*) FROM runtime_admission_requests q WHERE q.workspace_key=r.workspace_key AND q.resource_lane=r.resource_lane AND q.state='queued' AND q.enqueue_seq>r.enqueue_seq) END\
-         ,r.workspace_key,r.resource_lane FROM runtime_admission_requests r JOIN prepared_ordinary_launches p ON p.request_id=r.request_id \
-         WHERE r.state IN ('queued','leased','starting','active') ORDER BY r.enqueue_seq",
-        (),
+        "WITH ranked AS (
+           SELECT r.*,
+             ROW_NUMBER() OVER (
+               PARTITION BY r.workspace_key,r.resource_lane,r.state
+               ORDER BY CASE WHEN COALESCE(c.urgent_streak,0)<?1 THEN r.priority ELSE 1-r.priority END DESC,r.enqueue_seq
+             ) AS position,
+             COUNT(*) OVER (PARTITION BY r.workspace_key,r.resource_lane,r.state) AS population
+           FROM runtime_admission_requests r
+           LEFT JOIN runtime_admission_cursors c
+             ON c.workspace_key=r.workspace_key AND c.resource_lane=r.resource_lane
+           WHERE r.state IN ('queued','leased','starting','active')
+         )
+         SELECT r.request_id,COALESCE(p.job_id,json_extract(call.prepared_json,'$.job_id')),
+           COALESCE(p.run_id,call.run_id),r.state,r.claim_json,r.created_at,
+           p.runtime_capability_json,r.workspace_key,r.resource_lane,r.enqueue_seq,
+           r.position,r.population,
+           COALESCE(p.execution_id,json_extract(call.prepared_json,'$.execution_id')),
+           j.project_id,j.issue_id,j.thread_id
+         FROM ranked r
+         LEFT JOIN prepared_ordinary_launches p ON p.request_id=r.request_id
+         LEFT JOIN prepared_runtime_calls call ON call.request_id=r.request_id
+         LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,json_extract(call.prepared_json,'$.job_id'))
+         WHERE p.request_id IS NOT NULL OR call.request_id IS NOT NULL
+         ORDER BY r.workspace_key,r.resource_lane,
+           CASE WHEN r.state='queued' THEN 0 ELSE 1 END,
+           CASE WHEN r.state='queued' THEN r.position ELSE r.enqueue_seq END",
+        (DEFAULT_URGENT_BURST,),
         move |row| {
             let state = RuntimeAdmissionState::parse(&row.text(3)?)?;
-            let capability: PreparedRuntimeCapability =
-                decode_json(&row.text(7)?, "ordinary runtime capability")?;
-            let runtime_host = row.opt_text(5)?.map(|id| RuntimeHostIdentity {
-                kind: match capability.host_requirement {
-                    PreparedRuntimeHostRequirement::ResidentOn(kind) => kind,
-                    PreparedRuntimeHostRequirement::None => PreparedRuntimeHostKind::Runner,
-                },
-                id,
+            let claim: RuntimeResourceClaim = decode_json(&row.text(4)?, "runtime resource claim")?;
+            let capability: Option<PreparedRuntimeCapability> = row.opt_text(6)?
+                .map(|json| decode_json(&json, "runtime capability")).transpose()?;
+            let class = capability.as_ref().map(|value| value.class).unwrap_or_else(|| {
+                if claim.server_instance_key.is_some() {
+                    PreparedRuntimeClass::MultiplexedServer
+                } else if claim.resident_process_units > 0 {
+                    PreparedRuntimeClass::DedicatedProcess
+                } else {
+                    PreparedRuntimeClass::StatelessHttp
+                }
             });
-            let workspace_key = row.text(10)?;
-            let lane = row.text(11)?;
-            let lane_budget = (!workspace_key.starts_with("team:"))
+            let constraint = capability.map(|value| value.host_requirement);
+            let workspace = row.text(7)?;
+            let lane = row.text(8)?;
+            let budget = (!workspace.starts_with("team:") && workspace != CALL_ADMISSION_WORKSPACE)
                 .then(|| private_budgets.iter().find(|budget| budget.lane == lane).cloned())
                 .flatten();
-            Ok(OrdinaryAdmissionProjection {
-            workspace_key,
-            request_id: row.text(0)?,
-            job_id: row.text(1)?,
-            run_id: row.text(2)?,
-            state,
-            reason: (state == RuntimeAdmissionState::Queued)
-                .then_some(RuntimeAdmissionReason::WaitingForRuntimeCapacity),
-            position: row.opt_i64(8)?,
-            behind_count: row.opt_i64(9)?,
-            enqueue_age_ms: now.saturating_sub(row.i64(6)?).saturating_mul(1_000),
-            runtime_class: capability.class,
-            effective_claim: Some(decode_json(&row.text(4)?, "runtime resource claim")?),
-            effective_capacity: lane_budget.as_ref().map(LaneBudget::capacity),
-            lane_budget,
-            runtime_host,
-                host_constraint: capability.host_requirement,
+            let queued = state == RuntimeAdmissionState::Queued;
+            let sequence = row.i64(9)?;
+            Ok(ProviderAdmissionRecord {
+                request_id: row.text(0)?,
+                owner: ProviderAdmissionOwner {
+                    project_id: row.opt_text(13)?,
+                    issue_id: row.opt_text(14)?,
+                    thread_id: row.opt_text(15)?,
+                    execution_id: row.opt_text(12)?.filter(|id| !id.is_empty()),
+                    job_id: row.opt_text(1)?,
+                    run_id: row.opt_text(2)?,
+                },
+                authority_key: if workspace.starts_with("team:") { workspace.clone() } else { format!("private:{workspace}") },
+                workspace_id: workspace,
+                resource_lane: lane,
+                lane_order: Some(if queued { row.i64(10)? } else { sequence }),
+                enqueue_sequence: Some(sequence),
+                enqueued_at_unix_ms: Some(row.i64(5)?.saturating_mul(1_000)),
+                state: Some(state),
+                reason: queued.then_some(match budget.as_ref().and_then(|value| value.shortfall.as_ref()) {
+                    Some(LaneShortfall::StartupRecovery) => RuntimeAdmissionReason::WaitingForStartupRecovery,
+                    _ => RuntimeAdmissionReason::WaitingForRuntimeCapacity,
+                }),
+                position: queued.then(|| row.i64(10)).transpose()?,
+                behind_count: queued.then(|| Ok::<_, DbError>(row.i64(11)?-row.i64(10)?)).transpose()?,
+                runtime_class: class,
+                effective_claim: Some(claim),
+                effective_capacity: budget.as_ref().map(LaneBudget::capacity),
+                // Lease owner is a boot-scoped promoter, not a machine identity.
+                runtime_host: None,
+                host_constraint: constraint,
             })
         },
-    )
-    .await
+    ).await
 }
 
 fn from_row(row: &crate::turso::Row) -> DbResult<AdmissionRequest> {
@@ -777,6 +861,7 @@ pub async fn enqueue_admission_request(
         conn.execute("INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)", params![new.request_id.clone(),new.workspace_key,new.resource_lane,new.launch_key,claim_json,i64::from(new.urgent),seq,new.now]).await?;
         Ok(new.request_id)
     })}).await.and_then(|id| if id.is_empty() { Err(DbError::internal("empty admission request id")) } else { Ok(id) })?;
+    db.provider_admission_changed();
     get_admission_request(db, &resolved_id)
         .await?
         .ok_or_else(|| DbError::internal("enqueued admission request disappeared"))
@@ -1074,6 +1159,9 @@ pub async fn lease_next_admission_within(
         conn.execute("UPDATE runtime_admission_cursors SET urgent_streak=?3 WHERE workspace_key=?1 AND resource_lane=?2", params![workspace,lane,if urgent { streak+1 } else { 0 }]).await?;
         Ok(Outcome::Leased(id))
     })}).await?;
+    if matches!(outcome, Outcome::Leased(_)) {
+        db.provider_admission_changed();
+    }
     match outcome {
         Outcome::Leased(id) => get_admission_request(db, &id)
             .await?
@@ -1616,7 +1704,7 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
         boot_ramp: None,
     }];
     // Terminal requests are history, not queue activity.
-    assert!(ordinary_admission_projections(&db, 12, &capacity)
+    assert!(provider_admission_records(&db, &capacity)
         .await
         .unwrap()
         .is_empty());
@@ -1639,24 +1727,34 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
     )
     .await
     .unwrap();
-    let projected = ordinary_admission_projections(&db, 12, &capacity)
-        .await
-        .unwrap();
+    let projected = provider_admission_records(&db, &capacity).await.unwrap();
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].request_id, "ordinary-live");
     let projected = &projected[0];
-    assert_eq!(projected.job_id, "j");
+    assert_eq!(projected.owner.job_id.as_deref(), Some("j"));
+    assert_eq!(projected.owner.project_id.as_deref(), Some("p"));
     assert_eq!(
         projected.reason,
         Some(RuntimeAdmissionReason::WaitingForRuntimeCapacity)
+    );
+    let startup_capacity = [LaneBudget {
+        shortfall: Some(LaneShortfall::StartupRecovery),
+        ..capacity[0].clone()
+    }];
+    assert_eq!(
+        provider_admission_records(&db, &startup_capacity)
+            .await
+            .unwrap()[0]
+            .reason,
+        Some(RuntimeAdmissionReason::WaitingForStartupRecovery)
     );
     assert_eq!(
         (
             projected.position,
             projected.behind_count,
-            projected.enqueue_age_ms
+            projected.enqueued_at_unix_ms
         ),
-        (Some(1), Some(0), 11_000)
+        (Some(1), Some(0), Some(1_000))
     );
     assert_eq!(
         projected.runtime_class,
@@ -1670,14 +1768,28 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
             .resident_process_units,
         2
     );
-    assert_eq!(
-        projected.lane_budget.as_ref().map(|budget| budget.ceiling),
-        Some(Some(2))
-    );
+    let wire = serde_json::to_value(projected).unwrap();
+    let fields = wire.as_object().unwrap();
+    assert!(!fields.contains_key("laneBudget"));
+    for field in [
+        "memory",
+        "availableBytes",
+        "reserveBytes",
+        "inFlightBytes",
+        "shortfall",
+        "measuredAt",
+    ] {
+        assert!(
+            !serde_json::to_string(&wire).unwrap().contains(field),
+            "{field}"
+        );
+    }
     assert_eq!(projected.runtime_host, None);
     assert_eq!(
         projected.host_constraint,
-        PreparedRuntimeHostRequirement::ResidentOn(PreparedRuntimeHostKind::Runner)
+        Some(PreparedRuntimeHostRequirement::ResidentOn(
+            PreparedRuntimeHostKind::Runner
+        ))
     );
 }
 
@@ -1702,6 +1814,9 @@ pub async fn transition_admission(
             Ok(conn.execute("UPDATE runtime_admission_requests SET state=?5,updated_at=?6 WHERE request_id=?1 AND lease_owner=?2 AND lease_generation=?3 AND state=?4", params![request_id,owner,generation,from,to,now]).await?)
         })
     }).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
@@ -1730,6 +1845,9 @@ pub async fn cancel_queued_admission(
     let changed = db.write(move |conn| { let (request_id, reason) = (request_id.clone(), reason.clone()); Box::pin(async move {
         Ok(conn.execute("UPDATE runtime_admission_requests SET state='cancelled',failure_detail=?2,updated_at=?3 WHERE request_id=?1 AND state='queued'", params![request_id,reason,now]).await?)
     })}).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
@@ -1759,13 +1877,20 @@ pub async fn finish_admission_by_launch_key(
     let changed = db.write(move |conn| { let (workspace,launch_key,owner,state,detail)=values.clone(); Box::pin(async move {
         Ok(conn.execute("UPDATE runtime_admission_requests SET state=?5,failure_detail=?6,updated_at=?7 WHERE workspace_key=?1 AND launch_key=?2 AND lease_owner=?3 AND lease_generation=?4 AND state IN ('leased','starting','active')", params![workspace,launch_key,owner,generation,state,detail,now]).await?)
     })}).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
     Ok(changed == 1)
 }
 
 pub async fn reap_expired_admissions(db: &LocalDb, now: i64) -> DbResult<u64> {
-    db.write(move |conn| Box::pin(async move {
+    let changed = db.write(move |conn| Box::pin(async move {
         Ok(conn.execute("UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?1 WHERE state IN ('leased','starting','active') AND lease_expires_at < ?1", (now,)).await?)
-    })).await
+    })).await?;
+    if changed > 0 {
+        db.provider_admission_changed();
+    }
+    Ok(changed)
 }
 
 pub async fn admission_status(
@@ -2886,4 +3011,134 @@ mod tests {
         .unwrap()
         .is_none());
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn provider_records_include_prepared_calls_and_follow_lane_cursor() {
+    let db = crate::storage::migrated_test_db("provider-records.db").await;
+    let changes = db.subscribe_provider_admission_changes();
+    for (id, urgent, lane) in [
+        ("ordinary", false, "a"),
+        ("urgent", true, "a"),
+        ("other", false, "b"),
+    ] {
+        enqueue_admission_request(
+            &db,
+            NewAdmissionRequest {
+                request_id: id.into(),
+                workspace_key: CALL_ADMISSION_WORKSPACE.into(),
+                resource_lane: lane.into(),
+                launch_key: format!("call:{id}"),
+                resource_claim: RuntimeResourceClaim {
+                    resident_process_units: 1,
+                    server_instance_key: None,
+                    logical_stream_units: 1,
+                    estimated_memory_bytes: None,
+                },
+                urgent,
+                now: 10,
+            },
+        )
+        .await
+        .unwrap();
+        persist_prepared_runtime_call(
+            &db,
+            PreparedRuntimeCall {
+                request_id: id.into(),
+                run_id: format!("run:{id}"),
+                prepared_json: serde_json::json!({"job_id":"job", "execution_id":"execution",
+                "prompt":"secret prompt", "agent_config":{"credential":"secret"}})
+                .to_string(),
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    }
+    let rows = provider_admission_records(&db, &[]).await.unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.request_id.as_str())
+            .collect::<Vec<_>>(),
+        ["urgent", "ordinary", "other"]
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.position).collect::<Vec<_>>(),
+        [Some(1), Some(2), Some(1)]
+    );
+    assert_eq!(rows[0].enqueue_sequence, Some(2));
+    assert_eq!(rows[0].enqueued_at_unix_ms, Some(10_000));
+    assert_eq!(rows[0].owner.job_id.as_deref(), Some("job"));
+    assert_eq!(rows[0].owner.execution_id.as_deref(), Some("execution"));
+    assert_eq!(rows[0].host_constraint, None);
+    let wire = serde_json::to_string(&rows).unwrap();
+    assert!(!wire.contains("secret"));
+    assert!(!wire.contains("agent_config"));
+    let lease = lease_next_admission(&db, CALL_ADMISSION_WORKSPACE, "a", "promoter@boot", 11, 99)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.request_id, "urgent");
+    let before = *changes.borrow();
+    assert!(before > 0, "admission-changing commits advance the signal");
+    assert!(heartbeat_admission(
+        &db,
+        "urgent",
+        "promoter@boot",
+        lease.lease_generation,
+        12,
+        100
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        *changes.borrow(),
+        before,
+        "heartbeats do not invalidate provider snapshots"
+    );
+    for (from, to, state) in [
+        ("leased", "starting", RuntimeAdmissionState::Starting),
+        ("starting", "active", RuntimeAdmissionState::Active),
+    ] {
+        assert!(transition_admission(
+            &db,
+            "urgent",
+            "promoter@boot",
+            lease.lease_generation,
+            from,
+            to,
+            13
+        )
+        .await
+        .unwrap());
+        let rows = provider_admission_records(&db, &[]).await.unwrap();
+        let active = rows.iter().find(|row| row.request_id == "urgent").unwrap();
+        assert_eq!(active.state, Some(state));
+        assert_eq!(active.enqueue_sequence, Some(2));
+        assert_eq!(active.owner.run_id.as_deref(), Some("run:urgent"));
+        assert_eq!(active.runtime_host, None, "promoter is not a host");
+    }
+    assert_eq!(
+        requeue_orphaned_admissions(&db, CALL_ADMISSION_WORKSPACE, Some("new-boot"), 14)
+            .await
+            .unwrap(),
+        1
+    );
+    let rows = provider_admission_records(&db, &[]).await.unwrap();
+    assert_eq!(
+        rows[0].request_id, "urgent",
+        "recovery preserves durable identity"
+    );
+    db.execute("UPDATE runtime_admission_cursors SET urgent_streak=?1 WHERE workspace_key=?2 AND resource_lane='a'",
+        params![DEFAULT_URGENT_BURST, CALL_ADMISSION_WORKSPACE]).await.unwrap();
+    let rows = provider_admission_records(&db, &[]).await.unwrap();
+    assert_eq!(
+        rows[0].request_id, "ordinary",
+        "the fairness cursor changes candidate order"
+    );
+    cancel_queued_admission(&db, "urgent", None, 15)
+        .await
+        .unwrap();
+    assert_eq!(provider_admission_records(&db, &[]).await.unwrap().len(), 2);
 }

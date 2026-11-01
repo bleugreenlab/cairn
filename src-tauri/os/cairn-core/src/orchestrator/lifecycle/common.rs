@@ -250,7 +250,7 @@ pub(super) fn transition_run(
     let run_id = run_id.to_string();
     let emit_run_id = run_id.clone();
     let to_str = to.to_string();
-    let from = run_db_blocking({
+    let (from, admission_changed) = run_db_blocking({
         let dbs = orch.db.clone();
         move || async move {
             let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
@@ -309,6 +309,7 @@ pub(super) fn transition_run(
                     }
 
                     let now = chrono::Utc::now().timestamp();
+                    let mut admission_changed = false;
                     match to {
                         RunStatus::Live => {
                             conn.execute(
@@ -345,6 +346,7 @@ pub(super) fn transition_run(
                                 )
                                 .await?
                             {
+                                admission_changed = true;
                                 crate::orchestrator::attention_push::return_withdrawn_delivery_conn(
                                     conn, &withdrawn,
                                 )
@@ -362,7 +364,7 @@ pub(super) fn transition_run(
                             .await?;
                         }
                     }
-                    Ok(from)
+                    Ok((from, admission_changed))
                 })
             })
             .await
@@ -379,6 +381,9 @@ pub(super) fn transition_run(
             Ok(crate::notify::run_db_change_for_id(&db, &run_id, "update").await)
         }
     })?;
+    if admission_changed {
+        orch.db.local.provider_admission_changed();
+    }
     let _ = orch.services.emitter.emit("db-change", change);
     Ok(from)
 }

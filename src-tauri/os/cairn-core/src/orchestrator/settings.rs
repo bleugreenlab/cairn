@@ -118,6 +118,9 @@ impl Orchestrator {
         let before = self.get_settings();
         let embedding_before = before.embedding_model;
         let current = settings::update_settings(&self.config_dir, input, &self.provider_names())?;
+        if current.private_dedicated_process_capacity != before.private_dedicated_process_capacity {
+            self.db.local.provider_admission_changed();
+        }
 
         // A provider just enabled has no models yet: discover them now, not at
         // the next periodic refresh, so it can be chosen at once.

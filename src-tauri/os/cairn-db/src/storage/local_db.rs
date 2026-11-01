@@ -16,7 +16,7 @@ use cairn_platform::runtime_regions;
 use cairn_platform::stack::off_frame;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
@@ -625,6 +625,9 @@ pub struct LocalDb {
     /// writes settle; permit-backed, so a burst of commits collapses to a single
     /// pending wakeup and none is lost.
     commit_signal: Arc<Notify>,
+    /// Monotonic admission-input signal. The orchestrator owns the receiver and
+    /// cache; the database never retains a callback into its consumer.
+    provider_admission_changes: watch::Sender<u64>,
     /// Process-unique identity for this OPEN of a database, never reused.
     ///
     /// [`Self::mutation_generation`] is per HANDLE and starts at zero, so it
@@ -729,6 +732,7 @@ impl LocalDb {
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
@@ -789,6 +793,7 @@ impl LocalDb {
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
@@ -845,6 +850,7 @@ impl LocalDb {
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
@@ -900,6 +906,17 @@ impl LocalDb {
     /// The commit signal fired after each successful synced-replica transaction.
     /// The per-team push task in `storage::team_sync` waits on this to coalesce a
     /// write burst into one prompt push.
+    /// Subscribe to admission-changing commits. Lease heartbeats deliberately
+    /// do not advance this signal.
+    pub fn subscribe_provider_admission_changes(&self) -> watch::Receiver<u64> {
+        self.provider_admission_changes.subscribe()
+    }
+
+    pub fn provider_admission_changed(&self) {
+        self.provider_admission_changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     pub fn commit_signal(&self) -> Arc<Notify> {
         self.commit_signal.clone()
     }
@@ -3634,6 +3651,7 @@ mod tests {
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,

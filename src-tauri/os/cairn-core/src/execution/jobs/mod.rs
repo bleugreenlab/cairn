@@ -45,8 +45,8 @@ mod persistence;
 mod private_lane;
 pub(crate) use private_lane::{
     describe_job_launch, describe_lane, describe_shortfall, private_lane_budgets,
-    promote_private_lanes_blocking, spawn_produced_first_output, spawn_reports_first_output,
-    withdraw_orphaned_ordinary_admissions, PrivateLaneLedger,
+    private_lane_budgets_from, promote_private_lanes_blocking, spawn_produced_first_output,
+    spawn_reports_first_output, withdraw_orphaned_ordinary_admissions, PrivateLaneLedger,
 };
 /// Drive queued private admission deterministically without a scheduler task.
 #[cfg(any(test, feature = "test-utils"))]
@@ -64,8 +64,8 @@ mod turns;
 mod workflow;
 
 pub(crate) use calls::{
-    heal_settled_call_admissions, on_call_run_finalized, prepare_call_run, promote_call_lanes,
-    start_call_run,
+    heal_settled_call_admissions, on_call_run_finalized, prepare_call_run,
+    prepared_call_provider_metadata, promote_call_lanes, start_call_run,
 };
 pub(crate) use ordinary_admission::{
     promote_private_lane, recover_on_startup as recover_ordinary_admissions_on_startup,

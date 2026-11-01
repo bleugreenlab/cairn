@@ -387,6 +387,34 @@ fn call_lease_owner(orch: &Orchestrator) -> String {
     format!("{CALL_ADMISSION_OWNER}@{}", orch.boot_at)
 }
 
+/// Resolve exactly the backend reconstruction would launch, without exposing
+/// any of its prompt, agent configuration, or credentials to the inspector.
+pub(crate) fn prepared_call_provider_metadata(
+    prepared_json: &str,
+    server_instance_key: Option<String>,
+) -> Option<(
+    crate::storage::PreparedRuntimeCapability,
+    crate::storage::RuntimeResourceCapacity,
+)> {
+    let prepared = decode_prepared_call(prepared_json)?;
+    let backend = crate::backends::backend_for_name(admission_backend_name(&prepared).as_deref());
+    let capability = backend
+        .runtime_launch_capability(&crate::backends::RuntimeLaunch {
+            is_ephemeral_call: true,
+            server_instance_key,
+        })
+        .ok()?;
+    let capability = serde_json::from_value(serde_json::to_value(capability).ok()?).ok()?;
+    let ceiling = call_lane_ceiling(Some(&prepared));
+    Some((
+        capability,
+        crate::storage::RuntimeResourceCapacity {
+            resident_process_units: u32::try_from(ceiling).unwrap_or(u32::MAX),
+            logical_stream_units: u32::MAX,
+        },
+    ))
+}
+
 fn decode_prepared_call(prepared_json: &str) -> Option<PreparedCallRun> {
     serde_json::from_str(prepared_json).ok()
 }

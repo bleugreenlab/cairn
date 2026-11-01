@@ -209,6 +209,7 @@ fn resume_warm_race(
         .await
         .map_err(|e| e.to_string())
     })?;
+    orch.db.local.provider_admission_changed();
     Ok(false)
 }
 
@@ -2265,17 +2266,13 @@ mod tests {
                 "{run} must stay queued, not crashed"
             );
         }
-        let positions: Vec<_> = crate::storage::ordinary_admission_projections(
-            &orch.db.local,
-            chrono::Utc::now().timestamp(),
-            &[],
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|projection| projection.position.is_some())
-        .map(|projection| (projection.run_id, projection.position))
-        .collect();
+        let positions: Vec<_> = crate::storage::provider_admission_records(&orch.db.local, &[])
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|projection| projection.position.is_some())
+            .map(|projection| (projection.owner.run_id.unwrap(), projection.position))
+            .collect();
         assert_eq!(
             positions,
             vec![("r2".to_string(), Some(1)), ("r3".to_string(), Some(2))]
