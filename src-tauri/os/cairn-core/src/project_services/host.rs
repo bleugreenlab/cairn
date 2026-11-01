@@ -12,10 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use super::supervisor::{HostEvent, HostInput, HostProcess, LaunchSpec, ServiceHost};
+use super::supervisor::{HostEvent, HostInput, HostProcess, LaunchError, LaunchSpec, ServiceHost};
 use super::ServiceOwner;
 use crate::fleet::service_placement::{
-    acquire_service_lease, ResidentLaunch, ServiceIdentity, ServiceLease,
+    acquire_service_lease, ResidentLaunch, ServiceIdentity, ServiceLease, ServicePlacementError,
 };
 use crate::orchestrator::Orchestrator;
 
@@ -117,6 +117,15 @@ fn service_selector(spec: &LaunchSpec) -> cairn_common::executor_protocol::Execu
     }
 }
 
+/// What the supervisor is told about a refused start. Only a refusal the
+/// substrate made without judging the process is `Unplaced`.
+fn launch_error(error: ServicePlacementError) -> LaunchError {
+    match &error {
+        ServicePlacementError::Unroutable(_) => LaunchError::Unplaced(error.to_string()),
+        _ => LaunchError::Failed(error.to_string()),
+    }
+}
+
 impl LeaseHost {
     async fn lease(
         &self,
@@ -170,7 +179,11 @@ impl ServiceHost for LeaseHost {
         ))
     }
 
-    async fn launch(&self, orch: &Orchestrator, spec: &LaunchSpec) -> Result<HostProcess, String> {
+    async fn launch(
+        &self,
+        orch: &Orchestrator,
+        spec: &LaunchSpec,
+    ) -> Result<HostProcess, LaunchError> {
         let mut launch = launch_for(spec)?;
         let lease = self.lease(orch, spec).await?;
         // Generation-keyed, so a replacement starts beside the generation it
@@ -203,7 +216,7 @@ impl ServiceHost for LeaseHost {
         let mut subscription = lease
             .start_resident(&key, SERVICE_ROLE, &launch)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(launch_error)?;
         let (sender, events) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(event) = subscription.recv().await {
@@ -404,6 +417,22 @@ mod tests {
         );
         host.release(&orch, "p", &ServiceOwner::Project, "echo")
             .await;
+    }
+
+    /// Only the substrate's own refusal reaches the supervisor as `Unplaced`.
+    #[test]
+    fn only_an_unroutable_start_is_unplaced() {
+        assert!(matches!(
+            launch_error(ServicePlacementError::Unroutable("lagging".into())),
+            LaunchError::Unplaced(_)
+        ));
+        for refused in [
+            ServicePlacementError::Operation("spawn failed".into()),
+            ServicePlacementError::Unavailable("no admission".into()),
+            ServicePlacementError::InvalidRequest("bad".into()),
+        ] {
+            assert!(matches!(launch_error(refused), LaunchError::Failed(_)));
+        }
     }
 
     /// The structural half of confinement: the process is a pipe, never a

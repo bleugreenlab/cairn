@@ -308,27 +308,45 @@ async fn schedule_block(
          | Method | Every | Next due | Last run | Outcome | Failures in a row |\n\
          |---|---|---|---|---|---|\n",
     );
+    let retry_of = |row: &schedule::ScheduleRow| {
+        status.and_then(|status| status.placement_retries.get(&row.entry_key))
+    };
     for row in &rows {
         let next = row
             .due_at(now)
             .map(|_| "due now".to_string())
             .or_else(|| row.next_due_at(now).map(utc_seconds))
             .unwrap_or_else(|| "-".into());
+        // A refused placement is not an outcome yet: the occurrence is still
+        // due, and the last settled outcome stays what it was.
+        let outcome = match retry_of(row) {
+            Some(retry) => format!(
+                "retrying ({} of {})",
+                retry.refusals,
+                supervisor::PLACEMENT_RETRIES
+            ),
+            None => row.last_status.as_deref().unwrap_or("-").to_string(),
+        };
         out.push_str(&format!(
-            "| {} | {} | {next} | {} | {} | {} |\n",
+            "| {} | {} | {next} | {} | {outcome} | {} |\n",
             cell(&row.method),
             schedule::every_text(row.every_ms),
             row.last_run_at.map_or("never".into(), utc_seconds),
-            row.last_status.as_deref().unwrap_or("-"),
             row.consecutive_failures,
         ));
     }
-    for row in rows
-        .iter()
-        .filter(|row| row.last_status.as_deref() != Some("ok"))
-    {
-        if let Some(error) = &row.last_error {
-            out.push_str(&format!("\n`{}` last: {error}\n", row.method));
+    for row in &rows {
+        if let Some(retry) = retry_of(row) {
+            out.push_str(&format!(
+                "\n`{}` due {} could not be placed; retrying: {}\n",
+                row.method,
+                utc_seconds(retry.due),
+                retry.refusal
+            ));
+        } else if row.last_status.as_deref() != Some("ok") {
+            if let Some(error) = &row.last_error {
+                out.push_str(&format!("\n`{}` last: {error}\n", row.method));
+            }
         }
     }
     out

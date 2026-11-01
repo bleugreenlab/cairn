@@ -26,6 +26,8 @@ pub(crate) struct FakeHost {
     next_boot: StdMutex<Option<Boot>>,
     frames: StdMutex<Vec<Value>>,
     release_slow: Arc<Notify>,
+    /// Refusals the next launches answer, in order, before any launch starts.
+    refuse: StdMutex<VecDeque<LaunchError>>,
 }
 
 impl FakeHost {
@@ -65,7 +67,14 @@ fn out(events: &mpsc::UnboundedSender<HostEvent>, frame: Value) {
 
 #[async_trait]
 impl ServiceHost for Arc<FakeHost> {
-    async fn launch(&self, _orch: &Orchestrator, spec: &LaunchSpec) -> Result<HostProcess, String> {
+    async fn launch(
+        &self,
+        _orch: &Orchestrator,
+        spec: &LaunchSpec,
+    ) -> Result<HostProcess, LaunchError> {
+        if let Some(refusal) = self.refuse.lock().unwrap().pop_front() {
+            return Err(refusal);
+        }
         self.launches.fetch_add(1, Ordering::AcqRel);
         self.envs.lock().unwrap().push(spec.env.clone());
         let boot = self.next_boot.lock().unwrap().take().unwrap_or(Boot::Ready);
@@ -1312,7 +1321,7 @@ async fn count(h: &Harness, sql: &str) -> i64 {
     h.orch
         .db
         .local
-        .query_text(&format!("SELECT CAST(({sql}) AS TEXT)"), ())
+        .query_text(format!("SELECT CAST(({sql}) AS TEXT)"), ())
         .await
         .unwrap()
         .unwrap()
@@ -1556,6 +1565,246 @@ async fn a_rewrite_without_the_schedule_drops_it() {
     assert!(schedule::list(&h.orch.db.local, "p", &spanish(), "tutor")
         .await
         .unwrap()
+        .is_empty());
+}
+
+// ---- Placement refusals ----
+
+const STREAK_NOTICES: &str = "SELECT COUNT(*) FROM messages WHERE content LIKE '%started failing%'";
+
+/// The refusal of a start the runner could not route to its executor, as the
+/// lease host answers it.
+fn unroutable() -> LaunchError {
+    LaunchError::Unplaced(
+        "service process could not be routed to its executor: no connected executor reports \
+         this execution environment"
+            .into(),
+    )
+}
+
+/// `tutor` scheduled to call `echo` every five minutes, written but with no
+/// process, so its occurrence's call is what starts it; and a session run, so
+/// a streak notice has a run to wake. Answers the due occurrence.
+async fn scheduled_tutor_with_no_process(h: &Harness) -> i64 {
+    h.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('spanish-run', 'p', 'spanish-session', 'completed', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let payload = scheduled("echo");
+    crate::project_services::thread_store::write(
+        &h.orch.db.local,
+        "p",
+        &spanish(),
+        "tutor",
+        TUTOR,
+        &crate::project_services::thread_store::ServiceWriter {
+            job_id: "spanish-session".into(),
+        },
+        &payload,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let entries = crate::project_services::thread_store::package("tutor", TUTOR, &payload)
+        .unwrap()
+        .declaration
+        .schedule;
+    schedule::sync(
+        &h.orch.db.local,
+        "p",
+        &spanish(),
+        "tutor",
+        &entries,
+        1_000_000,
+    )
+    .await
+    .unwrap();
+    tutor_row(h).await.anchor_at
+}
+
+async fn tutor_row(h: &Harness) -> ScheduleRow {
+    schedule::list(&h.orch.db.local, "p", &spanish(), "tutor")
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+fn retrying_rows(log: &[String]) -> usize {
+    log.iter()
+        .filter(|text| text.contains("could not be placed") && text.contains("; retrying"))
+        .count()
+}
+
+/// A start the substrate could not route says nothing about the service: the
+/// occurrence stays due, the log says it is retrying, `/status` shows it
+/// retrying, and the next recheck runs it, with no failure recorded and
+/// nobody woken.
+#[tokio::test]
+async fn a_placement_refusal_is_retried_and_wakes_no_one() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    h.host.refuse.lock().unwrap().push_back(unroutable());
+
+    assert_eq!(
+        run_due(&h.orch, &tutor(), due).await,
+        0,
+        "a refused occurrence is left due, as a deferred one is"
+    );
+    let row = tutor_row(&h).await;
+    assert_eq!(row.due_at(due), Some(due), "its claim was given back");
+    assert_eq!(row.last_status, None, "and nothing was settled");
+    assert_eq!(row.consecutive_failures, 0);
+    let retry = tutor().status(&h.orch).unwrap().placement_retries[&row.entry_key].clone();
+    assert_eq!((retry.due, retry.refusals), (due, 1));
+    assert!(retry.refusal.contains("no connected executor"), "{retry:?}");
+    let shown = crate::resources::read_cairn_resource(
+        &h.orch,
+        &McpCallbackRequest::default(),
+        &format!("{TUTOR}/status"),
+    )
+    .await;
+    assert!(
+        shown.contains(&format!("retrying (1 of {PLACEMENT_RETRIES})")),
+        "{shown}"
+    );
+    let log = tutor_log(&h).await;
+    assert_eq!(retrying_rows(&log), 1, "{log:?}");
+    assert!(
+        log.iter()
+            .any(|text| text.starts_with("scheduled `echo` due ")
+                && text.contains("no connected executor")),
+        "the row names the refusal: {log:?}"
+    );
+
+    assert_eq!(run_due(&h.orch, &tutor(), due + 60).await, 1);
+    assert_eq!(h.host.frames_of("call").len(), 1, "the retry made the call");
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("ok"));
+    assert_eq!(row.last_fired_occurrence_at, Some(due));
+    assert_eq!(row.consecutive_failures, 0);
+    assert!(tutor()
+        .status(&h.orch)
+        .unwrap()
+        .placement_retries
+        .is_empty());
+    assert_eq!(
+        retrying_rows(&tutor_log(&h).await),
+        1,
+        "one refusal, one row"
+    );
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM messages").await, 0);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM attention_pushes").await, 0);
+}
+
+/// A substrate that refuses the first try and every retry is one the owner
+/// should hear about: the occurrence fails once, and the streak's one notice
+/// names the occurrence the refusals began at.
+#[tokio::test]
+async fn a_placement_refused_through_every_retry_fails_once_and_wakes_the_thread_once() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    for _ in 0..=PLACEMENT_RETRIES {
+        h.host.refuse.lock().unwrap().push_back(unroutable());
+    }
+
+    for retry in 0..PLACEMENT_RETRIES as i64 {
+        assert_eq!(run_due(&h.orch, &tutor(), due + 60 * retry).await, 0);
+        assert_eq!(tutor_row(&h).await.last_status, None);
+        assert_eq!(count(&h, STREAK_NOTICES).await, 0, "a retry wakes no one");
+    }
+    assert_eq!(
+        run_due(&h.orch, &tutor(), due + 60 * PLACEMENT_RETRIES as i64).await,
+        1
+    );
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("failed"));
+    assert_eq!(row.consecutive_failures, 1, "exactly one failed outcome");
+    assert_eq!(row.last_fired_occurrence_at, Some(due));
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains(PLACEMENT_UNAVAILABLE)),
+        "{row:?}"
+    );
+    assert_eq!(count(&h, STREAK_NOTICES).await, 1, "and one notice");
+    let notice = h
+        .orch
+        .db
+        .local
+        .query_text("SELECT content FROM messages", ())
+        .await
+        .unwrap()
+        .unwrap();
+    let began = chrono::DateTime::from_timestamp(due, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    assert!(notice.contains(&began), "{notice}");
+    assert!(notice.contains("no connected executor"), "{notice}");
+    assert!(tutor()
+        .status(&h.orch)
+        .unwrap()
+        .placement_retries
+        .is_empty());
+    assert_eq!(
+        retrying_rows(&tutor_log(&h).await),
+        PLACEMENT_RETRIES as usize
+    );
+    assert!(h.host.frames_of("call").is_empty());
+}
+
+/// A substrate still refusing when the next occurrence comes due has been away
+/// a whole interval: that occurrence fails at once rather than retrying anew.
+#[tokio::test]
+async fn a_placement_still_refused_at_the_next_occurrence_fails_it() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    for _ in 0..2 {
+        h.host.refuse.lock().unwrap().push_back(unroutable());
+    }
+    assert_eq!(run_due(&h.orch, &tutor(), due).await, 0);
+    let next = due + 300;
+    assert_eq!(run_due(&h.orch, &tutor(), next).await, 1);
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("failed"));
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.last_fired_occurrence_at, Some(next));
+    assert_eq!(count(&h, STREAK_NOTICES).await, 1);
+    assert_eq!(retrying_rows(&tutor_log(&h).await), 1);
+}
+
+/// A start that failed for any reason but the substrate's is the service's
+/// failure, exactly as before: settled at once, and the streak begins.
+#[tokio::test]
+async fn a_launch_failure_of_the_service_fails_its_occurrence_at_once() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    h.host.refuse.lock().unwrap().push_back(LaunchError::Failed(
+        "service package and runtime rejected".into(),
+    ));
+    assert_eq!(run_due(&h.orch, &tutor(), due).await, 1);
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("failed"));
+    assert_eq!(row.consecutive_failures, 1);
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("start_failed")),
+        "{row:?}"
+    );
+    assert_eq!(count(&h, STREAK_NOTICES).await, 1);
+    assert_eq!(retrying_rows(&tutor_log(&h).await), 0);
+    assert!(tutor()
+        .status(&h.orch)
+        .unwrap()
+        .placement_retries
         .is_empty());
 }
 

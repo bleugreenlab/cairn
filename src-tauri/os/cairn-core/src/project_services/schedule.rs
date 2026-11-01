@@ -13,6 +13,9 @@
 //! occurrence is claimed in the database before the call is made, so a restart
 //! mid-call or a second runner cannot run one occurrence twice; an occurrence
 //! missed while no runner was up is run once, not once per missed interval.
+//! A call the placement substrate refused (`placement_unavailable`) gives its
+//! claim back ([`unclaim`]) and is retried, a bounded number of times, rather
+//! than settled: the refusal is the substrate's, not the service's failure.
 //!
 //! A scheduled call is an ordinary call ([`super::supervisor::call`]): it boots
 //! an idle `on_demand` service, passes the concurrency gate, executes under a
@@ -344,6 +347,48 @@ pub(crate) async fn claim(
     .map_err(|error| format!("Failed to claim a scheduled occurrence: {error}"))
 }
 
+/// Give back the claim on occurrence `due`, so it is due again, restoring
+/// `prior` as the last occurrence fired. Only this claim is undone: a later
+/// occurrence claimed since stands.
+pub(crate) async fn unclaim(
+    db: &LocalDb,
+    project_id: &str,
+    owner: &ServiceOwner,
+    service: &str,
+    entry_key: &str,
+    due: i64,
+    prior: Option<i64>,
+) -> Result<(), String> {
+    let key = (
+        project_id.to_string(),
+        owner.key().to_string(),
+        service.to_string(),
+        entry_key.to_string(),
+    );
+    db.write(move |conn| {
+        let (project_id, owner, service, entry_key) = key.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE service_schedules SET last_fired_occurrence_at = ?6
+                 WHERE project_id = ?1 AND owner_thread = ?2 AND service = ?3 AND entry_key = ?4
+                   AND last_fired_occurrence_at = ?5",
+                params![
+                    project_id.as_str(),
+                    owner.as_str(),
+                    service.as_str(),
+                    entry_key.as_str(),
+                    due,
+                    prior
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to release a scheduled occurrence: {error}"))
+}
+
 /// How an occurrence ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -544,9 +589,16 @@ mod tests {
         crate::project_services::testing::seed_project(&db).await;
         let owner = ServiceOwner::Project;
         let refresh = entry("refresh", 15 * 60_000);
-        assert!(sync(&db, "p", &owner, "board", &[refresh.clone()], 1_000)
-            .await
-            .unwrap());
+        assert!(sync(
+            &db,
+            "p",
+            &owner,
+            "board",
+            std::slice::from_ref(&refresh),
+            1_000
+        )
+        .await
+        .unwrap());
         let rows = list(&db, "p", &owner, "board").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].anchor_at, 1_000 + 900);

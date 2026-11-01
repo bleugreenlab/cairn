@@ -24,7 +24,7 @@
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
@@ -60,6 +60,10 @@ const MAX_ERROR_BYTES: usize = 4 * 1024;
 /// The longest a schedule task sleeps before reading the wall clock again, so
 /// a machine that slept through an occurrence runs it soon after waking.
 const SCHEDULE_RECHECK: Duration = Duration::from_secs(60);
+/// How many times a scheduled occurrence the placement substrate refused is
+/// tried again, each at the schedule's recheck, before it is recorded as
+/// failed: a substrate that stays away that long is news to the owner.
+pub(crate) const PLACEMENT_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ServiceState {
@@ -105,6 +109,37 @@ impl CallError {
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+/// The code of a call refused because the placement substrate could not route
+/// the service's start to the executor holding its residency. The refusal says
+/// nothing about the service, so a scheduled occurrence it refuses is retried
+/// rather than counted as the service's failure.
+pub(crate) const PLACEMENT_UNAVAILABLE: &str = "placement_unavailable";
+
+/// Why a host did not start a service process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchError {
+    /// The placement substrate could not route the start to the executor
+    /// holding the service's residency: a fact about the substrate, not the
+    /// service.
+    Unplaced(String),
+    /// Anything else: the launch itself failed.
+    Failed(String),
+}
+
+impl From<String> for LaunchError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unplaced(error) | Self::Failed(error) => f.write_str(error),
+        }
     }
 }
 
@@ -155,7 +190,11 @@ pub(crate) trait ServiceHost: Send + Sync {
             url: crate::fleet::residency::runner_callback_url(orch),
         })
     }
-    async fn launch(&self, orch: &Orchestrator, spec: &LaunchSpec) -> Result<HostProcess, String>;
+    async fn launch(
+        &self,
+        orch: &Orchestrator,
+        spec: &LaunchSpec,
+    ) -> Result<HostProcess, LaunchError>;
     /// The service has stopped; give back whatever its placement holds.
     async fn release(
         &self,
@@ -326,6 +365,9 @@ struct Cell {
     /// project service whose schedule waits on the startup catch-up writes
     /// one row rather than one per recheck.
     deferral_noted: AtomicBool,
+    /// Scheduled occurrences the placement substrate refused, by entry key:
+    /// each is left due and tried again rather than recorded as failed.
+    placement_retries: StdMutex<BTreeMap<String, PlacementRetry>>,
     /// Sends a call's first attempt to this incarnation, standing in for the
     /// race where a replacement lands between choosing one and sending.
     #[cfg(test)]
@@ -348,6 +390,18 @@ impl Cell {
     }
 }
 
+/// A scheduled occurrence the placement substrate refused and left due, to be
+/// tried again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacementRetry {
+    /// The occurrence first refused, epoch seconds.
+    pub due: i64,
+    /// Refusals so far, the first included.
+    pub refusals: u32,
+    /// The latest refusal.
+    pub refusal: String,
+}
+
 /// A service's status, for `/status` and the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceStatus {
@@ -366,6 +420,10 @@ pub(crate) struct ServiceStatus {
     /// The serving incarnation's idle stop; `None` for a `launch` service or
     /// when nothing serves.
     pub idle_stop_after: Option<Duration>,
+    /// Scheduled occurrences being retried after a placement refusal, by
+    /// entry key. Held by this runner only: a restart finds the occurrence
+    /// still due and runs it afresh.
+    pub placement_retries: BTreeMap<String, PlacementRetry>,
 }
 
 /// A cell's key: (project id, [`ServiceOwner::key`], service).
@@ -443,6 +501,7 @@ impl ServiceSupervisor {
                     schedule_task: StdMutex::default(),
                     schedule_changed: Notify::new(),
                     deferral_noted: AtomicBool::new(false),
+                    placement_retries: StdMutex::default(),
                     #[cfg(test)]
                     force_first_pick: StdMutex::default(),
                 })
@@ -476,6 +535,7 @@ impl ServiceSupervisor {
         service: &str,
     ) -> Option<ServiceStatus> {
         let cell = self.existing(project_id, owner, service)?;
+        let placement_retries = cell.placement_retries.lock().unwrap().clone();
         let state = cell.state.lock().unwrap();
         let current = state.current.as_ref();
         Some(ServiceStatus {
@@ -497,6 +557,7 @@ impl ServiceSupervisor {
                 .map(|until| until.saturating_duration_since(Instant::now()).as_secs()),
             recent_calls: state.recent.iter().cloned().collect(),
             idle_stop_after: current.and_then(|i| i.declaration.idle_stop_after),
+            placement_retries,
         })
     }
 }
@@ -773,10 +834,11 @@ async fn boot_incarnation(
         Ok(process) => process,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "start failed").await;
-            let error = CallError::new(
-                "start_failed",
-                format!("could not place the service: {error}"),
-            );
+            let code = match &error {
+                LaunchError::Unplaced(_) => PLACEMENT_UNAVAILABLE,
+                LaunchError::Failed(_) => "start_failed",
+            };
+            let error = CallError::new(code, format!("could not place the service: {error}"));
             lifecycle(orch, cell, generation, &error.message, actor).await;
             return Err(error);
         }
@@ -1766,9 +1828,17 @@ async fn fire_due(orch: &Orchestrator, cell: &Arc<Cell>, rows: &[ScheduleRow], n
     due_count
 }
 
+/// An occurrence as a log row names it.
+fn occurrence_at(due: i64) -> String {
+    chrono::DateTime::from_timestamp(due, 0)
+        .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| due.to_string())
+}
+
 /// Claim occurrence `due` of one entry, call its method as the owner, record
 /// the outcome, and tell the owning thread if a failure streak begins.
-/// Answers false when the occurrence was deferred, unclaimed, to run later.
+/// Answers false when the occurrence was deferred, unclaimed, to run later:
+/// before the project pass, or after a placement refusal.
 async fn fire_occurrence(
     orch: &Orchestrator,
     cell: &Arc<Cell>,
@@ -1779,9 +1849,7 @@ async fn fire_occurrence(
         && !supervisor(orch).projects_current.load(Ordering::Acquire)
     {
         if !cell.deferral_noted.swap(true, Ordering::AcqRel) {
-            let at = chrono::DateTime::from_timestamp(due, 0)
-                .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_else(|| due.to_string());
+            let at = occurrence_at(due);
             lifecycle(
                 orch,
                 cell,
@@ -1815,6 +1883,9 @@ async fn fire_occurrence(
             return true;
         }
     }
+    // The occurrence a failure streak's notice names: this one, or the one
+    // placement refusals began at when they end in a failure.
+    let mut began_at = due;
     let outcome = if cell.state.lock().unwrap().sticky_stop {
         schedule::Outcome::Skipped(
             "the service is stopped; start or restart it to resume its schedule".into(),
@@ -1838,9 +1909,23 @@ async fn fire_occurrence(
         };
         match call(orch, request).await {
             Ok(_) => schedule::Outcome::Ok,
+            Err(error) if error.code == PLACEMENT_UNAVAILABLE => {
+                match retry_unplaced(orch, cell, &db, row, due, &error).await {
+                    None => return false,
+                    Some(first) => {
+                        began_at = first;
+                        schedule::Outcome::Failed(error.to_string())
+                    }
+                }
+            }
             Err(error) => schedule::Outcome::Failed(error.to_string()),
         }
     };
+    // However the occurrence settled, nothing of it is left to retry.
+    cell.placement_retries
+        .lock()
+        .unwrap()
+        .remove(&row.entry_key);
     let began = match schedule::settle(
         &db,
         project_id,
@@ -1860,13 +1945,76 @@ async fn fire_occurrence(
     };
     if let (true, schedule::Outcome::Failed(error)) = (began, &outcome) {
         let home = cell.home();
-        let content = schedule::streak_notice(&home, service, row, due, error);
+        let content = schedule::streak_notice(&home, service, row, began_at, error);
         let key = format!("service-schedule:{home}:{}", row.entry_key);
         if let Err(error) = schedule::notify_owner(orch, &db, owner, &key, &content).await {
             tracing::warn!(%error, service = %cell.service, "could not send a schedule failure notice");
         }
     }
     true
+}
+
+/// Occurrence `due` was refused by the placement substrate, which says nothing
+/// about the service. Give back its claim, so it stays due and the schedule
+/// task's recheck tries it again, and log that it will. Answers the occurrence
+/// the refusals began at once they stop being a retry, to be recorded as a
+/// failure: the first try and every retry were refused, or the substrate is
+/// still refusing when a later occurrence comes due.
+async fn retry_unplaced(
+    orch: &Orchestrator,
+    cell: &Arc<Cell>,
+    db: &crate::storage::LocalDb,
+    row: &ScheduleRow,
+    due: i64,
+    error: &CallError,
+) -> Option<i64> {
+    let retry = {
+        let mut retries = cell.placement_retries.lock().unwrap();
+        let retry = retries
+            .entry(row.entry_key.clone())
+            .or_insert_with(|| PlacementRetry {
+                due,
+                refusals: 0,
+                refusal: String::new(),
+            });
+        retry.refusals += 1;
+        retry.refusal = error.message.clone();
+        retry.clone()
+    };
+    if retry.due < due || retry.refusals > PLACEMENT_RETRIES {
+        return Some(retry.due);
+    }
+    if let Err(unclaim) = schedule::unclaim(
+        db,
+        &cell.project_id,
+        &cell.owner,
+        &cell.service,
+        &row.entry_key,
+        due,
+        row.last_fired_occurrence_at,
+    )
+    .await
+    {
+        // Left claimed it would never run: record it rather than lose it.
+        tracing::warn!(error = %unclaim, service = %cell.service, "could not release a refused occurrence");
+        return Some(retry.due);
+    }
+    let generation = cell.state.lock().unwrap().generation;
+    lifecycle(
+        orch,
+        cell,
+        generation,
+        &format!(
+            "scheduled `{}` due {} could not be placed ({}); retrying ({} of {PLACEMENT_RETRIES})",
+            row.method,
+            occurrence_at(due),
+            error.message,
+            retry.refusals,
+        ),
+        "schedule",
+    )
+    .await;
+    None
 }
 
 /// Run what `target`'s schedule has due at `now` (epoch seconds), as its

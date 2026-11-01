@@ -30,6 +30,11 @@ pub(crate) enum ServicePlacementError {
     Unavailable(String),
     #[error("service process operation failed: {0}")]
     Operation(String),
+    /// The runner could not route the operation to the executor holding the
+    /// residency. Unlike `Operation`, it says nothing about the process the
+    /// operation was for.
+    #[error("service process could not be routed to its executor: {0}")]
+    Unroutable(String),
     #[error("service process `{process_key}` did not exit within {timeout:?}")]
     Timeout {
         process_key: String,
@@ -778,6 +783,14 @@ fn process_generation(
             ResidencyFailureKind::Admission | ResidencyFailureKind::NotFound => {
                 Err(ServicePlacementError::Unavailable(diagnostic.clone()))
             }
+            // The substrate's refusal, not the process's: a service schedule
+            // retries a start refused this way instead of counting it as the
+            // service's failure. cairn/5754 refines this kind into a snapshot
+            // lagging its grant versus a route whose executor is gone; key the
+            // substrate's refusals on the kinds it lands.
+            ResidencyFailureKind::Unavailable => {
+                Err(ServicePlacementError::Unroutable(diagnostic.clone()))
+            }
             _ => Err(ServicePlacementError::Operation(diagnostic.clone())),
         },
         other => Err(ServicePlacementError::Operation(format!(
@@ -1300,6 +1313,29 @@ pub(crate) mod tests {
             label: "iMessage channel",
         })
         .is_err());
+    }
+
+    /// A start the runner could not route is the substrate's refusal and says
+    /// so in its variant; a refusal about the process stays an `Operation`.
+    #[test]
+    fn an_unroutable_start_is_its_own_refusal() {
+        let refused = |kind| ResidencyResult::Failed {
+            kind,
+            diagnostic: "no connected executor reports this execution environment".into(),
+            cell_outcome: None,
+        };
+        assert!(matches!(
+            process_generation(&refused(ResidencyFailureKind::Unavailable), "svc-1"),
+            Err(ServicePlacementError::Unroutable(_))
+        ));
+        assert!(matches!(
+            process_generation(&refused(ResidencyFailureKind::Process), "svc-1"),
+            Err(ServicePlacementError::Operation(_))
+        ));
+        assert!(matches!(
+            process_generation(&refused(ResidencyFailureKind::Admission), "svc-1"),
+            Err(ServicePlacementError::Unavailable(_))
+        ));
     }
 
     #[test]
