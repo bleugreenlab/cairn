@@ -5,15 +5,26 @@ use cairn_common::executor_protocol::{
     ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
     ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
     MemoryKill, ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
-    DURATION_SAMPLE_WINDOW, MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
+    DURATION_SAMPLE_WINDOW, MEASURED_RESERVATION_HEADROOM_PERCENT, MIN_CONFIDENT_DURATION_SAMPLES,
+    MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_db::turso::params;
 use std::sync::Arc;
 
 const MIN_CONFIDENT_SAMPLES: u64 = MIN_CONFIDENT_RESERVATION_SAMPLES;
-const HEADROOM_NUMERATOR: u64 = 5;
-const HEADROOM_DENOMINATOR: u64 = 4;
-const HEADROOM_PERCENT: u32 = 25;
+const HEADROOM_PERCENT: u32 = MEASURED_RESERVATION_HEADROOM_PERCENT;
+/// How far a lower peak pulls the memory high-water mark down: one
+/// thirty-second of the gap, so one light run is never mistaken for the
+/// command getting cheaper.
+const PEAK_DECAY_DIVISOR: u64 = 32;
+/// The same for a run whose build jobs this machine's memory bounded: half the
+/// gap. Such a run measured the command at the width the machine grants, which
+/// is the width the next run here gets too, so its peak is evidence about that
+/// run rather than an outlier to discount. Without it a peak learned at full
+/// width, before builds were memory-capped, takes some seventy capped runs to
+/// fall, and while it stays above the machine's ceiling the runs that would
+/// teach it seldom happen (cairn/5731).
+const MEMORY_BOUND_PEAK_DECAY_DIVISOR: u64 = 2;
 const MIN_CONTENTION_SAMPLES: usize = 3;
 /// A command reservation must leave room for the operating system, executor,
 /// and measurement noise. Peaks at or above this share describe saturation.
@@ -936,6 +947,12 @@ pub(super) async fn observe_completed(
             .await;
         }
     }
+    let memory_bound = kind == CompletionKind::Succeeded
+        && metadata
+            .allocation
+            .as_ref()
+            .and_then(|allocation| allocation.build_jobs)
+            .is_some_and(|jobs| jobs.memory_bound());
     let _ = update_profile_with(
         db,
         identity,
@@ -947,6 +964,10 @@ pub(super) async fn observe_completed(
         // A success here is the machine holding the command, which is the
         // one thing that disproves "it cannot run here at all".
         kind == CompletionKind::Succeeded,
+        match memory_bound {
+            true => MEMORY_BOUND_PEAK_DECAY_DIVISOR,
+            false => PEAK_DECAY_DIVISOR,
+        },
     )
     .await;
 }
@@ -1192,7 +1213,7 @@ pub(super) fn oom_killed_for_test(
 }
 
 fn with_headroom(value: u64) -> u64 {
-    value.saturating_mul(HEADROOM_NUMERATOR) / HEADROOM_DENOMINATOR
+    cairn_common::executor_protocol::with_measured_headroom(value)
 }
 
 #[cfg(test)]
@@ -1201,7 +1222,7 @@ fn update_upper(previous: u64, sample: u64) -> u64 {
         sample
     } else {
         // Slowly decay a high-water estimate while remaining biased upward.
-        previous.saturating_sub((previous - sample) / 32)
+        previous.saturating_sub((previous - sample) / PEAK_DECAY_DIVISOR)
     }
 }
 
@@ -1426,13 +1447,22 @@ async fn update_profile(
     duration: Option<u64>,
 ) -> Result<(), String> {
     update_profile_with(
-        db, identity, context, finished, memory, disk, duration, false,
+        db,
+        identity,
+        context,
+        finished,
+        memory,
+        disk,
+        duration,
+        false,
+        PEAK_DECAY_DIVISOR,
     )
     .await
 }
 
 /// [`update_profile`], also clearing a solo out-of-memory kill when this
-/// completion `held` the command, that is, succeeded on this machine.
+/// completion `held` the command, that is, succeeded on this machine, and
+/// pulling a higher peak down by `peak_decay_divisor` of the gap.
 #[allow(clippy::too_many_arguments)]
 async fn update_profile_with(
     db: Arc<LocalDb>,
@@ -1443,6 +1473,7 @@ async fn update_profile_with(
     disk: Option<u64>,
     duration: Option<u64>,
     held: bool,
+    peak_decay_divisor: u64,
 ) -> Result<(), String> {
     let identity = identity.clone();
     let context = context.clone();
@@ -1456,12 +1487,12 @@ async fn update_profile_with(
                    ON CONFLICT(identity_version, command_identity, executor_class, os, arch, toolchain_fingerprint) DO UPDATE SET
                      sample_count=MIN(command_resource_profiles.sample_count + 1, 10000),
                      updated_at_unix_ms=MAX(command_resource_profiles.updated_at_unix_ms, excluded.updated_at_unix_ms),
-                     upper_peak_rss_bytes=CASE WHEN excluded.upper_peak_rss_bytes IS NULL THEN command_resource_profiles.upper_peak_rss_bytes WHEN command_resource_profiles.upper_peak_rss_bytes IS NULL OR excluded.upper_peak_rss_bytes >= command_resource_profiles.upper_peak_rss_bytes THEN excluded.upper_peak_rss_bytes ELSE command_resource_profiles.upper_peak_rss_bytes - ((command_resource_profiles.upper_peak_rss_bytes - excluded.upper_peak_rss_bytes) / 32) END,
+                     upper_peak_rss_bytes=CASE WHEN excluded.upper_peak_rss_bytes IS NULL THEN command_resource_profiles.upper_peak_rss_bytes WHEN command_resource_profiles.upper_peak_rss_bytes IS NULL OR excluded.upper_peak_rss_bytes >= command_resource_profiles.upper_peak_rss_bytes THEN excluded.upper_peak_rss_bytes ELSE command_resource_profiles.upper_peak_rss_bytes - ((command_resource_profiles.upper_peak_rss_bytes - excluded.upper_peak_rss_bytes) / ?12) END,
                      upper_disk_delta_bytes=CASE WHEN excluded.upper_disk_delta_bytes IS NULL THEN command_resource_profiles.upper_disk_delta_bytes WHEN command_resource_profiles.upper_disk_delta_bytes IS NULL OR excluded.upper_disk_delta_bytes >= command_resource_profiles.upper_disk_delta_bytes THEN excluded.upper_disk_delta_bytes ELSE command_resource_profiles.upper_disk_delta_bytes - ((command_resource_profiles.upper_disk_delta_bytes - excluded.upper_disk_delta_bytes) / 32) END,
                      upper_duration_ms=CASE WHEN excluded.upper_duration_ms IS NULL THEN command_resource_profiles.upper_duration_ms WHEN command_resource_profiles.upper_duration_ms IS NULL OR excluded.upper_duration_ms >= command_resource_profiles.upper_duration_ms THEN excluded.upper_duration_ms ELSE command_resource_profiles.upper_duration_ms - ((command_resource_profiles.upper_duration_ms - excluded.upper_duration_ms) / 32) END,
                      confidence_millis=MIN(1000, (MIN(command_resource_profiles.sample_count + 1, 10000) * 1000) / 5),
                      oom_alone_machine_bytes=CASE WHEN ?11 = 1 THEN NULL ELSE command_resource_profiles.oom_alone_machine_bytes END"#,
-                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64],
+                params![identity.version as i64, identity.key, context.executor_class, context.os, context.arch, context.toolchain_fingerprint, finished as i64, memory.map(|value| value as i64), disk.map(|value| value as i64), duration.map(|value| value as i64), held as i64, peak_decay_divisor.max(1) as i64],
             ).await?;
             Ok(())
         })
@@ -1989,6 +2020,106 @@ mod tests {
     fn upper_estimate_rises_immediately_and_decays_slowly() {
         assert_eq!(update_upper(100, 200), 200);
         assert_eq!(update_upper(320, 0), 310);
+    }
+
+    /// cairn/5731: a whole-suite pass learned at 16.8 GiB from full-width runs,
+    /// then run on a 24 GiB Mac whose memory held its build to four jobs. That
+    /// run measured the command at the width this machine grants, so it moves
+    /// the high-water mark halfway down; a run at the CPU width moves it the
+    /// ordinary thirty-second, and a failed run, however bounded, the same.
+    #[tokio::test]
+    async fn a_memory_bound_run_pulls_the_learned_peak_toward_what_it_measured() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db("peak-memory-bound.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+        let peak_after = |label: &'static str| {
+            let db = db.clone();
+            let identity = identity.clone();
+            let context = context.clone();
+            async move {
+                load_profile(db, &identity, &context)
+                    .await
+                    .unwrap()
+                    .and_then(|profile| profile.upper_peak_rss_bytes)
+                    .unwrap_or_else(|| panic!("{label}: a peak was recorded"))
+            }
+        };
+        let run = |finished: u64, peak: u64, memory_available: u64| {
+            let mut meta = completion(None, finished, 60_000);
+            meta.peak_rss_bytes = Some(peak);
+            meta.allocation = Some(
+                cairn_common::executor_protocol::ExecutionAllocation::uncapped(
+                    10,
+                    cairn_common::executor_protocol::NoCapReason::PlatformHasNoCap,
+                    None,
+                    60_000,
+                )
+                .with_build_jobs(cairn_common::executor_protocol::BuildJobs::new(
+                    10,
+                    Some(cairn_common::executor_protocol::MemoryJobBound::new(
+                        memory_available,
+                        finished,
+                        5 * GIB / 2,
+                        1,
+                    )),
+                )),
+            );
+            meta
+        };
+
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &run(1, 16 * GIB, 100 * GIB),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        assert_eq!(peak_after("full width").await, 16 * GIB);
+
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &run(2, 8 * GIB, 10 * GIB),
+            CompletionKind::Failed,
+        )
+        .await;
+        assert_eq!(
+            peak_after("failed").await,
+            16 * GIB - 8 * GIB / 32,
+            "a failed run is not the pass at this width"
+        );
+
+        let before = peak_after("before").await;
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &run(3, 8 * GIB, 10 * GIB),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        assert_eq!(
+            peak_after("memory bound").await,
+            before - (before - 8 * GIB) / 2
+        );
+
+        let before = peak_after("before").await;
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &context,
+            &run(4, 8 * GIB, 100 * GIB),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        assert_eq!(
+            peak_after("cpu width").await,
+            before - (before - 8 * GIB) / 32,
+            "a run its memory did not bound decays as it always has"
+        );
     }
 
     #[tokio::test]

@@ -12787,9 +12787,9 @@ impl Fleet {
     /// The machines `rejected` passed over for an inference hold that would
     /// take `request` were the hold lifted.
     ///
-    /// Placement checks the hold before the selector, the platform, colocation
-    /// and the project, so a held machine that could never run the work is
-    /// refused for the hold too. Counting it as waiting would unload a model for
+    /// Placement checks the hold after the selector and the verdict platform
+    /// but before colocation and the project, so a held machine that could
+    /// never run the work may still be refused for the hold. Counting it as waiting would unload a model for
     /// a batch that cannot use the machine, and reload it on the next request.
     /// A machine whose own decline of this entry still stands would not take it
     /// either.
@@ -14029,6 +14029,9 @@ struct CandidateSurvey<'a> {
     /// built from these through [`account_from_journal`], not from the
     /// runner's reading of the machine at the moment it was composed.
     journal: Vec<PlacementRejection>,
+    /// Each surveyed machine's advertised memory budget, so ranking can ask
+    /// whether a machine it would wait on could hold the work at all.
+    memory_budgets: HashMap<String, Option<u64>>,
 }
 
 /// The facts about a piece of work that decide which machines could
@@ -14211,6 +14214,33 @@ fn candidate_rejection_under(
             role: entry.machine_role,
             work_class: scope.work_class,
         })
+    } else if scope
+        .selector
+        .is_some_and(|selector| !matches_selector(entry, selector))
+    {
+        // Ahead of every hold for the role's reason: a machine the work named
+        // itself out of can never run it, and reporting its drain or update
+        // hold instead makes it a machine to wait for. A macOS-only pass then
+        // waited on a Linux machine's executor update rather than taking the
+        // only Mac at the clamp (cairn/5731).
+        Some(PlacementRejectionReason::SelectorMismatch {
+            requested: scope
+                .selector
+                .map(|selector| selector.describe())
+                .unwrap_or_default(),
+        })
+    } else if !scope.verdict_platforms.is_empty()
+        && !scope
+            .verdict_platforms
+            .iter()
+            .any(|platform| platform.eq_ignore_ascii_case(&entry.advertisement.capabilities.os))
+    {
+        // The same: a platform this verdict does not count from is not one
+        // the work will ever wait for.
+        Some(PlacementRejectionReason::UntrustedVerdictPlatform {
+            os: entry.advertisement.capabilities.os.clone(),
+            trusted: scope.verdict_platforms.to_vec(),
+        })
     } else if entry.drained && !pinned_here {
         // The runner owns this refusal rather than asking the machine. A
         // residency pin is the exception: a batch reaches a drained home only
@@ -14322,26 +14352,6 @@ fn candidate_rejection_under(
         scope.selector,
     ) {
         Some(reason)
-    } else if scope
-        .selector
-        .is_some_and(|selector| !matches_selector(entry, selector))
-    {
-        Some(PlacementRejectionReason::SelectorMismatch {
-            requested: scope
-                .selector
-                .map(|selector| selector.describe())
-                .unwrap_or_default(),
-        })
-    } else if !scope.verdict_platforms.is_empty()
-        && !scope
-            .verdict_platforms
-            .iter()
-            .any(|platform| platform.eq_ignore_ascii_case(&entry.advertisement.capabilities.os))
-    {
-        Some(PlacementRejectionReason::UntrustedVerdictPlatform {
-            os: entry.advertisement.capabilities.os.clone(),
-            trusted: scope.verdict_platforms.to_vec(),
-        })
     } else if !scope.targeted() && !entry.colocated && !scope.mobility.may_spill() {
         // Untargeted work that has not been declared mobile stays on the
         // machine holding the runner's own checkout. Absence of a selector is
@@ -14502,12 +14512,22 @@ fn survey_candidates<'a>(
             ));
         }
     }
+    let memory_budgets = connections
+        .iter()
+        .map(|(executor_id, entry)| {
+            (
+                executor_id.clone(),
+                entry.advertisement.capabilities.memory_budget_bytes,
+            )
+        })
+        .collect();
     Ok(CandidateSurvey {
         usable,
         rejected,
         view: view.clone(),
         declined_here,
         journal,
+        memory_budgets,
     })
 }
 
@@ -14820,6 +14840,7 @@ fn rank_survey(
         view,
         declined_here,
         journal,
+        memory_budgets,
     } = survey;
     // Each machine's posted state is read against the demand the offer to it
     // will name: the reservation resolved for that machine, which an ordinary
@@ -14980,11 +15001,36 @@ fn rank_survey(
     // trades a wait for an out-of-memory kill hours in. So work free to move
     // waits on the decliner instead, as it would if nothing else were usable.
     // Work the caller settled stays at the clamp, as it always has.
+    //
+    // Only a decliner that could hold it is worth the wait. One whose budget
+    // is under the demand too ends at the clamp as surely as the winner does,
+    // so waiting on it trades the run for nothing, and while the learned peak
+    // stays above every eligible ceiling it is never re-measured: the probe
+    // at the clamp, run at the width the machine's memory grants, is what
+    // brings the peak back to what this fleet can actually run (cairn/5731).
+    // The demand is the winner's measurement, the only one this pass holds;
+    // a decliner with no stated budget may be larger and is still waited for.
+    let winner_ceiling = winner
+        .reservation
+        .and_then(|resolved| resolved.memory_fit.ceiling());
+    let could_hold = |rejection: &PlacementRejection| {
+        let Some(ceiling) = winner_ceiling else {
+            return true;
+        };
+        let budget = memory_budgets
+            .get(&rejection.executor_id)
+            .copied()
+            .flatten();
+        !matches!(
+            resource_profiles::MemoryFit::of(Some(ceiling.estimate_bytes), budget),
+            resource_profiles::MemoryFit::Exceeds(_)
+        )
+    };
     if winner.over_ceiling.is_some()
         && exercising_spill
         && rejected
             .iter()
-            .any(|rejection| waits_on_machine(&rejection.reason))
+            .any(|rejection| waits_on_machine(&rejection.reason) && could_hold(rejection))
     {
         rejected.extend(ranked.into_iter().map(|candidate| candidate.rejection()));
         return Ok(PlacementDraft {
@@ -23745,6 +23791,7 @@ mod tests {
                     view: AdmissionView::default(),
                     declined_here: HashMap::new(),
                     journal: vec![],
+                    memory_budgets: HashMap::new(),
                 },
                 SurveyRankingContext {
                     reservations: &HashMap::new(),
@@ -24900,6 +24947,176 @@ mod tests {
             "{diagnostic}"
         );
         assert!(diagnostic.contains("Waited on: bglab-mac"), "{diagnostic}");
+    }
+
+    /// cairn/5731's specimen: a macOS-only whole-suite pass measured above the
+    /// only Mac's ceiling, and a 125 GiB Linux machine on an executor-update
+    /// hold. The Linux machine can hold the memory and can never run the work,
+    /// so it is neither a machine to wait for nor one that "can hold it": the
+    /// pass goes to the Mac at the clamp, and its note says nothing could.
+    #[tokio::test]
+    async fn holdable_elsewhere_is_false_when_the_only_larger_machine_fails_the_selector() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db("ceiling-selector-scoped.db").await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        for (id, os, budget, update_hold) in [
+            ("bgsrv-mac", "macos", 11_042_782_208, false),
+            ("fedora", "linux", 125 * GIB, true),
+        ] {
+            let (id, mut entry) = fleet_entry_at(id, os, 0, &[], now);
+            entry.advertisement.capabilities.memory_budget_bytes = Some(budget);
+            entry.update_hold = update_hold;
+            measured_at(&mut entry, 0.01, budget, 500 * GIB, now);
+            resource_profiles::seed_memory_profile_for_test(
+                db.clone(),
+                &identity,
+                &ReservationPlan::context_for(
+                    &entry.identity.device_id,
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities,
+                ),
+                8 * GIB,
+            )
+            .await;
+            connections.insert(id, entry);
+        }
+        let pool = Fleet::default();
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        request.command_resource_identity = Some(identity);
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        request.executor = Some(ExecutorSelector {
+            os: Some("macos".into()),
+            ..ExecutorSelector::default()
+        });
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .expect("waited on a machine that cannot run the work");
+        assert_eq!(placement.selected.executor_id, "bgsrv-mac");
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "fedora"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::SelectorMismatch { .. }
+                )
+        }));
+        assert!(!placement
+            .decision
+            .rejected
+            .iter()
+            .any(|rejection| waits_on_machine(&rejection.reason)));
+        let above = placement.above_ceiling.expect("placed at the clamp");
+        assert!(!above.holdable_elsewhere);
+        assert!(
+            above.note().contains("no executor can hold"),
+            "{}",
+            above.note()
+        );
+    }
+
+    /// The other half of cairn/5731: a learned peak above every eligible
+    /// machine's ceiling. One Mac has declined, the other is usable, and both
+    /// budgets are under the demand. Waiting on the decliner can only end at
+    /// the clamp too, and while nothing runs the peak is never re-measured,
+    /// so the pass places a probe at the clamp now instead of waiting.
+    #[tokio::test]
+    async fn a_learned_peak_above_every_eligible_ceiling_places_a_probe_rather_than_waiting() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db("ceiling-probe.db").await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        for id in ["bgsrv-mac", "bgsrv-mac-2"] {
+            let (id, mut entry) = fleet_entry_at(id, "macos", 0, &[], now);
+            entry.advertisement.capabilities.memory_budget_bytes = Some(11_042_782_208);
+            measured_at(&mut entry, 0.01, 10 * GIB, 500 * GIB, now);
+            resource_profiles::seed_memory_profile_for_test(
+                db.clone(),
+                &identity,
+                &ReservationPlan::context_for(
+                    &entry.identity.device_id,
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities,
+                ),
+                8 * GIB,
+            )
+            .await;
+            connections.insert(id, entry);
+        }
+        let pool = Fleet::default();
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        request.command_resource_identity = Some(identity);
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        request.executor = Some(ExecutorSelector {
+            os: Some("macos".into()),
+            ..ExecutorSelector::default()
+        });
+        let generation = pool.lock_connections()["bgsrv-mac-2"].generation;
+        let declined = HashMap::from([(
+            "bgsrv-mac-2".to_string(),
+            queue::EntryDecline {
+                generation,
+                reason: DeclineReason::ProjectProvisioning,
+                detail: Some("provisioning project p".into()),
+                disk: None,
+                at_unix_ms: now,
+                condition: None,
+                backoff_ms: 0,
+                retry_after_unix_ms: 0,
+                superseded_at_unix_ms: None,
+            },
+        )]);
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &declined,
+                &AdmissionView::default(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .expect("waited on a machine that could not hold the work either");
+        assert_eq!(placement.selected.executor_id, "bgsrv-mac");
+        assert!(
+            placement.above_ceiling.is_some(),
+            "the probe is placed at the clamp, and says so"
+        );
     }
 
     /// The exclusion is the machine's answer at the size it was killed at.
@@ -28633,10 +28850,6 @@ mod tests {
             let machine = &connections["bginf-sp1"];
             let reason = candidate_rejection(machine, PlacementScope::of(&request), NOW)
                 .expect("the held machine is passed over");
-            assert!(
-                matches!(reason, PlacementRejectionReason::InferenceReserved { .. }),
-                "the hold is checked before the selector: {reason:?}"
-            );
             let rejected = vec![PlacementRejection {
                 executor_name: "bginf-sp1".into(),
                 executor_id: "bginf-sp1".into(),
@@ -28650,8 +28863,20 @@ mod tests {
             held(targeted_request("linux")),
             HashSet::from(["bginf-sp1".to_string()])
         );
+        let macos = targeted_request("macos");
+        assert!(
+            matches!(
+                candidate_rejection(
+                    &fleet.lock_connections()["bginf-sp1"],
+                    PlacementScope::of(&macos),
+                    NOW
+                ),
+                Some(PlacementRejectionReason::SelectorMismatch { .. })
+            ),
+            "a machine the selector excludes says so ahead of its hold (cairn/5731)"
+        );
         assert_eq!(
-            held(targeted_request("macos")),
+            held(macos),
             HashSet::new(),
             "a macOS-targeted lane (SelectorMismatch) could never run here"
         );

@@ -6157,6 +6157,17 @@ pub struct LearnedResourceEstimate {
 /// answering. An older runner talking to a newer executor takes the first
 /// `Healthy` as before and, holding no command once healthy, ignores a
 /// `Failed` that follows it.
+///
+/// cairn/5731 does not move the number. No frame, variant, field or
+/// serialized form changes. An executor's admission now holds a resident
+/// process its own sampler has watched for a minute at that measured peak
+/// plus [`MEASURED_RESERVATION_HEADROOM_PERCENT`], rather than at its declared
+/// unmeasured claim; that is executor-local arithmetic over a reading it
+/// already took, and the `unmeasuredHoldBytes` it reports keeps its meaning.
+/// The headroom constant moves here from the runner so both sides price a
+/// measurement alike; nothing sends it. What a runner gets wrong talking to an
+/// older executor: nothing; that executor keeps holding a service resident at
+/// its declared claim, declining work it could take until it updates.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -14374,6 +14385,20 @@ impl ObservationReuse {
 /// a single sample as a settled prediction while the scheduler is still treating
 /// it as a guess.
 pub const MIN_CONFIDENT_RESERVATION_SAMPLES: u64 = 5;
+
+/// The headroom a measured memory high-water mark carries when it is charged
+/// as a claim, in percent above the mark.
+///
+/// One number for every measurement that becomes a claim: the runner's learned
+/// command profiles, and the executor's charge for a resident process its
+/// sampler has watched. Pricing the two alike is what lets "measured" mean the
+/// same thing on both sides of the boundary.
+pub const MEASURED_RESERVATION_HEADROOM_PERCENT: u32 = 25;
+
+/// `bytes` with [`MEASURED_RESERVATION_HEADROOM_PERCENT`] added above it.
+pub fn with_measured_headroom(bytes: u64) -> u64 {
+    bytes.saturating_mul(100 + u64::from(MEASURED_RESERVATION_HEADROOM_PERCENT)) / 100
+}
 
 /// How the number this work was charged came to be that number.
 ///
