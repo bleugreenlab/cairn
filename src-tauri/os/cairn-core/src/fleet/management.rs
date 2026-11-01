@@ -79,15 +79,58 @@ pub struct RemoteExecutorMutationResult {
     pub os: Option<String>,
     pub arch: Option<String>,
     pub attach_state: String,
-    /// What a removal could not finish on the remote host, when the host could
-    /// not be reached at all. `None` means nothing was left behind.
-    ///
-    /// A removal is a registry operation and completes whether or not the
-    /// machine cooperates, so this is the honest account of the courtesy that
-    /// did not happen — which is a different thing from the removal failing, and
-    /// every surface renders it rather than claiming a clean teardown.
+    /// What a removed machine's host still holds. Information, never a
+    /// refusal: removal is a registry change that completes without the host,
+    /// and the executor takes these off the host itself the next time it dials
+    /// in. `None` for a removal that left nothing there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unverified_remote_cleanup: Option<String>,
+    pub left_on_host: Option<LeftOnHost>,
+}
+
+/// What a removed machine's host holds until its executor next dials in, is
+/// refused as revoked, and uninstalls itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeftOnHost {
+    pub binary_path: String,
+    pub cairn_home: String,
+    /// The service registration, named as that host's service manager knows it.
+    pub service: String,
+    /// The whole account in one sentence, for a surface to show as it is.
+    pub summary: String,
+}
+
+impl LeftOnHost {
+    /// What the host of `config` holds once the runner has forgotten it.
+    pub fn after_removal(config: &RemoteExecutorConfig) -> Self {
+        use cairn_common::executor_protocol::RemotePlatform;
+        let service = match config.platform {
+            RemotePlatform::LinuxX86_64 | RemotePlatform::LinuxArm64 => format!(
+                "the systemd user unit {}",
+                cairn_common::service::EXECUTOR_UNIT
+            ),
+            RemotePlatform::DarwinArm64 => format!(
+                "the launchd agent {}",
+                cairn_common::service::EXECUTOR_LABEL
+            ),
+            RemotePlatform::WindowsX86_64 => format!(
+                "the {} Run value",
+                cairn_common::service::EXECUTOR_RUN_VALUE
+            ),
+        };
+        let summary = format!(
+            "{host} still holds the executor binary at {binary}, its home at {home} with its credential, and {service}. The executor removes them itself the next time it dials in and is refused as revoked. A build from before self-uninstall (cairn/5705) only stops on that refusal and keeps retrying, so on such a machine, or one that never comes back, remove them by hand.",
+            host = config.host,
+            binary = config.binary_path,
+            home = config.cairn_home,
+        );
+        Self {
+            binary_path: config.binary_path.clone(),
+            cairn_home: config.cairn_home.clone(),
+            service,
+            summary,
+        }
+    }
 }
 
 /// The runner-owned side of fleet management.
@@ -106,7 +149,12 @@ pub trait RemoteExecutorLifecycle: Send + Sync {
         progress: EnrollmentProgress,
     ) -> Result<RemoteExecutorMutationResult, String>;
 
-    /// Unregister the resident service, clean up the machine, and revoke its enrollment.
+    /// Revoke a machine's enrollment and forget it, once it is empty.
+    ///
+    /// A registry change that never reaches the host, so no machine is ever
+    /// un-removable: the executor uninstalls itself when it next dials in with
+    /// its revoked credential, and the result names what the host holds until
+    /// then.
     ///
     /// The occupancy refusal is applied before this is called AND again inside
     /// the implementation under its own mutation gate; an implementation that
@@ -638,8 +686,8 @@ pub fn occupancy(orch: &Orchestrator, executor_id: &str) -> OccupancyReading {
 /// Refuse a removal while the machine still holds work, unless the caller has
 /// acknowledged stranding it.
 ///
-/// Removal unregisters the resident service, cleans the remote, revokes the
-/// enrollment, and disconnects the generation. Doing that underneath running work does not
+/// Removal revokes the enrollment, disconnects the generation, and abandons the
+/// machine's held work. Doing that underneath running work does not
 /// stop the work politely — it strands it. So the default answer is a refusal
 /// that says what is still there and what to do about it.
 pub fn refuse_removal_while_occupied(
@@ -1094,7 +1142,7 @@ pub async fn remove(
                 "removed abandoned enrollment; its machine was never configured or attached here"
             }
             .into(),
-            unverified_remote_cleanup: None,
+            left_on_host: None,
         });
     }
     let result = orch

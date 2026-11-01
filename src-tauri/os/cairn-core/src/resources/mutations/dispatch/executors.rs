@@ -387,15 +387,16 @@ pub(super) async fn dispatch(
                         "Removed {name}: cleared the failed enrollment record. Its rollback had already completed, so there was no configuration, supervision, credential, or remote process left to remove."
                     )
                 } else {
-                    match result.unverified_remote_cleanup {
-                        None => format!(
-                            "Removed {name}: supervision stopped, remote cleaned up, enrollment revoked, configuration removed"
-                        ),
-                        // Removal completed without the machine, so the summary says
-                        // which half happened rather than claiming a teardown that
-                        // never reached the host.
-                        Some(reason) => format!(
-                            "Removed {name}: supervision stopped, enrollment revoked, configuration removed. Its host could not be reached ({reason}), so no remote cleanup ran there; the revoked enrollment means anything still running on it cannot reattach."
+                    // Removal is a registry change that never reaches the host,
+                    // so the summary says what the host still holds rather than
+                    // claiming a teardown.
+                    match result.left_on_host {
+                        None => {
+                            format!("Removed {name}: enrollment revoked, configuration removed")
+                        }
+                        Some(left) => format!(
+                            "Removed {name}: enrollment revoked, configuration removed. {}",
+                            left.summary
                         ),
                     }
                 }

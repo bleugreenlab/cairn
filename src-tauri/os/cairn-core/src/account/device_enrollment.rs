@@ -1032,6 +1032,46 @@ mod tests {
         );
     }
 
+    /// Enrolling a removed machine's host again reactivates its record with a
+    /// fresh credential. The old credential then matches nothing, so the daemon
+    /// still holding it is refused as a stranger and is never told to
+    /// uninstall, which only a revoked credential earns, and so never deletes
+    /// the installation the re-enrollment just put there.
+    #[tokio::test]
+    async fn a_reenrolled_machine_turns_its_revoked_credential_into_a_strangers() {
+        let db = db().await;
+        let identity = ExecutorIdentity {
+            device_id: "remote-a-device".into(),
+            executor_id: "remote-a".into(),
+            display_name: "fedora".into(),
+        };
+        let removed = enroll(&db, "remote-a", "fedora").await.unwrap();
+        revoke(
+            &db,
+            DeviceKind::Executor,
+            "remote-a",
+            "remote-a-device",
+            "runner",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            accept_credential(&db, &removed, &identity).await,
+            Err(EnrollmentRejectionReason::Revoked)
+        );
+
+        let current = enroll(&db, "remote-a", "fedora").await.unwrap();
+
+        assert_eq!(
+            accept_credential(&db, &current, &identity).await,
+            Ok(AcceptOutcome::Reattached)
+        );
+        assert_eq!(
+            accept_credential(&db, &removed, &identity).await,
+            Err(EnrollmentRejectionReason::IdentityMismatch)
+        );
+    }
+
     #[tokio::test]
     async fn a_superseded_credential_is_refused_by_name() {
         let db = db().await;

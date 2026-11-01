@@ -113,6 +113,13 @@ impl LegacyIdentity {
     }
 }
 
+/// The resident executor's service identity. Owned here rather than by
+/// `cairn-exec` because the runner names it too, in what a removal reports is
+/// still registered on a host.
+pub const EXECUTOR_LABEL: &str = "computer.cairn.exec";
+pub const EXECUTOR_UNIT: &str = "cairn-exec.service";
+pub const EXECUTOR_RUN_VALUE: &str = "CairnExec";
+
 /// The runner's service identity (cairn/4377 onward).
 pub const RUNNER_LABEL: &str = "computer.cairn.orch";
 pub const RUNNER_UNIT: &str = "cairn-orch.service";

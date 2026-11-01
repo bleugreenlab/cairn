@@ -6126,6 +6126,22 @@ pub struct LearnedResourceEstimate {
 /// as any other. An older runner talking to a newer executor still reads the
 /// batch as held, but work inside a residency is bound to its machine and is
 /// offered there regardless, where the newer executor admits it.
+///
+/// cairn/5705 does not move the number. [`ExecutorMessage::EnrollmentRejected`]
+/// gains a defaulted `uninstall` flag, which a runner sets on the revoked
+/// refusal it gives a resident executor it removed, so that executor takes
+/// itself off its host the next time it dials in. Removal itself is now a
+/// runner-side registry change with no ssh step. The variant is a struct
+/// variant of an internally tagged enum with no `deny_unknown_fields`, so an
+/// executor that predates the key decodes the frame as the revoked refusal it
+/// has always received and stops exactly as before. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently. That executor
+/// leaves its files behind and keeps dialling until they are removed by hand,
+/// which is what every removal that could not reach its host already did, and
+/// the removal result says so. A revoked executor cannot be updated through the
+/// runner, so this reaches only machines that run a carrying build before they
+/// are removed; the build-hash rollout delivers it to every attached machine.
+/// An older runner never sets the flag.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -17263,6 +17279,18 @@ pub enum ExecutorMessage {
     EnrollmentRejected {
         reason: EnrollmentRejectionReason,
         diagnostic: String,
+        /// The runner removed this machine from its fleet, and asks the
+        /// executor to take itself off the host: stop its work, delete its
+        /// home, configuration, credential and binary, and unregister its
+        /// service. Sent only with [`EnrollmentRejectionReason::Revoked`] to a
+        /// resident executor, because a revoked credential is the one proof
+        /// that this runner removed this exact machine.
+        ///
+        /// Additive and defaulted. An executor that predates it decodes the
+        /// frame without the key and stops on the revoked refusal exactly as it
+        /// always has; a runner that predates it never sets it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        uninstall: bool,
     },
     Heartbeat {
         advertisement: ExecutorAdvertisement,
@@ -18035,6 +18063,54 @@ mod tests {
         );
     }
 
+    /// The uninstall directive rides the revoked refusal every executor already
+    /// understands, so neither side of a mixed fleet reads it differently.
+    #[test]
+    fn the_uninstall_directive_is_additive_on_the_revoked_refusal() {
+        // What a runner that predates the flag sends: no key, read as no
+        // directive.
+        let older_runner: ExecutorMessage = serde_json::from_value(serde_json::json!({
+            "type": "enrollmentRejected",
+            "reason": "revoked",
+            "diagnostic": "revoked",
+        }))
+        .unwrap();
+        assert_eq!(
+            older_runner,
+            ExecutorMessage::EnrollmentRejected {
+                reason: EnrollmentRejectionReason::Revoked,
+                diagnostic: "revoked".into(),
+                uninstall: false,
+            }
+        );
+
+        // A refusal without the directive keeps today's bytes exactly.
+        let plain = serde_json::to_value(&older_runner).unwrap();
+        assert!(plain.get("uninstall").is_none(), "{plain}");
+
+        let directed = serde_json::to_value(ExecutorMessage::EnrollmentRejected {
+            reason: EnrollmentRejectionReason::Revoked,
+            diagnostic: "removed".into(),
+            uninstall: true,
+        })
+        .unwrap();
+        assert_eq!(directed["uninstall"], true);
+
+        // An executor that predates the flag decodes this variant with these
+        // same serde attributes, so a key it does not know is ignored rather
+        // than failing the frame: it reads the revoked refusal it always has.
+        let mut from_the_future = directed.clone();
+        from_the_future["someLaterKey"] = serde_json::json!({"nested": true});
+        assert!(matches!(
+            serde_json::from_value::<ExecutorMessage>(from_the_future).unwrap(),
+            ExecutorMessage::EnrollmentRejected {
+                reason: EnrollmentRejectionReason::Revoked,
+                uninstall: true,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn batch_item_metadata_carries_the_items_own_cpu_and_width() {
         let mut command: CellExecutionMeta = serde_json::from_value(serde_json::json!({
@@ -18121,6 +18197,12 @@ mod tests {
             ExecutorMessage::EnrollmentRejected {
                 reason: EnrollmentRejectionReason::Revoked,
                 diagnostic: "revoked".into(),
+                uninstall: false,
+            },
+            ExecutorMessage::EnrollmentRejected {
+                reason: EnrollmentRejectionReason::Revoked,
+                diagnostic: "removed".into(),
+                uninstall: true,
             },
             ExecutorMessage::Heartbeat {
                 advertisement: advertisement.clone(),

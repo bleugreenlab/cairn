@@ -331,9 +331,15 @@ struct MutationResult {
     os: Option<String>,
     arch: Option<String>,
     attach_state: String,
-    /// Present when a removal completed without reaching the host. Absent means
-    /// nothing was left behind.
-    unverified_remote_cleanup: Option<String>,
+    /// What a removed machine's host still holds until its executor next dials
+    /// in and uninstalls itself. Absent means nothing was left there.
+    left_on_host: Option<LeftOnHost>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LeftOnHost {
+    summary: String,
 }
 
 /// What starting an enrollment answers with. The SSH bootstrap behind it takes
@@ -564,14 +570,12 @@ fn format_mutation(action: &str, result: &MutationResult) -> String {
         (Some(os), Some(arch)) => format!(" ({os}/{arch})"),
         _ => String::new(),
     };
-    let unreached = match &result.unverified_remote_cleanup {
-        Some(reason) => format!(
-            "\nIts host could not be reached ({reason}), so no remote cleanup ran there. The enrollment is revoked, so anything still running on it cannot reattach."
-        ),
+    let left = match &result.left_on_host {
+        Some(left) => format!("\n{}", left.summary),
         None => String::new(),
     };
     format!(
-        "{action} {}: {}{platform}{unreached}",
+        "{action} {}: {}{platform}{left}",
         result.display_name, result.attach_state
     )
 }
@@ -712,7 +716,7 @@ mod tests {
             os: Some("windows".into()),
             arch: Some("x86_64".into()),
             attach_state: "ready".into(),
-            unverified_remote_cleanup: None,
+            left_on_host: None,
         };
 
         assert_eq!(
@@ -721,19 +725,21 @@ mod tests {
         );
     }
 
-    /// A removal that never reached the host has to say so. The operator's next
-    /// move depends on it: the enrollment is revoked either way, but only in
-    /// this case is there possibly something still running on a machine Cairn
-    /// can no longer talk to.
+    /// A removal never reaches the host, so its confirmation says what the
+    /// host still holds, in the runner's words, as it decodes from the wire.
     #[test]
-    fn a_removal_that_never_reached_the_host_says_what_was_left_behind() {
-        let result = MutationResult {
-            display_name: "bglab-win".into(),
-            os: None,
-            arch: None,
-            attach_state: "removed".into(),
-            unverified_remote_cleanup: Some("ssh timed out".into()),
-        };
+    fn a_removal_says_what_its_host_still_holds() {
+        let result: MutationResult = serde_json::from_value(serde_json::json!({
+            "displayName": "bglab-win",
+            "attachState": "removed",
+            "leftOnHost": {
+                "binaryPath": "C:/cairn/cairn-exec.exe",
+                "cairnHome": "C:/cairn/home",
+                "service": "the CairnExec Run value",
+                "summary": "bglab-win still holds the executor binary; it removes it itself the next time it dials in.",
+            },
+        }))
+        .unwrap();
 
         let confirmation = format_mutation("Removed", &result);
 
@@ -741,8 +747,10 @@ mod tests {
             confirmation.starts_with("Removed bglab-win: removed"),
             "{confirmation}"
         );
-        assert!(confirmation.contains("ssh timed out"), "{confirmation}");
-        assert!(confirmation.contains("cannot reattach"), "{confirmation}");
+        assert!(
+            confirmation.ends_with("the next time it dials in."),
+            "{confirmation}"
+        );
     }
 
     fn ssh_output(code: u8, stderr: &str) -> Output {
