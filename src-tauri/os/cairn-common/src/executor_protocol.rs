@@ -6168,6 +6168,15 @@ pub struct LearnedResourceEstimate {
 /// measurement alike; nothing sends it. What a runner gets wrong talking to an
 /// older executor: nothing; that executor keeps holding a service resident at
 /// its declared claim, declining work it could take until it updates.
+///
+/// cairn/5664 does not move the number. No frame, variant, field or
+/// serialized form changes. Work the executor's blocking pool cancels at
+/// runtime shutdown now drops what it captured inside a blocking section, so
+/// an admission or retirement guard among it gives back inline instead of
+/// spawning onto the shutting-down pool and deadlocking on its lock. That is
+/// executor-local teardown of a process whose link is already ending. What a
+/// runner gets wrong talking to an older executor: nothing it did not already
+/// get wrong; that executor can still hang at shutdown with an admission held.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 160;
 
 /// The version `build.rs` derived from the paragraphs above
