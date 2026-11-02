@@ -646,6 +646,7 @@ impl OrchestratorBuilder {
         // reconstructs archived events before the orchestrator is built.
         crate::mcp::handlers::read::register_archived_file_renderer();
 
+        let admission_lock = Arc::new(crate::execution::gates::capacity::AdmissionLock::default());
         let private_lanes = Arc::new(crate::execution::jobs::PrivateLaneLedger::default());
         let provider_admission_cache = crate::runtime_admission::provider_admission_cache(
             &self.db,
@@ -759,7 +760,11 @@ impl OrchestratorBuilder {
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            admission_lock: Arc::new(crate::execution::gates::capacity::AdmissionLock::default()),
+            admission_lock: admission_lock.clone(),
+            sweep_pulse: Arc::new(crate::execution::gates::pulse::SweepPulse::new(
+                admission_lock,
+            )),
+            write_stops: Arc::default(),
             context_token_snapshots: self.context_token_snapshots,
             team_attention_sender: self.team_attention_sender,
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1478,6 +1483,12 @@ pub struct Orchestrator {
     /// never interleave over a count that spans databases. Bounded and
     /// attributed; see `execution::gates::capacity::AdmissionLock`.
     pub(crate) admission_lock: Arc<crate::execution::gates::capacity::AdmissionLock>,
+    /// The gate sweep loop's liveness and each held execution's last
+    /// evaluation; see `execution::gates::pulse`.
+    pub sweep_pulse: Arc<crate::execution::gates::pulse::SweepPulse>,
+    /// The stop flags of the resource writes now applying items; an operator
+    /// Stop raises its run's, and each write stops before its next item.
+    pub write_stops: Arc<crate::mcp::handlers::write::replay::WriteStops>,
     /// Latest normalized context-token snapshots keyed by durable session id.
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 

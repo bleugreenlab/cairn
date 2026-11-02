@@ -8,7 +8,9 @@ use cairn_core::internal::db::DbState;
 use cairn_core::internal::jj;
 use cairn_core::internal::mcp::handlers::read::handle_read_file;
 use cairn_core::internal::mcp::handlers::write::handle_write;
-use cairn_core::internal::mcp::handlers::write::replay::gate_settled_delivery;
+use cairn_core::internal::mcp::handlers::write::replay::{
+    gate_resource_item, gate_settled_delivery, ItemPhase,
+};
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::lifecycle;
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -2800,6 +2802,236 @@ async fn stop_after_real_resource_write_settlement_replays_exactly_once_provider
         .await,
         1
     );
+}
+
+/// Three message appends, `item-0` to `item-2`, as one guarded call.
+fn three_appends() -> serde_json::Value {
+    json!({
+        "changes": (0..3).map(|n| json!({
+            "target": "cairn://p/chg/messages",
+            "mode": "append",
+            "payload": {"content": format!("item-{n}")}
+        })).collect::<Vec<_>>()
+    })
+}
+
+async fn guarded_request(
+    repo: &ChangeTestRepo,
+    tool_use_id: &str,
+    payload: &serde_json::Value,
+) -> McpCallbackRequest {
+    record_write_call(&repo.orch.db.local, tool_use_id, payload).await;
+    let mut request = make_request(repo.cwd(), payload.clone());
+    request.run_id = Some("run-change".to_string());
+    request.tool_use_id = Some(tool_use_id.to_string());
+    request
+}
+
+async fn item_counts(repo: &ChangeTestRepo) -> Vec<i64> {
+    let mut counts = Vec::new();
+    for n in 0..3 {
+        counts.push(
+            repo.orch
+                .db
+                .local
+                .query_opt_i64(
+                    "SELECT COUNT(*) FROM messages WHERE content = ?1",
+                    params![format!("item-{n}")],
+                )
+                .await
+                .unwrap()
+                .unwrap_or(0),
+        );
+    }
+    counts
+}
+
+fn indices(report: &serde_json::Value, key: &str) -> Vec<u64> {
+    report[key]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["index"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn failure_error(report: &serde_json::Value, index: u64) -> String {
+    report["failures"]
+        .as_array()
+        .and_then(|failures| failures.iter().find(|failure| failure["index"] == index))
+        .and_then(|failure| failure["error"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A redelivery of the same call, bounded: a sealed row replays at once.
+async fn replay_within(repo: &ChangeTestRepo, request: &McpCallbackRequest) -> serde_json::Value {
+    let replayed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handle_write(&repo.orch, request),
+    )
+    .await
+    .expect("a stopped write's row is sealed, so a replay answers within 5s");
+    parse_report(&replayed)
+}
+
+/// cairn/5844 V13a: an operator Stop between items 1 and 2 stops the write
+/// there. The stop's result and a replay both list 0-1 applied and 2 not
+/// applied, and nothing runs twice.
+#[tokio::test]
+async fn a_write_stopped_between_items_reports_exactly_what_it_applied() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-stop-between-items";
+    let payload = three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let gate = gate_resource_item("run-change", tool_use_id, 2, ItemPhase::BeforeDispatch);
+
+    let (delivered, ()) = tokio::join!(handle_write(&repo.orch, &request), async {
+        gate.entered().await;
+        let orch = repo.orch.clone();
+        let stopper =
+            tokio::task::spawn_blocking(move || lifecycle::stop_session(&orch, "run-change"));
+        while !repo.orch.write_stops.is_raised("run-change", tool_use_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        gate.release();
+        stopper.await.unwrap().unwrap();
+    });
+
+    let delivered = parse_report(&delivered);
+    assert_eq!(indices(&delivered, "applied"), vec![0, 1], "{delivered}");
+    assert_eq!(indices(&delivered, "failures"), vec![2], "{delivered}");
+    assert!(
+        failure_error(&delivered, 2).starts_with("not applied"),
+        "{delivered}"
+    );
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 0]);
+
+    let stopped = parse_report(&stopped_result(&repo.orch.db.local, tool_use_id).await);
+    let stopped = parse_report(stopped["toolResult"].as_str().unwrap());
+    assert_eq!(indices(&stopped, "applied"), vec![0, 1], "{stopped}");
+    assert!(
+        failure_error(&stopped, 2).starts_with("not applied"),
+        "{stopped}"
+    );
+    assert!(
+        stopped["interrupted_during_write"]
+            .as_str()
+            .is_some_and(|note| note.contains("do not resend them")),
+        "{stopped}"
+    );
+    assert!(
+        stopped.get("interrupted_after_effect").is_none(),
+        "{stopped}"
+    );
+
+    let replayed = replay_within(&repo, &request).await;
+    assert!(replayed.get("replayed").is_some(), "{replayed}");
+    assert_eq!(indices(&replayed, "applied"), vec![0, 1], "{replayed}");
+    assert_eq!(indices(&replayed, "failures"), vec![2], "{replayed}");
+    assert_eq!(
+        item_counts(&repo).await,
+        vec![1, 1, 0],
+        "the replay ran nothing"
+    );
+}
+
+/// cairn/5844 V13b: a write whose future is dropped between items (the
+/// transport aborting it) seals its row, so a replay reports 0-1 applied and
+/// 2 not applied.
+#[tokio::test]
+async fn a_write_dropped_between_items_seals_what_it_applied() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-drop-between-items";
+    let payload = three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let gate = gate_resource_item("run-change", tool_use_id, 2, ItemPhase::BeforeDispatch);
+    {
+        let mut delivery = std::pin::pin!(handle_write(&repo.orch, &request));
+        tokio::select! {
+            _ = &mut delivery => panic!("the write must park before item 2"),
+            () = gate.entered() => {}
+        }
+    }
+
+    let replayed = replay_within(&repo, &request).await;
+    assert_eq!(indices(&replayed, "applied"), vec![0, 1], "{replayed}");
+    assert!(
+        failure_error(&replayed, 2).starts_with("not applied"),
+        "{replayed}"
+    );
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 0]);
+}
+
+/// cairn/5844 V13c: dropped after item 2's dispatcher returned but before it
+/// was recorded. Item 2 took effect; the replay calls it not confirmed and
+/// does not run it again.
+#[tokio::test]
+async fn a_write_dropped_during_an_item_reports_it_not_confirmed() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-drop-during-item";
+    let payload = three_appends();
+    let request = guarded_request(&repo, tool_use_id, &payload).await;
+    let gate = gate_resource_item("run-change", tool_use_id, 2, ItemPhase::AfterDispatch);
+    {
+        let mut delivery = std::pin::pin!(handle_write(&repo.orch, &request));
+        tokio::select! {
+            _ = &mut delivery => panic!("the write must park after item 2 dispatched"),
+            () = gate.entered() => {}
+        }
+    }
+    assert_eq!(item_counts(&repo).await, vec![1, 1, 1]);
+
+    let replayed = replay_within(&repo, &request).await;
+    assert_eq!(indices(&replayed, "applied"), vec![0, 1], "{replayed}");
+    assert!(
+        failure_error(&replayed, 2).starts_with("not confirmed"),
+        "{replayed}"
+    );
+    assert_eq!(
+        item_counts(&repo).await,
+        vec![1, 1, 1],
+        "the replay ran nothing"
+    );
+}
+
+/// cairn/5844 V13d: per-item checkpoints leave the row behind the pending
+/// marker with a body, and the blocking group's own checkpoint still takes
+/// it.
+#[tokio::test]
+async fn a_resource_append_then_a_blocking_append_still_checkpoints() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let payload = json!({
+        "changes": [
+            {"target": "cairn://p/chg/messages", "mode": "append", "payload": {"content": "item-0"}},
+            {"target": "cairn://p/chg/1/1/builder/tasks", "mode": "append",
+             "payload": {"subagentType": "Explore", "description": "noop", "prompt": "noop"}}
+        ]
+    });
+    let request = guarded_request(&repo, "tool-then-blocking", &payload).await;
+    let delivered = handle_write(&repo.orch, &request).await;
+    let report = parse_report(delivered.split("\n\n").next().unwrap());
+    assert_eq!(indices(&report, "applied")[0], 0, "{report}");
+    assert!(
+        !failure_error(&report, 1).contains("Could not checkpoint"),
+        "the blocking group's checkpoint must take a row with item progress: {report}"
+    );
+    assert_eq!(item_counts(&repo).await, vec![1, 0, 0]);
 }
 
 #[tokio::test]

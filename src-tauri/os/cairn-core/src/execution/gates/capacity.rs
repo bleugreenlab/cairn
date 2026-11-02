@@ -376,6 +376,7 @@ impl AdmissionLock {
             holder: self.holder.clone(),
             site,
             subject,
+            waited,
             acquired_at,
             span,
         })
@@ -413,8 +414,21 @@ pub struct AdmissionGuard {
     holder: HolderSlot,
     site: AdmissionSite,
     subject: String,
+    waited: Duration,
     acquired_at: Instant,
     span: tracing::Span,
+}
+
+impl AdmissionGuard {
+    /// How long the acquisition waited for the lock.
+    pub fn waited(&self) -> Duration {
+        self.waited
+    }
+
+    /// How long the lock has been held so far.
+    pub fn held(&self) -> Duration {
+        self.acquired_at.elapsed()
+    }
 }
 
 impl Drop for AdmissionGuard {
@@ -801,6 +815,9 @@ struct StoredHold {
     blocking: bool,
 }
 
+/// One start a snapshot reads for: `(execution id, issue id)`.
+type WantedStart = (Option<String>, Option<String>);
+
 /// The execution queue as one read sees it: the fleet's load, every
 /// capacity row, and the threads of the starts being decided. Read once per
 /// decision under the admission lock, so a sweep pass decides every candidate
@@ -861,7 +878,7 @@ impl QueueSnapshot {
 
         // Each database the starts live in: one read for their devices,
         // their issues' threads, and those threads' open children.
-        let mut groups: Vec<(&LocalDb, Vec<(Option<String>, Option<String>)>)> = Vec::new();
+        let mut groups: Vec<(&LocalDb, Vec<WantedStart>)> = Vec::new();
         for start in starts {
             let wanted = (
                 start.execution_id.map(str::to_string),
@@ -1204,7 +1221,7 @@ pub async fn decide(
 /// written only when what it renders changes; a row with no facts yet keeps
 /// its place in the count but is left for the next decision to write. Returns
 /// the executions whose census moved.
-pub async fn refresh_places(
+pub(crate) async fn refresh_places(
     orch: &Orchestrator,
     queue: Option<&QueueSnapshot>,
 ) -> Result<Vec<String>, String> {
@@ -1357,11 +1374,15 @@ pub struct QueueView {
     pub held: Vec<QueuedExecution>,
     /// `capacity_unclassified_yield{reason}` counts, by reason.
     pub unclassified_yields: BTreeMap<String, u64>,
+    /// Since when the gate sweep has completed no pass, once that is longer
+    /// than `pulse::STALL_AFTER_S`: the last completed pass, or the sweep
+    /// loop's start.
+    pub stalled_since: Option<i64>,
 }
 
 /// True when execution `e` is in the queue: a cap holds it right now through a
-/// blocking capacity gate (the same `no_evidence` row [`FLEET_AHEAD_SQL`]
-/// counts as ahead), and no unmet authored gate of its own holds it. The queue
+/// blocking capacity gate (the same `no_evidence` row a [`QueueSnapshot`] reads
+/// as in line), and no unmet authored gate of its own holds it. The queue
 /// page and a thread's own queue list exactly this set.
 macro_rules! cap_held_sql {
     () => {
@@ -1444,7 +1465,12 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
     held.sort_by(|(a_key, a_db, a), (b_key, b_db, b)| {
         (a_key, a_db, &a.execution_id).cmp(&(b_key, b_db, &b.execution_id))
     });
-    let held: Vec<QueuedExecution> = held.into_iter().map(|(_, _, queued)| queued).collect();
+    let mut held: Vec<QueuedExecution> = held.into_iter().map(|(_, _, queued)| queued).collect();
+    for queued in &mut held {
+        if let Some(census) = queued.census.as_mut() {
+            orch.sweep_pulse.stamp(&queued.execution_id, census);
+        }
+    }
     Ok(QueueView {
         in_progress: fleet.in_progress,
         limit: settings.max_concurrent_executions.max(1) as usize,
@@ -1452,6 +1478,7 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
         queued: held.len(),
         held,
         unclassified_yields: unclassified_yield_counts(),
+        stalled_since: orch.sweep_pulse.stalled_since(orch.services.clock.now()),
     })
 }
 
@@ -1713,6 +1740,12 @@ pub(crate) mod tests {
         full_fleet(&env).await;
 
         let filed = file(&env, 1, json!([])).await.unwrap();
+        assert!(
+            filed.starts_with(
+                "Filed execution 1 for prj/1 \"Issue 1\" (recipe 'memory-triage'): Queued · "
+            ),
+            "a capped filing on a full fleet names its issue's key and title: {filed}"
+        );
         assert!(
             filed.contains("(recipe 'memory-triage'): Queued · 6/6 running."),
             "the filing names the cap, not yet its place: {filed}"
@@ -2328,7 +2361,7 @@ pub(crate) mod tests {
         add_issue(&env, 1002, None).await;
         let filed = file(&env, 1002, json!([])).await.unwrap();
         assert!(
-            filed.starts_with("Started execution"),
+            filed.starts_with("Started execution 1 for prj/1002 \"Issue 1002\" (recipe '"),
             "nothing stalls the fleet: {filed}"
         );
         sweep_at(&env.orch, now()).await.unwrap();
@@ -2552,7 +2585,10 @@ pub(crate) mod tests {
             add_started(&env, number, Some("th"), "running").await;
         }
         let filed = file(&env, 103, json!([])).await.unwrap();
-        assert!(filed.starts_with("Started execution"), "{filed}");
+        assert!(
+            filed.starts_with("Started execution 2 for prj/103 \"Issue 103\" (recipe '"),
+            "{filed}"
+        );
     }
 
     /// A child whose executions all ended with no PR gave up its place, so
@@ -2594,7 +2630,10 @@ pub(crate) mod tests {
         add_issue(&env, 104, Some("th")).await;
         assert_eq!(open_children(&env, 104).await, vec![100, 101, 102]);
         let filed = file(&env, 104, json!([])).await.unwrap();
-        assert!(filed.starts_with("Started execution"), "{filed}");
+        assert!(
+            filed.starts_with("Started execution 1 for prj/104 \"Issue 104\" (recipe '"),
+            "{filed}"
+        );
     }
 
     #[tokio::test]

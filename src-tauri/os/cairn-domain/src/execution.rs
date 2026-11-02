@@ -244,6 +244,11 @@ pub struct ExecutionGateCensus {
     /// Present only when someone released this execution without waiting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_override: Option<ReleaseOverride>,
+    /// When the gate sweep last evaluated this held execution, in unix
+    /// seconds. Process-local: stamped only by the operator's surfaces, and
+    /// absent after a restart until the first pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_at: Option<i64>,
 }
 
 /// A gated, unreleased execution as an issue-level surface lists it: waiting

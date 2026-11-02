@@ -371,6 +371,7 @@ pub(super) enum FileReplayClaim {
 }
 
 /// The provider call one delivery of a `write` belongs to.
+#[derive(Debug, Clone)]
 pub(super) struct WriteCall {
     run_id: String,
     id: String,
@@ -754,6 +755,427 @@ pub(super) fn mark_as_replay(report: &str) -> String {
         ),
     );
     serde_json::to_string(&value).unwrap_or_else(|_| report.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// A stopped resource write
+// ---------------------------------------------------------------------------
+//
+// A resource-only write applies its items one at a time, and each item's
+// effect is real the moment its dispatcher returns. When the turn is stopped
+// partway, the report the agent gets (from the stop, or from a redelivery of
+// the same call) has to say exactly which items took effect. Three pieces do
+// that:
+//
+// - The carrier checkpoints the ledger row after every item, still behind the
+//   pending marker, so a redelivery keeps waiting rather than replaying a
+//   partial report.
+// - An operator Stop raises the call's flag in [`WriteStops`]; the carrier
+//   checks it before each dispatch, so a write stops between items, never in
+//   the middle of one, and seals its row.
+// - A carrier future dropped before it finalizes (the transport aborting the
+//   call) seals the row from what it last knew ([`ResourceWriteProgress`]'s
+//   `Drop`).
+//
+// A sealed row is final, so a redelivery replays it and applies nothing.
+
+/// The failure kind of an item a stopped write did not apply, or cannot
+/// vouch for.
+pub(crate) const STOPPED_KIND: &str = "stopped";
+const NOT_APPLIED: &str = "not applied: the write was stopped before this item";
+const NOT_CONFIRMED: &str =
+    "not confirmed: the write was stopped while this item ran; read its target before retrying";
+
+/// The stop flags of the resource writes now applying items, by
+/// `(run_id, tool_use_id)`.
+#[derive(Default)]
+pub struct WriteStops {
+    flags: std::sync::Mutex<
+        std::collections::HashMap<(String, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
+}
+
+impl WriteStops {
+    fn flags(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<(String, String), std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    > {
+        self.flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn register(&self, call: &WriteCall) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.flags()
+            .insert((call.run_id.clone(), call.id.clone()), flag.clone());
+        flag
+    }
+
+    fn unregister(&self, call: &WriteCall) {
+        self.flags().remove(&(call.run_id.clone(), call.id.clone()));
+    }
+
+    /// Ask every resource write of `run_id` to stop before its next item.
+    /// Returns how many were asked.
+    pub(crate) fn raise(&self, run_id: &str) -> usize {
+        let flags = self.flags();
+        let mut raised = 0;
+        for ((run, _), flag) in flags.iter() {
+            if run == run_id {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                raised += 1;
+            }
+        }
+        raised
+    }
+
+    /// Whether a stop has asked this call to stop.
+    pub fn is_raised(&self, run_id: &str, tool_use_id: &str) -> bool {
+        self.flags()
+            .get(&(run_id.to_string(), tool_use_id.to_string()))
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Whether this call is applying items right now.
+    pub(crate) fn is_applying(&self, run_id: &str, tool_use_id: &str) -> bool {
+        self.flags()
+            .contains_key(&(run_id.to_string(), tool_use_id.to_string()))
+    }
+}
+
+/// What a claimed resource write has done so far, kept in memory by its
+/// carrier and checkpointed into its ledger row after every item.
+pub(super) struct ResourceWriteProgress {
+    db: std::sync::Arc<LocalDb>,
+    call: WriteCall,
+    /// Every payload item's `(target, mode)`, for the items a stop leaves.
+    items: Vec<(String, String)>,
+    atomic: bool,
+    stops: std::sync::Arc<WriteStops>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    applied: Vec<super::types::AppliedChange>,
+    failures: Vec<super::types::ChangeFailure>,
+    in_flight: Option<usize>,
+    /// Whether dropping this seals the row. Cleared once the carrier
+    /// finalizes the row itself or hands it to the blocking group.
+    armed: bool,
+}
+
+impl ResourceWriteProgress {
+    /// Begin tracking a call whose resource claim this delivery holds.
+    pub(super) fn claimed(
+        orch: &Orchestrator,
+        call: &WriteCall,
+        payload: &ChangePayload,
+        atomic: bool,
+    ) -> Self {
+        let stop = orch.write_stops.register(call);
+        Self {
+            db: orch.db.local.clone(),
+            call: call.clone(),
+            items: payload
+                .changes
+                .iter()
+                .map(|item| {
+                    (
+                        item.target.clone(),
+                        super::types::mode_name(item.mode).to_string(),
+                    )
+                })
+                .collect(),
+            atomic,
+            stops: orch.write_stops.clone(),
+            stop,
+            applied: Vec::new(),
+            failures: Vec::new(),
+            in_flight: None,
+            armed: true,
+        }
+    }
+
+    /// Whether an operator Stop has asked this write to stop.
+    pub(super) fn stop_requested(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Item `index` is about to dispatch.
+    pub(super) fn begin(
+        &mut self,
+        index: usize,
+        applied: &[super::types::AppliedChange],
+        failures: &[super::types::ChangeFailure],
+    ) {
+        self.applied = applied.to_vec();
+        self.failures = failures.to_vec();
+        self.in_flight = Some(index);
+    }
+
+    /// The item in flight has settled into `applied` or `failures`: record
+    /// it, and checkpoint the row behind its pending marker.
+    pub(super) async fn settled(
+        &mut self,
+        applied: &[super::types::AppliedChange],
+        failures: &[super::types::ChangeFailure],
+    ) {
+        self.applied = applied.to_vec();
+        self.failures = failures.to_vec();
+        self.in_flight = None;
+        let partial = self.report(false);
+        if let Err(error) = update_blocking_checkpoint(
+            &self.db,
+            &self.call,
+            None,
+            LedgerClaim::NotClaimed,
+            &partial,
+        )
+        .await
+        {
+            log::warn!("could not checkpoint a resource write's progress: {error}");
+        }
+    }
+
+    /// The report as it stands; `stopped` adds a failure for every item not
+    /// yet settled.
+    fn report(&self, stopped: bool) -> String {
+        let partial_success = !self.applied.is_empty() && !self.failures.is_empty();
+        let report = super::empty_change_report(
+            self.applied.clone(),
+            self.failures.clone(),
+            None,
+            partial_success,
+            self.atomic,
+        );
+        let Ok(mut value) = serde_json::to_value(&report) else {
+            return String::new();
+        };
+        if stopped {
+            mark_unsettled(&mut value, &self.items, |index| {
+                if Some(index) == self.in_flight {
+                    NOT_CONFIRMED
+                } else {
+                    NOT_APPLIED
+                }
+            });
+        }
+        serde_json::to_string(&value).unwrap_or_default()
+    }
+
+    /// Stop before the next item: seal the row with every unsettled item
+    /// `not applied`, and return the report.
+    pub(super) async fn seal_stopped(
+        &mut self,
+        applied: &[super::types::AppliedChange],
+        failures: &[super::types::ChangeFailure],
+    ) -> String {
+        self.applied = applied.to_vec();
+        self.failures = failures.to_vec();
+        self.in_flight = None;
+        self.armed = false;
+        let report = self.report(true);
+        finalize_report(&self.db, &self.call, &report).await;
+        report
+    }
+
+    /// The carrier finalizes the row itself from here on.
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+        self.stops.unregister(&self.call);
+    }
+}
+
+impl Drop for ResourceWriteProgress {
+    fn drop(&mut self) {
+        self.stops.unregister(&self.call);
+        if !self.armed {
+            return;
+        }
+        // Dropped before it finalized: seal the row from what this delivery
+        // last knew, so a redelivery replays it instead of stalling. Only a
+        // row still pending is sealed; one the carrier finalized is final.
+        let report = self.report(true);
+        let (db, call) = (self.db.clone(), self.call.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { seal_if_pending(&db, &call, &report).await });
+            }
+            Err(_) => log::warn!(
+                "a resource write was dropped outside a runtime; its replay row stays pending"
+            ),
+        }
+    }
+}
+
+async fn seal_if_pending(db: &LocalDb, call: &WriteCall, report: &str) {
+    let sealed = db
+        .execute(
+            "UPDATE write_replay_ledger SET report=?3
+             WHERE run_id=?1 AND tool_use_id=?2 AND substr(report, 1, length(?4)) = ?4",
+            cairn_db::turso::params![
+                call.run_id.clone(),
+                call.id.clone(),
+                report.to_string(),
+                RESOURCE_PENDING,
+            ],
+        )
+        .await;
+    if let Err(error) = sealed {
+        log::warn!("could not seal a dropped resource write's replay row: {error}");
+    }
+}
+
+/// Add a `stopped` failure, worded by `phrase`, for every item of `items` the
+/// report neither applied nor failed.
+fn mark_unsettled(
+    report: &mut serde_json::Value,
+    items: &[(String, String)],
+    phrase: impl Fn(usize) -> &'static str,
+) {
+    let settled: std::collections::HashSet<u64> = ["applied", "failures"]
+        .iter()
+        .filter_map(|key| report.get(*key).and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|entry| entry.get("index").and_then(serde_json::Value::as_u64))
+        .collect();
+    let Some(object) = report.as_object_mut() else {
+        return;
+    };
+    let mut added = Vec::new();
+    for (index, (target, mode)) in items.iter().enumerate() {
+        if settled.contains(&(index as u64)) {
+            continue;
+        }
+        added.push(serde_json::json!({
+            "index": index,
+            "target": target,
+            "mode": mode,
+            "kind": STOPPED_KIND,
+            "error": phrase(index),
+        }));
+    }
+    if added.is_empty() {
+        return;
+    }
+    let failures = object
+        .entry("failures")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(failures) = failures.as_array_mut() {
+        failures.extend(added);
+    }
+    let applied = object
+        .get("applied")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|applied| !applied.is_empty());
+    if applied {
+        object.insert("partial_success".to_string(), serde_json::Value::Bool(true));
+    }
+}
+
+/// A stop's report for a resource write whose row is still pending: what its
+/// last checkpoint lists, and every other item of `input` (the call's
+/// `{changes:[...]}`) `not confirmed`. Never `not applied`: the carrier may
+/// still be running, and must not be contradicted.
+pub(crate) fn unsettled_write_report(row: &str, input: &serde_json::Value) -> String {
+    let mut report = blocking_checkpoint_report(row)
+        .and_then(|body| {
+            serde_json::Deserializer::from_str(body)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .and_then(Result::ok)
+        })
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({ "applied": [] }));
+    let items: Vec<(String, String)> = input
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .map(|change| {
+                    let field = |key: &str| {
+                        change
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (field("target"), field("mode"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    mark_unsettled(&mut report, &items, |_| NOT_CONFIRMED);
+    serde_json::to_string(&report).unwrap_or_else(|_| row.to_string())
+}
+
+/// Whether `report` lists an item a stop left unapplied or unconfirmed.
+pub(crate) fn report_was_stopped(report: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(report)
+        .ok()
+        .and_then(|value| value.get("failures").cloned())
+        .and_then(|failures| failures.as_array().cloned())
+        .is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure.get("kind").and_then(serde_json::Value::as_str) == Some(STOPPED_KIND)
+            })
+        })
+}
+
+/// Whether a ledger row is still behind the pending marker.
+pub(crate) fn is_pending(row: &str) -> bool {
+    row.starts_with(RESOURCE_PENDING)
+}
+
+/// Where an item gate parks a resource write.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemPhase {
+    /// Before the stop flag is checked and the item is marked in flight.
+    BeforeDispatch,
+    /// After the item's dispatcher returned, before it is recorded.
+    AfterDispatch,
+}
+
+#[cfg(feature = "test-utils")]
+type ItemGates =
+    Mutex<std::collections::HashMap<(String, String, usize, ItemPhase), Arc<SettlementGate>>>;
+
+#[cfg(feature = "test-utils")]
+static ITEM_GATES: OnceLock<ItemGates> = OnceLock::new();
+
+/// Park a resource write at one item's `phase`; production never registers
+/// one.
+#[cfg(feature = "test-utils")]
+pub fn gate_resource_item(
+    run_id: &str,
+    tool_use_id: &str,
+    index: usize,
+    phase: ItemPhase,
+) -> Arc<SettlementGate> {
+    let gate = Arc::new(SettlementGate::new());
+    ITEM_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(
+            (run_id.to_string(), tool_use_id.to_string(), index, phase),
+            Arc::clone(&gate),
+        );
+    gate
+}
+
+#[cfg(feature = "test-utils")]
+pub(super) async fn hold_resource_item(call: &WriteCall, index: usize, phase: ItemPhase) {
+    let gate = ITEM_GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(&(call.run_id.clone(), call.id.clone(), index, phase));
+    if let Some(gate) = gate {
+        gate.hold().await;
+    }
 }
 
 #[cfg(test)]

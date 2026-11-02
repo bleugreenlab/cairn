@@ -1421,6 +1421,38 @@ mod span_duration_tests {
         assert!(duration >= 0.0 && duration.is_finite());
     }
 
+    /// A field declared `Empty` and recorded later (the admission lock's
+    /// `wait_ms` and `held_ms`) arrives in `meta` through `on_record`.
+    #[test]
+    fn fields_recorded_after_creation_arrive_in_meta() {
+        let capture = Capture::default();
+        let span_layer =
+            SpanDurationLayer.with_filter(profiler_span_filter(LogLevel::Verbose.directives()));
+        let subscriber = tracing_subscriber::registry()
+            .with(span_layer)
+            .with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                target: "profiler",
+                "admission_lock",
+                site = "sweep_pass",
+                wait_ms = tracing::field::Empty,
+                held_ms = tracing::field::Empty,
+            );
+            span.record("wait_ms", 12_u64);
+            span.record("held_ms", 34_u64);
+            drop(span);
+        });
+
+        let events = profiler_events(&capture);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "admission_lock");
+        assert_eq!(events[0]["meta"]["site"], "sweep_pass");
+        assert_eq!(events[0]["meta"]["wait_ms"], 12);
+        assert_eq!(events[0]["meta"]["held_ms"], 34);
+    }
+
     #[test]
     fn status_field_is_promoted_out_of_meta() {
         let capture = Capture::default();

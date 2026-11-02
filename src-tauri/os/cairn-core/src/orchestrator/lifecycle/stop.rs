@@ -46,21 +46,36 @@ fn is_write_tool_call(name: &str) -> bool {
 const POST_EFFECT_STOP_ANNOTATION: &str =
     "The user stopped the turn after this write took effect. The applied report below is authoritative. Do not retry this write.";
 
-fn annotate_settled_write_report(report: &str) -> String {
+const DURING_WRITE_STOP_ANNOTATION: &str =
+    "The user stopped the turn during this write. Items under applied took effect; do not resend them. Items marked not applied did not run. Read the target of any item marked not confirmed before retrying.";
+
+/// How long a stop waits for a resource write that is applying items to stop
+/// at its next item boundary and seal its report.
+const WRITE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn annotate_write_report(report: &str, key: &str, annotation: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(report) else {
-        return format!("{POST_EFFECT_STOP_ANNOTATION}\n{report}");
+        return format!("{annotation}\n{report}");
     };
     let Some(object) = value.as_object_mut() else {
-        return format!("{POST_EFFECT_STOP_ANNOTATION}\n{report}");
+        return format!("{annotation}\n{report}");
     };
     object.insert(
-        "interrupted_after_effect".to_string(),
-        serde_json::Value::String(POST_EFFECT_STOP_ANNOTATION.to_string()),
+        key.to_string(),
+        serde_json::Value::String(annotation.to_string()),
     );
     serde_json::to_string(&value).unwrap_or_else(|_| report.to_string())
 }
 
-async fn settled_write_report(
+fn annotate_stopped_write_report(report: &str) -> String {
+    annotate_write_report(
+        report,
+        "interrupted_during_write",
+        DURING_WRITE_STOP_ANNOTATION,
+    )
+}
+
+async fn write_ledger_row(
     db: &LocalDb,
     run_id: &str,
     tool_use_id: &str,
@@ -79,15 +94,56 @@ async fn settled_write_report(
                 )
                 .await?;
             Ok(match rows.next().await? {
-                Some(row) => {
-                    crate::mcp::handlers::write::replay::blocking_checkpoint_report(&row.text(0)?)
-                        .map(str::to_string)
-                }
+                Some(row) => Some(row.text(0)?),
                 None => None,
             })
         })
     })
     .await
+}
+
+/// The result a stop gives a `write` call that has no result yet, or `None`
+/// when the write never claimed its ledger row (nothing took effect).
+///
+/// A resource write still applying items was asked to stop before its next
+/// item; wait, bounded, for it to seal its row. A sealed row is reported as
+/// it stands. A row still pending when the wait runs out (or one no carrier
+/// is applying, such as a blocking group's checkpoint) is reported from its
+/// last checkpoint, with every other item `not confirmed`: the carrier may
+/// still be running, so nothing is ever called `not applied` from here.
+async fn stopped_write_result(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    run_id: &str,
+    tool_use_id: &str,
+    input: &serde_json::Value,
+) -> DbResult<Option<String>> {
+    use crate::mcp::handlers::write::replay;
+    let deadline = tokio::time::Instant::now() + WRITE_STOP_WAIT;
+    loop {
+        let Some(row) = write_ledger_row(db, run_id, tool_use_id).await? else {
+            return Ok(None);
+        };
+        if !replay::is_pending(&row) {
+            return Ok(Some(if replay::report_was_stopped(&row) {
+                annotate_stopped_write_report(&row)
+            } else {
+                annotate_write_report(
+                    &row,
+                    "interrupted_after_effect",
+                    POST_EFFECT_STOP_ANNOTATION,
+                )
+            }));
+        }
+        if !orch.write_stops.is_applying(run_id, tool_use_id)
+            || tokio::time::Instant::now() >= deadline
+        {
+            return Ok(Some(annotate_stopped_write_report(
+                &replay::unsettled_write_report(&row, input),
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 fn pending_tool_results(
@@ -99,85 +155,97 @@ fn pending_tool_results(
     let turn_id = turn_id.to_string();
     run_db_blocking({
         let dbs = orch.db.clone();
-        let replay_db = orch.db.local.clone();
+        let orch = orch.clone();
         move || async move {
             let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
                 .await
                 .map_err(|e| e.to_string())?;
-            db.read(|conn| {
-                let run_id = run_id.clone();
-                let turn_id = turn_id.clone();
-                let replay_db = replay_db.clone();
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT data
+            let (mut candidates, writes, completed) = db
+                .read(|conn| {
+                    let run_id = run_id.clone();
+                    let turn_id = turn_id.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT data
                          FROM events
                          WHERE run_id = ?1
                            AND turn_id = ?2
                            AND event_type IN ('assistant', 'tool_result')
                          ORDER BY sequence ASC, rowid ASC",
-                            (run_id.as_str(), turn_id.as_str()),
-                        )
-                        .await?;
-                    let mut candidates = Vec::new();
-                    let mut completed = HashSet::new();
-                    while let Some(row) = rows.next().await? {
-                        let data = row.text(0)?;
-                        let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
-                            continue;
-                        };
-                        match event.event_type.as_str() {
-                            "assistant" => {
-                                for tool in event.tool_uses.unwrap_or_default() {
-                                    if is_run_tool_call(&tool.name, &tool.input) {
-                                        candidates.push(PendingToolResult {
-                                            tool_use_id: tool.id,
-                                            tool_name: tool.name,
-                                            session_id: event.session_id.clone(),
-                                            parent_tool_use_id: event.parent_tool_use_id.clone(),
-                                            result: USER_STOP_TOOL_RESULT.to_string(),
-                                            is_error: true,
-                                            reason: "user_stop",
-                                        });
-                                    } else if is_write_tool_call(&tool.name) {
-                                        if let Some(report) =
-                                            settled_write_report(&replay_db, &run_id, &tool.id)
-                                                .await?
-                                        {
-                                            if report != "__cairn_write_resource_pending__" {
-                                                candidates.push(PendingToolResult {
-                                                    tool_use_id: tool.id,
-                                                    tool_name: tool.name,
-                                                    session_id: event.session_id.clone(),
-                                                    parent_tool_use_id: event
-                                                        .parent_tool_use_id
-                                                        .clone(),
-                                                    result: annotate_settled_write_report(&report),
-                                                    is_error: false,
-                                                    reason: "user_stop_after_write_effect",
-                                                });
-                                            }
+                                (run_id.as_str(), turn_id.as_str()),
+                            )
+                            .await?;
+                        let mut candidates = Vec::new();
+                        let mut writes = Vec::new();
+                        let mut completed = HashSet::new();
+                        while let Some(row) = rows.next().await? {
+                            let data = row.text(0)?;
+                            let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
+                                continue;
+                            };
+                            match event.event_type.as_str() {
+                                "assistant" => {
+                                    for tool in event.tool_uses.unwrap_or_default() {
+                                        if is_run_tool_call(&tool.name, &tool.input) {
+                                            candidates.push(PendingToolResult {
+                                                tool_use_id: tool.id,
+                                                tool_name: tool.name,
+                                                session_id: event.session_id.clone(),
+                                                parent_tool_use_id: event
+                                                    .parent_tool_use_id
+                                                    .clone(),
+                                                result: USER_STOP_TOOL_RESULT.to_string(),
+                                                is_error: true,
+                                                reason: "user_stop",
+                                            });
+                                        } else if is_write_tool_call(&tool.name) {
+                                            writes.push((
+                                                tool,
+                                                event.session_id.clone(),
+                                                event.parent_tool_use_id.clone(),
+                                            ));
                                         }
                                     }
                                 }
-                            }
-                            "tool_result" => {
-                                if let Some(tool_use_id) = event.tool_use_id {
-                                    completed.insert(tool_use_id);
+                                "tool_result" => {
+                                    if let Some(tool_use_id) = event.tool_use_id {
+                                        completed.insert(tool_use_id);
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    Ok(candidates
-                        .into_iter()
-                        .filter(|candidate| !completed.contains(&candidate.tool_use_id))
-                        .collect())
+                        Ok((candidates, writes, completed))
+                    })
                 })
-            })
-            .await
-            .map_err(|e| e.to_string())
+                .await
+                .map_err(|e| e.to_string())?;
+            // Outside the read: a write still applying items is waited for.
+            for (tool, session_id, parent_tool_use_id) in writes {
+                if completed.contains(&tool.id) {
+                    continue;
+                }
+                let result =
+                    stopped_write_result(&orch, &orch.db.local, &run_id, &tool.id, &tool.input)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                if let Some(result) = result {
+                    candidates.push(PendingToolResult {
+                        tool_use_id: tool.id,
+                        tool_name: tool.name,
+                        session_id,
+                        parent_tool_use_id,
+                        result,
+                        is_error: false,
+                        reason: "user_stop_after_write_effect",
+                    });
+                }
+            }
+            Ok(candidates
+                .into_iter()
+                .filter(|candidate| !completed.contains(&candidate.tool_use_id))
+                .collect())
         }
     })
 }
@@ -277,6 +345,10 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
     // a self-suspend — was the latent defect behind never-resumed durable waits
     // (CAIRN-2970).
     if cancel_owned_waits {
+        // Ask each resource write the run is applying to stop before its next
+        // item, before the turn's pending results are settled. Only an
+        // external stop: a self-suspend's own write is the call that suspends.
+        orch.write_stops.raise(run_id);
         let cancel_result = run_db_blocking({
             let dbs = orch.db.clone();
             let run_id = run_id.to_string();

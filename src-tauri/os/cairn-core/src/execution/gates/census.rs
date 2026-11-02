@@ -344,6 +344,7 @@ pub fn census_with(
         detail,
         gates: entries,
         release_override,
+        evaluated_at: None,
     })
 }
 

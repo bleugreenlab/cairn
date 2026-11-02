@@ -395,18 +395,10 @@ fn due_at(
 /// Restart-safe and double-fire-safe via the executions-table dedupe in
 /// [`last_scheduled_fire`]: a fired schedule writes an execution row whose
 /// `started_at` moves the next computed fire into the future.
-///
-/// The same tick sweeps held executions' `after:` gates (see
-/// [`crate::execution::gates::sweep`]): first thing every iteration, so a
-/// restart re-evaluates every held execution at once, and with the soonest
-/// `notBefore` folded into the sleep bound so a clock gate releases on time.
 async fn run_scheduler_loop(orch: Orchestrator) {
     log::info!("Recipe scheduler started");
 
     loop {
-        if let Err(error) = crate::execution::gates::sweep::sweep(&orch).await {
-            log::error!("Failed to sweep execution gates: {error}");
-        }
         // Resolve the OS timezone each iteration so wall-clock schedules track
         // timezone changes and DST transitions.
         let timezone = get_timezone();
@@ -456,10 +448,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             })
             .filter_map(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
             .min();
-        let next_gate_due =
-            crate::execution::gates::sweep::next_gate_due_after(&orch, now.timestamp())
-                .await
-                .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0));
         let soonest = next_fires
             .iter()
             .map(|(_, fire)| *fire)
@@ -468,7 +456,6 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                 hold.next_due_at()
                     .and_then(|at| DateTime::<Utc>::from_timestamp(at, 0))
             }))
-            .chain(next_gate_due)
             .min();
         let sleep_dur = match soonest {
             Some(fire) => (fire - now)
@@ -479,49 +466,16 @@ async fn run_scheduler_loop(orch: Orchestrator) {
         };
         tokio::time::sleep(sleep_dur).await;
 
-        // Fire every recipe whose computed instant has now arrived. A capped wake
-        // (soonest still in the future) yields an empty due set and just
-        // recomputes on the next iteration.
-        let wake = Utc::now();
-        let mut fire_error = false;
-        for recipe in due_at(&next_fires, wake) {
-            log::info!(
-                "Firing scheduled recipe '{}' for project {}",
-                recipe.id,
-                recipe.project_key
-            );
-            if let Err(error) = fire_scheduled_recipe(&orch, recipe).await {
-                log::error!("Failed to fire scheduled recipe '{}': {}", recipe.id, error);
-                fire_error = true;
-            }
-        }
-        for schedule in wake_schedules {
-            if schedule.due_at(wake.timestamp()).is_none() {
-                continue;
-            }
-            if let Err(error) =
-                crate::orchestrator::wakes::fire_wake_schedule(&orch, &schedule, wake.timestamp())
-                    .await
-            {
-                log::error!("Failed to fire wake schedule '{}': {}", schedule.id, error);
-                fire_error = true;
-            }
-        }
-        for hold in provider_holds {
-            if hold.due_at(wake.timestamp()).is_none() {
-                continue;
-            }
-            if let Err(error) = crate::orchestrator::wakes::resolve_provider_limit_hold(
-                &orch,
-                &hold,
-                wake.timestamp(),
-            )
-            .await
-            {
-                log::error!("Failed to resolve provider hold '{}': {error}", hold.id);
-                fire_error = true;
-            }
-        }
+        // A capped wake (soonest still in the future) yields an empty due set
+        // and just recomputes on the next iteration.
+        let fire_error = fire_due(
+            &orch,
+            &next_fires,
+            &wake_schedules,
+            &provider_holds,
+            Utc::now(),
+        )
+        .await;
         if fire_error {
             // A failed fire writes no execution row, so its dedupe lookup still
             // returns the same due time; cool down a full interval so a
@@ -529,6 +483,53 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             tokio::time::sleep(MAX_SLEEP).await;
         }
     }
+}
+
+/// Fire every recipe, wake schedule and provider hold due at `wake`. Returns
+/// whether any of them failed.
+async fn fire_due(
+    orch: &Orchestrator,
+    next_fires: &[(ScheduledRecipe, DateTime<Utc>)],
+    wake_schedules: &[crate::orchestrator::wakes::WakeSchedule],
+    provider_holds: &[crate::orchestrator::wakes::ProviderLimitHold],
+    wake: DateTime<Utc>,
+) -> bool {
+    let mut fire_error = false;
+    for recipe in due_at(next_fires, wake) {
+        log::info!(
+            "Firing scheduled recipe '{}' for project {}",
+            recipe.id,
+            recipe.project_key
+        );
+        if let Err(error) = fire_scheduled_recipe(orch, recipe).await {
+            log::error!("Failed to fire scheduled recipe '{}': {}", recipe.id, error);
+            fire_error = true;
+        }
+    }
+    for schedule in wake_schedules {
+        if schedule.due_at(wake.timestamp()).is_none() {
+            continue;
+        }
+        if let Err(error) =
+            crate::orchestrator::wakes::fire_wake_schedule(orch, schedule, wake.timestamp()).await
+        {
+            log::error!("Failed to fire wake schedule '{}': {}", schedule.id, error);
+            fire_error = true;
+        }
+    }
+    for hold in provider_holds {
+        if hold.due_at(wake.timestamp()).is_none() {
+            continue;
+        }
+        if let Err(error) =
+            crate::orchestrator::wakes::resolve_provider_limit_hold(orch, hold, wake.timestamp())
+                .await
+        {
+            log::error!("Failed to resolve provider hold '{}': {error}", hold.id);
+            fire_error = true;
+        }
+    }
+    fire_error
 }
 
 /// Create a fresh issue for one scheduled fire and start the recipe as that
@@ -646,11 +647,16 @@ fn describe_schedule(config: &ScheduleConfig) -> String {
 /// Spawn the scheduler as a detached background loop. Called by the always-on
 /// hosts (runner and non-inert server), never the thin desktop app.
 ///
-/// The gate notifier is installed here rather than with the orchestrator: a
-/// host that does not run the scheduler cannot run executions, so it cannot
-/// release one either.
+/// The gate sweep loop and its watchdog start here rather than with the
+/// orchestrator: a host that does not run the scheduler cannot run
+/// executions, so it cannot release one either. The two loops are
+/// independent: neither waits on the other.
 pub(crate) fn spawn_recipe_scheduler(orch: Orchestrator) {
     crate::execution::gates::sweep::install_sweep_notifier(orch.clone());
+    crate::execution::gates::pulse::spawn_sweep_watchdog(
+        orch.sweep_pulse.clone(),
+        orch.services.clock.clone(),
+    );
     tokio::spawn(run_scheduler_loop(orch));
 }
 
@@ -1020,5 +1026,84 @@ edges:
             next > Utc::now(),
             "the schedule does not immediately re-fire"
         );
+    }
+
+    /// cairn/5844 V8: a due schedule fires while a sweep pass holds the
+    /// admission lock. The scheduler never waits on a pass; the capped fire
+    /// waits only for its own bounded acquisition, and lands once the pass
+    /// lets go.
+    #[tokio::test]
+    async fn a_due_schedule_fires_while_a_sweep_pass_holds_the_admission_lock() {
+        use crate::execution::gates::capacity::AdmissionSite;
+
+        let db = crate::storage::migrated_test_db("scheduler-fire-under-sweep.db").await;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        std::fs::write(config_dir.join("agents/build.md"), BUILD_AGENT_MD).unwrap();
+        std::fs::write(
+            config_dir.join("recipes/nightly.yaml"),
+            SCHEDULE_RECIPE_YAML,
+        )
+        .unwrap();
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        db.execute_script(&format!(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'Project', 'proj', '{}', 1, 1);
+            ",
+            project_dir.display()
+        ))
+        .await
+        .unwrap();
+        let orch = orchestrator_with_config(db, config_dir);
+        orch.admission_lock
+            .set_wait_bound(std::time::Duration::from_secs(5));
+
+        // The sweep loop, blocked mid-pass on the admission lock.
+        let guard = orch
+            .admission_lock
+            .acquire(AdmissionSite::SweepPass, "1 candidates")
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(guard);
+        });
+
+        let wake = Utc::now();
+        let due = vec![(
+            ScheduledRecipe {
+                id: "nightly".to_string(),
+                name: "Nightly".to_string(),
+                project_id: "p".to_string(),
+                project_key: "proj".to_string(),
+                project_path: project_dir.clone(),
+                schedule_config: daily_config(),
+            },
+            wake - Duration::seconds(1),
+        )];
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            fire_due(&orch, &due, &[], &[], wake),
+        )
+        .await
+        .expect("the fire completes within 3s of a pass that holds the lock for 300ms");
+        assert!(!failed, "the due schedule fired");
+        let executions = orch
+            .db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM executions WHERE triggered_by = 'schedule'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executions, Some(1));
+        assert_eq!(orch.admission_lock.acquisitions(AdmissionSite::Filing), 1);
     }
 }

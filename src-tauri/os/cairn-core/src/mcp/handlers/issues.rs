@@ -1251,7 +1251,9 @@ mod tests {
         assert!(
             outcome
                 .summary
-                .starts_with("Created issue proj/1: \"Started child\"\nStarted execution 1"),
+                .starts_with(
+                    "Created issue proj/1: \"Started child\"\nStarted execution 1 for proj/1 \"Started child\" (recipe '"
+                ),
             "{}",
             outcome.summary
         );

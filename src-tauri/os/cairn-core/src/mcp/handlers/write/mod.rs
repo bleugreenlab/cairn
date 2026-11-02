@@ -1606,9 +1606,17 @@ async fn handle_write_attempt(
 
     let atomic = payload.atomic.unwrap_or(false);
     let guard_resource_report = !has_file_targets && write_call.is_some();
+    // A claimed resource-only write's progress: checkpointed after each item,
+    // stopped between items by an operator Stop, and sealed if this future is
+    // dropped before it finalizes (see `replay::ResourceWriteProgress`).
+    let mut resource_progress: Option<replay::ResourceWriteProgress> = None;
     if let Some(call) = write_call.as_ref().filter(|_| !has_file_targets) {
         match replay::claim_resource_call(&orch.db.local, call).await {
-            replay::ResourceClaim::Claimed => {}
+            replay::ResourceClaim::Claimed => {
+                resource_progress = Some(replay::ResourceWriteProgress::claimed(
+                    orch, call, &payload, atomic,
+                ));
+            }
             replay::ResourceClaim::Replayed(report) => return replay::mark_as_replay(&report),
             replay::ResourceClaim::Stalled => {
                 return change_report_json(
@@ -1857,7 +1865,25 @@ async fn handle_write_attempt(
                 index += 1;
                 continue;
             }
-            match off_frame(|| dispatch_resource_change(orch, request, index, item, false)).await {
+            #[cfg(feature = "test-utils")]
+            if let Some(call) = write_call.as_ref().filter(|_| resource_progress.is_some()) {
+                replay::hold_resource_item(call, index, replay::ItemPhase::BeforeDispatch).await;
+            }
+            // A stopped write stops here, between items: an item already
+            // dispatching runs to completion.
+            if let Some(progress) = resource_progress.as_mut() {
+                if progress.stop_requested() {
+                    return progress.seal_stopped(&applied, &failures).await;
+                }
+                progress.begin(index, &applied, &failures);
+            }
+            let dispatched =
+                off_frame(|| dispatch_resource_change(orch, request, index, item, false)).await;
+            #[cfg(feature = "test-utils")]
+            if let Some(call) = write_call.as_ref().filter(|_| resource_progress.is_some()) {
+                replay::hold_resource_item(call, index, replay::ItemPhase::AfterDispatch).await;
+            }
+            match dispatched {
                 Ok(change) => {
                     if let Some(promoted) = change.promoted_memory.clone() {
                         promoted_memories.push((
@@ -1897,6 +1923,9 @@ async fn handle_write_attempt(
                     }
                     failures.push(failure);
                 }
+            }
+            if let Some(progress) = resource_progress.as_mut() {
+                progress.settled(&applied, &failures).await;
             }
             index += 1;
             continue;
@@ -2618,6 +2647,11 @@ async fn handle_write_attempt(
             .to_string(),
             pr_url: minted_pr_url.clone(),
         });
+        // From here the carrier settles the row itself: the blocking group
+        // through its own checkpoints, everything else just below.
+        if let Some(progress) = resource_progress.as_mut() {
+            progress.disarm();
+        }
         let mut blocking_checkpointed = false;
         if let Some(kind) = blocking_kind.filter(|_| !blocking_indices.is_empty()) {
             let mut blocking_request = request.clone();
@@ -2627,14 +2661,27 @@ async fn handle_write_attempt(
                     serde_json::to_string(&report).expect("write report serializes"),
                     &check_summary,
                 );
-                replay::checkpoint_blocking_report(
-                    &orch.db.local,
-                    call,
-                    replay_owner.as_ref(),
-                    ordinary_ledger_claim,
-                    &outer,
-                )
-                .await
+                if resource_progress.is_some() {
+                    // This delivery holds the resource claim, and its per-item
+                    // checkpoints already follow the marker: update behind it.
+                    replay::update_blocking_checkpoint(
+                        &orch.db.local,
+                        call,
+                        None,
+                        replay::LedgerClaim::NotClaimed,
+                        &outer,
+                    )
+                    .await
+                } else {
+                    replay::checkpoint_blocking_report(
+                        &orch.db.local,
+                        call,
+                        replay_owner.as_ref(),
+                        ordinary_ledger_claim,
+                        &outer,
+                    )
+                    .await
+                }
             } else {
                 Ok(())
             };

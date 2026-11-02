@@ -4,12 +4,13 @@
 //! ## The sweep is authoritative; events are hints
 //!
 //! Every predicate is level-resolvable, so the sweep can answer "may this
-//! execution start?" from the database alone. It runs inside the existing
-//! scheduler tick (`execution::scheduler`), not in a loop of its own. The
-//! satisfying transitions — an issue resolving, a PR merging, an artifact
-//! confirming, a check observation landing — call
-//! [`notify_gate_evidence_changed`], which only shortens the wait: a dropped
-//! notification costs one tick of latency, never a stranded execution.
+//! execution start?" from the database alone. It runs in a loop of its own,
+//! [`super::pulse::run_gate_sweep_loop`], the only production sweeper, so two
+//! passes never overlap and nothing else waits on one. The satisfying
+//! transitions — an issue resolving, a PR merging, an artifact confirming, a
+//! check observation landing — call [`notify_gate_evidence_changed`], which
+//! only shortens the wait: a dropped notification costs one tick of latency,
+//! never a stranded execution.
 //!
 //! ## Release is exactly once, and it is the launch's second half
 //!
@@ -48,7 +49,7 @@
 //! wakes the filer is not: dismissing a pending notification deletes the push,
 //! and must not re-arm the wake.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cairn_db::turso::params;
@@ -67,10 +68,6 @@ use crate::orchestrator::Orchestrator;
 use crate::routes::TriggerClause;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
-/// Coalescing window: a burst of satisfying writes (a merge resolves the issue,
-/// its PR, and a check in quick succession) becomes one sweep.
-const NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
-
 static NOTIFY: OnceLock<Mutex<Option<mpsc::UnboundedSender<()>>>> = OnceLock::new();
 
 fn notifier() -> &'static Mutex<Option<mpsc::UnboundedSender<()>>> {
@@ -80,8 +77,8 @@ fn notifier() -> &'static Mutex<Option<mpsc::UnboundedSender<()>>> {
 /// Say that evidence a gate might read has changed.
 ///
 /// A hint, not a delivery: it carries nothing, routes nowhere, and a host with
-/// no sweep installed drops it. Whatever it would have released, the next
-/// scheduler tick releases anyway.
+/// no sweep installed drops it. Whatever it would have released, the sweep
+/// loop's next tick releases anyway.
 pub fn notify_gate_evidence_changed() {
     if let Ok(sender) = notifier().lock() {
         if let Some(sender) = sender.as_ref() {
@@ -90,26 +87,22 @@ pub fn notify_gate_evidence_changed() {
     }
 }
 
-/// Install the coalescing notifier: one channel, a 250ms debounce, one sweep
-/// per batch. Installed beside the scheduler, so only a host that can run
-/// executions can release one.
+/// Install the nudge channel and start the sweep loop that drains it.
+/// Installed beside the scheduler, so only a host that can run executions can
+/// release one.
 pub(crate) fn install_sweep_notifier(orch: Orchestrator) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     if let Ok(mut sender) = notifier().lock() {
         *sender = Some(tx);
     }
     // Job-status and turn writers in `cairn-workflow` hint through the same
     // channel when they may have freed a fleet slot.
     cairn_workflow::gates::hint::install(notify_gate_evidence_changed);
-    tokio::spawn(async move {
-        while rx.recv().await.is_some() {
-            tokio::time::sleep(NOTIFY_DEBOUNCE).await;
-            while rx.try_recv().is_ok() {}
-            if let Err(error) = sweep(&orch).await {
-                log::error!("gate sweep after an evidence change failed: {error}");
-            }
-        }
-    });
+    tokio::spawn(super::pulse::run_gate_sweep_loop(
+        orch,
+        rx,
+        super::pulse::SweepLoopConfig::default(),
+    ));
 }
 
 /// Why a held execution was released.
@@ -167,6 +160,19 @@ pub struct SweepReport {
     pub released: Vec<String>,
     /// Gates this sweep latched as foreclosed.
     pub foreclosed: Vec<String>,
+    /// Held executions the pass evaluated.
+    pub evaluated: usize,
+    /// Those whose authored gates all allowed them to start.
+    pub candidates: usize,
+    /// Candidates the execution queue's caps held.
+    pub held_by_cap: usize,
+    /// How long the release phase waited for the admission lock, and held
+    /// it; `None` when the pass took no lock.
+    pub lock_wait_ms: Option<u64>,
+    pub lock_held_ms: Option<u64>,
+    /// Authored gates resolved this pass, by fact and outcome (`satisfied`,
+    /// `refuted`, `no_evidence`, `foreclosed`).
+    pub clauses: BTreeMap<(String, &'static str), usize>,
 }
 
 /// Evaluate every held execution in every open database, as of now.
@@ -223,6 +229,11 @@ pub(crate) async fn sweep_with(
                 &b.execution_id,
             ))
     });
+    report.evaluated = held.len();
+    let held_ids: HashSet<String> = held
+        .iter()
+        .map(|(_, _, execution)| execution.execution_id.clone())
+        .collect();
     // Evaluate, without the admission lock: resolve each execution's authored
     // gates and record what they say. One whose authored gates all allow it
     // is a candidate; whether the queue's caps let it start is the release
@@ -233,6 +244,11 @@ pub(crate) async fn sweep_with(
         // rest of the burst behind it.
         match resolve_held(orch, &db, vocabulary, &execution, now).await {
             Ok(resolved) => {
+                orch.sweep_pulse
+                    .note_evaluated(&execution.execution_id, now);
+                for (fact, outcome) in resolved.outcomes {
+                    *report.clauses.entry((fact, outcome)).or_default() += 1;
+                }
                 report.foreclosed.extend(resolved.evaluation.foreclosed);
                 if resolved.all_satisfied {
                     candidates.push(Candidate {
@@ -250,11 +266,19 @@ pub(crate) async fn sweep_with(
             ),
         }
     }
+    report.candidates = candidates.len();
     let queue = release_candidates(orch, &candidates, now, &mut report).await;
     if let Err(error) = super::capacity::refresh_places(orch, queue.as_ref()).await {
         log::warn!("gate sweep could not rewrite the queue's places in line: {error}");
     }
+    // A released or superseded execution is no longer listed held, so its
+    // stamp goes with this pass.
+    orch.sweep_pulse.retain_evaluated(&held_ids);
     Ok(report)
+}
+
+fn millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A held execution whose authored gates all allow it to start this pass.
@@ -297,6 +321,7 @@ async fn release_candidates(
     {
         Ok(guard) => guard,
         Err(busy) => {
+            report.lock_wait_ms = Some(millis(busy.waited));
             log::warn!(
                 "gate sweep left {} candidate(s) for the next pass: {busy}",
                 candidates.len()
@@ -304,6 +329,7 @@ async fn release_candidates(
             return None;
         }
     };
+    report.lock_wait_ms = Some(millis(guard.waited()));
     let starts: Vec<Start<'_>> = candidates
         .iter()
         .map(|candidate| Start {
@@ -324,6 +350,7 @@ async fn release_candidates(
     for (index, (candidate, start)) in candidates.iter().zip(&starts).enumerate() {
         let admission = queue.decide(start);
         if queue.holds_as_stored(start, &admission) {
+            report.held_by_cap += 1;
             continue;
         }
         let execution_id = candidate.execution.execution_id.as_str();
@@ -353,6 +380,7 @@ async fn release_candidates(
                 blocks,
                 moved: changed,
             }) => {
+                report.held_by_cap += 1;
                 queue.record_hold(start, &blocks, now);
                 if changed {
                     moved.insert(index);
@@ -364,6 +392,7 @@ async fn release_candidates(
             }
         }
     }
+    report.lock_held_ms = Some(millis(guard.held()));
     drop(guard);
 
     let mut announced = HashSet::new();
@@ -483,6 +512,7 @@ async fn evaluate_gates(
         mut evaluation,
         all_satisfied,
         gates_moved,
+        ..
     } = resolve_gates(orch, db, vocabulary, execution, gates, now).await?;
     if all_satisfied {
         match release_in(
@@ -514,6 +544,9 @@ struct Resolved {
     all_satisfied: bool,
     /// A new outcome or foreclosure was recorded.
     gates_moved: bool,
+    /// Each authored gate resolved, as `(fact, outcome)`: a gate counts as
+    /// satisfied only once its tenet decision, if any, is delivered.
+    outcomes: Vec<(String, &'static str)>,
 }
 
 /// A newly recorded outcome or foreclosure changes what the gate census on
@@ -539,6 +572,7 @@ async fn resolve_gates(
     let mut evaluation = Evaluation::default();
     let mut all_satisfied = true;
     let mut gates_moved = false;
+    let mut outcomes = Vec::new();
     for gate in gates {
         // Capacity gates are not resolved here: they are decided at release,
         // under the admission lock, once the authored gates allow it.
@@ -575,7 +609,13 @@ async fn resolve_gates(
             }
         }
         gates_moved |= record_outcome(db, gate, outcome, now).await?;
+        let fact = clause
+            .get("fact")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
         if outcome == GateOutcome::Satisfied {
+            outcomes.push((fact, outcome.as_str()));
             continue;
         }
         all_satisfied = false;
@@ -604,6 +644,14 @@ async fn resolve_gates(
                 }
             },
         };
+        outcomes.push((
+            fact,
+            if reason.is_some() {
+                "foreclosed"
+            } else {
+                outcome.as_str()
+            },
+        ));
         if let Some(reason) = reason {
             let rendered = vocabulary.render(&clause);
             deliver_foreclosure(
@@ -624,6 +672,7 @@ async fn resolve_gates(
         evaluation,
         all_satisfied,
         gates_moved,
+        outcomes,
     })
 }
 
@@ -1299,10 +1348,10 @@ async fn foreclosure_message(
 /// The soonest instant after `now` at which an unsatisfied gate could become
 /// true on its own, in unix seconds. Only `clock` gates answer.
 ///
-/// The scheduler folds this into its sleep bound so a `notBefore` releases on
+/// The sweep loop folds this into its sleep bound so a `notBefore` releases on
 /// time rather than up to a tick late. A due instant already in the past is
-/// excluded: the sweep at the top of the tick handles it, and folding it in
-/// would let one gate that keeps failing to resolve spin the loop.
+/// excluded: the pass that just ran handles it, and folding it in would let
+/// one gate that keeps failing to resolve spin the loop.
 pub async fn next_gate_due_after(orch: &Orchestrator, now: i64) -> Option<i64> {
     let vocabulary = gate_vocabulary();
     let mut soonest: Option<i64> = None;
@@ -1313,7 +1362,7 @@ pub async fn next_gate_due_after(orch: &Orchestrator, now: i64) -> Option<i64> {
             })
             .await
             .unwrap_or_else(|error| {
-                log::error!("failed to read waiting gates for the scheduler bound: {error}");
+                log::error!("failed to read waiting gates for the sweep loop's bound: {error}");
                 Vec::new()
             });
         for (_, predicate_json) in predicates {
@@ -1616,7 +1665,11 @@ pub(crate) mod tests {
     async fn a_held_execution_mints_nothing_until_its_gate_and_then_advances_in_place() {
         let mut env = env("gate-sweep-release.db").await;
         let summary = file(&env, 2, merged_after(1)).await.unwrap();
-        assert!(summary.contains("HELD"), "got: {summary}");
+        assert!(
+            summary.starts_with("Filed execution 1 for prj/2 \"Issue 2\" (recipe '")
+                && summary.contains(") HELD: no jobs and no slot until "),
+            "got: {summary}"
+        );
         assert!(
             summary.contains("after issue cairn://p/prj/1 merged (no verdict yet)"),
             "the filing names its gate and the evidence state: {summary}"
@@ -2154,13 +2207,18 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        assert!(summary.starts_with("Started execution 1"), "got: {summary}");
+        assert!(
+            summary.starts_with("Started execution 1 for prj/2 \"Issue 2\" (recipe '"),
+            "got: {summary}"
+        );
         let (id, status, released_at, jobs) = execution(&env, 2).await;
         assert_eq!(status, "running");
         assert!(released_at.is_some() && jobs > 0);
         assert_eq!(advanced(&mut env), vec![id]);
     }
 
+    /// A future `notBefore` bounds the sweep loop's sleep, and releases at the
+    /// pass taken once it is due.
     #[tokio::test]
     async fn a_future_clock_gate_bounds_the_scheduler_sleep_and_releases_when_due() {
         let env = env("gate-sweep-clock-future.db").await;
@@ -2663,7 +2721,10 @@ pub(crate) mod tests {
 
         // Already true at filing: released at creation.
         let summary = file(&env, 2, team_merged(1)).await.unwrap();
-        assert!(summary.starts_with("Started execution 1"), "got: {summary}");
+        assert!(
+            summary.starts_with("Started execution 1 for prj/2 \"Issue 2\" (recipe '"),
+            "got: {summary}"
+        );
         assert_eq!(advanced(&mut env).len(), 1);
 
         // True later: held, quiet rather than foreclosed, then released.

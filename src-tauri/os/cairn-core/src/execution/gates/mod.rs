@@ -9,6 +9,7 @@ mod admission_tests;
 pub mod authoring;
 pub mod capacity;
 pub mod census;
+pub mod pulse;
 pub mod reorder;
 pub mod sweep;
 pub mod vocabulary;

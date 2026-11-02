@@ -17,12 +17,12 @@ use crate::models::ExecutionSnapshot;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 
-/// Resolve `(project_id, issue_id)` for a project key + issue number.
+/// Resolve `(project_id, issue_id, title)` for a project key + issue number.
 async fn resolve_project_and_issue(
     db: &LocalDb,
     project_key: &str,
     number: i32,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, String), String> {
     let key = cairn_common::uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
@@ -30,7 +30,7 @@ async fn resolve_project_and_issue(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT p.id, i.id
+                        "SELECT p.id, i.id, i.title
                          FROM projects p
                          JOIN issues i ON i.project_id = p.id
                          WHERE p.key = ?1 AND i.number = ?2
@@ -39,7 +39,7 @@ async fn resolve_project_and_issue(
                     )
                     .await?;
                 match rows.next().await? {
-                    Some(row) => Ok::<_, DbError>(Some((row.text(0)?, row.text(1)?))),
+                    Some(row) => Ok::<_, DbError>(Some((row.text(0)?, row.text(1)?, row.text(2)?))),
                     None => Ok(None),
                 }
             })
@@ -71,7 +71,8 @@ pub(crate) async fn start_execution_from_collection(
     // execution would never start — the create-then-start half of team memory
     // triage (CAIRN-2587). `for_project` is a strict no-op for a local project.
     let owning_db = orch.db.for_project(project_key).await;
-    let (project_id, issue_id) = resolve_project_and_issue(&owning_db, project_key, number).await?;
+    let (project_id, issue_id, title) =
+        resolve_project_and_issue(&owning_db, project_key, number).await?;
     let key = cairn_common::uri::canonical_project(project_key);
 
     // Resolve the recipe once, refusing a path or file name, so the launch is
@@ -173,8 +174,7 @@ pub(crate) async fn start_execution_from_collection(
             None
         };
         return Ok(held_filing_summary(
-            &key,
-            number,
+            &format!("{key}/{number} \"{title}\""),
             seq,
             &execution.recipe_id,
             &issue_uri,
@@ -209,8 +209,8 @@ pub(crate) async fn start_execution_from_collection(
         crate::execution::recipe::QueuePlace::Tail => "",
     };
     Ok(format!(
-        "Started execution {} for {}-{} (recipe '{}').{}{} Watch {} for attention.",
-        seq, key, number, execution.recipe_id, standing, placed, issue_uri
+        "Started execution {} for {}/{} \"{}\" (recipe '{}').{}{} Watch {} for attention.",
+        seq, key, number, title, execution.recipe_id, standing, placed, issue_uri
     ))
 }
 
@@ -218,14 +218,13 @@ pub(crate) async fn start_execution_from_collection(
 /// what the evidence says about each gate, what it will do to the issue's
 /// attempt when it starts, and the way out if waiting is wrong.
 ///
-/// `queued` is the census's queued line when only the execution queue holds
-/// it (no gate the filer wrote is unmet). `next_attempt` is `Some(owner_now)`
-/// for a held next attempt: it fenced nothing at filing, and takes the attempt
-/// from whichever execution owns it at release.
-#[allow(clippy::too_many_arguments)]
+/// `issue` names the issue as `key/number "title"`. `queued` is the census's
+/// queued line when only the execution queue holds it (no gate the filer wrote
+/// is unmet). `next_attempt` is `Some(owner_now)` for a held next attempt: it
+/// fenced nothing at filing, and takes the attempt from whichever execution
+/// owns it at release.
 fn held_filing_summary(
-    key: &str,
-    number: i32,
+    issue: &str,
     seq: i32,
     recipe_id: &str,
     issue_uri: &str,
@@ -242,7 +241,7 @@ fn held_filing_summary(
             _ => String::new(),
         };
         return format!(
-            "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}'): {queued}.{attempt} {}",
+            "Filed execution {seq} for {issue} (recipe '{recipe_id}'): {queued}.{attempt} {}",
             crate::execution::gates::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
         );
     }
@@ -273,7 +272,7 @@ fn held_filing_summary(
         )
     };
     format!(
-        "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}') HELD: no jobs and no \
+        "Filed execution {seq} for {issue} (recipe '{recipe_id}') HELD: no jobs and no \
          slot until {waiting}. It starts on its own when the last gate is satisfied.\
          {attempt}{foreclosed}{exit}"
     )

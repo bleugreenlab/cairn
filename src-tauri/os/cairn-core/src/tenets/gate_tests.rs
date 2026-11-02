@@ -268,7 +268,10 @@ async fn a_thread_files_any_recipe_without_a_tenet_and_it_starts() {
     )
     .await
     .unwrap();
-    assert!(created.contains("\nStarted execution"), "{created}");
+    assert!(
+        created.contains("\nStarted execution 1 for prj/10 \"A plan\" (recipe '"),
+        "{created}"
+    );
 
     assert_eq!(count(&env, "SELECT COUNT(*) FROM execution_gates").await, 0);
     assert_eq!(count(&env, "SELECT COUNT(*) FROM tenets").await, 0);

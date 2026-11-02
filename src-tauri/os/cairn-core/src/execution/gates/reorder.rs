@@ -1022,7 +1022,10 @@ mod tests {
         add_thread(&env, "ta", "alpha").await;
         add_issue(&env, 201, Some("ta")).await;
         let filed = file_at_head(&env, None, 201, json!({})).await.unwrap();
-        assert!(filed.starts_with("Started execution"), "{filed}");
+        assert!(
+            filed.starts_with("Started execution 1 for prj/201 \"Issue 201\" (recipe '"),
+            "{filed}"
+        );
         assert!(
             filed.contains("It started now; nothing to place."),
             "{filed}"
