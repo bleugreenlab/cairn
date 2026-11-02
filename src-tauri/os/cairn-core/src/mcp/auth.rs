@@ -541,6 +541,11 @@ mod tests {
             // own to measure that refusal. Neither reads a real credential.
             "src-tauri/os/cairn-sandbox/src/operator_credential.rs",
             "src-tauri/os/cairn-sandbox/src/containment.rs",
+            // The page-call root rule: names the file only to refuse an
+            // interpreter root whose tree holds it, comparing directory-entry
+            // names in the executor before any page-call spawn. It never opens
+            // the file, and a refusal carries the path, never the value.
+            "src-tauri/os/cairn-sandbox/src/page_call.rs",
             // Hosts: the runner materializes it, the hosted server carries an
             // (never-matching) validator so both reach the same authorization.
             "src-tauri/cairn-orch/src/main.rs",
@@ -581,6 +586,15 @@ mod tests {
             // only in the request header; the module forwards its arguments and
             // returns only the runner's payload.
             "src-tauri/src/commands/tenets.rs",
+            // Phone-approval enrollment and the human base-merge policy: both
+            // commands route through `operator_target` before anything else,
+            // so only the main webview reaches the local runner or a
+            // configured peer; agent-opened browser labels are refused even
+            // when they name a peer. The module never reads the credential —
+            // it names only `invoke_as_operator`, forwards its arguments, and
+            // returns only the runner's payload, while `runner_client` keeps
+            // the token in the loopback request header.
+            "src-tauri/src/commands/base_merge_policy.rs",
             // Page writes: routed through `operator_target` like tenet
             // verdicts, forwarding the page's input unchanged and returning
             // only the runner's payload; the runner gates the input against

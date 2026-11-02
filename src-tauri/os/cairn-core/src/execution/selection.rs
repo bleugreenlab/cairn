@@ -140,6 +140,14 @@ pub struct CheckPlan {
     pub(crate) verdict_environment_names: Vec<String>,
     /// Platforms whose observations the project accepts as this check's verdict.
     pub(crate) verdict_platforms: Vec<String>,
+    /// The runtime this plan's verdict is about: each toolchain the check
+    /// declares as a runtime instrument, paired with the version a check
+    /// launched in the planned checkout resolves
+    /// ([`crate::execution::check_identity::expected_verdict_runtime`]). A
+    /// stored verdict answers this plan only if it was produced under exactly
+    /// these versions; a fresh one records the versions its own run measured
+    /// for the same instruments.
+    pub(crate) verdict_runtime: Vec<(String, String)>,
     /// The machines whose observations may answer this plan, when a request
     /// named one. `None` admits any machine on a trusted platform; an empty
     /// list admits none, which is the honest answer for a name nothing this
@@ -175,6 +183,13 @@ pub(crate) fn plan_checks(
     changed_files: &[GraphFileChange],
     repo_root: &Path,
 ) -> Vec<CheckPlan> {
+    // One probe for the whole plan set: every check here runs in this checkout,
+    // so every one expects the same toolchains, and the probe is held per pin.
+    let expected_toolchain = if checks.is_empty() {
+        String::new()
+    } else {
+        cairn_checkenv::expected_toolchain_identity_in(repo_root)
+    };
     let mut plans: Vec<CheckPlan> = checks
         .iter()
         .map(|(name, check)| {
@@ -184,6 +199,7 @@ pub(crate) fn plan_checks(
                 inputs.for_check(name),
                 changed_files,
                 repo_root,
+                &expected_toolchain,
             )
         })
         .collect();
@@ -199,7 +215,12 @@ pub(crate) fn plan_checks(
 /// whole-suite form: the uncertain-`{targets}` fallback works only because
 /// dropping a trailing unquoted ` {targets}` restores the declared base command,
 /// which is not true of any other position.
-fn unexpandable_plan(name: &str, check: &CheckCommand, placeholder: &str) -> CheckPlan {
+fn unexpandable_plan(
+    name: &str,
+    check: &CheckCommand,
+    placeholder: &str,
+    expected_toolchain: &str,
+) -> CheckPlan {
     let error = format!(
         "check {name:?} declares {placeholder} in a position the expansion contract \
          does not support. It must appear exactly once, as the final \
@@ -218,6 +239,10 @@ fn unexpandable_plan(name: &str, check: &CheckCommand, placeholder: &str) -> Che
             check,
         ),
         verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+        verdict_runtime: crate::execution::check_identity::expected_verdict_runtime(
+            check,
+            expected_toolchain,
+        ),
         verdict_executor_ids: None,
         config_error: Some(error),
     }
@@ -230,7 +255,10 @@ fn plan_one(
     selector: &InputSelector,
     changed_files: &[GraphFileChange],
     repo_root: &Path,
+    expected_toolchain: &str,
 ) -> CheckPlan {
+    let verdict_runtime =
+        || crate::execution::check_identity::expected_verdict_runtime(check, expected_toolchain);
     // An un-narrowed plan never carries a raw selector template: a placeholder
     // that reaches the shell unexpanded is a literal token the runner reads as a
     // file belonging to nothing, so it runs zero tests. A selector check carries
@@ -262,6 +290,7 @@ fn plan_one(
                 check,
             ),
             verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+            verdict_runtime: verdict_runtime(),
             verdict_executor_ids: None,
             config_error,
         }
@@ -309,7 +338,7 @@ fn plan_one(
         // `{changedFiles}` → the impact-matched changed files, expanded only where
         // the declaration puts the placeholder somewhere expansion is inert.
         if !placeholder_is_expandable(&check.command, CHANGED_FILES_PLACEHOLDER) {
-            return unexpandable_plan(name, check, CHANGED_FILES_PLACEHOLDER);
+            return unexpandable_plan(name, check, CHANGED_FILES_PLACEHOLDER, expected_toolchain);
         }
         let command = substitute(
             &check.command,
@@ -326,12 +355,13 @@ fn plan_one(
                 check,
             ),
             verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+            verdict_runtime: verdict_runtime(),
             verdict_executor_ids: None,
             config_error: None,
         }
     } else if check.command.contains(TARGETS_PLACEHOLDER) {
         if !placeholder_is_expandable(&check.command, TARGETS_PLACEHOLDER) {
-            return unexpandable_plan(name, check, TARGETS_PLACEHOLDER);
+            return unexpandable_plan(name, check, TARGETS_PLACEHOLDER, expected_toolchain);
         }
         // `{targets}` → crate-graph targets resolved from the matched files. On
         // uncertain resolution the placeholder degrades to an empty string, which
@@ -357,6 +387,7 @@ fn plan_one(
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
                     verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+                    verdict_runtime: verdict_runtime(),
                     verdict_executor_ids: None,
                     config_error: None,
                 }
@@ -374,6 +405,7 @@ fn plan_one(
                     verdict_environment_names:
                         crate::execution::check_identity::verdict_environment_names(check),
                     verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+                    verdict_runtime: verdict_runtime(),
                     verdict_executor_ids: None,
                     config_error: None,
                 }
@@ -692,6 +724,7 @@ mod tests {
             executor: None,
             verdict_environment: Vec::new(),
             verdict_platforms: None,
+            runtime: None,
             fixes: false,
             main_cadence: None,
             tree: Default::default(),

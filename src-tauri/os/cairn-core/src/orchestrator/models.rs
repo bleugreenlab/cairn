@@ -11,11 +11,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use cairn_models::complete::HttpComplete;
+use cairn_models::image::http::HttpImages;
 use cairn_models::interface::complete::Complete;
+use cairn_models::interface::image::ImageTransport;
 use cairn_models::interface::session::{CodexSessionProvider, SessionHost, SessionProvider};
+use cairn_models::interface::speak::SpeechTransport;
 use cairn_models::session::claude::ClaudeCli;
 use cairn_models::session::codex::managed::{UpdateOutcome, UPDATE_INTERVAL};
 use cairn_models::session::codex::{CodexAppServer, ManagedCodex};
+use cairn_models::speak::HttpSpeech;
 
 use cairn_db::storage::run_db_blocking;
 use cairn_db::turso::params;
@@ -35,14 +39,19 @@ use crate::storage::RowExt;
 
 /// The cairn-models facet's launch side as this orchestrator uses it.
 ///
-/// Every HTTP token request goes through `complete`; every Claude process is
-/// opened by `claude`, and every Codex app-server and thread by `codex`, on
-/// `host`. The builder installs the implementations that
+/// Every HTTP token request goes through `complete`; every image drawn over
+/// HTTP through `images`, and every utterance through `speech`; every Claude
+/// process is opened by `claude`, and every Codex app-server and thread by
+/// `codex`, on `host`. The builder installs the implementations that
 /// reach providers, with sessions on this machine; a test replaces them to
 /// observe or script every launch without touching a network or a CLI.
 #[derive(Clone)]
 pub struct ModelRuntime {
     pub complete: Arc<dyn Complete>,
+    /// The HTTP image wires. Codex's image offer draws on a pooled
+    /// app-server instead, through a transport built per call.
+    pub images: Arc<dyn ImageTransport>,
+    pub speech: Arc<dyn SpeechTransport>,
     pub claude: Arc<dyn SessionProvider>,
     pub codex: Arc<dyn CodexSessionProvider>,
     /// Where session processes run.
@@ -64,6 +73,8 @@ impl ModelRuntime {
         let codex_cli = Arc::new(ManagedCodex::for_host());
         Self {
             complete: Arc::new(HttpComplete),
+            images: Arc::new(HttpImages),
+            speech: Arc::new(HttpSpeech),
             claude: Arc::new(ClaudeCli),
             codex: Arc::new(CodexAppServer),
             host: Arc::new(

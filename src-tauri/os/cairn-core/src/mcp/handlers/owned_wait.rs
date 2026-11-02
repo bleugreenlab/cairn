@@ -1241,6 +1241,7 @@ mod tests {
                 .map(|name| (name.to_string(), check.clone()))
                 .collect(),
             applicable_names: lanes.iter().map(|name| name.to_string()).collect(),
+            expected_toolchain: String::new(),
             input_hashes: lanes
                 .iter()
                 .map(|name| (name.to_string(), format!("in-{name}")))

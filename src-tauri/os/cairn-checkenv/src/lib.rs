@@ -6,12 +6,23 @@
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use sha2::{Digest, Sha256};
 
 const ENVIRONMENT_IDENTITY_VERSION: &str = "check-environment-v1";
 const VERDICT_ENVIRONMENT_IDENTITY_VERSION: &str = "verdict-environment-v1";
+const VERDICT_RUNTIME_IDENTITY_VERSION: &str = "verdict-runtime-v1";
+
+/// The toolchains [`toolchain_identity`] and [`toolchain_identity_in`] probe,
+/// by the name a check declares one as a runtime instrument under (`runtime:`
+/// in its definition). Every composed identity carries exactly these.
+pub const RUNTIME_INSTRUMENTS: &[&str] = &["rustc", "bun"];
+
+/// The version an instrument reads as when the run's toolchain was never
+/// measured (a lane whose executor report was lost). No probe produces it, so a
+/// verdict whose runtime nobody measured never answers a lookup that expects one.
+const UNRECORDED: &str = "unrecorded";
 
 /// Source-sensitive identity embedded by `build.rs`, deliberately equal in every
 /// runner and executor linked against the same workspace source. The build fails
@@ -21,8 +32,10 @@ pub const fn implementation_identity() -> &'static str {
 }
 
 /// Hash only the environment variables a check declares as verdict inputs.
-/// Platform, architecture, toolchains, and build identity are deliberately not
-/// part of this value; they are recorded as separate execution facts.
+/// Platform, architecture, and build identity are deliberately not part of this
+/// value; they are recorded as separate execution facts. The toolchains a check
+/// declares as its runtime instruments join it through
+/// [`verdict_environment_with_runtime`], which every reuse key is made with.
 pub fn verdict_environment_hash(
     variable_names: impl IntoIterator<Item = String>,
     read_variable: impl Fn(&str) -> Option<String>,
@@ -44,6 +57,72 @@ pub fn verdict_environment_hash(
         }
     }
     digest(hasher)
+}
+
+/// A check's verdict environment: its declared-variable hash
+/// ([`verdict_environment_hash`]) extended by the version of every toolchain
+/// the check declares as a runtime instrument.
+///
+/// A check's runtime is an axis of its verdict when the check runs under it: the
+/// same `bun test` on the same tree fails 101 of 839 tests under Bun 1.3.14 and
+/// none under 1.4.4. Reuse matches this value exactly, so a verdict produced
+/// under one instrument version never answers a lookup that expects another.
+/// Only the declared instruments enter it, so a Bun bump leaves a rustc-only
+/// check's verdicts standing and a rustc bump leaves a Bun-only check's.
+///
+/// `runtime` pairs each instrument with its version, from [`runtime_versions`];
+/// order and repeats do not matter.
+pub fn verdict_environment_with_runtime(declared: &str, runtime: &[(String, String)]) -> String {
+    let mut runtime = runtime.to_vec();
+    runtime.sort();
+    runtime.dedup();
+    let mut hasher = Sha256::new();
+    field(&mut hasher, VERDICT_RUNTIME_IDENTITY_VERSION);
+    field(&mut hasher, declared);
+    field(&mut hasher, &runtime.len().to_string());
+    for (instrument, version) in &runtime {
+        field(&mut hasher, instrument);
+        field(&mut hasher, version);
+    }
+    digest(hasher)
+}
+
+/// The version of one instrument in a composed identity (`rustc=…;bun=…`).
+///
+/// rustc's component is `rustc --version --verbose`, whose later lines name the
+/// host triple and LLVM build. Only its first line (`rustc 1.97.1 (8bab26f4f
+/// 2026-07-14)`) is the release, so a Linux run and a macOS run of one pinned
+/// compiler read as the same version, which a check that trusts both platforms
+/// needs. `None` for an instrument this crate does not probe, or for a value
+/// that is not a composed identity.
+pub fn instrument_version<'a>(identity: &'a str, instrument: &str) -> Option<&'a str> {
+    let (rustc, bun) = identity.strip_prefix("rustc=")?.rsplit_once(";bun=")?;
+    match instrument {
+        "rustc" => rustc.lines().next().map(str::trim),
+        "bun" => Some(bun.trim()),
+        _ => None,
+    }
+}
+
+/// Each of `instruments` paired with the version `identity` records for it,
+/// the input [`verdict_environment_with_runtime`] takes.
+///
+/// An identity that was never recorded reads `unrecorded` for every
+/// instrument, and one that cannot be parsed reads the same, so neither can
+/// ever equal a probed expectation.
+pub fn runtime_versions<'a>(
+    instruments: impl IntoIterator<Item = &'a str>,
+    identity: Option<&str>,
+) -> Vec<(String, String)> {
+    instruments
+        .into_iter()
+        .map(|instrument| {
+            let version = identity
+                .and_then(|identity| instrument_version(identity, instrument))
+                .unwrap_or(UNRECORDED);
+            (instrument.to_string(), version.to_string())
+        })
+        .collect()
 }
 
 fn field(hasher: &mut Sha256, value: &str) {
@@ -183,7 +262,68 @@ pub fn refresh_toolchain_identity() -> &'static str {
     *IDENTITY
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+    EXPECTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     identity
+}
+
+/// Expectations [`expected_toolchain_identity_in`] has probed, keyed by the
+/// Rust toolchain pin in force where each was probed.
+static EXPECTED: Mutex<Vec<(Option<String>, String)>> = Mutex::new(Vec::new());
+
+/// The toolchains a check launched by this process in the checkout at `dir`
+/// would resolve, which is what a reuse lookup expects a stored verdict's
+/// runtime instruments to be.
+///
+/// It is the same question [`toolchain_identity_in`] answers for a command that
+/// ran, asked before anything runs, because the two must be comparable: an
+/// executor records the toolchain resolved inside the checkout, where rustup
+/// applies the tree's `rust-toolchain` pin. The host identity
+/// ([`toolchain_identity`]) is probed outside any checkout and names rustup's
+/// default instead, which a `rustup update` moves off the pin while every lane
+/// keeps compiling with the pin.
+///
+/// Held per pin rather than per directory, because every worktree of one tree
+/// resolves the same pin and planning runs on every commit; the probe itself
+/// costs two process starts. An answer in which any instrument is unavailable
+/// is not held, so a toolchain installed later is seen on the next plan. A
+/// stale answer costs reuse, never correctness: a stored verdict answers only
+/// when its own measured runtime equals the expectation, so a wrong expectation
+/// can only miss. [`refresh_toolchain_identity`] drops every held answer. A
+/// `dir` that does not exist has no launch context, and reads as the host.
+pub fn expected_toolchain_identity_in(dir: &Path) -> String {
+    if !dir.is_dir() {
+        return toolchain_identity().to_string();
+    }
+    let pin = rust_toolchain_pin(dir);
+    let mut held = EXPECTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, identity)) = held.iter().find(|(key, _)| *key == pin) {
+        return identity.clone();
+    }
+    let identity = toolchain_identity_in(dir, std::iter::empty::<(String, String)>());
+    if !identity.contains(UNAVAILABLE) {
+        held.push((pin, identity.clone()));
+    }
+    identity
+}
+
+/// The `rust-toolchain` file rustup would apply in `dir`: the nearest one in
+/// `dir` or an ancestor, named and with its contents, since either decides
+/// which compiler resolves. `None` when no ancestor holds one.
+fn rust_toolchain_pin(dir: &Path) -> Option<String> {
+    dir.ancestors().find_map(|ancestor| {
+        ["rust-toolchain", "rust-toolchain.toml"]
+            .into_iter()
+            .find_map(|name| {
+                std::fs::read_to_string(ancestor.join(name))
+                    .ok()
+                    .map(|contents| format!("{name}\n{contents}"))
+            })
+    })
 }
 
 fn probe_host_identity() -> String {
@@ -368,6 +508,104 @@ mod tests {
         let refreshed = refresh_toolchain_identity();
         assert_eq!(toolchain_identity(), refreshed);
         assert!(refreshed.starts_with("rustc=") && refreshed.contains(";bun="));
+    }
+
+    const RUSTC_VERBOSE: &str = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1";
+
+    fn identity(rustc: &str, bun: &str) -> String {
+        compose_identity(Some(rustc.to_string()), Some(bun.to_string()))
+    }
+
+    /// The version of each instrument is read from the composed identity, and
+    /// rustc's is its release line alone, so one pinned compiler reads the same
+    /// on every host triple.
+    #[test]
+    fn instrument_versions_are_read_from_a_composed_identity() {
+        let linux = identity(RUSTC_VERBOSE, "1.4.4");
+        let macos = identity(
+            &RUSTC_VERBOSE.replace("x86_64-unknown-linux-gnu", "aarch64-apple-darwin"),
+            "1.4.4",
+        );
+        assert_eq!(
+            instrument_version(&linux, "rustc"),
+            Some("rustc 1.97.1 (8bab26f4f 2026-07-14)")
+        );
+        assert_eq!(instrument_version(&linux, "bun"), Some("1.4.4"));
+        assert_eq!(
+            instrument_version(&linux, "rustc"),
+            instrument_version(&macos, "rustc")
+        );
+        assert_eq!(
+            instrument_version("rustc=unavailable;bun=1.3.14", "rustc"),
+            Some("unavailable")
+        );
+        assert_eq!(instrument_version(&linux, "node"), None);
+        assert_eq!(instrument_version("tools-1", "bun"), None);
+    }
+
+    /// Only the declared instruments enter the verdict environment: two runs a
+    /// Bun version apart separate a Bun check and leave a rustc check whole.
+    #[test]
+    fn only_declared_instruments_enter_the_verdict_environment() {
+        let old_bun = identity(RUSTC_VERBOSE, "1.3.14");
+        let new_bun = identity(RUSTC_VERBOSE, "1.4.4");
+        let key = |instruments: &[&str], toolchain: &str| {
+            verdict_environment_with_runtime(
+                "declared",
+                &runtime_versions(instruments.iter().copied(), Some(toolchain)),
+            )
+        };
+        assert_ne!(key(&["bun"], &old_bun), key(&["bun"], &new_bun));
+        assert_eq!(key(&["rustc"], &old_bun), key(&["rustc"], &new_bun));
+        assert_ne!(
+            key(&["rustc", "bun"], &old_bun),
+            key(&["rustc", "bun"], &new_bun)
+        );
+        assert_eq!(
+            key(&["bun", "rustc", "bun"], &new_bun),
+            key(&["rustc", "bun"], &new_bun),
+            "order and repeats do not move the key"
+        );
+        assert_ne!(
+            key(&[], &new_bun),
+            verdict_environment_with_runtime("other-declared", &[]),
+            "the declared variables still decide the key with no instrument"
+        );
+    }
+
+    /// A run whose toolchain nobody measured has a runtime no probe produces,
+    /// so it cannot stand in for any expectation, even an unavailable one.
+    #[test]
+    fn an_unrecorded_runtime_matches_no_expectation() {
+        let unrecorded = runtime_versions(["bun"], None);
+        assert_eq!(
+            unrecorded,
+            vec![("bun".to_string(), "unrecorded".to_string())]
+        );
+        for probed in ["rustc=unavailable;bun=unavailable", "rustc=x;bun=1.4.4"] {
+            assert_ne!(runtime_versions(["bun"], Some(probed)), unrecorded);
+        }
+    }
+
+    #[test]
+    fn the_nearest_rust_toolchain_pin_decides_the_expectation_key() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(rust_toolchain_pin(&nested), None);
+        std::fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
+        let pinned = rust_toolchain_pin(&nested).expect("an ancestor's pin applies");
+        assert!(pinned.starts_with("rust-toolchain.toml\n") && pinned.contains("1.97.1"));
+        std::fs::write(root.path().join("a/rust-toolchain"), "1.98.0\n").unwrap();
+        assert_eq!(
+            rust_toolchain_pin(&nested).as_deref(),
+            Some("rust-toolchain\n1.98.0\n"),
+            "the nearer pin wins"
+        );
     }
 
     #[test]

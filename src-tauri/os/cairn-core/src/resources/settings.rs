@@ -89,6 +89,14 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.max_open_triage_issues_per_scope
     ));
     out.push_str(&format!(
+        "- maxConcurrentExecutions: {}\n",
+        settings.max_concurrent_executions
+    ));
+    out.push_str(&format!(
+        "- maxOpenChildrenPerThread: {}\n",
+        settings.max_open_children_per_thread
+    ));
+    out.push_str(&format!(
         "- pendingMemoryThreshold: {}\n",
         settings.pending_memory_threshold
     ));

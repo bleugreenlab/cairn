@@ -74,6 +74,9 @@ pub struct ExecutionGate {
     pub foreclosed_at: Option<i64>,
     pub foreclosed_reason: Option<String>,
     pub created_at: i64,
+    /// The live reason of a CAPACITY gate (the execution queue's fleet slot or
+    /// thread focus), place in line included. `None` on an authored gate.
+    pub detail: Option<String>,
 }
 
 impl ExecutionGate {
@@ -110,7 +113,13 @@ pub enum GateEvidenceState {
 pub struct GateCensusEntry {
     pub gate_id: String,
     /// The predicate in prose, e.g. `check rust-tests passed on cairn://p/cairn/4724`.
+    /// For a capacity hold, its live reason with its place in line.
     pub predicate: String,
+    /// An execution-queue cap (fleet slot or thread focus) rather than an
+    /// authored `after:` gate: the system filed it, and only the operator's
+    /// Start now skips it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capacity: bool,
     pub state: GateEvidenceState,
     /// The evidence-state phrase, e.g. `no verdict yet`, `evidence says no`, or
     /// `can never be satisfied: <reason>`.
@@ -123,6 +132,13 @@ pub struct GateCensusEntry {
 pub struct ReleaseOverride {
     pub principal: String,
     pub at: Option<i64>,
+    /// The operator's Start now, proven by the invoke's credentials, rather
+    /// than an agent's or a caller's early release.
+    #[serde(default)]
+    pub operator: bool,
+    /// The capacity caps the start skipped (`fleet`, `thread`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 /// An execution's `after:` gates, rendered for display.

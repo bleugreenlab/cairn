@@ -121,6 +121,8 @@ pub async fn yield_turn(
 
     update_terminal_turn(db, turn_id, TurnState::Yielded, Some(reason), None).await?;
     emit_turn_update(db, turn_id, emitter).await;
+    // A parked turn may free its execution's fleet slot.
+    crate::gates::hint::evidence_changed();
     Ok(())
 }
 
@@ -147,6 +149,10 @@ pub async fn yield_running_turn_conn(
             ],
         )
         .await?;
+    if changed > 0 {
+        // A parked turn may free its execution's fleet slot.
+        crate::gates::hint::evidence_changed();
+    }
     Ok(changed > 0)
 }
 

@@ -801,6 +801,38 @@ fn pooled_mcp_attachment(orch: &Orchestrator) -> cairn_models::session::mcp::Mcp
     )
 }
 
+/// The transport that draws Codex's image offer: image worker threads on the
+/// pooled app-server signed in as the ChatGPT account routing chooses for
+/// `model`, exactly as a Codex completion is routed. Every non-Codex body it
+/// is handed goes over HTTP.
+pub(crate) fn codex_image_transport(
+    orch: &Orchestrator,
+    project_id: Option<&str>,
+    model: &str,
+) -> Result<cairn_models::image::codex::CodexImages, String> {
+    let selection = select_routed_serving_identity(
+        orch,
+        RoutedProvider::Codex,
+        project_id,
+        Some(model),
+        SelectionMode::Serve,
+    )?;
+    let codex_auth = selection
+        .identity
+        .codex_auth
+        .as_ref()
+        .ok_or_else(|| crate::backends::codex::NO_CODEX_CREDENTIAL.to_string())?;
+    let (server, _) = acquire_pooled_server(orch, codex_auth)?;
+    Ok(cairn_models::image::codex::CodexImages {
+        session_host: orch.models_runtime().host.clone(),
+        server: server.router(),
+        // The pooled server runs in Cairn's Codex home, where each worker
+        // removes what Codex saved for its thread.
+        codex_home: super::cairn_codex_home(),
+        http: cairn_models::image::http::HttpImages,
+    })
+}
+
 /// The pooled app-server that serves `codex_auth`, started if none is running,
 /// and the Cairn account its login belongs to. Records nothing: a caller with
 /// a run reports a failure there itself.

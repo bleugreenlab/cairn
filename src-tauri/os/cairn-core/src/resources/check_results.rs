@@ -297,6 +297,25 @@ fn verdict_platform_line(
     }
 }
 
+/// The runtime the run measured, beside its platform: a check's runtime
+/// instruments are part of its verdict environment, so two rows a Bun release
+/// apart are different verdicts and the page says which one this is. Every
+/// probed toolchain is named, since the page shows what the run measured
+/// rather than which of it the check declared.
+fn verdict_runtime_line(observation: &CheckResultObservationProjection) -> String {
+    let runtime = cairn_checkenv::runtime_versions(
+        cairn_checkenv::RUNTIME_INSTRUMENTS.iter().copied(),
+        observation.toolchain_fingerprint.as_deref(),
+    );
+    if observation.toolchain_fingerprint.is_none() {
+        return "- Runtime: unrecorded".to_string();
+    }
+    format!(
+        "- Runtime: {}",
+        crate::execution::check_identity::runtime_label(&runtime)
+    )
+}
+
 fn render_observation(
     project: &str,
     revision: &str,
@@ -385,6 +404,7 @@ fn render_observation_page(
             observation.verdict, observation.exit_code
         ),
         verdict_platform_line(observation, ran_on),
+        verdict_runtime_line(observation),
         format!("- Complete: {}", observation.complete),
         format!("- Reusable: {}", observation.reusable),
         format!(
@@ -973,6 +993,41 @@ mod tests {
             None,
         );
         assert!(body.contains("- Verdict platform: unrecorded\n"), "{body}");
+    }
+
+    /// The runtime the row was produced under is named right under its
+    /// platform, so a Bun 1.3.14 red and a Bun 1.4.4 green read as the two
+    /// different verdicts they are.
+    #[test]
+    fn observation_names_its_runtime_beside_its_platform() {
+        let mut observation = cached_observation();
+        observation.toolchain_fingerprint = Some(
+            "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x86_64-unknown-linux-gnu;bun=1.3.14"
+                .into(),
+        );
+        let query =
+            parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
+        let render = |observation: &CheckResultObservationProjection| {
+            render_observation(
+                "cairn",
+                "main",
+                "target-commit",
+                &query,
+                observation,
+                None,
+                Some("bginf-sp1 (linux/x86_64)"),
+            )
+        };
+        let body = render(&observation);
+        assert!(
+            body.contains(
+                "- Verdict platform: linux/x86_64 · ran on bginf-sp1 (linux/x86_64)\n\
+                 - Runtime: rustc 1.97.1 (8bab26f4f 2026-07-14), bun 1.3.14\n"
+            ),
+            "{body}"
+        );
+        observation.toolchain_fingerprint = None;
+        assert!(render(&observation).contains("- Runtime: unrecorded\n"));
     }
 
     /// Specimen c47874ea's split and a tiered lane's three passes, as the page

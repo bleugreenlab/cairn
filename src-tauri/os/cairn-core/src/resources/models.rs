@@ -451,6 +451,87 @@ pub(crate) fn render_embed(facet: &dyn Models) -> String {
     out
 }
 
+/// The image or speak door: what it takes, the workspace default that stands
+/// in for an omitted model, and the offers that serve the verb now.
+pub(crate) fn render_media(
+    facet: &dyn Models,
+    verb: VerbKind,
+    workspace_default: Option<&str>,
+) -> String {
+    let (title, uri, takes, setting, section) = match verb {
+        VerbKind::Image => (
+            "Image",
+            "cairn://models/image",
+            "prompt, model?, provider?, count?, size? | aspect? | orientation?, references?, edit?, extras?",
+            "imageModel",
+            "Images",
+        ),
+        _ => (
+            "Speak",
+            "cairn://models/speak",
+            "text, voice, model?, provider?, format?, speed?, instructions?",
+            "speechModel",
+            "Speech",
+        ),
+    };
+    let mut out = format!(
+        "# {title}\n\nInvoke with `run`, not `write`: `run({{commands:[{{target:\"{uri}\", payload:{{args_json:{{{takes}}}}}}}]}})`. What it makes is stored in the calling run's issue (or thread) and the reply names its address; read cairn://help or the affordances below for the full shape.\n\n"
+    );
+    match workspace_default
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        Some(model) => {
+            let _ = writeln!(
+                out,
+                "Default: `{model}` (`{setting}`), used when a request names no model.\n"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "Default: none. A request that names no model is refused until `{setting}` is set (Settings → Models → {section}).\n"
+            );
+        }
+    }
+    let catalog = match facet.catalog(&ModelScope::workspace()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let _ = writeln!(out, "Could not read the catalog: {error}");
+            return out;
+        }
+    };
+    let offers = catalog.offers_serving(verb);
+    if offers.is_empty() {
+        let _ = writeln!(
+            out,
+            "Nothing in this workspace serves {} yet. {}",
+            verb.as_str(),
+            cairn_models::interface::fixes(verb)
+        );
+        return out;
+    }
+    let _ = writeln!(out, "## Offers that serve {}\n", verb.as_str());
+    for offer in offers {
+        let declared = match &offer.served.verb {
+            Verb::Image(capabilities) => capabilities.summary(),
+            Verb::Speak(capabilities) => capabilities.to_string(),
+            _ => "declares nothing".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "- `{}` on `{}` ({}) — {declared}",
+            offer.model, offer.provider, offer.served.wire
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nEach offer in full: `cairn://models/catalog?serves={}`.",
+        verb.as_str()
+    );
+    out
+}
+
 /// How many of a provider's completion models the complete page names before
 /// pointing at the catalog.
 const COMPLETE_MODELS_NAMED: usize = 5;

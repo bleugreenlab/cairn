@@ -55,8 +55,8 @@ pub use project::{
     read_declared_check, CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector,
     CheckTree, CheckVocabulary, CheckWhen, CreateProject, DeclaredCheck, HumanBaseMergePolicy,
     HumanBaseMergePolicyError, HumanBaseMergePolicyReadState, HumanBaseMergePolicyState,
-    MainCadence, MoveProject, PopulateConfig, Project, ProjectRemoteStatus, TerminalCommand,
-    UnsupportedCheck, UpdateProject, VERDICT_PLATFORMS,
+    MainCadence, MoveProject, PopulateConfig, Project, ProjectRemoteStatus, RuntimeInstrument,
+    TerminalCommand, UnsupportedCheck, UpdateProject, VERDICT_PLATFORMS,
 };
 
 // Context token snapshot types

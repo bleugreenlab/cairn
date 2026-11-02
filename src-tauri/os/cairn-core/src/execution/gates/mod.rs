@@ -5,6 +5,7 @@
 //! beside the status projection that reads them.
 
 pub mod authoring;
+pub mod capacity;
 pub mod census;
 pub mod sweep;
 pub mod vocabulary;

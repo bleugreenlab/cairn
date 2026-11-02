@@ -245,6 +245,11 @@ pub(crate) struct HeadVerdictKeys<'a> {
     /// The head scope infrastructure rows are bound to.
     pub job_id: &'a str,
     pub commit_sha: &'a str,
+    /// The toolchain identity this head's checks expect to run under
+    /// (`cairn_checkenv::expected_toolchain_identity_in` at its checkout). A
+    /// verdict borrowed from another tree answers only if it was produced
+    /// under the same versions of the check's runtime instruments.
+    pub expected_toolchain: &'a str,
 }
 
 /// [`HeadVerdictKeys`] holding its own copies, for a read whose future must own
@@ -255,6 +260,7 @@ pub(crate) struct OwnedHeadVerdictKeys {
     pub input_hashes: std::collections::HashMap<String, String>,
     pub job_id: String,
     pub commit_sha: String,
+    pub expected_toolchain: String,
 }
 
 impl OwnedHeadVerdictKeys {
@@ -264,6 +270,7 @@ impl OwnedHeadVerdictKeys {
             input_hashes: &self.input_hashes,
             job_id: &self.job_id,
             commit_sha: &self.commit_sha,
+            expected_toolchain: &self.expected_toolchain,
         }
     }
 }
@@ -275,6 +282,7 @@ impl From<HeadVerdictKeys<'_>> for OwnedHeadVerdictKeys {
             input_hashes: head.input_hashes.clone(),
             job_id: head.job_id.to_string(),
             commit_sha: head.commit_sha.to_string(),
+            expected_toolchain: head.expected_toolchain.to_string(),
         }
     }
 }
@@ -3040,6 +3048,8 @@ pub(crate) async fn get_check_observation_public_handle_conn(
 pub(crate) struct ObservationMachine {
     pub executor_id: Option<String>,
     pub verdict_platform: Option<String>,
+    /// The toolchain the run measured, which names its runtime.
+    pub toolchain_fingerprint: Option<String>,
 }
 
 pub(crate) fn get_check_observation_machine(
@@ -3053,13 +3063,14 @@ pub(crate) fn get_check_observation_machine(
             let keys = keys.clone();
             Box::pin(async move {
                 let mut rows = conn.query(
-                    "SELECT executor_id, verdict_platform FROM check_result_observations WHERE project_id=?1 AND id=?2",
+                    "SELECT executor_id, verdict_platform, toolchain_fingerprint FROM check_result_observations WHERE project_id=?1 AND id=?2",
                     params![keys.0.as_str(), keys.1.as_str()],
                 ).await?;
                 match rows.next().await? {
                     Some(row) => Ok(Some(ObservationMachine {
                         executor_id: row.opt_text(0)?,
                         verdict_platform: row.opt_text(1)?,
+                        toolchain_fingerprint: row.opt_text(2)?,
                     })),
                     None => Ok(None),
                 }
@@ -4834,6 +4845,7 @@ mod tests {
             input_hashes,
             job_id: job_id.to_string(),
             commit_sha: commit_sha.to_string(),
+            expected_toolchain: String::new(),
         };
         run_checkpoint_cache_db(async move {
             db.read(move |conn| {
@@ -6219,6 +6231,7 @@ mod tests {
             input_hashes: [("rust".to_string(), "input-rust".to_string())].into(),
             job_id: "job-1".to_string(),
             commit_sha: "commit-1".to_string(),
+            expected_toolchain: String::new(),
         };
         let reader = db.clone();
         let lanes = run_checkpoint_cache_db(async move {

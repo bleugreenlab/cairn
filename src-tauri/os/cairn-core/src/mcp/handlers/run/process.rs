@@ -182,6 +182,8 @@ async fn run_model_door(
         ModelDoor::Complete => {
             run_complete(orch, run_context, header, args, timeout, interrupt).await
         }
+        ModelDoor::Image => super::media::run_image(orch, run_context, header, args, timeout).await,
+        ModelDoor::Speak => super::media::run_speak(orch, run_context, header, args, timeout).await,
     }
 }
 

@@ -259,16 +259,17 @@ pub(super) async fn questions(
 ) -> Result<Vec<OperatorNotification>, String> {
     let sql = format!(
         "SELECT p.id, p.run_id, p.questions, p.created_at, p.answered_at, p.withdrawn_at,
-                p.response IS NULL AND p.withdrawn_at IS NULL AND p.turn_id = j.current_turn_id
-                    AND j.status NOT IN ('complete', 'failed', 'cancelled')
-                    AND COALESCE(pt.state, '') <> 'cancelled',
+                {open_prompt},
                 {PLACE_COLUMNS}
            FROM prompts p
            JOIN runs r ON r.id = p.run_id
            JOIN jobs j ON j.id = COALESCE(p.job_id, r.job_id)
            LEFT JOIN turns pt ON pt.id = p.turn_id
            {PLACE_JOINS}
-          WHERE j.project_id = ?1"
+          WHERE j.project_id = ?1",
+        // One definition of an open question, shared with the execution
+        // queue's fleet cap, which frees exactly these jobs' slots.
+        open_prompt = cairn_db::open_prompt_sql!()
     );
     let rows = open_and_recent(
         db,
@@ -340,7 +341,7 @@ pub(super) async fn permissions(
     let rows = open_and_recent(
         db,
         &sql,
-        "pr.status = 'pending'",
+        cairn_db::pending_permission_sql!(),
         "pr.status <> 'pending' AND pr.responded_at >= ?2",
         &project.id,
         since,

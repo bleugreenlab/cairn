@@ -1018,6 +1018,12 @@ pub enum CairnResource {
     /// The `complete` verb's door: a `run` target that sends one completion
     /// to the model the caller names.
     ModelsComplete,
+    /// The `image` verb's door: a `run` target that draws with the model the
+    /// caller names, else the workspace's `imageModel`.
+    ModelsImage,
+    /// The `speak` verb's door: a `run` target that speaks one clip with the
+    /// model the caller names, else the workspace's `speechModel`.
+    ModelsSpeak,
     /// Every provider account, with its live usage windows and no secret.
     ModelsAccounts,
     /// One provider account by id.
@@ -1205,6 +1211,8 @@ impl CairnResource {
             Self::ModelsDecide => ResourceKind::ModelsDecide,
             Self::ModelsEmbed => ResourceKind::ModelsEmbed,
             Self::ModelsComplete => ResourceKind::ModelsComplete,
+            Self::ModelsImage => ResourceKind::ModelsImage,
+            Self::ModelsSpeak => ResourceKind::ModelsSpeak,
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,

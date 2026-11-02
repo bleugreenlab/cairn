@@ -946,6 +946,16 @@ pub(crate) const SETTINGS_MAX_OPEN_TRIAGE_ISSUES: KeySpec = KeySpec::new(
     KeyType::Int,
     "cap on simultaneously open memory-triage issues for one exact scope",
 );
+pub(crate) const SETTINGS_MAX_CONCURRENT_EXECUTIONS: KeySpec = KeySpec::new(
+    "maxConcurrentExecutions",
+    KeyType::Int,
+    "executions in progress across this runner's fleet before new starts hold for a slot (minimum 1)",
+);
+pub(crate) const SETTINGS_MAX_OPEN_CHILDREN_PER_THREAD: KeySpec = KeySpec::new(
+    "maxOpenChildrenPerThread",
+    KeyType::Int,
+    "open started children a thread may have before its new starts hold (minimum 1)",
+);
 pub(crate) const SETTINGS_PENDING_MEMORY_THRESHOLD: KeySpec = KeySpec::new(
     "pendingMemoryThreshold",
     KeyType::Int,

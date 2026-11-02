@@ -433,13 +433,23 @@ fn check_run_request(
 }
 
 /// The machine a verdict came from, as the result line names it: `fedora
-/// (linux)` for a run, `reused from fedora (linux)` for a cached verdict.
+/// (linux, bun 1.4.4)` for a run, `reused from fedora (linux, bun 1.4.4)` for a
+/// cached verdict. The runtime rides with the platform because a verdict under
+/// one Bun is not the verdict under another.
 fn check_machine_clause(result: &serde_json::Value, disposition: &str) -> Option<String> {
     let executor = result.get("executor").filter(|value| !value.is_null())?;
     let name = executor.get("name").and_then(serde_json::Value::as_str)?;
-    let machine = match executor.get("os").and_then(serde_json::Value::as_str) {
-        Some(os) => format!("{name} ({os})"),
-        None => name.to_string(),
+    let described = [
+        executor.get("os").and_then(serde_json::Value::as_str),
+        result.get("runtime").and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let machine = if described.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} ({})", described.join(", "))
     };
     Some(if disposition == "cached" {
         format!("reused from {machine}")
@@ -1387,6 +1397,38 @@ mod tests {
         assert!(
             noted.starts_with("batch pin os=windows not applied: no\ncache miss"),
             "{noted}"
+        );
+    }
+
+    /// A verdict names the runtime it was produced under beside its platform,
+    /// so a red under one Bun and a reused green under another read as
+    /// different verdicts rather than as a regression.
+    #[test]
+    fn check_run_response_names_the_runtime_beside_the_platform() {
+        let rendered = render_check_run_response(
+            &serde_json::json!({
+                "ok": true,
+                "result": {
+                    "checkName": "api",
+                    "commitSha": "abc1234567890",
+                    "disposition": "cached",
+                    "passed": true,
+                    "verified": true,
+                    "reusable": true,
+                    "observationRef": "cairn://p/CAIRN/check-observations/h",
+                    "ranAt": "t",
+                    "executor": { "name": "bginf-sp2", "os": "linux" },
+                    "verdictPlatform": "linux",
+                    "runtime": "bun 1.4.4",
+                }
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            rendered.contains("(cached) · reused from bginf-sp2 (linux, bun 1.4.4) ·"),
+            "{rendered}"
         );
     }
 

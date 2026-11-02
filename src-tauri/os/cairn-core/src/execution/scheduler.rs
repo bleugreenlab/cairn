@@ -594,7 +594,11 @@ async fn fire_scheduled_recipe(
         // supersede; `NewAttempt` is a no-op on a fresh issue's lineage.
         crate::execution::recipe::LaunchIntent::NewAttempt,
         &[],
+        // Nobody is present at a schedule's trigger: the execution queue's caps
+        // apply, and the held start releases on its own when they clear.
+        crate::execution::recipe::Starter::Capped,
     )?;
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
 
     // Wake any in-flight `watch` on the issue, mirroring the executions-collection
     // start path.

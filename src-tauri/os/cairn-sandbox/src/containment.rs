@@ -1150,16 +1150,15 @@ fn measure_page_call_crossings(
             }
         });
 
-    // On macOS the page-call profile closes the process table by denying
-    // `process-info*`, the `kern.procargs2`/`kern.procargs` sysctls, and
-    // `signal` for other processes. Which Seatbelt operation actually gates
+    // On macOS the page-call profile refuses `process-info*` and `signal`
+    // against every process but the batch's own. Whether anything gates
     // `KERN_PROCARGS2` is a fact about the OS, not an assumption the profile
-    // text can make, so a crossing proves it per machine: a sibling carries a
-    // marker only another process's environment read could see, and the
-    // page-call child must fail both to read it and to signal that sibling. A
-    // leak, or an inability to run the crossing at all, folds into the
-    // filesystem witness so the edge is Ambient or Unmeasured and the machine
-    // is never a candidate. Linux is not exposed on this axis: `/proc/<pid>/
+    // text can make (macOS 26.6 gates it under no Seatbelt rule at all), so a
+    // crossing proves it per machine: a sibling carries a marker only another
+    // process's environment read could see, and the page-call child must fail
+    // both to read it and to signal that sibling. A leak, or an inability to
+    // run the crossing at all, folds into the filesystem witness so the edge
+    // is Ambient or Unmeasured and the machine is never a candidate. Linux is not exposed on this axis: `/proc/<pid>/
     // environ` is outside the read allow-list and signals are scoped (ABI 6).
     #[cfg(target_os = "macos")]
     let filesystem = filesystem
@@ -1720,6 +1719,27 @@ mod tests {
         false
     }
 
+    /// macOS answers `KERN_PROCARGS2` for any same-uid process under every
+    /// Seatbelt profile, `(deny default)` included (cairn/5787 comment 2), so
+    /// the process-table crossing leaks on every Mac and no profile can close
+    /// it. Skipped only when that read is the measured verdict, so any other
+    /// crossing still fails the test; the production probe is unchanged and
+    /// keeps refusing page calls on these machines.
+    #[cfg(target_os = "macos")]
+    fn skip_page_call_probe_where_procargs_is_ungated(
+        test: &str,
+        measured: &PageCallMeasurement,
+    ) -> bool {
+        if matches!(&measured.filesystem, Ok(crossing) if crossing.crossing_permitted
+            && crossing.detail.contains("read the environment of another same-uid process"))
+        {
+            eprintln!("skipping {test}: Seatbelt does not gate KERN_PROCARGS2 on this macOS");
+            cairn_common::skip_ledger::record_skip(test, "procargs-ungated");
+            return true;
+        }
+        false
+    }
+
     /// A fenced test process cannot plant a probe home in `$HOME`. The
     /// production probe runs unconfined, so this is a test-lane gap only.
     #[cfg(unix)]
@@ -1761,6 +1781,13 @@ mod tests {
             return;
         }
         if skip_page_call_probe_when_home_unplantable(
+            "the_page_call_probe_refuses_every_planted_crossing_live",
+            &measured,
+        ) {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if skip_page_call_probe_where_procargs_is_ungated(
             "the_page_call_probe_refuses_every_planted_crossing_live",
             &measured,
         ) {

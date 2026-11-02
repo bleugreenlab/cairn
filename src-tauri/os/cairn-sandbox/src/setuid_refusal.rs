@@ -301,11 +301,15 @@ mod tests {
     /// The shapes above are pinned against the real kernel: under the agent
     /// floor or a check lane's inherited profile the shell is already refused
     /// `ps`; in an unconfined developer shell the smallest profile is applied.
-    /// Either way `pgrep` runs where `ps` cannot.
+    /// Either way `pgrep` runs where `ps` cannot. `pgrep` leaves out its own
+    /// ancestors, so the shell is never a match for itself; the script plants
+    /// a background process, finds it by pid (its name may still be the
+    /// shell's until it execs), then kills and reaps it. Nothing else running
+    /// on the machine can change the answer.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_profiled_shell_is_refused_ps_but_not_pgrep_live() {
-        let script = "pgrep -x -U \"$(id -u)\" sh >/dev/null; echo pgrep=$?; /bin/ps -p $$ -o pid=";
+        let script = "/bin/sleep 30 & planted=$!; pgrep -U \"$(id -u)\" | grep -qx \"$planted\"; echo pgrep=$?; kill $planted; wait $planted 2>/dev/null; /bin/ps -p $$ -o pid=";
         let args = vec!["-c".to_string(), script.to_string()];
         let (program, args) = if crate::current_process_is_confined() {
             ("/bin/sh".to_string(), args)

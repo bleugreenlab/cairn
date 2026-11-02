@@ -107,6 +107,10 @@ pub(crate) async fn start_execution_from_collection(
         crate::models::TriggerType::Manual,
         intent,
         &after,
+        // A write to an executions collection is never the operator's own
+        // start: agents, the CLI, issue creation and the route dispatcher all
+        // file here, so the execution queue's caps apply (cairn/5802).
+        crate::execution::recipe::Starter::Capped,
     )?;
 
     // Creation-time evaluation: a gate filed after something that has already
@@ -188,6 +192,27 @@ fn held_filing_summary(
     evaluation: &crate::execution::gates::sweep::Evaluation,
     next_attempt: Option<Option<i64>>,
 ) -> String {
+    // Held only by the execution queue: no gate the filer wrote is unmet.
+    if evaluation.waiting.is_empty() && !evaluation.held_by.is_empty() {
+        let reasons: Vec<String> = evaluation
+            .held_by
+            .iter()
+            .map(|block| block.reason())
+            .collect();
+        let attempt = match next_attempt {
+            Some(Some(owner)) => format!(
+                " Filing it fenced nothing: execution {owner} keeps running until this one \
+                 starts."
+            ),
+            _ => String::new(),
+        };
+        return format!(
+            "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}') HELD: {}. It starts \
+             on its own when that clears, oldest held first; only the operator's Start now skips \
+             the queue.{attempt} Watch {issue_uri} for its place in line.",
+            reasons.join("; ")
+        );
+    }
     let exit =
         format!(" Release it early with patch {{release:true}} on {issue_uri}/executions/{seq}.");
     let attempt = match next_attempt {
@@ -263,23 +288,42 @@ pub(crate) async fn patch_execution_gates(
                 return Ok(format!("Would release {label} early"));
             }
             let principal = acting_principal(orch, request).await;
-            let released = crate::execution::gates::sweep::release(
+            // Skips the authored `after:` gates only: a cap governs what a
+            // thread starts itself (tenet 1319), so a release written through
+            // a resource never skips one, whoever writes it.
+            let outcome = crate::execution::gates::sweep::release(
                 orch,
                 &execution_id,
                 crate::execution::gates::sweep::ReleaseCause::Override {
                     principal: principal.clone(),
+                    scope: crate::execution::gates::sweep::OverrideScope::AuthoredGates,
                 },
             )
             .await?;
-            if !released {
-                return Err(format!(
+            match outcome {
+                crate::execution::gates::sweep::ReleaseOutcome::Released => Ok(format!(
+                    "Released {label} early: its jobs exist and it advances now. Recorded as an \
+                     override by {principal}."
+                )),
+                crate::execution::gates::sweep::ReleaseOutcome::HeldByCap(blocks) => {
+                    if let Err(error) =
+                        crate::execution::gates::capacity::refresh_places(orch).await
+                    {
+                        log::warn!("could not rewrite the queue's places in line: {error}");
+                    }
+                    let reasons: Vec<String> = blocks.iter().map(|block| block.reason()).collect();
+                    Ok(format!(
+                        "Released the `after:` gates on {label} (recorded as an override by \
+                         {principal}), but it is still held by the execution queue: {}. It \
+                         starts on its own when that clears; only the operator's Start now \
+                         skips a cap.",
+                        reasons.join("; ")
+                    ))
+                }
+                crate::execution::gates::sweep::ReleaseOutcome::NotHeld => Err(format!(
                     "{label} was released by someone else first; it is already running"
-                ));
+                )),
             }
-            Ok(format!(
-                "Released {label} early: its jobs exist and it advances now. Recorded as an \
-                 override by {principal}."
-            ))
         }
         GatePatch::Replace(clauses) => {
             let gates = crate::execution::gates::authoring::canonical_predicates(

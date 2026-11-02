@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use crate::config::project_settings::CheckCommand;
+use crate::config::project_settings::{CheckCommand, RuntimeInstrument};
 use crate::execution::inputs::InputSelector;
 
 pub const CHECK_RESULT_SCHEMA_VERSION: u32 = 1;
@@ -81,6 +81,59 @@ pub fn verdict_environment_names(check: &CheckCommand) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// The toolchains whose version is part of this check's verdict environment, by
+/// the name the probe records them under, sorted.
+///
+/// Undeclared resolves to every probed toolchain. A check that says nothing
+/// about its runtime may depend on any of it, and the two ways to be wrong are
+/// not symmetric: keying on a toolchain the check never touches costs a re-run
+/// when that toolchain changes version, while omitting one it does touch lets a
+/// verdict from one version answer for another (a Bun 1.4.4 green standing in
+/// for a Bun 1.3.14 run in which 101 tests fail).
+pub fn verdict_runtime_instruments(check: &CheckCommand) -> Vec<&'static str> {
+    let mut instruments = check
+        .runtime
+        .as_deref()
+        .unwrap_or(RuntimeInstrument::ALL)
+        .iter()
+        .map(|instrument| instrument.as_str())
+        .collect::<Vec<_>>();
+    instruments.sort_unstable();
+    instruments.dedup();
+    instruments
+}
+
+/// The runtime a lookup expects `check`'s verdict to have been produced under:
+/// each of its instruments at the version `expected_toolchain` (from
+/// `cairn_checkenv::expected_toolchain_identity_in`) records.
+///
+/// Every reuse key is built from this function, whether the caller holds a
+/// plan (which carries the result, computed when it was planned) or the
+/// configured check, so the two entry points cannot disagree.
+pub fn expected_verdict_runtime(
+    check: &CheckCommand,
+    expected_toolchain: &str,
+) -> Vec<(String, String)> {
+    cairn_checkenv::runtime_versions(verdict_runtime_instruments(check), Some(expected_toolchain))
+}
+
+/// A runtime as a reader sees it beside a platform: `rustc 1.97.1 (8bab26f4f
+/// 2026-07-14), bun 1.4.4`. One label wherever a verdict names where it came
+/// from, so a red and the green it is compared with can be read side by side.
+pub fn runtime_label(runtime: &[(String, String)]) -> String {
+    runtime
+        .iter()
+        .map(|(instrument, version)| {
+            // rustc's version line already opens with its own name.
+            match version.strip_prefix(instrument.as_str()) {
+                Some(rest) if rest.starts_with(' ') => format!("{instrument}{rest}"),
+                _ => format!("{instrument} {version}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The platform families whose result for this check the project counts as its
@@ -333,6 +386,64 @@ mod tests {
         let impact = identity("command: bun run x\nimpact: [a/**]\ntree: impact\n");
         assert_eq!(implicit, full);
         assert_ne!(implicit, impact);
+    }
+
+    /// Every instrument a check can declare is one the probe measures, so a
+    /// declared instrument never reads as `unrecorded` on a run that was
+    /// measured.
+    #[test]
+    fn every_declarable_instrument_is_probed() {
+        for instrument in RuntimeInstrument::ALL {
+            assert!(
+                cairn_checkenv::RUNTIME_INSTRUMENTS.contains(&instrument.as_str()),
+                "{instrument:?} is declarable but never probed"
+            );
+        }
+        let mut probed = cairn_checkenv::RUNTIME_INSTRUMENTS.to_vec();
+        probed.sort_unstable();
+        assert_eq!(
+            verdict_runtime_instruments(&command("command: bun run lint\n")),
+            probed,
+            "an undeclared check depends on every probed toolchain"
+        );
+    }
+
+    #[test]
+    fn declared_instruments_are_the_whole_runtime_and_empty_means_none() {
+        assert_eq!(
+            verdict_runtime_instruments(&command("command: bun run test:api\nruntime: [bun]\n")),
+            ["bun"]
+        );
+        assert_eq!(
+            verdict_runtime_instruments(&command(
+                "command: cargo check\nruntime: [rustc, rustc]\n"
+            )),
+            ["rustc"]
+        );
+        assert!(
+            verdict_runtime_instruments(&command("command: node --test\nruntime: []\n")).is_empty()
+        );
+        let expected = expected_verdict_runtime(
+            &command("command: bun run test:api\nruntime: [bun]\n"),
+            "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x;bun=1.3.14",
+        );
+        assert_eq!(expected, vec![("bun".to_string(), "1.3.14".to_string())]);
+    }
+
+    #[test]
+    fn a_runtime_label_names_each_instrument_once() {
+        let runtime = cairn_checkenv::runtime_versions(
+            ["rustc", "bun"],
+            Some("rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x;bun=1.3.14"),
+        );
+        assert_eq!(
+            runtime_label(&runtime),
+            "rustc 1.97.1 (8bab26f4f 2026-07-14), bun 1.3.14"
+        );
+        assert_eq!(
+            runtime_label(&cairn_checkenv::runtime_versions(["bun"], None)),
+            "bun unrecorded"
+        );
     }
 
     #[test]

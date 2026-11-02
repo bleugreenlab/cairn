@@ -295,6 +295,7 @@ mod tests {
             executor: None,
             verdict_environment: Vec::new(),
             verdict_platforms: None,
+            runtime: None,
             fixes: false,
             main_cadence: None,
             tree: Default::default(),

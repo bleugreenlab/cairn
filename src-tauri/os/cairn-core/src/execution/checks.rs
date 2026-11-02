@@ -1398,6 +1398,11 @@ pub struct ManualConfiguredCheckResult {
     pub executor: Option<CheckMachine>,
     /// The platform the recorded verdict counts from.
     pub verdict_platform: Option<String>,
+    /// The versions of the check's runtime instruments the recorded verdict was
+    /// produced under (`bun 1.4.4`), named beside its machine because they are
+    /// part of which verdict it is. `None` when the check declares no
+    /// instrument or no observation was recorded.
+    pub runtime: Option<String>,
     /// Why the batch pin this request inherited was not applied, when it
     /// contradicted the suite's configuration.
     pub placement_note: Option<String>,
@@ -1502,6 +1507,7 @@ fn manual_configured_check_result(
         output_tail: outcome.output_tail,
         executor: None,
         verdict_platform: None,
+        runtime: None,
         placement_note: None,
         placement_unmet: None,
     }
@@ -1849,6 +1855,7 @@ pub(crate) async fn execute_check_contract(
     if let Some(crate::execution::cache::ObservationMachine {
         executor_id,
         verdict_platform,
+        toolchain_fingerprint,
     }) = result.observation_id.as_deref().and_then(|id| {
         crate::execution::cache::get_check_observation_machine(db.clone(), &project_id, id)
             .ok()
@@ -1861,6 +1868,19 @@ pub(crate) async fn execute_check_contract(
                 .unwrap_or_else(|| "unknown".to_string()),
         });
         result.verdict_platform = verdict_platform;
+        let runtime = keyed
+            .first()
+            .map(|(plan, _)| {
+                cairn_checkenv::runtime_versions(
+                    plan.verdict_runtime
+                        .iter()
+                        .map(|(instrument, _)| instrument.as_str()),
+                    toolchain_fingerprint.as_deref(),
+                )
+            })
+            .unwrap_or_default();
+        result.runtime = (!runtime.is_empty())
+            .then(|| crate::execution::check_identity::runtime_label(&runtime));
     }
     result.placement_unmet = unmet_placement(
         &placement,
@@ -8434,6 +8454,17 @@ fn fresh_observation_write(
             }
         });
     let (verdict_platform, verdict_arch) = observed_on.verdict_platform();
+    let toolchain_fingerprint = observed_on.toolchain_fingerprint();
+    let declared_environment = provenance
+        .and_then(|meta| meta.verdict_environment_hash.clone())
+        .or_else(|| {
+            coordinator_ran.then(|| {
+                cairn_checkenv::verdict_environment_hash(
+                    plan.verdict_environment_names.clone(),
+                    |name| std::env::var(name).ok(),
+                )
+            })
+        });
     FreshCheckObservationWrite {
         sealed_coordinate: sealed_coordinate.clone(),
         id: uuid::Uuid::new_v4().to_string(),
@@ -8447,16 +8478,11 @@ fn fresh_observation_write(
         environment_fingerprint,
         verdict_platform,
         verdict_arch,
-        verdict_environment_hash: provenance
-            .and_then(|meta| meta.verdict_environment_hash.clone())
-            .or_else(|| {
-                coordinator_ran.then(|| {
-                    cairn_checkenv::verdict_environment_hash(
-                        plan.verdict_environment_names.clone(),
-                        |name| std::env::var(name).ok(),
-                    )
-                })
-            }),
+        verdict_environment_hash: observed_verdict_environment_hash(
+            plan,
+            declared_environment,
+            toolchain_fingerprint.as_deref(),
+        ),
         exit_code,
         verdict: if exit_code == 0 { "passed" } else { "failed" }.to_string(),
         failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
@@ -8491,7 +8517,7 @@ fn fresh_observation_write(
         executor_started_at_unix_ms: provenance.map(|meta| meta.started_at_unix_ms as i64),
         executor_finished_at_unix_ms: provenance.map(|meta| meta.finished_at_unix_ms as i64),
         runner_build_id: Some(cairn_checkenv::implementation_identity().to_string()),
-        toolchain_fingerprint: observed_on.toolchain_fingerprint(),
+        toolchain_fingerprint,
         output_tail: output_tail.to_string(),
         target_results_json: parsed.and_then(|result| serde_json::to_string(result).ok()),
         selection: parsed.map(|result| result.selection.clone()),
@@ -8509,6 +8535,31 @@ fn fresh_observation_write(
         tests,
         infra_reset_scopes,
     }
+}
+
+/// The verdict environment a fresh observation is stored under: the declared
+/// variables as the run saw them, extended by the versions its own run measured
+/// for the plan's runtime instruments.
+///
+/// The versions come from the toolchain the command ran under, never from the
+/// plan's expectation: a lane the planner expected on Bun 1.4.4 that landed on a
+/// Bun 1.3.14 machine is a Bun 1.3.14 verdict, and only a lookup expecting
+/// 1.3.14 may be answered by it. `None` when the run reported no declared
+/// environment (an older executor, a lost report), which no lookup matches.
+fn observed_verdict_environment_hash(
+    plan: &CheckPlan,
+    declared: Option<String>,
+    toolchain_fingerprint: Option<&str>,
+) -> Option<String> {
+    declared.map(|declared| {
+        let measured = cairn_checkenv::runtime_versions(
+            plan.verdict_runtime
+                .iter()
+                .map(|(instrument, _)| instrument.as_str()),
+            toolchain_fingerprint,
+        );
+        cairn_checkenv::verdict_environment_with_runtime(&declared, &measured)
+    })
 }
 
 /// Stream prefix of a main-cadence lane. Its observations record
@@ -8670,9 +8721,11 @@ pub(crate) fn reusable_verdict_for_plan(
 
 /// [`reusable_verdict_for_plan`] for a caller holding the configured check
 /// rather than a plan, under no environment overrides: exactly the question a
-/// turn-end wave asks (`TURN_END_EFFECTIVE_ENV` is empty). A plan's trust set
-/// and verdict-environment names are derived from its configured check by these
-/// same two functions, so the two entry points cannot disagree.
+/// turn-end wave asks (`TURN_END_EFFECTIVE_ENV` is empty). A plan's trust set,
+/// verdict-environment names, and runtime are derived from its configured check
+/// by these same functions, so the two entry points cannot disagree.
+/// `expected_toolchain` is the toolchain identity the plan would have been
+/// planned under (`cairn_checkenv::expected_toolchain_identity_in`).
 ///
 /// It reads on a connection the caller already holds, so a projection asking
 /// it for every check makes all of its reads in one transaction.
@@ -8682,10 +8735,14 @@ pub(crate) async fn reusable_verdict_for_check_conn(
     name: &str,
     check: &CheckCommand,
     input_hash: &str,
+    expected_toolchain: &str,
 ) -> Option<ReusedCheckVerdict> {
-    let environment_hash = cairn_checkenv::verdict_environment_hash(
-        crate::execution::check_identity::verdict_environment_names(check),
-        |variable| std::env::var(variable).ok(),
+    let environment_hash = cairn_checkenv::verdict_environment_with_runtime(
+        &cairn_checkenv::verdict_environment_hash(
+            crate::execution::check_identity::verdict_environment_names(check),
+            |variable| std::env::var(variable).ok(),
+        ),
+        &crate::execution::check_identity::expected_verdict_runtime(check, expected_toolchain),
     );
     reusable_verdict_conn(
         conn,
@@ -8790,7 +8847,8 @@ async fn reusable_verdict_conn(
 /// is the verdict the engine would serve for the check's input hash without
 /// executing it, decided by the engine's own reuse predicate
 /// ([`reusable_verdict_for_check_conn`]): reusable, complete, inside the check's
-/// verdict-platform trust set, same runner and verdict environment. A weaker
+/// verdict-platform trust set, same runner and verdict environment, produced
+/// under the runtime the head expects. A weaker
 /// cross-tree rule would mark a lane answered that the next wave would
 /// actually run, and a waiter would settle on it while that wave was running.
 ///
@@ -8844,8 +8902,15 @@ pub(crate) async fn head_verdicts_conn(
         let Some(check) = checks.get(name) else {
             continue;
         };
-        let Some(reused) =
-            reusable_verdict_for_check_conn(conn, project_id, name, check, input_hash).await
+        let Some(reused) = reusable_verdict_for_check_conn(
+            conn,
+            project_id,
+            name,
+            check,
+            input_hash,
+            head.expected_toolchain,
+        )
+        .await
         else {
             continue;
         };
@@ -9669,14 +9734,16 @@ fn effective_verdict_environment_hash(
     plan: &CheckPlan,
     effective_env: &[(String, String)],
 ) -> String {
-    cairn_checkenv::verdict_environment_hash(plan.verdict_environment_names.clone(), |name| {
-        effective_env
-            .iter()
-            .rev()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var(name).ok())
-    })
+    let declared =
+        cairn_checkenv::verdict_environment_hash(plan.verdict_environment_names.clone(), |name| {
+            effective_env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var(name).ok())
+        });
+    cairn_checkenv::verdict_environment_with_runtime(&declared, &plan.verdict_runtime)
 }
 
 fn needs_execution(
@@ -13842,6 +13909,7 @@ cairn-common = { path = "../cairn-common" }
             resource_class: CheckResourceClass::Shared,
             verdict_environment_names: Vec::new(),
             verdict_platforms: vec![crate::execution::check_identity::gating_platform().to_string()],
+            verdict_runtime: Vec::new(),
             verdict_executor_ids: None,
             config_error: None,
         };
@@ -14223,6 +14291,7 @@ cairn-common = { path = "../cairn-common" }
             executor: None,
             verdict_environment: Vec::new(),
             verdict_platforms: None,
+            runtime: None,
             fixes: false,
             main_cadence: None,
             tree: Default::default(),
@@ -18212,7 +18281,30 @@ cairn-common = { path = "../cairn-common" }
             verdict_executor_ids: None,
             config_error: None,
             verdict_platforms: vec![crate::execution::check_identity::gating_platform().to_string()],
+            verdict_runtime: crate::execution::check_identity::expected_verdict_runtime(
+                &configured,
+                test_expected_toolchain(),
+            ),
         }
+    }
+
+    /// The toolchain a test plan expects: the one a check this test process
+    /// runs itself records, so a test's own fresh verdict answers its own
+    /// later lookup the way it would in production.
+    fn test_expected_toolchain() -> &'static str {
+        check_toolchain_identity()
+    }
+
+    /// A declared-variable hash as a test plan's lookup keys it: extended by
+    /// every probed instrument at [`test_expected_toolchain`]'s version.
+    fn test_verdict_environment(declared: &str) -> String {
+        cairn_checkenv::verdict_environment_with_runtime(
+            declared,
+            &cairn_checkenv::runtime_versions(
+                cairn_checkenv::RUNTIME_INSTRUMENTS.iter().copied(),
+                Some(test_expected_toolchain()),
+            ),
+        )
     }
 
     fn batch_item(command: &str, resource_class: CheckResourceClass) -> PlannedCheckBatchItem {
@@ -18397,15 +18489,14 @@ cairn-common = { path = "../cairn-common" }
             executor_started_at_unix_ms: None,
             executor_finished_at_unix_ms: None,
             runner_build_id: Some(cairn_checkenv::implementation_identity().to_string()),
-            toolchain_fingerprint: None,
+            toolchain_fingerprint: Some(test_expected_toolchain().to_string()),
             output_tail: "cached".to_string(),
             target_results_json: None,
             tests: Vec::new(),
             verdict_platform: Some(crate::execution::check_identity::gating_platform().to_string()),
             verdict_arch: Some(std::env::consts::ARCH.to_string()),
-            verdict_environment_hash: Some(cairn_checkenv::verdict_environment_hash(
-                Vec::<String>::new(),
-                |_| None,
+            verdict_environment_hash: Some(test_verdict_environment(
+                &cairn_checkenv::verdict_environment_hash(Vec::<String>::new(), |_| None),
             )),
         }
     }
@@ -18459,7 +18550,7 @@ cairn-common = { path = "../cairn-common" }
                     })
                 }),
                 sandbox: None,
-                toolchain_fingerprint: None,
+                toolchain_fingerprint: reports.then(|| test_expected_toolchain().to_string()),
                 containment: None,
                 stop: None,
                 cell_origin: None,
@@ -19284,6 +19375,206 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert!(serialized.contains("check-observations"));
     }
 
+    /// Two machines' toolchains, a Bun release apart and on one pinned rustc:
+    /// bginf-sp1 and bginf-sp2 as cairn://posts/505 measured them.
+    const BUN_1_3_14: &str =
+        "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x86_64-unknown-linux-gnu;bun=1.3.14";
+    const BUN_1_4_4: &str =
+        "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x86_64-unknown-linux-gnu;bun=1.4.4";
+    const BUN_DECLARED: &str = "command: bun run test:api\nruntime: [bun]\n";
+    const RUSTC_DECLARED: &str = "command: cargo check --locked\nruntime: [rustc]\n";
+
+    /// `yaml`'s check planned in a checkout whose toolchain is `expected`.
+    fn runtime_plan(yaml: &str, expected: &str) -> CheckPlan {
+        let configured: CheckCommand = serde_yaml::from_str(yaml).unwrap();
+        let mut planned = plan("lane", &configured.command);
+        planned.verdict_runtime =
+            crate::execution::check_identity::expected_verdict_runtime(&configured, expected);
+        planned
+    }
+
+    /// A green verdict for `planned`, recorded the way the production writer
+    /// records one whose run measured `toolchain`, on its own machine.
+    fn green_measured_under(
+        planned: &CheckPlan,
+        id: &str,
+        toolchain: &str,
+        ran_at: i64,
+    ) -> FreshCheckObservationWrite {
+        let mut observation =
+            reusable_observation_for(&planned.name, "input-runtime", format!("env-{id}"));
+        observation.id = id.to_string();
+        observation.public_handle = format!("handle-{id}");
+        observation.ran_at = ran_at;
+        observation.toolchain_fingerprint = Some(toolchain.to_string());
+        observation.verdict_environment_hash = observed_verdict_environment_hash(
+            planned,
+            Some(cairn_checkenv::verdict_environment_hash(
+                planned.verdict_environment_names.clone(),
+                |name| std::env::var(name).ok(),
+            )),
+            Some(toolchain),
+        );
+        observation
+    }
+
+    /// One `yaml` check, green under Bun 1.3.14 and, later, green under Bun
+    /// 1.4.4, both on rustc 1.97.1. Each machine plans the check as its own
+    /// checkout resolves it, and its run measures that same toolchain.
+    async fn greens_a_bun_release_apart(yaml: &str) -> Arc<LocalDb> {
+        let db = cache_db().await;
+        let older =
+            green_measured_under(&runtime_plan(yaml, BUN_1_3_14), "obs-1314", BUN_1_3_14, 100);
+        let newer = green_measured_under(&runtime_plan(yaml, BUN_1_4_4), "obs-144", BUN_1_4_4, 200);
+        record_fresh_check_observation(db.clone(), older).unwrap();
+        record_fresh_check_observation(db.clone(), newer).unwrap();
+        db
+    }
+
+    fn answered_by(db: &Arc<LocalDb>, yaml: &str, expected: &str) -> Option<String> {
+        reusable_verdict_for_plan(
+            db.clone(),
+            "project-a",
+            &runtime_plan(yaml, expected),
+            "input-runtime",
+            &[],
+        )
+        .map(|reused| reused.source_observation_id)
+    }
+
+    /// The specimen behind cairn/5790: a Bun check's verdict is a fact about
+    /// the Bun it ran under. A lookup expecting Bun 1.3.14 is answered by the
+    /// 1.3.14 row even though the 1.4.4 row is newer, one expecting 1.4.4 by the
+    /// 1.4.4 row, and one expecting a Bun neither ran under by nothing.
+    #[tokio::test]
+    async fn a_bun_declared_check_is_answered_only_under_its_own_bun() {
+        let db = greens_a_bun_release_apart(BUN_DECLARED).await;
+        assert_eq!(
+            answered_by(&db, BUN_DECLARED, BUN_1_3_14).as_deref(),
+            Some("obs-1314")
+        );
+        assert_eq!(
+            answered_by(&db, BUN_DECLARED, BUN_1_4_4).as_deref(),
+            Some("obs-144")
+        );
+        assert_eq!(
+            answered_by(
+                &db,
+                BUN_DECLARED,
+                &BUN_1_4_4.replace("bun=1.4.4", "bun=1.3.13")
+            ),
+            None,
+            "no Bun 1.3.13 run exists to answer for one"
+        );
+    }
+
+    /// The other half of the ruling: only declared instruments separate
+    /// verdicts. A rustc check's two rows, identical but for the Bun beside
+    /// them, are interchangeable, so either expectation is answered by the
+    /// newest.
+    #[tokio::test]
+    async fn a_rustc_declared_check_is_not_separated_by_bun() {
+        let db = greens_a_bun_release_apart(RUSTC_DECLARED).await;
+        assert_eq!(
+            answered_by(&db, RUSTC_DECLARED, BUN_1_3_14).as_deref(),
+            Some("obs-144")
+        );
+        assert_eq!(
+            answered_by(&db, RUSTC_DECLARED, BUN_1_4_4).as_deref(),
+            Some("obs-144")
+        );
+        assert_eq!(
+            answered_by(
+                &db,
+                RUSTC_DECLARED,
+                &BUN_1_4_4.replace("rustc 1.97.1", "rustc 1.98.0")
+            ),
+            None,
+            "its own instrument still separates it"
+        );
+    }
+
+    /// A check that declares nothing is keyed on every probed toolchain, so a
+    /// Bun change separates it too.
+    #[tokio::test]
+    async fn an_undeclared_check_is_separated_by_every_probed_toolchain() {
+        const UNDECLARED: &str = "command: bun run check:dead\n";
+        let db = greens_a_bun_release_apart(UNDECLARED).await;
+        assert_eq!(
+            answered_by(&db, UNDECLARED, BUN_1_3_14).as_deref(),
+            Some("obs-1314")
+        );
+    }
+
+    /// The `/checks` projection borrows from another tree by the same key: a
+    /// head expecting Bun 1.3.14 shows the 1.3.14 green, never the newer 1.4.4
+    /// one, and a reuse hit records its commit alias against the row it
+    /// reused.
+    #[tokio::test]
+    async fn the_head_listing_and_commit_alias_borrow_only_same_runtime_verdicts() {
+        let db = greens_a_bun_release_apart(BUN_DECLARED).await;
+        let configured: CheckCommand = serde_yaml::from_str(BUN_DECLARED).unwrap();
+        let checks = HashMap::from([("lane".to_string(), configured)]);
+        let input_hashes = HashMap::from([("lane".to_string(), "input-runtime".to_string())]);
+        let shown = |expected: &str| {
+            head_verdicts(
+                db.clone(),
+                "project-a",
+                &checks,
+                crate::execution::cache::HeadVerdictKeys {
+                    tree_hash: "tree-other",
+                    input_hashes: &input_hashes,
+                    job_id: "job-other",
+                    commit_sha: "commit-other",
+                    expected_toolchain: expected,
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|lane| lane.row.toolchain_fingerprint)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(BUN_1_3_14), vec![Some(BUN_1_3_14.to_string())]);
+        assert_eq!(shown(BUN_1_4_4), vec![Some(BUN_1_4_4.to_string())]);
+        assert!(shown(&BUN_1_4_4.replace("bun=1.4.4", "bun=1.3.13")).is_empty());
+
+        let plans = vec![(
+            runtime_plan(BUN_DECLARED, BUN_1_3_14),
+            "input-runtime".to_string(),
+        )];
+        let results = run_planned_checks_at_commit(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-target",
+            &plans,
+            "turn-checks:job-target",
+            CheckExecMode::Shared,
+            None,
+            |_index, _command, _stream_id| async move { exec_ok(Some(0), "must not run") },
+            |_| {},
+        )
+        .await;
+        assert!(
+            results[0].cached,
+            "the 1.3.14 green answers without running"
+        );
+        let aliased = db
+            .query_one(
+                "SELECT source_observation_id FROM check_result_commit_aliases
+                  WHERE project_id='project-a' AND commit_sha='commit-target' AND check_name='lane'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(aliased, "obs-1314");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn configured_verdict_environment_requires_an_exact_cache_hit() {
@@ -19547,6 +19838,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 input_hashes: &input_hashes,
                 job_id,
                 commit_sha,
+                expected_toolchain: test_expected_toolchain(),
             },
         )
         .unwrap()

@@ -33,7 +33,7 @@ use crate::models::ExecutionGate;
 use crate::storage::{DbResult, RowExt};
 
 const GATE_COLUMNS: &str = "id, execution_id, seq, predicate_json, satisfied_at, \
-                            last_outcome, foreclosed_at, foreclosed_reason, created_at";
+                            last_outcome, foreclosed_at, foreclosed_reason, created_at, detail";
 
 fn gate_from_row(row: &cairn_db::turso::Row) -> DbResult<ExecutionGate> {
     Ok(ExecutionGate {
@@ -46,6 +46,7 @@ fn gate_from_row(row: &cairn_db::turso::Row) -> DbResult<ExecutionGate> {
         foreclosed_at: row.opt_i64(6)?,
         foreclosed_reason: row.opt_text(7)?,
         created_at: row.i64(8)?,
+        detail: row.opt_text(9)?,
     })
 }
 
@@ -190,7 +191,9 @@ pub async fn latch_foreclosure_conn(
 ///
 /// `override_json` is `Some` only for a manual early release, recording the
 /// acting principal. Its presence is what distinguishes "the predicates came
-/// true" from "someone decided not to wait".
+/// true" from "someone decided not to wait". A `None` keeps an override already
+/// recorded while the execution was still held: an early release the execution
+/// queue's caps outlasted is still why its authored gates stopped holding it.
 ///
 /// A SUPERSEDED execution is never released: a later launch on its issue took
 /// the attempt while it was still waiting, so starting it now would put two
@@ -209,7 +212,8 @@ pub async fn release_execution_conn(
         .execute(
             concat!(
                 "UPDATE executions
-                    SET released_at = ?2, release_override_json = ?3
+                    SET released_at = ?2,
+                        release_override_json = COALESCE(?3, release_override_json)
                   WHERE id = ?1 AND released_at IS NULL
                     AND EXISTS (SELECT 1 FROM executions e WHERE e.id = ?1 AND ",
                 cairn_db::live_execution_sql!(),
@@ -220,15 +224,23 @@ pub async fn release_execution_conn(
         .await?)
 }
 
-/// `(gates, unsatisfied gates)` for one execution as stored right now, read in
-/// the caller's transaction. This is what authorizes an automatic release: the
-/// sweep's own view of the gates is a snapshot from before it resolved them,
-/// and a gate patch may have landed since.
+/// `(authored gates, unsatisfied authored gates)` for one execution as stored
+/// right now, read in the caller's transaction. This is what authorizes an
+/// automatic release: the sweep's own view of the gates is a snapshot from
+/// before it resolved them, and a gate patch may have landed since.
+///
+/// Capacity gates are not counted. They are level conditions re-decided inside
+/// the release itself, never latched in advance, so they cannot authorize or
+/// refuse a release from here.
 pub async fn gate_counts_conn(conn: &Connection, execution_id: &str) -> DbResult<(i64, i64)> {
     let mut rows = conn
         .query(
-            "SELECT COUNT(*), COALESCE(SUM(satisfied_at IS NULL), 0)
-               FROM execution_gates WHERE execution_id = ?1",
+            concat!(
+                "SELECT COUNT(*), COALESCE(SUM(g.satisfied_at IS NULL), 0)
+                   FROM execution_gates g WHERE g.execution_id = ?1 AND NOT (",
+                cairn_db::capacity_gate_sql!(),
+                ")"
+            ),
             params![execution_id],
         )
         .await?;
@@ -261,6 +273,171 @@ pub async fn set_gate_seq_conn(conn: &Connection, gate_id: &str, seq: i64) -> Db
     Ok(())
 }
 
+/// Where capacity gates sit in an execution's gate order: after every authored
+/// gate, so a census lists what the filer wrote first.
+pub const CAPACITY_GATE_SEQ_BASE: i64 = 1_000;
+
+/// Record that a capacity cap holds this execution now: its row exists, reads
+/// `no_evidence`, and carries `detail` as its reason. Inserted on first block;
+/// a later block rewrites the same row, so its `created_at` (the execution's
+/// place in line) survives the queue moving. Returns whether anything changed.
+pub async fn hold_capacity_gate_conn(
+    conn: &Connection,
+    execution_id: &str,
+    predicate_json: &str,
+    seq: i64,
+    detail: &str,
+    now: i64,
+) -> DbResult<bool> {
+    let updated = conn
+        .execute(
+            "UPDATE execution_gates
+                SET last_outcome = 'no_evidence', detail = ?3
+              WHERE execution_id = ?1 AND predicate_json = ?2 AND satisfied_at IS NULL
+                AND (last_outcome IS NOT 'no_evidence' OR detail IS NOT ?3)",
+            params![execution_id, predicate_json, detail],
+        )
+        .await?;
+    if updated > 0 {
+        return Ok(true);
+    }
+    let exists = conn
+        .query(
+            "SELECT 1 FROM execution_gates WHERE execution_id = ?1 AND predicate_json = ?2",
+            params![execution_id, predicate_json],
+        )
+        .await?
+        .next()
+        .await?
+        .is_some();
+    if exists {
+        return Ok(false);
+    }
+    let id = cairn_common::ids::mint_child(execution_id);
+    conn.execute(
+        "INSERT INTO execution_gates (
+             id, execution_id, seq, predicate_json, last_outcome, detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, 'no_evidence', ?5, ?6)",
+        params![id.as_str(), execution_id, seq, predicate_json, detail, now],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Record that a capacity cap no longer blocks this execution, WITHOUT
+/// latching it: a free slot can be taken again before the release, so the row
+/// stays (keeping the execution's place in line) and reads `satisfied` until
+/// the release latches it or a later decision blocks it again. Returns whether
+/// anything changed.
+pub async fn clear_capacity_gate_conn(
+    conn: &Connection,
+    execution_id: &str,
+    predicate_json: &str,
+) -> DbResult<bool> {
+    Ok(conn
+        .execute(
+            "UPDATE execution_gates SET last_outcome = 'satisfied', detail = NULL
+              WHERE execution_id = ?1 AND predicate_json = ?2 AND satisfied_at IS NULL
+                AND last_outcome IS NOT 'satisfied'",
+            params![execution_id, predicate_json],
+        )
+        .await?
+        > 0)
+}
+
+/// Latch every capacity gate of an execution being released, in the release's
+/// own transaction: from here on its caps are history, not holds.
+pub async fn latch_capacity_gates_conn(
+    conn: &Connection,
+    execution_id: &str,
+    now: i64,
+) -> DbResult<()> {
+    conn.execute(
+        concat!(
+            "UPDATE execution_gates
+                SET satisfied_at = COALESCE(satisfied_at, ?2), last_outcome = 'satisfied'
+              WHERE id IN (SELECT g.id FROM execution_gates g WHERE g.execution_id = ?1 AND ",
+            cairn_db::capacity_gate_sql!(),
+            ")"
+        ),
+        params![execution_id, now],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Rewrite a capacity gate's reason, as its place in line moves.
+pub async fn set_gate_detail_conn(conn: &Connection, gate_id: &str, detail: &str) -> DbResult<()> {
+    conn.execute(
+        "UPDATE execution_gates SET detail = ?2 WHERE id = ?1",
+        params![gate_id, detail],
+    )
+    .await?;
+    Ok(())
+}
+
+/// One capacity gate that is holding a still-releasable execution right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockingCapacityGate {
+    pub gate_id: String,
+    pub execution_id: String,
+    pub issue_id: Option<String>,
+    pub predicate_json: String,
+    pub detail: Option<String>,
+    /// When the execution first held on this cap: its place in line.
+    pub created_at: i64,
+}
+
+/// Every capacity gate currently blocking an execution that can still start
+/// and is not waiting on an authored gate of its own (such an execution has no
+/// place in line until its own gates clear).
+pub async fn list_blocking_capacity_gates_conn(
+    conn: &Connection,
+) -> DbResult<Vec<BlockingCapacityGate>> {
+    let mut rows = conn
+        .query(
+            concat!(
+                "SELECT g.id, g.execution_id, e.issue_id, g.predicate_json, g.detail, g.created_at
+                   FROM execution_gates g
+                   JOIN executions e ON e.id = g.execution_id
+                  WHERE g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
+                cairn_db::capacity_gate_sql!(),
+                " AND ",
+                cairn_db::awaiting_release_sql!(),
+                " AND NOT ",
+                cairn_db::awaits_authored_gate_sql!(),
+                " ORDER BY g.created_at, g.id"
+            ),
+            (),
+        )
+        .await?;
+    let mut gates = Vec::new();
+    while let Some(row) = rows.next().await? {
+        gates.push(BlockingCapacityGate {
+            gate_id: row.text(0)?,
+            execution_id: row.text(1)?,
+            issue_id: row.opt_text(2)?,
+            predicate_json: row.text(3)?,
+            detail: row.opt_text(4)?,
+            created_at: row.i64(5)?,
+        });
+    }
+    Ok(gates)
+}
+
+/// An execution `e`'s place in the queue (see [`HeldExecution::held_since`]):
+/// the oldest capacity row's `created_at`, else the oldest gate's.
+#[macro_export]
+macro_rules! held_since_sql {
+    () => {
+        concat!(
+            "COALESCE((SELECT MIN(g.created_at) FROM execution_gates g WHERE g.execution_id = e.id AND ",
+            cairn_db::capacity_gate_sql!(),
+            "), (SELECT MIN(first_gate.created_at) FROM execution_gates first_gate WHERE first_gate.execution_id = e.id))"
+        )
+    };
+}
+
 /// One execution that is held right now: it has gates and has not been
 /// released.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +446,12 @@ pub struct HeldExecution {
     pub issue_id: Option<String>,
     pub issue_number: Option<i64>,
     pub seq: Option<i64>,
+    /// Its place in the queue: when it first held on a CAPACITY cap, or, with
+    /// no capacity row yet, its oldest gate's `created_at`. The sweep releases
+    /// oldest-held first across every database. An execution that waited on
+    /// its `after:` gates takes a place in the queue only when those clear, so
+    /// this agrees with the place in line a capacity row renders.
+    pub held_since: i64,
 }
 
 /// Every held execution that can still be released, in RELEASE order:
@@ -285,7 +468,9 @@ pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldEx
     let mut rows = conn
         .query(
             concat!(
-                "SELECT e.id, e.issue_id, i.number, e.seq
+                "SELECT e.id, e.issue_id, i.number, e.seq, ",
+                held_since_sql!(),
+                "
                    FROM executions e
                    LEFT JOIN issues i ON i.id = e.issue_id
                   WHERE ",
@@ -302,6 +487,7 @@ pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldEx
             issue_id: row.opt_text(1)?,
             issue_number: row.opt_i64(2)?,
             seq: row.opt_i64(3)?,
+            held_since: row.opt_i64(4)?.unwrap_or(0),
         });
     }
     Ok(held)

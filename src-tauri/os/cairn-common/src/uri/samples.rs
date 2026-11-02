@@ -451,6 +451,8 @@ resource_samples! {
     ModelsDecide {} => Parser,
     ModelsEmbed {} => Parser,
     ModelsComplete {} => Parser,
+    ModelsImage {} => Parser,
+    ModelsSpeak {} => Parser,
     ModelsAccounts {} => Parser,
     ModelsAccount { id: "acc_7b58857c-d1db".to_string() } => Parser,
     ModelsUsage {} => Parser,

@@ -609,11 +609,16 @@ pub(super) async fn read_project_threads(db: &LocalDb, project_key: &str) -> Str
 /// Only the overview: every addressable descendant is normalized onto its
 /// node-family resource by [`delegate_thread_descendant`] before dispatch
 /// reaches here, so there is no sub-path interpretation left in this function.
+///
+/// `default_open_children` is the workspace's limit on a thread's open started
+/// children (the execution queue's focus cap), which a thread's own
+/// `max_open_children` overrides.
 pub(super) async fn read_thread(
     db: &LocalDb,
     project_key: &str,
     name: &str,
     path: &[String],
+    default_open_children: i64,
 ) -> String {
     let project_key = project_key.to_owned();
     let name = name.to_owned();
@@ -694,7 +699,12 @@ pub(super) async fn read_thread(
             }
             let mut children = match conn
                 .query(
-                    "SELECT number, title FROM issues WHERE parent_thread_id = ?1 ORDER BY number",
+                    concat!(
+                        "SELECT i.id, i.number, i.title, CASE WHEN ",
+                        cairn_db::open_thread_child_sql!(),
+                        " THEN 1 ELSE 0 END
+                           FROM issues i WHERE i.parent_thread_id = ?1 ORDER BY i.number"
+                    ),
                     params![id.as_str()],
                 )
                 .await
@@ -702,19 +712,68 @@ pub(super) async fn read_thread(
                 Ok(v) => v,
                 Err(_) => return Ok(out),
             };
-            out.push_str("\n## Children\n\n");
-            let mut any = false;
+            let mut listed = Vec::new();
             while let Ok(Some(row)) = children.next().await {
-                let (Ok(number), Ok(title)) = (row.i64(0), row.text(1)) else {
+                let (Ok(issue_id), Ok(number), Ok(title), Ok(open)) =
+                    (row.text(0), row.i64(1), row.text(2), row.i64(3))
+                else {
                     continue;
                 };
-                any = true;
+                listed.push((issue_id, number, title, open != 0));
+            }
+            drop(children);
+            let ids: Vec<String> = listed.iter().map(|(id, ..)| id.clone()).collect();
+            let mut held = crate::execution::gates::census::gated_executions_for_issues_conn(
+                conn, &ids,
+            )
+            .await
+            .unwrap_or_default();
+            let own_limit = crate::storage::query_opt_i64_conn(
+                conn,
+                "SELECT max_open_children FROM threads WHERE id = ?1",
+                params![id.as_str()],
+            )
+            .await
+            .ok()
+            .flatten();
+
+            out.push_str("\n## Children\n\n");
+            // The execution queue's focus cap: started children not yet merged
+            // or closed. A held start on this thread waits behind them.
+            let open: Vec<String> = listed
+                .iter()
+                .filter(|(.., open)| *open)
+                .map(|(_, number, ..)| number.to_string())
+                .collect();
+            let limit = own_limit.unwrap_or(default_open_children).max(1);
+            if !listed.is_empty() {
+                let at_cap = if open.len() as i64 >= limit {
+                    ": new starts hold until one merges or closes"
+                } else {
+                    ""
+                };
+                let numbers = if open.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", open.join(", "))
+                };
                 out.push_str(&format!(
-                    "- [{number} — {title}](cairn://p/{}/{number})\n",
+                    "Open children: {} of {limit}{numbers}{at_cap}\n\n",
+                    open.len()
+                ));
+            }
+            for (issue_id, number, title, _) in &listed {
+                let held_line = held
+                    .remove(issue_id)
+                    .and_then(|gated| gated.held.into_iter().next())
+                    .map(|execution| format!(" · {}", execution.line))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "- [{number} — {title}](cairn://p/{}/{number}){held_line}\n",
                     project.project_key
                 ));
             }
-            if !any {
+            if listed.is_empty() {
                 out.push_str("None.\n");
             }
             Ok(out)
@@ -1074,7 +1133,7 @@ mod tests {
             "the stored epoch must not reach the surface: {collection}"
         );
 
-        let overview = read_thread(&db, "thr", "design-review", &[]).await;
+        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
         // A thread's heading is its one identifier, the same string its URI
         // carries and its pane header shows.
         assert!(overview.contains("# design-review"));
@@ -1106,7 +1165,7 @@ mod tests {
             "a closed thread is not offered as somewhere to address: {collection}"
         );
 
-        let overview = read_thread(&db, "thr", "retired-topic", &[]).await;
+        let overview = read_thread(&db, "thr", "retired-topic", &[], 4).await;
         assert!(overview.contains("# retired-topic"));
         assert!(overview.contains("Status: closed"));
         assert!(
@@ -1306,7 +1365,7 @@ mod tests {
             "a read must never mint a thread's session job"
         );
 
-        let overview = read_thread(&db, "thr", "design-review", &[]).await;
+        let overview = read_thread(&db, "thr", "design-review", &[], 4).await;
         assert!(overview.contains("Live session: not started"), "{overview}");
     }
 

@@ -194,19 +194,28 @@ pub(crate) fn sbpl_profile(policy: &SandboxPolicy, floor: &OperatorCredentialFlo
     // A page-call batch shares its uid with every other batch and resident on
     // the machine, and each of those carries its own relay capability in its
     // environment. `(allow default)` leaves the process table open, so the
-    // fence must close the three ways one process reads or disturbs another:
-    // `process-info*` (enumeration and `proc_pidinfo`), the `kern.procargs2`
-    // / `kern.procargs` sysctls (which return a process's whole argument and
-    // environment block), and `signal`. Scoped to the allow-list read shape,
-    // which is the page-call policy and nothing else; a runtime that needs
-    // its own procargs fails the probe's positive control and its machine is
-    // refused rather than admitted, so denying it even for self is fail-closed.
+    // page-call profile refuses `process-info*` (`proc_pidinfo` and friends)
+    // and `signal` against every process but the batch's own. The filter is
+    // `(require-not (target self))` because `(target others)` matches nothing:
+    // under it a sibling is still signalled and still inspected. One cost is
+    // that a batch cannot signal its own children, which a page call never
+    // needs, because it is stopped from outside. Scoped to the allow-list read
+    // shape, which is the page-call policy and nothing else, so an ordinary
+    // batch still finds and stops its own dev server with `pgrep` and `kill`.
+    //
+    // No rule here closes `KERN_PROCARGS2`/`KERN_PROCARGS`, which return a
+    // same-uid process's whole argument and environment block: Seatbelt does
+    // not gate them, under `(deny sysctl-read)` or even `(deny default)`, so a
+    // sysctl rule would only claim a closure it does not make. The page-call
+    // probe's process-table crossing measures that read on every machine and
+    // refuses page calls wherever it leaks.
     if matches!(policy.reach.reads, crate::ReadScope::Allowlist { .. }) {
-        out.push_str(&format!("(deny process-info* (target others) {report})\n"));
         out.push_str(&format!(
-            "(deny sysctl-read (sysctl-name \"kern.procargs2\") (sysctl-name \"kern.procargs\") {report})\n"
+            "(deny process-info* (require-not (target self)) {report})\n"
         ));
-        out.push_str(&format!("(deny signal (target others) {report})\n"));
+        out.push_str(&format!(
+            "(deny signal (require-not (target self)) {report})\n"
+        ));
     }
 
     // The operator credential boundary goes after every allow above, so no
@@ -1058,12 +1067,16 @@ mod tests {
         assert!(profile.contains(&format!("(deny network* {report})")));
         assert!(profile.contains("(allow network-outbound (remote ip \"localhost:4321\"))"));
         assert!(profile.contains(&format!("(deny mach-lookup {report})")));
-        // The process table is closed to other processes: no page batch reads
-        // a sibling batch's environment (and its relay capability) through
-        // `process-info*` or `kern.procargs2`, and none signals another.
-        assert!(profile.contains(&format!("(deny process-info* (target others) {report})")));
-        assert!(profile.contains("(sysctl-name \"kern.procargs2\")"));
-        assert!(profile.contains(&format!("(deny signal (target others) {report})")));
+        // The process table is closed to every process but the batch's own:
+        // no page batch inspects or signals a sibling. `(target others)`
+        // matches nothing, so it must never be the filter that does this.
+        assert!(profile.contains(&format!(
+            "(deny process-info* (require-not (target self)) {report})"
+        )));
+        assert!(profile.contains(&format!(
+            "(deny signal (require-not (target self)) {report})"
+        )));
+        assert!(!profile.contains("(target others)"), "{profile}");
         // The read deny precedes the allow-list, and the floor is last.
         let deny_at = profile.find(&read_deny).unwrap();
         assert!(deny_at < profile.find(reads).unwrap());
@@ -1078,6 +1091,11 @@ mod tests {
         assert!(!ordinary.contains("(deny file-read* (subpath \"/\")"));
         assert!(!ordinary.contains("network"));
         assert!(!ordinary.contains("mach-lookup"));
+        // The process-table denies are the page call's alone: every agent
+        // batch runs the ordinary profile, and finds and stops its own dev
+        // server with `pgrep` and `kill`.
+        assert!(!ordinary.contains("process-info"), "{ordinary}");
+        assert!(!ordinary.contains("(deny signal"), "{ordinary}");
     }
 
     #[test]

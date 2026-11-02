@@ -11,6 +11,33 @@ use cairn_db::turso::params;
 const OLD: &str = "086a7e5f0000000000000000000000000000000a";
 const NEW: &str = "9e77a2750000000000000000000000000000000b";
 
+/// The runner and the server once ran different startup catch-ups and only the
+/// server's started the poll, so production ran without it. Both boot
+/// schedules now call `spawn_default_advance_reconcile` (pinned by
+/// `maintenance_policies_cover_the_same_inventory` in cairn-transport's
+/// `runtime.rs`); this pins that the poll starts there and nowhere else, so a
+/// second catch-up cannot quietly leave it out again.
+#[test]
+fn the_poll_starts_from_the_catch_up_both_boot_schedules_share() {
+    const ORCHESTRATOR: &str = include_str!("mod.rs");
+    assert_eq!(
+        ORCHESTRATOR.matches("spawn_base_branch_poll(").count(),
+        1,
+        "the polling floor must have exactly one start site"
+    );
+    let catch_up = ORCHESTRATOR
+        .split("pub fn spawn_default_advance_reconcile(")
+        .nth(1)
+        .unwrap()
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    assert!(
+        catch_up.contains("base_branch_sync::spawn_base_branch_poll(&orch);"),
+        "the default-advance catch-up must start the polling floor"
+    );
+}
+
 fn at(seconds: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(seconds, 0).unwrap()
 }

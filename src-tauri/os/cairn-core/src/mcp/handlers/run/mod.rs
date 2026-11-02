@@ -12,6 +12,7 @@ mod checks;
 mod commit_barrier;
 pub(crate) mod held;
 mod hygiene;
+mod media;
 mod output;
 mod process;
 mod redact;
@@ -6760,6 +6761,9 @@ impl CallAnswer {
     /// settled with the answer. By the time this returns the arming has
     /// ended either way.
     async fn race_arming(&mut self, deadline: tokio::time::Instant) -> Option<BatchAnswer> {
+        // Built and matched once on this stack frame and never stored, so the
+        // size difference costs nothing a box would save.
+        #[allow(clippy::large_enum_variant)]
         enum Race {
             Armed(Result<Result<DurableRecord, &'static str>, tokio::task::JoinError>),
             Answered(Option<BatchAnswer>),

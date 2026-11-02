@@ -55,6 +55,12 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "externalReplies",
     "gitIdentities",
     "bugReports",
+    // The execution queue's caps (tenets 1288, 1350) are rules written to
+    // constrain what agents start. An agent that could raise them would
+    // release its own way past them, which tenet 1319 forbids, so a write
+    // here is the operator's to approve.
+    "maxConcurrentExecutions",
+    "maxOpenChildrenPerThread",
 ];
 
 /// Sections that are cosmetic or account-local: they change how this install
@@ -181,7 +187,14 @@ mod tests {
 
     #[test]
     fn capability_bearing_settings_require_approval() {
-        for section in ["accounts", "backends", "buildServices", "channels"] {
+        for section in [
+            "accounts",
+            "backends",
+            "buildServices",
+            "channels",
+            "maxConcurrentExecutions",
+            "maxOpenChildrenPerThread",
+        ] {
             assert_eq!(
                 classify(&settings(section), false),
                 AuthorityPolicy::RequiresApproval(AuthorityReason::WorkspaceSettingsCapability),

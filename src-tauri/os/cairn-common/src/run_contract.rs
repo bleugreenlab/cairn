@@ -154,6 +154,8 @@ pub enum ModelDoor {
     Decide,
     Embed,
     Complete,
+    Image,
+    Speak,
 }
 
 impl ModelDoor {
@@ -163,6 +165,8 @@ impl ModelDoor {
             CairnResource::ModelsDecide => Some(Self::Decide),
             CairnResource::ModelsEmbed => Some(Self::Embed),
             CairnResource::ModelsComplete => Some(Self::Complete),
+            CairnResource::ModelsImage => Some(Self::Image),
+            CairnResource::ModelsSpeak => Some(Self::Speak),
             _ => None,
         }
     }
@@ -173,6 +177,8 @@ impl ModelDoor {
             Self::Decide => "cairn://models/decide",
             Self::Embed => "cairn://models/embed",
             Self::Complete => "cairn://models/complete",
+            Self::Image => "cairn://models/image",
+            Self::Speak => "cairn://models/speak",
         }
     }
 
@@ -188,6 +194,9 @@ impl ModelDoor {
             // It is the verb a response item calls, and a reasoning model's
             // answer can take minutes.
             Self::Complete => true,
+            // Generation is slow (the facet allows an image 180 s), and a
+            // long clip speaks for as long as it takes to say.
+            Self::Image | Self::Speak => true,
         }
     }
 }

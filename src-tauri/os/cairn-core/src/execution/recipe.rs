@@ -111,6 +111,21 @@ impl LaunchIntent {
     }
 }
 
+/// Who is starting an execution, as the execution queue judges it
+/// (`execution::gates::capacity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Starter {
+    /// The operator, proven by the invoke's credentials
+    /// (`has_operator_authority`): the composer's start. Takes a slot
+    /// immediately, even over either cap, and still counts toward both.
+    Operator,
+    /// Everyone else: an agent's or the CLI's write to an executions
+    /// collection, an issue created with an execution, the route dispatcher, a
+    /// schedule. Holds while a cap is full, and starts on its own when it
+    /// clears.
+    Capped,
+}
+
 pub fn create_jobs_for_execution(
     orch: &Orchestrator,
     execution_id: &str,
@@ -141,6 +156,9 @@ pub fn create_jobs_for_execution(
 /// every gate is true. The returned execution is `Held`; the caller evaluates it
 /// at once (`gates::sweep::evaluate_execution`) so a gate already true releases
 /// immediately, and the notifier poke here covers a caller that does not.
+///
+/// A [`Starter::Capped`] launch can also come back `Held` with no `after:`
+/// gates at all: the execution queue's caps hold it, the same way.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_recipe_execution_and_advance(
     orch: &Orchestrator,
@@ -155,6 +173,7 @@ pub(crate) fn start_recipe_execution_and_advance(
     trigger_type: TriggerType,
     intent: LaunchIntent,
     after: &[crate::routes::TriggerClause],
+    starter: Starter,
 ) -> Result<Execution, String> {
     let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
     let execution = launch_recipe_execution(
@@ -172,10 +191,11 @@ pub(crate) fn start_recipe_execution_and_advance(
         trigger_type,
         intent,
         &gates,
+        starter,
     )?;
     let execution_change =
         crate::notify::execution_db_change_ids("insert", &execution.id, Some(issue_id), project_id);
-    if !gates.is_empty() {
+    if execution.status == ExecutionStatus::Held {
         let _ = orch.services.emitter.emit("db-change", execution_change);
         crate::execution::gates::sweep::notify_gate_evidence_changed();
         return Ok(execution);
@@ -238,6 +258,10 @@ pub fn start_recipe_execution_impl(
     // `NewAttempt` supersedes every prior canonical execution of the issue in
     // the same transaction that inserts this one.
     intent: LaunchIntent,
+    // cairn/5802: whether the execution queue's caps may hold this start. The
+    // returned execution is `Held` when they do, and the caller must then
+    // create no jobs.
+    starter: Starter,
 ) -> Result<Execution, String> {
     launch_recipe_execution(
         orch,
@@ -254,6 +278,7 @@ pub fn start_recipe_execution_impl(
         trigger_type,
         intent,
         &[],
+        starter,
     )
 }
 
@@ -278,6 +303,7 @@ fn launch_recipe_execution(
     trigger_type: TriggerType,
     intent: LaunchIntent,
     gates: &[String],
+    starter: Starter,
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let this_device = orch.anon_device_manager.device_id();
@@ -497,6 +523,26 @@ fn launch_recipe_execution(
         })?
     };
 
+    // The execution queue (cairn/5802). A capped start with no `after:` gates
+    // is decided here, under the admission lock, which is held until the
+    // insert below commits so no other admission can take the same slot in
+    // between. One with `after:` gates files as before: its caps are decided
+    // when those gates clear, so it takes no place in line while it waits on
+    // something else.
+    let (admission_guard, caps) = if starter == Starter::Capped && gates.is_empty() {
+        let (orch, db, issue) = (orch.clone(), db.clone(), issue_id.to_string());
+        let (guard, admission) = run_recipe_db(async move {
+            let guard = crate::execution::gates::capacity::admission_lock(&orch).await;
+            let admission =
+                crate::execution::gates::capacity::decide(&orch, &db, Some(&issue), None).await?;
+            Ok((guard, admission))
+        })?;
+        (Some(guard), admission.blocks)
+    } else {
+        (None, Vec::new())
+    };
+    let held = !gates.is_empty() || !caps.is_empty();
+
     // Phase 1: sequence, fence, cascade, and insert as one transaction.
     let exec_id = ids::mint_child(issue_id);
     let launch = insert_issue_execution_atomic(
@@ -508,7 +554,7 @@ fn launch_recipe_execution(
             recipe_id: recipe.id.clone(),
             issue_id: Some(issue_id.to_string()),
             project_id: None,
-            status: if gates.is_empty() { "running" } else { "held" }.to_string(),
+            status: if held { "held" } else { "running" }.to_string(),
             started_at: now,
             completed_at: None,
             snapshot: Some(snapshot_json),
@@ -528,8 +574,11 @@ fn launch_recipe_execution(
         LaunchGates {
             predicates: gates.to_vec(),
             satisfied,
+            caps,
+            filed_at: orch.services.clock.now(),
         },
     )?;
+    drop(admission_guard);
 
     // Phase 2, after the fence has committed.
     stop_superseded_agents(orch, &launch.supersessions);
@@ -539,10 +588,10 @@ fn launch_recipe_execution(
         recipe_id: recipe.id,
         issue_id: Some(issue_id.to_string()),
         project_id: None,
-        status: if gates.is_empty() {
-            ExecutionStatus::Running
-        } else {
+        status: if held {
             ExecutionStatus::Held
+        } else {
+            ExecutionStatus::Running
         },
         started_at: now as i64,
         completed_at: None,
@@ -1175,6 +1224,8 @@ pub(crate) fn file_held_with_observed_satisfaction(
         LaunchGates {
             predicates: gates,
             satisfied,
+            caps: Vec::new(),
+            filed_at: orch.services.clock.now(),
         },
     )?;
     Ok(exec_id)
@@ -1184,10 +1235,18 @@ pub(crate) fn file_held_with_observed_satisfaction(
 /// and the subset the satisfaction preflight already observed satisfied. The
 /// two travel together because that observation is what waives a predicate's
 /// wait edge, and it is latched on the gate row in the same transaction.
+///
+/// `caps` are the execution queue's holds the admission decision found, filed
+/// as capacity gate rows in the same transaction. `filed_at` is the services
+/// clock's instant, stamped on every gate row: it is the execution's place in
+/// the queue (oldest held first), so it reads the one clock everything else
+/// does rather than the wall clock.
 #[derive(Default)]
 struct LaunchGates {
     predicates: Vec<String>,
     satisfied: std::collections::HashSet<String>,
+    caps: Vec<crate::execution::gates::capacity::CapBlock>,
+    filed_at: i64,
 }
 
 /// What starting an issue's execution actually did to its lineage.
@@ -1231,6 +1290,8 @@ fn insert_issue_execution_atomic(
     let LaunchGates {
         predicates: gates,
         satisfied,
+        caps,
+        filed_at,
     } = gates;
     if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
         return Err(
@@ -1246,6 +1307,7 @@ fn insert_issue_execution_atomic(
             let actor = actor.clone();
             let gates = gates.clone();
             let satisfied = satisfied.clone();
+            let caps = caps.clone();
             let dbs = dbs.clone();
             let own_db = own_db.clone();
             let mut execution = NewExecution {
@@ -1270,7 +1332,7 @@ fn insert_issue_execution_atomic(
                 )
                 .await?;
                 let seq = crate::execution::canonical::next_seq_conn(conn, &issue_id).await?;
-                let held = !gates.is_empty();
+                let held = !gates.is_empty() || !caps.is_empty();
 
                 // The fence is published BEFORE the successor exists, so there is
                 // never an instant at which two rows read canonical.
@@ -1313,12 +1375,23 @@ fn insert_issue_execution_atomic(
                 execution.seq = Some(seq);
                 execution.lifecycle = lifecycle;
                 insert_execution_conn(conn, &execution).await?;
+                for cap in &caps {
+                    cairn_workflow::gates::store::hold_capacity_gate_conn(
+                        conn,
+                        execution.id.as_str(),
+                        &crate::execution::gates::capacity::capacity_predicate(cap.fact()),
+                        cap.seq(),
+                        &cap.reason(),
+                        filed_at,
+                    )
+                    .await?;
+                }
                 if held {
                     let gate_ids = cairn_workflow::gates::store::insert_gates_conn(
                         conn,
                         execution.id.as_str(),
                         &gates,
-                        now,
+                        filed_at,
                     )
                     .await?;
                     // The satisfaction that waived a wait edge above is latched

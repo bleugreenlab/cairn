@@ -548,6 +548,11 @@ async fn update_issue_row(
                 None => Vec::new(),
             };
 
+            if parent.is_some() {
+                // A reparent moves a child between threads' focus counts, which
+                // may free a held start.
+                crate::execution::gates::sweep::notify_gate_evidence_changed();
+            }
             match parent {
                 // Parent left untouched.
                 None => {}

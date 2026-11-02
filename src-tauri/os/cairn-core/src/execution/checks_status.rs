@@ -1024,6 +1024,7 @@ async fn plan_verdict_rows(
         input_hashes: plan.input_hashes.clone(),
         job_id: job_id.to_string(),
         commit_sha: plan.head.clone(),
+        expected_toolchain: plan.expected_toolchain.clone(),
     };
     db.read(move |conn| {
         Box::pin(async move {
@@ -1219,6 +1220,10 @@ async fn settled_statuses(
             let live_rows = head_tree.as_deref().and_then(|tree_hash| {
                 let input_hashes =
                     check_input_hashes(checks, &inputs, entries.as_deref(), tree_hash);
+                // What a wave planned at this checkout would expect, so the
+                // projection borrows exactly the verdicts the wave would.
+                let expected_toolchain =
+                    cairn_checkenv::expected_toolchain_identity_in(&project_root);
                 let verdicts_started = Instant::now();
                 let rows = head_verdicts(
                     status_db.clone(),
@@ -1229,6 +1234,7 @@ async fn settled_statuses(
                         input_hashes: &input_hashes,
                         job_id: &status_job_id,
                         commit_sha: &logical_head,
+                        expected_toolchain: &expected_toolchain,
                     },
                 );
                 verdicts_elapsed = verdicts_started.elapsed();
@@ -2237,6 +2243,7 @@ mod tests {
             checks: Default::default(),
             applicable_names: Default::default(),
             input_hashes: Default::default(),
+            expected_toolchain: "rustc=r;bun=1.4.4".to_string(),
             unsupported: BTreeMap::from([("landing-compile".to_string(), unsupported)]),
         };
 

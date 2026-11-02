@@ -1211,8 +1211,9 @@ pub(crate) struct CheckVerdictCoordinate {
 ///
 /// The reuse guard supplies `reusable`, `complete`, `failure_kind IS NULL`,
 /// the declared platform set, `result_schema_version`, `runner_build_id`, and
-/// `verdict_environment_hash`. Exactly ONE condition is added on top, and the
-/// content identity is not it.
+/// `verdict_environment_hash` (declared variables and runtime-instrument
+/// versions). Exactly ONE condition is added on top, and the content identity
+/// is not it.
 ///
 /// ## Why there is no whole-tree comparison
 ///
@@ -1297,9 +1298,10 @@ pub(crate) fn check_verdict_evidence(
 /// non-empty selection where it is meaningful, since an empty selection forces
 /// `reusable = 0`.
 ///
-/// KNOWN RESIDUAL: toolchain drift. `toolchain_fingerprint` is recorded and not
-/// enforced by the reuse guard (cairn/4727), so a verdict produced under a
-/// different toolchain than the gated ref would run under still counts.
+/// Toolchain drift is the reuse guard's to refuse, not this function's: the
+/// verdict environment carries the versions of the check's declared runtime
+/// instruments, so a verdict produced under another version of one of them
+/// never reaches here.
 fn selection_is_narrowed(entry: &CheckResultCacheEntry) -> bool {
     entry
         .target_results_json
@@ -1363,14 +1365,17 @@ async fn check_verdict_coordinate(
         &check_platform_identity(),
         check_toolchain_identity(),
     );
+    let expected_toolchain = cairn_checkenv::expected_toolchain_identity_in(&repository);
     Some(CheckVerdictCoordinate {
         project_id,
         check_name: check_name.to_string(),
         input_hash,
         verdict_platforms: verdict_platforms(check),
-        verdict_environment_hash: cairn_checkenv::verdict_environment_hash(
-            verdict_environment_names(check),
-            |name| std::env::var(name).ok(),
+        verdict_environment_hash: cairn_checkenv::verdict_environment_with_runtime(
+            &cairn_checkenv::verdict_environment_hash(verdict_environment_names(check), |name| {
+                std::env::var(name).ok()
+            }),
+            &crate::execution::check_identity::expected_verdict_runtime(check, &expected_toolchain),
         ),
     })
 }

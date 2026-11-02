@@ -84,10 +84,13 @@ pub fn parse_after(value: Option<&Value>, key: &str) -> Result<Vec<TriggerClause
         .iter()
         .enumerate()
         .map(|(index, item)| match item {
-            Value::Object(map) => Ok(map
-                .iter()
-                .map(|(field, value)| (field.clone(), value.clone()))
-                .collect()),
+            Value::Object(map) => {
+                refuse_capacity_fact(map.get("fact").and_then(Value::as_str), key, index)?;
+                Ok(map
+                    .iter()
+                    .map(|(field, value)| (field.clone(), value.clone()))
+                    .collect())
+            }
             Value::String(prose) => Err(format!(
                 "{key}[{index}] is prose (\"{prose}\"); clause objects are the only authoring \
                  form. Corrected: {example}"
@@ -97,6 +100,21 @@ pub fn parse_after(value: Option<&Value>, key: &str) -> Result<Vec<TriggerClause
             )),
         })
         .collect()
+}
+
+/// Refuse a capacity fact by name. The execution queue files those holds itself
+/// and releases them on its own; nobody authors one, and only the operator's
+/// Start now skips one.
+fn refuse_capacity_fact(fact: Option<&str>, key: &str, index: usize) -> Result<(), String> {
+    match fact {
+        Some(fact) if super::capacity::CAPACITY_FACTS.contains(&fact) => Err(format!(
+            "{key}[{index}]: '{fact}' is system-filed: the execution queue holds an execution \
+             behind its caps on its own and releases it on its own; only the operator's Start \
+             now skips one. Gate on an issue, a PR, an artifact, a check, a clock, or a tenet \
+             instead."
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn example_clause() -> String {
@@ -120,6 +138,7 @@ pub fn canonical_predicates(clauses: &[TriggerClause], key: &str) -> Result<Vec<
     let mut seen = HashSet::new();
     let mut predicates = Vec::with_capacity(clauses.len());
     for (index, clause) in clauses.iter().enumerate() {
+        refuse_capacity_fact(clause.get("fact").and_then(Value::as_str), key, index)?;
         vocabulary
             .validate(clause)
             .map_err(|error| format!("{key}[{index}]: {error}"))?;
@@ -506,6 +525,16 @@ pub(crate) async fn replace_gates_observed(
         .await
         .map_err(|error| error.to_string())?;
     let now = orch.services.clock.now();
+    // Removing the last authored gate releases in the same transaction, which
+    // decides the execution queue's caps: decided under the admission lock,
+    // held until the write commits.
+    let (guard, admission) = if gates.is_empty() {
+        let guard = super::capacity::admission_lock(orch).await;
+        let admission = super::sweep::admission_for(orch, &db, execution_id).await?;
+        (Some(guard), admission)
+    } else {
+        (None, super::capacity::Admission::default())
+    };
     let (execution, gates_owned, label_owned) =
         (execution_id.to_string(), gates.to_vec(), label.to_string());
     let released = db
@@ -514,6 +543,7 @@ pub(crate) async fn replace_gates_observed(
             let gates = gates_owned.clone();
             let label = label_owned.clone();
             let satisfied = satisfied.clone();
+            let admission = admission.clone();
             let dbs = orch.db.clone();
             let own_db = db.clone();
             Box::pin(async move {
@@ -547,7 +577,13 @@ pub(crate) async fn replace_gates_observed(
                     .await?;
                 }
 
-                let existing = store::list_gates_conn(conn, &execution_id).await?;
+                // Only authored gates are the author's to replace: the
+                // execution queue's capacity rows stay as the queue left them.
+                let existing: Vec<_> = store::list_gates_conn(conn, &execution_id)
+                    .await?
+                    .into_iter()
+                    .filter(|gate| super::capacity::capacity_fact(&gate.predicate_json).is_none())
+                    .collect();
                 for gate in &existing {
                     if !gates.contains(&gate.predicate_json) {
                         store::delete_gate_conn(conn, &gate.id).await?;
@@ -570,6 +606,20 @@ pub(crate) async fn replace_gates_observed(
                         store::record_outcome_conn(conn, &gate_id, "satisfied", Some(now)).await?;
                     }
                 }
+                // Waiting on authored gates again, it takes no place in the
+                // queue: its capacity rows read cleared (unlatched, so their
+                // `created_at` still dates its place) until those gates clear
+                // and the release decides its caps again.
+                if !gates.is_empty() {
+                    for fact in super::capacity::CAPACITY_FACTS {
+                        store::clear_capacity_gate_conn(
+                            conn,
+                            &execution_id,
+                            &super::capacity::capacity_predicate(fact),
+                        )
+                        .await?;
+                    }
+                }
 
                 if gates.is_empty() {
                     return super::sweep::release_conn(
@@ -577,20 +627,37 @@ pub(crate) async fn replace_gates_observed(
                         &execution_id,
                         now,
                         &super::sweep::ReleaseCause::GatesRemoved,
+                        &admission,
                     )
                     .await;
                 }
-                Ok(None)
+                Ok(super::sweep::ConnRelease::NotHeld)
             })
         })
         .await
         .map_err(|error| error.to_string())?;
+    drop(guard);
 
-    if let Some(released) = released {
-        super::sweep::announce_release(orch, &db, execution_id, released).await;
-        return Ok(format!(
-            "Removed every gate from {label}; with nothing left to wait on, it started now."
-        ));
+    match released {
+        super::sweep::ConnRelease::Released(released) => {
+            super::sweep::announce_release(orch, &db, execution_id, released).await;
+            return Ok(format!(
+                "Removed every gate from {label}; with nothing left to wait on, it started now."
+            ));
+        }
+        super::sweep::ConnRelease::HeldByCap { blocks, .. } => {
+            if let Err(error) = super::capacity::refresh_places(orch).await {
+                log::warn!("could not rewrite the queue's places in line: {error}");
+            }
+            let reasons: Vec<String> = blocks.iter().map(|block| block.reason()).collect();
+            return Ok(format!(
+                "Removed every authored gate from {label}, but it is still held by the execution \
+                 queue: {}. It starts on its own when that clears; only the operator's Start now \
+                 skips a cap.",
+                reasons.join("; ")
+            ));
+        }
+        super::sweep::ConnRelease::NotHeld => {}
     }
     let evaluation = super::sweep::evaluate_execution(orch, execution_id).await?;
     if evaluation.released {

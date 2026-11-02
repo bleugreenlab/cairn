@@ -6383,6 +6383,16 @@ pub struct LearnedResourceEstimate {
 /// runner talking to a host's shell before any executor runs; no frame,
 /// variant, field or serialized form changes, and a runner talking to an older
 /// executor gets nothing wrong.
+///
+/// cairn/5802 does not move the number. The execution queue holds new
+/// executions behind a fleet cap and a per-thread focus cap as gate rows the
+/// runner files and releases before any job, cell request or placement exists:
+/// two settings keys join the workspace contract, two condition-SQL predicates
+/// and a gate `detail` column join the runner's database, and the runner reads
+/// its own placement queue to say how much in-progress work still waits for a
+/// machine. A held execution has no jobs, so nothing about it ever reaches an
+/// executor, and no frame, variant, field or serialized form changes; a runner
+/// talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

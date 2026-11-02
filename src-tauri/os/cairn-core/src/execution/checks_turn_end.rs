@@ -135,6 +135,15 @@ pub(crate) struct WavePlan {
     pub checks: std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
     pub applicable_names: std::collections::HashSet<String>,
     pub input_hashes: std::collections::HashMap<String, String>,
+    /// The toolchain identity the wave planned under, which its lanes'
+    /// borrowed verdicts must have been produced under
+    /// ([`crate::execution::cache::HeadVerdictKeys::expected_toolchain`]).
+    /// Recorded so a retired node's lanes read by the same key without the
+    /// checkout. A plan recorded before this field existed reads as expecting
+    /// no measured runtime, which no borrowed verdict matches; its own rows
+    /// still answer.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expected_toolchain: String,
     /// The checks the head declares that this build cannot run. Never planned,
     /// but listed beside the lanes, so they do not vanish from `/checks` while
     /// a wave runs or after the branch retires. A plan recorded before this
@@ -1085,40 +1094,49 @@ async fn run_turn_end_checks_inner(
     let planning_jj = jj.clone();
     let planning_repository = logical_repository.clone();
     let planning_commit = sealed_commit.clone();
-    let (plans, input_hashes, tree_hash) = tokio::task::spawn_blocking(move || {
-        // The entry listing feeds both the derived closures and the per-check
-        // cache key below, so it is read once here.
-        let entries = if any_check_declares_inputs(planning_checks.values()) {
-            tree_entries(&planning_jj, &planning_repository, &planning_commit).ok()
-        } else {
-            None
-        };
-        let blobs = TreeBlobs {
-            jj: &planning_jj,
-            repository: &planning_repository,
-        };
-        let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
-        let inputs = ResolvedInputs::resolve(&planning_checks, &planning_extra_inputs, &snapshot);
-        let plans = applicable_turn_end_checks(
-            &planning_checks,
-            &inputs,
-            &planning_changed,
-            &planning_repo,
-        );
-        if plans.is_empty() {
-            return Ok((plans, std::collections::HashMap::new(), String::new()));
-        }
-        // 6. The immutable tree identity, and every configured check's input
-        // hash at it: the key this wave reuses and records under, and the key
-        // the `/checks` projection reads lanes by while the wave runs.
-        let tree_hash = logical_tree_hash(&planning_jj, &planning_repository, &planning_commit)
-            .map_err(|error| error.to_string())?;
-        let input_hashes =
-            check_input_hashes(&planning_checks, &inputs, entries.as_deref(), &tree_hash);
-        Ok::<_, String>((plans, input_hashes, tree_hash))
-    })
-    .await
-    .map_err(|error| format!("turn-end check planning task failed: {error}"))??;
+    let (plans, input_hashes, tree_hash, expected_toolchain) =
+        tokio::task::spawn_blocking(move || {
+            // The entry listing feeds both the derived closures and the per-check
+            // cache key below, so it is read once here.
+            let entries = if any_check_declares_inputs(planning_checks.values()) {
+                tree_entries(&planning_jj, &planning_repository, &planning_commit).ok()
+            } else {
+                None
+            };
+            let blobs = TreeBlobs {
+                jj: &planning_jj,
+                repository: &planning_repository,
+            };
+            let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+            let inputs =
+                ResolvedInputs::resolve(&planning_checks, &planning_extra_inputs, &snapshot);
+            let plans = applicable_turn_end_checks(
+                &planning_checks,
+                &inputs,
+                &planning_changed,
+                &planning_repo,
+            );
+            if plans.is_empty() {
+                return Ok((
+                    plans,
+                    std::collections::HashMap::new(),
+                    String::new(),
+                    String::new(),
+                ));
+            }
+            // The same held probe `plan_checks` just made for these plans.
+            let expected_toolchain = cairn_checkenv::expected_toolchain_identity_in(&planning_repo);
+            // 6. The immutable tree identity, and every configured check's input
+            // hash at it: the key this wave reuses and records under, and the key
+            // the `/checks` projection reads lanes by while the wave runs.
+            let tree_hash = logical_tree_hash(&planning_jj, &planning_repository, &planning_commit)
+                .map_err(|error| error.to_string())?;
+            let input_hashes =
+                check_input_hashes(&planning_checks, &inputs, entries.as_deref(), &tree_hash);
+            Ok::<_, String>((plans, input_hashes, tree_hash, expected_toolchain))
+        })
+        .await
+        .map_err(|error| format!("turn-end check planning task failed: {error}"))??;
     if plans.is_empty() {
         log::debug!(
             "turn-end checks for job {}: no applicable review check; nothing to run",
@@ -1177,6 +1195,7 @@ async fn run_turn_end_checks_inner(
         checks: checks.clone(),
         applicable_names,
         input_hashes: input_hashes.clone(),
+        expected_toolchain,
         unsupported,
     });
     record_wave_plan(&owning_db, job_id, attempt_id, &plan).await;
@@ -3189,6 +3208,7 @@ mod tests {
             checks: Default::default(),
             applicable_names: Default::default(),
             input_hashes: Default::default(),
+            expected_toolchain: String::new(),
             unsupported: Default::default(),
         };
         let merged = RetiredNode {
@@ -3532,6 +3552,7 @@ mod tests {
                 verdict_executor_ids: None,
                 config_error: None,
                 verdict_platforms: Vec::new(),
+                verdict_runtime: Vec::new(),
             },
             format!("input-{name}"),
         )

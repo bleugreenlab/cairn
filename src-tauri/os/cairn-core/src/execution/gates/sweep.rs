@@ -95,6 +95,9 @@ pub(crate) fn install_sweep_notifier(orch: Orchestrator) {
     if let Ok(mut sender) = notifier().lock() {
         *sender = Some(tx);
     }
+    // Job-status and turn writers in `cairn-workflow` hint through the same
+    // channel when they may have freed a fleet slot.
+    cairn_workflow::gates::hint::install(notify_gate_evidence_changed);
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             tokio::time::sleep(NOTIFY_DEBOUNCE).await;
@@ -109,14 +112,49 @@ pub(crate) fn install_sweep_notifier(orch: Orchestrator) {
 /// Why a held execution was released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseCause {
-    /// Every gate resolved true.
+    /// Every authored gate resolved true.
     Satisfied,
     /// Someone decided not to wait. Carries the acting principal, serialized,
     /// which is recorded on the row and is what renders the release as an
-    /// override.
-    Override { principal: serde_json::Value },
-    /// The last gate was patched off, so nothing is left to wait on.
+    /// override, and how much of the hold it skips.
+    Override {
+        principal: serde_json::Value,
+        scope: OverrideScope,
+    },
+    /// The last authored gate was patched off, so nothing it wrote is left to
+    /// wait on.
     GatesRemoved,
+}
+
+/// How much of a hold an override skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideScope {
+    /// The authored `after:` gates only: an agent's or a caller's
+    /// `{release:true}`. The execution queue's caps still apply, because a cap
+    /// governs what a thread starts itself (tenet 1319): a thread must not be
+    /// able to release its own way past its cap.
+    AuthoredGates,
+    /// Every gate, the caps included: the operator's Start now, with a
+    /// principal the invoke's credentials proved.
+    Everything,
+}
+
+/// What a release attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// This caller released it; its jobs exist.
+    Released,
+    /// Every authored gate allows it, but the execution queue's caps hold it.
+    HeldByCap(Vec<super::capacity::CapBlock>),
+    /// Nothing to release: already released, superseded, its issue resolved,
+    /// or its authored gates do not license the cause.
+    NotHeld,
+}
+
+impl ReleaseOutcome {
+    pub fn released(&self) -> bool {
+        matches!(self, Self::Released)
+    }
 }
 
 /// What one sweep did.
@@ -145,27 +183,53 @@ pub(crate) async fn sweep_with(
     now: i64,
 ) -> Result<SweepReport, String> {
     let mut report = SweepReport::default();
+    // Oldest held first, across every database: a fleet slot that frees goes
+    // to whatever has waited longest, wherever it lives. A burst filed at one
+    // instant keeps its issue order. An older execution held only by its own
+    // thread's cap does not stop a younger one from another thread taking a
+    // free fleet slot: each is decided on its own caps.
+    let mut held = Vec::new();
     for db in orch.db.all_dbs().await {
-        let held = db
+        let listed = db
             .read(|conn| Box::pin(async move { list_held_executions_conn(conn).await }))
             .await
             .map_err(|error| format!("failed to list held executions: {error}"))?;
-        for execution in held {
-            // One execution whose evidence cannot be read must not hold up the
-            // rest of the burst behind it.
-            match evaluate_held(orch, &db, vocabulary, &execution, now).await {
-                Ok(evaluation) => {
-                    report.foreclosed.extend(evaluation.foreclosed);
-                    if evaluation.released {
-                        report.released.push(execution.execution_id);
-                    }
+        held.extend(listed.into_iter().map(|execution| (db.clone(), execution)));
+    }
+    held.sort_by(|(_, a), (_, b)| {
+        (
+            a.held_since,
+            a.issue_number.is_none(),
+            a.issue_number,
+            a.seq,
+            &a.execution_id,
+        )
+            .cmp(&(
+                b.held_since,
+                b.issue_number.is_none(),
+                b.issue_number,
+                b.seq,
+                &b.execution_id,
+            ))
+    });
+    for (db, execution) in held {
+        // One execution whose evidence cannot be read must not hold up the
+        // rest of the burst behind it.
+        match evaluate_held(orch, &db, vocabulary, &execution, now).await {
+            Ok(evaluation) => {
+                report.foreclosed.extend(evaluation.foreclosed);
+                if evaluation.released {
+                    report.released.push(execution.execution_id);
                 }
-                Err(error) => log::error!(
-                    "gate sweep could not evaluate held execution {}: {error}",
-                    execution.execution_id
-                ),
             }
+            Err(error) => log::error!(
+                "gate sweep could not evaluate held execution {}: {error}",
+                execution.execution_id
+            ),
         }
+    }
+    if let Err(error) = super::capacity::refresh_places(orch).await {
+        log::warn!("gate sweep could not rewrite the queue's places in line: {error}");
     }
     Ok(report)
 }
@@ -179,6 +243,8 @@ pub struct Evaluation {
     pub foreclosed: Vec<String>,
     /// The census phrase of each gate still unmet, with its evidence state.
     pub waiting: Vec<String>,
+    /// The execution queue's caps holding it, once every authored gate is met.
+    pub held_by: Vec<super::capacity::CapBlock>,
 }
 
 /// Evaluate one execution now, releasing it if every gate is already true.
@@ -208,10 +274,16 @@ pub(crate) async fn evaluate_execution_at(
         .map_err(|error| format!("failed to list held executions: {error}"))?
         .into_iter()
         .find(|held| held.execution_id == wanted);
-    match held {
-        Some(held) => evaluate_held(orch, &db, &gate_vocabulary(), &held, now).await,
-        None => Ok(Evaluation::default()),
+    let evaluation = match held {
+        Some(held) => evaluate_held(orch, &db, &gate_vocabulary(), &held, now).await?,
+        None => return Ok(Evaluation::default()),
+    };
+    if !evaluation.held_by.is_empty() {
+        if let Err(error) = super::capacity::refresh_places(orch).await {
+            log::warn!("could not rewrite the queue's places in line: {error}");
+        }
     }
+    Ok(evaluation)
 }
 
 async fn evaluate_held(
@@ -249,7 +321,9 @@ async fn evaluate_gates(
     let mut all_satisfied = true;
     let mut gates_moved = false;
     for gate in gates {
-        if gate.is_satisfied() {
+        // Capacity gates are not resolved here: they are decided inside the
+        // release, under the admission lock, once the authored gates allow it.
+        if gate.is_satisfied() || super::capacity::capacity_fact(&gate.predicate_json).is_some() {
             continue;
         }
         let clause: TriggerClause = match serde_json::from_str(&gate.predicate_json) {
@@ -328,14 +402,19 @@ async fn evaluate_gates(
     }
 
     if all_satisfied {
-        evaluation.released = release_in(
+        match release_in(
             orch,
             db,
             &execution.execution_id,
             ReleaseCause::Satisfied,
             now,
         )
-        .await?;
+        .await?
+        {
+            ReleaseOutcome::Released => evaluation.released = true,
+            ReleaseOutcome::HeldByCap(blocks) => evaluation.held_by = blocks,
+            ReleaseOutcome::NotHeld => {}
+        }
     }
     // A release announces itself through `announce_release`. Short of one, a
     // newly recorded outcome or foreclosure still changes what the gate census
@@ -398,17 +477,43 @@ async fn record_outcome(
 }
 
 /// Release a held execution: the second half of a launch, applied to the row
-/// that already exists. Returns `false` when it was not held — already
-/// released by someone else, or never gated.
+/// that already exists. The execution queue's caps are decided here too,
+/// unless the cause is the operator's [`OverrideScope::Everything`].
 pub async fn release(
     orch: &Orchestrator,
     execution_id: &str,
     cause: ReleaseCause,
-) -> Result<bool, String> {
+) -> Result<ReleaseOutcome, String> {
     let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
         .await
         .map_err(|error| error.to_string())?;
     release_in(orch, &db, execution_id, cause, orch.services.clock.now()).await
+}
+
+/// The admission decision for one held execution, taken under the admission
+/// lock the caller holds. Always decided, even for an operator start that will
+/// skip it, so the start records which caps it skipped.
+pub(crate) async fn admission_for(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+) -> Result<super::capacity::Admission, String> {
+    let id = execution_id.to_string();
+    let issue_id = db
+        .read(move |conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT issue_id FROM executions WHERE id = ?1",
+                    params![id.as_str()],
+                )
+                .await
+            })
+        })
+        .await
+        .map_err(|error| format!("failed to read execution {execution_id}: {error}"))?;
+    super::capacity::decide(orch, db, issue_id.as_deref(), Some(execution_id)).await
 }
 
 async fn release_in(
@@ -417,22 +522,42 @@ async fn release_in(
     execution_id: &str,
     cause: ReleaseCause,
     now: i64,
-) -> Result<bool, String> {
+) -> Result<ReleaseOutcome, String> {
+    let guard = super::capacity::admission_lock(orch).await;
+    let admission = admission_for(orch, db, execution_id).await?;
     let execution = execution_id.to_string();
-    let released = db
+    let outcome = db
         .write(|conn| {
             let execution_id = execution.clone();
             let cause = cause.clone();
-            Box::pin(async move { release_conn(conn, &execution_id, now, &cause).await })
+            let admission = admission.clone();
+            Box::pin(
+                async move { release_conn(conn, &execution_id, now, &cause, &admission).await },
+            )
         })
         .await
         .map_err(|error| format!("failed to release execution {execution_id}: {error}"))?;
-    let Some(released) = released else {
-        return Ok(false);
-    };
-    log::info!("released held execution {execution_id} ({cause:?})");
-    announce_release(orch, db, execution_id, released).await;
-    Ok(true)
+    drop(guard);
+    match outcome {
+        ConnRelease::Released(released) => {
+            log::info!("released held execution {execution_id} ({cause:?})");
+            announce_release(orch, db, execution_id, released).await;
+            Ok(ReleaseOutcome::Released)
+        }
+        ConnRelease::HeldByCap { blocks, moved } => {
+            if moved {
+                let change = crate::notify::execution_gates_db_change_for_execution(
+                    db,
+                    execution_id,
+                    "update",
+                )
+                .await;
+                let _ = orch.services.emitter.emit("db-change", change);
+            }
+            Ok(ReleaseOutcome::HeldByCap(blocks))
+        }
+        ConnRelease::NotHeld => Ok(ReleaseOutcome::NotHeld),
+    }
 }
 
 /// What a committed release did, for the post-commit tail.
@@ -476,11 +601,35 @@ pub(crate) async fn announce_release(
     }
 }
 
-/// The transactional half of a release, inside the caller's write. `None`
-/// means this caller may not release it — already released, superseded, its
-/// issue resolved, or its CURRENT gates do not license `cause` — so it owns
-/// nothing and mints nothing. `Some` means this caller released it and must
-/// run [`announce_release`] after the commit.
+/// What the transactional half of a release did.
+#[derive(Debug)]
+pub(crate) enum ConnRelease {
+    /// This caller released it and must run [`announce_release`] after the
+    /// commit.
+    Released(Released),
+    /// Its authored gates allow it, but the queue's caps hold it; their rows
+    /// were written in this transaction (`moved` when any changed).
+    HeldByCap {
+        blocks: Vec<super::capacity::CapBlock>,
+        moved: bool,
+    },
+    /// This caller may not release it, and owns nothing.
+    NotHeld,
+}
+
+/// The transactional half of a release, inside the caller's write.
+/// [`ConnRelease::NotHeld`] means this caller may not release it — already
+/// released, superseded, its issue resolved, or its CURRENT authored gates do
+/// not license `cause` — so it owns nothing and mints nothing.
+///
+/// `admission` is the execution queue's decision, taken under the admission
+/// lock the caller holds. Unless the cause is the operator's
+/// [`OverrideScope::Everything`], a blocking cap is written as (or kept as) a
+/// capacity gate row in THIS transaction and the execution stays held, so a
+/// held execution is never left without the rows that hold it. A cap that no
+/// longer blocks is marked cleared but not latched: a free slot can be taken
+/// again, and the row keeps the execution's place in line. On release every
+/// capacity row latches.
 ///
 /// A `pending` execution — a held next attempt — takes the attempt HERE: the
 /// same supersede a normal launch performs at insert, run against whatever
@@ -507,26 +656,125 @@ pub(crate) async fn release_conn(
     execution_id: &str,
     now: i64,
     cause: &ReleaseCause,
-) -> DbResult<Option<Released>> {
-    let (gates, unsatisfied) =
-        cairn_workflow::gates::store::gate_counts_conn(conn, execution_id).await?;
+    admission: &super::capacity::Admission,
+) -> DbResult<ConnRelease> {
+    use cairn_workflow::gates::store;
+
+    let (authored, unsatisfied) = store::gate_counts_conn(conn, execution_id).await?;
+    let existing = list_gates_conn(conn, execution_id).await?;
     let authorized = match cause {
-        ReleaseCause::Satisfied => gates > 0 && unsatisfied == 0,
-        ReleaseCause::GatesRemoved => gates == 0,
+        ReleaseCause::Satisfied => !existing.is_empty() && unsatisfied == 0,
+        ReleaseCause::GatesRemoved => authored == 0,
         ReleaseCause::Override { .. } => true,
     };
     if !authorized {
-        return Ok(None);
+        return Ok(ConnRelease::NotHeld);
     }
+    let skips_caps = matches!(
+        cause,
+        ReleaseCause::Override {
+            scope: OverrideScope::Everything,
+            ..
+        }
+    );
+
+    if !skips_caps {
+        let releasable = crate::storage::query_opt_text_conn(
+            conn,
+            concat!(
+                "SELECT e.id FROM executions e WHERE e.id = ?1 AND e.released_at IS NULL AND ",
+                cairn_db::live_execution_sql!()
+            ),
+            params![execution_id],
+        )
+        .await?
+        .is_some();
+        if !releasable {
+            return Ok(ConnRelease::NotHeld);
+        }
+        let mut moved = false;
+        for fact in super::capacity::CAPACITY_FACTS {
+            let predicate = super::capacity::capacity_predicate(fact);
+            match admission.blocks.iter().find(|block| block.fact() == *fact) {
+                Some(block) => {
+                    let prior = existing
+                        .iter()
+                        .find(|gate| gate.predicate_json == predicate)
+                        .and_then(|gate| gate.detail.as_deref());
+                    let detail = super::capacity::carry_place(prior, &block.reason());
+                    moved |= store::hold_capacity_gate_conn(
+                        conn,
+                        execution_id,
+                        &predicate,
+                        block.seq(),
+                        &detail,
+                        now,
+                    )
+                    .await?;
+                }
+                None => {
+                    moved |= store::clear_capacity_gate_conn(conn, execution_id, &predicate).await?
+                }
+            }
+        }
+        if !admission.is_clear() {
+            // An agent's early release still takes effect on what it may
+            // skip: its authored gates latch and its override is recorded, so
+            // the execution starts on its own once the caps clear.
+            if let ReleaseCause::Override { principal, .. } = cause {
+                for gate in existing.iter().filter(|gate| {
+                    !gate.is_satisfied()
+                        && super::capacity::capacity_fact(&gate.predicate_json).is_none()
+                }) {
+                    store::record_outcome_conn(conn, &gate.id, "satisfied", Some(now)).await?;
+                }
+                conn.execute(
+                    "UPDATE executions SET release_override_json = ?2
+                      WHERE id = ?1 AND released_at IS NULL",
+                    params![
+                        execution_id,
+                        serde_json::json!({ "principal": principal, "at": now }).to_string()
+                    ],
+                )
+                .await?;
+                moved = true;
+            }
+            return Ok(ConnRelease::HeldByCap {
+                blocks: admission.blocks.clone(),
+                moved,
+            });
+        }
+    }
+
     let override_json = match cause {
-        ReleaseCause::Override { principal } => {
+        ReleaseCause::Override {
+            principal,
+            scope: OverrideScope::Everything,
+        } => {
+            let skipped: Vec<&str> = admission
+                .blocks
+                .iter()
+                .map(super::capacity::CapBlock::skipped_label)
+                .collect();
+            Some(
+                serde_json::json!({
+                    "principal": principal,
+                    "at": now,
+                    "operator": true,
+                    "skipped": skipped,
+                })
+                .to_string(),
+            )
+        }
+        ReleaseCause::Override { principal, .. } => {
             Some(serde_json::json!({ "principal": principal, "at": now }).to_string())
         }
         ReleaseCause::Satisfied | ReleaseCause::GatesRemoved => None,
     };
     if release_execution_conn(conn, execution_id, now, override_json.as_deref()).await? == 0 {
-        return Ok(None);
+        return Ok(ConnRelease::NotHeld);
     }
+    store::latch_capacity_gates_conn(conn, execution_id, now).await?;
     let mut rows = conn
         .query(
             "SELECT issue_id, lifecycle FROM executions WHERE id = ?1",
@@ -535,14 +783,14 @@ pub(crate) async fn release_conn(
         .await?;
     let (issue_id, lifecycle) = match rows.next().await? {
         Some(row) => (row.opt_text(0)?, row.text(1)?),
-        None => return Ok(None),
+        None => return Ok(ConnRelease::NotHeld),
     };
     drop(rows);
 
     let mut supersessions = Vec::new();
     if let (Some(issue_id), "pending") = (issue_id.as_deref(), lifecycle.as_str()) {
         let actor = match cause {
-            ReleaseCause::Override { principal } => {
+            ReleaseCause::Override { principal, .. } => {
                 crate::execution::canonical::SupersessionActor {
                     kind: "gate-override",
                     reference: Some(principal.to_string()),
@@ -577,7 +825,7 @@ pub(crate) async fn release_conn(
     if let Some(issue_id) = issue_id.as_deref() {
         crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id).await?;
     }
-    Ok(Some(Released {
+    Ok(ConnRelease::Released(Released {
         issue_id,
         supersessions,
     }))
@@ -886,7 +1134,7 @@ pub async fn next_gate_due_after(orch: &Orchestrator, now: i64) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::effects::types::WorkflowEffect;
@@ -906,17 +1154,19 @@ mod tests {
 
     const RECIPE: &str = "memory-triage";
 
-    struct Env {
+    /// The gate-sweep test world, shared with the execution queue's tests
+    /// (`capacity::tests`).
+    pub(crate) struct Env {
         _temp: tempfile::TempDir,
-        orch: Orchestrator,
-        db: Arc<LocalDb>,
-        effects: mpsc::UnboundedReceiver<WorkflowEffect>,
+        pub(crate) orch: Orchestrator,
+        pub(crate) db: Arc<LocalDb>,
+        pub(crate) effects: mpsc::UnboundedReceiver<WorkflowEffect>,
     }
 
     /// A project `prj` with issues 1..=5 (all live), a parent issue 9 driven by
     /// a live coordinator node, and a real recipe on disk, so every filing below
     /// goes through the same launch path an agent's write does.
-    async fn env(name: &str) -> Env {
+    pub(crate) async fn env(name: &str) -> Env {
         let temp = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::storage::migrated_test_db(name).await);
         env_over(temp, db).await
@@ -993,7 +1243,7 @@ mod tests {
         json!([{"fact": "issue_resolution", "issue": format!("cairn://p/prj/{number}"), "resolution": "merged"}])
     }
 
-    async fn file(env: &Env, number: i32, after: Value) -> Result<String, String> {
+    pub(crate) async fn file(env: &Env, number: i32, after: Value) -> Result<String, String> {
         let clauses = super::super::authoring::parse_after(Some(&after), "after")?;
         start_execution_from_collection(
             &env.orch,
@@ -1010,7 +1260,7 @@ mod tests {
         .await
     }
 
-    async fn resolve_issue(env: &Env, number: i32, status: &str) {
+    pub(crate) async fn resolve_issue(env: &Env, number: i32, status: &str) {
         env.db
             .execute(
                 format!("UPDATE issues SET status = ?1, {status}_at = 5 WHERE number = ?2"),
@@ -1021,7 +1271,7 @@ mod tests {
     }
 
     /// The newest execution on issue `number`: (id, status, released_at, jobs).
-    async fn execution(env: &Env, number: i32) -> (String, String, Option<i64>, i64) {
+    pub(crate) async fn execution(env: &Env, number: i32) -> (String, String, Option<i64>, i64) {
         env.db
             .read(move |conn| {
                 Box::pin(async move {
@@ -1042,11 +1292,11 @@ mod tests {
             .unwrap()
     }
 
-    async fn count(env: &Env, sql: &str) -> i64 {
+    pub(crate) async fn count(env: &Env, sql: &str) -> i64 {
         env.db.query_opt_i64(sql, ()).await.unwrap().unwrap()
     }
 
-    fn advanced(env: &mut Env) -> Vec<String> {
+    pub(crate) fn advanced(env: &mut Env) -> Vec<String> {
         let mut advanced = Vec::new();
         while let Ok(effect) = env.effects.try_recv() {
             if let WorkflowEffect::AdvanceDag { execution_id, .. } = effect {
@@ -1058,9 +1308,9 @@ mod tests {
 
     /// The instant the test world stands at: the services clock and every
     /// explicit sweep agree on it.
-    const NOW: i64 = 1_900_000_000;
+    pub(crate) const NOW: i64 = 1_900_000_000;
 
-    fn now() -> i64 {
+    pub(crate) fn now() -> i64 {
         NOW
     }
 
@@ -1868,7 +2118,7 @@ mod tests {
         for handle in handles {
             released += handle.await.unwrap().len();
         }
-        released += usize::from(racing_release.await.unwrap());
+        released += usize::from(racing_release.await.unwrap().released());
 
         assert_eq!(released, 1, "exactly one caller owns the release");
         assert_eq!(
@@ -2275,9 +2525,12 @@ mod tests {
             .is_empty());
         let (id, _, released_at, jobs) = execution(&env, 2).await;
         assert_eq!((released_at, jobs), (None, 0));
-        assert!(!release(&env.orch, &id, ReleaseCause::Satisfied)
-            .await
-            .unwrap());
+        assert_eq!(
+            release(&env.orch, &id, ReleaseCause::Satisfied)
+                .await
+                .unwrap(),
+            ReleaseOutcome::NotHeld
+        );
         let error = patch(&env, 2, GatePatch::Release).await.unwrap_err();
         assert!(
             error.contains("already been merged or closed"),

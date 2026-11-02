@@ -50,6 +50,9 @@ const FORECLOSED_PREFIX: &str = "can never be satisfied";
 /// Precedence is satisfied, then foreclosed, then the newest resolution. A gate
 /// no sweep has resolved yet reads as `no verdict yet`, which is exactly true.
 pub fn render_gate(vocabulary: &GateVocabulary, gate: &ExecutionGate) -> GateCensusEntry {
+    if let Some(fact) = super::capacity::capacity_fact(&gate.predicate_json) {
+        return render_capacity_gate(fact, gate);
+    }
     let predicate = match serde_json::from_str::<TriggerClause>(&gate.predicate_json) {
         Ok(clause) => vocabulary.render(&clause),
         // A stored predicate that no longer parses is still something an
@@ -84,6 +87,42 @@ pub fn render_gate(vocabulary: &GateVocabulary, gate: &ExecutionGate) -> GateCen
     GateCensusEntry {
         gate_id: gate.id.clone(),
         predicate,
+        capacity: false,
+        state,
+        evidence,
+    }
+}
+
+/// A capacity hold renders its live reason, place in line included, as written
+/// by the queue. It is never latched before release, so one the last decision
+/// found clear (`last_outcome = satisfied`) reads satisfied and drops out of
+/// the waiting list, while one that blocks reads as the cap it is.
+fn render_capacity_gate(fact: &str, gate: &ExecutionGate) -> GateCensusEntry {
+    let (default_reason, cap) = match fact {
+        super::capacity::FLEET_SLOT_FACT => ("waiting for a fleet slot", "fleet cap"),
+        _ => ("its thread is at its open-children cap", "thread focus cap"),
+    };
+    let cleared = gate.is_satisfied()
+        || gate.last_outcome.as_deref() == Some(GateOutcome::Satisfied.as_str());
+    let predicate = gate
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or(default_reason)
+        .to_string();
+    let (state, evidence) = if cleared {
+        (
+            GateEvidenceState::Satisfied,
+            GateOutcome::Satisfied.evidence_phrase().to_string(),
+        )
+    } else {
+        (GateEvidenceState::NoEvidence, cap.to_string())
+    };
+    GateCensusEntry {
+        gate_id: gate.id.clone(),
+        predicate,
+        capacity: true,
         state,
         evidence,
     }
@@ -184,18 +223,39 @@ fn summarize(
 ) -> String {
     let waiting: Vec<String> = entries
         .iter()
-        .filter(|entry| entry.state != GateEvidenceState::Satisfied)
+        .filter(|entry| entry.state != GateEvidenceState::Satisfied && !entry.capacity)
         .map(|entry| format!("{} ({})", entry.predicate, entry.evidence))
         .collect();
+    let capped: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.state != GateEvidenceState::Satisfied && entry.capacity)
+        .map(|entry| entry.predicate.as_str())
+        .collect();
     if held {
-        return match waiting.is_empty() {
+        let mut parts = Vec::new();
+        if !waiting.is_empty() {
+            parts.push(format!("waiting on {}", waiting.join("; ")));
+        }
+        parts.extend(capped.iter().map(|reason| reason.to_string()));
+        return match parts.is_empty() {
             // Every gate latched but the sweep has not released it yet: the
             // window is one tick, and saying so beats calling it waiting.
             true => "held, every gate met — releases on the next sweep".to_string(),
-            false => format!("held, waiting on {}", waiting.join("; ")),
+            false => format!("held, {}", parts.join("; ")),
         };
     }
     match release_override {
+        Some(release) if release.operator => {
+            let skipped = match release.skipped.as_slice() {
+                [] => String::new(),
+                [one] => format!(", skipping the {one} cap"),
+                many => format!(", skipping the {} caps", many.join(" and ")),
+            };
+            format!(
+                "started now by the operator ({}){skipped}",
+                release.principal
+            )
+        }
         Some(release) if waiting.is_empty() => {
             format!("released early by {} (override)", release.principal)
         }
@@ -230,6 +290,21 @@ fn parse_release_override(json: &str) -> ReleaseOverride {
     ReleaseOverride {
         principal,
         at: value.get("at").and_then(Value::as_i64),
+        operator: value
+            .get("operator")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        skipped: value
+            .get("skipped")
+            .and_then(Value::as_array)
+            .map(|skipped| {
+                skipped
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -874,6 +949,7 @@ mod tests {
             foreclosed_at: None,
             foreclosed_reason: None,
             created_at: 1,
+            detail: None,
         }
     }
 
@@ -977,7 +1053,9 @@ mod tests {
             census.release_override,
             Some(ReleaseOverride {
                 principal: "cairn://p/cairn/4735/1/coordinator".into(),
-                at: Some(10)
+                at: Some(10),
+                operator: false,
+                skipped: Vec::new(),
             })
         );
         assert_eq!(

@@ -59,6 +59,8 @@ pub const RUN_TARGETS: &[RunTargetSpec] = &[
     models::MODELS_DECIDE_RUN_TARGET,
     models::MODELS_EMBED_RUN_TARGET,
     models::MODELS_COMPLETE_RUN_TARGET,
+    models::MODELS_IMAGE_RUN_TARGET,
+    models::MODELS_SPEAK_RUN_TARGET,
 ];
 
 /// The run target `kind` is, if it is one.
@@ -88,6 +90,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     models::MODELS_DECIDE_CONTRACT,
     models::MODELS_EMBED_CONTRACT,
     models::MODELS_COMPLETE_CONTRACT,
+    models::MODELS_IMAGE_CONTRACT,
+    models::MODELS_SPEAK_CONTRACT,
     models::MODELS_ACCOUNTS_CONTRACT,
     models::MODELS_ACCOUNT_CONTRACT,
     models::MODELS_USAGE_CONTRACT,

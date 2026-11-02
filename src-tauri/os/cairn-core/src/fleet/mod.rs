@@ -6991,6 +6991,18 @@ impl Fleet {
             .unwrap_or(occupancy::MachineOccupancy::Unforecastable)
     }
 
+    /// Jobs with a cell request no machine has claimed yet: the work the
+    /// placement queue is still holding for a machine. Read by the execution
+    /// queue to say how much of the fleet's in-progress work is still waiting
+    /// for a machine; placement itself never reads the queue's caps.
+    pub(crate) fn jobs_waiting_for_a_machine(&self) -> HashSet<String> {
+        self.queue
+            .waiting_rows()
+            .into_iter()
+            .filter_map(|row| row.requesting_job_id)
+            .collect()
+    }
+
     /// How many snapshots each connected executor's current link has delivered.
     pub(crate) fn snapshot_receipts(&self) -> HashMap<String, SnapshotReceipt> {
         self.lock_connections()

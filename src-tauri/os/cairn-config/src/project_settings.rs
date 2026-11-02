@@ -35,7 +35,7 @@ pub struct MaterializationSettings {
 use crate::models::{read_declared_check, DeclaredCheck};
 pub use crate::models::{
     CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckTree, CheckVocabulary,
-    CheckWhen, MainCadence, PopulateConfig, UnsupportedCheck,
+    CheckWhen, MainCadence, PopulateConfig, RuntimeInstrument, UnsupportedCheck,
 };
 
 /// Project settings as stored in YAML file.

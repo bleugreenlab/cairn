@@ -3717,6 +3717,8 @@ pub(super) async fn yield_turn_for_host(
         params![reason.as_str(), now, turn_id],
     )
     .await?;
+    // A parked turn may free its execution's fleet slot.
+    cairn_workflow::gates::hint::evidence_changed();
     Ok(true)
 }
 

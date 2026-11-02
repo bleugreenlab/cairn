@@ -36,7 +36,11 @@ use crate::credentials::{
     ProviderAuth,
 };
 use crate::orchestrator::Orchestrator;
+use cairn_models::image_wire::ImagesEndpoint;
 use cairn_models::interface::decide::DecisionRoute;
+use cairn_models::interface::image::ImageRoute;
+use cairn_models::interface::speak::SpeechRoute;
+use cairn_models::speech_wire::openai_speech::OpenAiSpeechEndpoint;
 use cairn_models::types::catalog::DiscoveredModel;
 use cairn_models::types::catalog::{self, ServedVerb, Verb, Wire};
 use cairn_models::types::image::ImageCapabilities;
@@ -237,7 +241,66 @@ impl CustomProviderConfig {
             )),
         }
     }
+
+    /// The deployment that draws this provider's images.
+    pub(crate) fn image_route(&self) -> Result<ImageRoute, String> {
+        match self.protocol {
+            // The stored headers carry a JSON content type; the image wire
+            // ignores it, because each body (a multipart edit's included)
+            // sets its own.
+            CustomProtocol::OpenAiImages => Ok(ImageRoute::OpenAi(ImagesEndpoint {
+                provider_name: self.display_name.clone(),
+                backend_key: self.backend_key(),
+                base_url: self.base_url.trim_end_matches('/').to_string(),
+                headers: self.headers.clone(),
+            })),
+            protocol => Err(format!(
+                "{} speaks the {} protocol, which draws no images",
+                self.display_name,
+                protocol.as_str()
+            )),
+        }
+    }
+
+    /// The deployment that speaks this provider's speech.
+    pub(crate) fn speech_route(&self) -> Result<SpeechRoute, String> {
+        match self.protocol {
+            CustomProtocol::OpenAiSpeech => Ok(SpeechRoute::OpenAiSpeech(OpenAiSpeechEndpoint {
+                provider_name: self.display_name.clone(),
+                url: format!("{}/audio/speech", self.base_url.trim_end_matches('/')),
+                headers: self.headers.clone(),
+            })),
+            // ElevenLabs authenticates its socket with the key itself, which
+            // `request_headers` stored as `xi-api-key`.
+            CustomProtocol::ElevenLabs => {
+                let key = self
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(ELEVENLABS_KEY_HEADER))
+                    .map(|(_, value)| value.as_str())
+                    .filter(|key| !key.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "{} has no ElevenLabs API key; add one in Settings → Providers",
+                            self.display_name
+                        )
+                    })?;
+                Ok(cairn_models::speak::elevenlabs::route_for(
+                    key,
+                    Some(&self.base_url),
+                ))
+            }
+            protocol => Err(format!(
+                "{} speaks the {} protocol, which speaks no audio",
+                self.display_name,
+                protocol.as_str()
+            )),
+        }
+    }
 }
+
+/// The header ElevenLabs takes its API key in.
+const ELEVENLABS_KEY_HEADER: &str = "xi-api-key";
 
 /// Every header a request to a `protocol` provider carries: the content type,
 /// the key in the header that protocol authenticates with (ElevenLabs'
@@ -250,7 +313,7 @@ fn request_headers(
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     if let Some(key) = api_key {
         headers.push(match protocol {
-            CustomProtocol::ElevenLabs => ("xi-api-key".to_string(), key.to_string()),
+            CustomProtocol::ElevenLabs => (ELEVENLABS_KEY_HEADER.to_string(), key.to_string()),
             CustomProtocol::OpenAiChatCompletions
             | CustomProtocol::Decisions
             | CustomProtocol::OpenAiImages

@@ -123,6 +123,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["models", "decide"] => Some(CairnResource::ModelsDecide),
         ["models", "embed"] => Some(CairnResource::ModelsEmbed),
         ["models", "complete"] => Some(CairnResource::ModelsComplete),
+        ["models", "image"] => Some(CairnResource::ModelsImage),
+        ["models", "speak"] => Some(CairnResource::ModelsSpeak),
         ["models", "accounts"] => Some(CairnResource::ModelsAccounts),
         ["models", "accounts", id] => Some(CairnResource::ModelsAccount {
             id: (*id).to_string(),

@@ -34,6 +34,8 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "memoryReviewEnabled",
     "memoryTriageEnabled",
     "maxOpenTriageIssuesPerScope",
+    "maxConcurrentExecutions",
+    "maxOpenChildrenPerThread",
     "pendingMemoryThreshold",
     "threadCompactThreshold",
     "seedBudgetTokens",

@@ -197,6 +197,119 @@ pub(crate) const MODELS_COMPLETE_RUN_TARGET: RunTargetSpec = RunTargetSpec {
     example: r#"run({commands:[{target:"cairn://models/complete",payload:{args_json:{model:"MODEL",prompt:"..."}}}]})"#,
 };
 
+const MODELS_MEDIA_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "KEY — only this provider's offers of the model, e.g. openrouter, codex, custom:<account id>",
+);
+
+const MODELS_IMAGE_MODEL: KeySpec = KeySpec::new(
+    "model",
+    KeyType::Str,
+    "the model to draw with: a catalog id, native id or provider/model, as cairn://models/image lists them; absent takes the workspace's `imageModel`, and with none set the call is refused",
+);
+
+const MODELS_IMAGE_PROMPT: KeySpec = KeySpec::new("prompt", KeyType::Str, "what to draw");
+
+const MODELS_IMAGE_COUNT: KeySpec = KeySpec::new(
+    "count",
+    KeyType::Int,
+    "N — how many images (default 1), up to what the offer draws per call",
+);
+
+const MODELS_IMAGE_SIZE: KeySpec = KeySpec::new(
+    "size",
+    KeyType::Str,
+    "WIDTHxHEIGHT, e.g. 1024x1536; give at most one of size, aspect and orientation",
+);
+
+const MODELS_IMAGE_ASPECT: KeySpec = KeySpec::new("aspect", KeyType::Str, "W:H, e.g. 2:3");
+
+const MODELS_IMAGE_ORIENTATION: KeySpec =
+    KeySpec::new("orientation", KeyType::Str, "portrait | landscape | square");
+
+const MODELS_IMAGE_REFERENCES: KeySpec = KeySpec::new(
+    "references",
+    KeyType::Array,
+    "[{image: cairn://p/PROJECT/ISSUE/images/N, label?}] — stored images to draw from, in this run's project",
+);
+
+const MODELS_IMAGE_EDIT: KeySpec = KeySpec::new(
+    "edit",
+    KeyType::Object,
+    "{image: cairn://p/.../images/N, mask?: cairn://p/.../images/N} — a stored image to change rather than draw from scratch; a mask's transparent pixels mark where",
+);
+
+const MODELS_IMAGE_EXTRAS: KeySpec = KeySpec::new(
+    "extras",
+    KeyType::Object,
+    "{WIRE: {field: value}} — provider-only knobs (quality, seed, ...), applied only when that wire carries the call, e.g. {\"openai-images\": {\"quality\": \"high\"}}",
+);
+
+pub(crate) const MODELS_IMAGE_RUN_TARGET: RunTargetSpec = RunTargetSpec {
+    kind: ResourceKind::ModelsImage,
+    label: "draw images with a named model or the workspace's image default",
+    required: &[MODELS_IMAGE_PROMPT],
+    optional: &[
+        MODELS_IMAGE_MODEL,
+        MODELS_MEDIA_PROVIDER,
+        MODELS_IMAGE_COUNT,
+        MODELS_IMAGE_SIZE,
+        MODELS_IMAGE_ASPECT,
+        MODELS_IMAGE_ORIENTATION,
+        MODELS_IMAGE_REFERENCES,
+        MODELS_IMAGE_EDIT,
+        MODELS_IMAGE_EXTRAS,
+    ],
+    example: r#"run({commands:[{target:"cairn://models/image",payload:{args_json:{prompt:"a lighthouse at dusk",orientation:"landscape"}}}]})"#,
+};
+
+const MODELS_SPEAK_MODEL: KeySpec = KeySpec::new(
+    "model",
+    KeyType::Str,
+    "the model to speak with: a catalog id, native id or provider/model, as cairn://models/speak lists them; absent takes the workspace's `speechModel`, and with none set the call is refused",
+);
+
+const MODELS_SPEAK_TEXT: KeySpec = KeySpec::new("text", KeyType::Str, "what to say");
+
+const MODELS_SPEAK_VOICE: KeySpec = KeySpec::new(
+    "voice",
+    KeyType::Str,
+    "who speaks: an OpenAI voice such as alloy, a compatible server's voice name, or an ElevenLabs voice_id",
+);
+
+const MODELS_SPEAK_FORMAT: KeySpec = KeySpec::new(
+    "format",
+    KeyType::Str,
+    "codec[_rate[_kbps]]: mp3, opus, pcm_24000, mp3_44100_128; absent takes the offer's default. PCM comes back as a WAV file",
+);
+
+const MODELS_SPEAK_SPEED: KeySpec = KeySpec::new(
+    "speed",
+    KeyType::Float,
+    "1.0 is normal, within the offer's range",
+);
+
+const MODELS_SPEAK_INSTRUCTIONS: KeySpec = KeySpec::new(
+    "instructions",
+    KeyType::Str,
+    "free-text delivery direction, for offers that take it (OpenAI's gpt-4o-mini-tts)",
+);
+
+pub(crate) const MODELS_SPEAK_RUN_TARGET: RunTargetSpec = RunTargetSpec {
+    kind: ResourceKind::ModelsSpeak,
+    label: "speak text as one audio clip with a named model or the workspace's speech default",
+    required: &[MODELS_SPEAK_TEXT, MODELS_SPEAK_VOICE],
+    optional: &[
+        MODELS_SPEAK_MODEL,
+        MODELS_MEDIA_PROVIDER,
+        MODELS_SPEAK_FORMAT,
+        MODELS_SPEAK_SPEED,
+        MODELS_SPEAK_INSTRUCTIONS,
+    ],
+    example: r#"run({commands:[{target:"cairn://models/speak",payload:{args_json:{text:"Hello there.",voice:"alloy",format:"mp3"}}}]})"#,
+};
+
 pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Models,
     uri_template: "cairn://models",
@@ -208,6 +321,8 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
         RelatedSpec { label: "answer typed questions with a named model (a run target)", kind: ResourceKind::ModelsDecide, actions: false },
         RelatedSpec { label: "embed texts with a named model (a run target)", kind: ResourceKind::ModelsEmbed, actions: false },
         RelatedSpec { label: "send one completion to a named model (a run target)", kind: ResourceKind::ModelsComplete, actions: false },
+        RelatedSpec { label: "draw images (a run target)", kind: ResourceKind::ModelsImage, actions: false },
+        RelatedSpec { label: "speak text as an audio clip (a run target)", kind: ResourceKind::ModelsSpeak, actions: false },
         RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::ModelsAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
         RelatedSpec { label: "the embedding model and how far history is embedded in it", kind: ResourceKind::ModelsEmbeddings, actions: false },
@@ -263,6 +378,28 @@ pub(crate) const MODELS_COMPLETE_CONTRACT: ResourceContract = ResourceContract {
     description: "The complete verb's door, invoked with `run`, not written: one tool-free completion with a model the caller names, without writing a response definition first. Give it the model and either a `prompt` or `messages` (ending with a user message), and optionally a `system` prompt, per-call `options` (reasoningEffort, serviceTier, fastMode, the keys a response definition takes) and an `output` JSON Schema. It returns the answer's `text`, the parsed answer as `structured` when a schema was given (an answer that violates it is retried once, naming the violation), the model and provider that answered, input and output tokens, cost where the provider reports it, latency, and the `history` entry the call was journaled as. It goes through the same execution and journal a named response does, so through the launch door's verb gate, the provider's account selection and its retry. It never chooses a model: an absent one, or one that serves no completions, is refused naming offers that do. Each provider request is bounded at 10 minutes, and the item runs to its own `timeout` up to the run ceiling, suspending its batch past the 120-second window as a response item does. Response definitions stay the named, reusable layer over the same verb. Reading it lists the providers that serve complete and how many models each offers.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "every offer that serves complete", kind: ResourceKind::ModelsCatalog, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_IMAGE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsImage,
+    uri_template: "cairn://models/image",
+    name: "Image",
+    description: "The image verb's door, invoked with `run`, not written. Give it a prompt and, optionally, the model, a shape (one of size, aspect or orientation), a count, stored reference images, a stored image to edit, and per-wire extras. The model is the one named, else the workspace's `imageModel` setting; with neither, the call is refused naming that setting, so leaving it unset keeps agents from drawing unasked. A named model that cannot take the request (a mask it does not support, a count past its limit) is refused naming the offers that could, and nothing else draws instead. Each image comes back as an image the caller sees and is stored in this run's issue as `cairn://p/PROJECT/ISSUE/images/N`, which renders wherever it is cited; a script gets those addresses, and the attachment `materialize` action puts one in its working cell as a file. The reply also carries the provenance (the provider, the model, the prompt as sent after any lowering) and the call's metered usage with its cost where the provider reports it. No per-request journal records it. One call is bounded at 180 seconds, and the item runs to its own `timeout`, suspending its batch past the 120-second window as a response item does. Reading it lists the offers that draw now, with what each can do, and the workspace default.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "every offer that serves image", kind: ResourceKind::ModelsCatalog, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_SPEAK_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsSpeak,
+    uri_template: "cairn://models/speak",
+    name: "Speak",
+    description: "The speech verb's door, invoked with `run`, not written. The verb streams; this door speaks one whole text and returns the finished clip. Give it the text and a voice and, optionally, the model, a format, a speed and delivery instructions. The model is the one named, else the workspace's `speechModel` setting; with neither, the call is refused naming that setting. A format, speed or instruction the offer cannot serve is refused naming the offers that could. The clip is stored in this run's issue as `cairn://p/PROJECT/ISSUE/attachments/N` (MP3, Ogg Opus, or WAV for PCM), at most 25 MiB; the attachment `materialize` action puts it in the caller's working cell as a file. The reply carries the address, the format, the offer that spoke, and the call's metered usage. No per-request journal records it. The item runs to its own `timeout`, suspending its batch past the 120-second window as a response item does, and a clip still speaking when it ends is cancelled upstream. Reading it lists the offers that speak now and the workspace default.",
+    read_projections: NO_PROJECTIONS,
+    related: &[RelatedSpec { label: "providers and the models they offer", kind: ResourceKind::ModelsCatalog, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
 };

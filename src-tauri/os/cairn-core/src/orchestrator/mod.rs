@@ -32,6 +32,7 @@ pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
 pub(crate) mod generation_cache;
 pub mod identity;
+pub(crate) mod image;
 pub mod inference;
 pub mod inference_control;
 pub mod inference_generate;
@@ -56,6 +57,7 @@ mod settings;
 mod sign_in_notices;
 pub(crate) use sign_in_notices::time_left as sign_in_time_left;
 pub mod skills;
+pub(crate) mod speak;
 pub mod startup_readiness;
 pub use startup_readiness::StartupReadiness;
 mod store_lock;
@@ -754,6 +756,7 @@ impl OrchestratorBuilder {
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            admission_lock: Arc::new(TokioMutex::new(())),
             context_token_snapshots: self.context_token_snapshots,
             team_attention_sender: self.team_attention_sender,
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1458,6 +1461,11 @@ pub struct Orchestrator {
     /// after acquiring it so one query pass serves an entire concurrent burst.
     pub sidebar_active_issues_rebuild: Arc<TokioMutex<()>>,
     sidebar_active_issues_rebuild_count: Arc<std::sync::atomic::AtomicU64>,
+    /// The execution queue's admission lock: every capped filing and every
+    /// gate release decides its caps and writes under it, so two admissions
+    /// never interleave over a count that spans databases. See
+    /// `execution::gates::capacity`.
+    pub(crate) admission_lock: Arc<TokioMutex<()>>,
     /// Latest normalized context-token snapshots keyed by durable session id.
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 

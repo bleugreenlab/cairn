@@ -2015,6 +2015,22 @@ async fn render_resource_body(
                 None => crate::resources::models::render_complete(orch),
             }
         }
+        CairnResource::ModelsImage => match reject_query_params("cairn://models/image", &params) {
+            Some(error) => error,
+            None => crate::resources::models::render_media(
+                orch,
+                cairn_models::types::catalog::VerbKind::Image,
+                orch.get_settings().image_model.as_deref(),
+            ),
+        },
+        CairnResource::ModelsSpeak => match reject_query_params("cairn://models/speak", &params) {
+            Some(error) => error,
+            None => crate::resources::models::render_media(
+                orch,
+                cairn_models::types::catalog::VerbKind::Speak,
+                orch.get_settings().speech_model.as_deref(),
+            ),
+        },
         CairnResource::ModelsAccounts => crate::resources::models::render_accounts(
             orch,
             &params,
@@ -2365,7 +2381,16 @@ async fn render_resource_body(
             project,
             name,
             path,
-        } => super::threads::read_thread(db, &project, &name, &path).await,
+        } => {
+            super::threads::read_thread(
+                db,
+                &project,
+                &name,
+                &path,
+                i64::from(orch.get_settings().max_open_children_per_thread),
+            )
+            .await
+        }
         CairnResource::ThreadBranches { project, thread } => {
             if let Some(error) = reject_query_params("thread branches", &params) {
                 error

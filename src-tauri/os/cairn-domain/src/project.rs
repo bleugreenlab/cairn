@@ -146,6 +146,30 @@ pub struct Project {
 /// The platform families a check's `verdictPlatforms` may name.
 pub const VERDICT_PLATFORMS: &[&str] = &["macos", "linux", "windows"];
 
+/// A toolchain a check can declare as a runtime instrument: one the check runs
+/// under, whose version can change its verdict. Each is a toolchain the
+/// check-environment probe measures on every run (`cairn-checkenv`'s
+/// `RUNTIME_INSTRUMENTS`), since a version nobody measures cannot key a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeInstrument {
+    Bun,
+    Rustc,
+}
+
+impl RuntimeInstrument {
+    /// Every instrument, which is what a check that declares none depends on.
+    pub const ALL: &'static [Self] = &[Self::Bun, Self::Rustc];
+
+    /// The instrument's name, as declared and as the probe records it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bun => "bun",
+            Self::Rustc => "rustc",
+        }
+    }
+}
+
 fn deserialize_verdict_platforms<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -403,6 +427,21 @@ pub struct CheckCommand {
         deserialize_with = "deserialize_verdict_platforms"
     )]
     pub verdict_platforms: Option<Vec<String>>,
+
+    /// The toolchains this check runs under whose version can change its
+    /// verdict: `bun` for a suite Bun executes, `rustc` for one cargo builds.
+    /// Each declared instrument's version is part of the check's verdict
+    /// environment, so a verdict produced under one Bun never answers a lookup
+    /// that expects another, while a toolchain the check does not declare can
+    /// change version without voiding its stored verdicts.
+    ///
+    /// Absent means every probed toolchain: a check that says nothing about its
+    /// runtime may depend on any of it, and the cost of assuming so is a re-run,
+    /// where the cost of assuming otherwise is a verdict from another runtime.
+    /// An empty list declares that no probed toolchain decides it (a suite that
+    /// runs under node alone, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Vec<RuntimeInstrument>>,
 
     /// Whether this check REWRITES the tree as its job — a formatter, not a
     /// verifier. Declared fixers run FIRST inside the write cadence's shared
@@ -671,6 +710,7 @@ pub struct CheckVocabulary {
     pub resource_class: Vec<String>,
     pub tree: Vec<String>,
     pub verdict_platforms: Vec<String>,
+    pub runtime: Vec<String>,
 }
 
 impl CheckVocabulary {
@@ -682,6 +722,7 @@ impl CheckVocabulary {
             resource_class: serde_variants::<CheckResourceClass>(),
             tree: serde_variants::<CheckTree>(),
             verdict_platforms: VERDICT_PLATFORMS.iter().map(|p| p.to_string()).collect(),
+            runtime: serde_variants::<RuntimeInstrument>(),
         }
     }
 
@@ -716,6 +757,19 @@ impl CheckVocabulary {
                         value.clone(),
                         self.verdict_platforms.clone(),
                     );
+                }
+            }
+        }
+        // An instrument a later build measures (`node`, say) is a newer word,
+        // not a typo this build may drop: dropping it would key the check on
+        // fewer toolchains than its author declared.
+        if let Some(serde_yaml::Value::Sequence(instruments)) = entry.get("runtime") {
+            for instrument in instruments {
+                let serde_yaml::Value::String(value) = instrument else {
+                    continue;
+                };
+                if !self.runtime.contains(value) {
+                    return unsupported("runtime", value.clone(), self.runtime.clone());
                 }
             }
         }
@@ -871,6 +925,7 @@ mod check_vocabulary_tests {
                 "executor",
                 "verdictEnvironment",
                 "verdictPlatforms",
+                "runtime",
                 "fixes",
                 "mainCadence",
                 "tree",
@@ -883,6 +938,30 @@ mod check_vocabulary_tests {
         assert_eq!(vocabulary.resource_class, ["shared", "exclusive"]);
         assert_eq!(vocabulary.tree, ["full", "impact"]);
         assert_eq!(vocabulary.verdict_platforms, ["macos", "linux", "windows"]);
+        assert_eq!(vocabulary.runtime, ["bun", "rustc"]);
+        assert_eq!(
+            RuntimeInstrument::ALL
+                .iter()
+                .map(|instrument| instrument.as_str())
+                .collect::<Vec<_>>(),
+            vocabulary.runtime,
+            "`ALL` and `as_str` name exactly what the deserializer accepts"
+        );
+    }
+
+    #[test]
+    fn runtime_reads_as_declared_and_absent_reads_as_undeclared() {
+        let vocabulary = CheckVocabulary::this_build();
+        let read = |yaml: &str| match read_declared_check(entry(yaml), &vocabulary) {
+            Ok(DeclaredCheck::Supported(check)) => check.runtime,
+            other => panic!("{yaml} must read as a supported check: {other:?}"),
+        };
+        assert_eq!(read("command: x\n"), None);
+        assert_eq!(read("command: x\nruntime: []\n"), Some(Vec::new()));
+        assert_eq!(
+            read("command: x\nruntime: [rustc, bun]\n"),
+            Some(vec![RuntimeInstrument::Rustc, RuntimeInstrument::Bun])
+        );
     }
 
     #[test]
@@ -944,6 +1023,7 @@ mod check_vocabulary_tests {
                 "verdictPlatforms",
                 "freebsd",
             ),
+            ("command: x\nruntime: [bun, node]\n", "runtime", "node"),
         ] {
             let DeclaredCheck::Unsupported(unsupported) =
                 read_declared_check(entry(yaml), &vocabulary).unwrap()

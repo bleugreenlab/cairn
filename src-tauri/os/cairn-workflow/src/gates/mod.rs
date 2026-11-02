@@ -6,4 +6,5 @@
 //! [`crate::transitions`] and execution detail in [`crate::queries`] — live in
 //! this crate, and `cairn-core` depends on it rather than the reverse.
 
+pub mod hint;
 pub mod store;

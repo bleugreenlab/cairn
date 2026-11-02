@@ -995,6 +995,12 @@ pub async fn write_job_status(
             .await?;
         }
     }
+    // A job leaving `pending`/`running` may free a fleet slot an execution is
+    // held for.
+    let working = |status: &JobStatus| matches!(status, JobStatus::Pending | JobStatus::Running);
+    if working(from) && !working(to) {
+        crate::gates::hint::evidence_changed();
+    }
     Ok(())
 }
 
