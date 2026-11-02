@@ -277,6 +277,7 @@ mod tests {
             .encode(br#"{"sub":"runner:runner-1","org_id":"org-1"}"#);
         ApprovalsClient::new(
             http,
+            Default::default(),
             ApiConfig {
                 base_url: "https://api.policy.test".into(),
             },

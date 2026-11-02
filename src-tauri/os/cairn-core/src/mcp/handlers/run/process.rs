@@ -179,7 +179,7 @@ async fn run_model_door(
     use cairn_common::run_contract::ModelDoor;
     let mut outcome = match door {
         ModelDoor::Decide => run_decide(orch, run_context, header, args, timeout).await,
-        ModelDoor::Embed => run_embed(orch, run_context, header, args, timeout).await,
+        ModelDoor::Embed => super::embed::run_embed(orch, run_context, header, args, timeout).await,
         ModelDoor::Complete => {
             run_complete(orch, run_context, header, args, timeout, interrupt).await
         }
@@ -244,58 +244,6 @@ async fn run_complete(
                 .structured
                 .as_ref()
                 .map_or_else(|| outcome.text.clone(), serde_json::Value::to_string),
-            succeeded: true,
-            suspended: false,
-            images: Vec::new(),
-            tracked_modifications: None,
-            data: serde_json::to_value(&outcome).ok(),
-            whole: false,
-        },
-    }
-}
-
-/// Answer a `cairn://models/embed` item, bounded by the item's timeout under
-/// the host-item cap. A timeout releases the caller at once, and the call it
-/// abandons sends no further request.
-async fn run_embed(
-    orch: &Orchestrator,
-    run_context: Option<&RunContext>,
-    header: String,
-    args: serde_json::Value,
-    timeout: Option<u32>,
-) -> ItemOutcome {
-    let request: crate::orchestrator::embed::EmbedDoorRequest = match serde_json::from_value(args) {
-        Ok(request) => request,
-        Err(error) => {
-            return ItemOutcome::failed(
-                header,
-                format!(
-                    "cairn://models/embed takes {{model, input, purpose?, width?}} in payload.args_json: {error}. Read cairn://models/embed for the shape."
-                ),
-            )
-        }
-    };
-    let bound = super::host_item_bound(timeout);
-    let project_id = run_context.map(|context| context.project_id.as_str());
-    match tokio::time::timeout(bound.limit, orch.embed_named(project_id, request)).await {
-        Err(_) => ItemOutcome::failed(
-            header,
-            format!(
-                "Embedding {} The call it abandoned sends no further request, and the one in flight ends within 60 s.",
-                bound.describe(None)
-            ),
-        ),
-        Ok(Err(refusal)) => ItemOutcome::failed(header, refusal),
-        Ok(Ok(outcome)) => ItemOutcome {
-            header: format!(
-                "cairn://models/embed [{} · {} · {}×{} · {:.1}s]",
-                outcome.provider,
-                outcome.model,
-                outcome.vectors.len(),
-                outcome.dims,
-                outcome.latency_ms as f64 / 1000.0
-            ),
-            body: serde_json::to_string(&outcome).unwrap_or_default(),
             succeeded: true,
             suspended: false,
             images: Vec::new(),

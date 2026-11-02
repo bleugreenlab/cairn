@@ -22,11 +22,14 @@ use cairn_common::executor_protocol::{ExecutorHealthSnapshot, GpuMemory, Measure
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
 use cairn_inference::served::{self, EngineMeasure};
-use cairn_inference::{DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine};
+use cairn_inference::{
+    DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine, Model, Server,
+};
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
 
 use super::inference_control::{self, LoadRow};
+use super::inference_verify::VerificationRow;
 use super::Orchestrator;
 use crate::fleet::models::requests::{Request, RequestState};
 use crate::fleet::models::settings::SettingOrigin;
@@ -128,9 +131,11 @@ pub struct Rates {
 #[serde(rename_all = "camelCase")]
 pub struct LoadableModel {
     pub model: String,
-    pub profile: String,
+    /// The profile a load runs, when a deployment of it is on the pool.
+    pub profile: Option<String>,
     pub size_bytes: Option<u64>,
-    pub fits: bool,
+    /// Why it cannot load on this pool, in a few words; `None` when it can.
+    pub blocked: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -150,6 +155,8 @@ pub struct InferenceModel {
     pub maker: Option<String>,
     pub facts: ModelFacts,
     pub profiles: Vec<ModelProfile>,
+    /// Why none of its deployments can run now, in a few words.
+    pub blocked: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -166,10 +173,15 @@ pub struct ModelFacts {
 pub struct ModelProfile {
     pub id: String,
     pub quantization: Option<String>,
-    pub server: Option<String>,
+    /// What runs it: the server of a container profile, else the engine kind.
+    pub engine: String,
     pub machines: u32,
-    pub origin: Option<String>,
+    /// authored, imported or generated.
+    pub origin: String,
     pub in_use: bool,
+    /// A container profile, which verification can measure on a pool.
+    pub verifiable: bool,
+    /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
 }
 
@@ -182,6 +194,8 @@ pub struct ProfileFit {
     pub load_ms: Option<u64>,
     pub decode_tokens_per_sec: Option<f64>,
     pub failed: Option<String>,
+    /// A verification on the pool is under way.
+    pub verifying: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -290,11 +304,39 @@ pub(crate) struct Sources<'a> {
     pub machines: &'a BTreeMap<String, MachineFacts>,
     pub engines: &'a BTreeMap<DeploymentId, EngineSummary>,
     pub measures: &'a BTreeMap<DeploymentId, EngineMeasure>,
+    /// The verifications, newest first, without those of a profile changed
+    /// since they ran.
+    pub verifications: &'a [VerificationRow],
     pub now: i64,
 }
 
 fn since(now: i64, at: i64) -> u64 {
     u64::try_from(now.saturating_sub(at)).unwrap_or(0)
+}
+
+/// Whether two real names name one model: the join between a model record and
+/// the profiles that serve it.
+fn same_model(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+fn engine_label(engine: &Engine) -> String {
+    match engine {
+        Engine::Container(container) => match container.server {
+            Server::Vllm => "vLLM",
+            Server::LlamaCpp => "llama.cpp",
+        }
+        .to_string(),
+        other => other.kind().to_string(),
+    }
+}
+
+/// A model and the profiles that serve it, joined by real name. A profile
+/// whose model has no record still makes a model of its own name.
+struct ModelGroup<'a> {
+    name: String,
+    record: Option<&'a Model>,
+    profiles: Vec<&'a InferenceProfile>,
 }
 
 impl Sources<'_> {
@@ -499,32 +541,266 @@ impl Sources<'_> {
         memory
     }
 
-    fn pool(&self, pool: &PoolView) -> InferencePool {
+    /// The newest verification that ran as `deployment`, when it is one's.
+    fn verification_of(&self, deployment: &DeploymentId) -> Option<&VerificationRow> {
+        self.verifications
+            .iter()
+            .find(|row| row.deployment == deployment.as_str())
+    }
+
+    fn model_groups(&self) -> Vec<ModelGroup<'_>> {
+        let mut groups: BTreeMap<String, ModelGroup<'_>> = BTreeMap::new();
+        for model in self.inventory.models.values() {
+            let entry = groups
+                .entry(model.name.trim().to_ascii_lowercase())
+                .or_insert_with(|| ModelGroup {
+                    name: model.name.trim().to_string(),
+                    record: None,
+                    profiles: Vec::new(),
+                });
+            entry.name = model.name.trim().to_string();
+            entry.record = Some(model);
+        }
+        for profile in self.inventory.profiles.values() {
+            groups
+                .entry(profile.model.name.trim().to_ascii_lowercase())
+                .or_insert_with(|| ModelGroup {
+                    name: profile.model.name.trim().to_string(),
+                    record: None,
+                    profiles: Vec::new(),
+                })
+                .profiles
+                .push(profile);
+        }
+        groups.into_values().collect()
+    }
+
+    /// Every model with a profile, as `pool`'s load menu offers it: those a
+    /// deployment here can run first, then those that cannot, each with why.
+    /// A pool busy with batch work still offers every model: a request stops
+    /// new batches there, so loading is never withheld for it.
+    fn loadable(
+        &self,
+        pool: &PoolView,
+        deployments: &[DeploymentId],
+        running: &[RunningModel],
+        groups: &[ModelGroup<'_>],
+    ) -> Vec<LoadableModel> {
+        let mut offered: Vec<LoadableModel> = groups
+            .iter()
+            .filter(|group| !group.profiles.is_empty())
+            // A model here, or on its way down, is not offered until it is down.
+            .filter(|group| {
+                !running
+                    .iter()
+                    .any(|r| r.state != RunningState::Failed && same_model(&r.model, &group.name))
+            })
+            .map(|group| self.offer(pool, deployments, group))
+            .collect();
+        offered.sort_by_key(|offer| offer.blocked.is_some());
+        offered
+    }
+
+    fn offer(
+        &self,
+        pool: &PoolView,
+        deployments: &[DeploymentId],
+        group: &ModelGroup<'_>,
+    ) -> LoadableModel {
+        let mut here: Vec<(&InferenceProfile, Option<u64>, Option<String>)> = deployments
+            .iter()
+            .filter_map(|id| Some((id, self.model_of(id)?)))
+            .filter(|(_, profile)| same_model(&profile.model.name, &group.name))
+            .map(|(id, profile)| {
+                let (size, per_machine) = self.size(id, profile);
+                let blocked = if !self.fits(pool, profile, per_machine) {
+                    Some("won't fit".to_string())
+                } else {
+                    match self.verification_of(id).map(|row| row.outcome.as_str()) {
+                        Some("running") => Some("verifying".to_string()),
+                        Some("passed") | None => None,
+                        Some(_) => Some("failed verify".to_string()),
+                    }
+                };
+                (profile, size, blocked)
+            })
+            .collect();
+        here.sort_by_key(|(_, _, blocked)| blocked.is_some());
+        match here.into_iter().next() {
+            Some((profile, size, blocked)) => LoadableModel {
+                model: group.name.clone(),
+                profile: Some(profile.id.to_string()),
+                size_bytes: size,
+                blocked,
+            },
+            None => LoadableModel {
+                model: group.name.clone(),
+                profile: None,
+                size_bytes: None,
+                blocked: Some(self.not_here(pool, group)),
+            },
+        }
+    }
+
+    /// Why `group` has no deployment on `pool`, in a few words.
+    fn not_here(&self, pool: &PoolView, group: &ModelGroup<'_>) -> String {
+        let members: BTreeSet<&str> = pool.members.iter().map(|m| m.machine.as_str()).collect();
+        // A gang reaching past this pool's machines: they are not linked.
+        for placement in self
+            .models
+            .deployments
+            .iter()
+            .filter(|placement| same_model(&placement.model, &group.name))
+        {
+            let Some(record) = self.inventory.deployments.get(&placement.deployment) else {
+                continue;
+            };
+            let machines: Vec<&str> = record.machines.iter().map(|m| m.as_str()).collect();
+            if machines.len() > 1
+                && machines.iter().any(|m| members.contains(m))
+                && !machines.iter().all(|m| members.contains(m))
+            {
+                return format!("needs {} link", machines.join("+"));
+            }
+        }
+        let size = pool.members.len() as u32;
+        if let Some(fewest) = group
+            .profiles
+            .iter()
+            .map(|profile| profile.requirements.machines)
+            .min()
+            .filter(|fewest| *fewest > size)
+        {
+            return format!("needs ×{fewest}");
+        }
+        if group
+            .profiles
+            .iter()
+            .any(|profile| matches!(profile.engine, Engine::Container(_)))
+        {
+            "unverified here".to_string()
+        } else {
+            "no deployment here".to_string()
+        }
+    }
+
+    /// Why none of `group`'s deployments can run now, in a few words; `None`
+    /// when one can, one is resident, or it has none.
+    fn model_blocked(&self, group: &ModelGroup<'_>) -> Option<String> {
+        let placements: Vec<_> = self
+            .models
+            .deployments
+            .iter()
+            .filter(|placement| same_model(&placement.model, &group.name))
+            .collect();
+        if placements.iter().any(|placement| {
+            placement.pool.is_some() || self.models.resident(&placement.deployment).is_some()
+        }) {
+            return None;
+        }
+        let placement = placements.first()?;
+        let pooled = |machine: &str| {
+            self.models
+                .pools
+                .iter()
+                .any(|pool| pool.members.iter().any(|m| m.machine == machine))
+        };
+        let machines: Vec<&str> = self
+            .inventory
+            .deployments
+            .get(&placement.deployment)
+            .map(|record| record.machines.iter().map(|m| m.as_str()).collect())
+            .unwrap_or_default();
+        Some(match machines.iter().find(|machine| !pooled(machine)) {
+            Some(machine) => format!("{machine} is in no pool"),
+            None if machines.len() > 1 => format!("no link between {}", machines.join(" and ")),
+            None => placement
+                .refused
+                .clone()
+                .unwrap_or_else(|| "cannot run now".to_string()),
+        })
+    }
+
+    /// A profile's fit per pool: the newest verification there, else what its
+    /// deployment's loads measured, else nothing (not measured).
+    fn profile_fit(&self, profile: &InferenceProfile) -> Vec<ProfileFit> {
+        let mut fits: BTreeMap<String, ProfileFit> = BTreeMap::new();
+        for row in self
+            .verifications
+            .iter()
+            .filter(|row| row.profile == profile.id.as_str())
+        {
+            if fits.contains_key(&row.pool) {
+                continue;
+            }
+            let passed = row.outcome == "passed";
+            fits.insert(
+                row.pool.clone(),
+                ProfileFit {
+                    pool: row.pool.clone(),
+                    fits: true,
+                    memory_bytes: row
+                        .footprint
+                        .as_ref()
+                        .filter(|_| passed)
+                        .map(|footprint| footprint.values().sum()),
+                    load_ms: row
+                        .load_ms
+                        .filter(|_| passed)
+                        .and_then(|ms| u64::try_from(ms).ok()),
+                    decode_tokens_per_sec: row.decode_tps.or(row.embed_tps).filter(|_| passed),
+                    failed: (row.outcome == "failed")
+                        .then(|| row.reason.clone().unwrap_or_else(|| "failed".to_string())),
+                    verifying: row.outcome == "running",
+                },
+            );
+        }
+        for id in self
+            .inventory
+            .deployments
+            .values()
+            .filter(|d| d.profile == profile.id)
+            .map(|d| &d.id)
+        {
+            let Some(pool) = self.pool_of(id) else {
+                continue;
+            };
+            let key = pool.key.to_string();
+            if fits.contains_key(&key) {
+                continue;
+            }
+            let (size, per_machine) = self.size(id, profile);
+            let fits_here = self.fits(pool, profile, per_machine);
+            let loads = self.loads.get(id).filter(|loads| !loads.is_empty());
+            if loads.is_none() && fits_here {
+                continue;
+            }
+            fits.insert(
+                key.clone(),
+                ProfileFit {
+                    pool: key,
+                    fits: fits_here,
+                    memory_bytes: size,
+                    load_ms: self.slowest_load_ms(id),
+                    decode_tokens_per_sec: None,
+                    failed: loads
+                        .and_then(|loads| loads.first())
+                        .filter(|load| !load.healthy)
+                        .and_then(|load| load.reason.clone()),
+                    verifying: false,
+                },
+            );
+        }
+        fits.into_values().collect()
+    }
+
+    fn pool(&self, pool: &PoolView, groups: &[ModelGroup<'_>]) -> InferencePool {
         let deployments = self.deployments_of(pool);
         let running: Vec<RunningModel> = deployments
             .iter()
             .filter_map(|id| self.running(id))
             .collect();
-        // A model on its way down is not offered for loading until it is down.
-        let busy: BTreeSet<&str> = running
-            .iter()
-            .filter(|r| r.state != RunningState::Failed)
-            .map(|r| r.deployment.as_str())
-            .collect();
-        let loadable = deployments
-            .iter()
-            .filter(|id| !busy.contains(id.as_str()))
-            .filter_map(|id| {
-                let profile = self.model_of(id)?;
-                let (size, per_machine) = self.size(id, profile);
-                Some(LoadableModel {
-                    model: profile.model.name.clone(),
-                    profile: profile.id.to_string(),
-                    size_bytes: size,
-                    fits: self.fits(pool, profile, per_machine),
-                })
-            })
-            .collect();
+        let loadable = self.loadable(pool, &deployments, &running, groups);
         let link = match (pool.members.as_slice(), pool.rate_gbps) {
             ([a, b], Some(gbps)) => Some(InferenceLink {
                 machines: [a.machine.clone(), b.machine.clone()],
@@ -558,102 +834,90 @@ impl Sources<'_> {
         }
     }
 
-    /// The models, from the profiles grouped by real name, with each profile's
-    /// fit per pool from the act side's load history.
-    ///
-    /// The fallback until model records and verifications exist (cairn/5730),
-    /// which replace this function: then facts come from the model record and
-    /// fit from the verification rows, quantization, server and origin from the
-    /// profile, and nothing here survives.
-    fn models_from_profiles(&self, running: &[RunningModel]) -> Vec<InferenceModel> {
+    /// The models: each model record with the profiles that serve it, its
+    /// facts read from the model (falling back to its first profile's), and
+    /// each profile's fit per pool.
+    fn model_list(
+        &self,
+        groups: &[ModelGroup<'_>],
+        running: &[RunningModel],
+    ) -> Vec<InferenceModel> {
         let in_use: BTreeSet<&str> = running
             .iter()
             .filter(|r| matches!(r.state, RunningState::Ready | RunningState::Loading))
             .map(|r| r.profile.as_str())
             .collect();
-        let mut by_name: BTreeMap<String, Vec<&InferenceProfile>> = BTreeMap::new();
-        for profile in self.inventory.profiles.values() {
-            by_name
-                .entry(profile.model.name.trim().to_ascii_lowercase())
-                .or_default()
-                .push(profile);
-        }
-        by_name
-            .into_values()
-            .filter_map(|profiles| {
-                let first = *profiles.first()?;
-                let name = first.model.name.trim().to_string();
-                let modalities = served::modalities(first);
-                let deployments_of = |profile: &InferenceProfile| -> Vec<&DeploymentId> {
-                    self.inventory
-                        .deployments
-                        .values()
-                        .filter(|d| d.profile == profile.id)
-                        .map(|d| &d.id)
-                        .collect()
-                };
-                let context_tokens = profiles
-                    .iter()
-                    .flat_map(|profile| deployments_of(profile))
-                    .filter_map(|id| self.measures.get(id)?.context_length())
-                    .max();
-                let model_profiles = profiles
-                    .iter()
-                    .map(|profile| ModelProfile {
-                        id: profile.id.to_string(),
-                        quantization: None,
-                        server: None,
-                        machines: profile.requirements.machines,
-                        origin: None,
-                        in_use: in_use.contains(profile.id.as_str()),
-                        fit: deployments_of(profile)
-                            .into_iter()
-                            .filter_map(|id| {
-                                let pool = self.pool_of(id)?;
-                                let (size, per_machine) = self.size(id, profile);
-                                let latest = self.loads.get(id).and_then(|loads| loads.first());
-                                Some(ProfileFit {
-                                    pool: pool.key.to_string(),
-                                    fits: self.fits(pool, profile, per_machine),
-                                    memory_bytes: size,
-                                    load_ms: self.slowest_load_ms(id),
-                                    decode_tokens_per_sec: None,
-                                    failed: latest
-                                        .filter(|load| !load.healthy)
-                                        .and_then(|load| load.reason.clone()),
-                                })
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                Some(InferenceModel {
-                    maker: name.split_once('/').map(|(maker, _)| maker.to_string()),
-                    name,
-                    facts: ModelFacts {
-                        inputs: modalities.input,
-                        outputs: modalities.output,
-                        parameters: None,
-                        context_tokens,
+        groups
+            .iter()
+            .map(|group| {
+                let facts = group.record.map(|model| &model.facts);
+                let (inputs, outputs) = match facts.and_then(|f| f.modalities.as_ref()) {
+                    Some(modalities) => (modalities.input.clone(), modalities.output.clone()),
+                    None => match group.profiles.first() {
+                        Some(first) => {
+                            let modalities = served::modalities(first);
+                            (modalities.input, modalities.output)
+                        }
+                        None => (vec![Modality::Text], vec![Modality::Text]),
                     },
-                    profiles: model_profiles,
-                })
+                };
+                let measured_context = group
+                    .profiles
+                    .iter()
+                    .flat_map(|profile| {
+                        self.inventory
+                            .deployments
+                            .values()
+                            .filter(move |d| d.profile == profile.id)
+                    })
+                    .filter_map(|d| self.measures.get(&d.id)?.context_length())
+                    .max();
+                InferenceModel {
+                    maker: group
+                        .name
+                        .split_once('/')
+                        .map(|(maker, _)| maker.to_string()),
+                    name: group.name.clone(),
+                    facts: ModelFacts {
+                        inputs,
+                        outputs,
+                        parameters: facts.and_then(|f| f.parameters),
+                        context_tokens: facts.and_then(|f| f.context).or(measured_context),
+                    },
+                    profiles: group
+                        .profiles
+                        .iter()
+                        .map(|profile| ModelProfile {
+                            id: profile.id.to_string(),
+                            quantization: profile.quantization.clone(),
+                            engine: engine_label(&profile.engine),
+                            machines: profile.requirements.machines,
+                            origin: profile.origin.label().to_string(),
+                            in_use: in_use.contains(profile.id.as_str()),
+                            verifiable: matches!(profile.engine, Engine::Container(_)),
+                            fit: self.profile_fit(profile),
+                        })
+                        .collect(),
+                    blocked: self.model_blocked(group),
+                }
             })
             .collect()
     }
 
     pub(crate) fn overview(&self) -> InferenceOverview {
+        let groups = self.model_groups();
         let pools: Vec<InferencePool> = self
             .models
             .pools
             .iter()
-            .map(|pool| self.pool(pool))
+            .map(|pool| self.pool(pool, &groups))
             .collect();
         let running: Vec<RunningModel> = pools
             .iter()
             .flat_map(|pool| pool.running.iter().cloned())
             .collect();
         InferenceOverview {
-            models: self.models_from_profiles(&running),
+            models: self.model_list(&groups, &running),
             pools,
         }
     }
@@ -704,6 +968,14 @@ async fn with_sources<T>(
         .collect();
     let engines = super::inference_metrics::summaries();
     let measures = super::inference_route::measures();
+    // Staleness is judged against the records as written: the served inventory
+    // lays settings declarations over them, which would read as a change.
+    let records = super::inference::load_inventory(db).await?;
+    let verifications: Vec<VerificationRow> = super::inference_verify::load_verifications(db)
+        .await?
+        .into_iter()
+        .filter(|row| !row.stale(&records))
+        .collect();
     Ok(with(&Sources {
         inventory: &inventory,
         phases: &phases,
@@ -712,6 +984,7 @@ async fn with_sources<T>(
         machines: &machines,
         engines: &engines,
         measures: &measures,
+        verifications: &verifications,
         now: crate::fleet::unix_time_ms() as i64,
     }))
 }
@@ -822,6 +1095,103 @@ pub async fn try_prompt(
         text: outcome.text,
         tokens_per_sec,
     })
+}
+
+/// Register a model by its Hugging Face repository id, reading its facts, as
+/// `append cairn://inference/models {repo}` does.
+pub async fn register_model(orch: &Orchestrator, repo: &str) -> Result<String, String> {
+    let hub = super::inference_models::Web::new()?;
+    super::inference_models::register(&orch.db.local, &hub, repo.trim(), None).await
+}
+
+/// A key an import needs that its files do not give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeededKey {
+    /// Where it goes in the spec: `ranks`, `env.VLLM_PORT`, `hostPaths./tmp`.
+    pub key: String,
+    pub meaning: String,
+}
+
+/// How an import from the page went: the profile written, or the keys the
+/// spec still lacks, which the page asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Imported {
+    pub message: String,
+    /// Empty once the profile is written.
+    pub needs: Vec<NeededKey>,
+}
+
+/// Import a profile from a compose service at a pinned commit, as
+/// `append cairn://inference/profiles {import}` does. A refusal that names
+/// keys is an answer, not an error: the page fills them and tries again.
+pub async fn import_profile(
+    orch: &Orchestrator,
+    spec: serde_json::Value,
+) -> Result<Imported, String> {
+    use super::inference_import::{import, ImportRefusal};
+    let spec: cairn_inference::import::ImportSpec = serde_json::from_value(spec)
+        .map_err(|error| format!("the import is not an import spec: {error}"))?;
+    let hub = super::inference_models::Web::new()?;
+    match import(&orch.db.local, &hub, &spec).await {
+        Ok(message) => Ok(Imported {
+            message,
+            needs: Vec::new(),
+        }),
+        Err(ImportRefusal::Compile(error)) if !error.missing.is_empty() => Ok(Imported {
+            message: error.to_string(),
+            needs: error
+                .missing
+                .into_iter()
+                .map(|missing| NeededKey {
+                    key: missing.key,
+                    meaning: missing.meaning,
+                })
+                .collect(),
+        }),
+        Err(refusal) => Err(refusal.to_string()),
+    }
+}
+
+/// Generate candidate profiles for `model` on `pool` from its machines'
+/// reported hardware, as `append cairn://inference/profiles {generate}` does.
+pub async fn generate_profiles(
+    orch: &Orchestrator,
+    model: &str,
+    pool: &str,
+) -> Result<super::inference_generate::Generation, String> {
+    use super::inference_generate::{detected_pool, executor_snapshots, generate};
+    let pool = detected_pool(orch, pool)?;
+    let hub = super::inference_models::Web::new()?;
+    generate(
+        &orch.db.local,
+        &hub,
+        model,
+        &pool,
+        &executor_snapshots(orch),
+        &BTreeMap::new(),
+    )
+    .await
+}
+
+/// Verify `profile` on `pool` in the background, as
+/// `patch cairn://inference/profiles/<id> {verify}` does.
+pub async fn verify_profile(
+    orch: &Orchestrator,
+    profile: &str,
+    pool: &str,
+) -> Result<String, String> {
+    let detected = super::inference_generate::detected_pool(orch, pool)?;
+    let id = super::inference_verify::spawn(
+        orch,
+        vec![cairn_inference::InferenceProfileId::from(profile)],
+        detected,
+        OPERATOR,
+        false,
+    )
+    .await?;
+    Ok(format!("Verifying {profile} on {pool} (verification {id})"))
 }
 
 #[cfg(test)]
@@ -982,6 +1352,7 @@ deployments:
         machines: BTreeMap<String, MachineFacts>,
         engines: BTreeMap<DeploymentId, EngineSummary>,
         measures: BTreeMap<DeploymentId, EngineMeasure>,
+        verifications: Vec<VerificationRow>,
     }
 
     impl World {
@@ -994,6 +1365,7 @@ deployments:
                 machines: BTreeMap::new(),
                 engines: BTreeMap::new(),
                 measures: BTreeMap::new(),
+                verifications: Vec::new(),
             }
         }
 
@@ -1010,6 +1382,7 @@ deployments:
                 machines: &self.machines,
                 engines: &self.engines,
                 measures: &self.measures,
+                verifications: &self.verifications,
                 now: 600_000,
             }
         }
@@ -1068,14 +1441,19 @@ deployments:
         );
         assert_eq!(sparks.warm.as_deref(), Some(DSV4));
         assert_eq!(sparks.machines[0].gpu.as_deref(), Some("NVIDIA GB10"));
-        // The running model is not offered for loading; the other profile is.
+        // The running model is not offered for loading. The other one deployed
+        // here declares 200 GB against 122 GiB machines, and the embedder has
+        // no deployment here: both are listed, each with why.
         assert_eq!(
             sparks
                 .loadable
                 .iter()
-                .map(|l| l.model.as_str())
+                .map(|l| (l.model.as_str(), l.blocked.as_deref()))
                 .collect::<Vec<_>>(),
-            [QWEN]
+            [
+                (EMBED, Some("no deployment here")),
+                (QWEN, Some("won't fit"))
+            ]
         );
     }
 
@@ -1209,10 +1587,11 @@ deployments:
         let sparks = pool(&overview, SPARKS);
         let qwen = sparks.loadable.iter().find(|l| l.model == QWEN).unwrap();
         // 200 GB declared against a 122 GiB machine.
-        assert!(!qwen.fits);
+        assert_eq!(qwen.blocked.as_deref(), Some("won't fit"));
         assert_eq!(qwen.size_bytes, Some(200_000_000_000));
         let deepseek = sparks.loadable.iter().find(|l| l.model == DSV4).unwrap();
-        assert!(deepseek.fits);
+        assert_eq!(deepseek.blocked, None);
+        assert_eq!(deepseek.profile.as_deref(), Some("dsv4f-tp2"));
         assert_eq!(deepseek.size_bytes, None);
         let model = overview.models.iter().find(|m| m.name == QWEN).unwrap();
         assert!(!model.profiles[0].fit[0].fits);
@@ -1275,6 +1654,9 @@ deployments:
         assert_eq!(deepseek.facts.context_tokens, Some(1_048_576));
         let profile = &deepseek.profiles[0];
         assert_eq!(profile.machines, 2);
+        assert_eq!(profile.engine, "command");
+        assert_eq!(profile.origin, "authored");
+        assert!(!profile.verifiable);
         assert!(!profile.in_use);
         assert_eq!(
             profile.fit,
@@ -1285,10 +1667,186 @@ deployments:
                 load_ms: Some(420_000),
                 decode_tokens_per_sec: None,
                 failed: None,
+                verifying: false,
             }]
         );
         let embedder = &overview.models[1];
         assert_eq!(embedder.facts.outputs, [Modality::Embeddings]);
+        // Nothing measured on its pool: no fit, which the page says as such.
+        assert_eq!(embedder.profiles[0].fit, []);
+    }
+
+    fn verification(profile: &str, pool: &str, outcome: &str) -> VerificationRow {
+        VerificationRow {
+            id: format!("{profile}-{pool}-{outcome}"),
+            profile: profile.into(),
+            profile_digest: String::new(),
+            pool: pool.into(),
+            deployment: format!("verify-{profile}-{pool}"),
+            machines: Vec::new(),
+            requested_by: OPERATOR.into(),
+            started_at: 0,
+            finished_at: None,
+            outcome: outcome.into(),
+            stage: String::new(),
+            reason: (outcome == "failed").then(|| "out of memory".to_string()),
+            load_ms: Some(300_000),
+            footprint: Some(BTreeMap::from([("fedora".to_string(), 9 * GIB)])),
+            context_tokens: None,
+            kv_tokens: None,
+            ttft_ms: None,
+            decode_tps: None,
+            prefill_tps: None,
+            embed_tps: Some(2_400.0),
+            engine_version: None,
+        }
+    }
+
+    #[test]
+    fn a_registered_model_shows_with_no_profile_and_its_facts_from_the_record() {
+        let mut world = World::new();
+        let mut fresh = Model::named("org/Fresh-7B");
+        fresh.facts.parameters = Some(7_000_000_000);
+        fresh.facts.context = Some(32_768);
+        world.inventory.insert_model(fresh);
+        let overview = world.overview();
+        let fresh = overview
+            .models
+            .iter()
+            .find(|m| m.name == "org/Fresh-7B")
+            .unwrap();
+        assert!(fresh.profiles.is_empty());
+        assert_eq!(fresh.facts.parameters, Some(7_000_000_000));
+        assert_eq!(fresh.facts.context_tokens, Some(32_768));
+        assert_eq!(fresh.blocked, None);
+        // No profile, so no pool offers it for loading.
+        assert!(overview
+            .pools
+            .iter()
+            .all(|pool| pool.loadable.iter().all(|l| l.model != "org/Fresh-7B")));
+    }
+
+    #[test]
+    fn a_profile_s_fit_is_its_newest_verification_per_pool() {
+        let mut world = World::new();
+        world.verifications = vec![
+            verification("qwen3-embed-4b", "fedora", "passed"),
+            verification("qwen3-embed-4b", "fedora", "failed"),
+            verification("qwen3-embed-4b", SPARKS, "running"),
+        ];
+        let overview = world.overview();
+        let embedder = overview.models.iter().find(|m| m.name == EMBED).unwrap();
+        assert_eq!(
+            embedder.profiles[0].fit,
+            [
+                ProfileFit {
+                    pool: "fedora".into(),
+                    fits: true,
+                    memory_bytes: Some(9 * GIB),
+                    load_ms: Some(300_000),
+                    decode_tokens_per_sec: Some(2_400.0),
+                    failed: None,
+                    verifying: false,
+                },
+                ProfileFit {
+                    pool: SPARKS.into(),
+                    fits: true,
+                    memory_bytes: None,
+                    load_ms: None,
+                    decode_tokens_per_sec: None,
+                    failed: None,
+                    verifying: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn every_pool_offers_every_model_and_greys_only_what_cannot_run_there() {
+        let mut world = World::new();
+        // The Sparks without their link: each is a pool of its own, and the
+        // two-machine deployment has nowhere to run.
+        world.models.pools = vec![
+            pool_view(&["sp1"], QWEN),
+            pool_view(&["sp2"], QWEN),
+            pool_view(&["fedora"], EMBED),
+        ];
+        world.models.deployments = vec![
+            DeploymentPlacement {
+                refused: Some("no fast link joins sp1 and sp2, so they are not one pool".into()),
+                pool: None,
+                ..placed("dsv4f-tp2", DSV4, SPARKS)
+            },
+            placed("qwen36-fast", QWEN, "sp1"),
+            placed("qwen3-embed-4b", EMBED, "fedora"),
+        ];
+        // Batch work on sp1 does not withhold loading there.
+        world.models.pools[0].idle_since = Some(599_000);
+        let overview = world.overview();
+        let offered = |id: &str| {
+            pool(&overview, id)
+                .loadable
+                .iter()
+                .map(|l| (l.model.clone(), l.blocked.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            offered("sp1"),
+            [
+                (QWEN.to_string(), None),
+                (DSV4.to_string(), Some("needs sp1+sp2 link".to_string())),
+                (EMBED.to_string(), Some("no deployment here".to_string())),
+            ]
+        );
+        assert_eq!(
+            offered("fedora"),
+            [
+                (EMBED.to_string(), None),
+                (DSV4.to_string(), Some("needs ×2".to_string())),
+                (QWEN.to_string(), Some("no deployment here".to_string())),
+            ]
+        );
+        let deepseek = overview.models.iter().find(|m| m.name == DSV4).unwrap();
+        assert_eq!(
+            deepseek.blocked.as_deref(),
+            Some("no link between sp1 and sp2")
+        );
+        let qwen = overview.models.iter().find(|m| m.name == QWEN).unwrap();
+        assert_eq!(qwen.blocked, None);
+    }
+
+    #[test]
+    fn a_verification_s_deployment_loads_only_once_it_passed() {
+        let mut world = World::new();
+        world
+            .inventory
+            .insert_deployment(cairn_inference::Deployment {
+                id: "verify-qwen3-embed-4b-sp1+sp2".into(),
+                source: cairn_inference::RecordSource::Cairn,
+                profile: "qwen3-embed-4b".into(),
+                head: "sp1".into(),
+                machines: vec!["sp1".into()],
+                api_port: 8090,
+                api_path: "/v1".into(),
+                health_path: "/v1/models".into(),
+            });
+        world
+            .models
+            .deployments
+            .push(placed("verify-qwen3-embed-4b-sp1+sp2", EMBED, SPARKS));
+        world.verifications = vec![verification("qwen3-embed-4b", SPARKS, "failed")];
+        let blocked = |world: &World| {
+            pool(&world.overview(), SPARKS)
+                .loadable
+                .iter()
+                .find(|l| l.model == EMBED)
+                .unwrap()
+                .blocked
+                .clone()
+        };
+        assert_eq!(blocked(&world).as_deref(), Some("failed verify"));
+        world.verifications = vec![verification("qwen3-embed-4b", SPARKS, "passed")];
+        assert_eq!(blocked(&world), None);
     }
 
     #[test]

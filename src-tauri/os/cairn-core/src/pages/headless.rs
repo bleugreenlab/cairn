@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
@@ -155,27 +155,37 @@ impl RenderedPage {
     }
 }
 
-fn render_permits() -> &'static Semaphore {
-    static PERMITS: OnceLock<Semaphore> = OnceLock::new();
-    PERMITS.get_or_init(|| Semaphore::new(MAX_CONCURRENT_RENDERS))
+/// The renders an orchestrator has in flight: a bound on how many run at once,
+/// and which readers hold one.
+pub(crate) struct RenderSlots {
+    permits: Semaphore,
+    /// One render at a time per reader, so a page that reads many resources
+    /// cannot fan one reader out into many renders.
+    readers: Mutex<HashMap<String, usize>>,
 }
 
-/// The readers with a render in flight: one at a time each, so a page that
-/// reads many resources cannot fan one reader out into many renders.
-fn readers_rendering() -> &'static Mutex<HashMap<String, usize>> {
-    static READERS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
-    READERS.get_or_init(|| Mutex::new(HashMap::new()))
+impl Default for RenderSlots {
+    fn default() -> Self {
+        Self {
+            permits: Semaphore::new(MAX_CONCURRENT_RENDERS),
+            readers: Mutex::default(),
+        }
+    }
 }
 
-struct ReaderSlot(Option<String>);
+struct ReaderSlot<'a> {
+    slots: &'a RenderSlots,
+    key: Option<String>,
+}
 
-impl ReaderSlot {
-    fn take(reader: &PageReader) -> Result<Self, String> {
+impl<'a> ReaderSlot<'a> {
+    fn take(slots: &'a RenderSlots, reader: &PageReader) -> Result<Self, String> {
         let key = match reader {
             PageReader::Agent(agent) => agent.run_id.clone(),
-            _ => return Ok(Self(None)),
+            _ => return Ok(Self { slots, key: None }),
         };
-        let mut readers = readers_rendering()
+        let mut readers = slots
+            .readers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if readers.get(&key).copied().unwrap_or(0) >= 1 {
@@ -185,14 +195,19 @@ impl ReaderSlot {
             );
         }
         *readers.entry(key.clone()).or_insert(0) += 1;
-        Ok(Self(Some(key)))
+        Ok(Self {
+            slots,
+            key: Some(key),
+        })
     }
 }
 
-impl Drop for ReaderSlot {
+impl Drop for ReaderSlot<'_> {
     fn drop(&mut self) {
-        if let Some(key) = &self.0 {
-            let mut readers = readers_rendering()
+        if let Some(key) = &self.key {
+            let mut readers = self
+                .slots
+                .readers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(count) = readers.get_mut(key) {
@@ -227,12 +242,13 @@ pub(crate) async fn render(
             ))
         }
     };
-    let _slot = match ReaderSlot::take(&request.reader) {
+    let slots = &*orch.page_renders;
+    let _slot = match ReaderSlot::take(slots, &request.reader) {
         Ok(slot) => slot,
         Err(why) => return RenderedPage::refused(why),
     };
     let _permit =
-        match tokio::time::timeout(limits.settle, render_permits().acquire()).await {
+        match tokio::time::timeout(limits.settle, slots.permits.acquire()).await {
             Ok(Ok(permit)) => permit,
             _ => {
                 return RenderedPage::refused(format!(

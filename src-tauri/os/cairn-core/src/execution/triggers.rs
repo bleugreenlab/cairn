@@ -215,15 +215,20 @@ pub(crate) fn dispatch_event_recipes(
             TriggerScope::Project => None,
         };
 
-        match start_event_triggered_execution(
-            orch,
-            &recipe,
-            trigger_type.clone(),
-            effective_payload.clone(),
-            issue_id,
-            project_id,
-            initiator.clone(),
-        ) {
+        // The dispatcher runs on the blocking pool, so the async launch is
+        // bridged through the one sanctioned bridge, as every other database
+        // step here is.
+        match crate::storage::run_db_blocking(|| {
+            start_event_triggered_execution(
+                orch,
+                &recipe,
+                trigger_type.clone(),
+                effective_payload.clone(),
+                issue_id,
+                project_id,
+                initiator.clone(),
+            )
+        }) {
             Ok(execution) => {
                 if let Err(error) = record_trigger_sources(orch, &execution.id, &effective_payload)
                 {
@@ -234,7 +239,9 @@ pub(crate) fn dispatch_event_recipes(
                     );
                 }
 
-                match create_jobs_for_execution(orch, &execution.id) {
+                match crate::storage::run_db_blocking(|| {
+                    create_jobs_for_execution(orch, &execution.id)
+                }) {
                     Ok(jobs) => {
                         log::info!(
                             "Created {} job(s) for event-triggered execution {}",

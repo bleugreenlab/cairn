@@ -34,6 +34,7 @@
 
 mod data;
 mod headless;
+pub(crate) use headless::RenderSlots;
 mod index;
 mod log;
 mod read;

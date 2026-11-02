@@ -138,7 +138,7 @@ fn is_events_nudge(text: &str) -> bool {
 ///
 /// The stream is not split: reading through the whole `WebSocketStream` is
 /// what lets tungstenite answer the api's protocol pings.
-async fn listen(mut socket: RelaySocket, doorbell: &Doorbell) {
+async fn listen(mut socket: RelaySocket, doorbell: &Doorbell, relay: &channel::RelaySignals) {
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
@@ -168,7 +168,7 @@ async fn listen(mut socket: RelaySocket, doorbell: &Doorbell) {
             }
             // The channel was replaced or deleted: this socket may be on one
             // the install no longer holds. Reconnect, re-reading the row.
-            _ = channel::channel_changed() => return,
+            _ = relay.channel_changed() => return,
             _ = tokio::time::sleep_until(heard + SILENCE_LIMIT) => {
                 log::debug!(
                     "relay doorbell heard nothing for {}s; reconnecting",
@@ -182,6 +182,7 @@ async fn listen(mut socket: RelaySocket, doorbell: &Doorbell) {
 
 /// Keep the doorbell connected for the life of the process.
 pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Arc<Doorbell>) {
+    let relay = orch.relay.clone();
     let mut backoff = RECONNECT_MIN;
     loop {
         let channel = channel::get_relay_channel(&orch.db.local)
@@ -194,7 +195,7 @@ pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Ar
             // No channel yet. `ensure` announces one; the timer is a backstop
             // for an announcement that landed before this wait began.
             tokio::select! {
-                _ = channel::channel_changed() => {}
+                _ = relay.channel_changed() => {}
                 _ = tokio::time::sleep(RECONNECT_MAX) => {}
             }
             continue;
@@ -211,7 +212,7 @@ pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Ar
                         log::warn!("relay doorbell could not record the accepted channel: {error}");
                     }
                     doorbell.set_connected(true);
-                    listen(socket, &doorbell).await;
+                    listen(socket, &doorbell, &relay).await;
                     doorbell.set_connected(false);
                     // Back to 15-second polling, starting with a sync now:
                     // a nudge may have been lost with the socket.
@@ -230,7 +231,7 @@ pub(crate) async fn maintain(orch: Orchestrator, relay_url: String, doorbell: Ar
         }
         tokio::select! {
             _ = tokio::time::sleep(backoff) => {}
-            _ = channel::channel_changed() => backoff = RECONNECT_MIN,
+            _ = relay.channel_changed() => backoff = RECONNECT_MIN,
         }
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
@@ -709,7 +710,7 @@ mod tests {
         channel::update_relay_channel(&db, |channel| channel.channel_id = Some("ch-new".into()))
             .await
             .unwrap();
-        channel::notify_channel_changed();
+        orch.relay.notify_channel_changed();
         eventually(
             "the doorbell moves to ch-new",
             Duration::from_secs(6),

@@ -7,8 +7,6 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::storage::{LocalDb, RowExt};
 
@@ -170,12 +168,30 @@ const ACTIVE_GRAPH_CTES: &str = "WITH ranked_issues AS (
  WHERE j.status <> 'cancelled' ORDER BY e.started_at DESC, j.created_at DESC, j.id LIMIT ?3
 ) ";
 
+/// Section reads per database handle, as `(graph, checks, feed)`. Keyed by the
+/// handle's process-unique instance, so a test counts the reads made against
+/// its own database and not those of a test running beside it.
 #[cfg(test)]
-static GRAPH_READS: AtomicUsize = AtomicUsize::new(0);
+static SECTION_READS: std::sync::Mutex<std::collections::BTreeMap<u64, (usize, usize, usize)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 #[cfg(test)]
-static CHECK_READS: AtomicUsize = AtomicUsize::new(0);
+fn count_read(db: &LocalDb, bump: fn(&mut (usize, usize, usize))) {
+    let mut reads = SECTION_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    bump(reads.entry(db.instance()).or_default());
+}
+
+/// The reads counted against `db` since the last call, resetting them.
 #[cfg(test)]
-static FEED_READS: AtomicUsize = AtomicUsize::new(0);
+fn take_read_counts(db: &LocalDb) -> (usize, usize, usize) {
+    SECTION_READS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&db.instance())
+        .unwrap_or_default()
+}
 
 async fn read_graph(
     db: &LocalDb,
@@ -188,7 +204,7 @@ async fn read_graph(
     String,
 > {
     #[cfg(test)]
-    GRAPH_READS.fetch_add(1, Ordering::SeqCst);
+    count_read(db, |reads| reads.0 += 1);
     db.read(|conn| Box::pin(async move {
         let mut issues = BTreeMap::new();
         let mut rows = conn.query(&format!("{ACTIVE_GRAPH_CTES} SELECT id,number,title,status FROM ranked_issues"), params![MAX_ISSUES as i64]).await?;
@@ -210,7 +226,7 @@ async fn read_graph(
 
 async fn read_checks(db: &LocalDb) -> Result<BTreeMap<String, CompanionCheck>, String> {
     #[cfg(test)]
-    CHECK_READS.fetch_add(1, Ordering::SeqCst);
+    count_read(db, |reads| reads.1 += 1);
     db.read(|conn| Box::pin(async move {
         let sql=format!("{ACTIVE_GRAPH_CTES}, latest AS (
           SELECT c.*, ROW_NUMBER() OVER(PARTITION BY c.job_id,c.check_name ORDER BY c.ran_at DESC,c.tree_hash DESC,c.input_hash DESC) AS rn
@@ -225,7 +241,7 @@ async fn read_checks(db: &LocalDb) -> Result<BTreeMap<String, CompanionCheck>, S
 
 async fn read_feed(db: &LocalDb) -> Result<BTreeMap<String, CompanionFeedItem>, String> {
     #[cfg(test)]
-    FEED_READS.fetch_add(1, Ordering::SeqCst);
+    count_read(db, |reads| reads.2 += 1);
     db.read(|conn| Box::pin(async move {
         let mut rows=conn.query("SELECT id,title,content,created_at FROM posts ORDER BY created_at DESC,id DESC LIMIT ?1",params![MAX_FEED_ITEMS as i64]).await?;
         let mut feed=BTreeMap::new();
@@ -513,16 +529,10 @@ mod tests {
         db
     }
 
-    fn reset_read_counts() {
-        GRAPH_READS.store(0, Ordering::SeqCst);
-        CHECK_READS.store(0, Ordering::SeqCst);
-        FEED_READS.store(0, Ordering::SeqCst);
-    }
-
     #[tokio::test]
     async fn localized_refresh_only_reads_requested_section() {
         let db = projection_db().await;
-        reset_read_counts();
+        take_read_counts(&db);
         refresh_companion_snapshot(
             db.clone(),
             &CompanionSnapshot::default(),
@@ -530,15 +540,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            (
-                GRAPH_READS.load(Ordering::SeqCst),
-                CHECK_READS.load(Ordering::SeqCst),
-                FEED_READS.load(Ordering::SeqCst)
-            ),
-            (0, 0, 1)
-        );
-        reset_read_counts();
+        assert_eq!(take_read_counts(&db), (0, 0, 1));
         refresh_companion_snapshot(
             db.clone(),
             &CompanionSnapshot::default(),
@@ -546,26 +548,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            (
-                GRAPH_READS.load(Ordering::SeqCst),
-                CHECK_READS.load(Ordering::SeqCst),
-                FEED_READS.load(Ordering::SeqCst)
-            ),
-            (0, 1, 0)
-        );
-        reset_read_counts();
-        refresh_companion_snapshot(db, &CompanionSnapshot::default(), CompanionSections::GRAPH)
-            .await
-            .unwrap();
-        assert_eq!(
-            (
-                GRAPH_READS.load(Ordering::SeqCst),
-                CHECK_READS.load(Ordering::SeqCst),
-                FEED_READS.load(Ordering::SeqCst)
-            ),
-            (1, 1, 0)
-        );
+        assert_eq!(take_read_counts(&db), (0, 1, 0));
+        refresh_companion_snapshot(
+            db.clone(),
+            &CompanionSnapshot::default(),
+            CompanionSections::GRAPH,
+        )
+        .await
+        .unwrap();
+        assert_eq!(take_read_counts(&db), (1, 1, 0));
     }
 
     #[tokio::test]

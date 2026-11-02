@@ -118,6 +118,214 @@ fn the_vcs_backend_never_resolves_seal_ownership_at_call_time() {
     assert_absent("mcp/vcs.rs", &["jj::seal("]);
 }
 
+/// The functions a hand-rolled runtime bridge may still live in, with why:
+/// `(path under src-tauri, function, reason)`. Every entry must still have the
+/// shape, so converting or deleting one fails the test until its entry goes.
+const RUNTIME_BRIDGES_ALLOWED: &[(&str, &str, &str)] = &[
+    (
+        "os/cairn-db/src/storage/blocking.rs",
+        "run_db_blocking",
+        "the one sanctioned bridge: on a multi-thread runtime it hands the worker's queue off \
+         with block_in_place before it joins (cairn/5788)",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/mod.rs",
+        "run_db",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-core/src/execution/jobs/mod.rs",
+        "run_db_borrowed",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-core/src/execution/queries.rs",
+        "block_on",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-session/src/runs/queries.rs",
+        "run_query_db",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-session/src/runs/queries.rs",
+        "run_query_db_scoped",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-workflow/src/queries.rs",
+        "run_query_db",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-attention/src/wakes/routing.rs",
+        "route_wake_sync",
+        "cairn/5858",
+    ),
+    (
+        "os/cairn-core/src/mcp/handlers/terminal.rs",
+        "finalize_terminal_by_session_id",
+        "cairn/5858 (found by this guard after that census)",
+    ),
+    (
+        "os/cairn-vcs/src/lib.rs",
+        "repoint_bookmark_if_unchanged",
+        "jj-lib futures are not Send, so the transaction runs on a thread of its own; it parks \
+         its caller for the transaction (cairn/5858, found by this guard after that census)",
+    ),
+];
+
+/// The name a line declares a function by, if it does.
+fn declared_fn(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest.split_once(')')?.1.trim_start();
+        }
+    }
+    for qualifier in ["const ", "async ", "unsafe "] {
+        rest = rest.strip_prefix(qualifier).unwrap_or(rest).trim_start();
+    }
+    if let Some(after) = rest.strip_prefix("extern ") {
+        rest = after.trim_start();
+        if rest.starts_with('"') {
+            rest = rest[1..].split_once('"')?.1.trim_start();
+        }
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Every production function, as `(path under src-tauri, function)`, that
+/// spawns a thread, builds a tokio runtime, `block_on`s a future on it, and
+/// joins the thread.
+fn hand_rolled_runtime_bridges(files: &[(PathBuf, String)]) -> Vec<(String, String)> {
+    const SPAWN: &[&str] = &["thread::spawn(", "thread::scope(", "thread::Builder::new("];
+    const RUNTIME: &[&str] = &[
+        "new_current_thread()",
+        "new_multi_thread()",
+        "Runtime::new()",
+    ];
+    let test_only = test_only_module_files(files);
+    let mut found = Vec::new();
+    for (path, source) in files {
+        let display = path.to_string_lossy().replace('\\', "/");
+        let Some((_, relative)) = display.split_once("src-tauri/") else {
+            continue;
+        };
+        if !relative.contains("src/") || relative.contains("/tests/") || test_only.contains(path) {
+            continue;
+        }
+        // (function, compiled only for tests, [spawns, builds a runtime,
+        // blocks on it, joins])
+        let mut functions: Vec<(String, bool, [bool; 4])> = Vec::new();
+        // A `#[cfg(test)]` on the function itself, which the module-level
+        // test filter does not see.
+        let mut gated = false;
+        for (_, line) in non_test_lines(source) {
+            let trimmed = line.trim_start();
+            if let Some(name) = declared_fn(line) {
+                functions.push((name.to_string(), gated, [false; 4]));
+                gated = false;
+            } else if trimmed.starts_with("#[") {
+                gated |= trimmed.contains("cfg(test)");
+            } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                gated = false;
+            }
+            let Some((_, _, shape)) = functions.last_mut() else {
+                continue;
+            };
+            shape[0] |= SPAWN.iter().any(|needle| line.contains(needle));
+            shape[1] |= RUNTIME.iter().any(|needle| line.contains(needle));
+            shape[2] |= line.contains(".block_on(");
+            shape[3] |= line.contains(".join()");
+        }
+        found.extend(
+            functions
+                .into_iter()
+                .filter(|(_, test_only, shape)| !test_only && shape.iter().all(|part| *part))
+                .map(|(name, _, _)| (relative.to_string(), name)),
+        );
+    }
+    found
+}
+
+/// cairn/5844. A function that spawns a thread, builds a tokio runtime on it,
+/// `block_on`s a future there and joins the thread parks its caller until the
+/// future finishes. Called on a runtime worker, the worker does nothing else
+/// meanwhile, and the runtime's abort cannot interrupt a join. When the future
+/// waits on something only the caller's runtime can finish (a lock one of its
+/// tasks holds), the worker never comes back: `run_recipe_db` was that bridge
+/// on the launch path, and it parked every worker of the 0.13.7 runner behind
+/// the execution queue's admission lock. `cairn_db::storage::run_db_blocking`
+/// is the one sanctioned bridge (cairn/5788).
+///
+/// Sites are classified by their shape, never by whether they look for an
+/// ambient runtime first: that check is how cairn/5788's sweep missed the ones
+/// still allowlisted. The allowlist is checked for staleness, so it only
+/// shrinks.
+#[test]
+fn no_production_code_hand_rolls_a_runtime_bridge() {
+    let files = workspace_rust_files();
+    let found = hand_rolled_runtime_bridges(&files);
+    assert!(
+        found
+            .iter()
+            .any(|(path, name)| path.ends_with("storage/blocking.rs") && name == "run_db_blocking"),
+        "the detector no longer recognizes the sanctioned bridge itself, so it proves nothing: \
+         {found:?}"
+    );
+    let unexpected: Vec<String> = found
+        .iter()
+        .filter(|(path, name)| {
+            !RUNTIME_BRIDGES_ALLOWED
+                .iter()
+                .any(|(allowed, function, _)| path == allowed && name == function)
+        })
+        .map(|(path, name)| format!("{path}: fn {name}"))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "a hand-rolled spawn + runtime + block_on + join bridge parks its caller; bridge \
+         through cairn_db::storage::run_db_blocking, or make the caller async:\n{}",
+        unexpected.join("\n")
+    );
+    let stale: Vec<String> = RUNTIME_BRIDGES_ALLOWED
+        .iter()
+        .filter(|(allowed, function, _)| {
+            !found
+                .iter()
+                .any(|(path, name)| path == allowed && name == function)
+        })
+        .map(|(path, function, reason)| format!("{path}: fn {function} ({reason})"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these allowlisted bridges no longer have the shape; delete their entries:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn the_runtime_bridge_detector_sees_through_qualifiers_and_ignores_types() {
+    assert_eq!(
+        declared_fn("pub(crate) async fn run_db<T>("),
+        Some("run_db")
+    );
+    assert_eq!(
+        declared_fn("    fn block_on<T, Fut>(future: Fut)"),
+        Some("block_on")
+    );
+    assert_eq!(declared_fn("pub const unsafe fn x()"), Some("x"));
+    assert_eq!(declared_fn("    let f: fn(i32) -> i32 = g;"), None);
+    assert_eq!(declared_fn("    // fn commented()"), None);
+}
+
 /// Every Rust file in the workspace, paired with its source.
 fn workspace_rust_files() -> Vec<(PathBuf, String)> {
     let mut paths = Vec::new();

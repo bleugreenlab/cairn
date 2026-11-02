@@ -15,12 +15,33 @@ use cairn_common::executor_protocol::{
 };
 use cairn_inference::generate::{self, Arch, HwMemory, MachineHw, PoolHw};
 use cairn_inference::{AcceleratorFamily, Inventory, MachineName};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::inference::{load_inventory, write_inventory, Authoring, Removals};
 use super::inference_models::{weight_sources, Hub};
+use super::Orchestrator;
 use crate::fleet::pools::Pool;
 use crate::storage::LocalDb;
+
+/// The latest health of every attached executor, by public name.
+pub(crate) fn executor_snapshots(orch: &Orchestrator) -> BTreeMap<String, ExecutorHealthSnapshot> {
+    orch.fleet
+        .executor_health(crate::fleet::unix_time_ms())
+        .into_iter()
+        .map(|snapshot| (snapshot.public_name.clone(), snapshot))
+        .collect()
+}
+
+/// The pool placement detects now under `key`.
+pub(crate) fn detected_pool(orch: &Orchestrator, key: &str) -> Result<Pool, String> {
+    orch.fleet
+        .detected_pools()
+        .into_iter()
+        .find(|pool| pool.key.0 == key)
+        .ok_or_else(|| {
+            format!("there is no pool {key} now; cairn://inference/pools lists the pools placement detects")
+        })
+}
 
 const GIB: u64 = 1 << 30;
 
@@ -149,6 +170,26 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
+/// One candidate written, with what the generator predicts of it on the pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratedCandidate {
+    pub profile: String,
+    pub machines: u32,
+    pub weight_bytes: u64,
+    pub per_machine_bytes: u64,
+    pub context: u64,
+    pub kv_tokens: Option<u64>,
+}
+
+/// What a generation wrote, best first, and the whole account of it in words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Generation {
+    pub candidates: Vec<GeneratedCandidate>,
+    pub said: String,
+}
+
 /// Generate profiles for `model` on `pool` and write them.
 pub async fn generate(
     db: &LocalDb,
@@ -157,7 +198,7 @@ pub async fn generate(
     pool: &Pool,
     snapshots: &BTreeMap<String, ExecutorHealthSnapshot>,
     stated: &BTreeMap<String, StatedHardware>,
-) -> Result<String, String> {
+) -> Result<Generation, String> {
     let inventory = load_inventory(db).await?;
     let model = inventory.models.get(model).cloned().ok_or_else(|| {
         format!("model {model} is not registered; append it to cairn://inference/models first")
@@ -228,7 +269,21 @@ pub async fn generate(
             model.name, best.profile.id
         ));
     }
-    Ok(said)
+    Ok(Generation {
+        candidates: generated
+            .candidates
+            .iter()
+            .map(|candidate| GeneratedCandidate {
+                profile: candidate.profile.id.to_string(),
+                machines: candidate.predicted.machines,
+                weight_bytes: candidate.predicted.weight_bytes,
+                per_machine_bytes: candidate.predicted.per_machine_bytes,
+                context: candidate.predicted.context,
+                kv_tokens: candidate.predicted.kv_tokens,
+            })
+            .collect(),
+        said,
+    })
 }
 
 #[cfg(test)]
@@ -284,6 +339,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            said.candidates
+                .first()
+                .map(|c| (c.profile.as_str(), c.machines)),
+            Some(("qwen3-embedding-4b-bf16-vllm-x1", 1))
+        );
+        let said = said.said;
         assert!(
             said.starts_with("Candidates for Qwen/Qwen3-Embedding-4B on pool bbs, best first"),
             "{said}"

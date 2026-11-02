@@ -90,6 +90,14 @@ pub(crate) struct EmbedDoorRequest {
     /// Exactly this width; absent is the model's native one.
     #[serde(default)]
     pub width: Option<u32>,
+    /// Whether the run door saves the reply into the caller's `$TMPDIR`
+    /// (`mcp/handlers/run/embed.rs`). Embedding ignores it.
+    #[serde(default = "saved_by_default")]
+    pub save: bool,
+}
+
+fn saved_by_default() -> bool {
+    true
 }
 
 /// Input tokens, when the provider reported them.
@@ -881,6 +889,7 @@ pub(crate) mod tests {
             input: (0..texts).map(|index| format!("text {index}")).collect(),
             purpose: super::EmbedPurpose::Document,
             width,
+            save: true,
         }
     }
 

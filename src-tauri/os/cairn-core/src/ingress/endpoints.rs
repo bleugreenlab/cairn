@@ -47,7 +47,7 @@ impl Channel {
 /// The install's channel, registered if it has none: minting is what first
 /// needs one.
 async fn ensured_channel(orch: &Orchestrator, relay_url: &str) -> Result<Channel, String> {
-    let channel = super::channel::ensure(&orch.db.local, relay_url).await?;
+    let channel = super::channel::ensure(&orch.db.local, &orch.relay, relay_url).await?;
     Channel::of(&channel)
         .ok_or_else(|| "the relay channel has no secret after registration".to_string())
 }

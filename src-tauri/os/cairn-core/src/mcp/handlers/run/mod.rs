@@ -10,6 +10,7 @@
 
 mod checks;
 mod commit_barrier;
+mod embed;
 pub(crate) mod held;
 mod hygiene;
 mod media;
@@ -9467,8 +9468,9 @@ mod decide_door_tests {
         assert_eq!(server.calls(), 2, "a refused batch asks nothing");
     }
 
-    /// An embed item answers in its text and, whole, in the envelope's `data`,
-    /// which is what the SDKs read.
+    /// An embed item answers whole in the envelope's `data`, which is what the
+    /// SDKs read. This call has no run, so no node scratch to save into, and
+    /// its text is the whole reply too (the saved case is `run/embed.rs`'s).
     #[tokio::test(flavor = "multi_thread")]
     async fn an_embed_item_returns_its_vectors_in_the_text_and_the_envelope_data() {
         use crate::orchestrator::embed::tests::{hub_reply, workspace_with_hub};
@@ -9515,12 +9517,15 @@ mod decide_door_tests {
                     "payload": {"args_json": {"model": "m", "texts": ["a"]}}}]),
         )
         .await;
-        assert!(text.contains("{model, input, purpose?, width?}"), "{text}");
+        assert!(
+            text.contains("{model, input, purpose?, width?, save?}"),
+            "{text}"
+        );
     }
 
-    /// An embed reply is never truncated or summarised: three 1536-wide
-    /// vectors run well past the cap that keeps command output readable, and
-    /// the item's text still carries every number and parses.
+    /// An unsaved embed reply is never truncated or summarised: three
+    /// 1536-wide vectors run well past the cap that keeps command output
+    /// readable, and the item's text still carries every number and parses.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_embed_reply_past_the_run_result_cap_arrives_whole_in_the_text() {
         use crate::orchestrator::embed::tests::workspace_with_hub_of;

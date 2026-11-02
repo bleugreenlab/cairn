@@ -44,19 +44,29 @@
 //!
 //! The fleet count spans every open database, and a per-database write
 //! transaction cannot serialize it. Every capped filing and every release takes
-//! [`Orchestrator::admission_lock`](crate::orchestrator::Orchestrator), decides,
-//! and writes before letting go, so two admissions never interleave. Outside
-//! the lock a count can only fall (a completion) or rise through the operator's
-//! own starts, which are allowed over the cap, so a stale count is only ever
-//! conservative. Exactly-once still rests on the guarded `released_at` update.
+//! the [`AdmissionLock`], decides, and writes before letting go, so two
+//! admissions never interleave. Outside the lock a count can only fall (a
+//! completion) or rise through the operator's own starts, which are allowed
+//! over the cap, so a stale count is only ever conservative. Exactly-once
+//! still rests on the guarded `released_at` update.
+//!
+//! The lock is cheap to hold and never waited on forever. A decision is one
+//! read of the queue ([`QueueSnapshot`]) and a pure function over it, so a
+//! sweep pass decides every candidate under ONE acquisition, oldest first,
+//! and writes only what changed. Display values (counts and places in line)
+//! are rewritten after the pass, outside the lock. An acquisition that waits
+//! past [`ADMISSION_WAIT_BOUND`] names the holder and fails retryably.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use cairn_db::turso::params;
 use cairn_workflow::gates::store::{
     list_blocking_capacity_gates_conn, set_gate_detail_conn, CAPACITY_GATE_SEQ_BASE,
 };
+use tracing::Instrument;
 
 use crate::models::{CapacityHold, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
@@ -147,9 +157,268 @@ impl Admission {
     }
 }
 
-/// Hold the admission lock across a decision and the write that acts on it.
-pub(crate) async fn admission_lock(orch: &Orchestrator) -> tokio::sync::OwnedMutexGuard<()> {
-    orch.admission_lock.clone().lock_owned().await
+// ---------------------------------------------------------------------------
+// The admission lock
+// ---------------------------------------------------------------------------
+
+/// Where an admission-lock acquisition comes from: what its timing, a
+/// timed-out wait, and the holder slot name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdmissionSite {
+    /// A capped filing deciding its caps before its insert.
+    Filing,
+    /// A sweep pass's release phase: every candidate, one acquisition.
+    SweepPass,
+    /// One execution's release: Start now, a creation-time evaluation, an
+    /// early release.
+    Release,
+    /// A gate patch removing the last authored gate, which releases.
+    GatePatch,
+}
+
+impl AdmissionSite {
+    const ALL: [AdmissionSite; 4] = [
+        AdmissionSite::Filing,
+        AdmissionSite::SweepPass,
+        AdmissionSite::Release,
+        AdmissionSite::GatePatch,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdmissionSite::Filing => "filing",
+            AdmissionSite::SweepPass => "sweep_pass",
+            AdmissionSite::Release => "release",
+            AdmissionSite::GatePatch => "gate_patch",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|site| *site == self)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) const ALL_FOR_TESTS: [AdmissionSite; 4] = Self::ALL;
+}
+
+impl std::fmt::Display for AdmissionSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How long an acquisition waits before it gives up, names the holder, and
+/// fails retryably.
+pub const ADMISSION_WAIT_BOUND: Duration = Duration::from_secs(30);
+
+/// A wait for, or a hold of, the lock this long is logged at any log level:
+/// the profiler span alone is off below verbose.
+const ADMISSION_SLOW: Duration = Duration::from_millis(250);
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// An acquisition that waited out its bound. Nothing was decided or written,
+/// so the operation that wanted the lock can be retried as it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionBusy {
+    pub waiter: AdmissionSite,
+    pub waited: Duration,
+    /// Who held the lock when the wait gave up, and for how long.
+    pub holder: Option<AdmissionHolder>,
+}
+
+/// Who holds the admission lock: its site, what it is admitting (an issue or
+/// execution id, or a sweep pass's candidate count), and for how long. A
+/// holder that never lets go is a future on no thread's stack, so this is how
+/// it names itself to whoever times out waiting for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionHolder {
+    pub site: AdmissionSite,
+    pub subject: String,
+    pub held: Duration,
+}
+
+impl std::fmt::Display for AdmissionHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a {} ({}) for {} ms",
+            self.site,
+            self.subject,
+            millis(self.held)
+        )
+    }
+}
+
+impl std::fmt::Display for AdmissionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the execution queue is busy: this {} waited {} ms for the admission lock",
+            self.waiter,
+            millis(self.waited)
+        )?;
+        match &self.holder {
+            Some(holder) => write!(f, ", held by {holder}")?,
+            None => f.write_str(", which was just let go")?,
+        }
+        f.write_str(". Nothing was written; retry.")
+    }
+}
+
+type HolderSlot = Arc<Mutex<Option<(AdmissionSite, String, Instant)>>>;
+
+/// The execution queue's admission lock: every capped filing and every gate
+/// release decides its caps and writes under it, so two admissions never
+/// interleave over a count that spans databases.
+///
+/// Lock order: this lock, then the owning database's write. Never take it
+/// while holding a write transaction, and never hold it across a thread join
+/// or a `block_on`: the holder is a future that needs a runtime worker to
+/// finish, and a worker blocked waiting for it is one fewer worker to run it
+/// (cairn/5844).
+///
+/// Bounded and attributed: an acquisition waits at most
+/// [`ADMISSION_WAIT_BOUND`], the current holder's site, subject and age are
+/// readable without the lock, and each acquisition is one `admission_lock`
+/// profiler span carrying its `wait_ms` and `held_ms`.
+pub struct AdmissionLock {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    holder: HolderSlot,
+    wait_bound_ms: AtomicU64,
+    acquisitions: [AtomicU64; 4],
+}
+
+impl Default for AdmissionLock {
+    fn default() -> Self {
+        Self {
+            mutex: Arc::new(tokio::sync::Mutex::new(())),
+            holder: Arc::new(Mutex::new(None)),
+            wait_bound_ms: AtomicU64::new(millis(ADMISSION_WAIT_BOUND)),
+            acquisitions: Default::default(),
+        }
+    }
+}
+
+impl AdmissionLock {
+    /// Take the lock for `site`, admitting `subject` (an issue or execution
+    /// id, or a pass's candidate count), or say who holds it once the bound
+    /// runs out.
+    pub async fn acquire(
+        &self,
+        site: AdmissionSite,
+        subject: impl Into<String>,
+    ) -> Result<AdmissionGuard, AdmissionBusy> {
+        let subject = subject.into();
+        let span = tracing::info_span!(
+            target: "profiler",
+            "admission_lock",
+            site = site.as_str(),
+            subject = subject.as_str(),
+            wait_ms = tracing::field::Empty,
+            held_ms = tracing::field::Empty,
+        );
+        let bound = Duration::from_millis(self.wait_bound_ms.load(Ordering::Relaxed));
+        let started = Instant::now();
+        let acquired = tokio::time::timeout(bound, self.mutex.clone().lock_owned()).await;
+        let waited = started.elapsed();
+        span.record("wait_ms", millis(waited));
+        let Ok(guard) = acquired else {
+            let busy = AdmissionBusy {
+                waiter: site,
+                waited,
+                holder: self.holder(),
+            };
+            let (holder, holder_subject, held_for) =
+                busy.holder.as_ref().map_or(("none", "", 0), |holder| {
+                    (
+                        holder.site.as_str(),
+                        holder.subject.as_str(),
+                        millis(holder.held),
+                    )
+                });
+            log::warn!(
+                "admission lock wait timed out waiter={site} waiter_subject={subject} \
+                 holder={holder} holder_subject={holder_subject} held_for_ms={held_for}"
+            );
+            return Err(busy);
+        };
+        if waited >= ADMISSION_SLOW {
+            log::info!(
+                "admission lock acquired after a slow wait site={site} subject={subject} \
+                 wait_ms={}",
+                millis(waited)
+            );
+        }
+        let acquired_at = Instant::now();
+        *self.holder.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((site, subject.clone(), acquired_at));
+        self.acquisitions[site.index()].fetch_add(1, Ordering::Relaxed);
+        Ok(AdmissionGuard {
+            _guard: guard,
+            holder: self.holder.clone(),
+            site,
+            subject,
+            acquired_at,
+            span,
+        })
+    }
+
+    /// The current holder: its site, subject, and how long it has held the
+    /// lock.
+    pub fn holder(&self) -> Option<AdmissionHolder> {
+        self.holder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|(site, subject, since)| AdmissionHolder {
+                site: *site,
+                subject: subject.clone(),
+                held: since.elapsed(),
+            })
+    }
+
+    /// How many times `site` has taken the lock.
+    pub fn acquisitions(&self, site: AdmissionSite) -> u64 {
+        self.acquisitions[site.index()].load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wait_bound(&self, bound: Duration) {
+        self.wait_bound_ms.store(millis(bound), Ordering::Relaxed);
+    }
+}
+
+/// The admission lock, held. Dropping it clears the holder slot before the
+/// lock is let go, and closes the acquisition's span with its `held_ms`.
+pub struct AdmissionGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    holder: HolderSlot,
+    site: AdmissionSite,
+    subject: String,
+    acquired_at: Instant,
+    span: tracing::Span,
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        *self.holder.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.span.record("held_ms", millis(held));
+        if held >= ADMISSION_SLOW {
+            log::info!(
+                "admission lock held long site={} subject={} held_ms={}",
+                self.site,
+                self.subject,
+                millis(held)
+            );
+        }
+    }
 }
 
 /// A fresh decision stored over a row that already has a place, carrying that
@@ -383,15 +652,7 @@ pub async fn fleet_load(orch: &Orchestrator) -> Result<FleetLoad, String> {
     })
 }
 
-/// The issue's thread, as the focus cap reads it.
-struct ThreadFocus {
-    thread_id: String,
-    thread_name: String,
-    limit: usize,
-    open_children: Vec<(i64, String)>,
-}
-
-const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name
+const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name, i.number
        FROM issues i JOIN threads t ON t.id = i.parent_thread_id
       WHERE i.id = ?1";
 
@@ -401,185 +662,494 @@ const OPEN_THREAD_CHILDREN_SQL: &str = concat!(
     " ORDER BY i.number"
 );
 
-async fn thread_focus(db: &LocalDb, issue_id: &str, limit: i32) -> DbResult<Option<ThreadFocus>> {
-    let issue_id = issue_id.to_string();
+/// The thread an issue is a child of, as the focus cap reads it.
+#[derive(Debug, Clone)]
+struct IssueThread {
+    thread_id: String,
+    thread_name: String,
+    number: i64,
+}
+
+async fn thread_of_issue_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<Option<IssueThread>> {
+    let mut rows = conn.query(THREAD_OF_ISSUE_SQL, params![issue_id]).await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(IssueThread {
+            thread_id: row.text(0)?,
+            thread_name: row.text(1)?,
+            number: row.i64(2)?,
+        })),
+        None => Ok(None),
+    }
+}
+
+/// A thread's open children, by issue number: `(number, issue id)`.
+async fn open_thread_children_conn(
+    conn: &cairn_db::turso::Connection,
+    thread_id: &str,
+) -> DbResult<Vec<(i64, String)>> {
+    let mut rows = conn
+        .query(OPEN_THREAD_CHILDREN_SQL, params![thread_id])
+        .await?;
+    let mut open = Vec::new();
+    while let Some(row) = rows.next().await? {
+        open.push((row.i64(0)?, row.text(1)?));
+    }
+    Ok(open)
+}
+
+/// Every unsatisfied capacity row in one database, with what the queue needs
+/// to know about its execution: whether it runs on this device (`?1`),
+/// whether it is in line at all (awaiting release, and not waiting on an
+/// authored gate of its own), and its issue's thread.
+const CAPACITY_ROWS_SQL: &str = concat!(
+    "SELECT g.execution_id, json_extract(g.predicate_json, '$.fact'), g.created_at,
+            g.last_outcome,
+            CASE WHEN COALESCE(e.runner_device_id, ?1) = ?1 THEN 1 ELSE 0 END,
+            CASE WHEN ",
+    cairn_db::awaiting_release_sql!(),
+    " AND NOT ",
+    cairn_db::awaits_authored_gate_sql!(),
+    " THEN 1 ELSE 0 END,
+            i.parent_thread_id
+       FROM execution_gates g
+       JOIN executions e ON e.id = g.execution_id
+       LEFT JOIN issues i ON i.id = e.issue_id
+      WHERE g.satisfied_at IS NULL AND ",
+    cairn_db::capacity_gate_sql!()
+);
+
+struct CapacityRow {
+    execution_id: String,
+    fact: &'static str,
+    created_at: i64,
+    /// `last_outcome = 'no_evidence'`: the cap holds it now. A cleared row
+    /// reads `satisfied` and only keeps the execution's place.
+    blocking: bool,
+    on_device: bool,
+    in_line: bool,
+    thread_id: Option<String>,
+}
+
+async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<Vec<CapacityRow>> {
+    let device = device.to_string();
     db.read(move |conn| {
-        let issue_id = issue_id.clone();
+        let device = device.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(THREAD_OF_ISSUE_SQL, params![issue_id.as_str()])
+                .query(CAPACITY_ROWS_SQL, params![device.as_str()])
                 .await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            let thread_id = row.text(0)?;
-            let thread_name = row.text(1)?;
-            drop(rows);
-            let mut rows = conn
-                .query(OPEN_THREAD_CHILDREN_SQL, params![thread_id.as_str()])
-                .await?;
-            let mut open_children = Vec::new();
+            let mut out = Vec::new();
             while let Some(row) = rows.next().await? {
-                open_children.push((row.i64(0)?, row.text(1)?));
+                let named = row.opt_text(1)?;
+                let Some(fact) = named
+                    .as_deref()
+                    .and_then(|named| CAPACITY_FACTS.iter().copied().find(|fact| *fact == named))
+                else {
+                    continue;
+                };
+                out.push(CapacityRow {
+                    execution_id: row.text(0)?,
+                    fact,
+                    created_at: row.i64(2)?,
+                    blocking: row.opt_text(3)?.as_deref() == Some("no_evidence"),
+                    on_device: row.i64(4)? != 0,
+                    in_line: row.i64(5)? != 0,
+                    thread_id: row.opt_text(6)?,
+                });
             }
-            Ok(Some(ThreadFocus {
-                thread_id,
-                thread_name,
-                limit: limit.max(1) as usize,
-                open_children,
-            }))
+            Ok(out)
         })
     })
     .await
 }
 
-/// Its own place in line on `fact`: when it first held on that cap, or `None`
-/// for a start that has not queued on it (a new filing, or one whose `after:`
-/// gates just cleared), which then queues behind everything already held.
-const OWN_PLACE_SQL: &str = "SELECT MIN(created_at) FROM execution_gates
-      WHERE execution_id = ?1 AND satisfied_at IS NULL
-        AND json_extract(predicate_json, '$.fact') = ?2";
-
-/// Fleet holds of this device's other executions that are ahead of `?2`.
-const FLEET_AHEAD_SQL: &str = concat!(
-    "SELECT COUNT(*) FROM execution_gates g JOIN executions e ON e.id = g.execution_id
-      WHERE json_extract(g.predicate_json, '$.fact') = 'fleet_slot'
-        AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence'
-        AND e.id IS NOT ?1 AND g.created_at < ?2
-        AND COALESCE(e.runner_device_id, ?3) = ?3 AND ",
-    cairn_db::awaiting_release_sql!(),
-    " AND NOT ",
-    cairn_db::awaits_authored_gate_sql!()
-);
-
-/// Focus holds of the same thread's other children that are ahead of `?2`.
-const THREAD_AHEAD_SQL: &str = concat!(
-    "SELECT COUNT(*) FROM execution_gates g JOIN executions e ON e.id = g.execution_id
-       JOIN issues held_child ON held_child.id = e.issue_id
-      WHERE json_extract(g.predicate_json, '$.fact') = 'thread_focus'
-        AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence'
-        AND e.id IS NOT ?1 AND g.created_at < ?2
-        AND held_child.parent_thread_id = ?3 AND ",
-    cairn_db::awaiting_release_sql!(),
-    " AND NOT ",
-    cairn_db::awaits_authored_gate_sql!()
-);
-
-async fn own_place(db: &LocalDb, execution_id: Option<&str>, fact: &str) -> DbResult<i64> {
-    let Some(execution_id) = execution_id else {
-        return Ok(i64::MAX);
-    };
-    let (execution_id, fact) = (execution_id.to_string(), fact.to_string());
-    let place = db
-        .read(move |conn| {
-            let (execution_id, fact) = (execution_id.clone(), fact.clone());
-            Box::pin(async move {
-                crate::storage::query_opt_i64_conn(
-                    conn,
-                    OWN_PLACE_SQL,
-                    params![execution_id.as_str(), fact.as_str()],
-                )
-                .await
-            })
-        })
-        .await?;
-    Ok(place.unwrap_or(i64::MAX))
+/// One start to decide: the held execution being released, or `None` for a
+/// new filing, on `issue_id` in `db`, the database that owns the issue.
+pub(crate) struct Start<'a> {
+    pub db: &'a LocalDb,
+    pub issue_id: Option<&'a str>,
+    pub execution_id: Option<&'a str>,
 }
 
-async fn count_ahead(
-    db: &LocalDb,
-    sql: &'static str,
-    execution_id: Option<&str>,
-    place: i64,
-    scope: &str,
-) -> DbResult<i64> {
-    let (execution_id, scope) = (execution_id.map(str::to_string), scope.to_string());
-    let ahead = db
-        .read(move |conn| {
-            let (execution_id, scope) = (execution_id.clone(), scope.clone());
-            Box::pin(async move {
-                crate::storage::query_opt_i64_conn(
-                    conn,
-                    sql,
-                    params![execution_id.as_deref(), place, scope.as_str()],
-                )
-                .await
-            })
-        })
-        .await?;
-    Ok(ahead.unwrap_or(0))
+/// An execution's oldest unsatisfied row on one cap: its place in line, and
+/// whether the cap holds it now.
+#[derive(Debug, Clone, Copy)]
+struct StoredHold {
+    since: i64,
+    blocking: bool,
 }
 
-/// Decide which caps hold a start on `issue_id` right now. Call it holding
-/// [`admission_lock`], and act on it before letting go.
+/// The execution queue as one read sees it: the fleet's load, every
+/// capacity row, and the threads of the starts being decided. Read once per
+/// decision under the admission lock, so a sweep pass decides every candidate
+/// against one read and keeps it current as it releases and holds, instead
+/// of reading the queue again per execution.
+pub(crate) struct QueueSnapshot {
+    fleet_limit: usize,
+    thread_limit: usize,
+    load: FleetLoad,
+    stored: HashMap<(String, &'static str), StoredHold>,
+    /// Fleet holds in line on this device: execution -> since.
+    fleet_line: HashMap<String, i64>,
+    /// Thread holds in line, per thread: execution -> since.
+    thread_lines: HashMap<String, HashMap<String, i64>>,
+    issues: HashMap<String, IssueThread>,
+    open_children: HashMap<String, Vec<(i64, String)>>,
+    /// Whether a start's execution runs on this device's fleet.
+    on_device: HashMap<String, bool>,
+}
+
+impl QueueSnapshot {
+    /// Read the queue for `starts`: `2D + G` read transactions for `D` open
+    /// databases and `G` databases the starts live in, however many starts.
+    pub(crate) async fn load(orch: &Orchestrator, starts: &[Start<'_>]) -> Result<Self, String> {
+        Self::read(orch, starts)
+            .instrument(tracing::info_span!(
+                target: "profiler",
+                "admission_decide",
+                starts = starts.len(),
+            ))
+            .await
+    }
+
+    async fn read(orch: &Orchestrator, starts: &[Start<'_>]) -> Result<Self, String> {
+        let reading = |error: crate::storage::DbError| format!("failed to read the queue: {error}");
+        let settings = orch.get_settings();
+        let device = orch.anon_device_manager.device_id();
+        let mut snapshot = Self {
+            fleet_limit: settings.max_concurrent_executions.max(1) as usize,
+            thread_limit: settings.max_open_children_per_thread.max(1) as usize,
+            load: fleet_load(orch).await?,
+            stored: HashMap::new(),
+            fleet_line: HashMap::new(),
+            thread_lines: HashMap::new(),
+            issues: HashMap::new(),
+            open_children: HashMap::new(),
+            on_device: HashMap::new(),
+        };
+        for db in orch.db.all_dbs().await {
+            for row in capacity_rows(&db, &device).await.map_err(reading)? {
+                snapshot.add_row(row);
+            }
+        }
+
+        // Each database the starts live in: one read for their devices,
+        // their issues' threads, and those threads' open children.
+        let mut groups: Vec<(&LocalDb, Vec<(Option<String>, Option<String>)>)> = Vec::new();
+        for start in starts {
+            let wanted = (
+                start.execution_id.map(str::to_string),
+                start.issue_id.map(str::to_string),
+            );
+            match groups
+                .iter_mut()
+                .find(|(db, _)| std::ptr::eq(*db, start.db))
+            {
+                Some((_, group)) => group.push(wanted),
+                None => groups.push((start.db, vec![wanted])),
+            }
+        }
+        for (db, wanted) in groups {
+            let known: HashSet<String> = snapshot.open_children.keys().cloned().collect();
+            let (devices, issues, children) = db
+                .read(move |conn| {
+                    let (wanted, mut known) = (wanted.clone(), known.clone());
+                    Box::pin(async move {
+                        let (mut devices, mut issues, mut children) =
+                            (Vec::new(), Vec::new(), Vec::new());
+                        for (execution_id, issue_id) in &wanted {
+                            if let Some(execution_id) = execution_id {
+                                let runner = crate::storage::query_opt_text_conn(
+                                    conn,
+                                    "SELECT runner_device_id FROM executions WHERE id = ?1",
+                                    params![execution_id.as_str()],
+                                )
+                                .await?;
+                                devices.push((execution_id.clone(), runner));
+                            }
+                            let Some(issue_id) = issue_id else { continue };
+                            let Some(thread) = thread_of_issue_conn(conn, issue_id).await? else {
+                                continue;
+                            };
+                            if known.insert(thread.thread_id.clone()) {
+                                children.push((
+                                    thread.thread_id.clone(),
+                                    open_thread_children_conn(conn, &thread.thread_id).await?,
+                                ));
+                            }
+                            issues.push((issue_id.clone(), thread));
+                        }
+                        Ok((devices, issues, children))
+                    })
+                })
+                .await
+                .map_err(reading)?;
+            for (execution_id, runner) in devices {
+                let on_device = runner.as_deref().is_none_or(|runner| runner == device);
+                snapshot.on_device.insert(execution_id, on_device);
+            }
+            snapshot.issues.extend(issues);
+            snapshot.open_children.extend(children);
+        }
+        Ok(snapshot)
+    }
+
+    fn add_row(&mut self, row: CapacityRow) {
+        let key = (row.execution_id.clone(), row.fact);
+        let stored = self.stored.entry(key).or_insert(StoredHold {
+            since: row.created_at,
+            blocking: row.blocking,
+        });
+        if row.created_at < stored.since {
+            *stored = StoredHold {
+                since: row.created_at,
+                blocking: row.blocking,
+            };
+        }
+        if !(row.blocking && row.in_line) {
+            return;
+        }
+        match row.fact {
+            FLEET_SLOT_FACT if row.on_device => {
+                self.fleet_line.insert(row.execution_id, row.created_at);
+            }
+            THREAD_FOCUS_FACT => {
+                if let Some(thread_id) = row.thread_id {
+                    self.thread_lines
+                        .entry(thread_id)
+                        .or_default()
+                        .insert(row.execution_id, row.created_at);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A start's place in line on `fact`: when it first held on that cap, or
+    /// last of all for one that has not queued on it (a new filing, or one
+    /// whose `after:` gates just cleared).
+    fn place(&self, start: &Start<'_>, fact: &'static str) -> i64 {
+        start
+            .execution_id
+            .and_then(|id| self.stored.get(&(id.to_string(), fact)))
+            .map_or(i64::MAX, |stored| stored.since)
+    }
+
+    /// Which caps hold `start` now.
+    ///
+    /// A cap holds when it is full, AND when anything is already held on it
+    /// ahead of this start: a slot that frees between sweeps goes to the
+    /// oldest held execution, never to a fresh filing that happened to land
+    /// first. A start that re-runs an issue already counted as an open child
+    /// of its thread opens no new child, so the thread cap does not hold it;
+    /// nor does it when the issue has no thread.
+    pub(crate) fn decide(&self, start: &Start<'_>) -> Admission {
+        let ahead = |line: &HashMap<String, i64>, place: i64| {
+            line.iter()
+                .filter(|(id, since)| Some(id.as_str()) != start.execution_id && **since < place)
+                .count()
+        };
+        let mut blocks = Vec::new();
+        if self.load.in_progress >= self.fleet_limit
+            || ahead(&self.fleet_line, self.place(start, FLEET_SLOT_FACT)) > 0
+        {
+            blocks.push(CapacityHold::Fleet {
+                running: self.load.in_progress,
+                limit: self.fleet_limit,
+                unplaced: self.load.waiting_for_machine,
+                place: None,
+            });
+        }
+        let thread = start.issue_id.and_then(|issue_id| {
+            let thread = self.issues.get(issue_id)?;
+            Some((issue_id, thread))
+        });
+        if let Some((issue_id, thread)) = thread {
+            let open = self
+                .open_children
+                .get(&thread.thread_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let already_open = open.iter().any(|(_, id)| id == issue_id);
+            let ahead = self
+                .thread_lines
+                .get(&thread.thread_id)
+                .map_or(0, |line| ahead(line, self.place(start, THREAD_FOCUS_FACT)));
+            if !already_open && (open.len() >= self.thread_limit || ahead > 0) {
+                blocks.push(CapacityHold::Thread {
+                    thread: thread.thread_name.clone(),
+                    open: open.iter().map(|(number, _)| *number).collect(),
+                    limit: self.thread_limit,
+                    place: None,
+                });
+            }
+        }
+        Admission { blocks }
+    }
+
+    /// Whether holding `start` on `admission` would change nothing stored: it
+    /// is held, and exactly the caps that hold it already have blocking rows.
+    /// Such a start costs its pass no write; its facts are refreshed with the
+    /// rest of the queue's after the pass.
+    pub(crate) fn holds_as_stored(&self, start: &Start<'_>, admission: &Admission) -> bool {
+        let Some(execution_id) = start.execution_id else {
+            return false;
+        };
+        !admission.is_clear()
+            && CAPACITY_FACTS.iter().all(|fact| {
+                let wanted = admission.blocks.iter().any(|block| block.fact() == *fact);
+                let stored = self
+                    .stored
+                    .get(&(execution_id.to_string(), *fact))
+                    .is_some_and(|stored| stored.blocking);
+                wanted == stored
+            })
+    }
+
+    /// `start` was released: it takes a fleet slot, opens its thread's child
+    /// if that was not open yet, and leaves every line.
+    pub(crate) fn record_release(&mut self, start: &Start<'_>) {
+        // The fleet counts this device's executions only: releasing one that
+        // runs on another device takes no slot here.
+        let on_device = start
+            .execution_id
+            .and_then(|id| self.on_device.get(id))
+            .copied()
+            .unwrap_or(true);
+        if on_device {
+            self.load.in_progress += 1;
+        }
+        if let Some(issue_id) = start.issue_id {
+            if let Some(thread) = self.issues.get(issue_id) {
+                let open = self
+                    .open_children
+                    .entry(thread.thread_id.clone())
+                    .or_default();
+                if !open.iter().any(|(_, id)| id == issue_id) {
+                    open.push((thread.number, issue_id.to_string()));
+                    open.sort();
+                }
+            }
+        }
+        if let Some(execution_id) = start.execution_id {
+            self.fleet_line.remove(execution_id);
+            for line in self.thread_lines.values_mut() {
+                line.remove(execution_id);
+            }
+            for fact in CAPACITY_FACTS {
+                self.stored.remove(&(execution_id.to_string(), *fact));
+            }
+        }
+    }
+
+    /// `start` was held on `blocks` as of `now`: it stands in line on each of
+    /// them, keeping its place where it had one, and leaves the others.
+    pub(crate) fn record_hold(&mut self, start: &Start<'_>, blocks: &[CapacityHold], now: i64) {
+        let Some(execution_id) = start.execution_id else {
+            return;
+        };
+        let thread_id = start
+            .issue_id
+            .and_then(|issue_id| self.issues.get(issue_id))
+            .map(|thread| thread.thread_id.clone());
+        let on_device = self.on_device.get(execution_id).copied().unwrap_or(true);
+        for fact in CAPACITY_FACTS {
+            let key = (execution_id.to_string(), *fact);
+            let holds = blocks.iter().any(|block| block.fact() == *fact);
+            let since = match self.stored.get_mut(&key) {
+                Some(stored) => {
+                    stored.blocking = holds;
+                    stored.since
+                }
+                None if holds => {
+                    self.stored.insert(
+                        key,
+                        StoredHold {
+                            since: now,
+                            blocking: true,
+                        },
+                    );
+                    now
+                }
+                None => continue,
+            };
+            let line = match *fact {
+                FLEET_SLOT_FACT if on_device => Some(&mut self.fleet_line),
+                THREAD_FOCUS_FACT => thread_id
+                    .as_ref()
+                    .map(|thread_id| self.thread_lines.entry(thread_id.clone()).or_default()),
+                _ => None,
+            };
+            if let Some(line) = line {
+                if holds {
+                    line.insert(execution_id.to_string(), since);
+                } else {
+                    line.remove(execution_id);
+                }
+            }
+        }
+    }
+
+    /// `hold` with this read's counts: the fleet's load and limit, or the
+    /// thread's name, open children and limit when this read knows the thread.
+    fn refresh_counts(&self, hold: &mut CapacityHold, thread_id: Option<&str>) {
+        match hold {
+            CapacityHold::Fleet {
+                running,
+                limit,
+                unplaced,
+                ..
+            } => {
+                *running = self.load.in_progress;
+                *limit = self.fleet_limit;
+                *unplaced = self.load.waiting_for_machine;
+            }
+            CapacityHold::Thread {
+                thread,
+                open,
+                limit,
+                ..
+            } => {
+                let Some(thread_id) = thread_id else { return };
+                let Some(children) = self.open_children.get(thread_id) else {
+                    return;
+                };
+                if let Some(known) = self
+                    .issues
+                    .values()
+                    .find(|known| known.thread_id == thread_id)
+                {
+                    thread.clone_from(&known.thread_name);
+                }
+                *open = children.iter().map(|(number, _)| *number).collect();
+                *limit = self.thread_limit;
+            }
+        }
+    }
+}
+
+/// Decide which caps hold a start on `issue_id` right now, over a fresh read
+/// of the queue. Call it holding the [`AdmissionLock`], and act on it before
+/// letting go.
 ///
 /// `db` is the database that owns the issue. `execution_id` is the held
 /// execution being released, or `None` for a new filing.
-///
-/// A cap holds when it is full, AND when anything is already held on it ahead
-/// of this start: a slot that frees between sweeps goes to the oldest held
-/// execution, never to a fresh filing that happened to land first. A start
-/// that re-runs an issue already counted as an open child of its thread opens
-/// no new child, so the thread cap does not hold it; nor does it when the
-/// issue has no thread.
 pub async fn decide(
     orch: &Orchestrator,
     db: &LocalDb,
     issue_id: Option<&str>,
     execution_id: Option<&str>,
 ) -> Result<Admission, String> {
-    let settings = orch.get_settings();
-    let mut blocks = Vec::new();
-    let counting = |error: crate::storage::DbError| format!("failed to read the queue: {error}");
-
-    let limit = settings.max_concurrent_executions.max(1) as usize;
-    let fleet = fleet_load(orch).await?;
-    let place = own_place(db, execution_id, FLEET_SLOT_FACT)
-        .await
-        .map_err(counting)?;
-    let device = orch.anon_device_manager.device_id();
-    let mut fleet_ahead = 0;
-    for queue_db in orch.db.all_dbs().await {
-        fleet_ahead += count_ahead(&queue_db, FLEET_AHEAD_SQL, execution_id, place, &device)
-            .await
-            .map_err(counting)?;
-    }
-    if fleet.in_progress >= limit || fleet_ahead > 0 {
-        blocks.push(CapacityHold::Fleet {
-            running: fleet.in_progress,
-            limit,
-            unplaced: fleet.waiting_for_machine,
-            place: None,
-        });
-    }
-
-    if let Some(issue_id) = issue_id {
-        let focus = thread_focus(db, issue_id, settings.max_open_children_per_thread)
-            .await
-            .map_err(|error| format!("failed to count the thread's open children: {error}"))?;
-        if let Some(focus) = focus {
-            let already_open = focus.open_children.iter().any(|(_, id)| id == issue_id);
-            let place = own_place(db, execution_id, THREAD_FOCUS_FACT)
-                .await
-                .map_err(counting)?;
-            let ahead = count_ahead(db, THREAD_AHEAD_SQL, execution_id, place, &focus.thread_id)
-                .await
-                .map_err(counting)?;
-            if !already_open && (focus.open_children.len() >= focus.limit || ahead > 0) {
-                blocks.push(CapacityHold::Thread {
-                    thread: focus.thread_name,
-                    open: focus
-                        .open_children
-                        .into_iter()
-                        .map(|(number, _)| number)
-                        .collect(),
-                    limit: focus.limit,
-                    place: None,
-                });
-            }
-        }
-    }
-    Ok(Admission { blocks })
+    let start = Start {
+        db,
+        issue_id,
+        execution_id,
+    };
+    let snapshot = QueueSnapshot::load(orch, std::slice::from_ref(&start)).await?;
+    Ok(snapshot.decide(&start))
 }
 
 // ---------------------------------------------------------------------------
@@ -588,11 +1158,18 @@ pub async fn decide(
 
 /// Rewrite every blocking capacity gate's place in line: the fleet's in one
 /// order across every database, each thread's within the thread. Oldest held
-/// first, by when the execution first held on that cap. A row is written only
-/// when its stored place changes; a row with no facts yet keeps its place in
-/// the count but is left for the next decision to write. Returns the
-/// executions whose census moved.
-pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> {
+/// first, by when the execution first held on that cap. With the `queue` a
+/// sweep pass decided against, as it stood once the pass was done, the counts
+/// each hold shows are rewritten too, so a hold the pass left as it was does
+/// not have to be written under the admission lock to stay current. Neither
+/// takes the lock: these are display values, never admission inputs. A row is
+/// written only when what it renders changes; a row with no facts yet keeps
+/// its place in the count but is left for the next decision to write. Returns
+/// the executions whose census moved.
+pub async fn refresh_places(
+    orch: &Orchestrator,
+    queue: Option<&QueueSnapshot>,
+) -> Result<Vec<String>, String> {
     struct Blocking {
         db: Arc<LocalDb>,
         gate_id: String,
@@ -673,11 +1250,15 @@ pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> 
         else {
             continue;
         };
-        if hold.place() == Some(*place) {
+        hold.set_place(Some(*place));
+        if let Some(queue) = queue {
+            let thread = gate.group.as_ref().map(|(_, thread)| thread.as_str());
+            queue.refresh_counts(&mut hold, thread);
+        }
+        let rendered = encode_hold(&hold);
+        if gate.detail.as_deref() == Some(rendered.as_str()) {
             continue;
         }
-        hold.set_place(Some(*place));
-        let rendered = encode_hold(&hold);
         let gate_id = gate.gate_id.clone();
         gate.db
             .write(|conn| {
@@ -935,11 +1516,23 @@ mod tests {
     }
 
     async fn open_children(env: &Env, issue_number: i32) -> Vec<i64> {
-        thread_focus(&env.db, &format!("si{issue_number}"), 4)
+        let issue_id = format!("si{issue_number}");
+        env.db
+            .read(move |conn| {
+                let issue_id = issue_id.clone();
+                Box::pin(async move {
+                    let Some(thread) = thread_of_issue_conn(conn, &issue_id).await? else {
+                        return Ok(Vec::new());
+                    };
+                    Ok(open_thread_children_conn(conn, &thread.thread_id)
+                        .await?
+                        .into_iter()
+                        .map(|(number, _)| number)
+                        .collect())
+                })
+            })
             .await
             .unwrap()
-            .map(|focus| focus.open_children.into_iter().map(|(n, _)| n).collect())
-            .unwrap_or_default()
     }
 
     async fn census_of(
@@ -1025,7 +1618,7 @@ mod tests {
     }
 
     /// The operator's own start, as the composer's invoke makes it.
-    fn operator_start(env: &Env, number: i32) -> String {
+    async fn operator_start(env: &Env, number: i32) -> String {
         let execution = crate::execution::recipe::start_recipe_execution_impl(
             &env.orch,
             &format!("si{number}"),
@@ -1042,9 +1635,12 @@ mod tests {
             LaunchIntent::NewAttempt,
             Starter::Operator,
         )
+        .await
         .unwrap();
         assert_eq!(execution.status, crate::models::ExecutionStatus::Running);
-        crate::execution::recipe::create_jobs_for_execution(&env.orch, &execution.id).unwrap();
+        crate::execution::recipe::create_jobs_for_execution(&env.orch, &execution.id)
+            .await
+            .unwrap();
         execution.id
     }
 
@@ -1302,7 +1898,7 @@ mod tests {
         assert_eq!(fleet(&env).await, 6);
         add_issue(&env, 105, Some("th")).await;
 
-        let id = operator_start(&env, 105);
+        let id = operator_start(&env, 105).await;
         assert_eq!(gate_rows(&env, &id).await, 0, "never held");
         assert_eq!(fleet(&env).await, 7, "it counts toward the fleet");
         assert_eq!(

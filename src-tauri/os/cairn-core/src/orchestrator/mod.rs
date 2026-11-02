@@ -699,6 +699,9 @@ impl OrchestratorBuilder {
                 crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
             ),
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
+            approval_keys: Arc::default(),
+            page_renders: Arc::default(),
+            relay: Arc::default(),
             private_lanes,
             provider_admission_cache,
             startup_readiness: self.startup_readiness,
@@ -756,7 +759,7 @@ impl OrchestratorBuilder {
             sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
             sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            admission_lock: Arc::new(TokioMutex::new(())),
+            admission_lock: Arc::new(crate::execution::gates::capacity::AdmissionLock::default()),
             context_token_snapshots: self.context_token_snapshots,
             team_attention_sender: self.team_attention_sender,
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1161,6 +1164,15 @@ pub struct Orchestrator {
     /// several of its calls at once is interrupted once, after the last of them
     /// has had its handoff grace. Shared across clones behind the `Arc`.
     pub(crate) park_slots: Arc<crate::orchestrator::lifecycle::ParkSlots>,
+    /// The approval service's signing keys, kept across the clients each merge
+    /// builds. See [`crate::approvals_client::ApprovalKeys`].
+    pub approval_keys: Arc<crate::approvals_client::ApprovalKeys>,
+    /// Rendered page reads in flight: the concurrency bound and the readers
+    /// holding a render.
+    pub(crate) page_renders: Arc<crate::pages::RenderSlots>,
+    /// This install's relay coordination: the operation lock and the signals
+    /// its sync loop and doorbell wait on.
+    pub relay: Arc<crate::ingress::channel::RelaySignals>,
     /// The last admission decision each private ordinary-session lane made:
     /// the budget it measured and why its queue head waits, if it does.
     pub(crate) private_lanes: Arc<crate::execution::jobs::PrivateLaneLedger>,
@@ -1463,9 +1475,9 @@ pub struct Orchestrator {
     sidebar_active_issues_rebuild_count: Arc<std::sync::atomic::AtomicU64>,
     /// The execution queue's admission lock: every capped filing and every
     /// gate release decides its caps and writes under it, so two admissions
-    /// never interleave over a count that spans databases. See
-    /// `execution::gates::capacity`.
-    pub(crate) admission_lock: Arc<TokioMutex<()>>,
+    /// never interleave over a count that spans databases. Bounded and
+    /// attributed; see `execution::gates::capacity::AdmissionLock`.
+    pub(crate) admission_lock: Arc<crate::execution::gates::capacity::AdmissionLock>,
     /// Latest normalized context-token snapshots keyed by durable session id.
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 

@@ -8,7 +8,6 @@
 
 use cairn_common::ids;
 use cairn_models::types::catalog::VerbKind;
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -126,20 +125,30 @@ pub enum Starter {
     Capped,
 }
 
-pub fn create_jobs_for_execution(
+pub async fn create_jobs_for_execution(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<Vec<Job>, String> {
-    let db = run_recipe_db({
-        let dbs = orch.db.clone();
-        let execution_id = execution_id.to_string();
-        async move {
-            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-    crate::execution::advancement::create_jobs_for_execution(db, execution_id)
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let execution_id = execution_id.to_string();
+    db.write(|conn| {
+        let execution_id = execution_id.clone();
+        Box::pin(async move {
+            crate::execution::advancement::create_jobs_for_execution_conn(conn, &execution_id).await
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to create jobs for execution: {e}"))
+}
+
+/// What a launch did: the execution, and, when the execution queue held it
+/// without `after:` gates of its own, the caps that hold it as the admission
+/// decision found them. A filing reports those without deciding again.
+pub(crate) struct Launched {
+    pub execution: Execution,
+    pub held_by: Vec<crate::models::CapacityHold>,
 }
 
 /// Start a recipe execution, create its jobs, and kick off DAG advancement.
@@ -158,9 +167,11 @@ pub fn create_jobs_for_execution(
 /// immediately, and the notifier poke here covers a caller that does not.
 ///
 /// A [`Starter::Capped`] launch can also come back `Held` with no `after:`
-/// gates at all: the execution queue's caps hold it, the same way.
+/// gates at all: the execution queue's caps hold it, the same way. That hold
+/// pokes no sweep: a new hold frees nothing, and the admission decision that
+/// made it is returned in [`Launched::held_by`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_recipe_execution_and_advance(
+pub(crate) async fn start_recipe_execution_and_advance(
     orch: &Orchestrator,
     issue_id: &str,
     recipe_id: Option<&str>,
@@ -174,9 +185,9 @@ pub(crate) fn start_recipe_execution_and_advance(
     intent: LaunchIntent,
     after: &[crate::routes::TriggerClause],
     starter: Starter,
-) -> Result<Execution, String> {
+) -> Result<Launched, String> {
     let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
-    let execution = launch_recipe_execution(
+    let launched = launch_recipe_execution(
         orch,
         issue_id,
         recipe_id,
@@ -192,15 +203,19 @@ pub(crate) fn start_recipe_execution_and_advance(
         intent,
         &gates,
         starter,
-    )?;
+    )
+    .await?;
+    let execution = &launched.execution;
     let execution_change =
         crate::notify::execution_db_change_ids("insert", &execution.id, Some(issue_id), project_id);
     if execution.status == ExecutionStatus::Held {
         let _ = orch.services.emitter.emit("db-change", execution_change);
-        crate::execution::gates::sweep::notify_gate_evidence_changed();
-        return Ok(execution);
+        if !gates.is_empty() {
+            crate::execution::gates::sweep::notify_gate_evidence_changed();
+        }
+        return Ok(launched);
     }
-    let jobs = create_jobs_for_execution(orch, &execution.id)?;
+    let jobs = create_jobs_for_execution(orch, &execution.id).await?;
     let _ = orch.services.emitter.emit("db-change", execution_change);
     for job in &jobs {
         let _ = orch
@@ -214,7 +229,7 @@ pub(crate) fn start_recipe_execution_and_advance(
             outbox_entry_id: None,
         });
     }
-    Ok(execution)
+    Ok(launched)
 }
 
 /// Start executing a recipe for an issue.
@@ -237,7 +252,7 @@ pub(crate) fn start_recipe_execution_and_advance(
 /// otherwise). It is resolved into node topology once, here, so every downstream
 /// derivation reads a snapshot that already has the right shape.
 #[allow(clippy::too_many_arguments)]
-pub fn start_recipe_execution_impl(
+pub async fn start_recipe_execution_impl(
     orch: &Orchestrator,
     issue_id: &str,
     recipe_id: Option<&str>,
@@ -280,6 +295,8 @@ pub fn start_recipe_execution_impl(
         &[],
         starter,
     )
+    .await
+    .map(|launched| launched.execution)
 }
 
 /// [`start_recipe_execution_impl`] with `after:` gates: `gates` are canonical
@@ -288,7 +305,7 @@ pub fn start_recipe_execution_impl(
 /// execution must never be observable without the gates that make it held,
 /// because with no gates and no jobs the projection derives `complete`.
 #[allow(clippy::too_many_arguments)]
-fn launch_recipe_execution(
+async fn launch_recipe_execution(
     orch: &Orchestrator,
     issue_id: &str,
     recipe_id: Option<&str>,
@@ -304,7 +321,7 @@ fn launch_recipe_execution(
     intent: LaunchIntent,
     gates: &[String],
     starter: Starter,
-) -> Result<Execution, String> {
+) -> Result<Launched, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let this_device = orch.anon_device_manager.device_id();
     let owner_device = runner_device_id.unwrap_or_else(|| this_device.clone());
@@ -313,7 +330,7 @@ fn launch_recipe_execution(
     // wholly in its synced replica, so the execution and its jobs must be created
     // there, not in the private DB. The id-keyed resolvers cannot be used yet —
     // the execution row does not exist — so resolve by project id.
-    let db = resolve_owning_db_for_project(orch, project_id)?;
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
 
     // CAIRN-2629: if a PEER device was chosen as the runner, enforce that it has a
     // local clone of this project before stamping ownership on it — otherwise its
@@ -321,17 +338,10 @@ fn launch_recipe_execution(
     // authoritative guard (the picker filters as a convenience). This machine is
     // trusted (the launch flow already blocks starting without a clone).
     if owner_device != this_device {
-        let db_check = db.clone();
-        let owner = owner_device.clone();
-        let project_id_owned = project_id.to_string();
-        let can_run = run_recipe_db(async move {
-            let key = crate::execution::ownership::project_key(&db_check, &project_id_owned)
-                .await
-                .ok_or_else(|| "Project not found".to_string())?;
-            Ok::<bool, String>(
-                crate::execution::ownership::device_has_clone(&db_check, &owner, &key).await,
-            )
-        })?;
+        let key = crate::execution::ownership::project_key(&db, project_id)
+            .await
+            .ok_or_else(|| "Project not found".to_string())?;
+        let can_run = crate::execution::ownership::device_has_clone(&db, &owner_device, &key).await;
         if !can_run {
             return Err(format!(
                 "Selected runner device {owner_device} has no local clone of this project"
@@ -340,7 +350,7 @@ fn launch_recipe_execution(
     }
 
     // Get project path for file-based recipe loading
-    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(&db, project_id).await?;
 
     // Get the recipe (use provided or find default)
     let recipe = match recipe_id {
@@ -368,7 +378,8 @@ fn launch_recipe_execution(
         backend,
         pinned,
         &effective_presets,
-    )?;
+    )
+    .await?;
 
     // Build execution snapshot. Resolution is early: the snapshot stores fully
     // concrete per-agent selections rather than the inputs they came from.
@@ -517,10 +528,7 @@ fn launch_recipe_execution(
     let satisfied = if gates.is_empty() {
         std::collections::HashSet::new()
     } else {
-        let (orch, gates) = (orch.clone(), gates.to_vec());
-        run_recipe_db(async move {
-            Ok(crate::execution::gates::authoring::already_satisfied(&orch, &gates).await)
-        })?
+        crate::execution::gates::authoring::already_satisfied(orch, gates).await
     };
 
     // The execution queue (cairn/5802). A capped start with no `after:` gates
@@ -530,13 +538,18 @@ fn launch_recipe_execution(
     // when those gates clear, so it takes no place in line while it waits on
     // something else.
     let (admission_guard, caps) = if starter == Starter::Capped && gates.is_empty() {
-        let (orch, db, issue) = (orch.clone(), db.clone(), issue_id.to_string());
-        let (guard, admission) = run_recipe_db(async move {
-            let guard = crate::execution::gates::capacity::admission_lock(&orch).await;
-            let admission =
-                crate::execution::gates::capacity::decide(&orch, &db, Some(&issue), None).await?;
-            Ok((guard, admission))
-        })?;
+        // A busy lock refuses the filing before anything is written, so the
+        // caller can retry it as it stands.
+        let guard = orch
+            .admission_lock
+            .acquire(
+                crate::execution::gates::capacity::AdmissionSite::Filing,
+                issue_id,
+            )
+            .await
+            .map_err(|busy| busy.to_string())?;
+        let admission =
+            crate::execution::gates::capacity::decide(orch, &db, Some(issue_id), None).await?;
         (Some(guard), admission.blocks)
     } else {
         (None, Vec::new())
@@ -574,16 +587,17 @@ fn launch_recipe_execution(
         LaunchGates {
             predicates: gates.to_vec(),
             satisfied,
-            caps,
+            caps: caps.clone(),
             filed_at: orch.services.clock.now(),
         },
-    )?;
+    )
+    .await?;
     drop(admission_guard);
 
     // Phase 2, after the fence has committed.
     stop_superseded_agents(orch, &launch.supersessions);
 
-    Ok(Execution {
+    let execution = Execution {
         id: exec_id,
         recipe_id: recipe.id,
         issue_id: Some(issue_id.to_string()),
@@ -605,6 +619,10 @@ fn launch_recipe_execution(
         released_at: None,
         release_override_json: None,
         gate_census: None,
+    };
+    Ok(Launched {
+        execution,
+        held_by: caps,
     })
 }
 
@@ -612,7 +630,7 @@ fn launch_recipe_execution(
 ///
 /// Creates an execution record for a manual trigger. Caller is responsible for
 /// creating jobs and advancing the DAG.
-pub fn start_manual_execution_impl(
+pub async fn start_manual_execution_impl(
     orch: &Orchestrator,
     recipe_id: &str,
     project_id: &str,
@@ -621,10 +639,10 @@ pub fn start_manual_execution_impl(
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
-    let db = resolve_owning_db_for_project(orch, project_id)?;
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
 
     // Get project path for file-based recipe loading
-    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(&db, project_id).await?;
 
     // Verify recipe exists (load from files)
     let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
@@ -670,7 +688,8 @@ pub fn start_manual_execution_impl(
             // runs stamp generation 0, which the fence answers Clear.
             lifecycle: crate::models::ExecutionLifecycle::Canonical,
         },
-    )?;
+    )
+    .await?;
 
     Ok(Execution {
         id: exec_id,
@@ -698,7 +717,7 @@ pub fn start_manual_execution_impl(
 /// - Stores `event_payload` in TriggerContext
 /// - Uses the triggering execution's initiator for credential resolution
 /// - Supports optional issue_id (Issue-scoped vs Project-scoped triggers)
-pub(crate) fn start_event_triggered_execution(
+pub(crate) async fn start_event_triggered_execution(
     orch: &Orchestrator,
     recipe: &crate::models::Recipe,
     trigger_type: TriggerType,
@@ -711,11 +730,11 @@ pub(crate) fn start_event_triggered_execution(
 
     let trigger_type_str = trigger_type.to_string();
 
-    let db = resolve_owning_db_for_project(orch, project_id)?;
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
 
     // Build execution snapshot with event payload. An event-triggered launch is
     // still a launch: when it carries an issue, that issue's labels route it.
-    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(&db, project_id).await?;
     let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let plan = plan_for_launch(
         &db,
@@ -724,7 +743,8 @@ pub(crate) fn start_event_triggered_execution(
         None,
         std::collections::HashSet::new(),
         &effective_presets,
-    )?;
+    )
+    .await?;
     let mut snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
@@ -775,12 +795,13 @@ pub(crate) fn start_event_triggered_execution(
                 LaunchIntent::AutomaticTrigger,
                 canonical::SupersessionActor::system(),
                 LaunchGates::default(),
-            )?;
+            )
+            .await?;
             stop_superseded_agents(orch, &launch.supersessions);
             (Some(launch.seq), launch.lifecycle)
         }
         None => {
-            insert_execution(db.clone(), new_execution)?;
+            insert_execution(db.clone(), new_execution).await?;
             (None, crate::models::ExecutionLifecycle::Canonical)
         }
     };
@@ -886,15 +907,15 @@ pub struct LaunchOverrides {
 
 /// Resolve a recipe's per-agent-node launch settings with provenance and loud,
 /// per-node errors. The composer's contract.
-pub fn resolve_recipe_launch(
+pub async fn resolve_recipe_launch(
     orch: &Orchestrator,
     recipe_id: &str,
     project_id: &str,
     issue_id: Option<&str>,
     overrides: Option<LaunchOverrides>,
 ) -> Result<LaunchPlan, String> {
-    let db = resolve_owning_db_for_project(orch, project_id)?;
-    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
+    let db = resolve_owning_db_for_project(orch, project_id).await?;
+    let project_path = project_path_for_recipe(&db, project_id).await?;
     let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
     let presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let overrides = overrides.unwrap_or_default();
@@ -921,7 +942,8 @@ pub fn resolve_recipe_launch(
         None,
         std::collections::HashSet::new(),
         &presets,
-    )?;
+    )
+    .await?;
 
     let config_dir = orch.config_dir.clone();
     // One provider record per backend, asked whether a selection can hold a
@@ -1125,7 +1147,7 @@ fn resolve_launch_nodes(
 /// that issue's labels and the project's binding table -- and a malformed table
 /// refuses the launch here, before an execution row exists, rather than
 /// degrading into "everything resolves to its default" in silence.
-fn plan_for_launch(
+async fn plan_for_launch(
     db: &Arc<LocalDb>,
     project_path: &Path,
     issue_id: Option<&str>,
@@ -1138,36 +1160,31 @@ fn plan_for_launch(
         return Ok(LaunchSelectionPlan::empty(backend));
     };
     let table = crate::config::model_routing::load_model_routing(project_path)?;
-    let labels = issue_labels_for_launch(db.clone(), issue_id.to_string())?;
+    let labels = issue_labels_for_launch(db, issue_id).await?;
     Ok(LaunchSelectionPlan::new(
         backend, table, labels, pinned, presets,
     ))
 }
 
-fn issue_labels_for_launch(db: Arc<LocalDb>, issue_id: String) -> Result<IssueLabels, String> {
-    run_recipe_db(async move {
-        db.read(|conn| {
-            let issue_id = issue_id.clone();
-            Box::pin(
-                async move { crate::labels::attach::list_labels_for_issue(conn, &issue_id).await },
-            )
-        })
-        .await
-        .map_err(|e| format!("Failed to read issue labels for model routing: {e}"))
+async fn issue_labels_for_launch(db: &LocalDb, issue_id: &str) -> Result<IssueLabels, String> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move { crate::labels::attach::list_labels_for_issue(conn, &issue_id).await })
     })
+    .await
+    .map_err(|e| format!("Failed to read issue labels for model routing: {e}"))
     .map(|labels| IssueLabels::new(labels.into_iter().map(|label| (label.id, label.name))))
 }
 
-fn project_path_for_recipe(
-    db: Arc<LocalDb>,
-    project_id: String,
+async fn project_path_for_recipe(
+    db: &LocalDb,
+    project_id: &str,
 ) -> Result<std::path::PathBuf, String> {
-    run_recipe_db(async move {
-        let repo_path = project_repo_path(&db, &project_id).await?;
-        repo_path
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| format!("Project not found: {}", project_id))
-    })
+    project_repo_path(db, project_id)
+        .await?
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| format!("Project not found: {}", project_id))
 }
 
 struct NewExecution {
@@ -1190,7 +1207,7 @@ struct NewExecution {
 /// observed `satisfied`, so a test can take the evidence away between that
 /// observation and the transaction that acts on it.
 #[cfg(test)]
-pub(crate) fn file_held_with_observed_satisfaction(
+pub(crate) async fn file_held_with_observed_satisfaction(
     orch: &Orchestrator,
     db: Arc<LocalDb>,
     issue_id: &str,
@@ -1227,7 +1244,8 @@ pub(crate) fn file_held_with_observed_satisfaction(
             caps: Vec::new(),
             filed_at: orch.services.clock.now(),
         },
-    )?;
+    )
+    .await?;
     Ok(exec_id)
 }
 
@@ -1278,7 +1296,7 @@ struct IssueLaunch {
 /// whatever owns it then (`gates::sweep::release_conn`). Fencing at filing would
 /// stop the very run a "re-run after X merges" is waiting to follow, and if that
 /// run has finished by release time there is nothing to fence at all.
-fn insert_issue_execution_atomic(
+async fn insert_issue_execution_atomic(
     db: Arc<LocalDb>,
     dbs: Arc<crate::db::DbState>,
     issue_id: String,
@@ -1301,133 +1319,126 @@ fn insert_issue_execution_atomic(
         );
     }
     let own_db = db.clone();
-    run_recipe_db(async move {
-        db.write(move |conn| {
-            let issue_id = issue_id.clone();
-            let actor = actor.clone();
-            let gates = gates.clone();
-            let satisfied = satisfied.clone();
-            let caps = caps.clone();
-            let dbs = dbs.clone();
-            let own_db = own_db.clone();
-            let mut execution = NewExecution {
-                id: execution.id.clone(),
-                recipe_id: execution.recipe_id.clone(),
-                issue_id: execution.issue_id.clone(),
-                project_id: execution.project_id.clone(),
-                status: execution.status.clone(),
-                started_at: execution.started_at,
-                completed_at: execution.completed_at,
-                snapshot: execution.snapshot.take(),
-                seq: execution.seq,
-                initiator: execution.initiator.clone(),
-                triggered_by: execution.triggered_by.clone(),
-                runner_device_id: execution.runner_device_id.clone(),
-                lifecycle: execution.lifecycle,
+    db.write(move |conn| {
+        let issue_id = issue_id.clone();
+        let actor = actor.clone();
+        let gates = gates.clone();
+        let satisfied = satisfied.clone();
+        let caps = caps.clone();
+        let dbs = dbs.clone();
+        let own_db = own_db.clone();
+        let mut execution = NewExecution {
+            id: execution.id.clone(),
+            recipe_id: execution.recipe_id.clone(),
+            issue_id: execution.issue_id.clone(),
+            project_id: execution.project_id.clone(),
+            status: execution.status.clone(),
+            started_at: execution.started_at,
+            completed_at: execution.completed_at,
+            snapshot: execution.snapshot.take(),
+            seq: execution.seq,
+            initiator: execution.initiator.clone(),
+            triggered_by: execution.triggered_by.clone(),
+            runner_device_id: execution.runner_device_id.clone(),
+            lifecycle: execution.lifecycle,
+        };
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp();
+            crate::execution::gates::authoring::refuse_cycles_conn(
+                conn, &dbs, &own_db, &issue_id, None, &gates, &satisfied,
+            )
+            .await?;
+            let seq = crate::execution::canonical::next_seq_conn(conn, &issue_id).await?;
+            let held = !gates.is_empty() || !caps.is_empty();
+
+            // The fence is published BEFORE the successor exists, so there is
+            // never an instant at which two rows read canonical.
+            let supersessions = if intent.supersedes() && !held {
+                crate::execution::canonical::supersede_canonical_conn(
+                    conn,
+                    &issue_id,
+                    execution.id.as_str(),
+                    &actor,
+                    now,
+                )
+                .await?
+            } else {
+                Vec::new()
             };
-            Box::pin(async move {
-                let now = chrono::Utc::now().timestamp();
-                crate::execution::gates::authoring::refuse_cycles_conn(
-                    conn, &dbs, &own_db, &issue_id, None, &gates, &satisfied,
+
+            // Resolved AFTER the fence, in the same transaction. An
+            // automatic trigger takes the attempt only when the read above
+            // finds nobody holding it -- and since it never supersedes, that
+            // means nobody held it to begin with.
+            let lifecycle = match intent {
+                LaunchIntent::NewAttempt if held => crate::models::ExecutionLifecycle::Pending,
+                LaunchIntent::NewAttempt => crate::models::ExecutionLifecycle::Canonical,
+                LaunchIntent::ParallelAlternative => crate::models::ExecutionLifecycle::Parallel,
+                LaunchIntent::AutomaticTrigger => {
+                    if crate::execution::canonical::issue_has_canonical_execution(conn, &issue_id)
+                        .await?
+                    {
+                        crate::models::ExecutionLifecycle::Parallel
+                    } else {
+                        crate::models::ExecutionLifecycle::Canonical
+                    }
+                }
+            };
+
+            execution.seq = Some(seq);
+            execution.lifecycle = lifecycle;
+            insert_execution_conn(conn, &execution).await?;
+            for cap in &caps {
+                use crate::execution::gates::capacity::{
+                    capacity_predicate, encode_hold, CapacityHoldExt,
+                };
+                cairn_workflow::gates::store::hold_capacity_gate_conn(
+                    conn,
+                    execution.id.as_str(),
+                    &capacity_predicate(cap.fact()),
+                    cap.seq(),
+                    &encode_hold(cap),
+                    filed_at,
                 )
                 .await?;
-                let seq = crate::execution::canonical::next_seq_conn(conn, &issue_id).await?;
-                let held = !gates.is_empty() || !caps.is_empty();
-
-                // The fence is published BEFORE the successor exists, so there is
-                // never an instant at which two rows read canonical.
-                let supersessions = if intent.supersedes() && !held {
-                    crate::execution::canonical::supersede_canonical_conn(
-                        conn,
-                        &issue_id,
-                        execution.id.as_str(),
-                        &actor,
-                        now,
-                    )
-                    .await?
-                } else {
-                    Vec::new()
-                };
-
-                // Resolved AFTER the fence, in the same transaction. An
-                // automatic trigger takes the attempt only when the read above
-                // finds nobody holding it -- and since it never supersedes, that
-                // means nobody held it to begin with.
-                let lifecycle = match intent {
-                    LaunchIntent::NewAttempt if held => crate::models::ExecutionLifecycle::Pending,
-                    LaunchIntent::NewAttempt => crate::models::ExecutionLifecycle::Canonical,
-                    LaunchIntent::ParallelAlternative => {
-                        crate::models::ExecutionLifecycle::Parallel
-                    }
-                    LaunchIntent::AutomaticTrigger => {
-                        if crate::execution::canonical::issue_has_canonical_execution(
-                            conn, &issue_id,
+            }
+            if held {
+                let gate_ids = cairn_workflow::gates::store::insert_gates_conn(
+                    conn,
+                    execution.id.as_str(),
+                    &gates,
+                    filed_at,
+                )
+                .await?;
+                // The satisfaction that waived a wait edge above is latched
+                // with the gate: evidence that goes away before the first
+                // sweep must not leave behind the very edge the refusal
+                // skipped because it was met.
+                for (gate_id, predicate) in gate_ids.iter().zip(&gates) {
+                    if satisfied.contains(predicate) {
+                        cairn_workflow::gates::store::record_outcome_conn(
+                            conn,
+                            gate_id,
+                            "satisfied",
+                            Some(now),
                         )
-                        .await?
-                        {
-                            crate::models::ExecutionLifecycle::Parallel
-                        } else {
-                            crate::models::ExecutionLifecycle::Canonical
-                        }
-                    }
-                };
-
-                execution.seq = Some(seq);
-                execution.lifecycle = lifecycle;
-                insert_execution_conn(conn, &execution).await?;
-                for cap in &caps {
-                    use crate::execution::gates::capacity::{
-                        capacity_predicate, encode_hold, CapacityHoldExt,
-                    };
-                    cairn_workflow::gates::store::hold_capacity_gate_conn(
-                        conn,
-                        execution.id.as_str(),
-                        &capacity_predicate(cap.fact()),
-                        cap.seq(),
-                        &encode_hold(cap),
-                        filed_at,
-                    )
-                    .await?;
-                }
-                if held {
-                    let gate_ids = cairn_workflow::gates::store::insert_gates_conn(
-                        conn,
-                        execution.id.as_str(),
-                        &gates,
-                        filed_at,
-                    )
-                    .await?;
-                    // The satisfaction that waived a wait edge above is latched
-                    // with the gate: evidence that goes away before the first
-                    // sweep must not leave behind the very edge the refusal
-                    // skipped because it was met.
-                    for (gate_id, predicate) in gate_ids.iter().zip(&gates) {
-                        if satisfied.contains(predicate) {
-                            cairn_workflow::gates::store::record_outcome_conn(
-                                conn,
-                                gate_id,
-                                "satisfied",
-                                Some(now),
-                            )
-                            .await?;
-                        }
-                    }
-                    // A held filing beside live work must not drag the issue's
-                    // projection; one on a fresh issue projects it backlog.
-                    crate::transitions::outcome::recompute_issue_status_conn(conn, &issue_id)
                         .await?;
+                    }
                 }
+                // A held filing beside live work must not drag the issue's
+                // projection; one on a fresh issue projects it backlog.
+                crate::transitions::outcome::recompute_issue_status_conn(conn, &issue_id).await?;
+            }
 
-                Ok(IssueLaunch {
-                    seq,
-                    lifecycle,
-                    supersessions,
-                })
+            Ok(IssueLaunch {
+                seq,
+                lifecycle,
+                supersessions,
             })
         })
-        .await
-        .map_err(|e| e.to_string())
     })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Step 2: interrupt the agents step 1 froze.
@@ -1496,29 +1507,27 @@ async fn insert_execution_conn(
 
 /// Insert a PROJECT-scoped execution (no issue), which owns no issue attempt and
 /// therefore has no lineage to contend for.
-fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), String> {
-    run_recipe_db(async move {
-        db.write(move |conn| {
-            let execution = NewExecution {
-                id: execution.id.clone(),
-                recipe_id: execution.recipe_id.clone(),
-                issue_id: execution.issue_id.clone(),
-                project_id: execution.project_id.clone(),
-                status: execution.status.clone(),
-                started_at: execution.started_at,
-                completed_at: execution.completed_at,
-                snapshot: execution.snapshot.clone(),
-                seq: execution.seq,
-                initiator: execution.initiator.clone(),
-                triggered_by: execution.triggered_by.clone(),
-                runner_device_id: execution.runner_device_id.clone(),
-                lifecycle: execution.lifecycle,
-            };
-            Box::pin(async move { insert_execution_conn(conn, &execution).await })
-        })
-        .await
-        .map_err(|e| e.to_string())
+async fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), String> {
+    db.write(move |conn| {
+        let execution = NewExecution {
+            id: execution.id.clone(),
+            recipe_id: execution.recipe_id.clone(),
+            issue_id: execution.issue_id.clone(),
+            project_id: execution.project_id.clone(),
+            status: execution.status.clone(),
+            started_at: execution.started_at,
+            completed_at: execution.completed_at,
+            snapshot: execution.snapshot.clone(),
+            seq: execution.seq,
+            initiator: execution.initiator.clone(),
+            triggered_by: execution.triggered_by.clone(),
+            runner_device_id: execution.runner_device_id.clone(),
+            lifecycle: execution.lifecycle,
+        };
+        Box::pin(async move { insert_execution_conn(conn, &execution).await })
     })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The recipe id a filing names, as its launch will resolve it.
@@ -1560,41 +1569,16 @@ async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<Stri
     .map_err(|e| e.to_string())
 }
 
-/// Fail-closed sync resolve of a project's owning database, bridged onto the
-/// recipe DB runtime. Used at execution-start sites where no execution/job/run
-/// row exists yet, so the id-keyed resolvers cannot be used.
-fn resolve_owning_db_for_project(
+/// Fail-closed resolve of a project's owning database. Used at execution-start
+/// sites where no execution/job/run row exists yet, so the id-keyed resolvers
+/// cannot be used.
+async fn resolve_owning_db_for_project(
     orch: &Orchestrator,
     project_id: &str,
 ) -> Result<Arc<LocalDb>, String> {
-    let dbs = orch.db.clone();
-    let project_id = project_id.to_string();
-    run_recipe_db(async move {
-        crate::execution::routing::owning_db_for_project(&dbs, &project_id)
-            .await
-            .map_err(|e| e.to_string())
-    })
-}
-
-fn run_recipe_db<T, Fut>(future: Fut) -> Result<T, String>
-where
-    T: Send + 'static,
-    Fut: Future<Output = Result<T, String>> + Send + 'static,
-{
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to start recipe database runtime: {}", e))?
-            .block_on(future)
-    })
-    .join()
-    .map_err(|payload| {
-        format!(
-            "Recipe database task panicked: {}",
-            crate::storage::panic_message(&*payload)
-        )
-    })?
+    crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]

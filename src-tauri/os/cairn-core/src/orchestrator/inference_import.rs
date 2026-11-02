@@ -180,13 +180,36 @@ pub fn weight_files(
     Ok(files)
 }
 
-fn refused(missing: Vec<Missing>, refused: Vec<String>) -> String {
-    ImportError { missing, refused }.to_string()
+/// Why an import was refused: the compile's account of the keys its spec
+/// lacks and what it refused, or any other reason in words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportRefusal {
+    Compile(ImportError),
+    Other(String),
+}
+
+impl From<String> for ImportRefusal {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
+}
+
+impl std::fmt::Display for ImportRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compile(error) => error.fmt(f),
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
 }
 
 /// Import `spec`: compile its service, pin its image and weights, and write
 /// the profile; or refuse with every key it needs.
-pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<String, String> {
+pub async fn import(
+    db: &LocalDb,
+    hub: &dyn Hub,
+    spec: &ImportSpec,
+) -> Result<String, ImportRefusal> {
     let inventory = load_inventory(db).await?;
     let model: Model = inventory.models.get(&spec.model).cloned().ok_or_else(|| {
         format!(
@@ -204,16 +227,16 @@ pub async fn import(db: &LocalDb, hub: &dyn Hub, spec: &ImportSpec) -> Result<St
         let text = read_file(hub, &spec.url, &spec.commit, path).await?;
         files.env_files.push((path.clone(), text));
     }
-    let mut compiled = import::compile(&spec, &files).map_err(|error| error.to_string())?;
+    let mut compiled = import::compile(&spec, &files).map_err(ImportRefusal::Compile)?;
     if let Some(tagged) = compiled.unpinned_image.take() {
         compiled.container.image = pin_image(hub, &tagged).await.map_err(|why| {
-            refused(
-                vec![Missing {
+            ImportRefusal::Compile(ImportError {
+                missing: vec![Missing {
                     key: "image".into(),
                     meaning: format!("{tagged} pinned by digest (name@sha256:<64 hex>): {why}"),
                 }],
-                Vec::new(),
-            )
+                refused: Vec::new(),
+            })
         })?;
     }
 
@@ -422,7 +445,7 @@ mod tests {
     async fn an_import_names_what_it_lacks_and_needs_a_registered_model() {
         let db = crate::storage::migrated_test_db("inference-import-refusals").await;
         let hub = hub();
-        let refusal = import(&db, &hub, &spec()).await.unwrap_err();
+        let refusal = import(&db, &hub, &spec()).await.unwrap_err().to_string();
         assert!(refusal.contains("is not registered"), "{refusal}");
         super::super::inference_models::register(
             &db,
@@ -437,6 +460,18 @@ mod tests {
             ..spec()
         };
         let refusal = import(&db, &hub, &bare).await.unwrap_err();
+        let ImportRefusal::Compile(needs) = &refusal else {
+            panic!("a spec without ranks names the key it lacks: {refusal}");
+        };
+        assert_eq!(
+            needs
+                .missing
+                .iter()
+                .map(|m| m.key.as_str())
+                .collect::<Vec<_>>(),
+            ["ranks"]
+        );
+        let refusal = refusal.to_string();
         assert!(
             refusal.contains("- ranks: one env map per machine"),
             "{refusal}"
@@ -445,7 +480,7 @@ mod tests {
             url: "https://gitlab.com/a/b".into(),
             ..spec()
         };
-        let refusal = import(&db, &hub, &elsewhere).await.unwrap_err();
+        let refusal = import(&db, &hub, &elsewhere).await.unwrap_err().to_string();
         assert!(
             refusal.contains("Cairn imports only from GitHub"),
             "{refusal}"

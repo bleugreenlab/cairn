@@ -404,7 +404,7 @@ impl From<String> for SyncError {
 const SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) async fn sync_once(orch: &Orchestrator, relay_url: &str) -> Result<(), SyncError> {
-    let _relay_operation = channel::relay_operation_lock().lock().await;
+    let _relay_operation = orch.relay.operation_lock().lock().await;
     let channel = channel::get_relay_channel(&orch.db.local).await?;
     let (Some((channel_id, secret)), Some(encrypted_private_key)) = (
         channel.credentials(),
@@ -546,8 +546,9 @@ pub fn spawn(orch: Orchestrator, relay_url: String) {
 
 /// Sync, then wait for the timer, the doorbell, or a repair, forever.
 pub(crate) async fn run(orch: Orchestrator, relay_url: String, doorbell: Arc<Doorbell>) {
+    let relay = orch.relay.clone();
     let mut consecutive_failures = 0;
-    let mut repair_generation = channel::relay_repair_generation();
+    let mut repair_generation = relay.repair_generation();
     loop {
         let result = sync_once(&orch, &relay_url).await;
         match &result {
@@ -568,16 +569,16 @@ pub(crate) async fn run(orch: Orchestrator, relay_url: String, doorbell: Arc<Doo
             }
         }
         let delay = delay_after(&result, consecutive_failures, doorbell.is_connected());
-        if channel::relay_repair_generation() != repair_generation {
-            repair_generation = channel::relay_repair_generation();
+        if relay.repair_generation() != repair_generation {
+            repair_generation = relay.repair_generation();
             consecutive_failures = 0;
             continue;
         }
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = doorbell.rung() => {}
-            _ = channel::relay_repair_notified() => {
-                repair_generation = channel::relay_repair_generation();
+            _ = relay.repair_notified() => {
+                repair_generation = relay.repair_generation();
                 consecutive_failures = 0;
             }
         }

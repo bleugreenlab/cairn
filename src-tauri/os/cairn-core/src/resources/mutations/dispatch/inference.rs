@@ -14,10 +14,12 @@
 
 use super::super::{build_failure, payload_str, ResourceMutationResult};
 use crate::fleet::models::{self, PinTarget};
-use crate::fleet::pools::{Pool, PoolKey};
+use crate::fleet::pools::PoolKey;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::inference::{adopt, write_inventory, Authoring, Removals};
-use crate::orchestrator::inference_generate::{generate, pool_hardware, StatedHardware};
+use crate::orchestrator::inference_generate::{
+    detected_pool, executor_snapshots as snapshots, generate, pool_hardware, StatedHardware,
+};
 use crate::orchestrator::inference_import::import;
 use crate::orchestrator::inference_models::{register, Web};
 use crate::orchestrator::inference_verify;
@@ -360,17 +362,6 @@ where
     write.await
 }
 
-/// The latest health of every attached executor, by public name.
-fn snapshots(
-    orch: &Orchestrator,
-) -> std::collections::BTreeMap<String, cairn_common::executor_protocol::ExecutorHealthSnapshot> {
-    orch.fleet
-        .executor_health(crate::fleet::unix_time_ms())
-        .into_iter()
-        .map(|snapshot| (snapshot.public_name.clone(), snapshot))
-        .collect()
-}
-
 fn pool_of(payload: &Value, key: &str) -> Result<(String, bool), String> {
     let verify = payload
         .get(key)
@@ -382,17 +373,6 @@ fn pool_of(payload: &Value, key: &str) -> Result<(String, bool), String> {
         .ok_or_else(|| format!("payload.{key}.pool must name a pool"))?;
     let all = verify.get("all").and_then(Value::as_bool).unwrap_or(false);
     Ok((pool.to_string(), all))
-}
-
-/// The pool placement detects now under `key`.
-pub(crate) fn detected_pool(orch: &Orchestrator, key: &str) -> Result<Pool, String> {
-    orch.fleet
-        .detected_pools()
-        .into_iter()
-        .find(|pool| pool.key.0 == key)
-        .ok_or_else(|| {
-            format!("there is no pool {key} now; cairn://inference/pools lists the pools placement detects")
-        })
 }
 
 async fn actor(orch: &Orchestrator, request: &McpCallbackRequest, named: Option<&str>) -> String {
@@ -646,10 +626,14 @@ pub(super) async fn dispatch(
                     )));
                 }
                 let hub = Web::new().map_err(fail)?;
-                return authorized(orch, request, import(&orch.db.local, &hub, &spec))
-                    .await
-                    .map(Some)
-                    .map_err(fail);
+                return authorized(orch, request, async {
+                    import(&orch.db.local, &hub, &spec)
+                        .await
+                        .map_err(|refusal| refusal.to_string())
+                })
+                .await
+                .map(Some)
+                .map_err(fail);
             }
             let generate_payload = payload
                 .get("generate")
@@ -682,11 +666,11 @@ pub(super) async fn dispatch(
             let detected = detected_pool(orch, pool).map_err(fail)?;
             let hub = Web::new().map_err(fail)?;
             let snapshots = snapshots(orch);
-            authorized(
-                orch,
-                request,
-                generate(&orch.db.local, &hub, model, &detected, &snapshots, &stated),
-            )
+            authorized(orch, request, async {
+                generate(&orch.db.local, &hub, model, &detected, &snapshots, &stated)
+                    .await
+                    .map(|generation| generation.said)
+            })
             .await
             .map(Some)
             .map_err(fail)

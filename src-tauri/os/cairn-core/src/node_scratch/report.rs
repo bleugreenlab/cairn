@@ -55,7 +55,7 @@ fn seconds(ms: u64) -> String {
     format!("{:.1} s", ms as f64 / 1000.0)
 }
 
-fn named(entries: &[ScratchEntrySize]) -> String {
+pub(super) fn named(entries: &[ScratchEntrySize]) -> String {
     entries
         .iter()
         .map(|entry| format!("`{}` ({})", entry.path, bytes(entry.bytes)))

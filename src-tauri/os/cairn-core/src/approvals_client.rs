@@ -14,7 +14,7 @@
 //! and enrollment are what make the journaled attribution trustworthy.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use cairn_common::approvals::{
     ApprovalChallenge, ApprovalOutcome, BaseMergeIntentV2, ServiceApprovalAssertion,
@@ -267,17 +267,44 @@ fn decode<T: serde::de::DeserializeOwned>(
         .map_err(|error| ApprovalsError::Unreachable(format!("{what} did not decode: {error}")))
 }
 
+/// The approval service's signing keys, per API base, as last fetched.
+///
+/// Owned by whoever outlives the clients that verify against it (the
+/// orchestrator, in a runner), so a verification after the first skips the
+/// key-set fetch until a signature fails.
+#[derive(Debug, Default)]
+pub struct ApprovalKeys(Mutex<HashMap<String, Vec<String>>>);
+
+impl ApprovalKeys {
+    fn get(&self, base: &str) -> Option<Vec<String>> {
+        self.0.lock().ok().and_then(|keys| keys.get(base).cloned())
+    }
+
+    fn insert(&self, base: String, keys: Vec<String>) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.insert(base, keys);
+        }
+    }
+}
+
 /// The runner's approvals-service client.
 pub struct ApprovalsClient<'a> {
     http: &'a dyn HttpClient,
+    keys: Arc<ApprovalKeys>,
     api: ApiConfig,
     credential: RunnerCredential,
 }
 
 impl<'a> ApprovalsClient<'a> {
-    pub fn new(http: &'a dyn HttpClient, api: ApiConfig, credential: RunnerCredential) -> Self {
+    pub fn new(
+        http: &'a dyn HttpClient,
+        keys: Arc<ApprovalKeys>,
+        api: ApiConfig,
+        credential: RunnerCredential,
+    ) -> Self {
         Self {
             http,
+            keys,
             api,
             credential,
         }
@@ -535,10 +562,8 @@ impl<'a> ApprovalsClient<'a> {
         expected: &AssertionExpectation<'_>,
         now: i64,
     ) -> Result<ServiceApprovalAssertion, AssertionRejection> {
-        let cache = jwks_cache();
         let base = self.api.base_url().to_string();
-        let cached = cache.lock().ok().and_then(|keys| keys.get(&base).cloned());
-        if let Some(keys) = cached {
+        if let Some(keys) = self.keys.get(&base) {
             match verify_service_assertion(token, &keys, expected, now) {
                 Err(AssertionRejection::InvalidSignature(_)) => {}
                 verdict => return verdict,
@@ -548,16 +573,9 @@ impl<'a> ApprovalsClient<'a> {
             .jwks()
             .await
             .map_err(|error| AssertionRejection::KeysUnavailable(error.to_string()))?;
-        if let Ok(mut cache) = cache.lock() {
-            cache.insert(base, keys.clone());
-        }
+        self.keys.insert(base, keys.clone());
         verify_service_assertion(token, &keys, expected, now)
     }
-}
-
-fn jwks_cache() -> &'static Mutex<HashMap<String, Vec<String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Everything a Human approval assertion must match for this runner to act on
@@ -906,7 +924,7 @@ mod tests {
                 respond(200, &responses["status"]["pending"]),
             )
             .respond_to("/approvals/challenges", respond(201, &responses["issue"]));
-        let client = ApprovalsClient::new(&http, api(), credential());
+        let client = ApprovalsClient::new(&http, Arc::default(), api(), credential());
         let intent: BaseMergeIntentV2 = serde_json::from_value(fixture["intent"].clone()).unwrap();
         let issued = client
             .issue(&intent, &ApprovalAdvisory::default())
@@ -981,7 +999,7 @@ mod tests {
         let mut extra = responses["status"]["pending"].clone();
         extra["surprise"] = true.into();
         http = MockHttpClient::new().respond_to("/approvals/challenges/", respond(200, &extra));
-        let client = ApprovalsClient::new(&http, api(), credential());
+        let client = ApprovalsClient::new(&http, Arc::default(), api(), credential());
         assert!(matches!(
             client.status(&id).await,
             Err(ApprovalsError::Unreachable(_))
@@ -996,7 +1014,7 @@ mod tests {
             .respond_to("/claims", respond(409, &responses["claim"]["unavailable"]))
             .respond_to("/completions", HttpResponse::new(503, Vec::new()))
             .respond_to("/challenges", respond(409, &responses["issueRefused"]));
-        let client = ApprovalsClient::new(&http, api(), credential());
+        let client = ApprovalsClient::new(&http, Arc::default(), api(), credential());
         assert_eq!(
             client.claim("apr_1", "aa", "c").await.unwrap(),
             ClaimOutcome::Unavailable

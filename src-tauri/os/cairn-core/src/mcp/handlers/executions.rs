@@ -94,7 +94,7 @@ pub(crate) async fn start_execution_from_collection(
         None
     };
 
-    let execution = crate::execution::recipe::start_recipe_execution_and_advance(
+    let launched = crate::execution::recipe::start_recipe_execution_and_advance(
         orch,
         &issue_id,
         recipe,
@@ -111,14 +111,24 @@ pub(crate) async fn start_execution_from_collection(
         // start: agents, the CLI, issue creation and the route dispatcher all
         // file here, so the execution queue's caps apply (cairn/5802).
         crate::execution::recipe::Starter::Capped,
-    )?;
+    )
+    .await?;
+    let execution = launched.execution;
 
     // Creation-time evaluation: a gate filed after something that has already
     // happened releases now, not on an event long past. The execution row is
     // durable either way, so a failed evaluation is the next tick's to retry,
-    // not this write's to refuse.
-    let evaluation = if execution.status == crate::models::ExecutionStatus::Held {
-        Some(
+    // not this write's to refuse. Only authored gates need it: an execution
+    // the queue alone holds was decided under the admission lock a moment ago,
+    // and deciding it again would take the lock again for the same answer.
+    let evaluation = match (execution.status, after.is_empty()) {
+        (crate::models::ExecutionStatus::Held, true) => {
+            Some(crate::execution::gates::sweep::Evaluation {
+                held_by: launched.held_by,
+                ..Default::default()
+            })
+        }
+        (crate::models::ExecutionStatus::Held, false) => Some(
             crate::execution::gates::sweep::evaluate_execution(orch, &execution.id)
                 .await
                 .unwrap_or_else(|error| {
@@ -128,9 +138,8 @@ pub(crate) async fn start_execution_from_collection(
                     );
                     Default::default()
                 }),
-        )
-    } else {
-        None
+        ),
+        _ => None,
     };
 
     // Wake any in-flight `watch` so the driving loop re-derives state promptly.
@@ -139,8 +148,8 @@ pub(crate) async fn start_execution_from_collection(
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
-        // Held by the queue alone. The line carries no place: the next sweep
-        // numbers it, and the filing path does no cross-database work.
+        // Held by the queue alone. The line carries no place in line: places
+        // are numbered at the end of a sweep pass, never on the filing path.
         let queued = (evaluation.waiting.is_empty() && !evaluation.held_by.is_empty())
             .then(|| crate::execution::gates::census::queued_summary(&evaluation.held_by));
         return Ok(held_filing_summary(
@@ -307,7 +316,7 @@ pub(crate) async fn patch_execution_gates(
                 )),
                 crate::execution::gates::sweep::ReleaseOutcome::HeldByCap(blocks) => {
                     if let Err(error) =
-                        crate::execution::gates::capacity::refresh_places(orch).await
+                        crate::execution::gates::capacity::refresh_places(orch, None).await
                     {
                         log::warn!("could not rewrite the queue's places in line: {error}");
                     }

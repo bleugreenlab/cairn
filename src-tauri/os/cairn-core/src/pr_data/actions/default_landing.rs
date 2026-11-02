@@ -559,6 +559,7 @@ pub(super) async fn land_on_default_with_approval(
     };
     let client = crate::approvals_client::ApprovalsClient::new(
         &*orch.services.http,
+        orch.approval_keys.clone(),
         orch.runtime_admission_api_config(),
         credential,
     );
@@ -963,6 +964,7 @@ pub async fn reconcile_approved_merges(orch: &Orchestrator) {
     };
     let client = crate::approvals_client::ApprovalsClient::new(
         &*orch.services.http,
+        orch.approval_keys.clone(),
         orch.runtime_admission_api_config(),
         credential,
     );

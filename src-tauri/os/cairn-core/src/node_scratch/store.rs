@@ -56,6 +56,16 @@ pub fn tree(repo: &ScratchRepo, commit: Option<&str>) -> Result<Tree, String> {
         .collect())
 }
 
+/// Write `bytes` into the store as a blob and return its id.
+pub fn write_blob(repo: &ScratchRepo, bytes: &[u8]) -> Result<String, String> {
+    let output = repo.run(["hash-object", "-w", "--stdin"], Some(bytes))?;
+    let oid = String::from_utf8_lossy(&output).trim().to_owned();
+    match cairn_codec::scratch_tree::valid_oid(&oid) {
+        true => Ok(oid),
+        false => Err(format!("git hash-object answered {oid:?}, not a blob id")),
+    }
+}
+
 /// Write `tree` as a scratch commit. Fails if any blob is absent.
 pub fn commit(repo: &ScratchRepo, tree: &Tree) -> Result<String, String> {
     let files: Vec<TreeFile> = tree
@@ -109,13 +119,7 @@ mod tests {
     use cairn_common::executor_protocol::{ScratchChange, ScratchPath};
 
     fn hash(repo: &ScratchRepo, bytes: &[u8]) -> String {
-        String::from_utf8(
-            repo.run(["hash-object", "-w", "--stdin"], Some(bytes))
-                .unwrap(),
-        )
-        .unwrap()
-        .trim()
-        .to_owned()
+        write_blob(repo, bytes).unwrap()
     }
 
     #[test]

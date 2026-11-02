@@ -228,6 +228,67 @@ async fn a_file_written_on_one_machine_is_read_on_another() {
     assert!(report.materialize.is_none(), "{report:?}");
 }
 
+/// A file the runner puts (a host door's output) lands in the head as a
+/// write-back would: a batch that ran meanwhile keeps its own writes beside
+/// it, and the next machine reads both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_the_runner_puts_is_read_on_a_machine_beside_a_concurrent_batchs_writes() {
+    let world = world(None).await;
+    let on_a = world.a.prepare(&world.grant().await).await;
+    std::fs::write(on_a.tree.join("notes.md"), "mine\n").unwrap();
+
+    let vectors = b"{\"vectors\":[[0.25,0.5]]}".to_vec();
+    super::put::put(
+        &world.orch,
+        &world.scratch_id,
+        vec![super::put::PutFile {
+            path: "embeddings/run.json".into(),
+            bytes: vectors.clone(),
+        }],
+        "models-embed",
+    )
+    .await
+    .unwrap();
+    let scratch = world.scratch().await;
+    assert_eq!(scratch.head_seq, 1);
+    assert_eq!(scratch.head_executor_id.as_deref(), Some("models-embed"));
+    assert_eq!(scratch.written_bytes, vectors.len() as u64);
+
+    let report = world.a.finish(on_a).await;
+    assert!(
+        matches!(applied(&report), ScratchWriteBackOutcome::Applied { conflicts, .. } if conflicts.is_empty()),
+        "{report:?}"
+    );
+    let on_b = world.b.prepare(&world.grant().await).await;
+    assert_eq!(
+        std::fs::read(on_b.tree.join("embeddings/run.json")).unwrap(),
+        vectors
+    );
+    assert_eq!(read(&on_b.tree, "notes.md").as_deref(), Some("mine\n"));
+    world.b.finish(on_b).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_past_the_ceiling_is_refused_by_name_and_moves_nothing() {
+    let world = world(Some("scratch:\n  ceilingMiB: 1\n")).await;
+    let refusal = super::put::put(
+        &world.orch,
+        &world.scratch_id,
+        vec![super::put::PutFile {
+            path: "embeddings/big.npy".into(),
+            bytes: vec![0u8; 2 * 1024 * 1024],
+        }],
+        "models-embed",
+    )
+    .await
+    .unwrap_err();
+    assert!(refusal.contains("cairn://p/nsc/1/1/builder"), "{refusal}");
+    assert!(refusal.contains("past its ceiling"), "{refusal}");
+    assert!(refusal.contains("`embeddings/big.npy`"), "{refusal}");
+    let scratch = world.scratch().await;
+    assert_eq!((scratch.head_commit, scratch.head_seq), (None, 0));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_writers_to_one_path_both_survive_and_the_conflict_is_named() {
     let world = world(None).await;

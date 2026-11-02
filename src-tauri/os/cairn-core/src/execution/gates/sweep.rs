@@ -47,6 +47,7 @@
 //! wakes the filer is not: dismissing a pending notification deletes the push,
 //! and must not re-arm the wake.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cairn_db::turso::params;
@@ -57,6 +58,7 @@ use cairn_workflow::gates::store::{
 use tokio::sync::mpsc;
 
 use super::authoring::gate_vocabulary;
+use super::capacity::{AdmissionSite, QueueSnapshot, Start};
 use super::vocabulary::{GateContext, GateOutcome, GateVocabulary};
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionGate;
@@ -212,14 +214,25 @@ pub(crate) async fn sweep_with(
                 &b.execution_id,
             ))
     });
+    // Evaluate, without the admission lock: resolve each execution's authored
+    // gates and record what they say. One whose authored gates all allow it
+    // is a candidate; whether the queue's caps let it start is the release
+    // phase's to decide.
+    let mut candidates = Vec::new();
     for (db, execution) in held {
         // One execution whose evidence cannot be read must not hold up the
         // rest of the burst behind it.
-        match evaluate_held(orch, &db, vocabulary, &execution, now).await {
-            Ok(evaluation) => {
-                report.foreclosed.extend(evaluation.foreclosed);
-                if evaluation.released {
-                    report.released.push(execution.execution_id);
+        match resolve_held(orch, &db, vocabulary, &execution, now).await {
+            Ok(resolved) => {
+                report.foreclosed.extend(resolved.evaluation.foreclosed);
+                if resolved.all_satisfied {
+                    candidates.push(Candidate {
+                        db,
+                        execution,
+                        gates_moved: resolved.gates_moved,
+                    });
+                } else if resolved.gates_moved {
+                    announce_gates_moved(orch, &db, &execution.execution_id).await;
                 }
             }
             Err(error) => log::error!(
@@ -228,10 +241,140 @@ pub(crate) async fn sweep_with(
             ),
         }
     }
-    if let Err(error) = super::capacity::refresh_places(orch).await {
+    let queue = release_candidates(orch, &candidates, now, &mut report).await;
+    if let Err(error) = super::capacity::refresh_places(orch, queue.as_ref()).await {
         log::warn!("gate sweep could not rewrite the queue's places in line: {error}");
     }
     Ok(report)
+}
+
+/// A held execution whose authored gates all allow it to start this pass.
+struct Candidate {
+    db: Arc<LocalDb>,
+    execution: HeldExecution,
+    /// Evaluating it recorded a new outcome or foreclosure.
+    gates_moved: bool,
+}
+
+/// The release phase of a pass: every candidate, oldest first, decided against
+/// ONE read of the queue under ONE acquisition of the admission lock. The read
+/// is kept current as candidates release and hold, so a held candidate stays
+/// ahead of the ones after it exactly as if each had been decided alone.
+///
+/// A candidate the caps hold on exactly the caps its rows already record
+/// costs no write: its facts are refreshed with the rest of the queue's after
+/// the pass. One that starts, newly holds, or whose caps changed is written
+/// through [`release_conn`], whose guarded update keeps a release exactly-once
+/// against every other releaser.
+///
+/// Returns the queue as the pass left it, for that refresh, or `None` when
+/// the pass decided nothing (no candidate, a busy lock, an unreadable queue).
+async fn release_candidates(
+    orch: &Orchestrator,
+    candidates: &[Candidate],
+    now: i64,
+    report: &mut SweepReport,
+) -> Option<QueueSnapshot> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let guard = match orch
+        .admission_lock
+        .acquire(
+            AdmissionSite::SweepPass,
+            format!("{} candidates", candidates.len()),
+        )
+        .await
+    {
+        Ok(guard) => guard,
+        Err(busy) => {
+            log::warn!(
+                "gate sweep left {} candidate(s) for the next pass: {busy}",
+                candidates.len()
+            );
+            return None;
+        }
+    };
+    let starts: Vec<Start<'_>> = candidates
+        .iter()
+        .map(|candidate| Start {
+            db: &candidate.db,
+            issue_id: candidate.execution.issue_id.as_deref(),
+            execution_id: Some(&candidate.execution.execution_id),
+        })
+        .collect();
+    let mut queue = match QueueSnapshot::load(orch, &starts).await {
+        Ok(queue) => queue,
+        Err(error) => {
+            log::error!("gate sweep could not read the execution queue: {error}");
+            return None;
+        }
+    };
+    let mut released = Vec::new();
+    let mut moved = HashSet::new();
+    for (index, (candidate, start)) in candidates.iter().zip(&starts).enumerate() {
+        let admission = queue.decide(start);
+        if queue.holds_as_stored(start, &admission) {
+            continue;
+        }
+        let execution_id = candidate.execution.execution_id.as_str();
+        let outcome = candidate
+            .db
+            .write(|conn| {
+                let execution_id = execution_id.to_string();
+                let admission = admission.clone();
+                Box::pin(async move {
+                    release_conn(
+                        conn,
+                        &execution_id,
+                        now,
+                        &ReleaseCause::Satisfied,
+                        &admission,
+                    )
+                    .await
+                })
+            })
+            .await;
+        match outcome {
+            Ok(ConnRelease::Released(tail)) => {
+                queue.record_release(start);
+                released.push((index, tail));
+            }
+            Ok(ConnRelease::HeldByCap {
+                blocks,
+                moved: changed,
+            }) => {
+                queue.record_hold(start, &blocks, now);
+                if changed {
+                    moved.insert(index);
+                }
+            }
+            Ok(ConnRelease::NotHeld) => {}
+            Err(error) => {
+                log::error!("gate sweep could not release held execution {execution_id}: {error}")
+            }
+        }
+    }
+    drop(guard);
+
+    let mut announced = HashSet::new();
+    for (index, tail) in released {
+        let candidate = &candidates[index];
+        let execution_id = &candidate.execution.execution_id;
+        log::info!(
+            "released held execution {execution_id} ({:?})",
+            ReleaseCause::Satisfied
+        );
+        announce_release(orch, &candidate.db, execution_id, tail).await;
+        report.released.push(execution_id.clone());
+        announced.insert(index);
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !announced.contains(&index) && (candidate.gates_moved || moved.contains(&index)) {
+            announce_gates_moved(orch, &candidate.db, &candidate.execution.execution_id).await;
+        }
+    }
+    Some(queue)
 }
 
 /// What evaluating one held execution found.
@@ -283,6 +426,16 @@ pub(crate) async fn evaluate_execution_at(
     }
 }
 
+async fn gates_of(db: &LocalDb, execution_id: &str) -> Result<Vec<ExecutionGate>, String> {
+    let execution_id = execution_id.to_string();
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        Box::pin(async move { list_gates_conn(conn, &execution_id).await })
+    })
+    .await
+    .map_err(|error| format!("failed to list gates: {error}"))
+}
+
 async fn evaluate_held(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
@@ -290,15 +443,19 @@ async fn evaluate_held(
     execution: &HeldExecution,
     now: i64,
 ) -> Result<Evaluation, String> {
-    let execution_id = execution.execution_id.clone();
-    let gates = db
-        .read(|conn| {
-            let execution_id = execution_id.clone();
-            Box::pin(async move { list_gates_conn(conn, &execution_id).await })
-        })
-        .await
-        .map_err(|error| format!("failed to list gates: {error}"))?;
+    let gates = gates_of(db, &execution.execution_id).await?;
     evaluate_gates(orch, db, vocabulary, execution, &gates, now).await
+}
+
+async fn resolve_held(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    vocabulary: &GateVocabulary,
+    execution: &HeldExecution,
+    now: i64,
+) -> Result<Resolved, String> {
+    let gates = gates_of(db, &execution.execution_id).await?;
+    resolve_gates(orch, db, vocabulary, execution, &gates, now).await
 }
 
 /// Resolve `gates` — the list as this evaluation READ it, which a concurrent
@@ -313,13 +470,69 @@ async fn evaluate_gates(
     gates: &[ExecutionGate],
     now: i64,
 ) -> Result<Evaluation, String> {
+    let Resolved {
+        mut evaluation,
+        all_satisfied,
+        gates_moved,
+    } = resolve_gates(orch, db, vocabulary, execution, gates, now).await?;
+    if all_satisfied {
+        match release_in(
+            orch,
+            db,
+            &execution.execution_id,
+            ReleaseCause::Satisfied,
+            now,
+        )
+        .await?
+        {
+            ReleaseOutcome::Released => evaluation.released = true,
+            ReleaseOutcome::HeldByCap(blocks) => evaluation.held_by = blocks,
+            ReleaseOutcome::NotHeld => {}
+        }
+    }
+    // A release announces itself through `announce_release`.
+    if gates_moved && !evaluation.released {
+        announce_gates_moved(orch, db, &execution.execution_id).await;
+    }
+    Ok(evaluation)
+}
+
+/// What resolving one held execution's authored gates found, before anyone
+/// decides whether it starts.
+struct Resolved {
+    evaluation: Evaluation,
+    /// Every authored gate allows it: a candidate for release.
+    all_satisfied: bool,
+    /// A new outcome or foreclosure was recorded.
+    gates_moved: bool,
+}
+
+/// A newly recorded outcome or foreclosure changes what the gate census on
+/// this issue's row says, and nothing else would tell the issue list.
+async fn announce_gates_moved(orch: &Orchestrator, db: &LocalDb, execution_id: &str) {
+    let change =
+        crate::notify::execution_gates_db_change_for_execution(db, execution_id, "update").await;
+    let _ = orch.services.emitter.emit("db-change", change);
+}
+
+/// Resolve `gates` and record what each says, latching satisfactions and
+/// foreclosures. Releases nothing: that is [`evaluate_gates`]' step for one
+/// execution and [`release_candidates`]' for a sweep pass.
+async fn resolve_gates(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    vocabulary: &GateVocabulary,
+    execution: &HeldExecution,
+    gates: &[ExecutionGate],
+    now: i64,
+) -> Result<Resolved, String> {
     let ctx = GateContext::new(orch, now);
     let mut evaluation = Evaluation::default();
     let mut all_satisfied = true;
     let mut gates_moved = false;
     for gate in gates {
-        // Capacity gates are not resolved here: they are decided inside the
-        // release, under the admission lock, once the authored gates allow it.
+        // Capacity gates are not resolved here: they are decided at release,
+        // under the admission lock, once the authored gates allow it.
         if gate.is_satisfied() || super::capacity::capacity_fact(&gate.predicate_json).is_some() {
             continue;
         }
@@ -398,34 +611,11 @@ async fn evaluate_gates(
         }
     }
 
-    if all_satisfied {
-        match release_in(
-            orch,
-            db,
-            &execution.execution_id,
-            ReleaseCause::Satisfied,
-            now,
-        )
-        .await?
-        {
-            ReleaseOutcome::Released => evaluation.released = true,
-            ReleaseOutcome::HeldByCap(blocks) => evaluation.held_by = blocks,
-            ReleaseOutcome::NotHeld => {}
-        }
-    }
-    // A release announces itself through `announce_release`. Short of one, a
-    // newly recorded outcome or foreclosure still changes what the gate census
-    // on this issue's row says, and nothing else would tell the issue list.
-    if gates_moved && !evaluation.released {
-        let change = crate::notify::execution_gates_db_change_for_execution(
-            db,
-            &execution.execution_id,
-            "update",
-        )
-        .await;
-        let _ = orch.services.emitter.emit("db-change", change);
-    }
-    Ok(evaluation)
+    Ok(Resolved {
+        evaluation,
+        all_satisfied,
+        gates_moved,
+    })
 }
 
 /// For a satisfied `tenet_verdict` gate, the approved choice as a comment on
@@ -520,7 +710,11 @@ async fn release_in(
     cause: ReleaseCause,
     now: i64,
 ) -> Result<ReleaseOutcome, String> {
-    let guard = super::capacity::admission_lock(orch).await;
+    let guard = orch
+        .admission_lock
+        .acquire(AdmissionSite::Release, execution_id)
+        .await
+        .map_err(|busy| busy.to_string())?;
     let admission = admission_for(orch, db, execution_id).await?;
     let execution = execution_id.to_string();
     let outcome = db
@@ -543,13 +737,7 @@ async fn release_in(
         }
         ConnRelease::HeldByCap { blocks, moved } => {
             if moved {
-                let change = crate::notify::execution_gates_db_change_for_execution(
-                    db,
-                    execution_id,
-                    "update",
-                )
-                .await;
-                let _ = orch.services.emitter.emit("db-change", change);
+                announce_gates_moved(orch, db, execution_id).await;
             }
             Ok(ReleaseOutcome::HeldByCap(blocks))
         }
@@ -1695,6 +1883,7 @@ pub(crate) mod tests {
             own_plan,
             observed,
         )
+        .await
         .unwrap();
         assert_eq!(
             count(&env, "SELECT COUNT(*) FROM execution_gates WHERE last_outcome = 'satisfied' AND satisfied_at IS NOT NULL").await,

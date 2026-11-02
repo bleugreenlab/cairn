@@ -12,10 +12,7 @@
 //! key is stored as the relay key ciphertext ([`crypto::encrypt_private_key`])
 //! and handled as-is here.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    OnceLock,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use cairn_db::turso::params;
@@ -25,47 +22,53 @@ use tokio::sync::{Mutex, Notify};
 use crate::github::crypto;
 use crate::storage::{LocalDb, RowExt};
 
-static RELAY_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static RELAY_REPAIR_NOTIFY: OnceLock<Notify> = OnceLock::new();
-static RELAY_REPAIR_GENERATION: AtomicU64 = AtomicU64::new(0);
-static CHANNEL_CHANGED: OnceLock<Notify> = OnceLock::new();
-
 /// Registration and key repair run under the relay operation lock, which
 /// minting and every sync wait on, so neither request may hang.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Serializes relay polling, channel registration, and key rotation for the
-/// lifetime of this process.
-pub fn relay_operation_lock() -> &'static Mutex<()> {
-    RELAY_OPERATION_LOCK.get_or_init(|| Mutex::new(()))
+/// How one install's relay work coordinates: the lock its polling,
+/// registration and key rotation share, and the signals its one sync loop and
+/// one doorbell wait on. The orchestrator holds the install's
+/// ([`crate::orchestrator::Orchestrator::relay`]); everything that touches the
+/// channel row is handed it.
+#[derive(Debug, Default)]
+pub struct RelaySignals {
+    operation: Mutex<()>,
+    repaired: Notify,
+    repair_generation: AtomicU64,
+    channel_changed: Notify,
 }
 
-pub fn relay_repair_generation() -> u64 {
-    RELAY_REPAIR_GENERATION.load(Ordering::Acquire)
-}
+impl RelaySignals {
+    /// Serializes relay polling, channel registration, and key rotation.
+    pub fn operation_lock(&self) -> &Mutex<()> {
+        &self.operation
+    }
 
-pub async fn relay_repair_notified() {
-    RELAY_REPAIR_NOTIFY
-        .get_or_init(Notify::new)
-        .notified()
-        .await;
-}
+    pub fn repair_generation(&self) -> u64 {
+        self.repair_generation.load(Ordering::Acquire)
+    }
 
-pub fn notify_relay_repaired() {
-    RELAY_REPAIR_GENERATION.fetch_add(1, Ordering::AcqRel);
-    // There is one relay poller. `notify_one` retains a permit when repair lands
-    // between its generation check and registration of the next waiter.
-    RELAY_REPAIR_NOTIFY.get_or_init(Notify::new).notify_one();
-}
+    pub async fn repair_notified(&self) {
+        self.repaired.notified().await;
+    }
 
-/// Resolves when the channel's identity (its id or secret) may have changed:
-/// registered, repaired, or deleted. The doorbell is the one waiter.
-pub async fn channel_changed() {
-    CHANNEL_CHANGED.get_or_init(Notify::new).notified().await;
-}
+    pub fn notify_repaired(&self) {
+        self.repair_generation.fetch_add(1, Ordering::AcqRel);
+        // There is one relay poller. `notify_one` retains a permit when repair
+        // lands between its generation check and registration of the next waiter.
+        self.repaired.notify_one();
+    }
 
-pub fn notify_channel_changed() {
-    CHANNEL_CHANGED.get_or_init(Notify::new).notify_one();
+    /// Resolves when the channel's identity (its id or secret) may have
+    /// changed: registered, repaired, or deleted. The doorbell is the one waiter.
+    pub async fn channel_changed(&self) {
+        self.channel_changed.notified().await;
+    }
+
+    pub fn notify_channel_changed(&self) {
+        self.channel_changed.notify_one();
+    }
 }
 
 /// The install's relay channel row. Every field is `None` (and the count zero)
@@ -295,11 +298,11 @@ pub async fn clear_rejection(db: &LocalDb) -> Result<(), String> {
 
 /// Forget the channel. Its endpoints on the api are not touched; callers
 /// revoke what should stop first.
-pub async fn delete_relay_channel(db: &LocalDb) -> Result<(), String> {
+pub async fn delete_relay_channel(db: &LocalDb, signals: &RelaySignals) -> Result<(), String> {
     db.execute("DELETE FROM relay_channel WHERE id = 'default'", ())
         .await
         .map_err(|error| error.to_string())?;
-    notify_channel_changed();
+    signals.notify_channel_changed();
     Ok(())
 }
 
@@ -332,20 +335,24 @@ pub fn relay_channel_status(channel: &RelayChannel) -> crate::models::EventDeliv
 /// but a broken keypair is repaired in place, keeping the channel: a new
 /// channel would orphan every endpoint minted on the old one. Only an install
 /// with no usable channel registers.
-pub async fn ensure(db: &LocalDb, relay_url: &str) -> Result<RelayChannel, String> {
+pub async fn ensure(
+    db: &LocalDb,
+    signals: &RelaySignals,
+    relay_url: &str,
+) -> Result<RelayChannel, String> {
     // The common case reads and returns: the lock is the sync loop's for a
     // whole sync, and an intact channel needs nothing from it.
     let channel = get_relay_channel(db).await?;
     if channel.credentials().is_some() && channel.intact_private_key().is_some() {
         return Ok(channel);
     }
-    let _relay_operation = relay_operation_lock().lock().await;
+    let _relay_operation = signals.operation_lock().lock().await;
     let channel = get_relay_channel(db).await?;
     if channel.credentials().is_some() {
         if channel.intact_private_key().is_some() {
             return Ok(channel);
         }
-        repair_locked(db, relay_url).await?;
+        repair_locked(db, signals, relay_url).await?;
         return get_relay_channel(db).await;
     }
     let registered = register(relay_url).await?;
@@ -362,7 +369,7 @@ pub async fn ensure(db: &LocalDb, relay_url: &str) -> Result<RelayChannel, Strin
         move |channel| *channel = fresh
     })
     .await?;
-    notify_channel_changed();
+    signals.notify_channel_changed();
     get_relay_channel(db).await
 }
 
@@ -426,12 +433,16 @@ struct RotationCursor {
 /// api accepted it. Only a rotation moves the cursor: the api answers with its
 /// newest event as `rotation_cursor` whether or not the key changed, and the
 /// events before it are sealed to the old key only when there was a new one.
-pub async fn repair(db: &LocalDb, relay_url: &str) -> Result<(), String> {
-    let _relay_operation = relay_operation_lock().lock().await;
-    repair_locked(db, relay_url).await
+pub async fn repair(db: &LocalDb, signals: &RelaySignals, relay_url: &str) -> Result<(), String> {
+    let _relay_operation = signals.operation_lock().lock().await;
+    repair_locked(db, signals, relay_url).await
 }
 
-async fn repair_locked(db: &LocalDb, relay_url: &str) -> Result<(), String> {
+async fn repair_locked(
+    db: &LocalDb,
+    signals: &RelaySignals,
+    relay_url: &str,
+) -> Result<(), String> {
     let mut channel = get_relay_channel(db).await?;
     let channel_id = channel
         .channel_id
@@ -521,7 +532,7 @@ async fn repair_locked(db: &LocalDb, relay_url: &str) -> Result<(), String> {
         channel.failing_event_at = None;
     })
     .await?;
-    notify_relay_repaired();
+    signals.notify_repaired();
     Ok(())
 }
 
@@ -532,10 +543,11 @@ mod tests {
 
     #[tokio::test]
     async fn repair_notification_is_retained_for_a_late_poller_waiter() {
-        notify_relay_repaired();
+        let signals = RelaySignals::default();
+        signals.notify_repaired();
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            relay_repair_notified(),
+            signals.repair_notified(),
         )
         .await
         .expect("repair notification should retain a permit");
@@ -560,7 +572,9 @@ mod tests {
         assert_eq!(channel.secret.as_deref(), Some("relay-shared-secret"));
         assert_eq!(channel.credentials(), Some(("ch-1", "relay-shared-secret")));
 
-        delete_relay_channel(&db).await.unwrap();
+        delete_relay_channel(&db, &RelaySignals::default())
+            .await
+            .unwrap();
         assert_eq!(
             get_relay_channel(&db).await.unwrap(),
             RelayChannel::default()
@@ -598,12 +612,13 @@ mod tests {
     async fn ensure_registers_once_and_then_returns_the_same_channel() {
         let db = migrated_test_db("relay-channel-ensure.db").await;
         let (url, seen) = relay().await;
-        let first = ensure(&db, &url).await.unwrap();
+        let signals = RelaySignals::default();
+        let first = ensure(&db, &signals, &url).await.unwrap();
         assert_eq!(first.channel_id.as_deref(), Some("ch-new"));
         assert_eq!(first.secret.as_deref(), Some("new-secret"));
         assert!(first.intact_private_key().is_some());
         assert!(first.key_rotated_at.is_some());
-        let second = ensure(&db, &url).await.unwrap();
+        let second = ensure(&db, &signals, &url).await.unwrap();
         assert_eq!(second, first);
         assert_eq!(
             *seen.lock().unwrap(),
@@ -623,7 +638,7 @@ mod tests {
         .await
         .unwrap();
         let (url, seen) = relay().await;
-        let channel = ensure(&db, &url).await.unwrap();
+        let channel = ensure(&db, &RelaySignals::default(), &url).await.unwrap();
         assert_eq!(channel.channel_id.as_deref(), Some("ch-old"));
         assert_eq!(channel.secret.as_deref(), Some("old-secret"));
         assert!(channel.intact_private_key().is_some());

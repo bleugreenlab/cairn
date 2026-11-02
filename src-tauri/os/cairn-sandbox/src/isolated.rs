@@ -173,9 +173,14 @@ impl IsolatedChild {
         // exactly as the worktree fence's hook already does.
         unsafe {
             command.pre_exec(move || {
-                apply_limits(limits)?;
+                // The rules first: building them opens descriptors, and until
+                // exec the child still holds every descriptor its parent had
+                // open, so under the lowered `RLIMIT_NOFILE` a busy parent
+                // leaves no slot for the ruleset (EMFILE). The limits bind the
+                // exec'd program either way.
                 #[cfg(target_os = "linux")]
                 rules.apply()?;
+                apply_limits(limits)?;
                 Ok(())
             });
         }
@@ -839,5 +844,32 @@ mod tests {
             vec![1, 1, 1, 1, 1, 1, 1],
             "[inet refused, unix refused, socketpair refused, canary unreadable, allow-list readable, fork refused, setsid refused]"
         );
+    }
+
+    /// Live: a parent holding more descriptors than the child's open-file limit
+    /// still spawns a confined child, as a runner with its pools and sockets
+    /// open does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parent_holding_many_descriptors_still_spawns_a_confined_child_live() {
+        if let Err(why) = IsolatedChild::availability() {
+            eprintln!("skipping: {why}");
+            cairn_common::skip_ledger::record_skip(
+                "a_parent_holding_many_descriptors_still_spawns_a_confined_child_live",
+                "isolated-child-unavailable",
+            );
+            return;
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let isolated = IsolatedChild::new(Path::new("/bin/true"), Vec::new(), scratch.path());
+        let held: Vec<std::fs::File> = (0..=isolated.limits.open_files + 44)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let mut command = std::process::Command::new("/bin/true");
+        isolated.install_pre_exec(&mut command);
+        let status = command
+            .status()
+            .unwrap_or_else(|error| panic!("holding {} descriptors: {error}", held.len()));
+        assert!(status.success());
     }
 }

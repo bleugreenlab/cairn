@@ -506,7 +506,7 @@ async fn speak(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::time::Duration;
 
     use cairn_common::uri::{parse_uri, CairnResource};
@@ -517,8 +517,9 @@ mod tests {
     use crate::models::UpdateSettings;
     use crate::orchestrator::Orchestrator;
 
-    /// A project `prj` with issue 7 and a live run `r` on a job in it.
-    async fn seed_run(orch: &Orchestrator) {
+    /// A project `prj` with issue 7 and a live run `r` on job `j` in it,
+    /// whose node is `cairn://p/prj/7/1/builder`.
+    pub(crate) async fn seed_run(orch: &Orchestrator) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",

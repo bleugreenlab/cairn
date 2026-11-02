@@ -529,7 +529,11 @@ pub(crate) async fn replace_gates_observed(
     // decides the execution queue's caps: decided under the admission lock,
     // held until the write commits.
     let (guard, admission) = if gates.is_empty() {
-        let guard = super::capacity::admission_lock(orch).await;
+        let guard = orch
+            .admission_lock
+            .acquire(super::capacity::AdmissionSite::GatePatch, execution_id)
+            .await
+            .map_err(|busy| busy.to_string())?;
         let admission = super::sweep::admission_for(orch, &db, execution_id).await?;
         (Some(guard), admission)
     } else {
@@ -646,7 +650,7 @@ pub(crate) async fn replace_gates_observed(
             ));
         }
         super::sweep::ConnRelease::HeldByCap { blocks, .. } => {
-            if let Err(error) = super::capacity::refresh_places(orch).await {
+            if let Err(error) = super::capacity::refresh_places(orch, None).await {
                 log::warn!("could not rewrite the queue's places in line: {error}");
             }
             let queued = super::census::queued_summary_for(&db, execution_id, &blocks).await;

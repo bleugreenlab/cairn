@@ -365,6 +365,7 @@ async fn run(
     };
     let client = ApprovalsClient::new(
         &http,
+        Default::default(),
         ApiConfig {
             base_url: "https://api.ceremony.test".into(),
         },
@@ -508,9 +509,12 @@ async fn the_advisory_has_exactly_three_keys_and_unsafe_text_is_null() {
 
 // ─── Stale before the claim ───
 
+/// A named change to one bound field of the observed merge.
+type ObservationEdit = (&'static str, fn(&mut Observation));
+
 #[tokio::test]
 async fn every_bound_field_that_changes_after_approval_is_stale_and_unclaimed() {
-    let edits: Vec<(&str, fn(&mut Observation))> = vec![
+    let edits: Vec<ObservationEdit> = vec![
         ("repository rename", |o| {
             o.repository_name = "bleugreen/cairn-renamed".into()
         }),
@@ -706,7 +710,7 @@ fn gate_checks_require_every_gate_lane_passed_on_the_tip() {
         ),
     ] {
         assert!(
-            gate_checks(Some(&[blocking.clone()]), &tip)
+            gate_checks(Some(std::slice::from_ref(&blocking)), &tip)
                 .blocking
                 .is_some(),
             "{blocking:?}"

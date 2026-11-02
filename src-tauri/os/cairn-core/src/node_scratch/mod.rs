@@ -13,6 +13,8 @@
 //! - [`merge`] folds a write-back into the head path by path.
 //! - [`plane`] serves the object channel's `scratch/*` routes every machine
 //!   syncs through.
+//! - [`put`] lands files the runner itself makes (a host door's output) as a
+//!   write-back would.
 //! - [`lifecycle`] deletes a scratch everywhere when its node closes.
 
 pub mod holders;
@@ -21,6 +23,7 @@ pub mod merge;
 pub mod owner;
 pub mod placement;
 pub mod plane;
+pub mod put;
 pub mod report;
 pub mod store;
 
