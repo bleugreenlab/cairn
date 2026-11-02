@@ -151,13 +151,18 @@ pub(crate) async fn render_overview(
                     .get::<i64>(0)?;
                 rendered.push(format!("{table}({}) — {count} rows", columns.join(", ")));
 
-                let mut index_rows = conn
-                    .query(&format!("PRAGMA index_list({quoted})"), ())
-                    .await?;
-                while let Some(row) = index_rows.next().await? {
-                    if row.get::<i64>(2)? != 0 {
-                        rendered.push(format!("  unique index {}", row.get::<String>(1)?));
+                let indexes = table_indexes(conn, table).await?;
+                if all_columns {
+                    for (name, sql) in indexes {
+                        rendered.push(format!("  {}", render_index(conn, &name, sql).await?));
                     }
+                } else if !indexes.is_empty() {
+                    let noun = if indexes.len() == 1 {
+                        "index"
+                    } else {
+                        "indexes"
+                    };
+                    rendered.push(format!("  {} {noun} → ?table={table}", indexes.len()));
                 }
             }
             if let Some(table) = &params.table {
@@ -181,6 +186,70 @@ pub(crate) async fn render_overview(
         })
     })
     .await
+}
+
+/// Every index on `table`, from the catalog itself, so no kind of index
+/// (non-unique, partial, expression) can be filtered out. Constraint
+/// autoindexes have no SQL text.
+async fn table_indexes(
+    conn: &cairn_db::turso::Connection,
+    table: &str,
+) -> DbResult<Vec<(String, Option<String>)>> {
+    let mut rows = conn
+        .query(
+            "SELECT name, sql FROM sqlite_schema \
+             WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+            cairn_db::turso::params![table],
+        )
+        .await?;
+    let mut indexes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        indexes.push((row.get::<String>(0)?, row.get::<Option<String>>(1)?));
+    }
+    Ok(indexes)
+}
+
+/// One index as `[unique] [partial] index NAME (TERMS) [WHERE PREDICATE]`.
+async fn render_index(
+    conn: &cairn_db::turso::Connection,
+    name: &str,
+    sql: Option<String>,
+) -> DbResult<String> {
+    let Some(sql) = sql else {
+        // An autoindex backs a PRIMARY KEY or UNIQUE constraint: unique, plain
+        // columns, never partial.
+        let mut rows = conn
+            .query(
+                &format!("PRAGMA index_info({})", quote_identifier(name)),
+                (),
+            )
+            .await?;
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await? {
+            columns.push(row.get::<String>(2)?);
+        }
+        return Ok(format!("unique index {name} ({})", columns.join(", ")));
+    };
+    Ok(match super::sql_policy::parse_create_index(&sql) {
+        Some(definition) => {
+            let mut line = String::new();
+            if definition.unique {
+                line.push_str("unique ");
+            }
+            if definition.predicate.is_some() {
+                line.push_str("partial ");
+            }
+            line.push_str(&format!("index {name} ({})", definition.terms.join(", ")));
+            if let Some(predicate) = definition.predicate {
+                line.push_str(&format!(" WHERE {predicate}"));
+            }
+            line
+        }
+        None => format!(
+            "index {name}: {}",
+            super::sql_policy::collapse_whitespace(&sql)
+        ),
+    })
 }
 
 /// Quote an SQL identifier, doubling embedded quotes. The one quoting rule for
@@ -338,6 +407,163 @@ mod tests {
         assert!(detail.body.contains("c19 TEXT"));
         assert!(!detail.body.contains("more →"));
         assert!(detail.body.contains("id INTEGER pk"));
+    }
+
+    fn detail(table: &str) -> OverviewParams {
+        OverviewParams {
+            table: Some(table.to_string()),
+            offset: 0,
+            limit: 1,
+        }
+    }
+
+    /// The index lines of a `?table=` detail, by index name.
+    fn listed_indexes(body: &str) -> Vec<(String, String)> {
+        let mut indexes: Vec<(String, String)> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .map(|line| {
+                let mut words = line.split_whitespace();
+                words.by_ref().find(|word| *word == "index").unwrap();
+                let name = words.next().unwrap().trim_end_matches(':').to_string();
+                (name, line.to_string())
+            })
+            .collect();
+        indexes.sort();
+        indexes
+    }
+
+    async fn catalog_indexes(db: &LocalDb, table: &str) -> Vec<(String, Option<String>)> {
+        let table = table.to_string();
+        db.read(move |conn| Box::pin(async move { super::table_indexes(conn, &table).await }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn table_detail_lists_exactly_the_catalog_indexes_of_a_migrated_database() {
+        let db = crate::storage::migrated_test_db("sql-schema-indexes.db").await;
+        for table in ["turns", "agent_waits"] {
+            let body = render_overview(&db, &detail(table)).await.unwrap().body;
+            let listed = listed_indexes(&body);
+            let catalog = catalog_indexes(&db, table).await;
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                catalog
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+                "{table} detail:\n{body}"
+            );
+            for ((_, line), (_, sql)) in listed.iter().zip(&catalog) {
+                let partial = sql
+                    .as_deref()
+                    .and_then(super::super::sql_policy::parse_create_index)
+                    .and_then(|definition| definition.predicate);
+                match partial {
+                    Some(predicate) => {
+                        assert!(line.contains("partial index "), "{line}");
+                        assert!(line.ends_with(&format!(" WHERE {predicate}")), "{line}");
+                    }
+                    None => assert!(
+                        !line.contains("partial") && !line.contains(" WHERE "),
+                        "{line}"
+                    ),
+                }
+            }
+        }
+
+        let turns = render_overview(&db, &detail("turns")).await.unwrap().body;
+        assert!(
+            turns.contains("\n  index idx_turns_job_id (job_id)"),
+            "{turns}"
+        );
+        let waits = render_overview(&db, &detail("agent_waits"))
+            .await
+            .unwrap()
+            .body;
+        for expected in [
+            "\n  partial index idx_agent_waits_pending_deadline (deadline_ms) WHERE state = 'pending' AND deadline_ms IS NOT NULL",
+            "\n  partial index idx_agent_waits_pending_terminal (state) WHERE state = 'pending' AND deadline_ms IS NULL",
+            "\n  unique partial index idx_agent_waits_one_pending_call (job_id, tool_use_id) WHERE state IN ('pending', 'resolving')",
+        ] {
+            assert!(waits.contains(expected), "missing {expected:?} in:\n{waits}");
+        }
+    }
+
+    #[tokio::test]
+    async fn table_detail_marks_every_kind_of_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("indexes.db")).await.unwrap();
+        db.execute_batch(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, sku TEXT UNIQUE, name TEXT, owner TEXT, state TEXT);
+             CREATE INDEX items_owner ON items(owner);
+             CREATE UNIQUE INDEX items_name ON items(name);
+             CREATE INDEX items_open ON items(owner, state)
+               WHERE state <> 'closed';
+             CREATE INDEX items_lower_name ON items(lower(name));",
+        )
+        .await
+        .unwrap();
+
+        let body = render_overview(&db, &detail("items")).await.unwrap().body;
+        let catalog = catalog_indexes(&db, "items").await;
+        let autoindex = catalog
+            .iter()
+            .find(|(_, sql)| sql.is_none())
+            .map(|(name, _)| name.clone())
+            .expect("the UNIQUE column constraint has an autoindex");
+        let lines: std::collections::BTreeMap<String, String> =
+            listed_indexes(&body).into_iter().collect();
+        let mut expected_names = vec![
+            "items_lower_name".to_string(),
+            "items_name".to_string(),
+            "items_open".to_string(),
+            "items_owner".to_string(),
+            autoindex.clone(),
+        ];
+        expected_names.sort();
+        assert_eq!(
+            lines.keys().cloned().collect::<Vec<_>>(),
+            expected_names,
+            "{body}"
+        );
+        assert_eq!(lines["items_owner"], "index items_owner (owner)");
+        assert_eq!(lines["items_name"], "unique index items_name (name)");
+        assert_eq!(lines[&autoindex], format!("unique index {autoindex} (sku)"));
+        // Turso re-serialises catalog SQL (`lower (name)`, `!=` for `<>`), so
+        // expression and predicate text is checked by its meaningful parts.
+        let expression = &lines["items_lower_name"];
+        assert!(
+            expression.starts_with("index items_lower_name (lower")
+                && expression.ends_with("(name))"),
+            "{expression}"
+        );
+        let partial = &lines["items_open"];
+        assert!(
+            partial.starts_with("partial index items_open (owner, state) WHERE state ")
+                && partial.ends_with(" 'closed'"),
+            "{partial}"
+        );
+
+        let listing = render_overview(
+            &db,
+            &OverviewParams {
+                table: None,
+                offset: 0,
+                limit: OVERVIEW_DEFAULT_TABLES,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            listing.body.ends_with("\n  5 indexes → ?table=items"),
+            "{}",
+            listing.body
+        );
     }
 
     #[tokio::test]

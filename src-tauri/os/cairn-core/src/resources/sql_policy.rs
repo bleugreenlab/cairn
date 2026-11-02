@@ -239,6 +239,136 @@ pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     statements
 }
 
+/// The parts of a `CREATE [UNIQUE] INDEX` statement, as SQLite's catalog keeps
+/// its text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexDefinition {
+    pub unique: bool,
+    /// Each indexed column or expression as written, with any `COLLATE` or
+    /// `ASC`/`DESC` suffix.
+    pub terms: Vec<String>,
+    /// A partial index's `WHERE` predicate. Whether the planner can use the
+    /// index depends on it, so it is never dropped.
+    pub predicate: Option<String>,
+}
+
+/// Parse a catalog `CREATE INDEX` statement. `None` means the text does not
+/// have the expected shape; callers then show the statement itself.
+pub(crate) fn parse_create_index(sql: &str) -> Option<IndexDefinition> {
+    let tokens = sql_tokens(sql);
+    if tokens.first().map(String::as_str) != Some("CREATE") {
+        return None;
+    }
+    let unique = match tokens.get(1).map(String::as_str) {
+        Some("UNIQUE") => true,
+        Some("INDEX") => false,
+        _ => return None,
+    };
+
+    // The first parenthesis opens the term list: everything before it is
+    // keywords and (possibly quoted) names.
+    let mut chars = sql.char_indices().peekable();
+    let mut depth = 0usize;
+    let mut open = None;
+    let mut separators = Vec::new();
+    let close = loop {
+        let (idx, ch) = chars.next()?;
+        match ch {
+            '\'' | '"' | '`' => skip_quoted(ch, &mut chars),
+            '[' => skip_bracket_identifier(&mut chars),
+            '-' if chars.peek().is_some_and(|(_, next)| *next == '-') => {
+                chars.next();
+                skip_line_comment(&mut chars);
+            }
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '*') => {
+                chars.next();
+                skip_block_comment(&mut chars);
+            }
+            '(' => {
+                open.get_or_insert(idx);
+                depth += 1;
+            }
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    break idx;
+                }
+            }
+            ',' if depth == 1 => separators.push(idx),
+            _ => {}
+        }
+    };
+    let open = open?;
+
+    let mut terms = Vec::with_capacity(separators.len() + 1);
+    let mut start = open + 1;
+    for end in separators.into_iter().chain(std::iter::once(close)) {
+        let term = sql[start..end].trim();
+        if term.is_empty() {
+            return None;
+        }
+        terms.push(collapse_whitespace(term));
+        start = end + 1;
+    }
+
+    let rest = sql[close + 1..].trim().trim_end_matches(';').trim_end();
+    let predicate = if rest.is_empty() {
+        None
+    } else {
+        let keyword = rest.get(..5)?;
+        let after = &rest[5..];
+        if !keyword.eq_ignore_ascii_case("WHERE")
+            || after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        let predicate = after.trim();
+        if predicate.is_empty() {
+            return None;
+        }
+        Some(collapse_whitespace(predicate))
+    };
+    Some(IndexDefinition {
+        unique,
+        terms,
+        predicate,
+    })
+}
+
+/// Collapse each whitespace run outside quoted text to one space, so a
+/// multi-line definition reads on one line with its literals intact.
+pub(crate) fn collapse_whitespace(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut closing_quote = None;
+    let mut pending_space = false;
+    for ch in sql.trim().chars() {
+        if let Some(quote) = closing_quote {
+            out.push(ch);
+            if ch == quote {
+                closing_quote = None;
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if std::mem::take(&mut pending_space) {
+            out.push(' ');
+        }
+        closing_quote = match ch {
+            '\'' | '"' | '`' => Some(ch),
+            '[' => Some(']'),
+            _ => None,
+        };
+        out.push(ch);
+    }
+    out
+}
+
 fn push_statement(statements: &mut Vec<String>, candidate: &str) {
     let candidate = candidate.trim();
     if !candidate.is_empty() {
@@ -374,6 +504,45 @@ fn skip_block_comment(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_index_parsing_keeps_terms_uniqueness_and_predicate() {
+        assert_eq!(
+            parse_create_index("CREATE INDEX idx_t_a ON t(a)"),
+            Some(IndexDefinition {
+                unique: false,
+                terms: vec!["a".into()],
+                predicate: None,
+            })
+        );
+        assert_eq!(
+            parse_create_index(
+                "create unique index if not exists \"odd (name\" on [t](\n  a COLLATE NOCASE,\n  b DESC\n)\nwhere state IN ('pending',\n   'two  spaces')"
+            ),
+            Some(IndexDefinition {
+                unique: true,
+                terms: vec!["a COLLATE NOCASE".into(), "b DESC".into()],
+                predicate: Some("state IN ('pending', 'two  spaces')".into()),
+            })
+        );
+        assert_eq!(
+            parse_create_index("CREATE INDEX e ON t(lower(name), coalesce(a, ','))"),
+            Some(IndexDefinition {
+                unique: false,
+                terms: vec!["lower(name)".into(), "coalesce(a, ',')".into()],
+                predicate: None,
+            })
+        );
+        for unparseable in [
+            "CREATE TABLE t(a)",
+            "CREATE INDEX i ON t()",
+            "CREATE INDEX i ON t(a",
+            "CREATE INDEX i ON t(a) WHEREVER",
+            "CREATE INDEX i ON t(a) WHERE",
+        ] {
+            assert_eq!(parse_create_index(unparseable), None, "{unparseable}");
+        }
+    }
 
     #[test]
     fn identifier_scanner_keeps_quoted_names_but_not_values_or_comments() {
