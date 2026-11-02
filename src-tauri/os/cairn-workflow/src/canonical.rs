@@ -471,12 +471,17 @@ async fn freeze_execution_conn(
         job_ids.push(row.text(0)?);
     }
 
-    conn.execute(
-        "UPDATE jobs SET status = 'cancelled', completed_at = ?1, updated_at = ?1
-          WHERE execution_id = ?2 AND status NOT IN ('complete', 'failed', 'cancelled')",
-        params![now, execution_id],
-    )
-    .await?;
+    let cancelled = conn
+        .execute(
+            "UPDATE jobs SET status = 'cancelled', completed_at = ?1, updated_at = ?1
+              WHERE execution_id = ?2 AND status NOT IN ('complete', 'failed', 'cancelled')",
+            params![now, execution_id],
+        )
+        .await?;
+    // Ended jobs may free a fleet slot or a thread's open-children count.
+    if cancelled > 0 {
+        crate::gates::hint::evidence_changed();
+    }
     conn.execute(
         "UPDATE sessions SET status = 'closed', updated_at = ?1
           WHERE job_id IN (SELECT id FROM jobs WHERE execution_id = ?2)

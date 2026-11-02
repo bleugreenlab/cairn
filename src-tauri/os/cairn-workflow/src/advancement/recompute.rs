@@ -995,13 +995,19 @@ pub async fn write_job_status(
             .await?;
         }
     }
-    // A job leaving `pending`/`running` may free a fleet slot an execution is
-    // held for.
-    let working = |status: &JobStatus| matches!(status, JobStatus::Pending | JobStatus::Running);
-    if working(from) && !working(to) {
+    if frees_capacity(from, to) {
         crate::gates::hint::evidence_changed();
     }
     Ok(())
+}
+
+/// Whether a job moving `from` -> `to` may release an execution the queue
+/// holds. A job leaving `pending`/`running` may free a fleet slot; a job
+/// ending, from any status that had not ended (`blocked` and `idle`
+/// included), may drop its issue out of its thread's open-children count.
+pub(crate) fn frees_capacity(from: &JobStatus, to: &JobStatus) -> bool {
+    let working = |status: &JobStatus| matches!(status, JobStatus::Pending | JobStatus::Running);
+    (working(from) && !working(to)) || (!from.is_terminal() && to.is_terminal())
 }
 
 /// Soft invariant check. Derivation is truth, so a surprising edge is logged for
@@ -2084,6 +2090,23 @@ mod gate_tests {
             decision_config: None,
             context_config: None,
         }
+    }
+
+    #[test]
+    fn a_job_ending_from_any_live_status_frees_capacity() {
+        use JobStatus::*;
+        for from in [Pending, Running, Blocked, Idle] {
+            for to in [Complete, Failed, Cancelled] {
+                assert!(frees_capacity(&from, &to), "{from} -> {to}");
+            }
+        }
+        assert!(frees_capacity(&Running, &Blocked), "leaving the fleet");
+        assert!(!frees_capacity(&Blocked, &Idle), "still an open child");
+        assert!(!frees_capacity(&Failed, &Cancelled), "already ended");
+        assert!(
+            !frees_capacity(&Blocked, &Running),
+            "a resume frees nothing"
+        );
     }
 
     #[test]

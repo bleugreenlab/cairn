@@ -610,9 +610,8 @@ pub(super) async fn read_project_threads(db: &LocalDb, project_key: &str) -> Str
 /// node-family resource by [`delegate_thread_descendant`] before dispatch
 /// reaches here, so there is no sub-path interpretation left in this function.
 ///
-/// `default_open_children` is the workspace's limit on a thread's open started
-/// children (the execution queue's focus cap), which a thread's own
-/// `max_open_children` overrides.
+/// `default_open_children` is the workspace's limit on a thread's open
+/// children (the execution queue's focus cap, `maxOpenChildrenPerThread`).
 pub(super) async fn read_thread(
     db: &LocalDb,
     project_key: &str,
@@ -728,39 +727,23 @@ pub(super) async fn read_thread(
             )
             .await
             .unwrap_or_default();
-            let own_limit = crate::storage::query_opt_i64_conn(
-                conn,
-                "SELECT max_open_children FROM threads WHERE id = ?1",
-                params![id.as_str()],
-            )
-            .await
-            .ok()
-            .flatten();
 
             out.push_str("\n## Children\n\n");
-            // The execution queue's focus cap: started children not yet merged
-            // or closed. A held start on this thread waits behind them.
+            // The execution queue's focus cap: children with live work or an
+            // open PR. A held start on this thread waits behind them.
             let open: Vec<String> = listed
                 .iter()
                 .filter(|(.., open)| *open)
                 .map(|(_, number, ..)| number.to_string())
                 .collect();
-            let limit = own_limit.unwrap_or(default_open_children).max(1);
+            let limit = default_open_children.max(1);
             if !listed.is_empty() {
-                let at_cap = if open.len() as i64 >= limit {
-                    ": new starts hold until one merges or closes"
-                } else {
-                    ""
-                };
                 let numbers = if open.is_empty() {
                     String::new()
                 } else {
-                    format!(" ({})", open.join(", "))
+                    format!(": {}", open.join(", "))
                 };
-                out.push_str(&format!(
-                    "Open children: {} of {limit}{numbers}{at_cap}\n\n",
-                    open.len()
-                ));
+                out.push_str(&format!("Open {}/{limit}{numbers}\n\n", open.len()));
             }
             for (issue_id, number, title, _) in &listed {
                 let held_line = held
@@ -781,6 +764,56 @@ pub(super) async fn read_thread(
     })
     .await
     .unwrap_or_else(|error| error)
+}
+
+#[cfg(test)]
+mod children_tests {
+    use crate::execution::gates::sweep::tests::{env, file};
+    use serde_json::json;
+
+    /// A thread's children read the queue's own line, and the open paragraph
+    /// counts against the workspace limit.
+    #[tokio::test]
+    async fn the_children_section_reads_the_queued_line_and_the_open_count() {
+        let env = env("thread-children-queue.db").await;
+        let mut seed = String::from(
+            "INSERT INTO threads(id, project_id, name, created_at, updated_at)
+               VALUES('th', 'p', 'harness', 1, 1);",
+        );
+        for number in [100, 101, 102, 103, 105] {
+            seed.push_str(&format!(
+                "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                    parent_thread_id, created_at, updated_at)
+                   VALUES('ci{number}', 'p', {number}, 'Child {number}', 'active', 'active',
+                          'none', 'th', 1, 1);"
+            ));
+        }
+        for number in 100..104 {
+            seed.push_str(&format!(
+                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                   VALUES('ce{number}', 'recipe', 'ci{number}', 'p', 'running', 1, 1);
+                 INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
+                                  created_at, updated_at)
+                   VALUES('cj{number}', 'ce{number}', 'p', 'ci{number}', 'builder', 'running', 1, 1);"
+            ));
+        }
+        env.db.execute_script(&seed).await.unwrap();
+        file(&env, 105, json!([])).await.unwrap();
+        // The sweep numbers its place in line.
+        crate::execution::gates::sweep::sweep(&env.orch)
+            .await
+            .unwrap();
+
+        let page = super::read_thread(&env.db, "prj", "harness", &[], 4).await;
+        assert!(page.contains("Open 4/4: 100, 101, 102, 103\n"), "{page}");
+        assert!(
+            page.contains(
+                "- [105 — Child 105](cairn://p/prj/105) · Queued · 1st · harness 4/4 open\n"
+            ),
+            "{page}"
+        );
+        assert!(!page.contains("merges or closes"), "{page}");
+    }
 }
 
 #[cfg(test)]

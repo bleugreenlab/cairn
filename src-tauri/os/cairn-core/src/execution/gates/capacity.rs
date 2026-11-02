@@ -1,12 +1,17 @@
 //! The execution queue: two capacity caps that decide whether a new execution
-//! starts now or holds (cairn/5802; tenets 1288 and 1350).
+//! starts now or holds (cairn/5802, cairn/5830; tenets 1288 and 1355).
 //!
 //! ## One queue, not a second scheduler
 //!
 //! A cap hold is a GATE ROW of a second kind beside the authored `after:`
-//! gates: `{"fact":"fleet_slot"}` or `{"fact":"thread_focus"}`, with its live
-//! reason in `execution_gates.detail`. Being a gate row, a cap-held execution is
-//! held by the one definition every surface already reads
+//! gates: `{"fact":"fleet_slot"}` or `{"fact":"thread_focus"}`, with its facts
+//! (a [`CapacityHold`], place in line included) as JSON in
+//! `execution_gates.detail`. Those facts become words in one place, the gate
+//! census, so every surface reads the same `Queued · 3rd · 39/30 running`.
+//! The sweep numbers the places; a filing never does, so a just-filed hold
+//! reads `Queued · 39/30 running` until the next pass.
+//!
+//! Being a gate row, a cap-held execution is held by the one definition every surface already reads
 //! (`cairn_db::awaiting_release_sql!`): it has no jobs, so it takes no slot and
 //! no cell and placement never sees it, and it is released by the same guarded,
 //! exactly-once `release_conn` the sweep uses for every other gate.
@@ -24,8 +29,11 @@
 //!   running and not parked off the machine), not waiting on the operator.
 //!   Sub-agent tasks count as part of their execution; threads never count.
 //! - **Thread focus** protects a thread's attention and keeps PRs from going
-//!   stale. It counts the thread's direct child issues that have started and
-//!   are not yet merged or closed, a child whose PR waits for review included.
+//!   stale. It counts the thread's direct child issues, not merged or closed,
+//!   that have live work or an open PR (`cairn_db::open_thread_child_sql!`):
+//!   a child whose PR waits for review counts, and one whose executions all
+//!   ended with no PR does not. The limit is the workspace's
+//!   `maxOpenChildrenPerThread`; a thread has no limit of its own.
 //!
 //! Neither is a load bound. The caps gate only STARTS (filing and release);
 //! placement and per-machine admission never consult them, and nothing here
@@ -50,7 +58,7 @@ use cairn_workflow::gates::store::{
     list_blocking_capacity_gates_conn, set_gate_detail_conn, CAPACITY_GATE_SEQ_BASE,
 };
 
-use crate::models::TurnYieldReason;
+use crate::models::{CapacityHold, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -75,96 +83,67 @@ pub fn capacity_fact(predicate_json: &str) -> Option<&'static str> {
     CAPACITY_FACTS.iter().copied().find(|known| *known == fact)
 }
 
-/// One cap that holds an execution right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CapBlock {
-    Fleet {
-        in_progress: usize,
-        limit: usize,
-        /// Of `in_progress`, how many are still waiting for a machine, read
-        /// from the placement queue. Said so the operator deciding on Start
-        /// now knows the fleet may be stuck on placement, not on work.
-        waiting_for_machine: usize,
-    },
-    Thread {
-        thread_name: String,
-        limit: usize,
-        /// The open started children holding it, by issue number.
-        open_children: Vec<i64>,
-    },
+/// Which gate row a [`CapacityHold`] is, and how an operator start names it.
+pub trait CapacityHoldExt {
+    /// The capacity fact of its gate row.
+    fn fact(&self) -> &'static str;
+    /// How an operator start records skipping this cap.
+    fn skipped_label(&self) -> &'static str;
+    /// Its gate row's seq: the fleet's sorts before the thread's.
+    fn seq(&self) -> i64;
 }
 
-impl CapBlock {
-    pub fn fact(&self) -> &'static str {
+impl CapacityHoldExt for CapacityHold {
+    fn fact(&self) -> &'static str {
         match self {
             Self::Fleet { .. } => FLEET_SLOT_FACT,
             Self::Thread { .. } => THREAD_FOCUS_FACT,
         }
     }
 
-    /// How an operator start records skipping this cap.
-    pub fn skipped_label(&self) -> &'static str {
+    fn skipped_label(&self) -> &'static str {
         match self {
             Self::Fleet { .. } => "fleet",
             Self::Thread { .. } => "thread",
         }
     }
 
-    pub(crate) fn seq(&self) -> i64 {
+    fn seq(&self) -> i64 {
         match self {
             Self::Fleet { .. } => CAPACITY_GATE_SEQ_BASE,
             Self::Thread { .. } => CAPACITY_GATE_SEQ_BASE + 1,
         }
     }
-
-    /// The reason, without its place in line.
-    pub fn reason(&self) -> String {
-        match self {
-            Self::Fleet {
-                in_progress,
-                limit,
-                waiting_for_machine,
-            } => {
-                let placing = match waiting_for_machine {
-                    0 => String::new(),
-                    n => format!(", {n} of them waiting for a machine"),
-                };
-                format!("waiting for a fleet slot: {in_progress} of {limit} in progress{placing}")
-            }
-            Self::Thread {
-                thread_name,
-                open_children,
-                ..
-            } => {
-                let numbers: Vec<String> = open_children.iter().map(i64::to_string).collect();
-                let noun = if open_children.len() == 1 {
-                    "child"
-                } else {
-                    "children"
-                };
-                format!(
-                    "{thread_name} has {} open {noun}: {}",
-                    open_children.len(),
-                    numbers.join(", ")
-                )
-            }
-        }
-    }
 }
 
-/// Every cap holding one execution, as decided under the admission lock.
+/// A hold as `execution_gates.detail` stores it.
+pub fn encode_hold(hold: &CapacityHold) -> String {
+    // Infallible for this type: strings and integers only, no map keys.
+    serde_json::to_string(hold).unwrap_or_default()
+}
+
+/// The hold a capacity row of `fact` stores, or `None` when its `detail`
+/// carries no facts for that cap (cleared, or written before facts were).
+pub fn decode_hold(fact: &str, detail: &str) -> Option<CapacityHold> {
+    let hold: CapacityHold = serde_json::from_str(detail).ok()?;
+    (hold.fact() == fact).then_some(hold)
+}
+
+/// The sentence an agent-facing reply adds after a queued line. An agent needs
+/// to know that no write of its own skips the queue; the operator's surfaces
+/// never carry it.
+pub const ONLY_START_NOW_SKIPS_THE_QUEUE: &str = "Only the operator's Start now skips the queue.";
+
+/// Every cap holding one execution, as decided under the admission lock. Each
+/// hold's `place` is `None`: the queue numbers it once it is stored.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Admission {
-    pub blocks: Vec<CapBlock>,
+    pub blocks: Vec<CapacityHold>,
 }
 
 impl Admission {
     pub fn is_clear(&self) -> bool {
         self.blocks.is_empty()
-    }
-
-    pub fn reasons(&self) -> Vec<String> {
-        self.blocks.iter().map(CapBlock::reason).collect()
     }
 }
 
@@ -173,47 +152,16 @@ pub(crate) async fn admission_lock(orch: &Orchestrator) -> tokio::sync::OwnedMut
     orch.admission_lock.clone().lock_owned().await
 }
 
-/// `"1st"`, `"2nd"`, ...
-fn ordinal(n: usize) -> String {
-    let suffix = match (n % 10, n % 100) {
-        (_, 11..=13) => "th",
-        (1, _) => "st",
-        (2, _) => "nd",
-        (3, _) => "rd",
-        _ => "th",
-    };
-    format!("{n}{suffix}")
-}
-
-const PLACE_SUFFIX: &str = " in line)";
-
-/// A reason with its place in line.
-pub fn with_place(reason: &str, place: usize) -> String {
-    format!("{reason} ({}{PLACE_SUFFIX}", ordinal(place))
-}
-
-/// The place-in-line suffix of a stored reason, `" (2nd in line)"`, if any.
-pub(crate) fn place_suffix(detail: &str) -> Option<&str> {
-    if !detail.ends_with(PLACE_SUFFIX) {
-        return None;
-    }
-    detail.rfind(" (").map(|at| &detail[at..])
-}
-
-fn without_place(detail: &str) -> &str {
-    match place_suffix(detail) {
-        Some(suffix) => &detail[..detail.len() - suffix.len()],
-        None => detail,
-    }
-}
-
-/// A fresh reason carried onto a row that already has a place, so re-deciding
-/// a hold does not churn its row between sweeps.
-pub(crate) fn carry_place(existing: Option<&str>, reason: &str) -> String {
-    match existing.and_then(place_suffix) {
-        Some(suffix) => format!("{reason}{suffix}"),
-        None => reason.to_string(),
-    }
+/// A fresh decision stored over a row that already has a place, carrying that
+/// place so re-deciding a hold does not churn its row between sweeps.
+pub(crate) fn carry_place(fact: &str, prior: Option<&str>, hold: &CapacityHold) -> String {
+    let mut hold = hold.clone();
+    hold.set_place(
+        prior
+            .and_then(|detail| decode_hold(fact, detail))
+            .and_then(|prior| prior.place()),
+    );
+    encode_hold(&hold)
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +391,7 @@ struct ThreadFocus {
     open_children: Vec<(i64, String)>,
 }
 
-const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name, t.max_open_children
+const THREAD_OF_ISSUE_SQL: &str = "SELECT t.id, t.name
        FROM issues i JOIN threads t ON t.id = i.parent_thread_id
       WHERE i.id = ?1";
 
@@ -453,11 +401,7 @@ const OPEN_THREAD_CHILDREN_SQL: &str = concat!(
     " ORDER BY i.number"
 );
 
-async fn thread_focus(
-    db: &LocalDb,
-    issue_id: &str,
-    default_limit: i32,
-) -> DbResult<Option<ThreadFocus>> {
+async fn thread_focus(db: &LocalDb, issue_id: &str, limit: i32) -> DbResult<Option<ThreadFocus>> {
     let issue_id = issue_id.to_string();
     db.read(move |conn| {
         let issue_id = issue_id.clone();
@@ -470,7 +414,6 @@ async fn thread_focus(
             };
             let thread_id = row.text(0)?;
             let thread_name = row.text(1)?;
-            let limit = row.opt_i64(2)?.map(|limit| limit as i32);
             drop(rows);
             let mut rows = conn
                 .query(OPEN_THREAD_CHILDREN_SQL, params![thread_id.as_str()])
@@ -482,7 +425,7 @@ async fn thread_focus(
             Ok(Some(ThreadFocus {
                 thread_id,
                 thread_name,
-                limit: limit.unwrap_or(default_limit).max(1) as usize,
+                limit: limit.max(1) as usize,
                 open_children,
             }))
         })
@@ -602,10 +545,11 @@ pub async fn decide(
             .map_err(counting)?;
     }
     if fleet.in_progress >= limit || fleet_ahead > 0 {
-        blocks.push(CapBlock::Fleet {
-            in_progress: fleet.in_progress,
+        blocks.push(CapacityHold::Fleet {
+            running: fleet.in_progress,
             limit,
-            waiting_for_machine: fleet.waiting_for_machine,
+            unplaced: fleet.waiting_for_machine,
+            place: None,
         });
     }
 
@@ -622,14 +566,15 @@ pub async fn decide(
                 .await
                 .map_err(counting)?;
             if !already_open && (focus.open_children.len() >= focus.limit || ahead > 0) {
-                blocks.push(CapBlock::Thread {
-                    thread_name: focus.thread_name,
-                    limit: focus.limit,
-                    open_children: focus
+                blocks.push(CapacityHold::Thread {
+                    thread: focus.thread_name,
+                    open: focus
                         .open_children
                         .into_iter()
                         .map(|(number, _)| number)
                         .collect(),
+                    limit: focus.limit,
+                    place: None,
                 });
             }
         }
@@ -644,7 +589,9 @@ pub async fn decide(
 /// Rewrite every blocking capacity gate's place in line: the fleet's in one
 /// order across every database, each thread's within the thread. Oldest held
 /// first, by when the execution first held on that cap. A row is written only
-/// when its text changes. Returns the executions whose census moved.
+/// when its stored place changes; a row with no facts yet keeps its place in
+/// the count but is left for the next decision to write. Returns the
+/// executions whose census moved.
 pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> {
     struct Blocking {
         db: Arc<LocalDb>,
@@ -652,7 +599,7 @@ pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> 
         execution_id: String,
         fact: &'static str,
         group: Option<(usize, String)>,
-        detail: String,
+        detail: Option<String>,
         created_at: i64,
     }
     let mut blocking = Vec::new();
@@ -697,7 +644,7 @@ pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> 
                 execution_id: gate.execution_id,
                 fact,
                 group,
-                detail: gate.detail.unwrap_or_default(),
+                detail: gate.detail,
                 created_at: gate.created_at,
             });
         }
@@ -719,10 +666,18 @@ pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> 
         };
         let place = places.entry(key).or_insert(0);
         *place += 1;
-        let rendered = with_place(without_place(&gate.detail), *place);
-        if rendered == gate.detail {
+        let Some(mut hold) = gate
+            .detail
+            .as_deref()
+            .and_then(|detail| decode_hold(gate.fact, detail))
+        else {
+            continue;
+        };
+        if hold.place() == Some(*place) {
             continue;
         }
+        hold.set_place(Some(*place));
+        let rendered = encode_hold(&hold);
         let gate_id = gate.gate_id.clone();
         gate.db
             .write(|conn| {
@@ -748,7 +703,7 @@ pub async fn refresh_places(orch: &Orchestrator) -> Result<Vec<String>, String> 
 // The queue view
 // ---------------------------------------------------------------------------
 
-/// One held execution as the queue view lists it.
+/// One cap-held execution as the queue view lists it.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedExecution {
@@ -764,34 +719,25 @@ pub struct QueuedExecution {
     pub census: Option<crate::models::ExecutionGateCensus>,
 }
 
-/// One active thread's focus cap, as the queue view lists it.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThreadFocusView {
-    pub project_id: String,
-    pub project_key: String,
-    pub thread_id: String,
-    pub name: String,
-    /// The thread's own limit, or `None` when it inherits the workspace's.
-    pub max_open_children: Option<i64>,
-    pub open_children: usize,
-}
-
-/// The whole execution queue: the fleet's load, every held execution in
-/// release order, and each active thread's focus cap.
+/// The whole execution queue: the fleet's load and every execution a CAP
+/// holds, in release order. One waiting on its own `after:` gates is not in
+/// the queue, so it is not listed.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueView {
     pub in_progress: usize,
     pub limit: usize,
     pub waiting_for_machine: usize,
-    pub max_open_children_per_thread: usize,
+    /// How many executions the caps hold: `held.len()`.
+    pub queued: usize,
     pub held: Vec<QueuedExecution>,
-    pub threads: Vec<ThreadFocusView>,
     /// `capacity_unclassified_yield{reason}` counts, by reason.
     pub unclassified_yields: BTreeMap<String, u64>,
 }
 
+/// Held executions a cap holds right now: a blocking capacity gate (the same
+/// `no_evidence` row [`FLEET_AHEAD_SQL`] counts as ahead), and no unmet
+/// authored gate of their own.
 const QUEUE_ROWS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, e.seq, i.number, i.title, p.id, p.key, t.name, ",
     cairn_workflow::held_since_sql!(),
@@ -801,49 +747,20 @@ const QUEUE_ROWS_SQL: &str = concat!(
        LEFT JOIN projects p ON p.id = i.project_id
        LEFT JOIN threads t ON t.id = i.parent_thread_id
       WHERE ",
-    cairn_db::awaiting_release_sql!()
+    cairn_db::awaiting_release_sql!(),
+    " AND EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
+                   AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
+    cairn_db::capacity_gate_sql!(),
+    ") AND NOT ",
+    cairn_db::awaits_authored_gate_sql!()
 );
 
-const THREAD_FOCUS_ROWS_SQL: &str = concat!(
-    "SELECT t.project_id, p.key, t.id, t.name, t.max_open_children,
-            (SELECT COUNT(*) FROM issues i WHERE i.parent_thread_id = t.id AND ",
-    cairn_db::open_thread_child_sql!(),
-    ")
-       FROM threads t JOIN projects p ON p.id = t.project_id
-      WHERE t.status = 'active'
-      ORDER BY p.key, t.name"
-);
-
-/// Every held execution across every database, in release order, with the
-/// fleet's load and each active thread's focus cap.
+/// Every cap-held execution across every database, in release order, with
+/// the fleet's load.
 pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
     let settings = orch.get_settings();
     let fleet = fleet_load(orch).await?;
     let mut held = Vec::new();
-    let mut threads = Vec::new();
-    for db in orch.db.all_dbs().await {
-        let rows = db
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn.query(THREAD_FOCUS_ROWS_SQL, ()).await?;
-                    let mut out = Vec::new();
-                    while let Some(row) = rows.next().await? {
-                        out.push(ThreadFocusView {
-                            project_id: row.text(0)?,
-                            project_key: row.text(1)?,
-                            thread_id: row.text(2)?,
-                            name: row.text(3)?,
-                            max_open_children: row.opt_i64(4)?,
-                            open_children: row.i64(5)?.max(0) as usize,
-                        });
-                    }
-                    Ok(out)
-                })
-            })
-            .await
-            .map_err(|error| format!("failed to list threads' focus caps: {error}"))?;
-        threads.extend(rows);
-    }
     for db in orch.db.all_dbs().await {
         let rows = db
             .read(|conn| {
@@ -890,61 +807,10 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
         in_progress: fleet.in_progress,
         limit: settings.max_concurrent_executions.max(1) as usize,
         waiting_for_machine: fleet.waiting_for_machine,
-        max_open_children_per_thread: settings.max_open_children_per_thread.max(1) as usize,
+        queued: held.len(),
         held,
-        threads,
         unclassified_yields: unclassified_yield_counts(),
     })
-}
-
-/// The thread a limit was set on, resolved from the id or name the operator
-/// gave, so the caller can emit a change scoped to that row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThreadLimitSet {
-    pub thread_id: String,
-    pub name: String,
-}
-
-/// Set (or clear, with `None`) one thread's own limit on open started
-/// children, and tell the queue its focus cap may have moved.
-pub async fn set_thread_max_open_children(
-    db: &LocalDb,
-    project_id: &str,
-    thread: &str,
-    value: Option<i64>,
-) -> Result<ThreadLimitSet, String> {
-    if value.is_some_and(|value| value < 1) {
-        return Err("a thread's limit on open children is at least 1".to_string());
-    }
-    let (project_id, thread) = (project_id.to_string(), thread.to_string());
-    let updated = db
-        .write(move |conn| {
-            let (project_id, thread) = (project_id.clone(), thread.clone());
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "UPDATE threads SET max_open_children = ?3
-                          WHERE project_id = ?1 AND (id = ?2 OR name = ?2)
-                          RETURNING id, name",
-                        params![project_id.as_str(), thread.as_str(), value],
-                    )
-                    .await?;
-                match rows.next().await? {
-                    Some(row) => Ok(Some(ThreadLimitSet {
-                        thread_id: row.text(0)?,
-                        name: row.text(1)?,
-                    })),
-                    None => Ok(None),
-                }
-            })
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let Some(updated) = updated else {
-        return Err("no such thread in this project".to_string());
-    };
-    super::sweep::notify_gate_evidence_changed();
-    Ok(updated)
 }
 
 #[cfg(test)]
@@ -981,28 +847,6 @@ mod tests {
             ))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn setting_a_thread_limit_by_name_resolves_the_row_it_wrote() {
-        let env = env("cap-set-thread-limit.db").await;
-        add_thread(&env, "th", "harness").await;
-        let set = set_thread_max_open_children(&env.db, "p", "harness", Some(2))
-            .await
-            .unwrap();
-        assert_eq!(
-            set,
-            ThreadLimitSet {
-                thread_id: "th".to_string(),
-                name: "harness".to_string(),
-            }
-        );
-        let by_id = set_thread_max_open_children(&env.db, "p", "th", None)
-            .await
-            .unwrap();
-        assert_eq!(by_id, set);
-        let missing = set_thread_max_open_children(&env.db, "p", "nope", Some(2)).await;
-        assert_eq!(missing, Err("no such thread in this project".to_string()));
     }
 
     /// An issue with no execution: a backlog child when `thread` is given.
@@ -1059,6 +903,19 @@ mod tests {
             .unwrap();
     }
 
+    /// A PR on issue `number`, owned by its job `sj{number}`.
+    async fn merge_request(env: &Env, number: i32, status: &str) {
+        env.db
+            .execute_script(&format!(
+                "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                            target_branch, status, opened_at, updated_at)
+                   VALUES('smr{number}', 'sj{number}', 'p', 'si{number}', 'PR', 'b', 'main',
+                          '{status}', 1, 1);"
+            ))
+            .await
+            .unwrap();
+    }
+
     /// Park job `sj{number}` on a durable wait whose condition is `condition`.
     async fn park_on(env: &Env, number: i32, condition: Value) {
         turn(env, number, "yielded", Some("wait")).await;
@@ -1085,7 +942,10 @@ mod tests {
             .unwrap_or_default()
     }
 
-    async fn summary(env: &Env, execution_id: &str) -> String {
+    async fn census_of(
+        env: &Env,
+        execution_id: &str,
+    ) -> Option<crate::models::ExecutionGateCensus> {
         let id = execution_id.to_string();
         env.db
             .read(move |conn| {
@@ -1097,7 +957,20 @@ mod tests {
             .await
             .unwrap()
             .remove(execution_id)
+    }
+
+    async fn summary(env: &Env, execution_id: &str) -> String {
+        census_of(env, execution_id)
+            .await
             .map(|census| census.summary)
+            .unwrap_or_default()
+    }
+
+    /// A queued execution's hover detail.
+    async fn detail(env: &Env, execution_id: &str) -> String {
+        census_of(env, execution_id)
+            .await
+            .and_then(|census| census.detail)
             .unwrap_or_default()
     }
 
@@ -1184,16 +1057,21 @@ mod tests {
 
         let filed = file(&env, 1, json!([])).await.unwrap();
         assert!(
-            filed.contains("HELD: waiting for a fleet slot: 6 of 6 in progress"),
-            "the filing names the cap: {filed}"
+            filed.contains("(recipe 'memory-triage'): Queued · 6/6 running."),
+            "the filing names the cap, not yet its place: {filed}"
         );
-        assert!(filed.contains("only the operator's Start now"), "{filed}");
+        assert!(
+            filed.ends_with("Only the operator's Start now skips the queue."),
+            "{filed}"
+        );
         assert!(is_held(&env, 1).await, "held: no jobs, no slot");
         let (id, ..) = execution(&env, 1).await;
         assert_eq!(
             summary(&env, &id).await,
-            "held, waiting for a fleet slot: 6 of 6 in progress (1st in line)"
+            "Queued · 6/6 running",
+            "the filing path numbers no place"
         );
+        assert_eq!(detail(&env, &id).await, "Fleet");
         assert!(
             advanced(&mut env).is_empty(),
             "a held filing never advances"
@@ -1203,6 +1081,12 @@ mod tests {
             .unwrap()
             .released
             .is_empty());
+        assert_eq!(
+            summary(&env, &id).await,
+            "Queued · 1st · 6/6 running",
+            "the sweep numbers it"
+        );
+        assert_eq!(detail(&env, &id).await, "Fleet · 1st");
 
         env.db
             .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj100'", ())
@@ -1285,7 +1169,7 @@ mod tests {
     async fn waiting_on_the_operator_frees_the_fleet_slot_but_not_the_thread_count() {
         let env = env("cap-operator-waits.db").await;
         add_thread(&env, "th", "harness").await;
-        // A PR or artifact awaiting review leaves its job blocked.
+        // An artifact awaiting review leaves its job blocked.
         add_started(&env, 100, Some("th"), "blocked").await;
         // An unanswered question on the current turn.
         add_started(&env, 101, Some("th"), "running").await;
@@ -1381,13 +1265,15 @@ mod tests {
 
         let filed = file(&env, 105, json!([])).await.unwrap();
         assert!(
-            filed.contains("HELD: harness has 4 open children: 100, 101, 102, 103"),
-            "the thread reason names the four: {filed}"
+            filed.contains("Queued · harness 4/4 open"),
+            "the thread cap holds it: {filed}"
         );
         let (id, ..) = execution(&env, 105).await;
+        assert_eq!(summary(&env, &id).await, "Queued · harness 4/4 open");
         assert_eq!(
-            summary(&env, &id).await,
-            "held, harness has 4 open children: 100, 101, 102, 103 (1st in line)"
+            detail(&env, &id).await,
+            "harness · 100, 101, 102, 103",
+            "the hover names the four"
         );
 
         resolve_issue(&env, 100, "merged").await;
@@ -1431,9 +1317,12 @@ mod tests {
         let (held, ..) = execution(&env, 106).await;
         assert_eq!(
             summary(&env, &held).await,
-            "held, waiting for a fleet slot: 7 of 6 in progress (1st in line); harness has 5 open \
-             children: 100, 101, 102, 103, 105 (1st in line)",
-            "both reasons show"
+            "Queued · 7/6 running · harness 5/4 open",
+            "both caps show"
+        );
+        assert_eq!(
+            detail(&env, &held).await,
+            "Fleet\nharness · 100, 101, 102, 103, 105"
         );
 
         // Later sweeps and a lowered cap never re-hold it.
@@ -1539,9 +1428,12 @@ mod tests {
 
         add_issue(&env, 113, Some("tx")).await;
         let filed = file(&env, 113, json!([])).await.unwrap();
-        assert!(
-            filed.contains("execution has 4 open children: 103, 110, 111, 112"),
-            "the new thread counts it: {filed}"
+        assert!(filed.contains("Queued · execution 4/4 open"), "{filed}");
+        let (held, ..) = execution(&env, 113).await;
+        assert_eq!(
+            detail(&env, &held).await,
+            "execution · 103, 110, 111, 112",
+            "the new thread counts it"
         );
     }
 
@@ -1599,11 +1491,11 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            reply.contains("still held by the execution queue: waiting for a fleet slot"),
+            reply.contains("still Queued · 1st · 6/6 running."),
             "{reply}"
         );
         assert!(
-            reply.contains("only the operator's Start now skips a cap"),
+            reply.ends_with("Only the operator's Start now skips the queue."),
             "{reply}"
         );
         assert!(is_held(&env, 1).await);
@@ -1662,8 +1554,8 @@ mod tests {
         crate::execution::gates::sweep::sweep_at(&env.orch, now())
             .await
             .unwrap();
-        assert!(summary(&env, &older).await.ends_with("(1st in line)"));
-        assert!(summary(&env, &younger).await.ends_with("(2nd in line)"));
+        assert_eq!(summary(&env, &older).await, "Queued · 1st · 6/6 running");
+        assert_eq!(summary(&env, &younger).await, "Queued · 2nd · 6/6 running");
 
         env.db
             .execute("UPDATE jobs SET status = 'complete' WHERE id = 'sj100'", ())
@@ -1675,7 +1567,7 @@ mod tests {
             vec![older],
             "one slot, the oldest takes it"
         );
-        assert!(summary(&env, &younger).await.ends_with("(1st in line)"));
+        assert!(summary(&env, &younger).await.starts_with("Queued · 1st · "));
     }
 
     /// An execution that waited on its `after:` gates takes its place in the
@@ -1711,9 +1603,9 @@ mod tests {
             .unwrap()
             .released
             .is_empty());
-        assert!(summary(&env, &queued).await.ends_with("(1st in line)"));
+        assert!(summary(&env, &queued).await.starts_with("Queued · 1st · "));
         assert!(
-            summary(&env, &waited).await.ends_with("(2nd in line)"),
+            summary(&env, &waited).await.starts_with("Queued · 2nd · "),
             "{}",
             summary(&env, &waited).await
         );
@@ -1729,7 +1621,7 @@ mod tests {
             "the place in line is the release order"
         );
         assert_eq!(advanced(&mut env), vec![queued]);
-        assert!(summary(&env, &waited).await.ends_with("(1st in line)"));
+        assert!(summary(&env, &waited).await.starts_with("Queued · 1st · "));
     }
 
     /// A cap-held execution that an agent patches onto a new `after:` gate
@@ -1768,7 +1660,7 @@ mod tests {
         let waiting = summary(&env, &patched).await;
         assert!(
             waiting.contains("waiting on issue cairn://p/prj/2 merged")
-                && !waiting.contains("in line"),
+                && !waiting.contains("Queued"),
             "waits on its gate, with no place in line: {waiting}"
         );
 
@@ -1783,7 +1675,7 @@ mod tests {
             "nothing stalls the fleet: {filed}"
         );
         sweep_at(&env.orch, now()).await.unwrap();
-        assert!(!summary(&env, &patched).await.contains("in line"));
+        assert!(!summary(&env, &patched).await.contains("Queued"));
     }
 
     /// A slot that frees between sweeps goes to the oldest held execution,
@@ -1809,7 +1701,7 @@ mod tests {
         add_issue(&env, 1002, None).await;
         let filed = file(&env, 1002, json!([])).await.unwrap();
         assert!(
-            filed.contains("HELD: waiting for a fleet slot: 5 of 6 in progress"),
+            filed.contains("Queued · 5/6 running"),
             "a free slot is the oldest held execution's: {filed}"
         );
         let report = sweep_at(&env.orch, now()).await.unwrap();
@@ -1839,10 +1731,7 @@ mod tests {
         resolve_issue(&env, 100, "merged").await;
 
         let filed = file(&env, 106, json!([])).await.unwrap();
-        assert!(
-            filed.contains("HELD: harness has 3 open children: 101, 102, 103"),
-            "{filed}"
-        );
+        assert!(filed.contains("Queued · harness 3/4 open"), "{filed}");
         let report = sweep_at(&env.orch, now()).await.unwrap();
         assert_eq!(report.released, vec![older]);
         assert!(is_held(&env, 106).await);
@@ -1882,7 +1771,7 @@ mod tests {
         );
         assert_eq!(
             summary(&env, &thread_held).await,
-            "held, harness has 4 open children: 100, 101, 102, 103 (1st in line)"
+            "Queued · 1st · harness 4/4 open"
         );
     }
 
@@ -2009,6 +1898,183 @@ mod tests {
         assert!(filed.starts_with("Started execution"), "{filed}");
     }
 
+    /// A child whose executions all ended with no PR gave up its place, so
+    /// rerunning it opens a new child the cap may hold.
+    #[tokio::test]
+    async fn rerunning_a_child_that_stopped_counting_is_a_new_child() {
+        let env = env("cap-rerun-ended-child.db").await;
+        caps(&env, 50, 4);
+        add_thread(&env, "th", "harness").await;
+        for number in 100..104 {
+            add_started(&env, number, Some("th"), "running").await;
+        }
+        add_started(&env, 104, Some("th"), "failed").await;
+        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
+        let filed = file(&env, 104, json!([])).await.unwrap();
+        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
+        assert!(is_held(&env, 104).await);
+    }
+
+    #[tokio::test]
+    async fn a_child_failed_at_preparation_without_a_pr_does_not_count() {
+        let env = env("cap-preparation-failed.db").await;
+        caps(&env, 50, 4);
+        add_thread(&env, "th", "harness").await;
+        for number in 100..103 {
+            add_started(&env, number, Some("th"), "running").await;
+        }
+        // cairn/4741's shape, as `mark_job_start_failed` leaves it: a failed
+        // job whose run ended at preparation.
+        add_started(&env, 103, Some("th"), "failed").await;
+        env.db
+            .execute_script(
+                "INSERT INTO runs(id, project_id, job_id, issue_id, status, exit_reason,
+                                  created_at, updated_at)
+                   VALUES('sr103', 'p', 'sj103', 'si103', 'crashed', 'job_preparation_failed', 1, 1);",
+            )
+            .await
+            .unwrap();
+        add_issue(&env, 104, Some("th")).await;
+        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102]);
+        let filed = file(&env, 104, json!([])).await.unwrap();
+        assert!(filed.starts_with("Started execution"), "{filed}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_child_with_an_open_pr_counts() {
+        let env = env("cap-failed-with-pr.db").await;
+        caps(&env, 50, 4);
+        add_thread(&env, "th", "harness").await;
+        for number in 100..103 {
+            add_started(&env, number, Some("th"), "running").await;
+        }
+        add_started(&env, 103, Some("th"), "failed").await;
+        merge_request(&env, 103, "open").await;
+        add_issue(&env, 104, Some("th")).await;
+        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
+        let filed = file(&env, 104, json!([])).await.unwrap();
+        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
+
+        // Closing the PR ends it.
+        env.db
+            .execute(
+                "UPDATE merge_requests SET status = 'closed' WHERE id = 'smr103'",
+                (),
+            )
+            .await
+            .unwrap();
+        let (id, ..) = execution(&env, 104).await;
+        assert_eq!(sweep_at(&env.orch, now()).await.unwrap().released, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn a_pr_awaiting_review_counts() {
+        let env = env("cap-pr-awaiting-review.db").await;
+        caps(&env, 50, 4);
+        add_thread(&env, "th", "harness").await;
+        for number in 100..103 {
+            add_started(&env, number, Some("th"), "running").await;
+        }
+        add_started(&env, 103, Some("th"), "blocked").await;
+        merge_request(&env, 103, "open").await;
+        add_issue(&env, 104, Some("th")).await;
+        assert_eq!(open_children(&env, 104).await, vec![100, 101, 102, 103]);
+        let filed = file(&env, 104, json!([])).await.unwrap();
+        assert!(filed.contains("Queued · harness 4/4 open"), "{filed}");
+    }
+
+    /// A sibling that fails while blocked (on review, say) ends its live work;
+    /// the transition nudges the queue, and one sweep releases the held start.
+    #[tokio::test]
+    async fn a_held_thread_start_releases_when_a_siblings_execution_fails_and_ends() {
+        let mut env = env("cap-sibling-fails.db").await;
+        caps(&env, 50, 2);
+        add_thread(&env, "th", "harness").await;
+        add_started(&env, 100, Some("th"), "blocked").await;
+        add_started(&env, 101, Some("th"), "blocked").await;
+        add_issue(&env, 102, Some("th")).await;
+        file(&env, 102, json!([])).await.unwrap();
+        assert!(is_held(&env, 102).await);
+        let (id, ..) = execution(&env, 102).await;
+
+        let hints = cairn_workflow::gates::hint::sent_on_this_thread();
+        env.db
+            .write(|conn| {
+                Box::pin(async move {
+                    cairn_workflow::advancement::recompute::write_job_status(
+                        conn,
+                        "sj100",
+                        &crate::models::JobStatus::Blocked,
+                        &crate::models::JobStatus::Failed,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            cairn_workflow::gates::hint::sent_on_this_thread() > hints,
+            "ending the job nudges the queue"
+        );
+        assert_eq!(open_children(&env, 102).await, vec![101]);
+
+        let report = sweep_at(&env.orch, now()).await.unwrap();
+        assert_eq!(report.released, vec![id.clone()], "released once");
+        assert_eq!(advanced(&mut env), vec![id]);
+        assert!(sweep_at(&env.orch, now())
+            .await
+            .unwrap()
+            .released
+            .is_empty());
+    }
+
+    /// The queue page lists what a CAP holds, and nothing that waits on its own
+    /// `after:` gates or whose cap has cleared and only awaits the release.
+    #[tokio::test]
+    async fn the_queue_lists_only_what_a_cap_holds() {
+        let env = env("cap-queue-view.db").await;
+        full_fleet(&env).await;
+        file(&env, 1, json!([])).await.unwrap();
+        let (capped, ..) = execution(&env, 1).await;
+        file(
+            &env,
+            2,
+            json!([{"fact": "issue_resolution", "issue": "cairn://p/prj/5", "resolution": "merged"}]),
+        )
+        .await
+        .unwrap();
+        assert!(is_held(&env, 2).await, "held on its own gate");
+        file(&env, 3, json!([])).await.unwrap();
+        let (cleared, ..) = execution(&env, 3).await;
+        env.db
+            .execute(
+                "UPDATE execution_gates SET last_outcome = 'satisfied', detail = NULL
+                  WHERE execution_id = ?1",
+                (cleared.clone(),),
+            )
+            .await
+            .unwrap();
+
+        let view = queue_view(&env.orch).await.unwrap();
+        let listed: Vec<&str> = view
+            .held
+            .iter()
+            .map(|held| held.execution_id.as_str())
+            .collect();
+        assert_eq!(listed, vec![capped.as_str()]);
+        assert_eq!(view.queued, 1);
+        assert_eq!((view.in_progress, view.limit), (6, 6));
+        let census = view.held[0].census.as_ref().unwrap();
+        assert!(census.queued);
+        // Both filings share the test clock's instant, so which is numbered
+        // first is a tie broken by id; `oldest_held_first` covers the order.
+        assert!(
+            census.summary.starts_with("Queued · ") && census.summary.ends_with(" · 6/6 running"),
+            "{}",
+            census.summary
+        );
+    }
+
     #[tokio::test]
     async fn a_cap_held_execution_is_not_a_notification() {
         let env = env("cap-not-a-notification.db").await;
@@ -2025,7 +2091,7 @@ mod tests {
         .unwrap();
         let rendered = format!("{entries:?}");
         assert!(
-            !rendered.contains(&id) && !rendered.contains("fleet slot"),
+            !rendered.contains(&id) && !rendered.contains("Queued"),
             "a held execution starts on its own, so it waits on nobody: {rendered}"
         );
     }
@@ -2162,7 +2228,6 @@ mod tests {
                 THREAD_FOCUS_FACT,
                 "max_concurrent_executions",
                 "maxConcurrentExecutions",
-                "max_open_children",
                 "maxOpenChildrenPerThread",
                 "gates::capacity",
             ] {
@@ -2171,33 +2236,66 @@ mod tests {
         }
     }
 
+    /// A hold's stored form round-trips, and a re-decided hold keeps the place
+    /// its row already had.
     #[test]
-    fn reasons_and_places_read_as_the_operator_sees_them() {
-        let fleet = CapBlock::Fleet {
-            in_progress: 6,
+    fn a_stored_hold_keeps_its_place_across_decisions() {
+        let decided = CapacityHold::Fleet {
+            running: 6,
             limit: 6,
-            waiting_for_machine: 2,
+            unplaced: 2,
+            place: None,
+        };
+        let stored = encode_hold(&CapacityHold::Fleet {
+            running: 7,
+            limit: 6,
+            unplaced: 0,
+            place: Some(3),
+        });
+        assert_eq!(
+            stored,
+            r#"{"cap":"fleet","running":7,"limit":6,"unplaced":0,"place":3}"#
+        );
+        let carried = carry_place(FLEET_SLOT_FACT, Some(&stored), &decided);
+        assert_eq!(
+            decode_hold(FLEET_SLOT_FACT, &carried),
+            Some(CapacityHold::Fleet {
+                running: 6,
+                limit: 6,
+                unplaced: 2,
+                place: Some(3),
+            })
+        );
+        assert_eq!(
+            decode_hold(
+                FLEET_SLOT_FACT,
+                &carry_place(FLEET_SLOT_FACT, None, &decided)
+            ),
+            Some(decided.clone()),
+            "a first hold has no place yet"
+        );
+        assert_eq!(
+            decode_hold(THREAD_FOCUS_FACT, &stored),
+            None,
+            "facts for another cap are not this row's"
+        );
+        assert_eq!(
+            decode_hold(
+                FLEET_SLOT_FACT,
+                "waiting for a fleet slot: 6 of 6 in progress"
+            ),
+            None,
+            "old prose is unknown facts"
+        );
+        let thread = CapacityHold::Thread {
+            thread: "harness".to_string(),
+            open: vec![5783, 5790],
+            limit: 2,
+            place: Some(1),
         };
         assert_eq!(
-            with_place(&fleet.reason(), 2),
-            "waiting for a fleet slot: 6 of 6 in progress, 2 of them waiting for a machine (2nd in line)"
+            decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),
+            Some(thread)
         );
-        let thread = CapBlock::Thread {
-            thread_name: "harness".to_string(),
-            limit: 4,
-            open_children: vec![5783, 5790, 5791, 5795],
-        };
-        assert_eq!(
-            with_place(&thread.reason(), 1),
-            "harness has 4 open children: 5783, 5790, 5791, 5795 (1st in line)"
-        );
-        assert_eq!(ordinal(11), "11th");
-        assert_eq!(ordinal(23), "23rd");
-        let placed = with_place("reason", 3);
-        assert_eq!(
-            carry_place(Some(&placed), "new reason"),
-            "new reason (3rd in line)"
-        );
-        assert_eq!(without_place(&placed), "reason");
     }
 }

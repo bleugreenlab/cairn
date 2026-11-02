@@ -387,6 +387,9 @@ pub async fn delete(
                     params![id.as_str()],
                 )
                 .await?;
+                // Its children leave the thread's focus count, so a start
+                // held on it can no longer be held by it.
+                crate::execution::gates::sweep::notify_gate_evidence_changed();
                 conn.execute(
                     "DELETE FROM comments WHERE thread_id = ?1",
                     params![id.as_str()],

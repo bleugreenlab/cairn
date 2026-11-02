@@ -78,10 +78,10 @@ pub use job::{Job, JobStatus};
 
 // Execution types (recipe instances)
 pub use execution::{
-    ConditionEvaluation, ConditionOutcome, Execution, ExecutionDetail, ExecutionFilters,
-    ExecutionGate, ExecutionGateCensus, ExecutionLifecycle, ExecutionListItem, ExecutionListResult,
-    ExecutionStatus, GateCensusEntry, GateEvidenceState, HeldExecution, Initiator, ReleaseOverride,
-    TriggerType, TriggeredExecution,
+    CapacityHold, ConditionEvaluation, ConditionOutcome, Execution, ExecutionDetail,
+    ExecutionFilters, ExecutionGate, ExecutionGateCensus, ExecutionLifecycle, ExecutionListItem,
+    ExecutionListResult, ExecutionStatus, GateCensusEntry, GateEvidenceState, HeldExecution,
+    Initiator, ReleaseOverride, TriggerType, TriggeredExecution,
 };
 
 // Run types

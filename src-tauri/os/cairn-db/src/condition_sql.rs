@@ -165,13 +165,28 @@ macro_rules! fleet_working_job_sql {
     };
 }
 
-/// True when issue `i` is an OPEN STARTED child for the thread focus cap: not
-/// merged or closed, with an execution that has started (any execution that is
-/// not gated-and-unreleased). Open while its PR waits for review or merge, on
-/// purpose: that is the stale work the cap exists to hold new work behind. The
-/// caller adds `i.parent_thread_id = ?`, so grandchildren (whose parent is an
-/// issue) and sub-agent tasks (jobs, not issues) never count, and a reparented
-/// child moves between counts at once. Expects an `issues` row aliased `i`.
+/// True when job `j` has not ended: `pending`, `running`, `blocked` or `idle`.
+/// A job that waits on the operator (a question, a permission, a PR or plan
+/// awaiting review) is always one of these, so it is covered; `idle` is
+/// resumable, which is how a long-running coordinator child waits. Expects a
+/// `jobs` row aliased `j`.
+#[macro_export]
+macro_rules! nonterminal_job_sql {
+    () => {
+        "j.status IN ('pending', 'running', 'blocked', 'idle')"
+    };
+}
+
+/// True when issue `i` is an OPEN child for the thread focus cap: not merged
+/// or closed, and either it has live work (an execution that is live, started,
+/// and has a job that has not ended, see [`nonterminal_job_sql!`]) or an open
+/// PR. A PR awaiting review counts on purpose: that is the stale work the cap
+/// exists to hold new work behind. A child whose executions all ended (failed,
+/// cancelled, complete) with no open PR does not count, and a restart makes it
+/// count again. The caller adds `i.parent_thread_id = ?`, so backlog children
+/// (no execution), grandchildren (whose parent is an issue) and sub-agent tasks
+/// (jobs, not issues) never count, and a reparented child moves between counts
+/// at once. Expects an `issues` row aliased `i`.
 ///
 /// No device scope, deliberately the opposite of
 /// [`fleet_counted_execution_sql!`]: a thread's open work is open wherever it
@@ -180,9 +195,13 @@ macro_rules! fleet_working_job_sql {
 macro_rules! open_thread_child_sql {
     () => {
         concat!(
-            "i.merged_at IS NULL AND i.closed_at IS NULL AND EXISTS (SELECT 1 FROM executions e WHERE e.issue_id = i.id AND NOT (",
+            "i.merged_at IS NULL AND i.closed_at IS NULL AND (EXISTS (SELECT 1 FROM executions e JOIN jobs j ON j.execution_id = e.id WHERE e.issue_id = i.id AND ",
+            $crate::live_execution_sql!(),
+            " AND NOT (",
             $crate::gated_unreleased_sql!(),
-            "))"
+            ") AND ",
+            $crate::nonterminal_job_sql!(),
+            ") OR EXISTS (SELECT 1 FROM merge_requests open_pr WHERE open_pr.issue_id = i.id AND open_pr.status = 'open'))"
         )
     };
 }
@@ -195,4 +214,180 @@ macro_rules! still_blocked_condition_sql {
     () => {
         "ce.outcome = 'blocked' AND NOT EXISTS (SELECT 1 FROM condition_evaluations routed WHERE routed.execution_id = ce.execution_id AND routed.recipe_node_id = ce.recipe_node_id AND routed.outcome = 'routed')"
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::{LocalDb, RowExt};
+
+    /// A project, a thread `th`, and a parent issue 9 for grandchildren.
+    async fn world() -> LocalDb {
+        let db = crate::storage::migrated_test_db("open-thread-child.db").await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p', 'default', 'P', 'prj', '/tmp/p', 1, 1);
+             INSERT INTO threads(id, project_id, name, created_at, updated_at)
+               VALUES('th', 'p', 'harness', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                created_at, updated_at)
+               VALUES('i9', 'p', 9, 'Parent', 'active', 'active', 'none', 1, 1);",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// A direct child of `th` with no execution: a backlog child.
+    async fn child(db: &LocalDb, number: i32) {
+        db.execute_script(&format!(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                parent_thread_id, created_at, updated_at)
+               VALUES('i{number}', 'p', {number}, 'Child {number}', 'active', 'active', 'none',
+                      'th', 1, 1);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// A started execution on issue `number` whose one job has `status`.
+    async fn started(db: &LocalDb, number: i32, lifecycle: &str, status: &str) {
+        db.execute_script(&format!(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq,
+                                    lifecycle)
+               VALUES('e{number}', 'r', 'i{number}', 'p', 'running', 1, 1, '{lifecycle}');
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
+                              created_at, updated_at)
+               VALUES('j{number}', 'e{number}', 'p', 'i{number}', 'builder', '{status}', 1, 1);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn pr(db: &LocalDb, number: i32, status: &str) {
+        db.execute_script(&format!(
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                        target_branch, status, opened_at, updated_at)
+               VALUES('mr{number}', 'j{number}', 'p', 'i{number}', 'PR', 'b', 'main', '{status}',
+                      1, 1);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn counted(db: &LocalDb) -> Vec<i64> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        concat!(
+                            "SELECT i.number FROM issues i WHERE i.parent_thread_id = 'th' AND ",
+                            open_thread_child_sql!(),
+                            " ORDER BY i.number"
+                        ),
+                        (),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row.i64(0)?);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_child_counts_while_it_has_live_work_or_an_open_pr() {
+        let db = world().await;
+
+        // Failed at preparation with no PR (cairn/4741's shape): the job
+        // failed and its run ended `job_preparation_failed`.
+        child(&db, 1).await;
+        started(&db, 1, "canonical", "failed").await;
+        db.execute_script(
+            "INSERT INTO runs(id, project_id, job_id, issue_id, status, exit_reason,
+                              created_at, updated_at)
+               VALUES('r1', 'p', 'j1', 'i1', 'failed', 'job_preparation_failed', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        // Failed, but its PR is open.
+        child(&db, 2).await;
+        started(&db, 2, "canonical", "failed").await;
+        pr(&db, 2, "open").await;
+
+        // A PR awaiting review leaves its job blocked.
+        child(&db, 3).await;
+        started(&db, 3, "canonical", "blocked").await;
+        pr(&db, 3, "open").await;
+
+        // A coordinator child waiting idle.
+        child(&db, 4).await;
+        started(&db, 4, "canonical", "idle").await;
+
+        // Only a superseded execution, its job never ended.
+        child(&db, 5).await;
+        started(&db, 5, "superseded", "running").await;
+
+        // A backlog child.
+        child(&db, 6).await;
+
+        // A grandchild: its parent is an issue, not the thread.
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                                parent_issue_id, created_at, updated_at)
+               VALUES('i7', 'p', 7, 'Grandchild', 'active', 'active', 'none', 'i9', 1, 1);",
+        )
+        .await
+        .unwrap();
+        started(&db, 7, "canonical", "running").await;
+
+        // Merged, and closed, with work still running.
+        child(&db, 8).await;
+        started(&db, 8, "canonical", "running").await;
+        child(&db, 10).await;
+        started(&db, 10, "canonical", "running").await;
+        pr(&db, 10, "open").await;
+        db.execute_script(
+            "UPDATE issues SET merged_at = 5 WHERE id = 'i8';
+             UPDATE issues SET closed_at = 5 WHERE id = 'i10';",
+        )
+        .await
+        .unwrap();
+
+        // A closed PR with failed jobs.
+        child(&db, 11).await;
+        started(&db, 11, "canonical", "failed").await;
+        pr(&db, 11, "closed").await;
+
+        // A held execution (gated, unreleased) is not work under way.
+        child(&db, 12).await;
+        db.execute_script(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e12', 'r', 'i12', 'p', 'held', 1, 1);
+             INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+               VALUES('g12', 'e12', 0, '{\"fact\":\"fleet_slot\"}', 1);",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counted(&db).await, vec![2, 3, 4]);
+
+        // A restart makes the failed child count again. It takes the attempt,
+        // superseding the failed execution, as a launch does.
+        db.execute_script(
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = 'e1';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e1b', 'r', 'i1', 'p', 'running', 2, 2);
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status,
+                              created_at, updated_at)
+               VALUES('j1b', 'e1b', 'p', 'i1', 'builder', 'pending', 2, 2);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(counted(&db).await, vec![1, 2, 3, 4]);
+    }
 }

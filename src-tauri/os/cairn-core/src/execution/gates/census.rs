@@ -26,11 +26,11 @@ use serde_json::Value;
 
 use super::vocabulary::{GateOutcome, GateVocabulary};
 use crate::models::{
-    ExecutionGate, ExecutionGateCensus, GateCensusEntry, GateEvidenceState, HeldExecution,
-    ReleaseOverride,
+    CapacityHold, ExecutionGate, ExecutionGateCensus, GateCensusEntry, GateEvidenceState,
+    HeldExecution, ReleaseOverride,
 };
 use crate::routes::{FactRegistry, TriggerClause};
-use crate::storage::{DbResult, RowExt};
+use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_workflow::gates::store::list_gates_for_executions_conn;
 
 /// The shared fact registry, whose gate half is the vocabulary every census
@@ -87,30 +87,30 @@ pub fn render_gate(vocabulary: &GateVocabulary, gate: &ExecutionGate) -> GateCen
     GateCensusEntry {
         gate_id: gate.id.clone(),
         predicate,
-        capacity: false,
+        hold: None,
         state,
         evidence,
     }
 }
 
-/// A capacity hold renders its live reason, place in line included, as written
-/// by the queue. It is never latched before release, so one the last decision
-/// found clear (`last_outcome = satisfied`) reads satisfied and drops out of
-/// the waiting list, while one that blocks reads as the cap it is.
+/// A capacity hold renders from the facts the queue stored on its row. It is
+/// never latched before release, so one the last decision found clear
+/// (`last_outcome = satisfied`) reads satisfied and drops out of the waiting
+/// list, while one that blocks reads as the cap it is. A row whose facts are
+/// unknown (cleared by a migration, or not yet written) reads as its cap's
+/// name until the next sweep rewrites it.
 fn render_capacity_gate(fact: &str, gate: &ExecutionGate) -> GateCensusEntry {
-    let (default_reason, cap) = match fact {
-        super::capacity::FLEET_SLOT_FACT => ("waiting for a fleet slot", "fleet cap"),
-        _ => ("its thread is at its open-children cap", "thread focus cap"),
-    };
+    let cap = cap_name(fact);
     let cleared = gate.is_satisfied()
         || gate.last_outcome.as_deref() == Some(GateOutcome::Satisfied.as_str());
-    let predicate = gate
+    let hold = gate
         .detail
         .as_deref()
-        .map(str::trim)
-        .filter(|detail| !detail.is_empty())
-        .unwrap_or(default_reason)
-        .to_string();
+        .and_then(|detail| super::capacity::decode_hold(fact, detail));
+    let predicate = hold
+        .as_ref()
+        .map(segment)
+        .unwrap_or_else(|| cap.to_string());
     let (state, evidence) = if cleared {
         (
             GateEvidenceState::Satisfied,
@@ -122,9 +122,118 @@ fn render_capacity_gate(fact: &str, gate: &ExecutionGate) -> GateCensusEntry {
     GateCensusEntry {
         gate_id: gate.id.clone(),
         predicate,
-        capacity: true,
+        hold,
         state,
         evidence,
+    }
+}
+
+fn cap_name(fact: &str) -> &'static str {
+    match fact {
+        super::capacity::FLEET_SLOT_FACT => "fleet cap",
+        _ => "thread cap",
+    }
+}
+
+/// `"1st"`, `"2nd"`, ...
+pub(crate) fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// A hold's segment of the queued line: `39/30 running`, `harness 5/5 open`.
+pub fn segment(hold: &CapacityHold) -> String {
+    match hold {
+        CapacityHold::Fleet { running, limit, .. } => format!("{running}/{limit} running"),
+        CapacityHold::Thread {
+            thread,
+            open,
+            limit,
+            ..
+        } => format!("{thread} {}/{limit} open", open.len()),
+    }
+}
+
+/// A hold's line of hover detail: `Fleet · 3rd · 1 unplaced`, `harness · 1st
+/// · 5783, 5790`. The children and the unplaced count live here, never on the
+/// line itself.
+fn hold_detail(hold: &CapacityHold) -> String {
+    let mut parts = Vec::new();
+    match hold {
+        CapacityHold::Fleet {
+            unplaced, place, ..
+        } => {
+            parts.push("Fleet".to_string());
+            parts.extend(place.map(ordinal));
+            if *unplaced > 0 {
+                parts.push(format!("{unplaced} unplaced"));
+            }
+        }
+        CapacityHold::Thread {
+            thread,
+            open,
+            place,
+            ..
+        } => {
+            parts.push(thread.clone());
+            parts.extend(place.map(ordinal));
+            if !open.is_empty() {
+                let numbers: Vec<String> = open.iter().map(i64::to_string).collect();
+                parts.push(numbers.join(", "));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// `Queued · 3rd · 39/30 running · harness 5/5 open`. One place shows: the
+/// first hold's, which is the fleet's when the fleet cap holds (it sorts
+/// first), and none at all when that hold has not been numbered yet.
+fn queued_line(place: Option<usize>, segments: impl IntoIterator<Item = String>) -> String {
+    let mut parts = vec!["Queued".to_string()];
+    parts.extend(place.map(ordinal));
+    parts.extend(segments);
+    parts.join(" · ")
+}
+
+/// The queued line for `holds` as decided, before the queue has numbered
+/// them. A surface that can read the census reads its summary instead, which
+/// carries the place.
+pub fn queued_summary(holds: &[CapacityHold]) -> String {
+    queued_line(
+        holds.first().and_then(CapacityHold::place),
+        holds.iter().map(segment),
+    )
+}
+
+/// The queued line of one cap-held execution as its census reads now, place
+/// included; rendered from `holds` when the census cannot be read or no longer
+/// calls it queued.
+pub async fn queued_summary_for(
+    db: &LocalDb,
+    execution_id: &str,
+    holds: &[CapacityHold],
+) -> String {
+    let id = execution_id.to_string();
+    let census = db
+        .read(move |conn| {
+            let id = id.clone();
+            Box::pin(
+                async move { census_for_executions_conn(conn, std::slice::from_ref(&id)).await },
+            )
+        })
+        .await
+        .ok()
+        .and_then(|mut censuses| censuses.remove(execution_id));
+    match census {
+        Some(census) if census.queued => census.summary,
+        _ => queued_summary(holds),
     }
 }
 
@@ -172,19 +281,59 @@ pub fn census_with(
         .iter()
         .map(|gate| render_gate(vocabulary, gate))
         .collect();
+    // Whether each entry is a capacity hold, known facts or not: an entry's
+    // `hold` is absent for a capacity row whose facts are unknown.
+    let capacity: Vec<bool> = gates
+        .iter()
+        .map(|gate| super::capacity::capacity_fact(&gate.predicate_json).is_some())
+        .collect();
     let gated_unreleased = !gates.is_empty() && released_at.is_none();
     let wont_start = wont_start.filter(|_| gated_unreleased).map(str::to_string);
     let held = gated_unreleased && wont_start.is_none();
-    let summary = match &wont_start {
+    let unmet_caps: Vec<&GateCensusEntry> = entries
+        .iter()
+        .zip(&capacity)
+        .filter(|(entry, is_cap)| **is_cap && entry.state != GateEvidenceState::Satisfied)
+        .map(|(entry, _)| entry)
+        .collect();
+    let unmet_authored = entries
+        .iter()
+        .zip(&capacity)
+        .any(|(entry, is_cap)| !*is_cap && entry.state != GateEvidenceState::Satisfied);
+    let queued = held && !unmet_caps.is_empty() && !unmet_authored;
+    let (summary, detail) = match &wont_start {
         // The gates are not what stops it, so the summary does not list them
         // as though they were; `gates` still carries every one.
-        Some(reason) => format!("{WONT_START_PREFIX}: {reason}"),
-        None => summarize(held, &entries, release_override.as_ref()),
+        Some(reason) => (format!("{WONT_START_PREFIX}: {reason}"), None),
+        None if queued => {
+            let place = unmet_caps
+                .first()
+                .and_then(|entry| entry.hold.as_ref())
+                .and_then(CapacityHold::place);
+            let line = queued_line(
+                place,
+                unmet_caps.iter().map(|entry| entry.predicate.clone()),
+            );
+            let detail: Vec<String> = unmet_caps
+                .iter()
+                .map(|entry| match &entry.hold {
+                    Some(hold) => hold_detail(hold),
+                    None => entry.predicate.clone(),
+                })
+                .collect();
+            (line, Some(detail.join("\n")))
+        }
+        None => (
+            summarize(held, &entries, &capacity, release_override.as_ref()),
+            None,
+        ),
     };
     Some(ExecutionGateCensus {
         held,
         wont_start,
+        queued,
         summary,
+        detail,
         gates: entries,
         release_override,
     })
@@ -215,21 +364,28 @@ pub fn wont_start_reason(
     }
 }
 
-/// One line naming every gate that is not yet met, each with its evidence.
+/// One line naming every gate that is not yet met, each with its evidence, for
+/// an execution that is not queued. `capacity` says which entries are
+/// capacity holds.
 fn summarize(
     held: bool,
     entries: &[GateCensusEntry],
+    capacity: &[bool],
     release_override: Option<&ReleaseOverride>,
 ) -> String {
-    let waiting: Vec<String> = entries
-        .iter()
-        .filter(|entry| entry.state != GateEvidenceState::Satisfied && !entry.capacity)
-        .map(|entry| format!("{} ({})", entry.predicate, entry.evidence))
+    let unmet = || {
+        entries
+            .iter()
+            .zip(capacity)
+            .filter(|(entry, _)| entry.state != GateEvidenceState::Satisfied)
+    };
+    let waiting: Vec<String> = unmet()
+        .filter(|(_, is_cap)| !**is_cap)
+        .map(|(entry, _)| format!("{} ({})", entry.predicate, entry.evidence))
         .collect();
-    let capped: Vec<&str> = entries
-        .iter()
-        .filter(|entry| entry.state != GateEvidenceState::Satisfied && entry.capacity)
-        .map(|entry| entry.predicate.as_str())
+    let capped: Vec<&str> = unmet()
+        .filter(|(_, is_cap)| **is_cap)
+        .map(|(entry, _)| entry.predicate.as_str())
         .collect();
     if held {
         let mut parts = Vec::new();
@@ -268,11 +424,13 @@ fn summarize(
     }
 }
 
-/// `exec N — <summary>`: the line a text census prints per execution.
+/// The line a text census prints per execution: `exec N — <summary>`, or the
+/// summary alone for a queued execution, whose `Queued · …` line names no
+/// execution because only one of an issue's executions can be queued.
 pub fn census_line(seq: Option<i64>, census: &ExecutionGateCensus) -> String {
     match seq {
-        Some(seq) => format!("exec {seq} — {}", census.summary),
-        None => census.summary.clone(),
+        Some(seq) if !census.queued => format!("exec {seq} — {}", census.summary),
+        _ => census.summary.clone(),
     }
 }
 
@@ -1075,5 +1233,119 @@ mod tests {
         let entry = render_gate(vocabulary(), &gate("not json"));
         assert_eq!(entry.predicate, "not json");
         assert_eq!(entry.evidence, "no verdict yet");
+    }
+
+    fn capacity_gate(id: &str, fact: &str, seq: i64, hold: Option<&CapacityHold>) -> ExecutionGate {
+        use crate::execution::gates::capacity::{capacity_predicate, encode_hold};
+        ExecutionGate {
+            id: id.into(),
+            seq,
+            last_outcome: Some("no_evidence".into()),
+            detail: hold.map(encode_hold),
+            ..gate(&capacity_predicate(fact))
+        }
+    }
+
+    /// Every way a queued execution reads, as the operator sees it: one terse
+    /// line with one place, the children and the unplaced count on hover.
+    #[test]
+    fn a_queued_execution_reads_one_terse_line_with_its_detail_on_hover() {
+        use crate::execution::gates::capacity::{FLEET_SLOT_FACT, THREAD_FOCUS_FACT};
+        let fleet = CapacityHold::Fleet {
+            running: 39,
+            limit: 30,
+            unplaced: 1,
+            place: Some(3),
+        };
+        let thread = CapacityHold::Thread {
+            thread: "harness".into(),
+            open: vec![5783, 5790, 5791, 5792, 5793],
+            limit: 5,
+            place: Some(1),
+        };
+        let fleet_gate = capacity_gate("gf", FLEET_SLOT_FACT, 1000, Some(&fleet));
+        let thread_gate = capacity_gate("gt", THREAD_FOCUS_FACT, 1001, Some(&thread));
+        let read = |gates: &[ExecutionGate]| census(gates, None, None, None).unwrap();
+        let mut rendered = Vec::new();
+
+        let fleet_only = read(std::slice::from_ref(&fleet_gate));
+        assert!(fleet_only.held && fleet_only.queued);
+        assert_eq!(fleet_only.summary, "Queued · 3rd · 39/30 running");
+        assert_eq!(
+            fleet_only.detail.as_deref(),
+            Some("Fleet · 3rd · 1 unplaced")
+        );
+        assert_eq!(
+            census_line(Some(2), &fleet_only),
+            "Queued · 3rd · 39/30 running",
+            "a queued line names no execution"
+        );
+        assert_eq!(fleet_only.gates[0].evidence, "fleet cap");
+        assert_eq!(fleet_only.gates[0].hold.as_ref(), Some(&fleet));
+        rendered.push(fleet_only);
+
+        let thread_only = read(std::slice::from_ref(&thread_gate));
+        assert_eq!(thread_only.summary, "Queued · 1st · harness 5/5 open");
+        assert_eq!(
+            thread_only.detail.as_deref(),
+            Some("harness · 1st · 5783, 5790, 5791, 5792, 5793")
+        );
+        rendered.push(thread_only);
+
+        let both = read(&[fleet_gate.clone(), thread_gate.clone()]);
+        assert_eq!(
+            both.summary, "Queued · 3rd · 39/30 running · harness 5/5 open",
+            "one place, the fleet's"
+        );
+        assert_eq!(
+            both.detail.as_deref(),
+            Some("Fleet · 3rd · 1 unplaced\nharness · 1st · 5783, 5790, 5791, 5792, 5793")
+        );
+        rendered.push(both);
+
+        let unnumbered = CapacityHold::Fleet {
+            running: 6,
+            limit: 6,
+            unplaced: 0,
+            place: None,
+        };
+        let fresh = read(&[capacity_gate(
+            "gn",
+            FLEET_SLOT_FACT,
+            1000,
+            Some(&unnumbered),
+        )]);
+        assert_eq!(fresh.summary, "Queued · 6/6 running");
+        assert_eq!(fresh.detail.as_deref(), Some("Fleet"));
+        assert_eq!(queued_summary(&[unnumbered]), "Queued · 6/6 running");
+        rendered.push(fresh);
+
+        let unknown = read(&[
+            capacity_gate("gu", FLEET_SLOT_FACT, 1000, None),
+            capacity_gate("gv", THREAD_FOCUS_FACT, 1001, None),
+        ]);
+        assert!(
+            unknown.queued,
+            "a capacity row with no facts is still a cap"
+        );
+        assert_eq!(unknown.summary, "Queued · fleet cap · thread cap");
+        assert_eq!(unknown.detail.as_deref(), Some("fleet cap\nthread cap"));
+        assert_eq!(unknown.gates[0].hold, None);
+        rendered.push(unknown);
+
+        // An authored gate still waiting: not queued, and it keeps its label.
+        let mixed = read(&[gate(CHECK), fleet_gate]);
+        assert!(mixed.held && !mixed.queued);
+        assert_eq!(mixed.detail, None);
+        assert!(
+            census_line(Some(1), &mixed).starts_with("exec 1 — held, waiting on check"),
+            "{}",
+            mixed.summary
+        );
+        rendered.push(mixed);
+
+        let text = format!("{rendered:?}");
+        assert!(!text.contains("in progress"), "{text}");
+        assert!(!text.contains("waiting for a machine"), "{text}");
     }
 }

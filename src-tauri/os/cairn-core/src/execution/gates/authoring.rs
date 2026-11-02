@@ -649,12 +649,10 @@ pub(crate) async fn replace_gates_observed(
             if let Err(error) = super::capacity::refresh_places(orch).await {
                 log::warn!("could not rewrite the queue's places in line: {error}");
             }
-            let reasons: Vec<String> = blocks.iter().map(|block| block.reason()).collect();
+            let queued = super::census::queued_summary_for(&db, execution_id, &blocks).await;
             return Ok(format!(
-                "Removed every authored gate from {label}, but it is still held by the execution \
-                 queue: {}. It starts on its own when that clears; only the operator's Start now \
-                 skips a cap.",
-                reasons.join("; ")
+                "Removed every authored gate from {label}; still {queued}. {}",
+                super::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
             ));
         }
         super::sweep::ConnRelease::NotHeld => {}

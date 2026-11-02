@@ -145,7 +145,7 @@ pub enum ReleaseOutcome {
     /// This caller released it; its jobs exist.
     Released,
     /// Every authored gate allows it, but the execution queue's caps hold it.
-    HeldByCap(Vec<super::capacity::CapBlock>),
+    HeldByCap(Vec<crate::models::CapacityHold>),
     /// Nothing to release: already released, superseded, its issue resolved,
     /// or its authored gates do not license the cause.
     NotHeld,
@@ -244,7 +244,7 @@ pub struct Evaluation {
     /// The census phrase of each gate still unmet, with its evidence state.
     pub waiting: Vec<String>,
     /// The execution queue's caps holding it, once every authored gate is met.
-    pub held_by: Vec<super::capacity::CapBlock>,
+    pub held_by: Vec<crate::models::CapacityHold>,
 }
 
 /// Evaluate one execution now, releasing it if every gate is already true.
@@ -274,16 +274,13 @@ pub(crate) async fn evaluate_execution_at(
         .map_err(|error| format!("failed to list held executions: {error}"))?
         .into_iter()
         .find(|held| held.execution_id == wanted);
-    let evaluation = match held {
-        Some(held) => evaluate_held(orch, &db, &gate_vocabulary(), &held, now).await?,
-        None => return Ok(Evaluation::default()),
-    };
-    if !evaluation.held_by.is_empty() {
-        if let Err(error) = super::capacity::refresh_places(orch).await {
-            log::warn!("could not rewrite the queue's places in line: {error}");
-        }
+    // A cap hold this evaluation writes is numbered by the next sweep, which
+    // rewrites every place in line: numbering spans every database, and this
+    // runs on the filing path.
+    match held {
+        Some(held) => evaluate_held(orch, &db, &gate_vocabulary(), &held, now).await,
+        None => Ok(Evaluation::default()),
     }
-    Ok(evaluation)
 }
 
 async fn evaluate_held(
@@ -610,7 +607,7 @@ pub(crate) enum ConnRelease {
     /// Its authored gates allow it, but the queue's caps hold it; their rows
     /// were written in this transaction (`moved` when any changed).
     HeldByCap {
-        blocks: Vec<super::capacity::CapBlock>,
+        blocks: Vec<crate::models::CapacityHold>,
         moved: bool,
     },
     /// This caller may not release it, and owns nothing.
@@ -658,6 +655,7 @@ pub(crate) async fn release_conn(
     cause: &ReleaseCause,
     admission: &super::capacity::Admission,
 ) -> DbResult<ConnRelease> {
+    use super::capacity::CapacityHoldExt;
     use cairn_workflow::gates::store;
 
     let (authored, unsatisfied) = store::gate_counts_conn(conn, execution_id).await?;
@@ -701,7 +699,7 @@ pub(crate) async fn release_conn(
                         .iter()
                         .find(|gate| gate.predicate_json == predicate)
                         .and_then(|gate| gate.detail.as_deref());
-                    let detail = super::capacity::carry_place(prior, &block.reason());
+                    let detail = super::capacity::carry_place(fact, prior, block);
                     moved |= store::hold_capacity_gate_conn(
                         conn,
                         execution_id,
@@ -754,7 +752,7 @@ pub(crate) async fn release_conn(
             let skipped: Vec<&str> = admission
                 .blocks
                 .iter()
-                .map(super::capacity::CapBlock::skipped_label)
+                .map(CapacityHoldExt::skipped_label)
                 .collect();
             Some(
                 serde_json::json!({

@@ -74,8 +74,9 @@ pub struct ExecutionGate {
     pub foreclosed_at: Option<i64>,
     pub foreclosed_reason: Option<String>,
     pub created_at: i64,
-    /// The live reason of a CAPACITY gate (the execution queue's fleet slot or
-    /// thread focus), place in line included. `None` on an authored gate.
+    /// The facts of a CAPACITY gate (the execution queue's fleet slot or
+    /// thread focus) as [`CapacityHold`] JSON, place in line included. `None`
+    /// on an authored gate, and on a capacity row the queue has cleared.
     pub detail: Option<String>,
 }
 
@@ -107,19 +108,67 @@ pub enum GateEvidenceState {
     Satisfied,
 }
 
+/// One execution-queue cap holding an execution, as facts rather than prose.
+///
+/// Decided by `cairn-core`'s `execution::gates::capacity`, stored as JSON in
+/// the capacity gate row's `execution_gates.detail`, and carried on the census,
+/// so the one renderer (`execution::gates::census`) turns the same facts into
+/// words on every surface. `place` is the execution's place in line on this
+/// cap, `None` until the queue has numbered it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cap", rename_all = "camelCase")]
+pub enum CapacityHold {
+    /// The fleet cap: executions running on this runner's fleet against its
+    /// limit, and how many of them have no machine yet.
+    #[serde(rename_all = "camelCase")]
+    Fleet {
+        running: usize,
+        limit: usize,
+        unplaced: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<usize>,
+    },
+    /// The thread focus cap: the thread's open children, by issue number,
+    /// against its limit.
+    #[serde(rename_all = "camelCase")]
+    Thread {
+        thread: String,
+        open: Vec<i64>,
+        limit: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        place: Option<usize>,
+    },
+}
+
+impl CapacityHold {
+    pub fn place(&self) -> Option<usize> {
+        match self {
+            Self::Fleet { place, .. } | Self::Thread { place, .. } => *place,
+        }
+    }
+
+    pub fn set_place(&mut self, to: Option<usize>) {
+        match self {
+            Self::Fleet { place, .. } | Self::Thread { place, .. } => *place = to,
+        }
+    }
+}
+
 /// One gate as a census shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GateCensusEntry {
     pub gate_id: String,
     /// The predicate in prose, e.g. `check rust-tests passed on cairn://p/cairn/4724`.
-    /// For a capacity hold, its live reason with its place in line.
+    /// For a capacity hold, its segment of the queued line: `39/30 running`
+    /// or `harness 5/5 open`.
     pub predicate: String,
-    /// An execution-queue cap (fleet slot or thread focus) rather than an
-    /// authored `after:` gate: the system filed it, and only the operator's
-    /// Start now skips it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub capacity: bool,
+    /// The facts of an execution-queue cap (fleet slot or thread focus) rather
+    /// than an authored `after:` gate: the system filed it, and only the
+    /// operator's Start now skips it. Absent for an authored gate, and for a
+    /// capacity row whose facts the queue has not written yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<CapacityHold>,
     pub state: GateEvidenceState,
     /// The evidence-state phrase, e.g. `no verdict yet`, `evidence says no`, or
     /// `can never be satisfied: <reason>`.
@@ -159,10 +208,19 @@ pub struct ExecutionGateCensus {
     /// execution is not held, and no surface may show it as waiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wont_start: Option<String>,
-    /// One line, without the execution's own label: `held, waiting on <gate>
+    /// Held by the execution queue's caps alone: held, and every unmet gate is
+    /// a capacity gate. Its summary is then the queued line.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
+    /// One line, without the execution's own label: `Queued · 3rd · 39/30
+    /// running` for a queued execution, `held, waiting on <gate>
     /// (<evidence>); ...`, `won't start: <reason>`, or how a released
     /// execution came to start.
     pub summary: String,
+    /// The hover text of a queued execution, one line per cap holding it:
+    /// `Fleet · 3rd · 1 unplaced`, `harness · 1st · 5783, 5790`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     /// Every gate in authored order, satisfied ones included.
     pub gates: Vec<GateCensusEntry>,
     /// Present only when someone released this execution without waiting.
@@ -177,7 +235,9 @@ pub struct ExecutionGateCensus {
 pub struct HeldExecution {
     pub execution_id: String,
     pub seq: Option<i64>,
-    /// `exec N — <summary>`, the line every text surface prints for it.
+    /// The line every text surface prints for it: `exec N — <summary>`, or
+    /// the summary alone for a queued execution (`Queued · 1st · harness 5/5
+    /// open`).
     pub line: String,
     pub census: ExecutionGateCensus,
 }

@@ -1245,7 +1245,7 @@ pub(crate) fn file_held_with_observed_satisfaction(
 struct LaunchGates {
     predicates: Vec<String>,
     satisfied: std::collections::HashSet<String>,
-    caps: Vec<crate::execution::gates::capacity::CapBlock>,
+    caps: Vec<crate::models::CapacityHold>,
     filed_at: i64,
 }
 
@@ -1376,12 +1376,15 @@ fn insert_issue_execution_atomic(
                 execution.lifecycle = lifecycle;
                 insert_execution_conn(conn, &execution).await?;
                 for cap in &caps {
+                    use crate::execution::gates::capacity::{
+                        capacity_predicate, encode_hold, CapacityHoldExt,
+                    };
                     cairn_workflow::gates::store::hold_capacity_gate_conn(
                         conn,
                         execution.id.as_str(),
-                        &crate::execution::gates::capacity::capacity_predicate(cap.fact()),
+                        &capacity_predicate(cap.fact()),
                         cap.seq(),
-                        &cap.reason(),
+                        &encode_hold(cap),
                         filed_at,
                     )
                     .await?;

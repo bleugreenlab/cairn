@@ -139,6 +139,10 @@ pub(crate) async fn start_execution_from_collection(
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
+        // Held by the queue alone. The line carries no place: the next sweep
+        // numbers it, and the filing path does no cross-database work.
+        let queued = (evaluation.waiting.is_empty() && !evaluation.held_by.is_empty())
+            .then(|| crate::execution::gates::census::queued_summary(&evaluation.held_by));
         return Ok(held_filing_summary(
             &key,
             number,
@@ -146,6 +150,7 @@ pub(crate) async fn start_execution_from_collection(
             &execution.recipe_id,
             &issue_uri,
             &evaluation,
+            queued.as_deref(),
             matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
                 .then_some(superseded),
         ));
@@ -180,9 +185,11 @@ pub(crate) async fn start_execution_from_collection(
 /// what the evidence says about each gate, what it will do to the issue's
 /// attempt when it starts, and the way out if waiting is wrong.
 ///
-/// `next_attempt` is `Some(owner_now)` for a held next attempt: it fenced
-/// nothing at filing, and takes the attempt from whichever execution owns it
-/// at release.
+/// `queued` is the census's queued line when only the execution queue holds
+/// it (no gate the filer wrote is unmet). `next_attempt` is `Some(owner_now)`
+/// for a held next attempt: it fenced nothing at filing, and takes the attempt
+/// from whichever execution owns it at release.
+#[allow(clippy::too_many_arguments)]
 fn held_filing_summary(
     key: &str,
     number: i32,
@@ -190,15 +197,10 @@ fn held_filing_summary(
     recipe_id: &str,
     issue_uri: &str,
     evaluation: &crate::execution::gates::sweep::Evaluation,
+    queued: Option<&str>,
     next_attempt: Option<Option<i64>>,
 ) -> String {
-    // Held only by the execution queue: no gate the filer wrote is unmet.
-    if evaluation.waiting.is_empty() && !evaluation.held_by.is_empty() {
-        let reasons: Vec<String> = evaluation
-            .held_by
-            .iter()
-            .map(|block| block.reason())
-            .collect();
+    if let Some(queued) = queued {
         let attempt = match next_attempt {
             Some(Some(owner)) => format!(
                 " Filing it fenced nothing: execution {owner} keeps running until this one \
@@ -207,10 +209,8 @@ fn held_filing_summary(
             _ => String::new(),
         };
         return format!(
-            "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}') HELD: {}. It starts \
-             on its own when that clears, oldest held first; only the operator's Start now skips \
-             the queue.{attempt} Watch {issue_uri} for its place in line.",
-            reasons.join("; ")
+            "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}'): {queued}.{attempt} {}",
+            crate::execution::gates::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
         );
     }
     let exit =
@@ -311,13 +311,16 @@ pub(crate) async fn patch_execution_gates(
                     {
                         log::warn!("could not rewrite the queue's places in line: {error}");
                     }
-                    let reasons: Vec<String> = blocks.iter().map(|block| block.reason()).collect();
+                    let queued = crate::execution::gates::census::queued_summary_for(
+                        &owning_db,
+                        &execution_id,
+                        &blocks,
+                    )
+                    .await;
                     Ok(format!(
-                        "Released the `after:` gates on {label} (recorded as an override by \
-                         {principal}), but it is still held by the execution queue: {}. It \
-                         starts on its own when that clears; only the operator's Start now \
-                         skips a cap.",
-                        reasons.join("; ")
+                        "Released the `after:` gates on {label} (override by {principal}); still \
+                         {queued}. {}",
+                        crate::execution::gates::capacity::ONLY_START_NOW_SKIPS_THE_QUEUE
                     ))
                 }
                 crate::execution::gates::sweep::ReleaseOutcome::NotHeld => Err(format!(

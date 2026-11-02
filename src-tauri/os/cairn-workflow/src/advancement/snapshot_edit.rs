@@ -147,6 +147,8 @@ pub async fn cancel_job_conn(
         params![now, job_id],
     )
     .await?;
+    // An ended job may free a fleet slot or a thread's open-children count.
+    crate::gates::hint::evidence_changed();
     conn.execute(
         "UPDATE sessions
          SET status = 'closed', terminal_reason = 'node_removed', closed_at = ?1, updated_at = ?1

@@ -278,7 +278,7 @@ pub async fn set_gate_seq_conn(conn: &Connection, gate_id: &str, seq: i64) -> Db
 pub const CAPACITY_GATE_SEQ_BASE: i64 = 1_000;
 
 /// Record that a capacity cap holds this execution now: its row exists, reads
-/// `no_evidence`, and carries `detail` as its reason. Inserted on first block;
+/// `no_evidence`, and carries `detail` as its facts (`CapacityHold` JSON). Inserted on first block;
 /// a later block rewrites the same row, so its `created_at` (the execution's
 /// place in line) survives the queue moving. Returns whether anything changed.
 pub async fn hold_capacity_gate_conn(
@@ -327,7 +327,8 @@ pub async fn hold_capacity_gate_conn(
 /// Record that a capacity cap no longer blocks this execution, WITHOUT
 /// latching it: a free slot can be taken again before the release, so the row
 /// stays (keeping the execution's place in line) and reads `satisfied` until
-/// the release latches it or a later decision blocks it again. Returns whether
+/// the release latches it or a later decision blocks it again. Its last facts
+/// stay, so a census still knows the row for the cap it is. Returns whether
 /// anything changed.
 pub async fn clear_capacity_gate_conn(
     conn: &Connection,
@@ -336,7 +337,7 @@ pub async fn clear_capacity_gate_conn(
 ) -> DbResult<bool> {
     Ok(conn
         .execute(
-            "UPDATE execution_gates SET last_outcome = 'satisfied', detail = NULL
+            "UPDATE execution_gates SET last_outcome = 'satisfied'
               WHERE execution_id = ?1 AND predicate_json = ?2 AND satisfied_at IS NULL
                 AND last_outcome IS NOT 'satisfied'",
             params![execution_id, predicate_json],
@@ -366,7 +367,7 @@ pub async fn latch_capacity_gates_conn(
     Ok(())
 }
 
-/// Rewrite a capacity gate's reason, as its place in line moves.
+/// Rewrite a capacity gate's facts, as its place in line moves.
 pub async fn set_gate_detail_conn(conn: &Connection, gate_id: &str, detail: &str) -> DbResult<()> {
     conn.execute(
         "UPDATE execution_gates SET detail = ?2 WHERE id = ?1",
