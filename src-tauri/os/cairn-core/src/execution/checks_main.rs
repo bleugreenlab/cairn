@@ -1551,13 +1551,19 @@ pub(crate) enum TestOutcome {
     Failed(Failure),
 }
 
-/// What a failed test's excerpt says.
+/// What a failed test's excerpt says, and when the test ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     /// See [`failure_signature`].
     pub(crate) signature: String,
     /// The machine condition the excerpt names, if any: see [`host_condition`].
     pub(crate) host_condition: Option<&'static HostCondition>,
+    /// Whether the excerpt says a time bound ended the test: see
+    /// [`BOUND_ENDINGS`].
+    pub(crate) bounded: bool,
+    /// Where the test ran on its lane's timeline, when the row recorded its
+    /// start.
+    pub(crate) span: Option<Span>,
 }
 
 impl Failure {
@@ -1565,7 +1571,38 @@ impl Failure {
         Self {
             signature: failure_signature(excerpt),
             host_condition: host_condition(excerpt),
+            bounded: ended_at_a_bound(excerpt),
+            span: None,
         }
+    }
+
+    fn ran(self, span: Option<Span>) -> Self {
+        Self { span, ..self }
+    }
+}
+
+/// Where a test ran on its lane's timeline: milliseconds from the lane's
+/// origin to its start and to its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Span {
+    start_ms: i64,
+    end_ms: i64,
+}
+
+impl Span {
+    /// The span a per-test row's start offset and duration describe; `None`
+    /// unless it recorded both.
+    fn recorded(started_offset_ms: Option<i64>, duration_ms: Option<i64>) -> Option<Self> {
+        let start_ms = started_offset_ms.filter(|start| *start >= 0)?;
+        let duration_ms = duration_ms.filter(|duration| *duration >= 0)?;
+        Some(Self {
+            start_ms,
+            end_ms: start_ms.saturating_add(duration_ms),
+        })
+    }
+
+    fn overlaps(&self, from_ms: i64, to_ms: i64) -> bool {
+        self.start_ms <= to_ms && from_ms <= self.end_ms
     }
 }
 
@@ -1594,6 +1631,10 @@ pub(crate) struct CadenceRow {
     pub(crate) selection: Option<String>,
     pub(crate) tests: BTreeMap<String, TestOutcome>,
     pub(crate) output_tail: String,
+    /// The wall-clock instant a [`Span`] counts from: the executor's spawn
+    /// stamp, when the lane's timeline started there (`phase_origin =
+    /// 'executor'`). `None` when the timeline started anywhere else.
+    pub(crate) lane_started_at_ms: Option<i64>,
 }
 
 impl CadenceRow {
@@ -1841,7 +1882,8 @@ async fn load_row(
         .query_opt(
             "SELECT id, COALESCE(public_handle, id), commit_sha, COALESCE(verdict_platform, ''),
                     executor_id, ran_at, verdict, exit_code, complete, output_tail, cadence,
-                    selection
+                    selection,
+                    CASE WHEN phase_origin = 'executor' THEN executor_started_at_unix_ms END
                FROM check_result_observations WHERE id = ?1",
             (observation_id.to_string(),),
             |row| {
@@ -1858,6 +1900,7 @@ async fn load_row(
                     row.text(9)?,
                     row.text(10)?,
                     row.opt_text(11)?,
+                    row.opt_i64(12)?,
                 ))
             },
         )
@@ -1877,21 +1920,32 @@ async fn load_row(
         tail,
         cadence,
         selection,
+        lane_started_at_ms,
     ) = head;
     let tests = db
         .query_all(
-            "SELECT test_id, status, failure_excerpt FROM check_test_results WHERE observation_id = ?1",
+            "SELECT test_id, status, failure_excerpt, started_offset_ms, duration_ms
+               FROM check_test_results WHERE observation_id = ?1",
             (id.clone(),),
-            |row| Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?)),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.text(1)?,
+                    row.opt_text(2)?,
+                    Span::recorded(row.opt_i64(3)?, row.opt_i64(4)?),
+                ))
+            },
         )
         .await
         .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|(test, status, excerpt)| {
+        .map(|(test, status, excerpt, span)| {
             let outcome = match status.as_str() {
                 "passed" => TestOutcome::Passed,
                 "skipped" => TestOutcome::Skipped,
-                _ => TestOutcome::Failed(Failure::from_excerpt(excerpt.as_deref().unwrap_or(""))),
+                _ => TestOutcome::Failed(
+                    Failure::from_excerpt(excerpt.as_deref().unwrap_or("")).ran(span),
+                ),
             };
             (test, outcome)
         })
@@ -1911,6 +1965,7 @@ async fn load_row(
         selection,
         tests,
         output_tail: tail,
+        lane_started_at_ms,
     })
 }
 
@@ -2319,11 +2374,67 @@ fn host_condition(excerpt: &str) -> Option<&'static HostCondition> {
     })
 }
 
+impl HostCondition {
+    /// How many of the condition's [`Spread`] `tests` hold.
+    fn breadth(&self, tests: &[&str]) -> usize {
+        match self.spread {
+            Spread::Tests => tests.len(),
+            Spread::Files => files(tests),
+        }
+    }
+}
+
+/// Lowercase spellings of a test ended by a time bound rather than by what it
+/// asserted: nextest's slow-timeout termination as the rust-tests runner
+/// spells it (`NEXTEST_TIMEOUT_EXCERPT` in scripts/lib/structured-test-result.ts,
+/// which must change with it), vitest's timeout and the frontend runner's
+/// rewrite of it, and tokio's `Elapsed` (its `Debug`, then its `Display`) from
+/// a test's own bounded wait. A host that stops scheduling ends every test in
+/// flight at whichever bound each carries, so these are what
+/// [`stall_windows`] dates.
+const BOUND_ENDINGS: &[&str] = &[
+    "nextest terminated this test at its slow-timeout bound",
+    "test timed out in ",
+    "timeout: vitest terminated this test",
+    "elapsed(())",
+    "deadline has elapsed",
+];
+
+/// Whether a failure excerpt says a time bound ended the test: see
+/// [`BOUND_ENDINGS`].
+fn ended_at_a_bound(excerpt: &str) -> bool {
+    let excerpt = excerpt.to_ascii_lowercase();
+    BOUND_ENDINGS
+        .iter()
+        .any(|spelling| excerpt.contains(spelling))
+}
+
 /// The test file a per-test id names. A vitest id is `<file> > <full name>`
-/// (and a file that failed to collect is the bare file); an id without the
-/// separator is its own file.
+/// (and a file that failed to collect is the bare file). A nextest id is
+/// `<crate>::<binary>$<module path>::<name>`, and its module stands for its
+/// file (`cairn-core::main$turso_sync_roundtrip`): a crate's integration-test
+/// files all build into one `main` binary, so the binary would make them one
+/// file. Any other id is its own file.
 fn test_file(test: &str) -> &str {
-    test.split(" > ").next().unwrap_or(test)
+    if let Some((file, _)) = test.split_once(" > ") {
+        return file;
+    }
+    match test.split_once('$') {
+        Some((binary, path)) => match path.rfind("::") {
+            Some(at) => &test[..binary.len() + 1 + at],
+            None => binary,
+        },
+        None => test,
+    }
+}
+
+/// How many test files `tests` span: see [`test_file`].
+fn files(tests: &[&str]) -> usize {
+    tests
+        .iter()
+        .map(|test| test_file(test))
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,39 +2834,219 @@ fn group_size(groups: &[(&str, Vec<&str>)]) -> usize {
 /// tests.
 #[derive(Debug)]
 struct HostConditionGroup<'a> {
-    condition: &'static HostCondition,
+    cause: HostCause,
     tests: Vec<&'a str>,
 }
 
+/// What puts a group's failures on the machine rather than the tree.
+#[derive(Debug)]
+enum HostCause {
+    /// One error naming the machine, in every excerpt.
+    Error(&'static HostCondition),
+    /// Runs that overlapped and ended at their time bounds: see
+    /// [`stall_windows`].
+    Stall(StallWindow),
+}
+
+/// Where on the lane's timeline a stall group's tests ran.
+#[derive(Debug)]
+struct StallWindow {
+    /// The earliest start and latest end of the tests that ended at a bound,
+    /// as lane offsets.
+    from_ms: i64,
+    to_ms: i64,
+    /// The span every one of them was in flight through, when they shared one.
+    together: Option<(i64, i64)>,
+    /// The group's first `bounded` tests ended at a bound; the rest failed some
+    /// other way while running through the window.
+    bounded: usize,
+}
+
 impl HostConditionGroup<'_> {
-    fn files(&self) -> usize {
-        self.tests
-            .iter()
-            .map(|test| test_file(test))
-            .collect::<HashSet<_>>()
-            .len()
+    /// The clause the report's headline gives the group.
+    fn headline(&self) -> String {
+        let count = self.tests.len();
+        match &self.cause {
+            HostCause::Error(condition) => {
+                format!(
+                    "{count} tests failed on one host condition: {}",
+                    condition.face
+                )
+            }
+            HostCause::Stall(window) => format!(
+                "{count} tests failed inside one stall window, {}",
+                lane_span(window.from_ms, window.to_ms, None)
+            ),
+        }
     }
 
-    /// How many of the condition's [`Spread`] the group holds.
-    fn breadth(&self) -> usize {
-        match self.condition.spread {
-            Spread::Tests => self.tests.len(),
-            Spread::Files => self.files(),
+    /// What the group's section is titled, on `row`'s timeline.
+    fn title(&self, row: &CadenceRow) -> String {
+        let count = self.tests.len();
+        match &self.cause {
+            HostCause::Error(condition) => {
+                format!("{count} tests failed on `{}`", condition.face)
+            }
+            HostCause::Stall(window) => format!(
+                "{count} tests failed inside one stall window, {}",
+                lane_span(window.from_ms, window.to_ms, row.lane_started_at_ms)
+            ),
         }
     }
 
     /// Why the group is the machine rather than the tree.
     fn reading(&self) -> String {
         let count = self.tests.len();
-        match self.condition.spread {
-            Spread::Tests => format!(
-                "one OS error across {count} tests is a condition of this machine, not of the tree"
-            ),
-            Spread::Files => format!(
-                "one time budget expiring across {count} tests in {} unrelated files is this machine's load, not the tree",
-                self.files()
-            ),
+        match &self.cause {
+            HostCause::Error(condition) => match condition.spread {
+                Spread::Tests => format!(
+                    "one OS error across {count} tests is a condition of this machine, not of the tree"
+                ),
+                Spread::Files => format!(
+                    "one time budget expiring across {count} tests in {} unrelated files is this machine's load, not the tree",
+                    files(&self.tests)
+                ),
+            },
+            HostCause::Stall(window) => {
+                let mut reading = format!(
+                    "{} tests in {} unrelated files ran into a time bound while their runs overlapped, which is this machine stalling, not the tree",
+                    window.bounded,
+                    files(&self.tests[..window.bounded])
+                );
+                let others = count - window.bounded;
+                if others > 0 {
+                    reading.push_str(&format!(
+                        "; {others} more failed while running through the same window"
+                    ));
+                }
+                reading
+            }
         }
+    }
+
+    /// Largest first, then error conditions by name before stalls by start.
+    fn order(&self) -> (std::cmp::Reverse<usize>, bool, &'static str, i64) {
+        let size = std::cmp::Reverse(self.tests.len());
+        match &self.cause {
+            HostCause::Error(condition) => (size, false, condition.face, 0),
+            HostCause::Stall(window) => (size, true, "", window.from_ms),
+        }
+    }
+}
+
+/// The stall windows of a row: failures that ended at a time bound
+/// ([`BOUND_ENDINGS`]) whose runs overlapped one another, in at least
+/// [`HOST_CONDITION_MIN`] test files, so the host stopped running them rather
+/// than one file hanging on itself. Each window then also holds every other
+/// failure whose run overlapped it: a test that failed its assertion after the
+/// machine froze around it carries no error naming the freeze, and its start is
+/// the only evidence that ties it to one. `taken` are the failures an error
+/// condition already holds.
+fn stall_windows<'a>(row: &'a CadenceRow, taken: &HashSet<&str>) -> Vec<HostConditionGroup<'a>> {
+    let timed: Vec<(&str, &Failure, Span)> = row
+        .tests
+        .iter()
+        .filter_map(|(test, outcome)| match outcome {
+            TestOutcome::Failed(failure) if !taken.contains(test.as_str()) => {
+                failure.span.map(|span| (test.as_str(), failure, span))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut bounded: Vec<(&str, Span)> = timed
+        .iter()
+        .filter(|(_, failure, _)| failure.bounded)
+        .map(|(test, _, span)| (*test, *span))
+        .collect();
+    bounded.sort_by_key(|(test, span)| (span.start_ms, *test));
+    // Maximal runs of transitively overlapping spans, so two windows never
+    // overlap each other.
+    let mut clusters: Vec<Vec<(&str, Span)>> = Vec::new();
+    let mut reach = i64::MIN;
+    for (test, span) in bounded {
+        match clusters.last_mut() {
+            Some(cluster) if span.start_ms <= reach => cluster.push((test, span)),
+            _ => clusters.push(vec![(test, span)]),
+        }
+        reach = reach.max(span.end_ms);
+    }
+    let mut joined: HashSet<&str> = HashSet::new();
+    let mut windows = Vec::new();
+    for cluster in clusters {
+        let mut tests: Vec<&str> = cluster.iter().map(|(test, _)| *test).collect();
+        if files(&tests) < HOST_CONDITION_MIN {
+            continue;
+        }
+        let starts = cluster.iter().map(|(_, span)| span.start_ms);
+        let ends = cluster.iter().map(|(_, span)| span.end_ms);
+        let (from_ms, latest_start) = (starts.clone().min(), starts.max());
+        let (earliest_end, to_ms) = (ends.clone().min(), ends.max());
+        let (Some(from_ms), Some(latest_start), Some(earliest_end), Some(to_ms)) =
+            (from_ms, latest_start, earliest_end, to_ms)
+        else {
+            continue;
+        };
+        let bounded = tests.len();
+        for &(test, failure, span) in &timed {
+            if !failure.bounded && span.overlaps(from_ms, to_ms) && joined.insert(test) {
+                tests.push(test);
+            }
+        }
+        windows.push(HostConditionGroup {
+            cause: HostCause::Stall(StallWindow {
+                from_ms,
+                to_ms,
+                together: (latest_start <= earliest_end).then_some((latest_start, earliest_end)),
+                bounded,
+            }),
+            tests,
+        });
+    }
+    windows
+}
+
+/// A lane offset as `1h 02m 05s`, `12m 05s`, or `45s`.
+fn lane_offset(ms: i64) -> String {
+    let seconds = (ms.max(0) + 500) / 1_000;
+    let (hours, minutes, seconds) = (seconds / 3_600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// `52m 10s to 1h 03m 14s into the lane`, and the wall clock when the lane's
+/// origin is known.
+fn lane_span(from_ms: i64, to_ms: i64, origin_ms: Option<i64>) -> String {
+    let mut text = format!(
+        "{} to {} into the lane",
+        lane_offset(from_ms),
+        lane_offset(to_ms)
+    );
+    if let Some(origin) = origin_ms {
+        text.push_str(&format!(
+            " ({} to {})",
+            stamp(origin.saturating_add(from_ms)),
+            stamp(origin.saturating_add(to_ms))
+        ));
+    }
+    text
+}
+
+/// ` · started 52m 10s, ran 11m 04s` for a failure whose row dated it.
+fn ran_at(row: &CadenceRow, test: &str) -> String {
+    match row.tests.get(test) {
+        Some(TestOutcome::Failed(Failure {
+            span: Some(span), ..
+        })) => format!(
+            " · started {}, ran {}",
+            lane_offset(span.start_ms),
+            lane_offset(span.end_ms - span.start_ms)
+        ),
+        _ => String::new(),
     }
 }
 
@@ -2787,7 +3078,7 @@ struct RowDiff<'a> {
 
 fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> RowDiff<'a> {
     let mut diff = RowDiff::default();
-    let mut faces: BTreeMap<&'static str, HostConditionGroup<'_>> = BTreeMap::new();
+    let mut faces: BTreeMap<&'static str, (&'static HostCondition, Vec<&str>)> = BTreeMap::new();
     for (test, outcome) in &current.tests {
         if let TestOutcome::Failed(Failure {
             host_condition: Some(condition),
@@ -2796,26 +3087,33 @@ fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> Ro
         {
             faces
                 .entry(condition.face)
-                .or_insert_with(|| HostConditionGroup {
-                    condition,
-                    tests: Vec::new(),
-                })
-                .tests
+                .or_insert_with(|| (condition, Vec::new()))
+                .1
                 .push(test.as_str());
         }
     }
-    faces.retain(|_, group| group.breadth() >= HOST_CONDITION_MIN);
-    let on_host: HashSet<&str> = faces
-        .values()
+    faces.retain(|_, (condition, tests)| condition.breadth(tests) >= HOST_CONDITION_MIN);
+    diff.host_conditions = faces
+        .into_values()
+        .map(|(condition, tests)| HostConditionGroup {
+            cause: HostCause::Error(condition),
+            tests,
+        })
+        .collect();
+    let on_error: HashSet<&str> = diff
+        .host_conditions
+        .iter()
         .flat_map(|group| group.tests.iter().copied())
         .collect();
-    diff.host_conditions = faces.into_values().collect();
-    diff.host_conditions.sort_by(|a, b| {
-        b.tests
-            .len()
-            .cmp(&a.tests.len())
-            .then(a.condition.face.cmp(b.condition.face))
-    });
+    diff.host_conditions
+        .extend(stall_windows(current, &on_error));
+    let on_host: HashSet<&str> = diff
+        .host_conditions
+        .iter()
+        .flat_map(|group| group.tests.iter().copied())
+        .collect();
+    diff.host_conditions
+        .sort_by(|a, b| a.order().cmp(&b.order()));
     let mut newly_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut first_red: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for (test, outcome) in &current.tests {
@@ -2988,11 +3286,22 @@ fn render_host_conditions(
                 .count()
         };
         out.push_str(&format!(
-            "\n**HOST CONDITION on `{}`: {count} tests failed on `{}`** — {}, so none of them is counted as newly red or still red.\n",
+            "\n**HOST CONDITION on `{}`: {}** — {}, so none of them is counted as newly red or still red.\n",
             host(row),
-            group.condition.face,
+            group.title(row),
             group.reading()
         ));
+        if let HostCause::Stall(StallWindow {
+            together: Some((from, to)),
+            bounded,
+            ..
+        }) = &group.cause
+        {
+            out.push_str(&format!(
+                "- All {bounded} that ended at a bound were in flight together from {}.\n",
+                lane_span(*from, *to, row.lane_started_at_ms)
+            ));
+        }
         let mut discriminator = match previous {
             Some(previous) => format!(
                 "- Discriminator: {} of {count} passed on `{}` at the compared row ({}, commit `{}`)",
@@ -3014,7 +3323,7 @@ fn render_host_conditions(
         discriminator.push_str(". The same test passing on the same host one tip earlier separates the host from the tree; a rerun here after the condition clears confirms it.\n");
         out.push_str(&discriminator);
         for test in group.tests.iter().take(MAX_IDS_PER_GROUP) {
-            out.push_str(&format!("  - `{test}`\n"));
+            out.push_str(&format!("  - `{test}`{}\n", ran_at(row, test)));
         }
         if count > MAX_IDS_PER_GROUP {
             out.push_str(&format!("  - … and {} more\n", count - MAX_IDS_PER_GROUP));
@@ -3156,13 +3465,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         let conditions: Vec<String> = diff
             .host_conditions
             .iter()
-            .map(|group| {
-                format!(
-                    "{} tests failed on one host condition: {}",
-                    group.tests.len(),
-                    group.condition.face
-                )
-            })
+            .map(HostConditionGroup::headline)
             .collect();
         headline.push_str(&format!(" — {}", conditions.join("; ")));
     }
@@ -3473,11 +3776,20 @@ mod tests {
                 .map(|(test, outcome)| (test.to_string(), outcome.clone()))
                 .collect(),
             output_tail: String::new(),
+            lane_started_at_ms: None,
         }
     }
 
     fn failed(excerpt: &str) -> TestOutcome {
         TestOutcome::Failed(Failure::from_excerpt(excerpt))
+    }
+
+    /// A failure the row dated: started `start_ms` into the lane, ran
+    /// `duration_ms`.
+    fn failed_at(excerpt: &str, start_ms: i64, duration_ms: i64) -> TestOutcome {
+        TestOutcome::Failed(
+            Failure::from_excerpt(excerpt).ran(Span::recorded(Some(start_ms), Some(duration_ms))),
+        )
     }
 
     /// `row` as recorded on another executor.
@@ -4396,6 +4708,144 @@ mod tests {
         );
         assert!(text.contains("1 failed — 1 newly red"), "{text}");
         assert!(!text.contains("HOST CONDITION"), "{text}");
+    }
+
+    /// Specimen cairn/5579 (54001404, fedora): 15 tests ended at nextest's
+    /// slow-timeout bound in three modules of cairn-core's `main` binary, and
+    /// other tests failed their assertions while the same freeze held them.
+    /// Dated, the timeouts are one window and the failures inside it join it;
+    /// a red outside the window stays a red.
+    #[test]
+    fn overlapping_timeouts_across_files_are_one_stall_window_with_its_bounds() {
+        const TIMEOUT: &str = "TIMEOUT: nextest terminated this test at its slow-timeout bound (src-tauri/.config/nextest.toml)\nran 663s before termination";
+        const MINUTE: i64 = 60_000;
+        let names = [
+            "cairn-core::main$turso_sync_roundtrip::case_0",
+            "cairn-core::main$turso_sync_roundtrip::case_1",
+            "cairn-core::main$turso_sync_roundtrip::case_2",
+            "cairn-core::main$turso_sync_roundtrip::case_3",
+            "cairn-core::main$pr_actions::two_next_branches_take_consecutive_numbers",
+            "cairn-core::cairn_core$ingress::ws::tests::a_doorbell_poke_syncs_within_a_second",
+            "cairn-exec::cairn_exec$tests::slot_adoption_holds_a_queued_request",
+            "cairn-core::cairn_core$projects::export::tests::quick",
+        ];
+        let passing: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .map(|name| (*name, TestOutcome::Passed))
+            .collect();
+        let previous = on("fedora", row("prev", "aaaaaaaaaaaaaaaa", HOUR, &passing));
+        let render = |tests: &[(&str, TestOutcome)], lane_started_at_ms: Option<i64>| {
+            let mut current = on("fedora", row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, tests));
+            current.lane_started_at_ms = lane_started_at_ms;
+            report(
+                &CadenceVerdict::Complete(current),
+                &same(&previous),
+                &Bracket::default(),
+            )
+        };
+
+        let mut frozen = passing.clone();
+        for (n, outcome) in frozen.iter_mut().take(4).enumerate() {
+            outcome.1 = failed_at(TIMEOUT, 50 * MINUTE + n as i64 * 1_000, 663_000);
+        }
+        frozen[4].1 = failed_at(TIMEOUT, 52 * MINUTE, 600_000);
+        frozen[5].1 = failed_at(
+            "test ingress::ws::tests::a_doorbell_poke_syncs_within_a_second has been running for over 60 seconds\n\nthread 'ingress::ws::tests::a_doorbell_poke_syncs_within_a_second' panicked at os/cairn-core/src/ingress/ws.rs:88:9:\nno sync within a second",
+            55 * MINUTE,
+            108_000,
+        );
+        frozen[6].1 = failed_at("assertion `left == right` failed", 5 * MINUTE, 29);
+        let origin = 1_793_346_970_320;
+        let text = render(&frozen, Some(origin));
+        assert!(
+            text.contains("7 failed — 6 tests failed inside one stall window, 50m 00s to 1h 02m 00s into the lane — 1 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert_eq!(text.matches("**HOST CONDITION").count(), 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "**HOST CONDITION on `fedora`: 6 tests failed inside one stall window, 50m 00s to 1h 02m 00s into the lane ({} to {})** — 5 tests in 2 unrelated files ran into a time bound while their runs overlapped, which is this machine stalling, not the tree; 1 more failed while running through the same window",
+                stamp(origin + 50 * MINUTE),
+                stamp(origin + 62 * MINUTE)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("- All 5 that ended at a bound were in flight together from 52m 00s to 1h 01m 03s into the lane"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Discriminator: 6 of 6 passed on `fedora` at the compared row"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  - `cairn-core::main$turso_sync_roundtrip::case_0` · started 50m 00s, ran 11m 03s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  - `cairn-core::cairn_core$ingress::ws::tests::a_doorbell_poke_syncs_within_a_second` · started 55m 00s, ran 1m 48s"),
+            "{text}"
+        );
+        // The red that ran an hour before the window is still the tree's.
+        assert!(
+            text.contains("**NEWLY RED: 1 test in 1 failure group**"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`cairn-exec::cairn_exec$tests::slot_adoption_holds_a_queued_request`"),
+            "{text}"
+        );
+
+        // Overlapping timeouts in one file may be that file's own hang.
+        let mut one_file = passing.clone();
+        for (n, outcome) in one_file.iter_mut().take(4).enumerate() {
+            outcome.1 = failed_at(TIMEOUT, 50 * MINUTE + n as i64 * 1_000, 663_000);
+        }
+        let text = render(&one_file, None);
+        assert!(text.contains("4 failed — 4 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+
+        // Timeouts in two files an hour apart are two reds, not one stall.
+        let mut apart = passing.clone();
+        apart[0].1 = failed_at(TIMEOUT, 5 * MINUTE, 600_000);
+        apart[4].1 = failed_at(TIMEOUT, 80 * MINUTE, 600_000);
+        let text = render(&apart, None);
+        assert!(text.contains("2 failed — 2 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+
+        // A lone timeout is a red to look at.
+        let mut lone = passing.clone();
+        lone[4].1 = failed_at(TIMEOUT, 52 * MINUTE, 600_000);
+        let text = render(&lone, None);
+        assert!(text.contains("1 failed — 1 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+
+        // Undated, the same timeouts cannot be bracketed and stay reds.
+        let mut undated = passing.clone();
+        for outcome in undated.iter_mut().take(5) {
+            outcome.1 = failed(TIMEOUT);
+        }
+        let text = render(&undated, None);
+        assert!(text.contains("5 failed — 5 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+    }
+
+    #[test]
+    fn a_nextest_ids_file_is_its_module_and_a_vitest_ids_is_its_file() {
+        assert_eq!(
+            test_file("cairn-core::main$turso_sync_roundtrip::all_dbs_list"),
+            "cairn-core::main$turso_sync_roundtrip"
+        );
+        assert_eq!(
+            test_file("cairn-core::cairn_core$ingress::ws::tests::a_doorbell"),
+            "cairn-core::cairn_core$ingress::ws::tests"
+        );
+        assert_eq!(test_file("cairn-cli::cli$top_level"), "cairn-cli::cli");
+        assert_eq!(
+            test_file("scripts/lib/a.test.ts > suite > case"),
+            "scripts/lib/a.test.ts"
+        );
+        assert_eq!(test_file("src/b.test.ts"), "src/b.test.ts");
     }
 
     #[test]

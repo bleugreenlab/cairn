@@ -1,0 +1,14 @@
+-- lineage: shared
+-- cairn/5579: when inside its lane each test started. A per-test row held its
+-- duration and not its start, so a host-wide stall (a freeze, an I/O stall)
+-- that ended a dozen tests at their time bounds could be inferred from the
+-- shape of their durations but never bracketed to the tests it hit.
+--
+-- Milliseconds from the lane's timeline origin to the moment the runner saw
+-- the test start. It is the origin the observation's `phase_origin` names
+-- (scripts/lib/lane-phases.ts): under `executor` it is
+-- `executor_started_at_unix_ms`, so the sum is a wall-clock instant.
+--
+-- NULL on rows recorded before this column existed, on tests that never
+-- started (skipped), and on runners that do not stamp starts (vitest, bun).
+ALTER TABLE check_test_results ADD COLUMN started_offset_ms INTEGER;

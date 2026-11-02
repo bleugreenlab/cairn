@@ -922,6 +922,7 @@ mod tests {
                         skip_reason: None,
                         skip_declaration: None,
                         skip_declaration_source: None,
+                        started_offset_ms: None,
                     })
                     .collect(),
                 undeclared_skips: 0,

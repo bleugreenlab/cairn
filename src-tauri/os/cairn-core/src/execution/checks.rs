@@ -8433,6 +8433,9 @@ fn fresh_observation_write(
                     skip_reason: test.skip_reason.clone(),
                     declaration_source: test.skip_declaration_source.clone(),
                     flaky: test.flaky,
+                    started_offset_ms: test
+                        .started_offset_ms
+                        .and_then(|offset| i64::try_from(offset).ok()),
                 })
                 .collect()
         })
@@ -22400,6 +22403,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 skip_reason: None,
                 skip_declaration: None,
                 skip_declaration_source: None,
+                started_offset_ms: None,
             }],
             undeclared_skips: 0,
             parser: "nextest".to_string(),

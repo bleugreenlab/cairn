@@ -1929,6 +1929,10 @@ pub(crate) struct CheckTestResultRow {
     pub skip_reason: Option<String>,
     pub declaration_source: Option<String>,
     pub flaky: bool,
+    /// When the test started, in milliseconds from the lane's timeline origin
+    /// (the one `phases.origin` names). `None` for a test that never started,
+    /// a deferral, and a runner that does not stamp starts.
+    pub started_offset_ms: Option<i64>,
 }
 
 #[allow(dead_code)]
@@ -2228,12 +2232,9 @@ fn observation_phases(row: &cairn_db::turso::Row, at: usize) -> DbResult<Observa
     ))
 }
 
-/// Every per-test outcome of one observation, read through the
-/// `check_test_outcomes` view: `check_test_results` (passed, failed, skipped)
-/// united with `check_deferred_tests` (deferred). Readers name the view rather
-/// than either table, so a deferred test is never invisible and never a pass.
-const OBSERVATION_TEST_COLUMNS: &str =
-    "test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,declaration_source,flaky";
+/// The columns of [`OBSERVATION_TEST_OUTCOMES`] every per-test reader selects,
+/// in the order [`observation_test_row`] decodes them.
+const OBSERVATION_TEST_COLUMNS: &str = "test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,declaration_source,flaky,started_offset_ms";
 
 /// One observation's per-test outcomes, its id bound as `?1`: the result rows
 /// united with the deferred tests as `status = 'deferred'`. Every per-test
@@ -2247,10 +2248,10 @@ const OBSERVATION_TEST_COLUMNS: &str =
 /// (cairn/5304). `observation_lookups_seek_their_index` pins the plan.
 const OBSERVATION_TEST_OUTCOMES: &str =
     "(SELECT test_id,status,duration_ms,attempt_count,failure_excerpt,skip_reason,
-             declaration_source,flaky
+             declaration_source,flaky,started_offset_ms
         FROM check_test_results WHERE observation_id=?1
       UNION ALL
-      SELECT test_id,'deferred',duration_ms,attempt_count,NULL,NULL,NULL,0
+      SELECT test_id,'deferred',duration_ms,attempt_count,NULL,NULL,NULL,0,NULL
         FROM check_deferred_tests WHERE observation_id=?1) outcomes";
 
 /// The per-test filter of a paged read: `?2` an exact status and `?3` a test-id
@@ -2274,6 +2275,21 @@ fn observation_test_page_sql() -> String {
           WHERE {OBSERVATION_TEST_FILTER}
           ORDER BY test_id ASC LIMIT ?4 OFFSET ?5"
     )
+}
+
+/// One per-test row selected as [`OBSERVATION_TEST_COLUMNS`].
+fn observation_test_row(row: &cairn_db::turso::Row) -> DbResult<CheckTestResultRow> {
+    Ok(CheckTestResultRow {
+        test_id: row.text(0)?,
+        status: row.text(1)?,
+        duration_ms: row.opt_i64(2)?,
+        attempt_count: row.opt_i64(3)?,
+        failure_excerpt: row.opt_text(4)?,
+        skip_reason: row.opt_text(5)?,
+        declaration_source: row.opt_text(6)?,
+        flaky: row.i64(7)? != 0,
+        started_offset_ms: row.opt_i64(8)?,
+    })
 }
 
 /// Whether a recorded result answers its lane
@@ -2535,12 +2551,7 @@ pub(crate) fn record_fresh_check_observation(
                     ).await?;
                     let mut stored = Vec::new();
                     while let Some(row) = tests.next().await? {
-                        stored.push(CheckTestResultRow {
-                            test_id: row.text(0)?, status: row.text(1)?, duration_ms: row.opt_i64(2)?,
-                            attempt_count: row.opt_i64(3)?, failure_excerpt: row.opt_text(4)?,
-                            skip_reason: row.opt_text(5)?, declaration_source: row.opt_text(6)?,
-                            flaky: row.i64(7)? != 0,
-                        });
+                        stored.push(observation_test_row(&row)?);
                     }
                     let mut expected = observation.tests.clone();
                     expected.sort_by(|a, b| a.test_id.cmp(&b.test_id));
@@ -2628,13 +2639,14 @@ pub(crate) fn record_fresh_check_observation(
                     conn.execute(
                         "INSERT INTO check_test_results (
                             observation_id, test_id, status, duration_ms, attempt_count,
-                            failure_excerpt, skip_reason, declaration_source, flaky
-                         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                            failure_excerpt, skip_reason, declaration_source, flaky,
+                            started_offset_ms
+                         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                          ON CONFLICT(observation_id, test_id) DO NOTHING",
                         params![observation.id.as_str(), test.test_id.as_str(), test.status.as_str(),
                             test.duration_ms, test.attempt_count, test.failure_excerpt.as_deref(),
                             test.skip_reason.as_deref(), test.declaration_source.as_deref(),
-                            i64::from(test.flaky)],
+                            i64::from(test.flaky), test.started_offset_ms],
                     ).await?;
                 }
                 let answers = result_answers_the_lane(
@@ -2896,12 +2908,7 @@ pub(crate) fn get_check_result_observation(
                     params![observation_id.as_str(), keys.4.as_deref(), keys.5.as_deref(), limit as i64, offset as i64]
                 ).await?;
                 while let Some(test) = tests.next().await? {
-                    projection.tests.push(CheckTestResultRow {
-                        test_id: test.text(0)?, status: test.text(1)?, duration_ms: test.opt_i64(2)?,
-                        attempt_count: test.opt_i64(3)?, failure_excerpt: test.opt_text(4)?,
-                        skip_reason: test.opt_text(5)?, declaration_source: test.opt_text(6)?,
-                        flaky: test.i64(7)? != 0,
-                    });
+                    projection.tests.push(observation_test_row(&test)?);
                 }
                 Ok(Some(projection))
             })
@@ -3003,16 +3010,7 @@ pub(crate) fn get_check_result_observation_by_handle(
                     .query(observation_tests_sql(), params![id.as_str()])
                     .await?;
                 while let Some(test) = tests.next().await? {
-                    projection.tests.push(CheckTestResultRow {
-                        test_id: test.text(0)?,
-                        status: test.text(1)?,
-                        duration_ms: test.opt_i64(2)?,
-                        attempt_count: test.opt_i64(3)?,
-                        failure_excerpt: test.opt_text(4)?,
-                        skip_reason: test.opt_text(5)?,
-                        declaration_source: test.opt_text(6)?,
-                        flaky: test.i64(7)? != 0,
-                    });
+                    projection.tests.push(observation_test_row(&test)?);
                 }
                 projection.test_total = projection.tests.len();
                 Ok(Some(projection))
@@ -3563,6 +3561,7 @@ mod tests {
                 skip_reason: None,
                 declaration_source: None,
                 flaky: false,
+                started_offset_ms: None,
             }],
         };
         observation.sealed_coordinate = SealedCheckCoordinate::new(
@@ -3724,6 +3723,7 @@ mod tests {
             skip_reason: None,
             declaration_source: None,
             flaky: false,
+            started_offset_ms: None,
         });
         record_fresh_check_observation(db.clone(), write.clone()).unwrap();
         // Re-recording the identical observation is idempotent: the manifest
@@ -5626,6 +5626,7 @@ mod tests {
                 skip_reason: None,
                 declaration_source: None,
                 flaky: false,
+                started_offset_ms: None,
             })
             .collect();
         record_fresh_check_observation(db.clone(), write).unwrap();
@@ -6058,6 +6059,7 @@ mod tests {
             skip_reason: None,
             declaration_source: None,
             flaky: false,
+            started_offset_ms: None,
         });
         assert!(record_fresh_check_observation(db.clone(), conflicting).is_err());
 
@@ -6644,7 +6646,7 @@ mod tests {
         // `input_hash` is the cache key; here it mirrors `tree_hash` so each
         // distinct-tree insert stays a distinct row under the
         // `(project_id, check_name, input_hash)` primary key.
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO check_result_cache
                (project_id, tree_hash, input_hash, check_name, exit_code, passed,
                 output_tail, duration_ms, ran_at)
@@ -6699,7 +6701,7 @@ mod tests {
         passed: bool,
         ran_at: i64,
     ) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO check_result_cache
                (project_id, tree_hash, input_hash, check_name, exit_code, passed,
                 output_tail, duration_ms, ran_at, job_id)
@@ -6817,7 +6819,7 @@ mod tests {
     async fn job_listing_keeps_the_verdict_over_a_newer_attempt_that_produced_none() {
         for (pass_at, infra_at) in [(100, 200), (200, 100)] {
             let db = cache_db().await;
-            db.execute_script(&format!(
+            db.execute_script(format!(
                 "
                 INSERT INTO check_result_cache
                    (project_id, tree_hash, input_hash, check_name, exit_code, passed,

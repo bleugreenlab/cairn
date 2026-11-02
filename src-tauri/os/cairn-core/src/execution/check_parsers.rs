@@ -276,6 +276,10 @@ pub(crate) struct CheckTestResult {
     pub(crate) skip_declaration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) skip_declaration_source: Option<String>,
+    /// When the runner saw the test start, in milliseconds from the lane's
+    /// timeline origin (`phases.origin`). Only the rust-tests runner stamps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) started_offset_ms: Option<u64>,
 }
 
 fn one_attempt() -> u32 {
@@ -828,6 +832,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
                 skip_reason: None,
                 skip_declaration: None,
                 skip_declaration_source: None,
+                started_offset_ms: None,
             });
             if status == "failed" {
                 assertion_failed = true;
@@ -1162,6 +1167,7 @@ fn test_row(id: String, status: &str, duration_ms: Option<u64>) -> CheckTestResu
         skip_reason: None,
         skip_declaration: None,
         skip_declaration_source: None,
+        started_offset_ms: None,
     }
 }
 

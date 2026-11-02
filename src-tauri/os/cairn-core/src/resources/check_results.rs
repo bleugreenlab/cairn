@@ -560,8 +560,22 @@ fn render_observation_page(
     let prelude_lines = body.iter().map(|line| line.split('\n').count()).sum();
     for test in &observation.tests {
         let mut line = format!("- [{}] {}", test.status, test.test_id);
-        if let Some(duration) = test.duration_ms {
-            line.push_str(&format!(" ({duration} ms)"));
+        // The start beside the duration is what dates a test against a host
+        // event: `(663979 ms, started 52 m 10 s into the lane)`.
+        let timing: Vec<String> = [
+            test.duration_ms.map(|duration| format!("{duration} ms")),
+            test.started_offset_ms.map(|offset| {
+                format!(
+                    "started {} into the lane",
+                    phase_span(u64::try_from(offset).unwrap_or(0))
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !timing.is_empty() {
+            line.push_str(&format!(" ({})", timing.join(", ")));
         }
         if test.flaky {
             line.push_str("; flaky");
@@ -896,6 +910,7 @@ mod tests {
                     skip_reason: None,
                     declaration_source: None,
                     flaky: false,
+                    started_offset_ms: Some(1_500),
                 },
                 crate::execution::cache::CheckTestResultRow {
                     test_id: "crate::fails".into(),
@@ -906,6 +921,7 @@ mod tests {
                     skip_reason: None,
                     declaration_source: None,
                     flaky: true,
+                    started_offset_ms: None,
                 },
             ],
             selection: Some("filtered".into()),
@@ -948,8 +964,8 @@ mod tests {
             "Ran at: 2025-",
             "Non-authoritative reason: red verdict",
             "1 passed, 1 failed, 0 skipped",
-            "crate::passes",
-            "crate::fails",
+            "- [passed] crate::passes (10 ms, started 2 s into the lane)",
+            "- [failed] crate::fails (20 ms); flaky",
             "flaky",
             "2 attempts",
             "Total: 3",
