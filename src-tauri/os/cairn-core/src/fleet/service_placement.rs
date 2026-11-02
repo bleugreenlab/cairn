@@ -795,11 +795,12 @@ fn process_generation(
             ResidencyFailureKind::Admission | ResidencyFailureKind::NotFound => {
                 Err(ServicePlacementError::Unavailable(diagnostic.clone()))
             }
-            // The substrate's refusal, not the process's: a service schedule
-            // retries a start refused this way instead of counting it as the
-            // service's failure. cairn/5754 refines this kind into a snapshot
-            // lagging its grant versus a route whose executor is gone; key the
-            // substrate's refusals on the kinds it lands.
+            // The substrate's refusal, not the process's: the runner could not
+            // route the start to the environment's cell (its machine is not
+            // answering, no longer reports it, has not been granted it, or no
+            // route exists), and its diagnostic names which. A service
+            // schedule retries a start refused this way instead of counting it
+            // as the service's failure.
             ResidencyFailureKind::Unavailable => {
                 Err(ServicePlacementError::Unroutable(diagnostic.clone()))
             }

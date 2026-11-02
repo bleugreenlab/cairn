@@ -1473,6 +1473,19 @@ pub struct Fleet {
     residency_routes: Arc<Mutex<HashMap<(String, String), ResidencyRoute>>>,
     residency_route_path: Arc<Option<PathBuf>>,
     residency_route_store_error: Arc<Mutex<Option<String>>>,
+    /// The cell each residency result returned, by executor and holder, held
+    /// until that executor's own report carries it. An executor answers a
+    /// grant before it publishes the snapshot that shows the grant, and the
+    /// two travel separately, so the snapshot can reach the runner well after
+    /// the answer; and a snapshot taken before the grant can arrive after it.
+    /// Between the two, the result is the only account of the cell.
+    ///
+    /// Scoped to the link generation the result arrived on and kept in memory:
+    /// a new link's opening snapshot, and after a runner restart the reconnect
+    /// snapshot, is the authority.
+    ///
+    /// Lock order: `residency_routes`, then this; never the reverse.
+    granted_cells: Arc<Mutex<HashMap<(String, String), GrantedCell>>>,
     /// Environments this runner rebuilt because the executor session holding the
     /// previous one ended, keyed by holder and drained by the surface that
     /// reports it. Held in memory on purpose: it is a fact about this runner's
@@ -1877,6 +1890,34 @@ struct ResidencyRoute {
     pending: bool,
 }
 
+/// A residency result's account of its cell, on the link it arrived on.
+#[derive(Clone, Debug)]
+struct GrantedCell {
+    generation: u64,
+    cell: PersistentCellState,
+    recorded_unix_ms: u64,
+}
+
+/// How long a granted cell outlives reports from its executor that lack it.
+///
+/// Not a wait: nothing is held back for it. It bounds how long the runner
+/// takes an executor's answer over that executor's later snapshots, which can
+/// trail the answer by as long as the executor's runtime is stalled. Erring
+/// long is cheap: a cell that really died inside the window gets one
+/// operation routed to its executor, which refuses it with `NotFound` or
+/// `StaleEpoch` itself. Erring short refuses operations on a cell that exists
+/// because a report was slow.
+const GRANT_CONFIRMATION_GRACE_MS: u64 = 60_000;
+
+/// The executor and cell a non-acquiring residency operation addresses.
+#[derive(Debug)]
+struct RoutedCell {
+    selected: SelectedExecutor,
+    residency: CellResidency,
+    cell_epoch: u64,
+    occupancy: cairn_common::executor_protocol::CellOccupancy,
+}
+
 /// How long an execution environment outlives its executor's link being down
 /// before the runner concludes the environment is gone and rebuilds it.
 ///
@@ -2046,6 +2087,18 @@ fn describe_holder(holder: &ResidencyHolder) -> String {
         ResidencyHolder::Job { job_id } => format!("job {job_id}"),
         other => other.storage_key(),
     }
+}
+
+/// A runner-clock instant as UTC wall time, for prose a reader lines up
+/// against logs.
+fn describe_utc_ms(unix_ms: u64) -> String {
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || format!("{unix_ms}ms"),
+            |at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        )
 }
 
 /// Milliseconds as minutes and seconds, for prose about how long a machine
@@ -6163,11 +6216,30 @@ impl Fleet {
         let connected = connections.keys().cloned().collect::<HashSet<_>>();
         drop(connections);
         drop(replaced);
+        let reported_holders = routes
+            .iter()
+            .map(|(route, _)| route.holder.storage_key())
+            .collect::<HashSet<_>>();
+        let now = unix_time_ms();
         let mut superseded = Vec::new();
         if let Err(error) = self.update_residency_routes(|known| {
-            known.retain(|(route_executor, _), route| {
-                route_executor != executor_id || route.pending
+            // A grant this report does not carry yet keeps its route: the
+            // report may have been taken before the grant. It stops counting
+            // once a report carries the cell (reports arrive in the order they
+            // were taken, so none older follows), once a new link has opened,
+            // or once reports have gone without it for the grace.
+            let mut granted = self.granted_cells.lock().unwrap();
+            granted.retain(|(granted_executor, holder_key), evidence| {
+                granted_executor.as_str() != executor_id
+                    || (!reported_holders.contains(holder_key)
+                        && evidence.generation == generation
+                        && now.saturating_sub(evidence.recorded_unix_ms)
+                            < GRANT_CONFIRMATION_GRACE_MS)
             });
+            known.retain(|key, route| {
+                key.0.as_str() != executor_id || route.pending || granted.contains_key(key)
+            });
+            drop(granted);
             for (route, fence) in routes {
                 // One owner, one environment. A machine coming back with a cell
                 // for an owner that another live machine now hosts is reporting a
@@ -9173,7 +9245,11 @@ impl Fleet {
                             placement.pinned_executor_id.is_some(),
                             *result,
                         );
-                        self.record_residency_result(&selected.executor_id, &result);
+                        self.record_residency_result(
+                            &selected.executor_id,
+                            dispatched_generation,
+                            &result,
+                        );
                         // Clear a failed pending route before releasing the identity.
                         drop(dispatch);
                         // This caller owns the typed result; queue.take journals
@@ -9358,40 +9434,13 @@ impl Fleet {
                         None,
                     );
                 };
-                let routed = {
-                    let connections = self.lock_connections();
-                    connections.iter().find_map(|(executor_id, connection)| {
-                        connection
-                            .snapshot
-                            .cells
-                            .iter()
-                            .find_map(|cell| {
-                                cell.residency
-                                    .as_ref()
-                                    .filter(|residency| residency.holder == *holder)
-                                    .cloned()
-                            })
-                            .map(|residency| {
-                                (
-                                    SelectedExecutor {
-                                        executor_id: executor_id.clone(),
-                                        device_id: connection.identity.device_id.clone(),
-                                        generation: connection.generation,
-                                        sender: connection.sender.clone(),
-                                        colocated: connection.colocated,
-                                        capabilities: connection.advertisement.capabilities.clone(),
-                                    },
-                                    residency,
-                                )
-                            })
-                    })
-                };
-                let Some((selected, residency)) = routed else {
-                    return residency_core_failure(
-                        ResidencyFailureKind::Unavailable,
-                        "no connected executor reports this execution environment",
-                        None,
-                    );
+                let RoutedCell {
+                    selected,
+                    residency,
+                    ..
+                } = match self.resolve_residency_operation_route(holder) {
+                    Ok(routed) => routed,
+                    Err(refusal) => return refusal,
                 };
                 let executor_config = if matches!(
                     operation,
@@ -9607,7 +9656,7 @@ impl Fleet {
                 )
             }
         };
-        self.record_residency_result(&selected.executor_id, &result);
+        self.record_residency_result(&selected.executor_id, selected.generation, &result);
         if let Some((relay_id, process_key)) = relayed_start {
             let started = match &result {
                 ResidencyResult::State { cell } => cell
@@ -9627,18 +9676,39 @@ impl Fleet {
         result
     }
 
-    fn record_residency_result(&self, executor_id: &str, result: &ResidencyResult) {
+    /// Record what a residency result says about its cell, as answered on link
+    /// `generation`.
+    ///
+    /// Every state result counts, not only a grant's: a later answer is a
+    /// newer account of the same cell than any the executor has reported.
+    fn record_residency_result(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        result: &ResidencyResult,
+    ) {
         match result {
             ResidencyResult::State { cell } => {
                 if let Some(residency) = cell.residency.as_ref() {
+                    let key = (executor_id.to_owned(), residency.holder.storage_key());
                     if let Err(error) = self.update_residency_routes(|routes| {
                         routes.insert(
-                            (executor_id.to_owned(), residency.holder.storage_key()),
+                            key.clone(),
                             ResidencyRoute {
                                 holder: residency.holder.clone(),
                                 repository: residency.repository.clone(),
                                 executor_id: executor_id.to_owned(),
                                 pending: false,
+                            },
+                        );
+                        // Under the route lock, so a snapshot applied at the
+                        // same moment sees the route and its grant together.
+                        self.granted_cells.lock().unwrap().insert(
+                            key.clone(),
+                            GrantedCell {
+                                generation,
+                                cell: cell.clone(),
+                                recorded_unix_ms: unix_time_ms(),
                             },
                         );
                     }) {
@@ -9650,6 +9720,10 @@ impl Fleet {
                 let released = holder.storage_key();
                 if let Err(error) = self.update_residency_routes(|routes| {
                     routes.retain(|(_, known_holder), _| known_holder != &released);
+                    self.granted_cells
+                        .lock()
+                        .unwrap()
+                        .retain(|(_, known_holder), _| known_holder != &released);
                 }) {
                     tracing::error!(%error, "persist released residency route removal failed");
                 }
@@ -9684,41 +9758,159 @@ impl Fleet {
         }
     }
 
-    /// What is running inside a residency's cell, as its executor last reported
-    /// it: resident processes, a batch in flight, a prior epoch still draining.
-    /// `None` when no connected executor reports the residency.
+    /// What is running inside a residency's cell, by the newest account the
+    /// runner holds of it: resident processes, a batch in flight, a prior
+    /// epoch still draining. `None` when no answering executor holds it.
     pub(crate) fn residency_occupancy(
         &self,
         holder: &ResidencyHolder,
     ) -> Option<cairn_common::executor_protocol::CellOccupancy> {
-        let connections = self.lock_connections();
-        connections.values().find_map(|connection| {
-            connection.snapshot.cells.iter().find_map(|cell| {
-                cell.residency
-                    .as_ref()
-                    .filter(|residency| residency.holder == *holder)
-                    .map(|_| cell.occupancy.clone())
-            })
-        })
+        self.resolve_residency_operation_route(holder)
+            .ok()
+            .map(|routed| routed.occupancy)
     }
 
-    #[allow(clippy::result_large_err)]
     /// The live fence for a residency as the fleet currently observes it. This
     /// lets a caller that knows only the holder — job teardown, say — address it
     /// without carrying an incarnation and epoch of its own.
     pub fn residency_fence(&self, holder: &ResidencyHolder) -> Option<ResidencyFence> {
-        let connections = self.lock_connections();
-        connections.values().find_map(|connection| {
-            connection.snapshot.cells.iter().find_map(|cell| {
-                cell.residency
-                    .as_ref()
-                    .filter(|residency| residency.holder == *holder)
-                    .map(|residency| ResidencyFence {
-                        holder: residency.holder.clone(),
-                        incarnation_id: residency.incarnation_id.clone(),
-                        cell_epoch: cell.cell_epoch,
-                    })
+        self.resolve_residency_operation_route(holder)
+            .ok()
+            .map(|routed| ResidencyFence {
+                holder: routed.residency.holder,
+                incarnation_id: routed.residency.incarnation_id,
+                cell_epoch: routed.cell_epoch,
             })
+    }
+
+    /// The executor and cell a non-acquiring operation on an owner's
+    /// environment addresses, or the refusal that says why there is none.
+    ///
+    /// The route table is the authority on where the environment is. The cell
+    /// comes from the newest account the runner holds on that route's current
+    /// link: the residency result the executor last returned for it, until a
+    /// report of the executor's own carries it, and that report after. Routing
+    /// by reports alone refused a process start sent straight after the acquire
+    /// that granted its cell, because the report showing the grant was still
+    /// behind the executor's stalled runtime.
+    ///
+    /// Every refusal is `Unavailable` and names which routing fact it is: the
+    /// environment's machine is not answering, its latest report no longer
+    /// carries the environment, its acquisition has not been granted, or no
+    /// route exists at all. None of them is a verdict on the operation itself.
+    #[allow(clippy::result_large_err)]
+    fn resolve_residency_operation_route(
+        &self,
+        holder: &ResidencyHolder,
+    ) -> Result<RoutedCell, ResidencyResult> {
+        let mut routes = self
+            .residency_routes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|route| route.holder == *holder)
+            .cloned()
+            .collect::<Vec<_>>();
+        // The refusal names one route, and the map has no order of its own.
+        routes.sort_by(|left, right| left.executor_id.cmp(&right.executor_id));
+        let now = unix_time_ms();
+        let mut routed = Vec::new();
+        let mut unanswered = Vec::new();
+        let mut unreported = Vec::new();
+        let mut ungranted = Vec::new();
+        for route in routes {
+            match self.route_answer(&route.executor_id, now) {
+                RouteAnswer::Live => match self.routed_cell(&route.executor_id, holder) {
+                    Some(cell) => routed.push(cell),
+                    None if route.pending => ungranted.push(route.executor_id),
+                    None => unreported.push(route.executor_id),
+                },
+                RouteAnswer::Unanswered(_) if route.pending => ungranted.push(route.executor_id),
+                RouteAnswer::Unanswered(quiet) => unanswered.push((route.executor_id, quiet)),
+            }
+        }
+        if routed.len() > 1 {
+            return Err(residency_core_failure(
+                ResidencyFailureKind::ConflictingDeclaration,
+                "multiple executors report the same execution environment",
+                None,
+            ));
+        }
+        if let Some(cell) = routed.pop() {
+            return Ok(cell);
+        }
+        let diagnostic = if let Some((executor_id, quiet)) = unanswered
+            .iter()
+            .min_by_key(|(_, quiet)| now.saturating_sub(quiet.since_unix_ms))
+        {
+            let state = match quiet.cause {
+                UnansweredCause::Disconnected => "disconnected".to_string(),
+                UnansweredCause::Silent { generation } => {
+                    format!("connected but silent on link generation {generation}")
+                }
+            };
+            format!(
+                "{} holds this execution environment and has not answered since {} ({} ago; {state})",
+                self.executor_name_for_text(executor_id),
+                describe_utc_ms(quiet.since_unix_ms),
+                describe_quiet_ms(now.saturating_sub(quiet.since_unix_ms)),
+            )
+        } else if let Some(executor_id) = unreported.first() {
+            format!(
+                "{}'s latest report no longer carries this execution environment",
+                self.executor_name_for_text(executor_id)
+            )
+        } else if let Some(executor_id) = ungranted.first() {
+            format!(
+                "this execution environment's acquisition on {} has not been granted yet",
+                self.executor_name_for_text(executor_id)
+            )
+        } else {
+            "no executor holds a route to this execution environment".to_string()
+        };
+        Err(residency_core_failure(
+            ResidencyFailureKind::Unavailable,
+            diagnostic,
+            None,
+        ))
+    }
+
+    /// The cell an executor's current link accounts for this owner: the last
+    /// residency result answered on that link while no later report has carried
+    /// the cell, otherwise the link's latest report.
+    ///
+    /// The result goes first because it can only still be held if every report
+    /// applied since it lacked the cell (one carrying it clears it), so it is
+    /// never older than the report beside it.
+    fn routed_cell(&self, executor_id: &str, holder: &ResidencyHolder) -> Option<RoutedCell> {
+        let granted = self
+            .granted_cells
+            .lock()
+            .unwrap()
+            .get(&(executor_id.to_owned(), holder.storage_key()))
+            .cloned();
+        let connections = self.lock_connections();
+        let entry = connections.get(executor_id)?;
+        let cell = granted
+            .filter(|granted| granted.generation == entry.generation)
+            .map(|granted| granted.cell)
+            .or_else(|| {
+                entry
+                    .snapshot
+                    .cells
+                    .iter()
+                    .find(|cell| {
+                        cell.residency
+                            .as_ref()
+                            .is_some_and(|residency| residency.holder == *holder)
+                    })
+                    .cloned()
+            })?;
+        Some(RoutedCell {
+            selected: selected_executor(entry),
+            residency: cell.residency?,
+            cell_epoch: cell.cell_epoch,
+            occupancy: cell.occupancy,
         })
     }
 
@@ -35926,6 +36118,362 @@ mod tests {
                 assert!(!orch.fleet.queue.holds(&identity));
                 assert!(!orch.fleet.residency_routes.lock().unwrap().values().next().unwrap().pending);
             }).await;
+    }
+
+    /// Grant `job`'s fresh acquisition on `remote` and return the cell the
+    /// grant answered with. No snapshot carries it.
+    async fn residency_grant_on_remote(
+        orch: &Orchestrator,
+        remote: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+        generation: u64,
+        job: &str,
+    ) -> PersistentCellState {
+        let request = residency_queue_request(job);
+        let (result, ()) = tokio::join!(
+            orch.fleet.operate_residency(
+                orch,
+                ResidencyOperation::Acquire {
+                    request: request.clone()
+                }
+            ),
+            async {
+                let entry = residency_queue_offer(remote).await;
+                orch.fleet.handle_executor_message(
+                    "remote",
+                    generation,
+                    ExecutorMessage::Claim {
+                        entry_id: entry.clone(),
+                    },
+                );
+                let (correlation, granted) = residency_queue_grant(remote, Some(&entry)).await;
+                residency_queue_reply(&orch.fleet, "remote", generation, correlation, &granted);
+            }
+        );
+        let ResidencyResult::State { cell } = result else {
+            panic!("the acquisition is granted: {result:?}");
+        };
+        cell
+    }
+
+    fn residency_fence_of(cell: &PersistentCellState) -> ResidencyFence {
+        let residency = cell.residency.as_ref().unwrap();
+        ResidencyFence {
+            holder: residency.holder.clone(),
+            incarnation_id: residency.incarnation_id.clone(),
+            cell_epoch: cell.cell_epoch,
+        }
+    }
+
+    /// Stop a process in `cell` and answer for `executor` on `generation`,
+    /// asserting the operation went out on that link with the cell's fence.
+    async fn residency_stop_routed_to(
+        orch: &Orchestrator,
+        receiver: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+        executor: &str,
+        generation: u64,
+        cell: &PersistentCellState,
+    ) -> ResidencyResult {
+        let fence = residency_fence_of(cell);
+        let (result, ()) = tokio::join!(
+            orch.fleet.operate_residency(
+                orch,
+                ResidencyOperation::StopProcess {
+                    fence: fence.clone(),
+                    process_key: "svc".into(),
+                }
+            ),
+            async {
+                let correlation_id = match residency_queue_frame(receiver).await {
+                    ExecutorMessage::ResidencyRequest {
+                        correlation_id,
+                        operation: ResidencyOperation::StopProcess { fence: sent, .. },
+                        ..
+                    } => {
+                        assert_eq!(sent, fence);
+                        correlation_id
+                    }
+                    other => panic!("the stop goes out on {executor}'s link: {other:?}"),
+                };
+                orch.fleet.handle_executor_message(
+                    executor,
+                    generation,
+                    ExecutorMessage::ResidencyResponse {
+                        correlation_id,
+                        result: ResidencyResult::State { cell: cell.clone() },
+                    },
+                );
+            }
+        );
+        result
+    }
+
+    async fn residency_stop_refusal(orch: &Orchestrator, cell: &PersistentCellState) -> String {
+        let result = orch
+            .fleet
+            .operate_residency(
+                orch,
+                ResidencyOperation::StopProcess {
+                    fence: residency_fence_of(cell),
+                    process_key: "svc".into(),
+                },
+            )
+            .await;
+        match result {
+            ResidencyResult::Failed {
+                kind: ResidencyFailureKind::Unavailable,
+                diagnostic,
+                ..
+            } => diagnostic,
+            other => panic!("an unroutable operation is refused Unavailable: {other:?}"),
+        }
+    }
+
+    /// The specimen ordering: the executor's answer to a grant reaches the
+    /// runner before any snapshot showing the cell. An operation sent straight
+    /// after the acquire routes to the granting link by the grant itself, and
+    /// the fence a holder-only caller reads comes from the grant too.
+    #[tokio::test]
+    async fn an_operation_right_after_its_grant_routes_to_the_granting_link() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "granted").await;
+            let holder = cell.residency.as_ref().unwrap().holder.clone();
+            assert!(
+                orch.fleet.lock_connections()["remote"]
+                    .snapshot
+                    .cells
+                    .is_empty(),
+                "no snapshot carries the granted cell"
+            );
+            assert_eq!(
+                orch.fleet.residency_fence(&holder),
+                Some(residency_fence_of(&cell))
+            );
+            let result =
+                residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A snapshot taken before the grant can reach the runner after the grant's
+    /// answer. It does not carry the cell, and rewriting the executor's routes
+    /// from it must not erase the route the grant just recorded.
+    #[tokio::test]
+    async fn a_snapshot_older_than_the_grant_keeps_the_grants_route() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "stale").await;
+            let key = (
+                "remote".to_string(),
+                cell.residency.as_ref().unwrap().holder.storage_key(),
+            );
+            orch.fleet.handle_executor_message(
+                "remote",
+                generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot::default(),
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(orch
+                .fleet
+                .residency_routes
+                .lock()
+                .unwrap()
+                .contains_key(&key));
+            assert!(orch.fleet.granted_cells.lock().unwrap().contains_key(&key));
+            let result =
+                residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A grant speaks only for the link it was answered on. With that link
+    /// gone, the refusal names the machine and that it stopped answering; on
+    /// the machine's next link, before and after that link's opening snapshot,
+    /// the refusal names what the runner then knows.
+    #[tokio::test]
+    async fn a_grant_on_a_retired_link_is_refused_naming_the_routing_case() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let cell = residency_grant_on_remote(&orch, &mut remote, generation, "retired").await;
+            let key = (
+                "remote".to_string(),
+                cell.residency.as_ref().unwrap().holder.storage_key(),
+            );
+            assert!(orch.fleet.disconnect_advertised_executor_with_origin(
+                "remote",
+                generation,
+                ExecutorDisconnectOrigin::RunnerInitiated
+            ));
+            let detached = residency_stop_refusal(&orch, &cell).await;
+            assert!(
+                detached.starts_with(
+                    "remote holds this execution environment and has not answered since "
+                ) && detached.ends_with("; disconnected)"),
+                "{detached}"
+            );
+
+            let (next_generation, _next) = residency_queue_attach(&orch.fleet, "remote");
+            assert_ne!(next_generation, generation);
+            assert_eq!(
+                residency_stop_refusal(&orch, &cell).await,
+                "remote's latest report no longer carries this execution environment"
+            );
+            orch.fleet.handle_executor_message(
+                "remote",
+                next_generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot::default(),
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(!orch.fleet.granted_cells.lock().unwrap().contains_key(&key));
+            assert!(!orch
+                .fleet
+                .residency_routes
+                .lock()
+                .unwrap()
+                .contains_key(&key));
+            assert_eq!(
+                residency_stop_refusal(&orch, &cell).await,
+                "no executor holds a route to this execution environment"
+            );
+        })
+        .await;
+    }
+
+    /// A report carrying the cell retires its grant, and the route stands on
+    /// the report. A grant that reports go on lacking past the grace is given
+    /// up, and its route with it.
+    #[tokio::test]
+    async fn a_grant_is_retired_by_a_report_that_carries_it_or_by_the_grace() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let confirmed =
+                residency_grant_on_remote(&orch, &mut remote, generation, "confirmed").await;
+            let confirmed_key = (
+                "remote".to_string(),
+                confirmed.residency.as_ref().unwrap().holder.storage_key(),
+            );
+            orch.fleet.handle_executor_message(
+                "remote",
+                generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot {
+                        cells: vec![confirmed.clone()],
+                        ..FleetSnapshot::default()
+                    },
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(!orch
+                .fleet
+                .granted_cells
+                .lock()
+                .unwrap()
+                .contains_key(&confirmed_key));
+            assert!(orch
+                .fleet
+                .residency_routes
+                .lock()
+                .unwrap()
+                .contains_key(&confirmed_key));
+
+            let expired =
+                residency_grant_on_remote(&orch, &mut remote, generation, "expired").await;
+            let expired_key = (
+                "remote".to_string(),
+                expired.residency.as_ref().unwrap().holder.storage_key(),
+            );
+            orch.fleet
+                .granted_cells
+                .lock()
+                .unwrap()
+                .get_mut(&expired_key)
+                .unwrap()
+                .recorded_unix_ms = unix_time_ms().saturating_sub(GRANT_CONFIRMATION_GRACE_MS + 1);
+            orch.fleet.handle_executor_message(
+                "remote",
+                generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot {
+                        cells: vec![confirmed.clone()],
+                        ..FleetSnapshot::default()
+                    },
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(!orch
+                .fleet
+                .granted_cells
+                .lock()
+                .unwrap()
+                .contains_key(&expired_key));
+            assert!(!orch
+                .fleet
+                .residency_routes
+                .lock()
+                .unwrap()
+                .contains_key(&expired_key));
+            assert!(
+                orch.fleet
+                    .residency_routes
+                    .lock()
+                    .unwrap()
+                    .contains_key(&confirmed_key),
+                "the report that keeps carrying a cell keeps its route"
+            );
+        })
+        .await;
+    }
+
+    /// After a runner restart no grant is held, and a route recorded only from
+    /// an executor's report routes exactly as it always has.
+    #[tokio::test]
+    async fn a_route_recorded_only_by_a_report_routes_to_its_executor() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let mut cell = materialization_read_cell("reported-cell", "reported");
+            cell.executor_id = "remote".into();
+            orch.fleet.handle_executor_message(
+                "remote",
+                generation,
+                ExecutorMessage::SnapshotUpdated {
+                    snapshot: FleetSnapshot {
+                        cells: vec![cell.clone()],
+                        ..FleetSnapshot::default()
+                    },
+                    health: ExecutorSubstrateReport::default(),
+                },
+            );
+            assert!(orch.fleet.granted_cells.lock().unwrap().is_empty());
+            let result =
+                residency_stop_routed_to(&orch, &mut remote, "remote", generation, &cell).await;
+            assert!(
+                matches!(result, ResidencyResult::State { .. }),
+                "{result:?}"
+            );
+        })
+        .await;
     }
 
     /// A machine that posts another acquisition's provisioning hold on the

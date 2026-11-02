@@ -6528,6 +6528,15 @@ pub struct LearnedResourceEstimate {
 /// directory's name is derived from the request and attempt rather than drawn
 /// at random, and the directory is kept until its tree is proven gone, then
 /// removed by the release, the drain, the sweep or the pressure ladder.
+///
+/// cairn/5754 does not move the number. The runner routes a non-acquiring
+/// residency operation by its residency route and the cell the executor's own
+/// `ResidencyResult::State` answer returned, instead of waiting for a snapshot
+/// to carry that cell, and every `ResidencyFailureKind::Unavailable` it
+/// produces at routing now names which routing fact it is. Both are
+/// runner-side readings of frames every executor already sends; no frame,
+/// variant, field or serialized form changes, and a runner talking to an older
+/// executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
