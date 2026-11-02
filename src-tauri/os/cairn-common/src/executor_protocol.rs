@@ -6453,6 +6453,14 @@ pub struct LearnedResourceEstimate {
 /// already get wrong; that executor can still deliver a pass's stale snapshot
 /// after a newer one, briefly hiding a cell acquired in between, until it runs
 /// a build carrying this.
+///
+/// cairn/5446 does not move the number. The executor's link test fixture now
+/// answers the executor's own CLI and tool refresh requests 404 and keeps
+/// waiting for the upgrade, as the runner's router already routes them by
+/// path. Blocking work that runtime shutdown cancels ends its awaiting task
+/// by a silent unwind instead of a printed panic. Both are inside the
+/// executor process, no frame, variant, field or serialized form changes, and
+/// a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
