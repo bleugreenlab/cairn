@@ -165,7 +165,7 @@ impl<'a> Ranks<'a> {
         for peer in &ordered[1..] {
             if peer.address.is_none() {
                 return Err(Refusal(format!(
-                    "machine {}'s address is unknown, so the head cannot reach it over ssh; set its address on its pool",
+                    "machine {}'s address is unknown, so the head cannot reach it over ssh; give it a machine record with its address",
                     peer.name
                 )));
             }
@@ -206,11 +206,11 @@ fn why_unfilled(name: &str, ranks: &Ranks<'_>, rank: usize) -> String {
     match name {
         "revision" => "the profile pins no weight file".into(),
         "head.link" => format!(
-            "the head {} has no link address; set it on its pool",
+            "the head {} has no link address: it reports no fast link joining it to a pool",
             ranks.machines[0].name
         ),
         "self.link" => format!(
-            "machine {} has no link address; set it on its pool",
+            "machine {} has no link address: it reports no fast link joining it to a pool",
             ranks.machines[rank].name
         ),
         "weights" => "the profile mounts no Hugging Face cache or pins no weight file".into(),
@@ -516,10 +516,10 @@ fn stop_script(ranks: &Ranks<'_>, deployment: &Deployment) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pool::RecordSource;
     use crate::profile::{
         Accelerator, HostOptions, ModelRef, Mount, ProfileOrigin, Requirements, SourcePin,
     };
+    use crate::record::RecordSource;
 
     const SHA: &str = "a83948492cf13df455170fb42885f5ef4db54fefe0feff0f841ecbff464ac9d8";
 
@@ -840,7 +840,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             refusal.0,
-            "profile deepseek-v4-flash-vision-exp-dspark-x2 uses {self.link}, which cannot be filled in: machine bginf-sp2 has no link address; set it on its pool"
+            "profile deepseek-v4-flash-vision-exp-dspark-x2 uses {self.link}, which cannot be filled in: machine bginf-sp2 has no link address: it reports no fast link joining it to a pool"
         );
         machines[1].address = None;
         let refusal = render(

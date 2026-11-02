@@ -2539,7 +2539,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
     (
-        "inference_pools",
+        "inference_machines",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
+    // Placement's preferences for the pools it detects here (cairn/5728):
+    // each pool's warm model and idle override, and the standing pins.
+    (
+        "model_pool_preferences",
+        TableScope::Private(PrivateReason::HostConfiguration),
+    ),
+    (
+        "model_pins",
         TableScope::Private(PrivateReason::HostConfiguration),
     ),
     // The models those profiles serve, by real name (cairn/5730).
@@ -2562,12 +2572,8 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_deployment_loads",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
-    // The pool controller's record per pool and its queue of model requests:
-    // what this orch decided for, and was asked of, its own inference machines.
-    (
-        "inference_pool_control",
-        TableScope::Private(PrivateReason::RunnerTransient),
-    ),
+    // Placement's queue of model requests: what this orch was asked of its
+    // own inference machines.
     (
         "inference_requests",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -5651,6 +5657,88 @@ mod tests {
             .unwrap(),
             1,
             "the rebuild keeps the evidence that references a tenet"
+        );
+    }
+
+    /// cairn/5728: the pool records retire. Each machine's address becomes a
+    /// machine record, a pool's default its warm model by real name under the
+    /// pool's sorted machine key, the controller's operator-set idle window the
+    /// override, and its pin a pin per deployment.
+    #[tokio::test]
+    async fn pool_records_carry_into_machines_preferences_and_pins() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("model-placement.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0315")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
+        db.execute_batch(
+            r#"INSERT INTO inference_recipes (id, source, body_json, created_at, updated_at) VALUES
+               ('dsv4f-tp2', 'bginf', '{"id":"dsv4f-tp2","model":{"name":"deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"}}', 1, 1),
+               ('qwen3-embed-4b', 'bginf', '{"id":"qwen3-embed-4b","model":{"name":"Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)"}}', 1, 1);
+             INSERT INTO inference_deployments (id, source, body_json, created_at, updated_at) VALUES
+               ('dsv4f-tp2', 'bginf', '{"id":"dsv4f-tp2","recipe":"dsv4f-tp2","machines":["bginf-sp1","bginf-sp2"]}', 1, 1),
+               ('qwen3-embed-4b', 'bginf', '{"id":"qwen3-embed-4b","recipe":"qwen3-embed-4b","machines":["fedora"]}', 1, 1);
+             INSERT INTO inference_pools (id, source, body_json, created_at, updated_at) VALUES
+               ('halo', 'bginf', '{"id":"halo","source":"bginf","machines":[{"name":"fedora","address":"10.20.20.43"}],"default":["qwen3-embed-4b"]}', 2, 3),
+               ('sparks', 'bginf', '{"id":"sparks","source":"bginf","machines":[{"name":"bginf-sp2"},{"name":"bginf-sp1","address":"10.20.20.40"}],"default":["dsv4f-tp2"],"pin":[]}', 2, 4),
+               ('empty', 'cairn', '{"id":"empty","machines":[{"name":"spare"}],"default":[]}', 2, 5);
+             INSERT INTO inference_pool_control (pool, body_json, generation, updated_at) VALUES
+               ('sparks', '{"pool":"sparks","controlled":true,"settings":{"modelIdleSecs":600,"minResidencySecs":600},"pin":{"set":["dsv4f-tp2"],"holder":"operator","at":77},"active":{"members":{},"why":{"kind":"adopted"},"since":1},"lastBatchWorkAt":1,"generation":3}', 3, 4);"#,
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || '=' || source || ':' || json_extract(body_json, '$.address'), ';')
+                 FROM (SELECT * FROM inference_machines ORDER BY id)"
+            )
+            .await
+            .unwrap(),
+            "bginf-sp1=bginf:10.20.20.40;fedora=bginf:10.20.20.43",
+            "a machine with an address becomes a machine record; one without has nothing to carry"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(pool_key || '=' || COALESCE(warm_model, '-') || '/' || COALESCE(idle_override_secs, '-'), ';')
+                 FROM (SELECT * FROM model_pool_preferences ORDER BY pool_key)"
+            )
+            .await
+            .unwrap(),
+            "bginf-sp1+bginf-sp2=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/600;fedora=Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)/-",
+            "keyed by sorted machine names; a pool with neither a default nor an override carries nothing"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT deployment_id || '=' || model || '/' || holder || '@' || at FROM model_pins"
+            )
+            .await
+            .unwrap(),
+            "dsv4f-tp2=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/operator@77"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('inference_pools', 'inference_pool_control')"
+            )
+            .await
+            .unwrap(),
+            0,
+            "the pool records and the controller's record retire"
         );
     }
 

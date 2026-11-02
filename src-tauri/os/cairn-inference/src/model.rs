@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use cairn_models_types::catalog::{Modalities, VerbKind};
 use serde::{Deserialize, Serialize};
 
-use crate::pool::RecordSource;
+use crate::record::RecordSource;
 
 /// A model, keyed by its Hugging Face repository id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

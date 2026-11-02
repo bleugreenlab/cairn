@@ -157,10 +157,6 @@ async fn resolve_task_agent_config(
 struct MaterializedTask {
     packet: crate::models::DelegatedWorkPacket,
     job_id: String,
-    /// The child's run when the spawn already knew it. Results resolve the run
-    /// again when they render, so a child that starts later still reports.
-    run_id: Option<String>,
-    agent_config: AgentConfig,
     description: String,
     schema_type: String,
     /// How far the child had got when the spawn answered. Set by the task
@@ -431,8 +427,7 @@ pub(crate) async fn spawn_task_packets_within(
         }
     }
 
-    let mut prepared: Vec<(crate::models::DelegatedWorkPacket, AgentConfig, String)> =
-        Vec::with_capacity(count);
+    let mut prepared: Vec<(crate::models::DelegatedWorkPacket, String)> = Vec::with_capacity(count);
     let mut persist_failure: Option<(usize, String)> = None;
     for (index, (payload, agent_config)) in resolved.into_iter().enumerate() {
         #[cfg(test)]
@@ -452,7 +447,7 @@ pub(crate) async fn spawn_task_packets_within(
         )
         .await
         {
-            Ok(packet) => prepared.push((packet, agent_config, payload.description.clone())),
+            Ok(packet) => prepared.push((packet, payload.description.clone())),
             Err(e) => {
                 persist_failure = Some((index, e));
                 break;
@@ -491,7 +486,7 @@ pub(crate) async fn spawn_task_packets_within(
     let mut materialized: Vec<MaterializedTask> = Vec::with_capacity(prepared.len());
     let mut materialized_indices = Vec::with_capacity(prepared.len());
     let mut refused = Vec::new();
-    for (index, (packet, agent_config, description)) in prepared.into_iter().enumerate() {
+    for (index, (packet, description)) in prepared.into_iter().enumerate() {
         match classify_packet_launch(
             orch,
             &execution_db,
@@ -508,15 +503,9 @@ pub(crate) async fn spawn_task_packets_within(
                 launch,
             } => {
                 let schema_type = packet.output_contract.artifact_name();
-                let run_id = match &launch {
-                    TaskLaunch::Started { run_id, .. } => Some(run_id.clone()),
-                    TaskLaunch::WaitingToStart { .. } => None,
-                };
                 materialized.push(MaterializedTask {
                     packet: *packet,
                     job_id,
-                    run_id,
-                    agent_config,
                     description,
                     schema_type,
                     launch: Some(launch),
@@ -1001,8 +990,6 @@ pub async fn spawn_call_packets(
         materialized.push(MaterializedTask {
             packet,
             job_id: prepared.job_id,
-            run_id: Some(prepared.run_id),
-            agent_config: prepared.agent_config,
             description: payload.description.clone(),
             schema_type,
             launch: None,
@@ -1274,31 +1261,6 @@ async fn suspend_parent_for_tasks(
     }
 }
 
-/// A minimal placeholder agent config for a workflow's `MaterializedTask`. The
-/// suspend/resume tail reads only `name` from it (in the failure-branch message);
-/// a workflow's success result is rendered from its output artifact, not this.
-fn workflow_placeholder_agent_config(workflow_id: &str) -> AgentConfig {
-    AgentConfig {
-        id: "workflow".to_string(),
-        name: format!("workflow {workflow_id}"),
-        description: String::new(),
-        prompt: String::new(),
-        tools: vec![],
-        tier: None,
-        workspace_id: Some("workspace".to_string()),
-        project_id: None,
-        created_at: 0,
-        updated_at: 0,
-        disallowed_tools: None,
-        skills: None,
-        fence: None,
-        backend_preference: None,
-        icon: None,
-        selection: None,
-        extras: None,
-    }
-}
-
 /// Canonical workflow-invocation spawn pipeline (CAIRN-2487).
 ///
 /// A workflow `run` target is delegation-shaped like a call, but its process is a
@@ -1407,8 +1369,6 @@ pub async fn spawn_workflow_packets(
     let materialized = vec![MaterializedTask {
         packet,
         job_id: prepared.job_id.clone(),
-        run_id: Some(prepared.run_id.clone()),
-        agent_config: workflow_placeholder_agent_config(input.workflow_id),
         description,
         schema_type: contract.artifact_name(),
         launch: None,
@@ -1447,23 +1407,11 @@ async fn build_tasks_response(
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id)
         .await
         .unwrap_or_else(|_| orch.db.local.clone());
-    let mut run_ids = Vec::with_capacity(materialized.len());
-    for task in materialized {
-        run_ids.push(
-            latest_run_for_job(&db, &task.job_id)
-                .await
-                .ok()
-                .flatten()
-                .or_else(|| task.run_id.clone()),
-        );
-    }
     if materialized.len() == 1 {
         let task = &materialized[0];
         return build_task_callback_response(
             &db,
-            run_ids[0].as_deref(),
             &task.job_id,
-            &task.agent_config,
             &task.description,
             &task.schema_type,
         )
@@ -1472,15 +1420,9 @@ async fn build_tasks_response(
 
     let mut sections = Vec::with_capacity(materialized.len());
     for (index, task) in materialized.iter().enumerate() {
-        let response = build_task_callback_response(
-            &db,
-            run_ids[index].as_deref(),
-            &task.job_id,
-            &task.agent_config,
-            &task.description,
-            &task.schema_type,
-        )
-        .await;
+        let response =
+            build_task_callback_response(&db, &task.job_id, &task.description, &task.schema_type)
+                .await;
         sections.push(format!(
             "## Task {}: {}\n\n{}",
             index + 1,
@@ -1498,7 +1440,7 @@ async fn build_tasks_response(
 /// fails before it ever had a run: both are reported for what they are, and a
 /// parent waiting on them is answered.
 #[cfg(test)]
-mod unstarted_child_tests {
+pub(super) mod unstarted_child_tests {
     use super::*;
     use crate::agent_process::process::RunHandle;
     use crate::effects::executor::EffectExecutor;
@@ -1515,7 +1457,7 @@ mod unstarted_child_tests {
     /// Records each start request and starts nothing, so a created child job
     /// stays queued exactly as it does behind a busy runner.
     #[derive(Default)]
-    struct HoldingExecutor {
+    pub(in crate::execution::delegation::runtime) struct HoldingExecutor {
         started: Mutex<Vec<String>>,
     }
 
@@ -1538,7 +1480,9 @@ mod unstarted_child_tests {
 
     /// An issue-node parent (`j-parent`, run `run-parent`) mid-turn on `T1`,
     /// an `Explore` agent, and an executor that never starts a child.
-    async fn parent_fixture(db_name: &str) -> (Orchestrator, Arc<HoldingExecutor>) {
+    pub(in crate::execution::delegation::runtime) async fn parent_fixture(
+        db_name: &str,
+    ) -> (Orchestrator, Arc<HoldingExecutor>) {
         let executor = Arc::new(HoldingExecutor::default());
         let orch = parent_fixture_with(db_name, executor.clone()).await;
         (orch, executor)
@@ -1664,12 +1608,14 @@ mod unstarted_child_tests {
     /// Register the parent's live codex process so it can be parked and
     /// resumed through the real durable-wait path.
     /// The parent's scripted provider requests, and its provider turn id.
-    type ParentProcess = (
+    pub(in crate::execution::delegation::runtime) type ParentProcess = (
         Arc<Mutex<Vec<serde_json::Value>>>,
         Arc<Mutex<Option<String>>>,
     );
 
-    fn register_parent_process(orch: &Orchestrator) -> ParentProcess {
+    pub(in crate::execution::delegation::runtime) fn register_parent_process(
+        orch: &Orchestrator,
+    ) -> ParentProcess {
         let (stdin, requests, provider_turn) =
             crate::backends::codex::scripted_delegated_wait_stdin_for_test(
                 "native-thread",
@@ -1694,7 +1640,9 @@ mod unstarted_child_tests {
         (requests, provider_turn)
     }
 
-    fn explore_payload(description: &str) -> DelegatedTaskPayload {
+    pub(in crate::execution::delegation::runtime) fn explore_payload(
+        description: &str,
+    ) -> DelegatedTaskPayload {
         DelegatedTaskPayload {
             description: description.to_string(),
             prompt: "Trace how executors are placed.".to_string(),
@@ -1707,7 +1655,7 @@ mod unstarted_child_tests {
         }
     }
 
-    async fn spawn(
+    pub(in crate::execution::delegation::runtime) async fn spawn(
         orch: &Orchestrator,
         payloads: &[DelegatedTaskPayload],
         budget: Duration,
@@ -1726,7 +1674,10 @@ mod unstarted_child_tests {
         .await
     }
 
-    async fn text(orch: &Orchestrator, sql: &str) -> Option<String> {
+    pub(in crate::execution::delegation::runtime) async fn text(
+        orch: &Orchestrator,
+        sql: &str,
+    ) -> Option<String> {
         orch.db
             .local
             .query_opt_text(sql.to_string(), ())
@@ -1734,7 +1685,10 @@ mod unstarted_child_tests {
             .unwrap()
     }
 
-    async fn count(orch: &Orchestrator, sql: &str) -> i64 {
+    pub(in crate::execution::delegation::runtime) async fn count(
+        orch: &Orchestrator,
+        sql: &str,
+    ) -> i64 {
         orch.db
             .local
             .query_opt_i64(sql.to_string(), ())
@@ -1743,7 +1697,9 @@ mod unstarted_child_tests {
             .unwrap_or(0)
     }
 
-    async fn successor_count(orch: &Orchestrator) -> i64 {
+    pub(in crate::execution::delegation::runtime) async fn successor_count(
+        orch: &Orchestrator,
+    ) -> i64 {
         count(
             orch,
             "SELECT COUNT(*) FROM turns WHERE predecessor_id = 'T1' AND start_reason = 'dependency_unblock'",
@@ -1753,7 +1709,9 @@ mod unstarted_child_tests {
 
     /// The tool result the wake delivered to the spawning call. Delivery is
     /// stored after the successor turn is claimed, so wait for it.
-    async fn delivered_tool_result(orch: &Orchestrator) -> Option<String> {
+    pub(in crate::execution::delegation::runtime) async fn delivered_tool_result(
+        orch: &Orchestrator,
+    ) -> Option<String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(result) = stored_tool_result(orch).await {
@@ -1797,7 +1755,7 @@ mod unstarted_child_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    async fn await_successor(orch: &Orchestrator) {
+    pub(in crate::execution::delegation::runtime) async fn await_successor(orch: &Orchestrator) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while successor_count(orch).await == 0 {
             assert!(
@@ -1812,7 +1770,7 @@ mod unstarted_child_tests {
 
     /// Spawn one blocking task whose child stays queued, then return the
     /// parent parked on it and the child's job id.
-    async fn spawn_and_park(
+    pub(in crate::execution::delegation::runtime) async fn spawn_and_park(
         db_name: &str,
     ) -> (Orchestrator, String, Arc<Mutex<Vec<serde_json::Value>>>) {
         let (orch, executor) = parent_fixture(db_name).await;

@@ -3,13 +3,14 @@
 //! the stage it failed at and why.
 //!
 //! A verification runs as a background task and returns its id at once. It
-//! loads the profile as deployment `verify-<profile>-<pool>` on the pool's first
-//! machines through the same act side a deployment's own page uses, so
-//! reservation, fit and drain are unchanged. A pool under the controller is
-//! held by pinning it to that deployment as `verify:<id>`; one pinned by
-//! anyone else is refused, naming them. A pool not under control has whatever
-//! holds its machines stopped first and started again afterwards. Every path
-//! ends with the deployment stopped, the pin released and the pool restored.
+//! writes the profile as deployment `verify-<profile>-<pool>` on the first
+//! machines of a pool placement detects, and pins that deployment for
+//! `verify:<id>`: placement acquires it as it acquires any pinned model,
+//! displacing the unpinned residents on its machines, reserving its room and
+//! draining batches as for any load. A pool another holder has pinned is
+//! refused, naming them. Every path ends with the deployment unloaded (its pin
+//! revoked and it stopped); placement's own rules bring the pool's models back
+//! (a request reacquires one, an idle pool places its warm model).
 //!
 //! A start that fails because the context does not fit the KV cache (vLLM
 //! names the cache's size) is recorded, the profile is revised in place with
@@ -19,7 +20,7 @@
 //! recorded reason, not something fixed.
 //!
 //! A verification left running when the orch stops is failed at the next boot
-//! with "orch restarted", and its deployment and pin are cleaned up.
+//! with "orch restarted", and its deployment is unloaded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -27,34 +28,30 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use cairn_db::turso::params;
-use cairn_inference::control::{Phase, Request, START_REPORT_BOUND_SECS, STOP_REPORT_BOUND_SECS};
-use cairn_inference::pool_control;
+use cairn_inference::control::{Phase, START_REPORT_BOUND_SECS, STOP_REPORT_BOUND_SECS};
 use cairn_inference::verify::{self, ChatSample, EmbedSample, Speeds, Stage};
 use cairn_inference::{
     AcceleratorFamily, Deployment, DeploymentId, Engine, InferenceProfile, InferenceProfileId,
-    Inventory, PoolId, ProfileOrigin, RecordSource, Server,
+    Inventory, MachineName, ProfileOrigin, RecordSource, Server,
 };
 use cairn_models::types::catalog::VerbKind;
 use sha2::{Digest, Sha256};
 
 use super::inference::{load_inventory, write_inventory, Authoring, Removals};
-use super::inference_control::{load_history, load_states, SETTLE_MS};
+use super::inference_control::{link_addresses, load_history, load_states, SETTLE_MS};
+use crate::fleet::models::{self, store::load_pins, PinTarget};
+use crate::fleet::pools::{Pool, PoolKey};
 use crate::storage::{LocalDb, RowExt};
 
 pub type Pending<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Everything a verification does to the world.
 pub trait Act: Send + Sync {
-    fn start(&self, deployment: String) -> Pending<'_, Result<String, String>>;
-    fn stop(&self, deployment: String) -> Pending<'_, Result<String, String>>;
-    /// Pin a controlled pool to `set` for `holder`.
-    fn pin(
-        &self,
-        pool: String,
-        set: Vec<String>,
-        holder: String,
-    ) -> Pending<'_, Result<String, String>>;
-    fn release(&self, pool: String, holder: String) -> Pending<'_, Result<String, String>>;
+    /// Pin `deployment` for `holder`: placement acquires it, displacing the
+    /// unpinned residents on its machines.
+    fn pin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
+    /// Unload `deployment` for `holder`: revoke its pin and stop it.
+    fn unload(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
     /// A GET's body, `None` when it did not answer successfully.
     fn get(&self, url: String) -> Pending<'_, Option<String>>;
     fn chat(&self, api_base: String, model: String) -> Pending<'_, Result<ChatSample, String>>;
@@ -70,7 +67,7 @@ fn holder(id: &str) -> String {
     format!("verify:{id}")
 }
 
-fn deployment_id(profile: &InferenceProfileId, pool: &PoolId) -> DeploymentId {
+fn deployment_id(profile: &InferenceProfileId, pool: &PoolKey) -> DeploymentId {
     DeploymentId::new(format!("verify-{profile}-{pool}"))
 }
 
@@ -235,7 +232,7 @@ pub struct Planned {
     /// same deployment and says nothing about this one.
     pub started_at: i64,
     pub profile: InferenceProfileId,
-    pub pool: PoolId,
+    pub pool: PoolKey,
     pub deployment: DeploymentId,
 }
 
@@ -251,10 +248,11 @@ fn port_for(profile: &InferenceProfile) -> u16 {
 pub async fn begin(
     db: &LocalDb,
     profile_id: &str,
-    pool_id: &str,
+    pool: &Pool,
     requested_by: &str,
     now: i64,
 ) -> Result<Planned, String> {
+    let pool_id = &pool.key;
     let inventory = load_inventory(db).await?;
     let profile = inventory
         .profiles
@@ -263,11 +261,6 @@ pub async fn begin(
             format!("there is no profile {profile_id}; cairn://inference/profiles lists them")
         })?
         .clone();
-    let pool = inventory
-        .pools
-        .get(&PoolId::from(pool_id))
-        .ok_or_else(|| format!("there is no pool {pool_id}; cairn://inference/pools lists them"))?
-        .clone();
     if !matches!(profile.engine, Engine::Container(_)) {
         return Err(format!(
             "profile {profile_id} is a {} profile; verification measures container profiles",
@@ -275,35 +268,35 @@ pub async fn begin(
         ));
     }
     let k = profile.requirements.machines as usize;
-    if pool.machines.len() < k {
+    if pool.members.len() < k {
         return Err(format!(
             "profile {profile_id} runs on {k} machines and pool {pool_id} has {}",
-            pool.machines.len()
+            pool.members.len()
         ));
     }
     let id = uuid::Uuid::new_v4().to_string();
-    if let Some(control) = super::pool_control::load_controls(db).await?.get(&pool.id) {
-        if let Some(pin) = control.pin.as_ref().filter(|_| control.controlled) {
-            if !pin.holder.starts_with("verify:") {
-                return Err(format!(
-                    "pool {pool_id} is pinned by {}; verification needs the pool to itself, so it waits for that pin to be released",
-                    pin.holder
-                ));
-            }
+    for (pinned, stored) in load_pins(db).await? {
+        let on_pool = inventory
+            .deployments
+            .get(&pinned)
+            .is_some_and(|d| d.machines.iter().any(|m| pool.has(m.as_str())));
+        if !on_pool {
+            continue;
+        }
+        let holder = &stored.pin.holder;
+        if holder.starts_with("verify:") {
             return Err(format!(
-                "pool {pool_id} is already being verified ({}); wait for it to finish",
-                pin.holder
+                "pool {pool_id} is already being verified ({holder}); wait for it to finish"
             ));
         }
+        return Err(format!(
+            "pool {pool_id} is pinned by {holder} ({}); verification needs the pool to itself, so it waits for that pin to be released",
+            stored.model
+        ));
     }
-    let machines: Vec<_> = pool
-        .machines
-        .iter()
-        .take(k)
-        .map(|m| m.name.clone())
-        .collect();
+    let machines: Vec<MachineName> = pool.machines().take(k).map(MachineName::from).collect();
     let deployment = Deployment {
-        id: deployment_id(&profile.id, &pool.id),
+        id: deployment_id(&profile.id, pool_id),
         source: RecordSource::Cairn,
         profile: profile.id.clone(),
         head: machines[0].clone(),
@@ -325,7 +318,7 @@ pub async fn begin(
     let machines_json =
         serde_json::to_string(&machines.iter().map(|m| m.to_string()).collect::<Vec<_>>())
             .expect("machine names serialize");
-    let (profile_key, pool_key) = (profile.id.to_string(), pool.id.to_string());
+    let (profile_key, pool_key) = (profile.id.to_string(), pool_id.to_string());
     let (row_id, digest, requester, deployment_key) = (
         id.clone(),
         digest(&profile),
@@ -394,7 +387,9 @@ pub async fn begin(
             "pool {pool_id} is already being verified (verification {running}); wait for it to finish"
         ));
     }
-    if let Some(problem) = super::inference_control::render_problem(&inventory, &deployment) {
+    let links = link_addresses(&pool.members);
+    if let Some(problem) = super::inference_control::render_problem(&inventory, &deployment, &links)
+    {
         let reason = format!("it cannot be rendered into scripts for its head: {problem}");
         finish(db, &id, false, Some(reason.clone()), now).await?;
         return Err(format!(
@@ -405,7 +400,7 @@ pub async fn begin(
         id,
         started_at: now,
         profile: profile.id,
-        pool: pool.id,
+        pool: pool_id.clone(),
         deployment: deployment.id,
     })
 }
@@ -450,140 +445,32 @@ async fn wait_for(
     }
 }
 
-/// What the pool ran before, to be put back.
-enum Restore {
-    Controlled {
-        previous: BTreeSet<String>,
-    },
-    Uncontrolled {
-        stopped: Vec<DeploymentId>,
-        /// Whether the verification's own deployment was asked to start.
-        started: bool,
-    },
-}
-
-/// Hold the pool for `plan` and start its deployment. A failure says what
-/// was already changed, so it is put back.
-async fn hold(
-    db: &LocalDb,
-    act: &dyn Act,
-    plan: &Planned,
-) -> Result<Restore, (Option<Restore>, String)> {
-    let controls = super::pool_control::load_controls(db)
-        .await
-        .map_err(|why| (None, why))?;
-    if let Some(control) = controls.get(&plan.pool).filter(|c| c.controlled) {
-        let previous = pool_control::desired(control)
-            .unwrap_or_default()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        act.pin(
-            plan.pool.to_string(),
-            vec![plan.deployment.to_string()],
-            holder(&plan.id),
-        )
-        .await
-        .map_err(|why| (None, why))?;
-        return Ok(Restore::Controlled { previous });
-    }
-    let inventory = load_inventory(db).await.map_err(|why| (None, why))?;
-    let ours = inventory
-        .deployments
-        .get(&plan.deployment)
-        .ok_or((None, "the verification's deployment is gone".to_string()))?
-        .clone();
-    let states = load_states(db).await.map_err(|why| (None, why))?;
-    let mut stopped = Vec::new();
-    for (id, row) in &states {
-        if *id == plan.deployment || !row.phase.reserves() {
-            continue;
-        }
-        let Some(other) = inventory.deployments.get(id) else {
-            continue;
-        };
-        if other.machines.iter().any(|m| ours.machines.contains(m)) {
-            let stopping = act.stop(id.to_string()).await;
-            if let Err(why) = stopping {
-                let restore = Restore::Uncontrolled {
-                    stopped,
-                    started: false,
-                };
-                return Err((Some(restore), why));
-            }
-            stopped.push(id.clone());
-            let _ = wait_for(db, act, id, STOP_REPORT_BOUND_SECS, |p| !p.reserves()).await;
-        }
-    }
-    if let Err(why) = act.start(plan.deployment.to_string()).await {
-        let restore = Restore::Uncontrolled {
-            stopped,
-            started: false,
-        };
-        return Err((Some(restore), why));
-    }
-    Ok(Restore::Uncontrolled {
-        stopped,
-        started: true,
-    })
-}
-
-async fn restore(db: &LocalDb, act: &dyn Act, plan: &Planned, restore: Restore) -> Vec<String> {
+/// Let the verification's deployment go: unload it and wait for it to stop
+/// holding its machines. What went wrong, if anything.
+async fn release(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut note = |result: Result<String, String>| {
-        if let Err(why) = result {
-            problems.push(why);
-        }
-    };
-    match restore {
-        Restore::Controlled { previous } => {
-            note(
-                act.pin(
-                    plan.pool.to_string(),
-                    previous.into_iter().collect(),
-                    holder(&plan.id),
-                )
-                .await,
-            );
-            note(act.release(plan.pool.to_string(), holder(&plan.id)).await);
-        }
-        Restore::Uncontrolled { stopped, started } => {
-            if started {
-                note(act.stop(plan.deployment.to_string()).await);
-                let _ = wait_for(db, act, &plan.deployment, STOP_REPORT_BOUND_SECS, |p| {
-                    !p.reserves()
-                })
-                .await;
-            }
-            for id in stopped {
-                note(act.start(id.to_string()).await);
-            }
-        }
+    if let Err(why) = act
+        .unload(plan.deployment.to_string(), holder(&plan.id))
+        .await
+    {
+        problems.push(why);
     }
+    let _ = wait_for(db, act, &plan.deployment, STOP_REPORT_BOUND_SECS, |p| {
+        !p.reserves()
+    })
+    .await;
     problems
 }
 
 /// Run one verification to its end.
 pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome, String> {
     set_stage(db, &plan.id, Stage::Start).await?;
-    let held = match hold(db, act, plan).await {
-        Ok(held) => held,
-        Err((partial, why)) => {
-            let problems = match partial {
-                Some(partial) => restore(db, act, plan, partial).await,
-                None => Vec::new(),
-            };
-            let reason = if problems.is_empty() {
-                why.clone()
-            } else {
-                format!("{why}; afterwards: {}", problems.join("; "))
-            };
-            finish(db, &plan.id, false, Some(reason), act.now_ms()).await?;
-            return Ok(Outcome::Failed(why));
-        }
-    };
+    if let Err(why) = act.pin(plan.deployment.to_string(), holder(&plan.id)).await {
+        finish(db, &plan.id, false, Some(why.clone()), act.now_ms()).await?;
+        return Ok(Outcome::Failed(why));
+    }
     let measured = measure(db, act, plan).await;
-    let problems = restore(db, act, plan, held).await;
+    let problems = release(db, act, plan).await;
     let (outcome, reason) = match measured {
         Ok(m) => {
             record(db, &plan.id, &m).await?;
@@ -665,8 +552,8 @@ async fn clamp_profile(
 
 async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured, String> {
     // Only a phase this run produced counts: the deployment id is reused
-    // across runs, and on a controlled pool the controller starts it on its
-    // own pass, so until then the stored phase is the previous run's.
+    // across runs, and placement starts it on its own pass once its machines
+    // have room, so until then the stored phase is the previous run's.
     let started = plan.started_at;
     let reached = wait_for(
         db,
@@ -797,12 +684,12 @@ pub async fn recover(db: &LocalDb, act: &dyn Act) -> Result<Vec<String>, String>
             act.now_ms(),
         )
         .await?;
-        let _ = act.stop(row.deployment.clone()).await;
+        let _ = act.unload(row.deployment.clone(), holder(&row.id)).await;
         recovered.push(row.id.clone());
     }
-    for (pool, control) in super::pool_control::load_controls(db).await? {
-        if let Some(pin) = control.pin.filter(|pin| pin.holder.starts_with("verify:")) {
-            let _ = act.release(pool.to_string(), pin.holder).await;
+    for (deployment, stored) in load_pins(db).await? {
+        if stored.pin.holder.starts_with("verify:") {
+            let _ = act.unload(deployment.to_string(), stored.pin.holder).await;
         }
     }
     Ok(recovered)
@@ -813,10 +700,10 @@ pub async fn recover(db: &LocalDb, act: &dyn Act) -> Result<Vec<String>, String>
 pub fn candidates(
     inventory: &Inventory,
     model: &str,
-    pool: &PoolId,
+    pool: &Pool,
     family: Option<AcceleratorFamily>,
 ) -> Vec<InferenceProfileId> {
-    let size = inventory.pools.get(pool).map_or(0, |p| p.machines.len());
+    let size = pool.members.len();
     let mut profiles: Vec<&InferenceProfile> = inventory
         .profiles
         .values()
@@ -853,7 +740,7 @@ pub async fn verify_in_order(
     db: &LocalDb,
     act: &dyn Act,
     profiles: Vec<InferenceProfileId>,
-    pool: &PoolId,
+    pool: &Pool,
     requested_by: &str,
     all: bool,
     first: Option<Planned>,
@@ -865,15 +752,7 @@ pub async fn verify_in_order(
         loop {
             let plan = match first.take() {
                 Some(plan) if plan.profile == profile => plan,
-                _ => match begin(
-                    db,
-                    profile.as_str(),
-                    pool.as_str(),
-                    requested_by,
-                    act.now_ms(),
-                )
-                .await
-                {
+                _ => match begin(db, profile.as_str(), pool, requested_by, act.now_ms()).await {
                     Ok(plan) => plan,
                     Err(why) => {
                         results.push((String::new(), Outcome::Failed(why)));
@@ -893,7 +772,7 @@ pub async fn verify_in_order(
     Ok(results)
 }
 
-/// The live world: the act side, the pool controller and HTTP.
+/// The live world: placement and HTTP.
 pub struct Live {
     pub orch: super::Orchestrator,
     pub client: reqwest::Client,
@@ -910,44 +789,20 @@ impl Live {
 }
 
 impl Act for Live {
-    fn start(&self, deployment: String) -> Pending<'_, Result<String, String>> {
+    fn pin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
         Box::pin(async move {
-            super::inference_control::request_deployment(&self.orch, &deployment, Request::Start)
-                .await
+            models::pin(
+                &self.orch,
+                PinTarget::Deployment(DeploymentId::new(deployment)),
+                &holder,
+            )
+            .await
         })
     }
 
-    fn stop(&self, deployment: String) -> Pending<'_, Result<String, String>> {
+    fn unload(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
         Box::pin(async move {
-            super::inference_control::request_deployment(&self.orch, &deployment, Request::Stop)
-                .await
-        })
-    }
-
-    fn pin(
-        &self,
-        pool: String,
-        set: Vec<String>,
-        holder: String,
-    ) -> Pending<'_, Result<String, String>> {
-        Box::pin(async move {
-            let patch = super::pool_control::PoolPatch {
-                pool: pool.as_str().into(),
-                pin: Some(set.into_iter().map(DeploymentId::new).collect()),
-                ..super::pool_control::PoolPatch::default()
-            };
-            super::pool_control::patch_pool(&self.orch, &patch, &holder).await
-        })
-    }
-
-    fn release(&self, pool: String, holder: String) -> Pending<'_, Result<String, String>> {
-        Box::pin(async move {
-            let patch = super::pool_control::PoolPatch {
-                pool: pool.as_str().into(),
-                release: true,
-                ..super::pool_control::PoolPatch::default()
-            };
-            super::pool_control::patch_pool(&self.orch, &patch, &holder).await
+            models::unload(&self.orch, &DeploymentId::new(deployment), &holder).await
         })
     }
 
@@ -1096,31 +951,34 @@ pub fn spawn_recovery(orch: super::Orchestrator) {
 pub async fn spawn(
     orch: &super::Orchestrator,
     profiles: Vec<InferenceProfileId>,
-    pool: &str,
+    pool: Pool,
     requested_by: &str,
     all: bool,
 ) -> Result<String, String> {
     let first = profiles
         .first()
-        .ok_or_else(|| format!("no profile to verify on pool {pool}"))?
+        .ok_or_else(|| format!("no profile to verify on pool {}", pool.key))?
         .clone();
     let plan = begin(
         &orch.db.local,
         first.as_str(),
-        pool,
+        &pool,
         requested_by,
         crate::fleet::unix_time_ms() as i64,
     )
     .await?;
     let id = plan.id.clone();
     let live = Live::new(orch.clone())?;
-    let (pool, requested_by) = (PoolId::from(pool), requested_by.to_string());
+    let requested_by = requested_by.to_string();
     let db = orch.db.local.clone();
     tokio::spawn(async move {
         if let Err(error) =
             verify_in_order(&db, &live, profiles, &pool, &requested_by, all, Some(plan)).await
         {
-            log::warn!("inference: a verification on pool {pool} stopped: {error}");
+            log::warn!(
+                "inference: a verification on pool {} stopped: {error}",
+                pool.key
+            );
         }
     });
     Ok(id)
@@ -1129,6 +987,8 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::models::rules::Pin;
+    use crate::fleet::models::store::{delete_pin, save_pin, StoredPin};
     use std::sync::Mutex;
 
     const PROFILE: &str = r#"
@@ -1169,22 +1029,27 @@ profiles:
     requirements: {machines: 1}
 deployments:
   - {id: old, profile: old, machines: [box], head: box, apiPort: 9000, apiPath: /v1, healthPath: /v1/models}
-pools:
-  - {id: solo, machines: [{name: box, address: 10.0.0.9}]}
+machines:
+  - {name: box, address: 10.0.0.9}
 "#;
 
-    /// A world where starts and stops take effect at once, through the same
-    /// stored phases the act side writes.
+    /// The pool the profiles are verified on: `box`, on its own.
+    fn solo() -> Pool {
+        Pool::of_one("box")
+    }
+
+    /// A world where placement acts at once, through the same stored phases
+    /// the act side writes: a pinned deployment comes up on placement's next
+    /// pass (the next sleep), an unloaded one stops.
     pub(crate) struct Fake<'a> {
         db: &'a LocalDb,
         pub(crate) calls: Mutex<Vec<String>>,
-        /// The reasons the next starts fail with, in order.
+        /// The reasons the next loads fail with, in order.
         failures: Mutex<Vec<String>>,
         now: Mutex<i64>,
-        /// The act side refuses a start with this.
-        refuse_start: Mutex<Option<String>>,
-        /// A controlled pool's verify deployment, which the controller starts
-        /// on its next pass rather than at once.
+        /// Placement refuses a pin with this.
+        refuse_pin: Mutex<Option<String>>,
+        /// The pinned deployment placement starts on its next pass.
         pending: Mutex<Option<String>>,
     }
 
@@ -1195,7 +1060,7 @@ pools:
                 calls: Mutex::default(),
                 failures: Mutex::default(),
                 now: Mutex::new(1_000_000),
-                refuse_start: Mutex::default(),
+                refuse_pin: Mutex::default(),
                 pending: Mutex::default(),
             }
         }
@@ -1254,28 +1119,30 @@ pools:
     }
 
     impl Act for Fake<'_> {
-        fn start(&self, deployment: String) -> Pending<'_, Result<String, String>> {
+        fn pin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("start {deployment}"));
-                if deployment.starts_with("verify-") {
-                    if let Some(why) = self.refuse_start.lock().unwrap().clone() {
-                        return Err(why);
-                    }
+                    .push(format!("pin {deployment} {holder}"));
+                if let Some(why) = self.refuse_pin.lock().unwrap().clone() {
+                    return Err(why);
                 }
-                self.come_up(deployment).await;
-                Ok("started".into())
+                *self.pending.lock().unwrap() = Some(deployment);
+                Ok("pinned".into())
             })
         }
 
-        fn stop(&self, deployment: String) -> Pending<'_, Result<String, String>> {
+        fn unload(
+            &self,
+            deployment: String,
+            holder: String,
+        ) -> Pending<'_, Result<String, String>> {
             Box::pin(async move {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(format!("stop {deployment}"));
+                    .push(format!("unload {deployment} {holder}"));
                 self.set(
                     &deployment,
                     Phase::Stopped {
@@ -1283,35 +1150,7 @@ pools:
                     },
                 )
                 .await;
-                Ok("stopped".into())
-            })
-        }
-
-        fn pin(
-            &self,
-            pool: String,
-            set: Vec<String>,
-            holder: String,
-        ) -> Pending<'_, Result<String, String>> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .push(format!("pin {pool} {set:?} {holder}"));
-                if let Some(ours) = set.iter().find(|d| d.starts_with("verify-")) {
-                    *self.pending.lock().unwrap() = Some(ours.clone());
-                }
-                Ok("pinned".into())
-            })
-        }
-
-        fn release(&self, pool: String, holder: String) -> Pending<'_, Result<String, String>> {
-            Box::pin(async move {
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .push(format!("release {pool} {holder}"));
-                Ok("released".into())
+                Ok("unloaded".into())
             })
         }
 
@@ -1381,37 +1220,47 @@ pools:
     }
 
     #[tokio::test]
-    async fn a_pass_records_its_measurements_and_restores_the_pool() {
+    async fn a_pass_pins_records_its_measurements_and_unloads() {
         let db = seeded("inference-verify-pass").await;
         let fake = Fake::new(&db);
-        fake.set(
-            "old",
-            Phase::Healthy {
-                since_ms: 0,
-                load_ms: None,
-            },
-        )
-        .await;
-        let plan = begin(&db, "embed", "solo", "operator", 1).await.unwrap();
-        assert_eq!(plan.deployment.as_str(), "verify-embed-solo");
+        let plan = begin(&db, "embed", &solo(), "operator", 1).await.unwrap();
+        assert_eq!(plan.deployment.as_str(), "verify-embed-box");
         assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
+        let holder = format!("verify:{}", plan.id);
         assert_eq!(
             fake.calls(),
             vec![
-                "stop old",
-                "start verify-embed-solo",
-                "stop verify-embed-solo",
-                "start old"
+                format!("pin verify-embed-box {holder}"),
+                format!("unload verify-embed-box {holder}"),
             ]
         );
         let row = &load_verifications(&db).await.unwrap()[0];
         assert_eq!(row.outcome, "passed");
         assert_eq!(row.stage, "done");
+        assert_eq!(row.pool, "box");
         assert_eq!(row.load_ms, Some(42_000));
         assert_eq!(row.footprint.as_ref().unwrap()["box"], 9 << 30);
         assert_eq!(row.embed_tps, Some(2_000.0));
         assert_eq!(row.engine_version.as_deref(), Some("0.32.0"));
         assert!(!row.stale(&load_inventory(&db).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_pin_waits_for_this_runs_load_not_the_last_ones_failure() {
+        let db = seeded("inference-verify-this-run").await;
+        let fake = Fake::new(&db);
+        fake.set(
+            "verify-chat-box",
+            Phase::Failed {
+                at_ms: 5,
+                reason: "an earlier run's failure".into(),
+            },
+        )
+        .await;
+        let plan = begin(&db, "chat", &solo(), "operator", fake.now_ms())
+            .await
+            .unwrap();
+        assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
     }
 
     #[tokio::test]
@@ -1425,7 +1274,7 @@ pools:
             &db,
             &fake,
             vec!["chat".into()],
-            &"solo".into(),
+            &Pool::of_one("box"),
             "operator",
             false,
             None,
@@ -1464,17 +1313,20 @@ pools:
     }
 
     #[tokio::test]
-    async fn a_failure_is_recorded_and_the_pool_is_restored_on_every_path() {
+    async fn a_failure_is_recorded_and_the_deployment_unloaded() {
         let db = seeded("inference-verify-fail").await;
         let fake = Fake::new(&db);
         fake.failures
             .lock()
             .unwrap()
             .push("CUDA driver version is insufficient for CUDA runtime version".into());
-        let plan = begin(&db, "chat", "solo", "operator", 1).await.unwrap();
+        let plan = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
         let outcome = run(&db, &fake, &plan).await.unwrap();
         assert!(matches!(&outcome, Outcome::Failed(why) if why.contains("driver")));
-        assert_eq!(fake.calls().last().unwrap(), "stop verify-chat-solo");
+        assert_eq!(
+            fake.calls().last().unwrap(),
+            &format!("unload verify-chat-box verify:{}", plan.id)
+        );
         let row = &load_verifications(&db).await.unwrap()[0];
         assert_eq!(
             (row.outcome.as_str(), row.stage.as_str()),
@@ -1483,25 +1335,51 @@ pools:
     }
 
     #[tokio::test]
+    async fn a_refused_pin_fails_with_placements_reason_and_changes_nothing() {
+        let db = seeded("inference-verify-refused").await;
+        let fake = Fake::new(&db);
+        *fake.refuse_pin.lock().unwrap() =
+            Some("verify-embed-box cannot run: box is in no detected pool".into());
+        let plan = begin(&db, "embed", &solo(), "operator", 1).await.unwrap();
+        let outcome = run(&db, &fake, &plan).await.unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Failed("verify-embed-box cannot run: box is in no detected pool".into())
+        );
+        assert_eq!(
+            fake.calls(),
+            vec![format!("pin verify-embed-box verify:{}", plan.id)],
+            "nothing was acquired, so nothing is unloaded"
+        );
+    }
+
+    #[tokio::test]
     async fn a_pool_pinned_by_someone_else_is_refused_and_boot_recovers_a_running_one() {
         let db = seeded("inference-verify-pinned").await;
-        let pool = load_inventory(&db).await.unwrap().pools[&PoolId::from("solo")].clone();
-        let mut control =
-            pool_control::PoolControl::begin(&pool, &BTreeMap::new(), &BTreeMap::new(), 0);
-        control.pin(BTreeSet::new(), "agent-7", 0).unwrap();
-        db.execute(
-            "INSERT INTO inference_pool_control (pool, body_json, updated_at) VALUES ('solo', ?1, 0)",
-            params![serde_json::to_string(&control).unwrap()],
+        let old = DeploymentId::from("old");
+        save_pin(
+            &db,
+            &old,
+            &StoredPin {
+                model: "chat/Model".into(),
+                pin: Pin {
+                    holder: "agent-7".into(),
+                    at: 0,
+                },
+            },
         )
         .await
         .unwrap();
-        let refusal = begin(&db, "chat", "solo", "operator", 1).await.unwrap_err();
-        assert!(refusal.contains("pinned by agent-7"), "{refusal}");
-
-        db.execute("DELETE FROM inference_pool_control", ())
+        let refusal = begin(&db, "chat", &solo(), "operator", 1)
             .await
-            .unwrap();
-        let plan = begin(&db, "chat", "solo", "operator", 1).await.unwrap();
+            .unwrap_err();
+        assert!(
+            refusal.contains("pinned by agent-7 (chat/Model)"),
+            "{refusal}"
+        );
+
+        delete_pin(&db, &old).await.unwrap();
+        let plan = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
         let fake = Fake::new(&db);
         assert_eq!(
             recover(fake.db, &fake).await.unwrap(),
@@ -1509,67 +1387,9 @@ pools:
         );
         let row = &load_verifications(&db).await.unwrap()[0];
         assert_eq!(row.reason.as_deref(), Some("orch restarted"));
-        assert_eq!(fake.calls(), vec!["stop verify-chat-solo"]);
-    }
-
-    #[tokio::test]
-    async fn a_controlled_pool_waits_for_this_runs_load_not_the_last_ones_failure() {
-        let db = seeded("inference-verify-controlled").await;
-        let pool = load_inventory(&db).await.unwrap().pools[&PoolId::from("solo")].clone();
-        let control =
-            pool_control::PoolControl::begin(&pool, &BTreeMap::new(), &BTreeMap::new(), 0);
-        assert!(control.controlled);
-        db.execute(
-            "INSERT INTO inference_pool_control (pool, body_json, updated_at) VALUES ('solo', ?1, 0)",
-            params![serde_json::to_string(&control).unwrap()],
-        )
-        .await
-        .unwrap();
-        let fake = Fake::new(&db);
-        fake.set(
-            "verify-chat-solo",
-            Phase::Failed {
-                at_ms: 5,
-                reason: "an earlier run's failure".into(),
-            },
-        )
-        .await;
-        let plan = begin(&db, "chat", "solo", "operator", fake.now_ms())
-            .await
-            .unwrap();
-        assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
-        let calls = fake.calls();
-        assert_eq!(
-            calls[0],
-            format!("pin solo [\"verify-chat-solo\"] verify:{}", plan.id)
-        );
-        assert!(calls[1].starts_with("pin solo []"), "{calls:?}");
-        assert_eq!(calls[2], format!("release solo verify:{}", plan.id));
-    }
-
-    #[tokio::test]
-    async fn a_refused_start_puts_back_what_it_stopped() {
-        let db = seeded("inference-verify-refused").await;
-        let fake = Fake::new(&db);
-        fake.set(
-            "old",
-            Phase::Healthy {
-                since_ms: 0,
-                load_ms: None,
-            },
-        )
-        .await;
-        *fake.refuse_start.lock().unwrap() = Some("box is held by deployment other".into());
-        let plan = begin(&db, "embed", "solo", "operator", 1).await.unwrap();
-        let outcome = run(&db, &fake, &plan).await.unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Failed("box is held by deployment other".into())
-        );
         assert_eq!(
             fake.calls(),
-            vec!["stop old", "start verify-embed-solo", "start old"],
-            "the refused deployment is not stopped; the pool's model is restarted"
+            vec![format!("unload verify-chat-box verify:{}", plan.id)]
         );
     }
 
@@ -1585,7 +1405,9 @@ pools:
         write_inventory(&db, &Authoring::Replace(inventory.to_yaml()))
             .await
             .unwrap();
-        let refusal = begin(&db, "chat", "solo", "operator", 1).await.unwrap_err();
+        let refusal = begin(&db, "chat", &solo(), "operator", 1)
+            .await
+            .unwrap_err();
         assert!(
             refusal.contains("failed at render, before anything was stopped"),
             "{refusal}"
@@ -1601,14 +1423,14 @@ pools:
     #[tokio::test]
     async fn one_verification_holds_a_pool_at_a_time() {
         let db = seeded("inference-verify-one").await;
-        let first = begin(&db, "chat", "solo", "operator", 1).await.unwrap();
-        let refusal = begin(&db, "embed", "solo", "operator", 2)
+        let first = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
+        let refusal = begin(&db, "embed", &solo(), "operator", 2)
             .await
             .unwrap_err();
         assert_eq!(
             refusal,
             format!(
-                "pool solo is already being verified (verification {}); wait for it to finish",
+                "pool box is already being verified (verification {}); wait for it to finish",
                 first.id
             )
         );
@@ -1637,7 +1459,7 @@ pools:
             candidates(
                 &inventory,
                 "chat/Model",
-                &"solo".into(),
+                &Pool::of_one("box"),
                 Some(AcceleratorFamily::Nvidia)
             ),
             vec![

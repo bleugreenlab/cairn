@@ -1817,7 +1817,7 @@ mod tests {
     /// Profiles and deployments are written at the index, whose writes their
     /// pages carry, and the profiles collection carries its own (import or
     /// generate a profile); the index offers its YAML export as a projection,
-    /// and the pool controller's two surfaces carry its writes.
+    /// and placement's two surfaces carry its writes.
     #[test]
     fn affordance_for_inference_kinds() {
         // Profiles and deployments are written at the index, so their pages
@@ -1869,7 +1869,10 @@ mod tests {
         let pools = affordance_for_kind(ResourceKind::InferencePools);
         assert!(pools.contains("warm model"), "{pools}");
         assert!(pools.contains("`warm(str, "), "{pools}");
-        assert!(pools.contains("`pool(str)`"), "{pools}");
+        assert!(
+            pools.contains("`pool(str, a detected pool's key"),
+            "{pools}"
+        );
         let requests = affordance_for_kind(ResourceKind::InferenceRequests);
         assert!(requests.contains("request a model"), "{requests}");
         assert!(requests.contains("cancel a waiting request"), "{requests}");

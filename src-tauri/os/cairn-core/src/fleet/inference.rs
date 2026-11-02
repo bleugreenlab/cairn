@@ -1,24 +1,20 @@
-//! The fleet's half of inference deployments: the holds that keep a
-//! deployment's machines away from batch work, the commands sent to its head,
-//! and the reports that come back.
-//!
-//! A hold is a drain with a named reason (`InferenceReserved`), held by this
-//! runner alone and never told to the machine, beside the operator's drain and
-//! the self-update hold. The cairn-inference facet decides which machines are
-//! held; this module only applies the set it is given and routes the head's
-//! reports to whoever subscribed. Holds are keyed by executor public name,
-//! which is how a deployment names its machines.
+//! The fleet's half of inference deployments: the commands sent to a
+//! deployment's head, the reports that come back, and the batches on a gang's
+//! machines that placement's model pass drains for a loading model
+//! ([`super::models`]). Machines are named by executor public name, which is
+//! how a deployment names its machines.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use cairn_common::executor_protocol::{
-    CellPriority, DeploymentOperation, DeploymentPhaseReport, ExecutorMessage, InferenceHold,
+    CellPriority, DeploymentOperation, DeploymentPhaseReport, ExecutorMessage,
     MACHINE_READING_STALE_AFTER_MS,
 };
-use cairn_inference::control::{gib, RunningBatch};
+use cairn_inference::control::gib;
 use tokio::sync::mpsc;
 
+use super::models::room::RunningBatch;
 use super::{executor_names_match, executor_public_name, CancelCause, Fleet, RequestIdentity};
 
 /// Why a batch was stopped to make room for an inference deployment: what the
@@ -61,47 +57,6 @@ pub struct DeploymentReportReceived {
 }
 
 impl Fleet {
-    /// Replace every inference hold, by executor public name, and restamp each
-    /// live connection. The caller hands over the whole set each time, so a
-    /// released hold is simply absent.
-    ///
-    /// The connection table is taken first, as attach takes it before reading
-    /// the holds, so an attach either sees this set or is restamped by it.
-    ///
-    /// Work waiting on a hold (placement waits on one rather than refusing)
-    /// is woken when any hold is released, so it is offered the machine at
-    /// once.
-    pub fn set_inference_holds(&self, holds: HashMap<String, InferenceHold>) {
-        let mut released = false;
-        {
-            let mut connections = self.lock_connections();
-            for entry in connections.values_mut() {
-                let hold = holds.get(&executor_public_name(entry)).cloned();
-                released |= entry.inference_hold.is_some() && hold.is_none();
-                entry.inference_hold = hold;
-            }
-            *self.inference_holds.lock().unwrap() = holds;
-        }
-        if released {
-            self.connection_ready.notify_waiters();
-        }
-    }
-
-    /// The hold for the machine with this public name, read under the
-    /// connection table's lock by attach.
-    pub(super) fn inference_hold_named(&self, public_name: &str) -> Option<InferenceHold> {
-        self.inference_holds
-            .lock()
-            .unwrap()
-            .get(public_name)
-            .cloned()
-    }
-
-    /// Every hold this runner applies now, by executor public name.
-    pub fn inference_holds(&self) -> HashMap<String, InferenceHold> {
-        self.inference_holds.lock().unwrap().clone()
-    }
-
     /// The batches running on the attached machines publicly named `names`,
     /// by name, as a reserving deployment's drain weighs them.
     ///

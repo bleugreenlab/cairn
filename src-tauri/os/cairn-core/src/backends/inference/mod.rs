@@ -3,9 +3,9 @@
 //! offered whether or not it is loaded (tenet 1321).
 //!
 //! Nothing here starts an engine. Each request asks for its model through
-//! [`crate::orchestrator::inference_route`], which loads it on a pool under
-//! Cairn's control, and is sent once the deployment is healthy, straight to the
-//! deployment head's API under the name the engine serves:
+//! [`crate::orchestrator::inference_route`], which asks placement for it
+//! ([`crate::fleet::models`]), and is sent once the deployment is healthy,
+//! straight to the deployment head's API under the name the engine serves:
 //! `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` reaches the engine as
 //! `deepseek-v4-flash-vision-exp`. A named model is never served
 //! by another. An agent turn waits on its own thread, interruptibly, with what
@@ -189,7 +189,7 @@ impl AgentBackend for InferenceBackend {
         model: &str,
     ) -> Result<(), String> {
         let inventory = run_db_blocking(|| inference_route::served_inventory(orch))?;
-        crate::orchestrator::pool_control::deployment_for(&inventory, model, None).map(|_| ())
+        inference_route::resolve_model(&inventory, model).map(|_| ())
     }
 
     fn complete(
@@ -220,7 +220,7 @@ impl AgentBackend for InferenceBackend {
     }
 
     /// An outside client's request registers demand like any other: it asks
-    /// the pool controller for the model and waits while it loads, then goes
+    /// placement for the model and waits while it loads, then goes
     /// to the engine under the engine's own name.
     fn relay_route(
         &self,

@@ -428,7 +428,9 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("config_disables", CONFIG),
     keep("inference_profiles", CONFIG),
     keep("inference_deployments", CONFIG),
-    keep("inference_pools", CONFIG),
+    keep("inference_machines", CONFIG),
+    keep("model_pool_preferences", CONFIG),
+    keep("model_pins", "one row per pinned model resident"),
     keep("inference_models", CONFIG),
     owned_by(
         "inference_verifications",
@@ -444,10 +446,9 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "cairn-core orchestrator::inference_control",
         "the newest loads per deployment, pruned on insert",
     ),
-    keep("inference_pool_control", CONFIG),
     keep(
         "inference_requests",
-        "the pool controller deletes answered requests a week after they were answered",
+        "placement deletes answered model requests a week after they were answered",
     ),
     keep("ingress_endpoints", CONFIG),
     keep("account", IDENTITY),

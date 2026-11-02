@@ -1,44 +1,44 @@
 //! The act side of the cairn-inference facet: the orch starts, stops and
-//! health-checks deployments through their head executors, holds every machine
-//! of a gang away from batch work while it does, and records how long each load
-//! took and how much GPU memory it settled at.
+//! health-checks deployments through their head executors, and records how
+//! long each load took and how much GPU memory it settled at.
 //!
 //! The rules are the facet's (`cairn_inference::control`); this module is their
 //! host. It keeps one row per deployment Cairn has acted on
 //! (`inference_deployment_state`) and one per finished load
-//! (`inference_deployment_loads`), and a single background task owns every
-//! command after a request: it sends a reserving start once the gang fits,
-//! applies the head's reports, probes deployments Cairn controls, watches a
-//! starting or healthy deployment's GPU memory for its engine dying, fails a
-//! command that outlives its bound, and restates the fleet's holds. A request
-//! itself only moves the stored phase (and sends a stop, which needs no wait),
-//! inside one database transaction, so a request and the task never act on
-//! two different readings of a phase.
+//! (`inference_deployment_loads`), and a single background task applies the
+//! head's reports, probes deployments, watches a starting or healthy
+//! deployment's GPU memory for its engine dying, records settled footprints
+//! and fails a command that outlives its bound. A request itself only moves the stored
+//! phase (and sends a stop, which needs no wait), inside one database
+//! transaction, so a request and the task never act on two different readings
+//! of a phase.
 //!
-//! Deployments Cairn has never acted on are left alone entirely: whatever runs
-//! there was not started by Cairn, and Cairn takes no machine away from builds
-//! for a model it did not load or stop.
+//! What runs when is not decided here. Execution's placement
+//! ([`crate::fleet::models`]) holds a running model as a resident on its
+//! gang's machines: it asks for the start, drains the gang while the start is
+//! reserving, and sends it ([`launch`]) once every machine has the room.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cairn_common::executor_protocol::{
     DeploymentOperation, DeploymentPhaseReport, DeploymentScript, ExecutorHealthSnapshot,
-    GpuMemory, InferenceHold, MeasurementReading,
+    MeasurementReading,
 };
 use cairn_db::turso::params;
 use cairn_inference::control::{
-    self, Allocation, AllocationWatch, Drain, GangMachine, LoadOutcome, Observation, Phase, Report,
-    Request, Room, RunningBatch, START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
+    self, Allocation, AllocationWatch, LoadOutcome, Observation, Phase, Report, Request,
+    START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
 use cairn_inference::render::{render, MachineAt};
-use cairn_inference::MachineName;
-use cairn_inference::{Deployment, DeploymentId, Inventory};
+use cairn_inference::{Deployment, DeploymentId, Inventory, MachineName};
 
 use super::inference::load_inventory;
 use super::Orchestrator;
 use crate::fleet::inference::Preemption;
+use crate::fleet::models::room::{gpu_allocated_bytes, RunningBatch};
+use crate::fleet::pools::PoolMember;
 use crate::fleet::{DeploymentReportReceived, Fleet};
 use crate::storage::{LocalDb, RowExt};
 
@@ -79,34 +79,18 @@ pub struct MachineReading {
 
 impl MachineReading {
     pub fn of(snapshot: &ExecutorHealthSnapshot) -> Self {
-        let mut allocated: Option<u64> = None;
         let mut discrete_free: Option<u64> = None;
         if let MeasurementReading::Measured { value: devices } = &snapshot.host.gpus.reading {
-            if devices.is_empty() {
-                allocated = Some(0);
-            }
             for device in devices {
-                match &device.memory {
-                    MeasurementReading::Measured {
-                        value:
-                            GpuMemory::Discrete {
-                                used_bytes,
-                                total_bytes,
-                            },
-                    } => {
-                        *allocated.get_or_insert(0) += used_bytes;
-                        *discrete_free.get_or_insert(0) += total_bytes.saturating_sub(*used_bytes);
-                    }
-                    MeasurementReading::Measured {
-                        value:
-                            GpuMemory::Unified {
-                                gpu_allocated_bytes: MeasurementReading::Measured { value: bytes },
-                                ..
-                            },
-                    } => {
-                        *allocated.get_or_insert(0) += bytes;
-                    }
-                    _ => {}
+                if let MeasurementReading::Measured {
+                    value:
+                        cairn_common::executor_protocol::GpuMemory::Discrete {
+                            used_bytes,
+                            total_bytes,
+                        },
+                } = &device.memory
+                {
+                    *discrete_free.get_or_insert(0) += total_bytes.saturating_sub(*used_bytes);
                 }
             }
         }
@@ -115,15 +99,16 @@ impl MachineReading {
             MeasurementReading::Unavailable { .. } => None,
         };
         Self {
-            gpu_allocated_bytes: allocated,
+            gpu_allocated_bytes: gpu_allocated_bytes(&snapshot.host),
             free_is_host_memory: discrete_free.is_none(),
             free_bytes: discrete_free.or(host_free),
         }
     }
 }
 
-/// What the controller needs of the fleet: sending to a head, reading the
-/// attached machines, and applying the holds.
+/// What the act side and placement's model pass need of the fleet: sending to
+/// a head, reading the attached machines and the batches on them, and stopping
+/// one to make room.
 pub(crate) trait Heads: Send + Sync {
     fn send(
         &self,
@@ -134,11 +119,13 @@ pub(crate) trait Heads: Send + Sync {
     ) -> Result<(), String>;
     /// Every attached machine's readings, by public name.
     fn readings(&self) -> BTreeMap<String, MachineReading>;
-    fn hold(&self, holds: HashMap<String, InferenceHold>);
     /// The batches running on these machines, by public name.
     fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>>;
     /// Stop one running batch to make room; false when it has already ended.
     fn preempt(&self, request_id: &str, attempt_id: &str, preemption: Preemption) -> bool;
+    /// Each pooled machine's address on the fast link joining its pool, by
+    /// public name, as placement detects the pools now.
+    fn links(&self) -> BTreeMap<String, String>;
 }
 
 impl Heads for Fleet {
@@ -159,10 +146,6 @@ impl Heads for Fleet {
             .collect()
     }
 
-    fn hold(&self, holds: HashMap<String, InferenceHold>) {
-        self.set_inference_holds(holds);
-    }
-
     fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>> {
         self.running_batches(machines)
     }
@@ -174,6 +157,38 @@ impl Heads for Fleet {
             preemption,
         )
     }
+
+    fn links(&self) -> BTreeMap<String, String> {
+        link_addresses(self.detected_pools().iter().flat_map(|pool| &pool.members))
+    }
+}
+
+/// Each of `members`' addresses on the link joining its pool, by machine.
+pub(crate) fn link_addresses<'a>(
+    members: impl IntoIterator<Item = &'a PoolMember>,
+) -> BTreeMap<String, String> {
+    members
+        .into_iter()
+        .filter_map(|member| Some((member.machine.clone(), member.link_address?.to_string())))
+        .collect()
+}
+
+/// `deployment`'s machines as the renderer reaches them: each one's address
+/// from its machine record, and its fast-link address from `links`.
+pub(crate) fn machines_at(
+    inventory: &Inventory,
+    deployment: &Deployment,
+    links: &BTreeMap<String, String>,
+) -> Vec<MachineAt> {
+    deployment
+        .machines
+        .iter()
+        .map(|name| MachineAt {
+            name: name.clone(),
+            address: inventory.address_of(name).map(str::to_string),
+            link: links.get(name.as_str()).cloned(),
+        })
+        .collect()
 }
 
 /// One deployment's stored row.
@@ -426,43 +441,18 @@ async fn record_footprint(
     .map_err(|error| format!("write inference_deployment_loads: {error}"))
 }
 
-fn phases_of(states: &BTreeMap<DeploymentId, StateRow>) -> BTreeMap<DeploymentId, Phase> {
-    states
-        .iter()
-        .map(|(id, row)| (id.clone(), row.phase.clone()))
-        .collect()
-}
-
-/// The machines every reserving phase holds, by executor public name.
-pub fn holds_of(
-    inventory: &Inventory,
-    states: &BTreeMap<DeploymentId, StateRow>,
-) -> HashMap<String, InferenceHold> {
-    control::reservations(inventory, &phases_of(states))
+/// Each deployment's phase as the act side holds it. A deployment with no row
+/// is missing from the map: unknown, not stopped, since the act side has never
+/// acted on it. A read that fails is an error, never an empty map, so a pass
+/// never acts on phases it could not read.
+pub(crate) async fn deployment_phases(
+    db: &LocalDb,
+) -> Result<BTreeMap<DeploymentId, Phase>, String> {
+    Ok(load_states(db)
+        .await?
         .into_iter()
-        .map(|(machine, held)| {
-            let waiting_on = match states.get(&held.deployment).map(|row| &row.phase) {
-                Some(Phase::Reserving { waiting_on, .. }) => waiting_on.clone(),
-                _ => None,
-            };
-            (
-                machine.as_str().to_string(),
-                InferenceHold {
-                    deployment: held.deployment.to_string(),
-                    phase: held.phase.to_string(),
-                    waiting_on,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Restate the fleet's holds from the stored phases.
-pub(crate) async fn refresh_holds(db: &LocalDb, heads: &dyn Heads) -> Result<(), String> {
-    let inventory = load_inventory(db).await?;
-    let states = load_states(db).await?;
-    heads.hold(holds_of(&inventory, &states));
-    Ok(())
+        .map(|(id, row)| (id, row.phase))
+        .collect())
 }
 
 /// What the head runs for one deployment.
@@ -474,23 +464,16 @@ struct Plan {
 }
 
 impl Plan {
-    fn of(inventory: &Inventory, deployment: &Deployment) -> Result<Self, String> {
+    fn of(
+        inventory: &Inventory,
+        deployment: &Deployment,
+        links: &BTreeMap<String, String>,
+    ) -> Result<Self, String> {
         let profile = inventory
             .profiles
             .get(&deployment.profile)
             .ok_or_else(|| format!("its profile {} is missing", deployment.profile))?;
-        let pool = inventory.pool_of_deployment(deployment);
-        let machines: Vec<MachineAt> = deployment
-            .machines
-            .iter()
-            .map(|name| MachineAt {
-                name: name.clone(),
-                address: pool
-                    .and_then(|pool| pool.address_of(name))
-                    .map(str::to_string),
-                link: pool.and_then(|pool| pool.link_of(name)).map(str::to_string),
-            })
-            .collect();
+        let machines = machines_at(inventory, deployment, links);
         let rendered = render(profile, deployment, &machines).map_err(|refusal| refusal.0)?;
         let address = inventory.address_of(&deployment.head).ok_or_else(|| {
             format!(
@@ -531,8 +514,12 @@ impl Plan {
 /// Why Cairn could not render `deployment`'s start and stop for its head, or
 /// `None` when it can: what a start would refuse, asked before anything is
 /// stopped to make room for it.
-pub(crate) fn render_problem(inventory: &Inventory, deployment: &Deployment) -> Option<String> {
-    Plan::of(inventory, deployment).err()
+pub(crate) fn render_problem(
+    inventory: &Inventory,
+    deployment: &Deployment,
+    links: &BTreeMap<String, String>,
+) -> Option<String> {
+    Plan::of(inventory, deployment, links).err()
 }
 
 /// Which stored command an observation must belong to.
@@ -544,13 +531,15 @@ enum Matching {
     Command(String),
 }
 
-/// Apply an observation, record the load it finished, and restate the holds.
-/// `command` is the command id the phase holds afterwards when it is one in
-/// flight; `None` keeps the one it held.
-#[allow(clippy::too_many_arguments)]
+/// Apply an observation and record the load it finished. `command` is the
+/// command id the phase holds afterwards when it is one in flight; `None`
+/// keeps the one it held.
+///
+/// A probe that finds a deployment Cairn has never acted on answering gives it
+/// a healthy row, so placement adopts it as a resident instead of placing work
+/// on memory a model it did not know of holds.
 async fn apply(
     db: &LocalDb,
-    heads: &dyn Heads,
     inventory: &Inventory,
     id: &DeploymentId,
     observation: Observation,
@@ -563,7 +552,15 @@ async fn apply(
         id,
         now_ms,
         Arc::new(move |current| {
-            let row = current?;
+            let Some(row) = current else {
+                return (observation == Observation::Probed { healthy: true }).then_some((
+                    Phase::Healthy {
+                        since_ms: now_ms,
+                        load_ms: None,
+                    },
+                    None,
+                ));
+            };
             match &matching {
                 Matching::Any => {}
                 Matching::Command(expected) => {
@@ -587,23 +584,13 @@ async fn apply(
     let Some((before, after)) = changed else {
         return Ok(None);
     };
-    settle(
-        db,
-        heads,
-        inventory,
-        id,
-        before.as_ref(),
-        &after.phase,
-        now_ms,
-    )
-    .await?;
+    settle(db, inventory, id, before.as_ref(), &after.phase, now_ms).await?;
     Ok(Some(after.phase))
 }
 
-/// What follows any change of phase: the load it finished, the holds, a log.
+/// What follows any change of phase: the load it finished, and a log.
 async fn settle(
     db: &LocalDb,
-    heads: &dyn Heads,
     inventory: &Inventory,
     id: &DeploymentId,
     before: Option<&Phase>,
@@ -620,7 +607,7 @@ async fn settle(
             record_load(db, deployment, before, outcome, now_ms).await?;
         }
     }
-    refresh_holds(db, heads).await
+    Ok(())
 }
 
 fn machine_list(deployment: &Deployment) -> String {
@@ -649,23 +636,13 @@ pub(crate) async fn request(
             format!("there is no deployment {id}; cairn://inference/deployments lists them")
         })?
         .clone();
-    let plan = Plan::of(&inventory, &deployment)
+    let plan = Plan::of(&inventory, &deployment, &heads.links())
         .map_err(|why| format!("Cairn cannot {} {id}: {why}", request.as_str()))?;
-    let states = load_states(db).await?;
-    match request {
-        Request::Start => {
-            if let Some(refusal) = control::conflict(&inventory, &phases_of(&states), &deployment) {
-                return Err(format!("Cairn cannot start {id}: {refusal}"));
-            }
-        }
-        Request::Stop => {
-            if plan.stop.is_none() {
-                return Err(format!(
-                    "Cairn cannot stop {id}: its profile {} has no stop command",
-                    deployment.profile
-                ));
-            }
-        }
+    if request == Request::Stop && plan.stop.is_none() {
+        return Err(format!(
+            "Cairn cannot stop {id}: its profile {} has no stop command",
+            deployment.profile
+        ));
     }
     let stop_command = new_command_id("stop");
     let refused: Arc<Mutex<Option<String>>> = Arc::default();
@@ -701,19 +678,10 @@ pub(crate) async fn request(
             .unwrap_or_else(|| "nothing changed".to_string());
         return Err(format!("Cairn did not {} {id}: {why}", request.as_str()));
     };
-    settle(
-        db,
-        heads,
-        &inventory,
-        &id,
-        before.as_ref(),
-        &after.phase,
-        now_ms,
-    )
-    .await?;
+    settle(db, &inventory, &id, before.as_ref(), &after.phase, now_ms).await?;
     match &after.phase {
         Phase::Reserving { .. } => Ok(format!(
-            "Deployment {id}: start requested. Its machines ({}) are reserved now and take no batch work; the start goes to its head {} once each machine has the memory it needs. Read cairn://inference/deployments/{id} for its phase.",
+            "Deployment {id}: start requested. Placement reserves its footprint on its machines ({}) now, and sends the start to its head {} once each machine has the memory it needs. Read cairn://inference/deployments/{id} for its phase.",
             machine_list(&deployment),
             deployment.head
         )),
@@ -723,7 +691,6 @@ pub(crate) async fn request(
                 let reason = format!("the stop could not be sent: {why}");
                 apply(
                     db,
-                    heads,
                     &inventory,
                     &id,
                     Observation::NotSent {
@@ -737,7 +704,7 @@ pub(crate) async fn request(
                 return Err(format!("Cairn did not stop {id}: {reason}"));
             }
             Ok(format!(
-                "Deployment {id}: stop sent to its head {}. Its machines ({}) stay reserved until its health check stops answering. Read cairn://inference/deployments/{id} for its phase.",
+                "Deployment {id}: stop sent to its head {}; its memory on {} returns once its health check stops answering. Read cairn://inference/deployments/{id} for its phase.",
                 deployment.head,
                 machine_list(&deployment)
             ))
@@ -763,7 +730,6 @@ fn report_of(phase: DeploymentPhaseReport) -> Report {
 /// Apply one report from a head.
 pub(crate) async fn on_report(
     db: &LocalDb,
-    heads: &dyn Heads,
     report: DeploymentReportReceived,
     now_ms: i64,
 ) -> Result<(), String> {
@@ -786,17 +752,7 @@ pub(crate) async fn on_report(
             Matching::Command(report.command_id),
         )
     };
-    apply(
-        db,
-        heads,
-        &inventory,
-        &id,
-        observation,
-        matching,
-        None,
-        now_ms,
-    )
-    .await?;
+    apply(db, &inventory, &id, observation, matching, None, now_ms).await?;
     Ok(())
 }
 
@@ -842,11 +798,14 @@ async fn note_late_start_failure(
 }
 
 /// The task's own state between ticks: when each deployment was last probed,
-/// and how far each starting or healthy deployment's GPU memory has climbed.
+/// how far each starting or healthy deployment's GPU memory has climbed, and
+/// which deployments Cairn never acted on were already probed since their head
+/// attached.
 #[derive(Debug, Default)]
 pub(crate) struct Probes {
     last: HashMap<DeploymentId, i64>,
     allocations: HashMap<DeploymentId, AllocationWatch>,
+    unknown_probed: HashSet<DeploymentId>,
 }
 
 impl Probes {
@@ -868,12 +827,12 @@ fn probe(
     plan: &Plan,
     readings: &BTreeMap<String, MachineReading>,
     now_ms: i64,
-) {
+) -> bool {
     if !readings.contains_key(deployment.head.as_str()) || !probes.due(&deployment.id, now_ms) {
-        return;
+        return false;
     }
     let command = new_command_id(PROBE_PREFIX.trim_end_matches('-'));
-    if let Err(why) = heads.send(
+    match heads.send(
         deployment.head.as_str(),
         &command,
         deployment.id.as_str(),
@@ -881,7 +840,11 @@ fn probe(
             health_url: plan.health_url.clone(),
         },
     ) {
-        log::debug!("inference: could not probe {}: {why}", deployment.id);
+        Ok(()) => true,
+        Err(why) => {
+            log::debug!("inference: could not probe {}: {why}", deployment.id);
+            false
+        }
     }
 }
 
@@ -933,7 +896,6 @@ pub(crate) async fn tick(
         if let Some(reason) = control::overdue(&row.phase, now_ms) {
             apply(
                 db,
-                heads,
                 &inventory,
                 id,
                 Observation::Overdue { reason },
@@ -944,13 +906,12 @@ pub(crate) async fn tick(
             .await?;
             continue;
         }
-        let plan = match Plan::of(&inventory, deployment) {
+        let plan = match Plan::of(&inventory, deployment, &heads.links()) {
             Ok(plan) => plan,
             Err(why) => {
                 if matches!(row.phase, Phase::Reserving { .. }) {
                     apply(
                         db,
-                        heads,
                         &inventory,
                         id,
                         Observation::NotSent { reason: why },
@@ -967,12 +928,11 @@ pub(crate) async fn tick(
             probes.allocations.remove(id);
         }
         match &row.phase {
-            Phase::Reserving { since_ms, .. } => {
-                dispatch(
-                    db, heads, &inventory, deployment, &plan, &readings, &history, probes,
-                    *since_ms, now_ms,
-                )
-                .await?;
+            // Placement drains the gang and launches the start. A model that
+            // already answers while it waits is adopted as it stands, rather
+            // than waiting for memory it is itself using.
+            Phase::Reserving { .. } => {
+                probe(heads, probes, deployment, &plan, &readings, now_ms);
             }
             Phase::Starting { .. } | Phase::Healthy { .. } => {
                 // Probed while starting too: health answering is what makes
@@ -988,7 +948,6 @@ pub(crate) async fn tick(
                     probes.allocations.remove(id);
                     apply(
                         db,
-                        heads,
                         &inventory,
                         id,
                         Observation::Lost { reason },
@@ -1031,116 +990,98 @@ pub(crate) async fn tick(
             Phase::Stopping { .. } => {}
         }
     }
-    refresh_holds(db, heads).await
+    Ok(())
 }
 
-/// Send a reserving start once its head is attached and the gang fits,
-/// draining its machines meanwhile: they take no new batch work (the hold),
-/// the work already there may finish until the drain's bound, and past it the
-/// checks whose measured memory is in the way are preempted
-/// ([`control::drain`]).
-#[allow(clippy::too_many_arguments)]
-async fn dispatch(
+/// Probe every deployment Cairn has never acted on, once each time its head
+/// attaches: one that answers gets a healthy row, which placement adopts as a
+/// resident, so what is left running from before Cairn acted on it is held,
+/// not ignored. One that does not answer is not asked again until its head is
+/// seen detached and attached again (a power cycle, say), when a model may
+/// have come up with it.
+pub(crate) async fn probe_unknown(
     db: &LocalDb,
     heads: &dyn Heads,
-    inventory: &Inventory,
-    deployment: &Deployment,
-    plan: &Plan,
-    readings: &BTreeMap<String, MachineReading>,
-    history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
     probes: &mut Probes,
-    reserving_since_ms: i64,
     now_ms: i64,
 ) -> Result<(), String> {
-    let id = &deployment.id;
-    let waiting = |on: String| Observation::Waiting { on };
-    if !readings.contains_key(deployment.head.as_str()) {
-        apply(
-            db,
-            heads,
-            inventory,
-            id,
-            waiting(format!("its head {} is not attached", deployment.head)),
-            Matching::Any,
-            None,
-            now_ms,
-        )
-        .await?;
-        return Ok(());
-    }
-    let footprint = last_footprint(history.get(id));
-    let profile = inventory.profiles.get(&deployment.profile);
-    let stated = profile.and_then(control::stated_need);
-    let names: BTreeSet<String> = deployment
-        .machines
-        .iter()
-        .map(|machine| machine.as_str().to_string())
-        .collect();
-    let mut running = heads.running(&names);
-    let gang: BTreeMap<_, _> = deployment
-        .machines
-        .iter()
-        .map(|machine| {
-            let reading = readings.get(machine.as_str());
-            (
-                machine.clone(),
-                GangMachine {
-                    room: Room {
-                        free_bytes: reading.and_then(|r| r.free_bytes),
-                        need_bytes: footprint.get(machine.as_str()).copied().or(stated),
-                    },
-                    shared_with_batches: reading.is_some_and(|r| r.free_is_host_memory),
-                    batches: running.remove(machine.as_str()).unwrap_or_default(),
-                },
-            )
-        })
-        .collect();
-    let on = match control::drain(&gang, reserving_since_ms, now_ms) {
-        Drain::Start => None,
-        Drain::Wait(on) => Some(on),
-        Drain::Preempt { batches, waiting } => {
-            let model = profile
-                .map(|profile| profile.model.name.to_string())
-                .unwrap_or_else(|| deployment.profile.to_string());
-            for batch in batches {
-                heads.preempt(
-                    &batch.request_id,
-                    &batch.attempt_id,
-                    Preemption {
-                        deployment: id.to_string(),
-                        model: model.clone(),
-                        executor: batch.machine.as_str().to_string(),
-                        need_bytes: batch.need_bytes,
-                        free_bytes: batch.free_bytes,
-                        resident_bytes: batch.resident_bytes,
-                    },
-                );
+    let inventory = load_inventory(db).await?;
+    let states = load_states(db).await?;
+    let readings = heads.readings();
+    probes
+        .unknown_probed
+        .retain(|id| inventory.deployments.contains_key(id));
+    for deployment in inventory.deployments.values() {
+        let id = &deployment.id;
+        if states.contains_key(id) || !readings.contains_key(deployment.head.as_str()) {
+            probes.unknown_probed.remove(id);
+            continue;
+        }
+        if probes.unknown_probed.contains(id) {
+            continue;
+        }
+        if let Ok(plan) = Plan::of(&inventory, deployment, &heads.links()) {
+            if probe(heads, probes, deployment, &plan, &readings, now_ms) {
+                probes.unknown_probed.insert(id.clone());
             }
-            Some(waiting)
+        }
+    }
+    Ok(())
+}
+
+/// Record what a reserving start waits on, in placement's words.
+pub(crate) async fn note_waiting(
+    db: &LocalDb,
+    id: &DeploymentId,
+    on: String,
+    now_ms: i64,
+) -> Result<(), String> {
+    let inventory = load_inventory(db).await?;
+    apply(
+        db,
+        &inventory,
+        id,
+        Observation::Waiting { on },
+        Matching::Any,
+        None,
+        now_ms,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Send a reserving start to its head: placement found every machine of its
+/// gang with the room it needs. A start that cannot be sent fails, naming why.
+pub(crate) async fn launch(
+    db: &LocalDb,
+    heads: &dyn Heads,
+    id: &DeploymentId,
+    now_ms: i64,
+) -> Result<(), String> {
+    let inventory = load_inventory(db).await?;
+    let Some(deployment) = inventory.deployments.get(id) else {
+        return Err(format!("there is no deployment {id}"));
+    };
+    let plan = match Plan::of(&inventory, deployment, &heads.links()) {
+        Ok(plan) => plan,
+        Err(why) => {
+            apply(
+                db,
+                &inventory,
+                id,
+                Observation::NotSent { reason: why },
+                Matching::Any,
+                None,
+                now_ms,
+            )
+            .await?;
+            return Ok(());
         }
     };
-    if let Some(on) = on {
-        apply(
-            db,
-            heads,
-            inventory,
-            id,
-            waiting(on),
-            Matching::Any,
-            None,
-            now_ms,
-        )
-        .await?;
-        // It may already be running and using the very memory it waits for:
-        // a probe that finds it answering adopts it.
-        probe(heads, probes, deployment, plan, readings, now_ms);
-        return Ok(());
-    }
     let command = new_command_id("start");
     let sent = apply(
         db,
-        heads,
-        inventory,
+        &inventory,
         id,
         Observation::StartSent,
         Matching::Any,
@@ -1160,8 +1101,7 @@ async fn dispatch(
     ) {
         apply(
             db,
-            heads,
-            inventory,
+            &inventory,
             id,
             Observation::NotSent {
                 reason: format!("the start could not be sent: {why}"),
@@ -1173,15 +1113,6 @@ async fn dispatch(
         .await?;
     }
     Ok(())
-}
-
-/// Start or stop a deployment for an agent or the operator.
-pub async fn request_deployment(
-    orch: &Orchestrator,
-    id: &str,
-    action: Request,
-) -> Result<String, String> {
-    request(&orch.db.local, orch.fleet.as_ref(), id, action, now_ms()).await
 }
 
 /// Everything the deployment pages render about what Cairn has done.
@@ -1201,9 +1132,10 @@ pub async fn load_control_view(orch: &Orchestrator) -> Result<ControlView, Strin
     })
 }
 
-/// Act on deployments for the life of the process: restate the holds from
-/// the stored phases at once (a model loaded before a restart still holds its
-/// machines), then apply every report and tick every [`TICK`].
+/// Act on deployments for the life of the process: apply every report, tick
+/// every [`TICK`], and wake placement's model pass whenever a phase may have
+/// moved. Every deployment Cairn has never acted on is probed once each time
+/// its head attaches, so a model left running is adopted.
 pub fn spawn_deployment_control(orch: Orchestrator) {
     tokio::spawn(async move {
         let mut reports = orch.fleet.subscribe_deployment_reports();
@@ -1211,18 +1143,20 @@ pub fn spawn_deployment_control(orch: Orchestrator) {
         let mut ticks = tokio::time::interval(TICK);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let heads: &dyn Heads = orch.fleet.as_ref();
-        if let Err(error) = refresh_holds(&orch.db.local, heads).await {
-            log::warn!("inference: could not restate deployment holds: {error}");
-        }
         loop {
             tokio::select! {
                 Some(report) = reports.recv() => {
-                    if let Err(error) = on_report(&orch.db.local, heads, report, now_ms()).await {
+                    if let Err(error) = on_report(&orch.db.local, report, now_ms()).await {
                         log::warn!("inference: a deployment report was not applied: {error}");
                     }
+                    orch.fleet.wake_model_pass();
                 }
                 _ = ticks.tick() => {
-                    if let Err(error) = tick(&orch.db.local, heads, &mut probes, now_ms()).await {
+                    let now = now_ms();
+                    if let Err(error) = probe_unknown(&orch.db.local, heads, &mut probes, now).await {
+                        log::debug!("inference: could not probe unknown deployments: {error}");
+                    }
+                    if let Err(error) = tick(&orch.db.local, heads, &mut probes, now).await {
                         log::warn!("inference: a deployment control pass failed: {error}");
                     }
                 }
@@ -1231,23 +1165,22 @@ pub fn spawn_deployment_control(orch: Orchestrator) {
     });
 }
 
-/// The act side's test fixtures, shared with the pool controller's tests.
+/// The act side's test fixtures, shared with placement's model tests.
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use cairn_inference::{
-        DeploymentSet, Engine, InferenceProfile, ModelRef, Pool, PoolMachine, RecordSource,
-        Requirements,
+        Engine, InferenceProfile, MachineRecord, ModelRef, RecordSource, Requirements,
     };
 
     #[derive(Default)]
     pub(crate) struct FakeHeads {
         pub(crate) sent: Mutex<Vec<(String, String, String, DeploymentOperation)>>,
         readings: Mutex<BTreeMap<String, MachineReading>>,
-        holds: Mutex<HashMap<String, InferenceHold>>,
         pub(crate) refuse: Mutex<Option<String>>,
-        running: Mutex<BTreeMap<String, Vec<RunningBatch>>>,
-        preempted: Mutex<Vec<(String, Preemption)>>,
+        pub(crate) running: Mutex<BTreeMap<String, Vec<RunningBatch>>>,
+        pub(crate) preempted: Mutex<Vec<(String, Preemption)>>,
+        pub(crate) links: Mutex<BTreeMap<String, String>>,
     }
 
     impl Heads for FakeHeads {
@@ -1272,9 +1205,6 @@ pub(crate) mod tests {
         fn readings(&self) -> BTreeMap<String, MachineReading> {
             self.readings.lock().unwrap().clone()
         }
-        fn hold(&self, holds: HashMap<String, InferenceHold>) {
-            *self.holds.lock().unwrap() = holds;
-        }
         fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>> {
             self.running
                 .lock()
@@ -1296,6 +1226,9 @@ pub(crate) mod tests {
                 .push((request_id.to_string(), preemption));
             true
         }
+        fn links(&self) -> BTreeMap<String, String> {
+            self.links.lock().unwrap().clone()
+        }
     }
 
     impl FakeHeads {
@@ -1309,7 +1242,16 @@ pub(crate) mod tests {
                 },
             );
         }
-        fn run(&self, name: &str, request_id: &str, restartable: bool, resident_gib: u64) {
+        pub(crate) fn detach(&self, name: &str) {
+            self.readings.lock().unwrap().remove(name);
+        }
+        pub(crate) fn run(
+            &self,
+            name: &str,
+            request_id: &str,
+            restartable: bool,
+            resident_gib: u64,
+        ) {
             self.running
                 .lock()
                 .unwrap()
@@ -1331,10 +1273,14 @@ pub(crate) mod tests {
                 .cloned()
                 .expect("something was sent")
         }
-        pub(crate) fn held(&self) -> Vec<String> {
-            let mut names: Vec<_> = self.holds.lock().unwrap().keys().cloned().collect();
-            names.sort();
-            names
+        pub(crate) fn starts(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, _, op)| matches!(op, DeploymentOperation::Start { .. }))
+                .map(|(_, _, deployment, _)| deployment.clone())
+                .collect()
         }
     }
 
@@ -1385,8 +1331,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// sp1 and sp2 in pool `sparks`, which has no default: `dsv4f-tp2` spans
-    /// both and `qwen36-fast` is on sp1.
+    /// sp1 and sp2 with their addresses: `dsv4f-tp2` spans both and
+    /// `qwen36-fast` is on sp1. Each profile's model is named by its id.
     pub(crate) async fn sparks_db(name: &str) -> LocalDb {
         let db = crate::storage::migrated_test_db(name).await;
         let mut inventory = Inventory::default();
@@ -1396,24 +1342,13 @@ pub(crate) mod tests {
         inventory.insert_deployment(deployment(DSV4F, &[SP1, SP2]));
         inventory.insert_profile(profile(QWEN, 1));
         inventory.insert_deployment(deployment(QWEN, &[SP1]));
-        inventory.insert_pool(Pool {
-            id: "sparks".into(),
-            source: RecordSource::Cairn,
-            machines: vec![
-                PoolMachine {
-                    name: SP1.into(),
-                    address: Some("10.20.20.40".into()),
-                    link: Some("10.0.1.1".into()),
-                },
-                PoolMachine {
-                    name: SP2.into(),
-                    address: Some("10.20.20.41".into()),
-                    link: Some("10.0.1.2".into()),
-                },
-            ],
-            default: DeploymentSet::new(),
-            pin: Some(DeploymentSet::new()),
-        });
+        for (name, address) in [(SP1, "10.20.20.40"), (SP2, "10.20.20.41")] {
+            inventory.insert_machine(MachineRecord {
+                name: name.into(),
+                source: RecordSource::Cairn,
+                address: address.into(),
+            });
+        }
         inventory.validate().expect("the test inventory is valid");
         let rows: Vec<(&str, String, String)> = inventory
             .models
@@ -1439,11 +1374,11 @@ pub(crate) mod tests {
                     serde_json::to_string(d).unwrap(),
                 )
             }))
-            .chain(inventory.pools.values().map(|p| {
+            .chain(inventory.machines.values().map(|m| {
                 (
-                    "inference_pools",
-                    p.id.to_string(),
-                    serde_json::to_string(p).unwrap(),
+                    "inference_machines",
+                    m.name.to_string(),
+                    serde_json::to_string(m).unwrap(),
                 )
             }))
             .collect();
@@ -1467,7 +1402,10 @@ pub(crate) mod tests {
             .clone()
     }
 
-    fn report(command_id: &str, phase: DeploymentPhaseReport) -> DeploymentReportReceived {
+    pub(crate) fn report(
+        command_id: &str,
+        phase: DeploymentPhaseReport,
+    ) -> DeploymentReportReceived {
         DeploymentReportReceived {
             executor: SP1.into(),
             command_id: command_id.into(),
@@ -1477,7 +1415,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_load_and_stop_runs_through_the_head_and_holds_the_gang_throughout() {
+    async fn a_load_and_stop_runs_through_the_head() {
         let db = sparks_db("inference-control-cycle").await;
         let heads = FakeHeads::default();
         heads.attach(SP1, 110, 0);
@@ -1489,10 +1427,12 @@ pub(crate) mod tests {
             .unwrap();
         assert!(said.contains("bginf-sp1, bginf-sp2"), "{said}");
         assert_eq!(phase(&db, DSV4F).await.label(), "reserving");
-        assert_eq!(heads.held(), [SP1, SP2], "reserved before anything is sent");
-        assert!(heads.sent.lock().unwrap().is_empty());
+        assert!(
+            heads.sent.lock().unwrap().is_empty(),
+            "nothing is sent until placement launches it"
+        );
 
-        tick(&db, &heads, &mut probes, 2_000).await.unwrap();
+        launch(&db, &heads, &DSV4F.into(), 2_000).await.unwrap();
         let (executor, start_id, deployment, operation) = heads.last_sent();
         assert_eq!(
             (executor.as_str(), deployment.as_str()),
@@ -1517,7 +1457,6 @@ pub(crate) mod tests {
         // A report for some other command changes nothing.
         on_report(
             &db,
-            &heads,
             report(
                 "start-old",
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1530,7 +1469,6 @@ pub(crate) mod tests {
 
         on_report(
             &db,
-            &heads,
             report(&start_id, DeploymentPhaseReport::Starting),
             3_000,
         )
@@ -1538,7 +1476,6 @@ pub(crate) mod tests {
         .unwrap();
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1554,7 +1491,6 @@ pub(crate) mod tests {
                 load_ms: Some(300_000)
             }
         );
-        assert_eq!(heads.held(), [SP1, SP2]);
         let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
         assert_eq!(loads.len(), 1);
         assert_eq!(
@@ -1594,14 +1530,12 @@ pub(crate) mod tests {
         assert!(
             matches!(operation, DeploymentOperation::Stop { ref script, .. } if script == "./stop-dsv4f-tp2.sh")
         );
-        assert_eq!(
-            heads.held(),
-            [SP1, SP2],
-            "a stopping model still holds its memory"
+        assert!(
+            phase(&db, DSV4F).await.reserves(),
+            "a stopping model still occupies its machines"
         );
         on_report(
             &db,
-            &heads,
             report(&stop_id, DeploymentPhaseReport::Stopped),
             430_000,
         )
@@ -1611,27 +1545,20 @@ pub(crate) mod tests {
             phase(&db, DSV4F).await,
             Phase::Stopped { since_ms: 430_000 }
         );
-        assert!(
-            heads.held().is_empty(),
-            "a stopped deployment releases both Sparks"
-        );
     }
 
     #[tokio::test]
-    async fn a_failed_start_reports_why_records_the_load_and_frees_the_machines() {
+    async fn a_failed_start_reports_why_and_records_the_load() {
         let db = sparks_db("inference-control-failed").await;
         let heads = FakeHeads::default();
         heads.attach(SP1, 110, 0);
-        heads.attach(SP2, 110, 0);
-        let mut probes = Probes::default();
         request(&db, &heads, DSV4F, Request::Start, 1_000)
             .await
             .unwrap();
-        tick(&db, &heads, &mut probes, 2_000).await.unwrap();
+        launch(&db, &heads, &DSV4F.into(), 2_000).await.unwrap();
         let (_, start_id, _, _) = heads.last_sent();
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Failed {
@@ -1642,14 +1569,15 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        let failed = phase(&db, DSV4F).await;
         assert_eq!(
-            phase(&db, DSV4F).await,
+            failed,
             Phase::Failed {
                 at_ms: 5_000,
                 reason: "the start command exited 127: not found".into()
             }
         );
-        assert!(heads.held().is_empty());
+        assert!(!failed.reserves(), "a failed start frees its machines");
         let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
         assert_eq!(
             (loads[0].healthy, loads[0].reason.as_deref()),
@@ -1658,16 +1586,15 @@ pub(crate) mod tests {
     }
 
     /// Start dsv4f-tp2 on two attached Sparks and return the start's id.
-    async fn started(db: &LocalDb, heads: &FakeHeads, probes: &mut Probes) -> String {
+    async fn started(db: &LocalDb, heads: &FakeHeads) -> String {
         request(db, heads, DSV4F, Request::Start, 1_000)
             .await
             .unwrap();
-        tick(db, heads, probes, 2_000).await.unwrap();
+        launch(db, heads, &DSV4F.into(), 2_000).await.unwrap();
         let (_, start_id, _, operation) = heads.last_sent();
         assert!(matches!(operation, DeploymentOperation::Start { .. }));
         on_report(
             db,
-            heads,
             report(&start_id, DeploymentPhaseReport::Starting),
             3_000,
         )
@@ -1697,7 +1624,7 @@ pub(crate) mod tests {
         heads.attach(SP1, 110, 0);
         heads.attach(SP2, 110, 0);
         let mut probes = Probes::default();
-        let start_id = started(&db, &heads, &mut probes).await;
+        let start_id = started(&db, &heads).await;
 
         tick(&db, &heads, &mut probes, 40_000).await.unwrap();
         let (_, probe_id, _, operation) = heads.last_sent();
@@ -1707,7 +1634,6 @@ pub(crate) mod tests {
         );
         on_report(
             &db,
-            &heads,
             report(
                 &probe_id,
                 DeploymentPhaseReport::Healthy { ran_start: false },
@@ -1723,7 +1649,6 @@ pub(crate) mod tests {
                 load_ms: Some(401_000)
             }
         );
-        assert_eq!(heads.held(), [SP1, SP2]);
         let states = load_states(&db).await.unwrap();
         assert_eq!(
             states[&DeploymentId::from(DSV4F)].command_id.as_deref(),
@@ -1734,7 +1659,6 @@ pub(crate) mod tests {
         // The head's own sighting of health, then the script's bad exit.
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1746,7 +1670,6 @@ pub(crate) mod tests {
         let late = "the start command exited 1 after its health check had answered: warm-up request timed out";
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Failed {
@@ -1765,7 +1688,6 @@ pub(crate) mod tests {
             },
             "health decides, not the script"
         );
-        assert_eq!(heads.held(), [SP1, SP2]);
         let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
         assert_eq!(loads.len(), 1);
         assert_eq!(
@@ -1785,10 +1707,9 @@ pub(crate) mod tests {
         heads.attach(SP1, 110, 0);
         heads.attach(SP2, 110, 0);
         let mut probes = Probes::default();
-        let start_id = started(&db, &heads, &mut probes).await;
+        let start_id = started(&db, &heads).await;
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1808,7 +1729,6 @@ pub(crate) mod tests {
                 load_ms: Some(300_000)
             }
         );
-        assert_eq!(heads.held(), [SP1, SP2]);
     }
 
     #[tokio::test]
@@ -1818,10 +1738,9 @@ pub(crate) mod tests {
         heads.attach(SP1, 110, 0);
         heads.attach(SP2, 110, 0);
         let mut probes = Probes::default();
-        let start_id = started(&db, &heads, &mut probes).await;
+        let start_id = started(&db, &heads).await;
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1835,20 +1754,20 @@ pub(crate) mod tests {
         assert!(matches!(operation, DeploymentOperation::Probe { .. }));
         on_report(
             &db,
-            &heads,
             report(&probe_id, DeploymentPhaseReport::Stopped),
             441_000,
         )
         .await
         .unwrap();
+        let failed = phase(&db, DSV4F).await;
         assert_eq!(
-            phase(&db, DSV4F).await,
+            failed,
             Phase::Failed {
                 at_ms: 441_000,
                 reason: "it stopped answering its health check".into()
             }
         );
-        assert!(heads.held().is_empty(), "both Sparks are released");
+        assert!(!failed.reserves(), "both Sparks are released");
     }
 
     /// bginf's agent killed the engine on 10-31 while Cairn read `starting`
@@ -1862,7 +1781,7 @@ pub(crate) mod tests {
         heads.attach(SP1, 110, 0);
         heads.attach(SP2, 110, 0);
         let mut probes = Probes::default();
-        started(&db, &heads, &mut probes).await;
+        started(&db, &heads).await;
 
         heads.attach(SP1, 28, 82);
         heads.attach(SP2, 28, 82);
@@ -1878,7 +1797,6 @@ pub(crate) mod tests {
             reason,
             "its engine is gone: bginf-sp1's GPU memory fell to 0.0 GiB after reaching 82.0 GiB (its footprint is 100.0 GiB)"
         );
-        assert!(heads.held().is_empty());
         let loads = &load_history(&db).await.unwrap()[&DeploymentId::from(DSV4F)];
         assert_eq!(
             (loads[0].healthy, loads[0].reason.as_deref()),
@@ -1890,11 +1808,10 @@ pub(crate) mod tests {
         request(&db, &heads, DSV4F, Request::Start, 20_000)
             .await
             .unwrap();
-        tick(&db, &heads, &mut probes, 21_000).await.unwrap();
+        launch(&db, &heads, &DSV4F.into(), 21_000).await.unwrap();
         let (_, start_id, _, _) = heads.last_sent();
         on_report(
             &db,
-            &heads,
             report(
                 &start_id,
                 DeploymentPhaseReport::Healthy { ran_start: true },
@@ -1916,47 +1833,33 @@ pub(crate) mod tests {
             reason.contains("bginf-sp2's GPU memory fell to 1.0 GiB"),
             "{reason}"
         );
-        assert!(heads.held().is_empty());
     }
 
     #[tokio::test]
-    async fn a_start_waits_for_its_head_and_memory_and_gives_up_at_its_bound() {
+    async fn a_reserving_start_records_what_it_waits_on_and_gives_up_at_its_bound() {
         let db = sparks_db("inference-control-wait").await;
         let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
         let mut probes = Probes::default();
         request(&db, &heads, DSV4F, Request::Start, 1_000)
             .await
             .unwrap();
-        tick(&db, &heads, &mut probes, 2_000).await.unwrap();
+        note_waiting(
+            &db,
+            &DSV4F.into(),
+            "memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB".into(),
+            2_000,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             phase(&db, DSV4F).await,
             Phase::Reserving {
                 since_ms: 1_000,
-                waiting_on: Some("its head bginf-sp1 is not attached".into())
+                waiting_on: Some("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB".into())
             }
         );
-        assert!(heads.sent.lock().unwrap().is_empty());
-
-        // A measured footprint from an earlier load makes memory the gate.
-        db.execute(
-            "INSERT INTO inference_deployment_loads
-               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
-             VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
-            params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", 100u64 << 30, 100u64 << 30)],
-        )
-        .await
-        .unwrap();
-        heads.attach(SP1, 110, 0);
-        heads.attach(SP2, 20, 0);
         tick(&db, &heads, &mut probes, 3_000).await.unwrap();
-        let Phase::Reserving { waiting_on, .. } = phase(&db, DSV4F).await else {
-            panic!("still reserving");
-        };
-        let waiting_on = waiting_on.unwrap_or_default();
-        assert!(
-            waiting_on.starts_with("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB; "),
-            "{waiting_on}"
-        );
         let (_, probe_id, _, operation) = heads.last_sent();
         assert!(
             matches!(operation, DeploymentOperation::Probe { .. }),
@@ -1973,107 +1876,6 @@ pub(crate) mod tests {
             reason.contains("memory: bginf-sp2 has 20.0 GiB free and needs 100.0 GiB"),
             "{reason}"
         );
-        assert!(heads.held().is_empty());
-    }
-
-    /// The load order on machines with batch work: hold (no new work), let
-    /// the work finish until the drain's bound, then preempt only the checks
-    /// whose measured memory is in the way, never the agent turn, naming the
-    /// model and the memory; the start goes once the gang fits.
-    #[tokio::test]
-    async fn a_start_drains_its_machines_then_preempts_only_the_checks_in_its_way() {
-        let db = sparks_db("inference-control-drain").await;
-        let heads = FakeHeads::default();
-        let mut probes = Probes::default();
-        db.execute(
-            "INSERT INTO inference_deployment_loads
-               (deployment_id, profile_id, requested_at, finished_at, outcome, load_ms, footprint_json)
-             VALUES (?1, ?1, 0, 1, 'healthy', 1, ?2)",
-            params![DSV4F, format!("{{\"{SP1}\":{},\"{SP2}\":{}}}", 100u64 << 30, 100u64 << 30)],
-        )
-        .await
-        .unwrap();
-        heads.attach(SP1, 60, 0);
-        heads.attach(SP2, 110, 0);
-        heads.run(SP1, "check-big", true, 45);
-        heads.run(SP1, "check-small", true, 5);
-        heads.run(SP1, "turn", false, 30);
-        heads.run(SP2, "check-resident", true, 8);
-        request(&db, &heads, DSV4F, Request::Start, 1_000)
-            .await
-            .unwrap();
-        assert_eq!(
-            heads.held(),
-            [SP1, SP2],
-            "no new work from the moment it is asked for"
-        );
-
-        tick(&db, &heads, &mut probes, 2_000).await.unwrap();
-        assert!(
-            heads.preempted.lock().unwrap().is_empty(),
-            "inside the bound"
-        );
-        let Phase::Reserving { waiting_on, .. } = phase(&db, DSV4F).await else {
-            panic!("still reserving");
-        };
-        assert!(
-            waiting_on
-                .unwrap_or_default()
-                .contains("may finish for 5 min more"),
-            "the wait names the bound"
-        );
-
-        let past = 1_000 + (control::DRAIN_BOUND_SECS as i64) * 1_000;
-        tick(&db, &heads, &mut probes, past).await.unwrap();
-        let preempted = heads.preempted.lock().unwrap().clone();
-        assert_eq!(
-            preempted.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            ["check-big"],
-            "40 GiB short on sp1: the one check that covers it; never the turn, never sp2's resident that fits"
-        );
-        let (_, why) = &preempted[0];
-        assert_eq!(
-            (
-                why.deployment.as_str(),
-                why.model.as_str(),
-                why.executor.as_str()
-            ),
-            (DSV4F, DSV4F, SP1)
-        );
-        assert_eq!(
-            (why.need_bytes, why.free_bytes, why.resident_bytes),
-            (100 << 30, 60 << 30, 45 << 30)
-        );
-        assert!(
-            heads
-                .sent
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(_, _, _, op)| !matches!(op, DeploymentOperation::Start { .. })),
-            "the start waits for the memory to come back"
-        );
-
-        // Its memory came back: the gang fits beside the turn and the
-        // resident, and the start goes.
-        heads
-            .running
-            .lock()
-            .unwrap()
-            .get_mut(SP1)
-            .unwrap()
-            .retain(|b| !b.preempted);
-        heads.attach(SP1, 105, 0);
-        tick(&db, &heads, &mut probes, past + 5_000).await.unwrap();
-        assert!(matches!(
-            heads.last_sent().3,
-            DeploymentOperation::Start { .. }
-        ));
-        assert_eq!(
-            heads.preempted.lock().unwrap().len(),
-            1,
-            "nothing else was stopped"
-        );
     }
 
     #[tokio::test]
@@ -2086,7 +1888,6 @@ pub(crate) mod tests {
             .unwrap();
         on_report(
             &db,
-            &heads,
             report(
                 "probe-1",
                 DeploymentPhaseReport::Healthy { ran_start: false },
@@ -2105,19 +1906,12 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_overlapping_start_and_an_unsendable_stop_are_refused_by_name() {
+    async fn a_second_start_and_an_unsendable_stop_are_refused_by_name() {
         let db = sparks_db("inference-control-refusals").await;
         let heads = FakeHeads::default();
         request(&db, &heads, DSV4F, Request::Start, 1_000)
             .await
             .unwrap();
-        let refusal = request(&db, &heads, "qwen36-fast", Request::Start, 1_001)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            refusal,
-            "Cairn cannot start qwen36-fast: bginf-sp1 is held by deployment dsv4f-tp2 (reserving); stop it first"
-        );
         assert_eq!(
             request(&db, &heads, DSV4F, Request::Start, 1_002)
                 .await
@@ -2134,7 +1928,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(said.contains("nothing ran"), "{said}");
-        assert!(heads.held().is_empty());
 
         *heads.refuse.lock().unwrap() = Some("executor bginf-sp1 is not attached".into());
         let refusal = request(&db, &heads, DSV4F, Request::Stop, 1_005)
@@ -2145,11 +1938,10 @@ pub(crate) mod tests {
             "Cairn did not stop dsv4f-tp2: the stop could not be sent: executor bginf-sp1 is not attached"
         );
         assert_eq!(phase(&db, DSV4F).await.label(), "failed");
-        assert!(heads.held().is_empty());
     }
 
     #[tokio::test]
-    async fn a_stopped_model_back_after_a_power_cycle_is_held_again() {
+    async fn a_stopped_model_back_after_a_power_cycle_is_healthy_again() {
         let db = sparks_db("inference-control-power-cycle").await;
         let heads = FakeHeads::default();
         heads.attach(SP1, 110, 0);
@@ -2158,20 +1950,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let (_, stop_id, _, _) = heads.last_sent();
-        on_report(
-            &db,
-            &heads,
-            report(&stop_id, DeploymentPhaseReport::Stopped),
-            2_000,
-        )
-        .await
-        .unwrap();
+        on_report(&db, report(&stop_id, DeploymentPhaseReport::Stopped), 2_000)
+            .await
+            .unwrap();
         tick(&db, &heads, &mut probes, 3_000).await.unwrap();
         let (_, probe_id, _, operation) = heads.last_sent();
         assert!(matches!(operation, DeploymentOperation::Probe { .. }));
         on_report(
             &db,
-            &heads,
             report(
                 &probe_id,
                 DeploymentPhaseReport::Healthy { ran_start: false },
@@ -2181,18 +1967,112 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert_eq!(phase(&db, DSV4F).await.label(), "healthy");
-        assert_eq!(heads.held(), [SP1, SP2]);
     }
 
+    /// A model left running before Cairn acted on it is found by one probe and
+    /// given a healthy row, which placement adopts; one that does not answer
+    /// is left alone until its head attaches again, and neither is ever sent a
+    /// start or a stop for it.
     #[tokio::test]
-    async fn deployments_cairn_never_touched_are_not_probed_or_held() {
+    async fn a_deployment_cairn_never_touched_is_probed_once_and_adopted_if_it_answers() {
         let db = sparks_db("inference-control-untouched").await;
         let heads = FakeHeads::default();
         heads.attach(SP1, 110, 0);
-        tick(&db, &heads, &mut Probes::default(), 1_000)
+        let mut probes = Probes::default();
+        tick(&db, &heads, &mut probes, 1_000).await.unwrap();
+        assert!(
+            heads.sent.lock().unwrap().is_empty(),
+            "the tick probes only rows"
+        );
+
+        probe_unknown(&db, &heads, &mut probes, 1_000)
             .await
             .unwrap();
-        assert!(heads.sent.lock().unwrap().is_empty());
-        assert!(heads.held().is_empty());
+        let probed: Vec<String> = heads
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, _, op)| matches!(op, DeploymentOperation::Probe { .. }))
+            .map(|(_, _, deployment, _)| deployment.clone())
+            .collect();
+        assert_eq!(probed, [DSV4F, QWEN]);
+        probe_unknown(&db, &heads, &mut probes, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            heads.sent.lock().unwrap().len(),
+            2,
+            "not again within the interval"
+        );
+
+        let (_, probe_id, _, _) = heads.sent.lock().unwrap()[0].clone();
+        on_report(
+            &db,
+            report(
+                &probe_id,
+                DeploymentPhaseReport::Healthy { ran_start: false },
+            ),
+            3_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            phase(&db, DSV4F).await,
+            Phase::Healthy {
+                since_ms: 3_000,
+                load_ms: None
+            }
+        );
+        on_report(
+            &db,
+            DeploymentReportReceived {
+                deployment: QWEN.into(),
+                ..report("probe-2", DeploymentPhaseReport::Stopped)
+            },
+            3_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !load_states(&db)
+                .await
+                .unwrap()
+                .contains_key(&DeploymentId::from(QWEN)),
+            "one that does not answer stays unknown"
+        );
+        let probes_of = |heads: &FakeHeads, deployment: &str| {
+            heads
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, d, op)| {
+                    d == deployment && matches!(op, DeploymentOperation::Probe { .. })
+                })
+                .count()
+        };
+        probe_unknown(&db, &heads, &mut probes, 1_000 + 10 * PROBE_INTERVAL_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            probes_of(&heads, QWEN),
+            1,
+            "a silent deployment is not asked again while its head stays attached"
+        );
+        heads.detach(SP1);
+        probe_unknown(&db, &heads, &mut probes, 1_000 + 11 * PROBE_INTERVAL_MS)
+            .await
+            .unwrap();
+        heads.attach(SP1, 110, 0);
+        probe_unknown(&db, &heads, &mut probes, 1_000 + 12 * PROBE_INTERVAL_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            probes_of(&heads, QWEN),
+            2,
+            "its head attaching again asks once more"
+        );
+        assert!(heads.starts().is_empty());
     }
 }

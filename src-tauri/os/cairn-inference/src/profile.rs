@@ -6,7 +6,7 @@ use cairn_models_types::catalog::{Modalities, VerbKind};
 use serde::{Deserialize, Serialize};
 
 use crate::inventory::ValidationError;
-use crate::pool::RecordSource;
+use crate::record::RecordSource;
 
 crate::string_id!(
     /// A profile's id, unique within the inventory.

@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineName;
-use crate::pool::RecordSource;
 use crate::profile::InferenceProfileId;
+use crate::record::RecordSource;
 
 crate::string_id!(
     /// A deployment's id, unique within the inventory.

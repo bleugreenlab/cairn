@@ -1,4 +1,5 @@
-//! The inventory: every profile, deployment and pool, validated as a whole.
+//! The inventory: every profile, deployment and machine address, validated as
+//! a whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -6,11 +7,10 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::deployment::{Deployment, DeploymentId};
-use crate::machine::MachineName;
+use crate::machine::{MachineName, MachineRecord};
 use crate::model::Model;
-use crate::pool::{Pool, PoolId, RecordSource};
 use crate::profile::{InferenceProfile, InferenceProfileId};
-use crate::resolve::{self, Resolution, Slot};
+use crate::record::RecordSource;
 
 /// Every inference record Cairn knows, keyed by id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -19,12 +19,13 @@ pub struct Inventory {
     pub models: BTreeMap<String, Model>,
     pub profiles: BTreeMap<InferenceProfileId, InferenceProfile>,
     pub deployments: BTreeMap<DeploymentId, Deployment>,
-    pub pools: BTreeMap<PoolId, Pool>,
+    pub machines: BTreeMap<MachineName, MachineRecord>,
 }
 
-/// Cairn's own record format: lists, so each id is written once.
+/// Cairn's own record format: lists, so each id is written once. A document
+/// still carrying the retired `pools:` section is refused naming it.
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InventoryFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<Model>,
@@ -33,7 +34,7 @@ struct InventoryFile {
     #[serde(default)]
     deployments: Vec<Deployment>,
     #[serde(default)]
-    pools: Vec<Pool>,
+    machines: Vec<MachineRecord>,
     /// The kind's name before profiles were renamed, read only to refuse it:
     /// a document still naming it would otherwise parse as holding no
     /// profiles, which a whole-document replace takes as removing them all.
@@ -116,37 +117,7 @@ pub enum ValidationError {
         which: &'static str,
         path: String,
     },
-    /// A deployment whose machines lie in more than one pool, or partly in
-    /// none (bginf's `straddle`). `None` stands for "no pool".
-    DeploymentSpansPools {
-        deployment: DeploymentId,
-        pools: Vec<Option<PoolId>>,
-    },
-    DuplicatePoolMachine {
-        pool: PoolId,
-        machine: MachineName,
-    },
-    MachineInTwoPools {
-        machine: MachineName,
-        first: PoolId,
-        second: PoolId,
-    },
-    UnknownSetMember {
-        pool: PoolId,
-        slot: Slot,
-        deployment: DeploymentId,
-    },
-    SetMemberOutsidePool {
-        pool: PoolId,
-        slot: Slot,
-        deployment: DeploymentId,
-        machine: MachineName,
-    },
-    OverlappingSet {
-        pool: PoolId,
-        slot: Slot,
-        first: DeploymentId,
-        second: DeploymentId,
+    EmptyAddress {
         machine: MachineName,
     },
     /// An id written twice in one inventory document.
@@ -234,55 +205,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "deployment {deployment} {which} path {path:?} does not start with /"
             ),
-            Self::DeploymentSpansPools { deployment, pools } => {
-                let pools: Vec<String> = pools
-                    .iter()
-                    .map(|p| p.as_ref().map_or("no pool".to_string(), |p| p.to_string()))
-                    .collect();
-                write!(
-                    f,
-                    "deployment {deployment} spans pools {}",
-                    pools.join(", ")
-                )
+            Self::EmptyAddress { machine } => {
+                write!(f, "machine {machine} has an empty address")
             }
-            Self::DuplicatePoolMachine { pool, machine } => {
-                write!(f, "pool {pool} lists machine {machine} twice")
-            }
-            Self::MachineInTwoPools {
-                machine,
-                first,
-                second,
-            } => write!(f, "machine {machine} is in pools {first} and {second}"),
-            Self::UnknownSetMember {
-                pool,
-                slot,
-                deployment,
-            } => write!(
-                f,
-                "pool {pool} {} names unknown deployment {deployment}",
-                slot.as_str()
-            ),
-            Self::SetMemberOutsidePool {
-                pool,
-                slot,
-                deployment,
-                machine,
-            } => write!(
-                f,
-                "pool {pool} {} names deployment {deployment}, which uses machine {machine} outside the pool",
-                slot.as_str()
-            ),
-            Self::OverlappingSet {
-                pool,
-                slot,
-                first,
-                second,
-                machine,
-            } => write!(
-                f,
-                "pool {pool} {} holds deployments {first} and {second}, which both use machine {machine}",
-                slot.as_str()
-            ),
             Self::DuplicateId { kind, id } => write!(f, "{kind} {id} appears twice"),
         }
     }
@@ -312,18 +237,6 @@ impl fmt::Display for YamlError {
 
 impl std::error::Error for YamlError {}
 
-/// A pool id the inventory does not hold.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnknownPool(pub PoolId);
-
-impl fmt::Display for UnknownPool {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown pool {}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownPool {}
-
 /// What one change to the inventory added, removed and updated, per record
 /// kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -331,7 +244,7 @@ pub struct ChangeReport {
     pub models: KindReport,
     pub profiles: KindReport,
     pub deployments: KindReport,
-    pub pools: KindReport,
+    pub machines: KindReport,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -360,7 +273,7 @@ impl ChangeReport {
         !(self.models.is_empty()
             && self.profiles.is_empty()
             && self.deployments.is_empty()
-            && self.pools.is_empty())
+            && self.machines.is_empty())
     }
 
     /// One line per change.
@@ -370,7 +283,7 @@ impl ChangeReport {
             ("model", &self.models),
             ("profile", &self.profiles),
             ("deployment", &self.deployments),
-            ("pool", &self.pools),
+            ("machine", &self.machines),
         ] {
             lines.extend(report.added.iter().map(|id| format!("added {kind} {id}")));
             lines.extend(
@@ -410,7 +323,7 @@ macro_rules! sourced {
     )*};
 }
 
-sourced!(Model, InferenceProfile, Deployment, Pool);
+sourced!(Model, InferenceProfile, Deployment, MachineRecord);
 
 fn changed_fields<T: Serialize>(before: &T, after: &T) -> Vec<String> {
     let (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) =
@@ -489,11 +402,15 @@ impl Inventory {
         self.deployments.insert(deployment.id.clone(), deployment);
     }
 
-    pub fn insert_pool(&mut self, pool: Pool) {
-        self.pools.insert(pool.id.clone(), pool);
+    pub fn insert_machine(&mut self, machine: MachineRecord) {
+        self.machines.insert(machine.name.clone(), machine);
     }
 
     /// Every validation error, in a stable order. Empty when coherent.
+    ///
+    /// Which machines a deployment may run on together is not checked here:
+    /// placement checks a gang against the pools it detects when it acquires
+    /// the deployment, and says why when it cannot.
     pub fn problems(&self) -> Vec<ValidationError> {
         let mut problems = Vec::new();
         for profile in self.profiles.values() {
@@ -505,28 +422,11 @@ impl Inventory {
                 });
             }
         }
-
-        let mut membership: BTreeMap<&MachineName, &PoolId> = BTreeMap::new();
-        for pool in self.pools.values() {
-            let mut seen = BTreeSet::new();
-            for machine in &pool.machines {
-                if !seen.insert(&machine.name) {
-                    problems.push(ValidationError::DuplicatePoolMachine {
-                        pool: pool.id.clone(),
-                        machine: machine.name.clone(),
-                    });
-                    continue;
-                }
-                match membership.get(&machine.name) {
-                    Some(first) => problems.push(ValidationError::MachineInTwoPools {
-                        machine: machine.name.clone(),
-                        first: (*first).clone(),
-                        second: pool.id.clone(),
-                    }),
-                    None => {
-                        membership.insert(&machine.name, &pool.id);
-                    }
-                }
+        for machine in self.machines.values() {
+            if machine.address.trim().is_empty() {
+                problems.push(ValidationError::EmptyAddress {
+                    machine: machine.name.clone(),
+                });
             }
         }
 
@@ -576,63 +476,6 @@ impl Inventory {
                     });
                 }
             }
-            let pools: BTreeSet<Option<&PoolId>> = deployment
-                .machines
-                .iter()
-                .map(|m| membership.get(m).copied())
-                .collect();
-            if pools.len() > 1 {
-                problems.push(ValidationError::DeploymentSpansPools {
-                    deployment: id(),
-                    pools: pools.into_iter().map(|p| p.cloned()).collect(),
-                });
-            }
-        }
-
-        for pool in self.pools.values() {
-            for slot in resolve::SLOTS {
-                let Some(set) = resolve::slot_set(pool, slot) else {
-                    continue;
-                };
-                let mut occupied: BTreeMap<&MachineName, &DeploymentId> = BTreeMap::new();
-                for member in set {
-                    let Some(deployment) = self.deployments.get(member) else {
-                        problems.push(ValidationError::UnknownSetMember {
-                            pool: pool.id.clone(),
-                            slot,
-                            deployment: member.clone(),
-                        });
-                        continue;
-                    };
-                    if let Some(outside) = deployment.machines.iter().find(|m| !pool.has_machine(m))
-                    {
-                        problems.push(ValidationError::SetMemberOutsidePool {
-                            pool: pool.id.clone(),
-                            slot,
-                            deployment: member.clone(),
-                            machine: outside.clone(),
-                        });
-                        continue;
-                    }
-                    if let Some((machine, first)) = deployment
-                        .machines
-                        .iter()
-                        .find_map(|m| occupied.get(m).map(|first| (m, *first)))
-                    {
-                        problems.push(ValidationError::OverlappingSet {
-                            pool: pool.id.clone(),
-                            slot,
-                            first: first.clone(),
-                            second: member.clone(),
-                            machine: machine.clone(),
-                        });
-                        continue;
-                    }
-                    for machine in &deployment.machines {
-                        occupied.insert(machine, member);
-                    }
-                }
-            }
         }
         problems
     }
@@ -648,12 +491,12 @@ impl Inventory {
     }
 
     /// Every record that is not Cairn's own, as `kind id (source)`, profiles
-    /// first, then deployments, then pools, each in id order.
+    /// first, then deployments, then machines, each in id order.
     pub fn foreign_records(&self) -> Vec<String> {
         foreign_of("model", &self.models)
             .chain(foreign_of("profile", &self.profiles))
             .chain(foreign_of("deployment", &self.deployments))
-            .chain(foreign_of("pool", &self.pools))
+            .chain(foreign_of("machine", &self.machines))
             .collect()
     }
 
@@ -664,7 +507,7 @@ impl Inventory {
         adopt_kind("model", &mut self.models, from, &mut adopted);
         adopt_kind("profile", &mut self.profiles, from, &mut adopted);
         adopt_kind("deployment", &mut self.deployments, from, &mut adopted);
-        adopt_kind("pool", &mut self.pools, from, &mut adopted);
+        adopt_kind("machine", &mut self.machines, from, &mut adopted);
         adopted
     }
 
@@ -673,7 +516,7 @@ impl Inventory {
         self.models.extend(records.models);
         self.profiles.extend(records.profiles);
         self.deployments.extend(records.deployments);
-        self.pools.extend(records.pools);
+        self.machines.extend(records.machines);
     }
 
     /// What turning `current` into `next` adds, removes and updates.
@@ -682,48 +525,15 @@ impl Inventory {
             models: diff_kind(&current.models, &next.models),
             profiles: diff_kind(&current.profiles, &next.profiles),
             deployments: diff_kind(&current.deployments, &next.deployments),
-            pools: diff_kind(&current.pools, &next.pools),
+            machines: diff_kind(&current.machines, &next.machines),
         }
     }
 
-    /// The pool holding `machine`, if any.
-    pub fn pool_of_machine(&self, machine: &MachineName) -> Option<&Pool> {
-        self.pools.values().find(|pool| pool.has_machine(machine))
-    }
-
-    /// The pool every machine of `deployment` lies in, if there is one.
-    pub fn pool_of_deployment(&self, deployment: &Deployment) -> Option<&Pool> {
-        let pool = self.pool_of_machine(deployment.machines.first()?)?;
-        deployment
-            .machines
-            .iter()
-            .all(|m| pool.has_machine(m))
-            .then_some(pool)
-    }
-
-    /// The deployments placed entirely on `pool`'s machines.
-    pub fn pool_deployments<'a>(&'a self, pool: &'a Pool) -> impl Iterator<Item = &'a Deployment> {
-        self.deployments.values().filter(move |d| {
-            !d.machines.is_empty() && d.machines.iter().all(|m| pool.has_machine(m))
-        })
-    }
-
-    /// The network address of `machine`, as its pool records it.
+    /// The network address of `machine`, as its record states it.
     pub fn address_of(&self, machine: &MachineName) -> Option<&str> {
-        self.pool_of_machine(machine)?.address_of(machine)
-    }
-
-    /// Resolve one pool against the powered machines.
-    pub fn resolve_pool(
-        &self,
-        pool: &PoolId,
-        powered: &BTreeSet<MachineName>,
-    ) -> Result<Resolution, UnknownPool> {
-        let pool = self
-            .pools
-            .get(pool)
-            .ok_or_else(|| UnknownPool(pool.clone()))?;
-        Ok(resolve::resolve(pool, &self.deployments, powered))
+        self.machines
+            .get(machine)
+            .map(|record| record.address.as_str())
     }
 
     /// Cairn's own record format, as YAML.
@@ -732,7 +542,7 @@ impl Inventory {
             models: self.models.values().cloned().collect(),
             profiles: self.profiles.values().cloned().collect(),
             deployments: self.deployments.values().cloned().collect(),
-            pools: self.pools.values().cloned().collect(),
+            machines: self.machines.values().cloned().collect(),
             retired_recipes: None,
         };
         serde_yaml::to_string(&file).expect("inventory records serialize to YAML")
@@ -774,10 +584,10 @@ impl Inventory {
                 false => inventory.insert_deployment(deployment),
             }
         }
-        for pool in file.pools {
-            match inventory.pools.contains_key(&pool.id) {
-                true => duplicate("pool", &pool.id),
-                false => inventory.insert_pool(pool),
+        for machine in file.machines {
+            match inventory.machines.contains_key(&machine.name) {
+                true => duplicate("machine", &machine.name),
+                false => inventory.insert_machine(machine),
             }
         }
         Ok((inventory, duplicates))
@@ -812,9 +622,8 @@ impl Inventory {
 mod tests {
     use super::*;
     use crate::fixture::{
-        command_profile, deployment, insert_command_profile, set, test_inventory,
+        command_profile, deployment, insert_command_profile, machine, test_inventory,
     };
-    use crate::pool::PoolMachine;
     use crate::profile::Engine;
 
     fn problems_of(inventory: &Inventory) -> Vec<ValidationError> {
@@ -826,98 +635,28 @@ mod tests {
         assert_eq!(test_inventory().validate(), Ok(()));
     }
 
-    /// bginf `test_pools_resolve_independently`: the `straddle` profile spans
-    /// two pools and is refused.
+    /// Which machines a gang may span is placement's to judge against the
+    /// pools it detects, not the inventory's.
     #[test]
-    fn a_deployment_spanning_pools_is_refused() {
+    fn a_deployment_may_name_any_machines_its_profile_counts() {
         let mut inventory = test_inventory();
         insert_command_profile(&mut inventory, "straddle", 2);
         inventory.insert_deployment(deployment("straddle", &["sp1", "halo"]));
-        assert_eq!(
-            problems_of(&inventory),
-            vec![ValidationError::DeploymentSpansPools {
-                deployment: "straddle".into(),
-                pools: vec![Some("halo".into()), Some("sparks".into())],
-            }]
-        );
-    }
-
-    /// bginf `test_pin_targets_the_profiles_pool_and_off_every_pool`: a pin
-    /// of a Spark profile in pool halo is refused.
-    #[test]
-    fn a_set_member_outside_the_pool_is_refused() {
-        let mut inventory = test_inventory();
-        inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&["qwen36-fast"]));
-        assert_eq!(
-            problems_of(&inventory),
-            vec![ValidationError::SetMemberOutsidePool {
-                pool: "halo".into(),
-                slot: Slot::Pin,
-                deployment: "qwen36-fast".into(),
-                machine: "sp1".into(),
-            }]
-        );
+        assert_eq!(problems_of(&inventory), Vec::new());
     }
 
     #[test]
-    fn overlapping_deployments_in_one_set_are_refused() {
-        let mut inventory = test_inventory();
-        inventory
-            .pools
-            .get_mut(&PoolId::from("sparks"))
-            .unwrap()
-            .default = set(&["dsv4f-tp2", "qwen36-fast"]);
+    fn a_machine_s_address_is_where_its_deployments_answer() {
+        let inventory = test_inventory();
+        assert_eq!(inventory.address_of(&"sp1".into()), Some("10.20.20.40"));
+        assert_eq!(inventory.address_of(&"sp2".into()), None);
+        let mut blank = test_inventory();
+        blank.insert_machine(machine("sp2", " "));
         assert_eq!(
-            problems_of(&inventory),
-            vec![ValidationError::OverlappingSet {
-                pool: "sparks".into(),
-                slot: Slot::Default,
-                first: "dsv4f-tp2".into(),
-                second: "qwen36-fast".into(),
-                machine: "sp1".into(),
+            problems_of(&blank),
+            vec![ValidationError::EmptyAddress {
+                machine: "sp2".into()
             }]
-        );
-    }
-
-    #[test]
-    fn an_unknown_set_member_is_refused() {
-        let mut inventory = test_inventory();
-        inventory
-            .pools
-            .get_mut(&PoolId::from("sparks"))
-            .unwrap()
-            .default = set(&["nope"]);
-        assert_eq!(
-            problems_of(&inventory),
-            vec![ValidationError::UnknownSetMember {
-                pool: "sparks".into(),
-                slot: Slot::Default,
-                deployment: "nope".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn a_machine_in_two_pools_is_refused() {
-        let mut inventory = test_inventory();
-        inventory
-            .pools
-            .get_mut(&PoolId::from("halo"))
-            .unwrap()
-            .machines
-            .push(PoolMachine {
-                name: "sp2".into(),
-                address: None,
-                link: None,
-            });
-        let problems = problems_of(&inventory);
-        assert!(
-            problems.contains(&ValidationError::MachineInTwoPools {
-                machine: "sp2".into(),
-                first: "halo".into(),
-                second: "sparks".into(),
-            }),
-            "{problems:?}"
         );
     }
 
@@ -989,8 +728,8 @@ mod tests {
         for deployment in inventory.deployments.values_mut() {
             deployment.source = RecordSource::Bginf;
         }
-        for pool in inventory.pools.values_mut() {
-            pool.source = RecordSource::Bginf;
+        for machine in inventory.machines.values_mut() {
+            machine.source = RecordSource::Bginf;
         }
         inventory
     }
@@ -1001,7 +740,6 @@ mod tests {
         insert_command_profile(&mut inventory, "own", 1);
         assert_eq!(inventory.foreign_records().len(), 8);
         assert_eq!(inventory.foreign_records()[0], "profile dsv4f-tp2 (bginf)");
-
         let before = inventory.clone();
         let adopted = inventory.adopt(RecordSource::Bginf);
         assert_eq!(
@@ -1013,8 +751,8 @@ mod tests {
                 "deployment dsv4f-tp2",
                 "deployment qwen3-embed-4b",
                 "deployment qwen36-fast",
-                "pool halo",
-                "pool sparks",
+                "machine halo",
+                "machine sp1",
             ]
         );
         assert!(inventory.foreign_records().is_empty());
@@ -1055,13 +793,13 @@ mod tests {
             description: None,
         };
         next.insert_profile(command_profile("new", 1));
-        next.pools.remove(&PoolId::from("halo"));
+        next.machines.remove(&MachineName::from("halo"));
         assert_eq!(
             Inventory::changes(&current, &next).lines(),
             vec![
                 "added profile new",
                 "updated profile qwen36-fast: engine",
-                "removed pool halo",
+                "removed machine halo",
             ]
         );
     }
@@ -1087,8 +825,7 @@ mod tests {
 
     #[test]
     fn the_yaml_format_round_trips_and_validates_on_import() {
-        let mut inventory = test_inventory();
-        inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&[]));
+        let inventory = test_inventory();
         let yaml = inventory.to_yaml();
         assert_eq!(Inventory::from_yaml(&yaml), Ok(inventory.clone()));
 
@@ -1101,6 +838,17 @@ mod tests {
     }
 
     #[test]
+    fn a_document_with_the_retired_pools_section_is_refused_by_name() {
+        let Err(YamlError::Parse(error)) =
+            Inventory::from_yaml("pools:\n  - {id: sparks, machines: [{name: sp1}]}\n")
+        else {
+            panic!("pools are detected now, not written");
+        };
+        assert!(error.contains("unknown field `pools`"), "{error}");
+        assert!(error.contains("machines"), "{error}");
+    }
+
+    #[test]
     fn a_refused_document_names_every_problem_at_once() {
         let yaml = r#"
 profiles:
@@ -1108,8 +856,8 @@ profiles:
   - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ''}, requirements: {machines: 1}}
 deployments:
   - {id: d, profile: missing, machines: [a], head: b, apiPort: 8000, apiPath: /v1, healthPath: /health}
-pools:
-  - {id: p, machines: [{name: a}], default: [nope]}
+machines:
+  - {name: a, address: ''}
 "#;
         let Err(YamlError::Invalid(problems)) = Inventory::from_yaml(yaml) else {
             panic!("the document is refused");
@@ -1120,9 +868,9 @@ pools:
             vec![
                 "profile r appears twice",
                 "profile r serves model r, which is not registered; register it at cairn://inference/models first",
+                "machine a has an empty address",
                 "deployment d names unknown profile missing",
                 "deployment d has head b, which is not one of its machines",
-                "pool p default names unknown deployment nope",
             ]
         );
         assert!(Inventory::parse_yaml(yaml).is_err(), "an id written twice");
@@ -1149,11 +897,15 @@ pools:
     #[test]
     fn a_record_without_a_source_is_cairns() {
         let parsed = Inventory::parse_yaml(
-            "profiles:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\n",
+            "profiles:\n  - {id: r, model: {name: r}, servedName: r, engine: {kind: command, start: ./s}, requirements: {machines: 1}}\nmachines:\n  - {name: sp1, address: 10.20.20.40}\n",
         )
         .unwrap();
         assert_eq!(
             parsed.profiles[&InferenceProfileId::from("r")].source,
+            RecordSource::Cairn
+        );
+        assert_eq!(
+            parsed.machines[&MachineName::from("sp1")].source,
             RecordSource::Cairn
         );
     }
@@ -1179,14 +931,5 @@ pools:
             Inventory::changes(&inventory, &next).lines(),
             vec!["added model qwen36-fast"]
         );
-    }
-
-    #[test]
-    fn the_empty_pin_survives_yaml_as_pinned_to_nothing() {
-        let mut inventory = test_inventory();
-        inventory.pools.get_mut(&PoolId::from("halo")).unwrap().pin = Some(set(&[]));
-        let parsed = Inventory::from_yaml(&inventory.to_yaml()).unwrap();
-        assert_eq!(parsed.pools[&PoolId::from("halo")].pin, Some(set(&[])));
-        assert_eq!(parsed.pools[&PoolId::from("sparks")].pin, None);
     }
 }

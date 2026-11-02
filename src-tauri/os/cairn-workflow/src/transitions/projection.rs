@@ -83,6 +83,11 @@ pub struct JobFacts {
     pub requires_output: bool,
     /// An artifact row exists for this job (the declared output was produced).
     pub artifact_present: bool,
+    /// The job was re-prompted once for its missing output and a later work
+    /// turn that saw the re-prompt also ended without it
+    /// (`jobs.return_abandoned_at`). A still-missing output then fails the job
+    /// instead of holding it Blocked; the output arriving late still completes it.
+    pub output_abandoned: bool,
     /// The node derives as long-running from its recipe's topology (a
     /// contract-less control-terminal in a recipe with no terminal action node):
     /// at clean turn-end with no unmet output contract it settles Idle
@@ -106,6 +111,7 @@ impl JobFacts {
             resolution: Resolution::Pending,
             requires_output: false,
             artifact_present: false,
+            output_abandoned: false,
             long_running: false,
         }
     }
@@ -128,7 +134,8 @@ impl JobFacts {
 ///    cascade or readiness re-derivation; the job runs until its turn ends.
 /// 2. Latest turn failed, or resolution rejected -> **Failed**.
 /// 3. Latest turn completed -> **Complete**, unless a declared output is
-///    missing (-> **Blocked**, idle/resumable), the node derives as
+///    missing (-> **Blocked**, idle/resumable; -> **Failed** once the job was
+///    re-prompted for it and still did not produce it), the node derives as
 ///    long-running with no unmet output contract (-> **Idle**, non-terminal),
 ///    or a User-policy confirm gate is unconfirmed (-> **Blocked**).
 /// 4. Upstream control-dep `Failed` -> **Failed** (cascade by derivation).
@@ -159,9 +166,14 @@ pub fn derive_job_status(facts: &JobFacts) -> JobStatus {
     if facts.turn_complete {
         // A node that declares an output contract must actually produce it before
         // it can complete and fire control-out. Missing output holds Blocked
-        // (idle, resumable) rather than advancing downstream onto empty work.
+        // (idle, resumable) rather than advancing downstream onto empty work,
+        // until the job has been asked for it once and still not produced it.
         if facts.requires_output && !facts.artifact_present {
-            return JobStatus::Blocked;
+            return if facts.output_abandoned {
+                JobStatus::Failed
+            } else {
+                JobStatus::Blocked
+            };
         }
         // A long-running node with no unmet output contract settles Idle
         // (non-terminal, resumable) instead of Complete, so it keeps taking
@@ -348,6 +360,34 @@ mod tests {
             artifact_present: false,
         };
         assert_eq!(derive_job_status(&f), JobStatus::Blocked);
+    }
+
+    #[test]
+    fn failed_when_required_output_still_missing_after_its_reprompt() {
+        // Asked once for the output and ended another turn without it: the
+        // missing output is now a failure, which settles the job terminally.
+        let f = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            requires_output: true,
+            artifact_present: false,
+            output_abandoned: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Failed);
+    }
+
+    #[test]
+    fn complete_when_an_abandoned_output_arrives_late() {
+        // Abandonment is a fact about the missing output, not a verdict that
+        // outlives it: the output written late still completes the job.
+        let f = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            requires_output: true,
+            artifact_present: true,
+            output_abandoned: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Complete);
     }
 
     #[test]

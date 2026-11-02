@@ -415,9 +415,7 @@ pub(crate) fn render_executors(
                 crate::fleet::DrainResidents::of(&executor.occupancy).headline()
             ));
         }
-        if let Some(hold) = &executor.health.inference_hold {
-            out.push_str(&inference_hold_line(hold));
-        }
+        out.push_str(&model_residents_line(&executor.health.model_residents));
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
             executor.occupancy.executing_requests.len(),
@@ -547,12 +545,21 @@ pub(crate) fn render_enrollment(
     out
 }
 
-/// The line naming the inference deployment that holds a machine.
-fn inference_hold_line(hold: &cairn_common::executor_protocol::InferenceHold) -> String {
+/// The line naming the models placement holds resident on a machine, or
+/// nothing when it holds none.
+fn model_residents_line(
+    residents: &[cairn_common::executor_protocol::MachineModelResident],
+) -> String {
+    if residents.is_empty() {
+        return String::new();
+    }
     format!(
-        "- Inference: {}; see cairn://inference/deployments/{}\n",
-        hold.describe(),
-        hold.deployment
+        "- Models: {}; see cairn://inference/pools\n",
+        residents
+            .iter()
+            .map(|resident| resident.describe())
+            .collect::<Vec<_>>()
+            .join("; ")
     )
 }
 
@@ -1101,9 +1108,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.captured_at_unix_ms,
     ));
     out.push_str(&format!("- Draining: {}\n", drain_line(executor)));
-    if let Some(hold) = &executor.health.inference_hold {
-        out.push_str(&inference_hold_line(hold));
-    }
+    out.push_str(&model_residents_line(&executor.health.model_residents));
     out.push_str(&format!("- Build: {}\n", render_build(executor)));
     if let Some(status) = &executor.self_update {
         out.push_str(&format!(
@@ -6082,7 +6087,7 @@ mod tests {
             colocated,
             health: ExecutorHealthSnapshot {
                 build_volume: None,
-                inference_hold: None,
+                model_residents: Vec::new(),
                 identity: identity.clone(),
                 public_name: name.into(),
                 colocated,

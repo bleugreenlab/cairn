@@ -42,9 +42,10 @@ deployments:
   - {id: dsv4f-tp2, source: bginf, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen3-embed-4b, source: bginf, profile: qwen3-embed-4b, machines: [halo], head: halo, apiPort: 8090, apiPath: /v1, healthPath: /health}
   - {id: qwen36-fast, source: bginf, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
-pools:
-  - {id: sparks, source: bginf, machines: [{name: sp1, address: 10.20.20.40}, {name: sp2, address: 10.20.20.41}], default: [dsv4f-tp2]}
-  - {id: halo, source: bginf, machines: [{name: halo, address: 10.20.20.43}], default: [qwen3-embed-4b]}
+machines:
+  - {name: sp1, source: bginf, address: 10.20.20.40}
+  - {name: sp2, source: bginf, address: 10.20.20.41}
+  - {name: halo, source: bginf, address: 10.20.20.43}
 "#,
     )
     .unwrap();
@@ -146,7 +147,7 @@ fn no_old_alias_served_name_or_id_names_a_model() {
     ] {
         assert!(!listed.iter().any(|id| id == name), "{name}");
         assert!(
-            crate::orchestrator::pool_control::deployment_for(&inventory, name, None).is_err(),
+            crate::orchestrator::inference_route::resolve_model(&inventory, name).is_err(),
             "{name}"
         );
     }

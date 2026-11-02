@@ -234,6 +234,48 @@ pub fn derive_pools<'a>(
     pools
 }
 
+impl PoolKey {
+    /// The key of the pool `machines` form.
+    pub fn of<'a>(machines: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut names: Vec<&str> = machines.into_iter().collect();
+        names.sort_unstable();
+        names.dedup();
+        Self(names.join("+"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for PoolKey {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl Pool {
+    /// A pool of one machine, as a GPU machine with no fast link is.
+    pub fn of_one(machine: &str) -> Self {
+        Self {
+            key: PoolKey::of([machine]),
+            members: vec![PoolMember {
+                machine: machine.to_string(),
+                link_address: None,
+            }],
+            rate_gbps: None,
+        }
+    }
+
+    pub fn has(&self, machine: &str) -> bool {
+        self.members.iter().any(|member| member.machine == machine)
+    }
+
+    pub fn machines(&self) -> impl Iterator<Item = &str> {
+        self.members.iter().map(|member| member.machine.as_str())
+    }
+}
+
 impl super::Fleet {
     /// The model pools the attached machines' latest reports derive, by each
     /// machine's public name. Cached state only: nothing is probed.

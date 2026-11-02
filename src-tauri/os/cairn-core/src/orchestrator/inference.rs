@@ -6,19 +6,20 @@
 //! inverse of `cairn://inference?format=yaml`), or records added, replaced and
 //! removed within it ([`Authoring::Patch`]). Either is validated as a whole and
 //! refused naming every problem, and neither may take away what is running: a
-//! deployment the act side holds machines for is stopped before it is removed
-//! or moved, and a pool the controller drives is handed back before it is
-//! removed. Records mirrored from bginf before it retired are read-only until
-//! [`adopt`] makes them Cairn's, keeping their ids; authoring is refused until
-//! then, so nothing half-adopted is ever written.
+//! deployment whose model occupies its machines is stopped before it is
+//! removed or moved. Records mirrored from bginf before it retired are
+//! read-only until [`adopt`] makes them Cairn's, keeping their ids; authoring
+//! is refused until then, so nothing half-adopted is ever written.
+//!
+//! Which machines form a pool is not written here: placement detects pools
+//! from the links executors report ([`crate::fleet::pools`]).
 
 use std::collections::BTreeMap;
 
 use cairn_db::turso::params;
 use cairn_inference::control::Phase;
-use cairn_inference::pool_control::PoolControl;
 use cairn_inference::{
-    DeploymentId, InferenceProfileId, Inventory, PoolId, RecordSource, YamlError,
+    DeploymentId, InferenceProfileId, Inventory, MachineName, RecordSource, YamlError,
 };
 use serde::Serialize;
 
@@ -28,7 +29,7 @@ use crate::storage::{LocalDb, RowExt};
 const MODELS: &str = "inference_models";
 const PROFILES: &str = "inference_profiles";
 const DEPLOYMENTS: &str = "inference_deployments";
-const POOLS: &str = "inference_pools";
+const MACHINES: &str = "inference_machines";
 
 /// Every read-modify-write of the inventory holds this, so two writes never
 /// interleave.
@@ -78,8 +79,8 @@ pub async fn load_inventory(db: &LocalDb) -> Result<Inventory, String> {
     for deployment in parse_bodies(DEPLOYMENTS, load_bodies(db, DEPLOYMENTS).await?) {
         inventory.insert_deployment(deployment);
     }
-    for pool in parse_bodies(POOLS, load_bodies(db, POOLS).await?) {
-        inventory.insert_pool(pool);
+    for machine in parse_bodies(MACHINES, load_bodies(db, MACHINES).await?) {
+        inventory.insert_machine(machine);
     }
     Ok(inventory)
 }
@@ -146,10 +147,10 @@ pub(crate) fn diff_rows(current: &Inventory, next: &Inventory) -> Vec<RowChange>
         &mut changes,
     );
     diff_kind(
-        POOLS,
-        &current.pools,
-        &next.pools,
-        |p| p.source,
+        MACHINES,
+        &current.machines,
+        &next.machines,
+        |m| m.source,
         &mut changes,
     );
     changes
@@ -223,7 +224,7 @@ pub struct Removals {
     pub models: Vec<String>,
     pub profiles: Vec<InferenceProfileId>,
     pub deployments: Vec<DeploymentId>,
-    pub pools: Vec<PoolId>,
+    pub machines: Vec<MachineName>,
 }
 
 /// A change the operator writes to Cairn's own records.
@@ -298,7 +299,12 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
                 &remove.deployments,
                 &mut problems,
             );
-            remove_each("pool", &mut next.pools, &remove.pools, &mut problems);
+            remove_each(
+                "machine",
+                &mut next.machines,
+                &remove.machines,
+                &mut problems,
+            );
             problems.extend(next.problems().iter().map(ToString::to_string));
             next
         }
@@ -313,14 +319,12 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
     }
 }
 
-/// What `next` would take away that is running: a deployment the act side
-/// holds machines for, removed or moved to other machines, and a pool the
-/// controller drives, removed.
+/// What `next` would take away that is running: a deployment whose model
+/// occupies its machines, removed or moved to other machines.
 fn running_refusals(
     current: &Inventory,
     next: &Inventory,
     phases: &BTreeMap<DeploymentId, Phase>,
-    controls: &BTreeMap<PoolId, PoolControl>,
 ) -> Vec<String> {
     let mut refusals = Vec::new();
     for (id, phase) in phases.iter().filter(|(_, phase)| phase.reserves()) {
@@ -343,13 +347,6 @@ fn running_refusals(
             Some(_) => {}
         }
     }
-    for (pool, _) in controls.iter().filter(|(_, control)| control.controlled) {
-        if current.pools.contains_key(pool) && !next.pools.contains_key(pool) {
-            refusals.push(format!(
-                "pool {pool} is under Cairn's control; hand it back first (patch cairn://inference/pools {{pool:\"{pool}\", controlled:false}})"
-            ));
-        }
-    }
     refusals
 }
 
@@ -362,9 +359,8 @@ pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<Stri
     let _held = INVENTORY.lock().await;
     let current = load_inventory(db).await?;
     let next = authored(&current, authoring).map_err(refused)?;
-    let phases = super::pool_control::deployment_phases(db).await?;
-    let controls = super::pool_control::load_controls(db).await?;
-    let running = running_refusals(&current, &next, &phases, &controls);
+    let phases = super::inference_control::deployment_phases(db).await?;
+    let running = running_refusals(&current, &next, &phases);
     if !running.is_empty() {
         return Err(refused(running));
     }
@@ -379,49 +375,6 @@ pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<Stri
     ))
 }
 
-/// Set `pool`'s warm model, the one it loads when idle: the one deployment of
-/// `model` (by real name) in the pool, or nothing. The pool record's `default`
-/// holds it.
-pub async fn set_pool_warm(
-    db: &LocalDb,
-    pool: &PoolId,
-    model: Option<&str>,
-) -> Result<String, String> {
-    let _held = INVENTORY.lock().await;
-    let current = load_inventory(db).await?;
-    let record = current
-        .pools
-        .get(pool)
-        .ok_or_else(|| format!("there is no pool {pool}; cairn://inference/pools lists them"))?;
-    if record.source != RecordSource::Cairn {
-        return Err(format!(
-            "pool {pool} is still mirrored from {} and read-only; adopt it first: patch cairn://inference {{adopt:\"{}\"}}",
-            record.source.as_str(),
-            record.source.as_str()
-        ));
-    }
-    let set: cairn_inference::DeploymentSet = match model {
-        None => Default::default(),
-        Some(model) => {
-            let (deployment, _) = super::pool_control::deployment_for(&current, model, Some(pool))?;
-            [deployment].into()
-        }
-    };
-    let mut next = current.clone();
-    if let Some(record) = next.pools.get_mut(pool) {
-        record.default = set;
-    }
-    let problems = next.problems();
-    if !problems.is_empty() {
-        return Err(refused(problems.iter().map(ToString::to_string).collect()));
-    }
-    save_rows(db, diff_rows(&current, &next), now_ms()).await?;
-    Ok(match model {
-        Some(model) => format!("pool {pool} warms {model} when idle"),
-        None => format!("pool {pool} warms nothing"),
-    })
-}
-
 /// Everything the `cairn://inference` pages render.
 #[derive(Debug, Clone)]
 pub struct InferenceView {
@@ -432,8 +385,9 @@ pub struct InferenceView {
     pub executors: BTreeMap<String, bool>,
     /// What Cairn has done to the deployments it acts on.
     pub deployment_control: super::inference_control::ControlView,
-    /// The pool controller's records and plans.
-    pub control: super::pool_control::ControlView,
+    /// What placement holds and decides: the detected pools with their
+    /// residents, the requests and why each waits.
+    pub models: crate::fleet::models::ModelsView,
     /// Every verification, newest first.
     pub verifications: Vec<super::inference_verify::VerificationRow>,
     pub now_ms: i64,
@@ -451,14 +405,13 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
         executors.insert(executor.name, true);
     }
     let inventory = load_inventory(&orch.db.local).await?;
-    let control = super::pool_control::load_control_view(orch, &inventory).await?;
     Ok(InferenceView {
         inventory,
         retired_link_setting: crate::config::settings::load_inference(&orch.config_dir)
             .retired_bginf_link,
         executors,
         deployment_control: super::inference_control::load_control_view(orch).await?,
-        control,
+        models: crate::fleet::models::view(orch).await?,
         verifications: super::inference_verify::load_verifications(&orch.db.local).await?,
         now_ms: now_ms(),
     })
@@ -491,9 +444,9 @@ profiles:
 deployments:
   - {id: dsv4f-tp2, source: bginf, profile: dsv4f-tp2, machines: [bginf-sp1, bginf-sp2], head: bginf-sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen3-embed-4b, source: bginf, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
-pools:
-  - {id: sparks, source: bginf, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2}], default: [dsv4f-tp2], pin: []}
-  - {id: halo, source: bginf, machines: [{name: fedora, address: 10.20.20.43}], default: [qwen3-embed-4b]}
+machines:
+  - {name: bginf-sp1, source: bginf, address: 10.20.20.40}
+  - {name: fedora, source: bginf, address: 10.20.20.43}
 "#;
 
     fn mirrored() -> Inventory {
@@ -516,7 +469,7 @@ pools:
 
     async fn sources(db: &LocalDb) -> Vec<String> {
         let mut sources = Vec::new();
-        for table in [PROFILES, DEPLOYMENTS, POOLS] {
+        for table in [PROFILES, DEPLOYMENTS, MACHINES] {
             sources.extend(
                 db.query_all(
                     format!("SELECT id || ' ' || source FROM {table} ORDER BY id"),
@@ -552,48 +505,6 @@ pools:
                 .unwrap()
                 .contains("aliases")
         );
-    }
-
-    #[tokio::test]
-    async fn a_pool_warms_one_deployment_of_a_model_named_by_its_real_name() {
-        let db = seeded("inference-warm").await;
-        adopt(&db, RecordSource::Bginf).await.unwrap();
-        let sparks = PoolId::from("sparks");
-        let said = set_pool_warm(&db, &sparks, None).await.unwrap();
-        assert_eq!(said, "pool sparks warms nothing");
-        assert!(load_inventory(&db).await.unwrap().pools[&sparks]
-            .default
-            .is_empty());
-        set_pool_warm(
-            &db,
-            &sparks,
-            Some("deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            load_inventory(&db).await.unwrap().pools[&sparks].default,
-            [DeploymentId::from("dsv4f-tp2")].into()
-        );
-        // The embedder is not deployed in the Sparks, and an id names no model.
-        assert!(
-            set_pool_warm(&db, &sparks, Some("Qwen/Qwen3-Embedding-4B-GGUF (Q8_0)"))
-                .await
-                .unwrap_err()
-                .starts_with("no deployment of")
-        );
-        assert!(set_pool_warm(&db, &sparks, Some("dsv4f-tp2"))
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn a_mirrored_pool_is_not_warmed_until_adopted() {
-        let db = seeded("inference-warm-mirrored").await;
-        assert!(set_pool_warm(&db, &PoolId::from("sparks"), None)
-            .await
-            .unwrap_err()
-            .contains("adopt it first"));
     }
 
     #[tokio::test]
@@ -671,7 +582,7 @@ pools:
         let broken = before
             .to_yaml()
             .replace("head: fedora", "head: bginf-sp1")
-            .replace("- qwen3-embed-4b\n", "- nope\n")
+            .replace("address: 10.20.20.43", "address: ' '")
             .replacen("source: cairn", "source: bginf", 1);
         let refusal = write_inventory(&db, &Authoring::Replace(broken))
             .await
@@ -682,7 +593,7 @@ pools:
         );
         for problem in [
             "deployment qwen3-embed-4b has head bginf-sp1, which is not one of its machines",
-            "pool halo default names unknown deployment nope",
+            "machine fedora has an empty address",
             "model Qwen/Qwen3-Embedding-4B-GGUF (Q8_0) (bginf) is not Cairn's",
         ] {
             assert!(refusal.contains(problem), "{problem}: {refusal}");
@@ -705,8 +616,8 @@ profiles:
   - {id: qwen36-fast, model: {name: nvidia/Qwen3.6-35B-A3B-NVFP4}, servedName: qwen3.6-35b, engine: {kind: command, start: ./serve-qwen36.sh}, requirements: {machines: 1}}
 deployments:
   - {id: qwen36-fast, profile: qwen36-fast, machines: [bginf-sp1], head: bginf-sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
-pools:
-  - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [qwen36-fast]}
+machines:
+  - {name: bginf-sp2, address: 10.20.20.41}
 "#;
         let said = write_inventory(
             &db,
@@ -721,7 +632,7 @@ pools:
             "added model nvidia/Qwen3.6-35B-A3B-NVFP4",
             "added profile qwen36-fast",
             "added deployment qwen36-fast",
-            "updated pool sparks: default, machines, pin",
+            "added machine bginf-sp2",
         ] {
             assert!(said.contains(line), "{line}: {said}");
         }
@@ -749,7 +660,7 @@ pools:
         let said = write_inventory(
             &db,
             &Authoring::Patch {
-                upsert: Some("pools:\n  - {id: sparks, machines: [{name: bginf-sp1, address: 10.20.20.40}, {name: bginf-sp2, address: 10.20.20.41}], default: [dsv4f-tp2]}\n".into()),
+                upsert: Some("machines:\n  - {name: bginf-sp2, address: 10.20.20.42}\n".into()),
                 remove: Removals {
                     profiles: vec!["qwen36-fast".into()],
                     deployments: vec!["qwen36-fast".into(), "nope".into()],
@@ -766,7 +677,7 @@ pools:
     }
 
     #[test]
-    fn a_running_deployment_or_a_controlled_pool_is_not_taken_away() {
+    fn a_running_deployment_is_not_taken_away() {
         let current = adopted();
         let healthy = Phase::Healthy {
             since_ms: 0,
@@ -779,25 +690,16 @@ pools:
                 Phase::Stopped { since_ms: 0 },
             ),
         ]);
-        let halo = &current.pools[&PoolId::from("halo")];
-        let controls = BTreeMap::from([(
-            halo.id.clone(),
-            PoolControl::begin(halo, &current.deployments, &phases, 0),
-        )]);
 
-        let mut without_halo = current.clone();
-        without_halo.pools.remove(&PoolId::from("halo"));
-        without_halo
+        let mut without = current.clone();
+        without
             .deployments
             .remove(&DeploymentId::from("qwen3-embed-4b"));
-        without_halo
-            .deployments
-            .remove(&DeploymentId::from("dsv4f-tp2"));
+        without.deployments.remove(&DeploymentId::from("dsv4f-tp2"));
         assert_eq!(
-            running_refusals(&current, &without_halo, &phases, &controls),
+            running_refusals(&current, &without, &phases),
             vec![
                 "deployment qwen3-embed-4b is healthy on fedora; stop it first (cairn://inference/deployments/qwen3-embed-4b), or its machines would be released with the model still on them",
-                "pool halo is under Cairn's control; hand it back first (patch cairn://inference/pools {pool:\"halo\", controlled:false})",
             ],
             "a stopped deployment goes freely"
         );
@@ -810,7 +712,7 @@ pools:
         embed.machines = vec!["bginf-sp2".into()];
         embed.head = "bginf-sp2".into();
         assert_eq!(
-            running_refusals(&current, &moved, &phases, &controls),
+            running_refusals(&current, &moved, &phases),
             vec!["deployment qwen3-embed-4b is healthy; stop it (cairn://inference/deployments/qwen3-embed-4b) before moving it to other machines"]
         );
 
@@ -820,18 +722,18 @@ pools:
             .get_mut(&InferenceProfileId::from("qwen3-embed-4b"))
             .unwrap()
             .notes = Some("a new start command takes effect at the next start".into());
-        assert!(running_refusals(&current, &restarted, &phases, &controls).is_empty());
+        assert!(running_refusals(&current, &restarted, &phases).is_empty());
     }
 
     #[test]
     fn the_validation_error_for_a_duplicate_reads_plainly() {
         assert_eq!(
             ValidationError::DuplicateId {
-                kind: "pool",
-                id: "halo".into()
+                kind: "machine",
+                id: "fedora".into()
             }
             .to_string(),
-            "pool halo appears twice"
+            "machine fedora appears twice"
         );
     }
 }

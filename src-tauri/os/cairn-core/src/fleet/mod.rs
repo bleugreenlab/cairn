@@ -11,6 +11,7 @@ pub(crate) mod inference;
 pub mod link_clock;
 pub mod load;
 pub mod management;
+pub mod models;
 pub(crate) mod occupancy;
 pub(crate) mod output_guard;
 pub(crate) mod placement;
@@ -64,7 +65,7 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
-    InferenceHold, PriorDecline,
+    MachineModelResident, PriorDecline,
 };
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
@@ -1418,9 +1419,9 @@ pub struct Fleet {
     /// settings file does not. Attach stamps from it; the machine is never
     /// told.
     machine_roles: Arc<Mutex<HashMap<String, MachineRole>>>,
-    /// The machines held for inference deployments, by executor public name.
-    /// Replaced whole by [`Fleet::set_inference_holds`]; attach stamps from it.
-    inference_holds: Arc<Mutex<HashMap<String, InferenceHold>>>,
+    /// Placement's local models: the residents on each machine, the room
+    /// refusals that may evict them, and the pass that decides them.
+    models: Arc<models::ModelPlacement>,
     /// Where deployment reports go; see [`Fleet::subscribe_deployment_reports`].
     deployment_reports:
         Arc<Mutex<Option<mpsc::UnboundedSender<inference::DeploymentReportReceived>>>>,
@@ -3109,9 +3110,10 @@ struct ExecutorConnectionState {
     /// [`Fleet::machine_roles`] on attach and whenever the roles are
     /// re-adopted, for the same reason `drained` is.
     machine_role: MachineRole,
-    /// The inference deployment holding this machine, stamped from
-    /// [`Fleet::inference_holds`] on attach and whenever the holds change.
-    inference_hold: Option<InferenceHold>,
+    /// The models placement holds resident on this machine, stamped from
+    /// [`Fleet::model_residents`] on attach and by every model pass that
+    /// changes them, so placement weighs their room under the table lock.
+    model_residents: Vec<MachineModelResident>,
     /// Projects this machine recorded as unpreparable (a setup command not
     /// found), by project id. Stamped from [`Fleet::preparation_refusals`] on
     /// attach, keeping only refusals recorded against the environment this
@@ -3829,7 +3831,7 @@ impl Fleet {
             update_hold,
             // Stamped below, under the table lock.
             machine_role: MachineRole::General,
-            inference_hold: None,
+            model_residents: Vec::new(),
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
@@ -3858,10 +3860,10 @@ impl Fleet {
             // restore the role it replaced. Unlike a drain, the machine is not
             // told: only this runner's placement reads it.
             connection.machine_role = self.machine_role(&executor_id);
-            // Under the same lock `set_inference_holds` takes first, for the
-            // same reason as the role.
-            connection.inference_hold =
-                self.inference_hold_named(&executor_public_name(&connection));
+            // Under the same lock the model pass takes first when it
+            // publishes the residents, for the same reason as the role.
+            connection.model_residents =
+                self.model_residents_named(&executor_public_name(&connection));
             connections
                 .insert(executor_id.clone(), connection)
                 .map(|previous| previous.generation)
@@ -7522,44 +7524,6 @@ impl Fleet {
             .map(executor_public_name)
     }
 
-    /// Batch work on, or waiting for, the machines publicly named `names`: the
-    /// build pressure the inference pool controller weighs against a loaded
-    /// model.
-    ///
-    /// Running work is what the attached machines report executing, split into
-    /// agent turns (submitted at `AgentInteractive` priority, never preempted)
-    /// and restartable checks. The submitted priority, not the effective one:
-    /// aging promotes a long-waiting check to the top tier, and it is still a
-    /// check. Waiting work is every unclaimed queue entry one of these machines
-    /// declined for a reason unloading a model would relieve; see
-    /// [`queue::ExecutionQueue::waiting_relieved_by_unload`].
-    pub fn machine_set_pressure(
-        &self,
-        names: &std::collections::BTreeSet<String>,
-    ) -> cairn_inference::pool_control::BuildPressure {
-        let connections = self.lock_connections();
-        let mut pressure = cairn_inference::pool_control::BuildPressure::default();
-        let mut executor_ids = HashSet::new();
-        for entry in connections.values() {
-            if !names.contains(&executor_public_name(entry)) {
-                continue;
-            }
-            executor_ids.insert(entry.identity.executor_id.clone());
-            for request in &entry.snapshot.executing_requests {
-                if request.priority
-                    == Some(cairn_common::executor_protocol::CellPriority::AgentInteractive)
-                {
-                    pressure.running_turns += 1;
-                } else {
-                    pressure.running_other += 1;
-                }
-            }
-        }
-        drop(connections);
-        pressure.waiting = self.queue.waiting_relieved_by_unload(&executor_ids);
-        pressure
-    }
-
     pub async fn set_executor_runtime_policy(
         &self,
         executor_id: &str,
@@ -10422,8 +10386,7 @@ impl Fleet {
             .lock_connections()
             .get(executor_id)
             .is_some_and(|entry| {
-                (entry.drained || entry.inference_hold.is_some())
-                    && environment_live_work(entry, &acquisition.holder).is_empty()
+                entry.drained && environment_live_work(entry, &acquisition.holder).is_empty()
             });
         idle_on_drain && self.environment_could_move(acquisition, executor_id)
     }
@@ -12811,43 +12774,6 @@ impl Fleet {
         rows
     }
 
-    /// The machines `rejected` passed over for an inference hold that would
-    /// take `request` were the hold lifted.
-    ///
-    /// Placement checks the hold after the selector and the verdict platform
-    /// but before colocation and the project, so a held machine that could
-    /// never run the work may still be refused for the hold. Counting it as waiting would unload a model for
-    /// a batch that cannot use the machine, and reload it on the next request.
-    /// A machine whose own decline of this entry still stands would not take it
-    /// either.
-    fn held_machines_an_unload_would_admit(
-        &self,
-        request: &CellRequest,
-        declined: &HashMap<String, queue::EntryDecline>,
-        rejected: &[PlacementRejection],
-        now_unix_ms: u64,
-    ) -> HashSet<String> {
-        let scope = PlacementScope::of(request);
-        let connections = self.lock_connections();
-        rejected
-            .iter()
-            .filter(|rejection| {
-                matches!(
-                    rejection.reason,
-                    PlacementRejectionReason::InferenceReserved { .. }
-                )
-            })
-            .filter_map(|rejection| connections.get(&rejection.executor_id))
-            .filter(|machine| {
-                candidate_rejection_under(machine, scope, now_unix_ms, None).is_none()
-                    && !declined
-                        .get(&machine.identity.executor_id)
-                        .is_some_and(|decline| decline.stands_on(machine.generation, now_unix_ms))
-            })
-            .map(|machine| machine.identity.executor_id.clone())
-            .collect()
-    }
-
     /// Wait for an executor this request can be placed on, bounded by the
     /// requester's horizon.
     ///
@@ -12914,21 +12840,34 @@ impl Fleet {
                 }
                 Ok(Selection::Waiting { rejected }) => rejected,
             };
-            // A held machine is never offered the work, so it never declines
-            // it; the queue learns from this pass that the entry waits for
-            // one, which is the build pressure the inference pool controller
-            // weighs against a loaded model.
-            if let Some(entry_id) = entry_id {
-                self.queue.note_inference_holds(
-                    entry_id,
-                    self.held_machines_an_unload_would_admit(
-                        request,
-                        &declined,
-                        &rejected,
-                        unix_time_ms(),
-                    ),
-                );
-            }
+            // The work went nowhere. A machine that refused it only for room
+            // a model resident holds was otherwise able to take it (the room
+            // is checked after every eligibility check), so placement's model
+            // pass may evict that resident if it can give way. A machine
+            // whose own decline of this entry still stands would not take it
+            // either, and an executor's decline evicts nothing: it does not
+            // say whose memory is short. Nor does work whose memory was never
+            // measured: a guess waits for a model, it never displaces one.
+            self.note_room_refusal(
+                rejected
+                    .iter()
+                    .filter(|rejection| {
+                        matches!(
+                            rejection.reason,
+                            PlacementRejectionReason::ModelResident {
+                                demand_unmeasured: false,
+                                ..
+                            }
+                        ) && !declined.get(&rejection.executor_id).is_some_and(|decline| {
+                            self.lock_connections()
+                                .get(&rejection.executor_id)
+                                .is_some_and(|machine| {
+                                    decline.stands_on(machine.generation, unix_time_ms())
+                                })
+                        })
+                    })
+                    .map(|rejection| rejection.executor_name.clone()),
+            );
             // Work kept off the machines it cannot run on is pending for a
             // reason the queue view owes its reader, and nothing else records a
             // pass that placed nothing.
@@ -14213,22 +14152,14 @@ fn selected_link_dispatch_error(
 /// could go asks here rather than approximating with a subset of these clauses
 /// — a forecast that checked only the selector would happily read a machine that
 /// does not serve the project.
+///
+/// The room a model resident holds is not judged here but where the work's
+/// resolved demand is known ([`model_room_rejection`]), after every clause
+/// below, so a machine refused for it is otherwise able to take the work.
 fn candidate_rejection(
     entry: &ExecutorConnectionState,
     scope: PlacementScope<'_>,
     now_unix_ms: u64,
-) -> Option<PlacementRejectionReason> {
-    candidate_rejection_under(entry, scope, now_unix_ms, entry.inference_hold.as_ref())
-}
-
-/// [`candidate_rejection`] with `inference_hold` standing in for the machine's
-/// own, so a caller can ask what the machine would say with its model
-/// unloaded.
-fn candidate_rejection_under(
-    entry: &ExecutorConnectionState,
-    scope: PlacementScope<'_>,
-    now_unix_ms: u64,
-    inference_hold: Option<&InferenceHold>,
 ) -> Option<PlacementRejectionReason> {
     let pinned_here = scope.pinned_executor_id == Some(entry.identity.executor_id.as_str());
     if !entry.machine_role.accepts(scope.work_class) && !pinned_here {
@@ -14279,14 +14210,6 @@ fn candidate_rejection_under(
         // The self-update rollout's hold, with a drain's exemption for the same
         // reason: resident work has to finish for the machine to empty.
         Some(PlacementRejectionReason::UpdatePending)
-    } else if let Some(hold) = inference_hold.filter(|_| !pinned_here) {
-        // An inference deployment holds this machine: a named drain, with the
-        // drain's exemption. An idle environment here moves off at its next
-        // batch (`drained_home_is_idle`); live work holding one finishes.
-        Some(PlacementRejectionReason::InferenceReserved {
-            deployment: hold.deployment.clone(),
-            phase: hold.phase.clone(),
-        })
     } else if let Some(volume) = entry
         .health
         .build_volume
@@ -14560,11 +14483,10 @@ fn survey_candidates<'a>(
 
 /// Whether a rejection is something to wait for rather than a reason to
 /// refuse: a capable machine's "not yet" (its own decline, or a posted
-/// condition its admission would decline on), or a drain the runner holds that
+/// condition its admission would decline on), a drain the runner holds that
 /// ends without anyone acting on the work (the self-update rollout's hold ends
-/// when the machine returns on the runner's build; an inference deployment's
-/// hold ends when the deployment stops, which the pool controller does when
-/// batches wait for its machines).
+/// when the machine returns on the runner's build), or room a model resident
+/// holds, which placement evicts for the work once the resident is idle.
 ///
 /// An operator's drain is not one. Only an operator ends it, so work it refuses
 /// is told so at once rather than parked on a decision nobody is making.
@@ -14574,9 +14496,38 @@ fn waits_on_machine(reason: &PlacementRejectionReason) -> bool {
         PlacementRejectionReason::Declined { .. }
             | PlacementRejectionReason::Held { .. }
             | PlacementRejectionReason::UpdatePending
-            | PlacementRejectionReason::InferenceReserved { .. }
+            | PlacementRejectionReason::ModelResident { .. }
             | PlacementRejectionReason::ProvisioningTurn { .. }
     )
+}
+
+/// Why `entry` cannot take work needing `demand` of memory because of the
+/// room its model residents hold, or `None`. A measured demand is weighed
+/// against the machine's measured room. Work whose memory was never measured
+/// (no reservation, an `Unmeasured` guess, or zero bytes) fails closed
+/// against a loading model's reserved room (tenet 302) and runs beside a
+/// healthy one; its refusal is marked `demand_unmeasured`, which is never
+/// grounds for eviction, so a guess never displaces a model (tenet 1337). A
+/// residency pin is exempt, as it is from a drain: work whose environment
+/// lives here finishes here.
+fn model_room_rejection(
+    entry: &ExecutorConnectionState,
+    demand: Option<&ResourceReservation>,
+    pinned_here: bool,
+) -> Option<PlacementRejectionReason> {
+    if pinned_here || entry.model_residents.is_empty() {
+        return None;
+    }
+    let gpu_allocated = models::room::gpu_allocated_bytes(&entry.health.host);
+    let Some(demand) = demand
+        .filter(|demand| demand.source != ResourceReservationSource::Unmeasured)
+        .map(|demand| demand.memory_bytes)
+        .filter(|bytes| *bytes > 0)
+    else {
+        return models::room::unmeasured_misfit(&entry.model_residents, gpu_allocated);
+    };
+    let available = entry.health.machine.memory.value()?.available_bytes;
+    models::room::resident_misfit(available, demand, &entry.model_residents, gpu_allocated)
 }
 
 /// Whether a rejection is the kernel's own verdict that this machine cannot
@@ -14699,7 +14650,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
         PlacementRejectionReason::UpdatePending => "updatePending",
-        PlacementRejectionReason::InferenceReserved { .. } => "inferenceReserved",
+        PlacementRejectionReason::ModelResident { .. } => "modelResident",
         PlacementRejectionReason::BuildVolumeAbsent { .. } => "buildVolumeAbsent",
         PlacementRejectionReason::RoleExcluded { .. } => "roleExcluded",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
@@ -14958,6 +14909,21 @@ fn rank_survey(
                 now_unix_ms,
             );
             candidate.cache_distance = cache_distances.get(&entry.identity.executor_id).copied();
+            if candidate.blindness.is_none() {
+                // The same demand the memory fit weighs: the reservation
+                // resolved for this machine, else the one the request states.
+                candidate.model_room = model_room_rejection(
+                    entry,
+                    Some(
+                        candidate
+                            .reservation
+                            .map_or(&request.resource_reservation, |resolved| {
+                                &resolved.reservation
+                            }),
+                    ),
+                    pinned == Some(entry.identity.executor_id.as_str()),
+                );
+            }
             candidate.scratch_sync_ms = request
                 .scratch_sync
                 .as_ref()
@@ -15172,6 +15138,12 @@ struct ScoredCandidate<'a> {
     blindness: Option<PlacementRejectionReason>,
     /// Set when the machine is measured and the resolved demand does not fit.
     misfit: Option<PlacementRejectionReason>,
+    /// Set when the resolved demand does not fit beside the model residents
+    /// here: a loading model's unmet footprint, or memory evicting an idle
+    /// one would return. A filter, unlike `misfit`: offering the work would
+    /// put it on memory a model is about to take, which the machine's own
+    /// admission cannot see, so the work waits and placement may evict.
+    model_room: Option<PlacementRejectionReason>,
     /// Set when the work's measured memory demand is larger than this machine
     /// will ever reserve. A fact about the machine's size rather than its
     /// readings, so it holds whether or not the machine is blind.
@@ -15339,6 +15311,7 @@ impl<'a> ScoredCandidate<'a> {
             reservation,
             blindness,
             misfit,
+            model_room: None,
             over_ceiling,
             excluded,
             held: hold.map(|hold| hold.evidence.clone()),
@@ -15360,6 +15333,7 @@ impl<'a> ScoredCandidate<'a> {
             reason: self
                 .excluded
                 .clone()
+                .or_else(|| self.model_room.clone())
                 .or_else(|| self.blindness.clone())
                 .or_else(|| self.over_ceiling.clone())
                 .or_else(|| self.misfit.clone())
@@ -15374,6 +15348,7 @@ impl<'a> ScoredCandidate<'a> {
         let reason = self
             .excluded
             .clone()
+            .or_else(|| self.model_room.clone())
             .or_else(|| self.blindness.clone())
             .or_else(|| self.over_ceiling.clone())
             .or_else(|| self.misfit.clone())
@@ -15461,6 +15436,7 @@ fn rank_candidates<'a, 'b>(
         a.excluded
             .is_some()
             .cmp(&b.excluded.is_some())
+            .then_with(|| a.model_room.is_some().cmp(&b.model_room.is_some()))
             .then_with(|| a.blindness.is_some().cmp(&b.blindness.is_some()))
             .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
@@ -15536,6 +15512,7 @@ fn rank_candidates<'a, 'b>(
     };
     let selectable = |candidate: &&ScoredCandidate<'a>| {
         candidate.excluded.is_none()
+            && candidate.model_room.is_none()
             && (candidate.blindness.is_none()
                 || settled_by_caller
                 || candidate.entry.colocated
@@ -17304,7 +17281,7 @@ fn executor_health_snapshot(
         // about a drain is still drained, so the surfaces read the union.
         drain_mode: entry.drained || entry.health.drain_mode,
         role: entry.machine_role,
-        inference_hold: entry.inference_hold.clone(),
+        model_residents: entry.model_residents.clone(),
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
@@ -18235,15 +18212,15 @@ fn no_matching_executor_diagnostic(
             name = rejection.executor_name
         );
     }
-    let inference_target = rejected.iter().find(|rejection| {
+    let model_target = rejected.iter().find(|rejection| {
         matches!(
             rejection.reason,
-            PlacementRejectionReason::InferenceReserved { .. }
+            PlacementRejectionReason::ModelResident { .. }
         ) && would_serve(rejection)
     });
-    if let Some(rejection) = inference_target {
+    if let Some(rejection) = model_target {
         return format!(
-            "{name} is {}. It clears when the deployment stops; cairn://inference/deployments shows it.{account}",
+            "on {name}, {}. cairn://inference/pools shows the models placement holds and when each may go.{account}",
             rejection.reason.describe(),
             name = rejection.executor_name
         );
@@ -24006,7 +23983,7 @@ mod tests {
                 drained: false,
                 update_hold: false,
                 machine_role: MachineRole::General,
-                inference_hold: None,
+                model_residents: Vec::new(),
                 identity: identity.clone(),
                 advertisement: ExecutorAdvertisement {
                     identity,
@@ -28860,163 +28837,122 @@ mod tests {
         );
     }
 
-    /// A machine an inference deployment holds is passed over for every class
-    /// of work and by an explicit selector. The hold ends on its own when the
-    /// deployment stops, so work that could go nowhere else waits on it, the
-    /// wait naming the deployment, instead of being refused; releasing the
-    /// hold re-admits it.
-    #[test]
-    fn placement_waits_on_a_machine_held_for_inference() {
-        let mut connections = HashMap::from([
-            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
-            fleet_entry("bginf-sp1", "linux", 0, &[]),
-        ]);
-        connections
-            .get_mut(COLOCATED_EXECUTOR_ID)
-            .unwrap()
-            .colocated = true;
-        connections.get_mut("bginf-sp1").unwrap().inference_hold = Some(InferenceHold {
+    fn model_resident(phase: &str, held_gib: u64) -> MachineModelResident {
+        MachineModelResident {
+            model: "deepseek-ai/DeepSeek-V4-Flash".into(),
             deployment: "dsv4f-tp2".into(),
-            phase: "starting".into(),
-            waiting_on: None,
-        });
-        let mut request = targeted_request("linux");
-        request.executor = Some(ExecutorSelector {
-            name: Some("bginf-sp1".into()),
-            ..ExecutorSelector::default()
-        });
-        for work_class in [
-            PlacementWorkClass::ReviewChecks,
-            PlacementWorkClass::WriteChecks,
-            PlacementWorkClass::AgentSessions,
-            PlacementWorkClass::DevInstances,
-            PlacementWorkClass::Services,
-        ] {
-            request.placement_work_class = work_class;
-            let draft = place(&connections, &request)
-                .expect("a machine held for inference is waited on, not refused");
-            assert!(
-                draft.selected.is_none(),
-                "{work_class:?}: a held machine takes no batch work"
-            );
-            let held = draft
-                .rejected
-                .iter()
-                .find(|rejection| rejection.executor_name == "bginf-sp1")
-                .expect("the held machine is named in the wait");
-            assert!(
-                held.reason
-                    .describe()
-                    .contains("reserved for inference deployment dsv4f-tp2 (starting)"),
-                "{work_class:?}: {}",
-                held.reason.describe()
-            );
-            assert!(waits_on_machine(&held.reason));
+            phase: phase.into(),
+            held_bytes: Some(held_gib << 30),
+            unified: true,
+            pinned: false,
+            leased: false,
+            evictable_at_unix_ms: None,
         }
-
-        connections.get_mut("bginf-sp1").unwrap().inference_hold = None;
-        assert_eq!(
-            place(&connections, &request)
-                .unwrap()
-                .selected
-                .expect("releasing the hold re-admits it")
-                .0
-                .executor_id,
-            "bginf-sp1"
-        );
     }
 
-    /// A held machine is noted as one a batch waits for, the build pressure
-    /// against its model, only when unloading the model would let the batch
-    /// run there.
+    fn demand(gib: u64, source: ResourceReservationSource) -> ResourceReservation {
+        ResourceReservation {
+            memory_bytes: gib << 30,
+            source,
+            ..ResourceReservation::default()
+        }
+    }
+
+    /// A machine whose room a loading model has not taken yet refuses
+    /// measured work that would need it, naming the model, and the refusal is
+    /// waited on. Work whose memory was never measured is refused that room
+    /// too (it fails closed), marked so it never evicts. A residency pin is
+    /// exempt as from a drain, a healthy model leaves its machine's measured
+    /// room to batches, and a discrete VRAM model never refuses one.
     #[test]
-    fn a_held_machine_is_waited_for_only_by_work_an_unload_would_admit() {
-        let fleet = Fleet::default();
-        let (id, mut sp1) = fleet_entry("bginf-sp1", "linux", 0, &[]);
-        sp1.inference_hold = Some(InferenceHold {
-            deployment: "dsv4f-tp2".into(),
-            phase: "healthy".into(),
-            waiting_on: None,
-        });
-        fleet.lock_connections().insert(id, sp1);
-        let held = |request: CellRequest| {
-            let connections = fleet.lock_connections();
-            let machine = &connections["bginf-sp1"];
-            let reason = candidate_rejection(machine, PlacementScope::of(&request), NOW)
-                .expect("the held machine is passed over");
-            let rejected = vec![PlacementRejection {
-                executor_name: "bginf-sp1".into(),
-                executor_id: "bginf-sp1".into(),
-                reason,
-                prediction: None,
-            }];
-            drop(connections);
-            fleet.held_machines_an_unload_would_admit(&request, &HashMap::new(), &rejected, NOW)
-        };
-        assert_eq!(
-            held(targeted_request("linux")),
-            HashSet::from(["bginf-sp1".to_string()])
-        );
-        let macos = targeted_request("macos");
+    fn a_loading_model_s_room_refuses_measured_work_and_is_waited_on() {
+        let (_, mut sp1) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+        measured(&mut sp1, 0.1, 110 << 30, 500 << 30);
+        sp1.model_residents = vec![model_resident("reserving", 100)];
+        let learned = demand(20, ResourceReservationSource::Learned);
+        let reason = model_room_rejection(&sp1, Some(&learned), false)
+            .expect("10 GiB is left beside the model's 100");
+        assert!(waits_on_machine(&reason));
+        assert_eq!(placement_rejection_signature(&reason), "modelResident");
         assert!(
-            matches!(
-                candidate_rejection(
-                    &fleet.lock_connections()["bginf-sp1"],
-                    PlacementScope::of(&macos),
-                    NOW
+            reason.describe().starts_with(
+                "room is held by deepseek-ai/DeepSeek-V4-Flash (reserving, 100.0 GiB); it is loading"
+            ),
+            "{}",
+            reason.describe()
+        );
+        assert_eq!(
+            model_room_rejection(&sp1, Some(&learned), true),
+            None,
+            "pinned here: work whose environment lives here finishes here"
+        );
+        for unmeasured in [
+            Some(demand(20, ResourceReservationSource::Unmeasured)),
+            Some(demand(0, ResourceReservationSource::Learned)),
+            None,
+        ] {
+            let reason = model_room_rejection(&sp1, unmeasured.as_ref(), false)
+                .expect("nothing shows unmeasured work fits beside the reserved room");
+            assert!(waits_on_machine(&reason));
+            assert!(
+                matches!(
+                    reason,
+                    PlacementRejectionReason::ModelResident {
+                        demand_unmeasured: true,
+                        ..
+                    }
                 ),
-                Some(PlacementRejectionReason::SelectorMismatch { .. })
-            ),
-            "a machine the selector excludes says so ahead of its hold (cairn/5731)"
-        );
+                "{reason:?}"
+            );
+            assert!(
+                reason.describe().starts_with(
+                    "room is reserved for deepseek-ai/DeepSeek-V4-Flash (reserving, 100.0 GiB); this work's memory has never been measured"
+                ),
+                "{}",
+                reason.describe()
+            );
+        }
+        assert!(model_room_rejection(
+            &sp1,
+            Some(&demand(8, ResourceReservationSource::Declared)),
+            false
+        )
+        .is_none());
+
+        sp1.model_residents = vec![model_resident("healthy", 100)];
         assert_eq!(
-            held(macos),
-            HashSet::new(),
-            "a macOS-targeted lane (SelectorMismatch) could never run here"
+            model_room_rejection(&sp1, Some(&learned), false),
+            None,
+            "its memory is already out of the 110 GiB measured free"
         );
-        let stays_home = CellRequest {
-            executor: None,
-            placement_mobility: Default::default(),
-            ..targeted_request("linux")
-        };
-        let connections = fleet.lock_connections();
-        assert!(matches!(
-            candidate_rejection_under(
-                &connections["bginf-sp1"],
-                PlacementScope::of(&stays_home),
-                NOW,
-                None
-            ),
-            Some(PlacementRejectionReason::NotColocated)
-        ));
-        drop(connections);
-        assert_eq!(
-            held(stays_home),
-            HashSet::new(),
-            "conservative work stays on the home machine (NotColocated)"
-        );
+        sp1.model_residents = vec![MachineModelResident {
+            unified: false,
+            ..model_resident("reserving", 20)
+        }];
+        assert_eq!(model_room_rejection(&sp1, Some(&learned), false), None);
     }
 
-    /// Holds are stamped by public name on live connections and on attach,
-    /// and replaced whole.
+    /// Residents are stamped by public name on live connections and on
+    /// attach, and replaced whole.
     #[test]
-    fn inference_holds_stamp_live_connections_by_name() {
+    fn model_residents_stamp_live_connections_by_name() {
         let fleet = Fleet::default();
         let (_name, entry) = fleet_entry("bginf-sp2", "linux", 0, &[]);
         fleet.lock_connections().insert("bginf-sp2".into(), entry);
-        let hold = InferenceHold {
-            deployment: "dsv4f-tp2".into(),
-            phase: "healthy".into(),
-            waiting_on: None,
-        };
-        fleet.set_inference_holds(HashMap::from([("bginf-sp2".to_string(), hold.clone())]));
+        let resident = model_resident("healthy", 98);
+        fleet.set_model_residents(HashMap::from([(
+            "bginf-sp2".to_string(),
+            vec![resident.clone()],
+        )]));
         assert_eq!(
-            fleet.lock_connections()["bginf-sp2"].inference_hold,
-            Some(hold.clone())
+            fleet.lock_connections()["bginf-sp2"].model_residents,
+            vec![resident.clone()]
         );
-        assert_eq!(fleet.inference_hold_named("bginf-sp2"), Some(hold));
-        fleet.set_inference_holds(HashMap::new());
-        assert_eq!(fleet.lock_connections()["bginf-sp2"].inference_hold, None);
+        assert_eq!(fleet.model_residents_named("bginf-sp2"), vec![resident]);
+        fleet.set_model_residents(HashMap::new());
+        assert!(fleet.lock_connections()["bginf-sp2"]
+            .model_residents
+            .is_empty());
     }
 
     /// A busy home and an idle, never-explored remote under a remote-first
@@ -36765,12 +36701,12 @@ mod tests {
         );
     }
 
-    /// Work that only a machine held for inference could take waits on the
-    /// hold rather than being refused, the pool controller reads it as build
-    /// pressure on that machine (and only that machine), and releasing the hold
-    /// places it there.
+    /// Work only a machine whose room a loading model holds could take waits
+    /// on the model rather than being refused, placement's model pass hears of
+    /// the refusal on that machine (and only that machine), and the room
+    /// returning places the work there.
     #[tokio::test]
-    async fn work_waiting_on_an_inference_hold_is_build_pressure_and_places_on_release() {
+    async fn work_refused_a_model_s_room_waits_reports_the_refusal_and_places_when_it_returns() {
         let pool = Fleet::default();
         let (sender, _colocated) = mpsc::unbounded_channel();
         pool.attach_executor(sender);
@@ -36780,18 +36716,24 @@ mod tests {
         request.repository = RepositoryLocator::ScratchOnly {
             owner_id: request.project_id.clone(),
         };
+        request.resource_reservation = demand(20, ResourceReservationSource::Declared);
         let mut policy = ActivePlacementPolicy::default_profile();
         policy
             .profile
             .routes
             .insert(request.placement_work_class, PlacementStance::RemoteOnly);
-        pool.set_inference_holds(HashMap::from([(
+        // Fresh against the clock select_executor reads, so the machine is
+        // measured rather than blind.
+        measured_at(
+            pool.lock_connections().get_mut("remote").unwrap(),
+            0.1,
+            110 << 30,
+            500 << 30,
+            unix_time_ms(),
+        );
+        pool.set_model_residents(HashMap::from([(
             remote_name.clone(),
-            InferenceHold {
-                deployment: "dsv4f-tp2".into(),
-                phase: "reserving".into(),
-                waiting_on: Some("memory: bginf-sp1 has 60.0 GiB free and needs 100.0 GiB".into()),
-            },
+            vec![model_resident("reserving", 100)],
         )]));
         let (entry, _waiter) = pool
             .queue
@@ -36819,31 +36761,104 @@ mod tests {
                 .await
             }
         });
-        let names = std::collections::BTreeSet::from([remote_name.clone()]);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while pool.machine_set_pressure(&names).waiting == 0 {
+        while pool.models.refused.lock().unwrap().is_empty() {
             assert!(
                 Instant::now() < deadline,
-                "a request held off the reserved machine counts as waiting for it"
+                "work refused the model's room is reported for eviction"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(!placing.is_finished(), "held, not refused");
+        assert!(!placing.is_finished(), "waiting, not refused");
         assert_eq!(
-            pool.machine_set_pressure(&std::collections::BTreeSet::from([
-                "some-other-machine".to_string()
-            ]))
-            .waiting,
-            0,
-            "pressure is counted only against the machines that hold it off"
+            *pool.models.refused.lock().unwrap(),
+            std::collections::BTreeSet::from([remote_name.clone()]),
+            "only the machine that refused it"
         );
 
-        pool.set_inference_holds(HashMap::new());
+        pool.set_model_residents(HashMap::new());
         let placement = placing
             .await
             .unwrap()
-            .expect("releasing the hold wakes the wait")
-            .expect("the released machine takes the work");
+            .expect("the room returning wakes the wait")
+            .expect("the machine takes the work");
+        assert_eq!(placement.selected.executor_id, "remote");
+    }
+
+    /// Work whose memory was never measured, offered only a machine whose
+    /// loading model has room still to take, is refused that room (it fails
+    /// closed) and waits, without the refusal being reported for eviction.
+    /// The model turning healthy places it there.
+    #[tokio::test]
+    async fn unmeasured_work_waits_out_a_loading_model_and_places_once_it_is_healthy() {
+        let pool = Fleet::default();
+        let (sender, _colocated) = mpsc::unbounded_channel();
+        pool.attach_executor(sender);
+        let (_generation, _remote) = residency_queue_attach(&pool, "remote");
+        let remote_name = pool.executor_public_name("remote").unwrap();
+        let mut request = spillable_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        request.resource_reservation = demand(0, ResourceReservationSource::Unmeasured);
+        let mut policy = ActivePlacementPolicy::default_profile();
+        policy
+            .profile
+            .routes
+            .insert(request.placement_work_class, PlacementStance::RemoteOnly);
+        measured_at(
+            pool.lock_connections().get_mut("remote").unwrap(),
+            0.1,
+            110 << 30,
+            500 << 30,
+            unix_time_ms(),
+        );
+        pool.set_model_residents(HashMap::from([(
+            remote_name.clone(),
+            vec![model_resident("reserving", 100)],
+        )]));
+        let (entry, _waiter) = pool
+            .queue
+            .enqueue(
+                queue::NewEntry {
+                    request: request.clone(),
+                    admission_kind: CellAdmissionKind::Command,
+                    interactive: false,
+                    execution_residency: None,
+                    standing: false,
+                },
+                unix_time_ms(),
+            )
+            .unwrap();
+
+        let waiting = pool.clone();
+        let placing = tokio::spawn({
+            let request = request.clone();
+            let entry = entry.clone();
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    waiting.select_executor(&request, None, &policy, Some(&entry)),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!placing.is_finished(), "waiting on the model, not placed");
+        assert!(
+            pool.models.refused.lock().unwrap().is_empty(),
+            "a guess never asks for the model to be evicted"
+        );
+
+        pool.set_model_residents(HashMap::from([(
+            remote_name,
+            vec![model_resident("healthy", 100)],
+        )]));
+        let placement = placing
+            .await
+            .unwrap()
+            .expect("the model turning healthy wakes the wait")
+            .expect("the machine takes the work beside it");
         assert_eq!(placement.selected.executor_id, "remote");
     }
 

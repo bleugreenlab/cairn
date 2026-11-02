@@ -27,15 +27,6 @@ where
     crate::storage::run_db_blocking(move || fut)
 }
 
-pub(super) fn block_on_value<T>(
-    fut: impl std::future::Future<Output = T> + Send + 'static,
-) -> Result<T, String>
-where
-    T: Send + 'static,
-{
-    block_on(async move { Ok(fut.await) })
-}
-
 /// Resolve the turn a new delegated packet should anchor its resume on.
 ///
 /// New waits keep the yielded predecessor as `current_turn_id` until their final
@@ -396,13 +387,6 @@ pub(super) async fn latest_run_for_job(
     )
     .await
     .map_err(|e| format!("Failed to load delegated run: {}", e))
-}
-
-pub(super) async fn latest_run_for_job_arc(
-    db: std::sync::Arc<LocalDb>,
-    job_id: String,
-) -> Result<Option<String>, String> {
-    latest_run_for_job(&db, &job_id).await
 }
 
 pub(super) async fn refresh_packet_state(

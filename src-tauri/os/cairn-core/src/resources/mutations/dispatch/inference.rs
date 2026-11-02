@@ -1,12 +1,11 @@
 //! The inference facet's writes. The records': the whole inventory replaced
 //! (`replace cairn://inference`), records added, replaced and removed
 //! (`patch {upsert, remove}`), or the records mirrored from bginf adopted
-//! (`patch {adopt: "bginf"}`), each decided by `orchestrator::inference`. The
-//! pool controller's: a pool patch (take or hand back control, the windows, a
-//! pin, a release or revocation) and the request queue (ask for a model,
-//! cancel a request). The act side's: one deployment's
-//! `patch {action: start|stop}`, which is parsed here and decided by the
-//! deployment controller (`orchestrator::inference_control`).
+//! (`patch {adopt: "bginf"}`), each decided by `orchestrator::inference`.
+//! Placement's (`fleet::models`): a pool patch (its warm model, its idle
+//! window, a pin, a release or revocation), the request queue (ask for a
+//! model, cancel a request), and one deployment's
+//! `patch {action: start|stop}` by hand.
 //!
 //! Who acts is the authenticated agent run, named by its home, so a pin's
 //! holder and a request's requester cannot be claimed by another run. A write
@@ -14,20 +13,179 @@
 //! `requester` its payload names.
 
 use super::super::{build_failure, payload_str, ResourceMutationResult};
+use crate::fleet::models::{self, PinTarget};
+use crate::fleet::pools::{Pool, PoolKey};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::inference::{adopt, write_inventory, Authoring, Removals};
 use crate::orchestrator::inference_generate::{generate, pool_hardware, StatedHardware};
 use crate::orchestrator::inference_import::import;
 use crate::orchestrator::inference_models::{register, Web};
 use crate::orchestrator::inference_verify;
-use crate::orchestrator::pool_control::{cancel_request, patch_pool, request_model, PoolPatch};
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityRequest;
 use cairn_common::uri::{parse_uri, CairnResource};
-use cairn_inference::control::Request;
 use cairn_inference::import::ImportSpec;
 use cairn_inference::RecordSource;
 use serde_json::Value;
+
+/// A `cairn://inference/pools` patch: applied as preferences, then a pin,
+/// then a release or revocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PoolPatch {
+    pub pool: PoolKey,
+    /// `Some(None)` clears the warm model.
+    pub warm: Option<Option<String>>,
+    /// `Some(None)` derives the idle window again.
+    pub idle_secs: Option<Option<u64>>,
+    /// The model, by real name, to pin on the pool.
+    pub pin: Option<String>,
+    /// `Some(None)`: every pin on the pool the actor holds (or, revoking,
+    /// anyone holds); `Some(Some(model))`: that model's.
+    pub release: Option<Option<String>>,
+    pub revoke: Option<Option<String>>,
+}
+
+const POOL_KEYS: &str = "pool, warm, idleSecs, pin, release and revoke";
+
+fn model_or_all(key: &str, value: &Value) -> Result<Option<Option<String>>, String> {
+    match value {
+        Value::Bool(false) | Value::Null => Ok(None),
+        Value::Bool(true) => Ok(Some(None)),
+        Value::String(model) if !model.trim().is_empty() => Ok(Some(Some(model.trim().into()))),
+        _ => Err(format!(
+            "{key} is true (every pin on the pool) or a model's real name"
+        )),
+    }
+}
+
+impl PoolPatch {
+    pub fn parse(payload: &Value) -> Result<Self, String> {
+        let object = payload.as_object().ok_or("the payload must be an object")?;
+        let mut patch = PoolPatch {
+            pool: PoolKey(String::new()),
+            warm: None,
+            idle_secs: None,
+            pin: None,
+            release: None,
+            revoke: None,
+        };
+        for (key, value) in object {
+            match key.as_str() {
+                "pool" => {
+                    patch.pool = PoolKey(
+                        value
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or("pool must name a pool by its key, as cairn://inference/pools lists it")?
+                            .trim()
+                            .to_string(),
+                    );
+                }
+                "warm" => {
+                    patch.warm = Some(match value {
+                        Value::Null => None,
+                        Value::String(model) if !model.trim().is_empty() => {
+                            Some(model.trim().to_string())
+                        }
+                        _ => return Err("warm must be a model's real name, or null to clear it".into()),
+                    })
+                }
+                "idleSecs" => {
+                    patch.idle_secs = Some(match value {
+                        Value::Null => None,
+                        value => Some(value.as_u64().filter(|s| *s > 0).ok_or(
+                            "idleSecs must be a positive number of seconds, or null to derive it",
+                        )?),
+                    })
+                }
+                "pin" => {
+                    patch.pin = Some(
+                        value
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .ok_or("pin must be a model's real name")?
+                            .trim()
+                            .to_string(),
+                    )
+                }
+                "release" => patch.release = model_or_all("release", value)?,
+                "revoke" => patch.revoke = model_or_all("revoke", value)?,
+                "controlled" => {
+                    return Err(format!(
+                        "controlled retired: placement runs every pool's models now; a pool patch takes {POOL_KEYS}"
+                    ))
+                }
+                "settings" => {
+                    return Err(format!(
+                        "settings retired: a pool has one idle window (idleSecs), and its minimum residency and load bound derive from its measured load; a pool patch takes {POOL_KEYS}"
+                    ))
+                }
+                other => {
+                    return Err(format!(
+                        "unknown key '{other}'; a pool patch takes {POOL_KEYS}"
+                    ))
+                }
+            }
+        }
+        if patch.pool.as_str().is_empty() {
+            return Err(
+                "pool must name a pool by its key, as cairn://inference/pools lists it".into(),
+            );
+        }
+        if patch.release.is_some() && patch.revoke.is_some() {
+            return Err("release your own pin or revoke one, not both".to_string());
+        }
+        if patch
+            == (PoolPatch {
+                pool: patch.pool.clone(),
+                warm: None,
+                idle_secs: None,
+                pin: None,
+                release: None,
+                revoke: None,
+            })
+        {
+            return Err(format!("the patch changes nothing; it takes {POOL_KEYS}"));
+        }
+        Ok(patch)
+    }
+}
+
+async fn patch_pool(orch: &Orchestrator, patch: PoolPatch, actor: &str) -> Result<String, String> {
+    let mut lines = Vec::new();
+    if patch.warm.is_some() || patch.idle_secs.is_some() {
+        lines.push(
+            models::set_preference(orch, &patch.pool, patch.warm.clone(), patch.idle_secs).await?,
+        );
+    }
+    if let Some(model) = &patch.pin {
+        lines.push(
+            models::pin(
+                orch,
+                PinTarget::Model {
+                    name: model.clone(),
+                    pool: Some(patch.pool.clone()),
+                },
+                actor,
+            )
+            .await?,
+        );
+    }
+    for (which, revoke) in [(&patch.release, false), (&patch.revoke, true)] {
+        let Some(which) = which else {
+            continue;
+        };
+        let target = match which {
+            None => PinTarget::Pool(patch.pool.clone()),
+            Some(model) => PinTarget::Model {
+                name: model.clone(),
+                pool: Some(patch.pool.clone()),
+            },
+        };
+        lines.push(models::release(orch, target, actor, revoke).await?);
+    }
+    Ok(lines.join("\n"))
+}
 
 /// A `cairn://inference` patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,25 +209,25 @@ fn removal_ids<T: From<String>>(remove: &Value, kind: &str) -> Result<Vec<T>, St
     }
 }
 
-const REMOVABLE: &[&str] = &["models", "profiles", "deployments", "pools"];
+const REMOVABLE: &[&str] = &["models", "profiles", "deployments", "machines"];
 
 fn parse_removals(remove: Option<&Value>) -> Result<Removals, String> {
     let Some(remove) = remove.filter(|remove| !remove.is_null()) else {
         return Ok(Removals::default());
     };
     let object = remove.as_object().ok_or(
-        "payload.remove must be {models?, profiles?, deployments?, pools?}, each a list of ids",
+        "payload.remove must be {models?, profiles?, deployments?, machines?}, each a list of ids",
     )?;
     if let Some(key) = object.keys().find(|key| !REMOVABLE.contains(&key.as_str())) {
         return Err(format!(
-            "payload.remove.{key} is not a record kind; it takes models, profiles, deployments and pools"
+            "payload.remove.{key} is not a record kind; it takes models, profiles, deployments and machines (pools are detected, not written)"
         ));
     }
     Ok(Removals {
         models: removal_ids(remove, "models")?,
         profiles: removal_ids(remove, "profiles")?,
         deployments: removal_ids(remove, "deployments")?,
-        pools: removal_ids(remove, "pools")?,
+        machines: removal_ids(remove, "machines")?,
     })
 }
 
@@ -226,6 +384,17 @@ fn pool_of(payload: &Value, key: &str) -> Result<(String, bool), String> {
     Ok((pool.to_string(), all))
 }
 
+/// The pool placement detects now under `key`.
+pub(crate) fn detected_pool(orch: &Orchestrator, key: &str) -> Result<Pool, String> {
+    orch.fleet
+        .detected_pools()
+        .into_iter()
+        .find(|pool| pool.key.0 == key)
+        .ok_or_else(|| {
+            format!("there is no pool {key} now; cairn://inference/pools lists the pools placement detects")
+        })
+}
+
 async fn actor(orch: &Orchestrator, request: &McpCallbackRequest, named: Option<&str>) -> String {
     match crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request).await {
         Ok(agent) => agent.home,
@@ -291,7 +460,7 @@ pub(super) async fn dispatch(
                 return Ok(Some(format!("Would patch pool {}", patch.pool)));
             }
             let actor = actor(orch, request, None).await;
-            patch_pool(orch, &patch, &actor)
+            patch_pool(orch, patch, &actor)
                 .await
                 .map(Some)
                 .map_err(fail)
@@ -304,18 +473,24 @@ pub(super) async fn dispatch(
             let model = payload_str(payload, "model", &[]).ok_or_else(|| {
                 fail("payload.model must name the model to load by its real name".into())
             })?;
-            let pool = payload_str(payload, "pool", &[]).map(cairn_inference::PoolId::from);
+            let pool = payload_str(payload, "pool", &[]).map(|pool| PoolKey(pool.to_string()));
             if dry_run {
                 return Ok(Some(format!("Would request {model}")));
             }
             let requester = actor(orch, request, payload_str(payload, "requester", &[])).await;
-            let handle = request_model(orch, model, pool.as_ref(), &requester)
+            let inventory = crate::orchestrator::inference_route::served_inventory(orch)
+                .await
+                .map_err(fail)?;
+            let real = crate::orchestrator::inference_route::resolve_model(&inventory, model)
+                .map_err(fail)?;
+            let handle = models::request(orch, &real, &requester, pool.as_ref())
                 .await
                 .map_err(fail)?;
             let status = handle.status(orch).await.map_err(fail)?;
             Ok(Some(format!(
-                "Request #{} for {} on pool {}: {}. Read cairn://inference/requests for the queue.",
+                "Request #{} for {} (deployment {}) on pool {}: {}. Read cairn://inference/requests for the queue.",
                 handle.id,
+                handle.model,
                 handle.deployment,
                 handle.pool,
                 status.describe()
@@ -338,16 +513,16 @@ pub(super) async fn dispatch(
                 return Ok(Some(format!("Would cancel request #{id}")));
             }
             let by = actor(orch, request, None).await;
-            cancel_request(orch, id, &by).await.map(Some).map_err(fail)
+            models::cancel(orch, id, &by).await.map(Some).map_err(fail)
         }
         (CairnResource::InferenceDeployment { id }, ChangeMode::Patch) => {
-            let action = match item
+            let start = match item
                 .payload
                 .as_ref()
                 .and_then(|payload| payload_str(payload, "action", &[]))
             {
-                Some("start") => Request::Start,
-                Some("stop") => Request::Stop,
+                Some("start") => true,
+                Some("stop") => false,
                 Some(other) => {
                     return Err(fail(format!(
                         "payload.action `{other}` must be start or stop"
@@ -356,12 +531,19 @@ pub(super) async fn dispatch(
                 None => return Err(fail("payload.action must be start or stop".into())),
             };
             if dry_run {
-                return Ok(Some(format!("Would {} deployment {id}", action.as_str())));
+                return Ok(Some(format!(
+                    "Would {} deployment {id}",
+                    if start { "start" } else { "stop" }
+                )));
             }
-            crate::orchestrator::inference_control::request_deployment(orch, id, action)
-                .await
-                .map(Some)
-                .map_err(fail)
+            let by = actor(orch, request, None).await;
+            if start {
+                models::start_by_hand(orch, id, &by).await
+            } else {
+                models::stop_by_hand(orch, id, &by).await
+            }
+            .map(Some)
+            .map_err(fail)
         }
         (CairnResource::InferenceModels, ChangeMode::Append) => {
             let payload = item
@@ -412,11 +594,11 @@ pub(super) async fn dispatch(
             let inventory = crate::orchestrator::inference::load_inventory(&orch.db.local)
                 .await
                 .map_err(fail)?;
-            let pool_id = cairn_inference::PoolId::from(pool.as_str());
-            let family = pool_hardware(&inventory, &pool_id, &snapshots(orch), &Default::default())
+            let detected = detected_pool(orch, &pool).map_err(fail)?;
+            let family = pool_hardware(&detected, &snapshots(orch), &Default::default())
                 .ok()
                 .and_then(|hw| hw.machines.first().map(|m| m.family));
-            let profiles = inference_verify::candidates(&inventory, name, &pool_id, family);
+            let profiles = inference_verify::candidates(&inventory, name, &detected, family);
             if profiles.is_empty() {
                 return Err(fail(format!(
                     "model {name} has no container profile that suits pool {pool}; import one or generate candidates at cairn://inference/profiles"
@@ -424,7 +606,7 @@ pub(super) async fn dispatch(
             }
             let requester = actor(orch, request, None).await;
             let count = profiles.len();
-            let id = inference_verify::spawn(orch, profiles, &pool, &requester, all)
+            let id = inference_verify::spawn(orch, profiles, detected, &requester, all)
                 .await
                 .map_err(fail)?;
             Ok(Some(format!(
@@ -497,12 +679,13 @@ pub(super) async fn dispatch(
                     "Would generate profiles for {model} on pool {pool}"
                 )));
             }
+            let detected = detected_pool(orch, pool).map_err(fail)?;
             let hub = Web::new().map_err(fail)?;
             let snapshots = snapshots(orch);
             authorized(
                 orch,
                 request,
-                generate(&orch.db.local, &hub, model, pool, &snapshots, &stated),
+                generate(&orch.db.local, &hub, model, &detected, &snapshots, &stated),
             )
             .await
             .map(Some)
@@ -517,18 +700,19 @@ pub(super) async fn dispatch(
             if dry_run {
                 return Ok(Some(format!("Would verify profile {id} on pool {pool}")));
             }
+            let detected = detected_pool(orch, &pool).map_err(fail)?;
             let requester = actor(orch, request, None).await;
             let verification = inference_verify::spawn(
                 orch,
                 vec![cairn_inference::InferenceProfileId::from(id.as_str())],
-                &pool,
+                detected,
                 &requester,
                 false,
             )
             .await
             .map_err(fail)?;
             Ok(Some(format!(
-                "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, then its health is checked and it is benchmarked; the pool's own model is stopped first and restored after. Read cairn://inference/verifications/{verification} for its stage."
+                "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, pinned for the verification so placement displaces any unpinned model on its machines, then its health is checked and it is benchmarked; afterwards it is unloaded and placement's rules bring the pool's models back. Read cairn://inference/verifications/{verification} for its stage."
             )))
         }
         _ => Ok(None),
@@ -555,26 +739,97 @@ mod tests {
         );
         assert!(parse_inventory_patch(&serde_json::json!({"adopt": "cairn"})).is_err());
         assert!(parse_inventory_patch(
-            &serde_json::json!({"adopt": "bginf", "upsert": "pools: []"})
+            &serde_json::json!({"adopt": "bginf", "upsert": "machines: []"})
         )
         .unwrap_err()
         .starts_with("adopt stands alone"));
         assert_eq!(
             parse_inventory_patch(&serde_json::json!({
-                "upsert": "pools: []",
-                "remove": {"deployments": ["qwen36-fast"]}
+                "upsert": "machines: []",
+                "remove": {"deployments": ["qwen36-fast"], "machines": ["bbs"]}
             })),
             Ok(InventoryPatch::Author(Authoring::Patch {
-                upsert: Some("pools: []".into()),
+                upsert: Some("machines: []".into()),
                 remove: Removals {
                     deployments: vec!["qwen36-fast".into()],
+                    machines: vec!["bbs".into()],
                     ..Removals::default()
                 },
             }))
         );
         assert!(parse_inventory_patch(&serde_json::json!({})).is_err());
         assert!(parse_inventory_patch(&serde_json::json!({"remove": {"modelz": []}})).is_err());
-        assert!(parse_inventory_patch(&serde_json::json!({"remove": {"pools": [1]}})).is_err());
+        assert!(
+            parse_inventory_patch(&serde_json::json!({"remove": {"pools": ["sparks"]}}))
+                .unwrap_err()
+                .contains("pools are detected, not written")
+        );
+        assert!(parse_inventory_patch(&serde_json::json!({"remove": {"machines": [1]}})).is_err());
+    }
+
+    #[test]
+    fn a_pool_patch_takes_the_new_keys_and_names_them_for_the_retired_ones() {
+        let parse = |value: Value| PoolPatch::parse(&value);
+        let patch = parse(serde_json::json!({
+            "pool": "bginf-sp1+bginf-sp2",
+            "warm": "deepseek-ai/DeepSeek-V4-Flash",
+            "idleSecs": 1200,
+            "pin": "deepseek-ai/DeepSeek-V4-Flash"
+        }))
+        .unwrap();
+        assert_eq!(patch.pool, PoolKey("bginf-sp1+bginf-sp2".into()));
+        assert_eq!(
+            patch.warm,
+            Some(Some("deepseek-ai/DeepSeek-V4-Flash".into()))
+        );
+        assert_eq!(patch.idle_secs, Some(Some(1200)));
+        assert_eq!(patch.pin.as_deref(), Some("deepseek-ai/DeepSeek-V4-Flash"));
+        let cleared =
+            parse(serde_json::json!({"pool": "fedora", "warm": null, "idleSecs": null})).unwrap();
+        assert_eq!((cleared.warm, cleared.idle_secs), (Some(None), Some(None)));
+        assert_eq!(
+            parse(serde_json::json!({"pool": "fedora", "release": true}))
+                .unwrap()
+                .release,
+            Some(None)
+        );
+        assert_eq!(
+            parse(serde_json::json!({"pool": "fedora", "revoke": "m"}))
+                .unwrap()
+                .revoke,
+            Some(Some("m".into()))
+        );
+
+        for (payload, says) in [
+            (
+                serde_json::json!({"pool": "sparks", "controlled": true}),
+                "controlled retired",
+            ),
+            (
+                serde_json::json!({"pool": "sparks", "settings": {"modelIdleSecs": 60}}),
+                "settings retired: a pool has one idle window (idleSecs)",
+            ),
+            (
+                serde_json::json!({"pool": "sparks", "default": ["x"]}),
+                "unknown key 'default'",
+            ),
+            (serde_json::json!({"warm": "x"}), "pool must name a pool"),
+            (
+                serde_json::json!({"pool": "sparks", "idleSecs": 0}),
+                "idleSecs must be a positive number",
+            ),
+            (
+                serde_json::json!({"pool": "sparks", "release": true, "revoke": true}),
+                "not both",
+            ),
+            (serde_json::json!({"pool": "sparks"}), "changes nothing"),
+        ] {
+            let refusal = parse(payload.clone()).unwrap_err();
+            assert!(refusal.contains(says), "{payload}: {refusal}");
+            if says.ends_with("retired") || says.starts_with("unknown") {
+                assert!(refusal.contains(POOL_KEYS), "{refusal}");
+            }
+        }
     }
 
     #[test]

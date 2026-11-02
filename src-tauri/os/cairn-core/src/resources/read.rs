@@ -1943,7 +1943,7 @@ async fn render_resource_body(
             crate::resources::grants::read_grant(&orch.db.local, &id).await
         }
         // The cairn-inference facet: the stored inventory, what the act side
-        // has done to it, and the pool controller's state and request queue.
+        // has done to it, and placement's model residents and request queue.
         CairnResource::Inference
         | CairnResource::InferenceProfiles
         | CairnResource::InferenceDeployments

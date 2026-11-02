@@ -1,16 +1,14 @@
 //! The test inventory, bginf's own test fixture (`ctl/test_ctl.py`) as Cairn
-//! records: sp1 and sp2 in pool `sparks`, halo in pool `halo`, the defaults
-//! `dsv4f-tp2` and `qwen3-embed-4b`, and no pins. Each profile's model is
+//! records: `dsv4f-tp2` across sp1 and sp2, `qwen36-fast` on sp1 and
+//! `qwen3-embed-4b` on halo, with sp1's and halo's addresses. Each profile's model is
 //! registered under the profile's id, every fact unknown.
-
-use std::collections::BTreeSet;
 
 use crate::deployment::Deployment;
 use crate::inventory::Inventory;
-use crate::machine::MachineName;
+use crate::machine::{MachineName, MachineRecord};
 use crate::model::Model;
-use crate::pool::{DeploymentSet, Pool, PoolMachine, RecordSource};
 use crate::profile::{Engine, InferenceProfile, ModelRef, ProfileOrigin, Requirements};
+use crate::record::RecordSource;
 
 pub(crate) fn command_profile(id: &str, machines: u32) -> InferenceProfile {
     InferenceProfile {
@@ -55,28 +53,11 @@ pub(crate) fn deployment(id: &str, machines: &[&str]) -> Deployment {
     }
 }
 
-pub(crate) fn set(ids: &[&str]) -> DeploymentSet {
-    ids.iter().map(|id| (*id).into()).collect()
-}
-
-pub(crate) fn machines(names: &[&str]) -> BTreeSet<MachineName> {
-    names.iter().map(|m| (*m).into()).collect()
-}
-
-pub(crate) fn pool(id: &str, machines: &[&str], default: &[&str]) -> Pool {
-    Pool {
-        id: id.into(),
+pub(crate) fn machine(name: &str, address: &str) -> MachineRecord {
+    MachineRecord {
+        name: name.into(),
         source: RecordSource::Cairn,
-        machines: machines
-            .iter()
-            .map(|m| PoolMachine {
-                name: (*m).into(),
-                address: None,
-                link: None,
-            })
-            .collect(),
-        default: set(default),
-        pin: None,
+        address: address.into(),
     }
 }
 
@@ -96,7 +77,7 @@ pub(crate) fn test_inventory() -> Inventory {
         insert_command_profile(&mut inventory, id, nodes.len() as u32);
         inventory.insert_deployment(deployment(id, nodes));
     }
-    inventory.insert_pool(pool("sparks", &["sp1", "sp2"], &["dsv4f-tp2"]));
-    inventory.insert_pool(pool("halo", &["halo"], &["qwen3-embed-4b"]));
+    inventory.insert_machine(machine("sp1", "10.20.20.40"));
+    inventory.insert_machine(machine("halo", "10.20.20.43"));
     inventory
 }

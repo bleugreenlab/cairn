@@ -4,11 +4,12 @@
 //! goes through the same function the `cairn://inference` writes do, so the
 //! page and an agent change a pool the same way.
 //!
-//! Today the overview is read from the inventory, the pool controller's
-//! records and request queue, the act side's phases and load history, the
-//! fleet's executor health, and the engines' live metrics. When placement runs
-//! local models (cairn/5728) this module is rewired to it; the wire types and
-//! the page do not change.
+//! The overview is read from placement's view of local models
+//! ([`crate::fleet::models::view`]: the detected pools with their link, warm
+//! model and windows, the residents and their pins, where each deployment may
+//! run, and the requests), the inventory, the act side's phases and load
+//! history, the fleet's executor health, and the engines' live metrics. Its
+//! actions are placement's doors.
 //!
 //! A machine's memory is its discrete GPUs' VRAM when it has any, otherwise
 //! its system memory (unified memory: a GB10 Spark, Strix Halo). A machine
@@ -20,17 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use cairn_common::executor_protocol::{ExecutorHealthSnapshot, GpuMemory, MeasurementReading};
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
-use cairn_inference::pool_control::{self as control, PoolControl, RequestState};
 use cairn_inference::served::{self, EngineMeasure};
-use cairn_inference::{
-    DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine, Pool, PoolId,
-};
+use cairn_inference::{DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine};
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
 
 use super::inference_control::{self, LoadRow};
-use super::pool_control::{self, PoolPatch, SettingKey, StoredRequest};
 use super::Orchestrator;
+use crate::fleet::models::requests::{Request, RequestState};
+use crate::fleet::models::settings::SettingOrigin;
+use crate::fleet::models::{self, ModelsView, PinTarget, PoolView};
+use crate::fleet::pools::PoolKey;
 
 /// Who the page acts as.
 pub const OPERATOR: &str = "operator";
@@ -50,8 +51,7 @@ pub struct InferenceOverview {
 pub struct InferencePool {
     pub id: String,
     pub machines: Vec<InferenceMachine>,
-    /// The interconnect joining the pool's machines, once detected
-    /// (cairn/5728).
+    /// The interconnect joining the pool's machines, as detection measured it.
     pub link: Option<InferenceLink>,
     pub memory: Option<PoolMemory>,
     pub running: Vec<RunningModel>,
@@ -285,8 +285,8 @@ pub(crate) struct Sources<'a> {
     pub inventory: &'a Inventory,
     pub phases: &'a BTreeMap<DeploymentId, Phase>,
     pub loads: &'a BTreeMap<DeploymentId, Vec<LoadRow>>,
-    pub controls: &'a BTreeMap<PoolId, PoolControl>,
-    pub requests: &'a [StoredRequest],
+    /// What placement holds and decides about local models.
+    pub models: &'a ModelsView,
     pub machines: &'a BTreeMap<String, MachineFacts>,
     pub engines: &'a BTreeMap<DeploymentId, EngineSummary>,
     pub measures: &'a BTreeMap<DeploymentId, EngineMeasure>,
@@ -303,12 +303,12 @@ impl Sources<'_> {
         self.inventory.profiles.get(&record.profile)
     }
 
-    fn waiting(&self, deployment: &DeploymentId) -> Vec<&StoredRequest> {
-        self.requests
+    fn waiting(&self, deployment: &DeploymentId) -> Vec<&Request> {
+        self.models
+            .requests
             .iter()
-            .filter(|r| {
-                &r.request.deployment == deployment && r.request.state == RequestState::Waiting
-            })
+            .map(|view| &view.request)
+            .filter(|r| &r.deployment == deployment && r.state == RequestState::Waiting)
             .collect()
     }
 
@@ -326,8 +326,29 @@ impl Sources<'_> {
         inference_control::last_footprint(self.loads.get(deployment))
     }
 
-    fn running(&self, pool: &Pool, deployment: &DeploymentId) -> Option<RunningModel> {
+    /// The deployments placement may place on `pool`, and those resident there.
+    fn deployments_of(&self, pool: &PoolView) -> Vec<DeploymentId> {
+        let mut ids: BTreeSet<DeploymentId> = self
+            .models
+            .deployments
+            .iter()
+            .filter(|placement| placement.pool.as_ref() == Some(&pool.key))
+            .map(|placement| placement.deployment.clone())
+            .collect();
+        ids.extend(pool.residents.iter().map(|r| r.deployment.clone()));
+        ids.into_iter()
+            .filter(|id| self.inventory.deployments.contains_key(id))
+            .collect()
+    }
+
+    fn pool_of(&self, deployment: &DeploymentId) -> Option<&PoolView> {
+        let key = self.models.placement(deployment)?.pool.as_ref()?;
+        self.models.pools.iter().find(|pool| &pool.key == key)
+    }
+
+    fn running(&self, deployment: &DeploymentId) -> Option<RunningModel> {
         let profile = self.model_of(deployment)?;
+        let resident = self.models.resident(deployment);
         let waiting = self.waiting(deployment);
         let expected_ms = self.slowest_load_ms(deployment);
         let loading = |at: i64| Loading {
@@ -344,20 +365,22 @@ impl Sources<'_> {
                 (RunningState::Loading, Some(loading(*since_ms)), None)
             }
             Some(Phase::Stopping { .. }) => (RunningState::Stopping, None, None),
-            Some(Phase::Failed { at_ms, reason }) if self.now - at_ms < FAILED_SHOWN_MS => {
+            Some(Phase::Failed { at_ms, reason })
+                if resident.is_none() && self.now - at_ms < FAILED_SHOWN_MS =>
+            {
                 (RunningState::Failed, None, Some(reason.clone()))
             }
             _ => {
-                // Asked for and not started yet: loading from the first ask.
-                let first = waiting.iter().map(|r| r.request.at).min()?;
+                // Placed and not started yet, or asked for and not placed
+                // yet: loading from the earlier of the two.
+                let first = resident
+                    .map(|r| r.chosen_at)
+                    .into_iter()
+                    .chain(waiting.iter().map(|r| r.at))
+                    .min()?;
                 (RunningState::Loading, Some(loading(first)), None)
             }
         };
-        let pinned = self
-            .controls
-            .get(&pool.id)
-            .and_then(|control| control.pin.as_ref())
-            .is_some_and(|pin| pin.set.contains(deployment));
         let rates = self
             .engines
             .get(deployment)
@@ -371,7 +394,7 @@ impl Sources<'_> {
             model: profile.model.name.clone(),
             profile: profile.id.to_string(),
             state,
-            pinned,
+            pinned: resident.is_some_and(|r| r.pin.is_some()),
             loading,
             failed,
             rates,
@@ -379,10 +402,10 @@ impl Sources<'_> {
     }
 
     /// The smallest memory a machine of `pool` has, of those that report.
-    fn smallest_machine(&self, pool: &Pool) -> Option<u64> {
-        pool.machines
+    fn smallest_machine(&self, pool: &PoolView) -> Option<u64> {
+        pool.members
             .iter()
-            .filter_map(|m| self.machines.get(m.name.as_str())?.memory)
+            .filter_map(|m| self.machines.get(m.machine.as_str())?.memory)
             .map(|(total, _)| total)
             .min()
     }
@@ -411,8 +434,8 @@ impl Sources<'_> {
         )
     }
 
-    fn fits(&self, pool: &Pool, profile: &InferenceProfile, per_machine: Option<u64>) -> bool {
-        if profile.requirements.machines as usize > pool.machines.len() {
+    fn fits(&self, pool: &PoolView, profile: &InferenceProfile, per_machine: Option<u64>) -> bool {
+        if profile.requirements.machines as usize > pool.members.len() {
             return false;
         }
         match (per_machine, self.smallest_machine(pool)) {
@@ -421,7 +444,7 @@ impl Sources<'_> {
         }
     }
 
-    fn pool_memory(&self, pool: &Pool, running: &[RunningModel]) -> Option<PoolMemory> {
+    fn pool_memory(&self, pool: &PoolView, running: &[RunningModel]) -> Option<PoolMemory> {
         let busy: Vec<&DeploymentId> = running
             .iter()
             .filter(|r| matches!(r.state, RunningState::Ready | RunningState::Loading))
@@ -433,8 +456,8 @@ impl Sources<'_> {
             })
             .collect();
         let mut memory: Option<PoolMemory> = None;
-        for machine in &pool.machines {
-            let name = machine.name.as_str();
+        for member in &pool.members {
+            let name = member.machine.as_str();
             let Some(facts) = self.machines.get(name) else {
                 continue;
             };
@@ -476,21 +499,11 @@ impl Sources<'_> {
         memory
     }
 
-    fn pool(&self, pool: &Pool) -> InferencePool {
-        let deployments: Vec<&DeploymentId> = self
-            .inventory
-            .deployments
-            .values()
-            .filter(|d| {
-                self.inventory
-                    .pool_of_deployment(d)
-                    .is_some_and(|p| p.id == pool.id)
-            })
-            .map(|d| &d.id)
-            .collect();
+    fn pool(&self, pool: &PoolView) -> InferencePool {
+        let deployments = self.deployments_of(pool);
         let running: Vec<RunningModel> = deployments
             .iter()
-            .filter_map(|id| self.running(pool, id))
+            .filter_map(|id| self.running(id))
             .collect();
         // A model on its way down is not offered for loading until it is down.
         let busy: BTreeSet<&str> = running
@@ -512,47 +525,35 @@ impl Sources<'_> {
                 })
             })
             .collect();
-        let warm = pool
-            .default
-            .iter()
-            .find_map(|id| self.model_of(id))
-            .map(|profile| profile.model.name.clone());
-        let slowest: BTreeMap<&DeploymentId, u64> = deployments
-            .iter()
-            .filter_map(|id| Some((*id, self.slowest_load_ms(id)?)))
-            .collect();
-        let settings = self
-            .controls
-            .get(&pool.id)
-            .map(|control| control.settings)
-            .unwrap_or_default()
-            .effective(control::slowest_load_secs(
-                pool,
-                &self.inventory.deployments,
-                slowest,
-            ));
+        let link = match (pool.members.as_slice(), pool.rate_gbps) {
+            ([a, b], Some(gbps)) => Some(InferenceLink {
+                machines: [a.machine.clone(), b.machine.clone()],
+                bytes_per_sec: u64::from(gbps) * 1_000_000_000 / 8,
+            }),
+            _ => None,
+        };
         InferencePool {
-            id: pool.id.to_string(),
+            id: pool.key.to_string(),
             machines: pool
-                .machines
+                .members
                 .iter()
-                .map(|machine| {
-                    let facts = self.machines.get(machine.name.as_str());
+                .map(|member| {
+                    let facts = self.machines.get(member.machine.as_str());
                     InferenceMachine {
-                        name: machine.name.to_string(),
+                        name: member.machine.clone(),
                         gpu: facts.and_then(|f| f.gpu.clone()),
                         memory_bytes: facts.and_then(|f| f.memory).map(|(total, _)| total),
                     }
                 })
                 .collect(),
-            link: None,
+            link,
             memory: self.pool_memory(pool, &running),
             running,
-            warm,
+            warm: pool.warm_model.clone(),
             loadable,
             unload_idle: UnloadIdle {
-                secs: settings.model_idle.secs,
-                auto: !matches!(settings.model_idle.origin, control::SettingOrigin::Operator),
+                secs: pool.settings.idle.secs,
+                auto: !matches!(pool.settings.idle.origin, SettingOrigin::Operator),
             },
         }
     }
@@ -608,13 +609,11 @@ impl Sources<'_> {
                         fit: deployments_of(profile)
                             .into_iter()
                             .filter_map(|id| {
-                                let pool = self
-                                    .inventory
-                                    .pool_of_deployment(&self.inventory.deployments[id])?;
+                                let pool = self.pool_of(id)?;
                                 let (size, per_machine) = self.size(id, profile);
                                 let latest = self.loads.get(id).and_then(|loads| loads.first());
                                 Some(ProfileFit {
-                                    pool: pool.id.to_string(),
+                                    pool: pool.key.to_string(),
                                     fits: self.fits(pool, profile, per_machine),
                                     memory_bytes: size,
                                     load_ms: self.slowest_load_ms(id),
@@ -644,9 +643,9 @@ impl Sources<'_> {
 
     pub(crate) fn overview(&self) -> InferenceOverview {
         let pools: Vec<InferencePool> = self
-            .inventory
+            .models
             .pools
-            .values()
+            .iter()
             .map(|pool| self.pool(pool))
             .collect();
         let running: Vec<RunningModel> = pools
@@ -694,10 +693,9 @@ async fn with_sources<T>(
 ) -> Result<T, String> {
     let db = &orch.db.local;
     let inventory = super::inference_route::served_inventory(orch).await?;
-    let phases = pool_control::deployment_phases(db).await?;
+    let phases = inference_control::deployment_phases(db).await?;
     let loads = inference_control::load_history(db).await?;
-    let controls = pool_control::load_controls(db).await?;
-    let requests = pool_control::load_requests(db).await?;
+    let models = models::view(orch).await?;
     let machines: BTreeMap<String, MachineFacts> = orch
         .fleet
         .executor_health(crate::fleet::unix_time_ms())
@@ -710,8 +708,7 @@ async fn with_sources<T>(
         inventory: &inventory,
         phases: &phases,
         loads: &loads,
-        controls: &controls,
-        requests: &requests,
+        models: &models,
         machines: &machines,
         engines: &engines,
         measures: &measures,
@@ -736,35 +733,46 @@ pub async fn running_detail(
 /// Load `model` (its real name) on `pool`: a request, so the model loads and
 /// its idle clock starts.
 pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String, String> {
-    let handle =
-        pool_control::request_model(orch, model, Some(&PoolId::from(pool)), OPERATOR).await?;
+    let handle = models::request(orch, model, OPERATOR, Some(&PoolKey::from(pool))).await?;
     let status = handle.status(orch).await?;
     Ok(format!("Request #{}: {}", handle.id, status.describe()))
 }
 
+/// Unload `deployment` now, whoever pinned it and whatever waits for it.
 pub async fn unload(orch: &Orchestrator, deployment: &str) -> Result<String, String> {
-    pool_control::unload(orch, &DeploymentId::from(deployment), OPERATOR).await
+    models::unload(orch, &DeploymentId::from(deployment), OPERATOR).await
 }
 
+/// Pin `deployment` against eviction, or unpin it. The operator outranks
+/// another holder: a pin in its way is revoked rather than refusing.
 pub async fn set_pinned(
     orch: &Orchestrator,
     deployment: &str,
     pinned: bool,
 ) -> Result<String, String> {
-    pool_control::set_pinned(orch, &DeploymentId::from(deployment), pinned, OPERATOR).await
+    let target = PinTarget::Deployment(DeploymentId::from(deployment));
+    if pinned {
+        return models::pin_outranking(orch, target, OPERATOR).await;
+    }
+    match models::release(orch, target, OPERATOR, true).await {
+        Err(why) if why == models::NOTHING_PINNED => Ok(format!("{deployment} is not pinned")),
+        said => said,
+    }
 }
 
+/// Set the model `pool` places when idle, or none.
 pub async fn set_warm(
     orch: &Orchestrator,
     pool: &str,
     model: Option<&str>,
 ) -> Result<String, String> {
-    let patch = PoolPatch {
-        pool: PoolId::from(pool),
-        warm: Some(model.map(str::to_string)),
-        ..PoolPatch::default()
-    };
-    pool_control::patch_pool(orch, &patch, OPERATOR).await
+    models::set_preference(
+        orch,
+        &PoolKey::from(pool),
+        Some(model.map(str::to_string)),
+        None,
+    )
+    .await
 }
 
 /// Override the pool's unload-idle window in minutes, or derive it again.
@@ -776,12 +784,13 @@ pub async fn set_unload_idle(
     if minutes == Some(0) {
         return Err("unload idle is a positive number of minutes, or auto".into());
     }
-    let patch = PoolPatch {
-        pool: PoolId::from(pool),
-        settings: vec![(SettingKey::ModelIdle, minutes.map(|m| m * 60))],
-        ..PoolPatch::default()
-    };
-    pool_control::patch_pool(orch, &patch, OPERATOR).await
+    models::set_preference(
+        orch,
+        &PoolKey::from(pool),
+        None,
+        Some(minutes.map(|m| m * 60)),
+    )
+    .await
 }
 
 /// Ask `model` (its real name) one short question through the models facet.
@@ -818,11 +827,16 @@ pub async fn try_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_inference::pool_control::{Active, Pin, PoolSettings, Request, Why};
+    use crate::fleet::models::rules::{Pin, Why};
+    use crate::fleet::models::settings::EffectiveSettings;
+    use crate::fleet::models::{DeploymentPlacement, RequestView, ResidentView};
+    use crate::fleet::pools::PoolMember;
 
     const GIB: u64 = 1 << 30;
     const DSV4: &str = "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp";
     const QWEN: &str = "Qwen/Qwen3.6-35B-A3B";
+    const EMBED: &str = "Qwen/Qwen3-Embedding-4B";
+    const SPARKS: &str = "sp1+sp2";
 
     fn inventory() -> Inventory {
         Inventory::from_yaml(
@@ -853,12 +867,74 @@ deployments:
   - {id: dsv4f-tp2, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen36-fast, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8000, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen3-embed-4b, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
-pools:
-  - {id: sparks, machines: [{name: sp1}, {name: sp2}], default: [dsv4f-tp2]}
-  - {id: halo, machines: [{name: fedora}], default: [qwen3-embed-4b]}
 "#,
         )
         .unwrap()
+    }
+
+    fn pool_view(machines: &[&str], warm: &str) -> PoolView {
+        PoolView {
+            key: PoolKey::of(machines.iter().copied()),
+            members: machines
+                .iter()
+                .map(|machine| PoolMember {
+                    machine: machine.to_string(),
+                    link_address: None,
+                })
+                .collect(),
+            rate_gbps: None,
+            settings: EffectiveSettings::derive(None, None),
+            warm_model: Some(warm.to_string()),
+            idle_override_secs: None,
+            idle_since: None,
+            residents: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    fn placed(deployment: &str, model: &str, pool: &str) -> DeploymentPlacement {
+        DeploymentPlacement {
+            deployment: deployment.into(),
+            model: model.into(),
+            pool: Some(PoolKey::from(pool)),
+            refused: None,
+        }
+    }
+
+    /// The two pools placement detects for the inventory: the Sparks joined by
+    /// their link, and the Fedora box alone.
+    fn placement() -> ModelsView {
+        ModelsView {
+            pools: vec![
+                pool_view(&["sp1", "sp2"], DSV4),
+                pool_view(&["fedora"], EMBED),
+            ],
+            deployments: vec![
+                placed("dsv4f-tp2", DSV4, SPARKS),
+                placed("qwen36-fast", QWEN, SPARKS),
+                placed("qwen3-embed-4b", EMBED, "fedora"),
+            ],
+            ..ModelsView::default()
+        }
+    }
+
+    fn resident(deployment: &str, model: &str, chosen_at: i64) -> ResidentView {
+        ResidentView {
+            deployment: deployment.into(),
+            model: model.into(),
+            pool: SPARKS.into(),
+            machines: ["sp1".to_string(), "sp2".to_string()].into(),
+            phase: None,
+            why: Why::Adopted,
+            why_said: String::new(),
+            chosen_at,
+            loading_since: None,
+            healthy_since: None,
+            hold: None,
+            pin: None,
+            footprint: BTreeMap::new(),
+            unified: true,
+        }
     }
 
     fn spark(allocated: Option<u64>) -> MachineFacts {
@@ -882,17 +958,19 @@ pools:
         }
     }
 
-    fn waiting(id: i64, deployment: &str, at: i64) -> StoredRequest {
-        StoredRequest {
-            pool: "sparks".into(),
+    fn waiting(id: i64, deployment: &str, at: i64) -> RequestView {
+        RequestView {
             request: Request {
                 id,
+                pool: SPARKS.into(),
                 deployment: deployment.into(),
                 model: DSV4.into(),
                 requester: "operator".into(),
                 at,
                 state: RequestState::Waiting,
             },
+            wait: None,
+            said: String::new(),
         }
     }
 
@@ -900,8 +978,7 @@ pools:
         inventory: Inventory,
         phases: BTreeMap<DeploymentId, Phase>,
         loads: BTreeMap<DeploymentId, Vec<LoadRow>>,
-        controls: BTreeMap<PoolId, PoolControl>,
-        requests: Vec<StoredRequest>,
+        models: ModelsView,
         machines: BTreeMap<String, MachineFacts>,
         engines: BTreeMap<DeploymentId, EngineSummary>,
         measures: BTreeMap<DeploymentId, EngineMeasure>,
@@ -913,8 +990,7 @@ pools:
                 inventory: inventory(),
                 phases: BTreeMap::new(),
                 loads: BTreeMap::new(),
-                controls: BTreeMap::new(),
-                requests: Vec::new(),
+                models: placement(),
                 machines: BTreeMap::new(),
                 engines: BTreeMap::new(),
                 measures: BTreeMap::new(),
@@ -930,13 +1006,16 @@ pools:
                 inventory: &self.inventory,
                 phases: &self.phases,
                 loads: &self.loads,
-                controls: &self.controls,
-                requests: &self.requests,
+                models: &self.models,
                 machines: &self.machines,
                 engines: &self.engines,
                 measures: &self.measures,
                 now: 600_000,
             }
+        }
+
+        fn sparks(&mut self) -> &mut PoolView {
+            &mut self.models.pools[0]
         }
     }
 
@@ -965,7 +1044,7 @@ pools:
             },
         );
         let overview = world.overview();
-        let sparks = pool(&overview, "sparks");
+        let sparks = pool(&overview, SPARKS);
         assert_eq!(sparks.running.len(), 1);
         let running = &sparks.running[0];
         assert_eq!(running.model, DSV4);
@@ -1001,6 +1080,21 @@ pools:
     }
 
     #[test]
+    fn a_pool_shows_the_link_detection_measured_between_its_machines() {
+        let mut world = World::new();
+        assert_eq!(pool(&world.overview(), SPARKS).link, None);
+        world.sparks().rate_gbps = Some(200);
+        assert_eq!(
+            pool(&world.overview(), SPARKS).link,
+            Some(InferenceLink {
+                machines: ["sp1".into(), "sp2".into()],
+                bytes_per_sec: 25_000_000_000,
+            })
+        );
+        assert_eq!(pool(&world.overview(), "fedora").link, None);
+    }
+
+    #[test]
     fn discrete_vram_is_the_pool_memory_and_no_reading_draws_nothing() {
         let mut world = World::new();
         world.machines.insert(
@@ -1012,9 +1106,9 @@ pools:
             },
         );
         let overview = world.overview();
-        // Nothing runs on halo, so the 4 GiB in use is not a model's.
+        // Nothing runs on the Fedora box, so the 4 GiB in use is not a model's.
         assert_eq!(
-            pool(&overview, "halo").memory,
+            pool(&overview, "fedora").memory,
             Some(PoolMemory {
                 total_bytes: 24 * GIB,
                 model_bytes: 0,
@@ -1022,8 +1116,8 @@ pools:
                 free_bytes: 20 * GIB,
             })
         );
-        assert_eq!(pool(&overview, "sparks").memory, None);
-        assert_eq!(pool(&overview, "sparks").machines[0].memory_bytes, None);
+        assert_eq!(pool(&overview, SPARKS).memory, None);
+        assert_eq!(pool(&overview, SPARKS).machines[0].memory_bytes, None);
     }
 
     #[test]
@@ -1043,12 +1137,12 @@ pools:
                 healthy_load(420_000, &[]),
             ],
         );
-        world.requests = vec![
+        world.models.requests = vec![
             waiting(1, "dsv4f-tp2", 410_000),
             waiting(2, "dsv4f-tp2", 415_000),
         ];
         let overview = world.overview();
-        let running = &pool(&overview, "sparks").running[0];
+        let running = &pool(&overview, SPARKS).running[0];
         assert_eq!(running.state, RunningState::Loading);
         assert_eq!(
             running.loading,
@@ -1063,12 +1157,27 @@ pools:
     #[test]
     fn a_request_not_yet_started_already_reads_as_loading() {
         let mut world = World::new();
-        world.requests = vec![waiting(1, "qwen36-fast", 540_000)];
+        world.models.requests = vec![waiting(1, "qwen36-fast", 540_000)];
         let overview = world.overview();
-        let running = &pool(&overview, "sparks").running[0];
+        let running = &pool(&overview, SPARKS).running[0];
         assert_eq!(running.model, QWEN);
         assert_eq!(running.loading.unwrap().elapsed_ms, 60_000);
         assert_eq!(running.loading.unwrap().waiting, 1);
+    }
+
+    #[test]
+    fn a_resident_placed_and_not_yet_started_reads_as_loading_since_it_was_chosen() {
+        let mut world = World::new();
+        world.sparks().residents = vec![ResidentView {
+            why: Why::Warm { idle_since: 0 },
+            ..resident("dsv4f-tp2", DSV4, 500_000)
+        }];
+        let overview = world.overview();
+        let running = &pool(&overview, SPARKS).running[0];
+        assert_eq!(running.model, DSV4);
+        assert_eq!(running.state, RunningState::Loading);
+        assert_eq!(running.loading.unwrap().elapsed_ms, 100_000);
+        assert_eq!(running.loading.unwrap().waiting, 0);
     }
 
     #[test]
@@ -1081,27 +1190,14 @@ pools:
                 load_ms: None,
             },
         );
-        world.controls.insert(
-            "sparks".into(),
-            PoolControl {
-                pool: "sparks".into(),
-                controlled: true,
-                settings: PoolSettings::default(),
-                pin: Some(Pin {
-                    set: ["dsv4f-tp2".into()].into(),
-                    holder: OPERATOR.into(),
-                    at: 0,
-                }),
-                active: Active {
-                    members: BTreeMap::new(),
-                    why: Why::Adopted,
-                    since: 0,
-                },
-                last_batch_work_at: 0,
-                generation: 0,
-            },
-        );
-        assert!(pool(&world.overview(), "sparks").running[0].pinned);
+        world.sparks().residents = vec![ResidentView {
+            pin: Some(Pin {
+                holder: OPERATOR.into(),
+                at: 0,
+            }),
+            ..resident("dsv4f-tp2", DSV4, 0)
+        }];
+        assert!(pool(&world.overview(), SPARKS).running[0].pinned);
     }
 
     #[test]
@@ -1110,7 +1206,7 @@ pools:
         world.machines.insert("sp1".into(), spark(None));
         world.machines.insert("sp2".into(), spark(None));
         let overview = world.overview();
-        let sparks = pool(&overview, "sparks");
+        let sparks = pool(&overview, SPARKS);
         let qwen = sparks.loadable.iter().find(|l| l.model == QWEN).unwrap();
         // 200 GB declared against a 122 GiB machine.
         assert!(!qwen.fits);
@@ -1120,40 +1216,31 @@ pools:
         assert_eq!(deepseek.size_bytes, None);
         let model = overview.models.iter().find(|m| m.name == QWEN).unwrap();
         assert!(!model.profiles[0].fit[0].fits);
-        assert_eq!(model.profiles[0].fit[0].pool, "sparks");
+        assert_eq!(model.profiles[0].fit[0].pool, SPARKS);
     }
 
     #[test]
-    fn unload_idle_derives_from_the_slowest_load_until_the_operator_sets_it() {
+    fn unload_idle_is_placement_s_window_and_says_whether_the_operator_set_it() {
         let mut world = World::new();
         assert_eq!(
-            pool(&world.overview(), "sparks").unload_idle,
+            pool(&world.overview(), SPARKS).unload_idle,
             UnloadIdle {
                 secs: 30 * 60,
                 auto: true
             }
         );
-        world
-            .loads
-            .insert("dsv4f-tp2".into(), vec![healthy_load(120_000, &[])]);
         // 6 × 2 min is under the 15-minute floor.
+        world.sparks().settings = EffectiveSettings::derive(None, Some(120));
         assert_eq!(
-            pool(&world.overview(), "sparks").unload_idle,
+            pool(&world.overview(), SPARKS).unload_idle,
             UnloadIdle {
                 secs: 15 * 60,
                 auto: true
             }
         );
-        let mut control = PoolControl::begin(
-            &world.inventory.pools[&PoolId::from("sparks")],
-            &world.inventory.deployments,
-            &BTreeMap::new(),
-            0,
-        );
-        control.settings.model_idle_secs = Some(600);
-        world.controls.insert("sparks".into(), control);
+        world.sparks().settings = EffectiveSettings::derive(Some(600), Some(120));
         assert_eq!(
-            pool(&world.overview(), "sparks").unload_idle,
+            pool(&world.overview(), SPARKS).unload_idle,
             UnloadIdle {
                 secs: 600,
                 auto: false
@@ -1181,7 +1268,7 @@ pools:
         let overview = world.overview();
         let names: Vec<&str> = overview.models.iter().map(|m| m.name.as_str()).collect();
         // By real name, case-insensitively.
-        assert_eq!(names, [DSV4, "Qwen/Qwen3-Embedding-4B", QWEN]);
+        assert_eq!(names, [DSV4, EMBED, QWEN]);
         let deepseek = &overview.models[0];
         assert_eq!(deepseek.maker.as_deref(), Some("deepseek-ai"));
         assert_eq!(deepseek.facts.inputs, [Modality::Text, Modality::Image]);
@@ -1192,7 +1279,7 @@ pools:
         assert_eq!(
             profile.fit,
             [ProfileFit {
-                pool: "sparks".into(),
+                pool: SPARKS.into(),
                 fits: true,
                 memory_bytes: Some(200 * GIB),
                 load_ms: Some(420_000),

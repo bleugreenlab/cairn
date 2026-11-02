@@ -5,13 +5,8 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 
-use super::common::{
-    block_on, block_on_value, latest_run_for_job_arc, refresh_packet_state, select_optional_text,
-    ParentRunContext,
-};
-use super::results::{
-    latest_nonempty_artifact_content_arc, latest_nonempty_assistant_content_arc, task_artifact_uri,
-};
+use super::common::{block_on, refresh_packet_state, select_optional_text, ParentRunContext};
+use super::results::{render_task_result, task_artifact_uri, task_result};
 use crate::orchestrator::attention_push::{
     latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
 };
@@ -202,43 +197,24 @@ pub(super) fn schedule_deferred_parent_suspend_for_delegated_wait(
     );
 }
 
-fn delegated_result_text(
-    db: std::sync::Arc<LocalDb>,
+/// A settled packet's result as its parent receives it, through the same
+/// renderer the inline wait uses.
+async fn delegated_result_text(
+    db: &LocalDb,
     packet: &crate::models::DelegatedWorkPacket,
-) -> Result<String, String> {
+) -> String {
     let Some(job_id) = packet.result_artifact_job_id.as_deref() else {
-        return Ok(format!(
+        return format!(
             "Delegated task '{}' has no materialized result.",
             packet.title
-        ));
+        );
     };
-
-    if matches!(
-        packet.status,
-        DelegatedStatus::Failed | DelegatedStatus::Cancelled
-    ) {
-        return Ok(format!("Delegated task '{}' failed.", packet.title));
-    }
-
-    if let Some(content) = block_on_value(latest_nonempty_artifact_content_arc(
-        db.clone(),
-        job_id.to_string(),
-        None,
-    ))? {
-        return Ok(content);
-    }
-
-    let child_run_id = block_on(latest_run_for_job_arc(db.clone(), job_id.to_string()))?;
-    if let Some(child_run_id) = child_run_id.as_deref() {
-        if let Some(content) = block_on_value(latest_nonempty_assistant_content_arc(
-            db.clone(),
-            child_run_id.to_string(),
-        ))? {
-            return Ok(content);
-        }
-    }
-
-    Ok("Task completed.".to_string())
+    let result = task_result(db, job_id, &packet.output_contract.artifact_name()).await;
+    let home = crate::jobs::queries::home_uri_for_job(db, job_id)
+        .await
+        .ok()
+        .flatten();
+    render_task_result(&packet.title, home.as_deref(), &result)
 }
 
 /// How a settled task reaches its parent.
@@ -302,7 +278,7 @@ async fn render_delegated_results(
 ) -> Result<Vec<(crate::models::DelegatedWorkPacket, String)>, String> {
     let mut rendered = Vec::with_capacity(packets.len());
     for packet in packets {
-        let result = delegated_result_text(db.clone(), &packet)?;
+        let result = delegated_result_text(db, &packet).await;
         let result = match (mode, packet.result_artifact_job_id.as_deref()) {
             (ResumeMode::Repair, Some(job_id)) => format!(
                 "{}\n\n{}",

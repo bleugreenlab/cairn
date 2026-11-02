@@ -1882,6 +1882,9 @@ mod honest_pause_regressions {
     ) -> (Orchestrator, GoalControl, Arc<Mutex<Vec<Value>>>) {
         let db = test_db().await;
         let mut snapshot: Value = serde_json::from_str(&running_child_snapshot()).unwrap();
+        // A Blocked job that owes no delegated `return` (no packet names it),
+        // so the missing-return re-prompt never resumes it out of Blocked.
+        snapshot["delegatedPackets"] = serde_json::json!([]);
         let mut output = snapshot["recipe"]["nodes"][0].clone();
         output["id"] = "return-node".into();
         output["nodeType"] = "artifact".into();

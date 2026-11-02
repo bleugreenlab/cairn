@@ -7,8 +7,8 @@
 //! through the ordinary `backend_for_name(key).start_session` path, and the
 //! recorder must have seen it. A provider that answers decisions only
 //! (TypeSafe) has its session launch refused and a decision asked instead.
-//! Cairn inference is launched against a deployment on a pool under Cairn's
-//! control, so each request asks the pool controller for its model and is sent
+//! Cairn inference is launched against a deployment placement holds resident,
+//! so each request asks placement for its model by its real name and is sent
 //! to that deployment under the engine's own name for it. A provider added to
 //! the catalog without an adapter here fails, because `plan` has no answer for
 //! it.
@@ -737,15 +737,12 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
 }
 
 /// One cairn-inference deployment of [`INFERENCE_MODEL`], whose engine answers
-/// to [`INFERENCE_SERVED_NAME`], on a pool Cairn controls, which the act side
-/// holds healthy: the state in which the pool controller answers a request on
-/// the pass that makes it. In a controlled pool only the act side's own phase
-/// says a deployment answers, so the row is written before control is taken,
-/// which adopts what is healthy then. Nothing probes it here: no head is
-/// attached. The built-in provider's catalog is refreshed, which installs it,
-/// so a decision can be offered on it without the workspace enabling anything.
+/// to [`INFERENCE_SERVED_NAME`], which the act side holds healthy, so placement
+/// adopts it as a resident and answers a request on the pass that makes it.
+/// Nothing probes it here: no head is attached. The built-in provider's catalog
+/// is refreshed, which installs it, so a decision can be offered on it without
+/// the workspace enabling anything.
 async fn seed_inference(orch: &Orchestrator) {
-    use crate::orchestrator::pool_control::{patch_pool, PoolPatch};
     use cairn_db::turso::params;
 
     let inventory = cairn_inference::Inventory::from_yaml(
@@ -761,8 +758,8 @@ profiles:
     requirements: {machines: 1}
 deployments:
   - {id: coverage-deployment, source: cairn, profile: coverage-profile, machines: [coverage-box], head: coverage-box, apiPort: 9, apiPath: /v1, healthPath: /v1/models}
-pools:
-  - {id: coverage-pool, source: cairn, machines: [{name: coverage-box, address: 127.0.0.1}], default: [coverage-deployment], pin: []}
+machines:
+  - {name: coverage-box, source: cairn, address: 127.0.0.1}
 "#,
     )
     .unwrap();
@@ -788,11 +785,11 @@ pools:
             serde_json::to_string(deployment).unwrap(),
         ));
     }
-    for pool in inventory.pools.values() {
+    for machine in inventory.machines.values() {
         rows.push((
-            "inference_pools",
-            pool.id.to_string(),
-            serde_json::to_string(pool).unwrap(),
+            "inference_machines",
+            machine.name.to_string(),
+            serde_json::to_string(machine).unwrap(),
         ));
     }
     let db = &orch.db.local;
@@ -821,17 +818,6 @@ pools:
 
     // Built in: nothing enables it, and what discovery finds installs it.
     assert!(!orch.provider_enabled(crate::backends::inference::INFERENCE_BACKEND_KEY));
-    patch_pool(
-        orch,
-        &PoolPatch {
-            pool: "coverage-pool".into(),
-            controlled: Some(true),
-            ..PoolPatch::default()
-        },
-        "coverage",
-    )
-    .await
-    .unwrap();
     orch.refresh_provider_model_catalog_blocking(crate::backends::inference::INFERENCE_BACKEND_KEY);
 }
 
@@ -1084,14 +1070,14 @@ async fn every_catalog_provider_launches_through_the_facet() {
         }
     }
 
-    // Every Cairn inference launch asked the pool controller for its model,
-    // which answered each from the deployment it found healthy.
-    let requests = crate::orchestrator::pool_control::load_requests(&orch.db.local)
+    // Every Cairn inference launch asked placement for its model by its real
+    // name, which answered each from the resident it adopted.
+    let requests = crate::fleet::models::store::load_requests(&orch.db.local)
         .await
         .unwrap();
     let requesters: Vec<&str> = requests
         .iter()
-        .map(|stored| stored.request.requester.as_str())
+        .map(|request| request.requester.as_str())
         .collect();
     for requester in [
         "cairn://p/COVERAGE/1/1/builder",
@@ -1103,15 +1089,15 @@ async fn every_catalog_provider_launches_through_the_facet() {
             "{requester} made no request: {requests:?}"
         );
     }
-    for stored in &requests {
-        assert_eq!(stored.request.model, INFERENCE_MODEL);
-        assert_eq!(stored.request.deployment.as_str(), "coverage-deployment");
+    for request in &requests {
+        assert_eq!(request.model, INFERENCE_MODEL);
+        assert_eq!(request.deployment.as_str(), "coverage-deployment");
         assert!(
             matches!(
-                stored.request.state,
-                cairn_inference::pool_control::RequestState::Ready { .. }
+                request.state,
+                crate::fleet::models::requests::RequestState::Ready { .. }
             ),
-            "{stored:?}"
+            "{request:?}"
         );
     }
 

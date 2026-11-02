@@ -368,7 +368,12 @@ async fn node_uri_for_job_conn(
     crate::jobs::queries::home_uri_for_job_conn(conn, job_id).await
 }
 
-async fn insert_system_direct_push_once_conn(
+/// The id of the one system direct a given idempotency key may ever insert.
+pub(crate) fn system_direct_once_message_id(idempotency_key: &str) -> String {
+    format!("reconcile:{idempotency_key}")
+}
+
+pub(crate) async fn insert_system_direct_push_once_conn(
     conn: &cairn_db::turso::Connection,
     recipient_job_id: &str,
     recipient_run_id: &str,
@@ -378,7 +383,7 @@ async fn insert_system_direct_push_once_conn(
 ) -> Result<(String, crate::orchestrator::attention_push::Wake, bool), DbError> {
     use crate::orchestrator::attention_push::Boundary;
     let now = chrono::Utc::now().timestamp();
-    let message_id = format!("reconcile:{idempotency_key}");
+    let message_id = system_direct_once_message_id(idempotency_key);
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO messages (
@@ -402,7 +407,7 @@ async fn insert_system_direct_push_once_conn(
         .await?
         .unwrap_or_else(|| recipient_job_id.to_string());
     let push_id = uuid::Uuid::new_v4().to_string();
-    let key = format!("direct:{message_id}");
+    let key = crate::orchestrator::attention_push::direct_push_key(&message_id, None);
     conn.execute(
         "INSERT INTO attention_pushes
            (id, recipient, content_ref, wake, boundary, key, created_at)

@@ -3,11 +3,11 @@
 //! Every record is Cairn's own and the operator writes it at the index: the
 //! whole inventory replaced, or records added, replaced and removed by a
 //! patch, each validated as a whole. Records mirrored from bginf before it
-//! retired are adopted there too. The pool controller writes desired state: a
-//! pool patch takes a pool under Cairn's control, sets its windows, and pins
-//! or releases it; a requests append asks for a model. One deployment's own
-//! resource is the act side: patching it starts or stops the deployment
-//! through its head executor. Nothing here powers a machine.
+//! retired are adopted there too. Which model runs is placement's: a pool
+//! patch sets a detected pool's warm model and idle window and pins or
+//! releases a model there; a requests append asks for a model. One
+//! deployment's own resource starts or stops it by hand. Nothing here powers a
+//! machine.
 
 use super::specs::*;
 use super::types::*;
@@ -105,57 +105,52 @@ const INFERENCE_UPSERT: KeySpec = KeySpec::new(
 const INFERENCE_REMOVE: KeySpec = KeySpec::new(
     "remove",
     KeyType::Object,
-    "{models?, profiles?, deployments?, pools?}: the ids of records to take out",
+    "{models?, profiles?, deployments?, machines?}: the ids of records to take out",
 );
 
-const INFERENCE_POOL: KeySpec = KeySpec::new("pool", KeyType::Str, "");
+const INFERENCE_POOL: KeySpec = KeySpec::new(
+    "pool",
+    KeyType::Str,
+    "a detected pool's key: its machine names, sorted, joined with +",
+);
 
 const INFERENCE_WARM: KeySpec = KeySpec::new(
     "warm",
     KeyType::Str,
-    "the model (real name) the pool loads when idle, held as the pool record's default; null warms nothing",
+    "the model, by its real name, placed when the pool has had no batch work for its idle window; null clears it",
+);
+
+const INFERENCE_IDLE_SECS: KeySpec = KeySpec::new(
+    "idleSecs",
+    KeyType::Int,
+    "the pool's idle window in seconds, for eviction and the warm model alike; null derives it from the pool's measured load again",
+);
+
+const INFERENCE_PIN: KeySpec = KeySpec::new(
+    "pin",
+    KeyType::Str,
+    "a model, by its real name, to keep resident on the pool: a standing lease, acquired at once and never evicted for room; refused while another holder's pin holds its machines, naming them",
+);
+
+const INFERENCE_RELEASE: KeySpec = KeySpec::new(
+    "release",
+    KeyType::Str,
+    "true releases your pins on the pool, or name the model; the model stays, its residency counted from the pin",
+);
+
+const INFERENCE_REVOKE: KeySpec =
+    KeySpec::new("revoke", KeyType::Str, "as release, for anyone's pin");
+
+const INFERENCE_MODEL: KeySpec = KeySpec::new(
+    "model",
+    KeyType::Str,
+    "the model's real name, its Hugging Face repository id (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp); a deployment id, profile id or served name names no model; never served by another model",
 );
 
 const INFERENCE_REQUEST_POOL: KeySpec = KeySpec::new(
     "pool",
     KeyType::Str,
-    "the pool to load it on, when the model is deployed in more than one",
-);
-
-const INFERENCE_CONTROLLED: KeySpec = KeySpec::new(
-    "controlled",
-    KeyType::Bool,
-    "true: the controller decides the pool's desired set, adopting what is healthy now; false: hands it back and cancels its waiting requests",
-);
-
-const INFERENCE_SETTINGS: KeySpec = KeySpec::new(
-    "settings",
-    KeyType::Object,
-    "{modelIdleSecs, poolIdleSecs, minResidencySecs, loadBoundSecs}; null derives that setting from measured loads again",
-);
-
-const INFERENCE_PIN: KeySpec = KeySpec::new(
-    "pin",
-    KeyType::Array,
-    "deployment ids held resident against idle unload ([] pins nothing); refused while another holder's pin stands, naming them",
-);
-
-const INFERENCE_RELEASE: KeySpec = KeySpec::new(
-    "release",
-    KeyType::Bool,
-    "true releases your own pin; its set carries over to the controller",
-);
-
-const INFERENCE_REVOKE: KeySpec = KeySpec::new(
-    "revoke",
-    KeyType::Bool,
-    "true releases the pin whoever holds it, naming them",
-);
-
-const INFERENCE_MODEL: KeySpec = KeySpec::new(
-    "model",
-    KeyType::Str,
-    "the model's real name, its Hugging Face repository id (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp); a deployment id, profile id or served name names no model",
+    "narrows which pool's deployment serves it, by the pool's key",
 );
 
 const INFERENCE_REQUESTER: KeySpec = KeySpec::new(
@@ -172,7 +167,7 @@ pub(crate) const INFERENCE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Inference,
     uri_template: "cairn://inference",
     name: "Inference facet",
-    description: "The cairn-inference facet: which model each inference machine should run. The record counts, one line per collection, and, while any is left, what remains of bginf: records still mirrored from it (read-only until adopted) and the retired link setting. Every record is Cairn's own and is written here: replace with the whole inventory (the inverse of ?format=yaml), or patch to add, replace and remove records. A write is validated as a whole and refused naming every problem, and may not remove or move a deployment Cairn is running or remove a pool the controller drives. Writing records needs the same authority as the `inference` settings section, since a profile's start and stop commands run as shell on its head machine; adopting does not. Cairn starts and stops a deployment only when its own resource (`cairn://inference/deployments/{id}`) is patched or the controller asks, and powers nothing.",
+    description: "The cairn-inference facet: how each local model is run and where; which runs when is placement's (cairn://inference/pools). The record counts, one line per collection, and, while any is left, what remains of bginf: records still mirrored from it (read-only until adopted) and the retired link setting. Every record is Cairn's own and is written here: replace with the whole inventory (the inverse of ?format=yaml), or patch to add, replace and remove records. A write is validated as a whole and refused naming every problem, and may not remove or move a deployment whose model occupies its machines. Writing records needs the same authority as the `inference` settings section, since a profile's start and stop commands run as shell on its head machine; adopting does not. Placement starts and stops deployments as models are requested, evicted, pinned or warmed, and by hand on a deployment's own resource (`cairn://inference/deployments/{id}`); Cairn powers nothing.",
     read_projections: &[ProjectionSpec { key: "format", values: "yaml — the whole inventory in Cairn's own record format" }],
     related: INFERENCE_INDEX_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -182,7 +177,7 @@ pub(crate) const INFERENCE_CONTRACT: ResourceContract = ResourceContract {
             required: &[INFERENCE_CONTENT],
             optional: &[INFERENCE_FORMAT],
             label: "replace the whole inventory with Cairn's own records, validated as a whole",
-            example: r#"write({changes:[{target:"cairn://inference",mode:"replace",payload:{format:"yaml",content:"profiles: []\ndeployments: []\npools: []\n"}}]})"#,
+            example: r#"write({changes:[{target:"cairn://inference",mode:"replace",payload:{format:"yaml",content:"profiles: []\ndeployments: []\nmachines: []\n"}}]})"#,
         },
         MutationSpec {
             mode: ChangeMode::Patch,
@@ -364,7 +359,7 @@ pub(crate) const INFERENCE_POOLS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::InferencePools,
     uri_template: "cairn://inference/pools",
     name: "Inference pools",
-    description: "Every pool: whose record it is, its machines (enrolment and address), the pin its record holds and its default. A pool under Cairn's control also shows the pool controller's state: the desired set it writes, which slot won (pin, requested, default or nothing) and why, Cairn's pin and its holder, each member's phase and residency, the batches running on and waiting for the pool's machines, and the idle windows, minimum residency and load bound in force with where each came from. The controller loads a requested model, unloads an idle one when batches wait for the pool, and loads the default when the pool has had no batch work for its idle window; it writes desired state and never starts or stops an engine itself. A pool not under control is decided by nothing, and its deployments start and stop only from their own pages. The pool records themselves are written at cairn://inference.",
+    description: "The pools placement detects from the links executors report (machines joined by a fast link; a GPU machine with none is a pool of its own): each pool's machines and link, the models resident on it with their phase, footprint, why each is there and why it stays or that it is idle, its warm model, its idle window, minimum residency and load bound with where each came from, and the deployments placement cannot run and why. A loading model keeps its unmet footprint off batches; a healthy one runs beside them; an idle unpinned one is evicted when work is refused its room; an idle pool places its warm model. Patch a pool to set its warm model and idle window, or to pin, release or revoke a model there.",
     read_projections: NO_PROJECTIONS,
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,
@@ -373,14 +368,13 @@ pub(crate) const INFERENCE_POOLS_CONTRACT: ResourceContract = ResourceContract {
         required: &[INFERENCE_POOL],
         optional: &[
             INFERENCE_WARM,
-            INFERENCE_CONTROLLED,
-            INFERENCE_SETTINGS,
+            INFERENCE_IDLE_SECS,
             INFERENCE_PIN,
             INFERENCE_RELEASE,
             INFERENCE_REVOKE,
         ],
-        label: "set a pool's warm model, or control it: take or hand back control, set its windows, pin or release it",
-        example: r#"write({changes:[{target:"cairn://inference/pools",mode:"patch",payload:{pool:"sparks",controlled:true,settings:{modelIdleSecs:1800}}}]})"#,
+        label: "set a pool's warm model and idle window, or pin, release or revoke a model there",
+        example: r#"write({changes:[{target:"cairn://inference/pools",mode:"patch",payload:{pool:"bginf-sp1+bginf-sp2",warm:"deepseek-ai/DeepSeek-V4-Flash",idleSecs:1800}}]})"#,
     }],
 };
 
@@ -388,7 +382,7 @@ pub(crate) const INFERENCE_REQUESTS_CONTRACT: ResourceContract = ResourceContrac
     kind: ResourceKind::InferenceRequests,
     uri_template: "cairn://inference/requests",
     name: "Inference requests",
-    description: "The pool controller's queue of model requests. Append a model, by its real name, to ask for it: the name (and the pool, when the model is deployed in several) must mean exactly one deployment, which must be in a pool under Cairn's control, and waits until that deployment is healthy, fails to load, or is cancelled; a named model is never served by another. The page lists every waiting request with the model, the pool, the requester and what it waits on (builds draining from the pool's machines, an agent turn that is never preempted, another model unloading, the load itself, a pin, a loaded model inside its idle window or minimum residency, or an earlier request for the same machines), then the requests answered in the last week.",
+    description: "Placement's model requests. Append a model, by its real name, to ask for it: the request leases one deployment of it, loading it if it is absent, and waits until it is healthy, fails to load, or is cancelled; a model is never served by another. The page lists every waiting request with the model, the pool, the requester and what it waits on (the gang fitting while the work on its machines finishes, the load itself, another model stopping, a model pinned or inside its idle window or minimum residency, or an earlier request for the same machines), then the requests answered in the last week.",
     read_projections: NO_PROJECTIONS,
     related: INFERENCE_BACK,
     cross_actions: NO_CROSS_ACTIONS,

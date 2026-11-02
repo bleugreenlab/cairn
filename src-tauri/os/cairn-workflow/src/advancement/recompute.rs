@@ -392,6 +392,22 @@ async fn artifact_fact(
         .map(|v| v != 0))
 }
 
+/// Whether the job was given up on for its missing output
+/// (`jobs.return_abandoned_at`): re-prompted once, it ended a later work turn
+/// that had seen the re-prompt without producing the output either.
+async fn output_abandoned_fact(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT return_abandoned_at IS NOT NULL FROM jobs WHERE id = ?1",
+            (job_id,),
+        )
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => row.i64(0)? != 0,
+        None => false,
+    })
+}
+
 /// Record a job's failure as a turn fact so the projection derives `Failed`.
 ///
 /// Failure is a *turn* truth, not a job-status truth (the two-axis split). If the
@@ -551,6 +567,7 @@ async fn node_job_facts_conn(
     // The artifact fact is scoped to the terminal artifact name: a ctx-self
     // living doc's confirm flag must never resolve the job's gate.
     let artifact = artifact_fact(conn, job_id, required_artifact_name.as_deref()).await?;
+    let output_abandoned = output_abandoned_fact(conn, job_id).await?;
     let facts = JobFacts {
         dag_ready,
         upstream_failed,
@@ -568,6 +585,7 @@ async fn node_job_facts_conn(
         },
         requires_output,
         artifact_present: artifact.is_some(),
+        output_abandoned,
         long_running: crate::inputs::is_long_running_node(snapshot, node_id, requires_output),
     };
     Ok(NodeJobFacts {
@@ -688,6 +706,7 @@ async fn node_less_terminal_status_conn(
         resolution: Resolution::Pending,
         requires_output: true,
         artifact_present,
+        output_abandoned: output_abandoned_fact(conn, job_id).await?,
         long_running: false,
     };
     Ok(settle_for_terminal_issue(derive_job_status(&facts)))
@@ -1667,6 +1686,7 @@ pub async fn reduce_delegated_child_job_conn(
         .await?
         .is_some();
     let turn = turn_facts(conn, job_id).await?;
+    let output_abandoned = output_abandoned_fact(conn, job_id).await?;
     // A node-less ephemeral CALL establishes no DB turn (unlike a workflow or a
     // task, which both run a real turn), so its completion cannot be read from
     // turn facts — the job would spin `running` forever after its run finalizes,
@@ -1693,6 +1713,7 @@ pub async fn reduce_delegated_child_job_conn(
             resolution: Resolution::Pending,
             requires_output,
             artifact_present,
+            output_abandoned,
             long_running: false,
         }
     } else {
@@ -1706,6 +1727,7 @@ pub async fn reduce_delegated_child_job_conn(
             resolution: Resolution::Pending,
             requires_output,
             artifact_present,
+            output_abandoned,
             long_running: false,
         }
     };
@@ -2077,6 +2099,7 @@ mod gate_tests {
                 resolution: Resolution::Confirmed,
                 requires_output: true,
                 artifact_present: true,
+                output_abandoned: false,
                 long_running: false,
             };
             assert_eq!(derive_job_status(&facts), JobStatus::Running);

@@ -1,13 +1,11 @@
-//! The cairn-inference facet: which model each inference machine should run.
+//! The cairn-inference facet: how each model is run and where.
 //!
-//! The records ([`profile`], [`deployment`], [`pool`]) describe how a model is
-//! run, where it is placed, and which machines share one desired state; the
-//! [`inventory`] holds them together and validates them as a whole.
-//! [`resolve`] is the pin-over-default resolver that turns a pool and its
-//! powered machines into the deployments it should be running. A pool under
-//! Cairn's own control is decided instead by the [`pool_control`] module's pool
-//! controller, which loads on request, unloads for waiting builds and loads
-//! the default when the pool is idle, and writes the result as desired state.
+//! The records ([`profile`], [`deployment`], [`machine`]) describe how a model
+//! is run, which machines a deployment of it occupies, and where each machine
+//! answers; the [`inventory`] holds them together and validates them as a
+//! whole. Which model runs when is not decided here: execution's placement
+//! holds a running model as a resident on a pool of machines it detects, and
+//! acquires, evicts and warms it like any other work (tenets 1336, 1337).
 //! [`served`] is what Cairn offers from its deployments: every deployed
 //! model under its real name, loaded or not, with what each model takes and
 //! gives and the context its engine can actually hold.
@@ -15,9 +13,9 @@
 //! [`metrics`] reads what a running engine says about itself in its
 //! Prometheus metrics, vLLM's or llama.cpp's, into rates and latencies.
 //!
-//! [`control`] is the act side: a deployment's phase as the orch holds it, the
-//! transitions start and stop requests and the head's reports move it through,
-//! the machines a phase reserves, and whether a gang fits.
+//! [`control`] is the act side: a deployment's phase as the orch holds it, and
+//! the transitions start and stop requests and the head's reports move it
+//! through.
 //!
 //! Every record is Cairn's own and the operator writes it, as a whole
 //! [`Inventory::from_yaml`] document or records [`Inventory::upsert`]ed into
@@ -35,11 +33,9 @@ pub mod inventory;
 pub mod machine;
 pub mod metrics;
 pub mod model;
-pub mod pool;
-pub mod pool_control;
 pub mod profile;
+pub mod record;
 pub mod render;
-pub mod resolve;
 pub mod served;
 pub mod verify;
 
@@ -50,17 +46,16 @@ pub use deployment::{Deployment, DeploymentId};
 pub use inventory::{
     ChangeReport, Inventory, KindReport, UpdatedRecord, ValidationError, YamlError,
 };
-pub use machine::MachineName;
+pub use machine::{MachineName, MachineRecord};
 pub use model::{Model, ModelFacts};
-pub use pool::{DeploymentSet, Pool, PoolId, PoolMachine, RecordSource};
 pub use profile::{
     Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
     InferenceProfile, InferenceProfileId, Interconnect, MemoryPerMachine, ModelRef, Mount,
     MountSource, ProfileOrigin, Requirements, Server, SourcePin, SystemRamBytes, VramBytes,
     WeightFile,
 };
-pub use resolve::{resolve, Blocked, Reason, Resolution, Slot, SLOTS};
-pub use served::{served_models, EngineMeasure, ServedModel};
+pub use record::RecordSource;
+pub use served::{deployments_serving, served_models, EngineMeasure, ServedModel};
 
 /// A string identifier newtype: transparent in serde, ordered, displayable.
 macro_rules! string_id {

@@ -1053,10 +1053,10 @@ pub enum CairnResource {
     InferenceDeployment {
         id: String,
     },
-    /// Pools, their machines, pin and default, and the pool controller's state
-    /// for pools under Cairn's control.
+    /// The pools placement detects, the models resident on each, and each
+    /// pool's warm model, idle window and pins.
     InferencePools,
-    /// The pool controller's queue of model requests.
+    /// Placement's queue of model requests.
     InferenceRequests,
     /// Models by their Hugging Face name, with the facts their config states.
     InferenceModels,

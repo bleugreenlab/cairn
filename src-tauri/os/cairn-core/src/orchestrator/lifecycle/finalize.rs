@@ -90,6 +90,7 @@ pub fn transition_to_warm_state(
                 );
             }
             reduce_nodeless_delegated_child(orch, &job_id);
+            settle_missing_return(orch, &job_id, run_id);
             finish_memory_review_if_due(orch, &job_id, run_id);
             reconcile_warm_codex_goal_from_job(orch, run_id, &job_id);
             // Turn-end: the agent went idle. Emit a fact-driven event so any
@@ -580,6 +581,36 @@ fn reduce_nodeless_delegated_child(orch: &Orchestrator, job_id: &str) {
     }
 }
 
+/// A delegated task owes its parent a `return`: settle a turn end that left it
+/// unwritten (`execution::delegation::settle_missing_return`). Runs after the
+/// recompute that derives the missing output Blocked and before the idle flush
+/// that delivers a re-prompt it queues. An abandonment is recomputed here, so
+/// the failure it derives reaches the parent resume and the inline waiters that
+/// follow in the same turn end.
+fn settle_missing_return(orch: &Orchestrator, job_id: &str, run_id: &str) {
+    use crate::execution::delegation::MissingReturn;
+    let short = &job_id[..job_id.len().min(8)];
+    match crate::execution::delegation::settle_missing_return(orch, job_id, run_id) {
+        Ok(MissingReturn::Asked) => {
+            log::info!("Task {short} ended its turn without `return`; re-prompted it once");
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "messages", "action": "insert"}),
+            );
+            orch.notifier.emit_change("attention_pushes");
+        }
+        Ok(MissingReturn::Abandoned) => {
+            log::info!("Task {short} ended without `return` after its re-prompt; failing it");
+            if let Err(e) = crate::execution::advancement::recompute_job(orch, job_id) {
+                log::error!("Failed to recompute abandoned task {job_id}: {e}");
+            }
+            reduce_nodeless_delegated_child(orch, job_id);
+        }
+        Ok(MissingReturn::NotOwed | MissingReturn::AwaitingReply) => {}
+        Err(error) => log::warn!("Failed to settle task {short}'s missing `return`: {error}"),
+    }
+}
+
 fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -1007,6 +1038,7 @@ fn finalize_run_inner(
                 );
             }
             reduce_nodeless_delegated_child(orch, &job_id);
+            settle_missing_return(orch, &job_id, run_id);
             finish_memory_review_if_due(orch, &job_id, run_id);
             // Turn-end on any terminal run outcome (clean exit or crash): the
             // agent is idle now. The recompute above may have flipped status

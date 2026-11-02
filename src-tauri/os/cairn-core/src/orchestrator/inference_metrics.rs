@@ -16,7 +16,7 @@ use cairn_inference::metrics::{self, EngineSample, EngineSummary};
 use cairn_inference::DeploymentId;
 
 use super::inference::load_inventory;
-use super::pool_control::deployment_phases;
+use super::inference_control::deployment_phases;
 use super::Orchestrator;
 
 /// How often each healthy deployment is scraped.

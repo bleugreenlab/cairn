@@ -1,24 +1,23 @@
 //! Renderers for the cairn-inference facet's resources, `cairn://inference/*`.
 //!
 //! Each page renders an [`InferenceView`]: the stored inventory, what Cairn
-//! has done to the deployments it acted on, the pool controller's state and
-//! the enrolled executors. A pool under Cairn's control shows the
-//! controller's state, and the requests page lists the controller's queue,
-//! each computed by the same plan the next tick writes.
+//! has done to the deployments it acted on, the enrolled executors, and what
+//! placement holds and decides about local models ([`ModelsView`]): the pools
+//! it detects, the residents on them, and the requests with what each waits
+//! on, as the last pass left them.
 
 use std::fmt::Write as _;
 
 use cairn_common::query::QueryParam;
-use cairn_inference::pool_control::{self, RequestState};
-use cairn_inference::{
-    DeploymentSet, Engine, InferenceProfile, MachineName, MemoryPerMachine, Pool, Requirements,
-};
+use cairn_inference::{Engine, InferenceProfile, MachineName, MemoryPerMachine, Requirements};
 
 use super::common::find_query_value;
+use crate::fleet::models::requests::RequestState;
+use crate::fleet::models::store::ANSWERED_KEPT_MS;
+use crate::fleet::models::{ModelsView, PoolView, ResidentView};
 use crate::orchestrator::inference::InferenceView;
-use crate::orchestrator::inference_control::{holds_of, LoadRow};
+use crate::orchestrator::inference_control::{link_addresses, machines_at, LoadRow};
 use crate::orchestrator::inference_verify::VerificationRow;
-use crate::orchestrator::pool_control::ANSWERED_KEPT_MS;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
 use cairn_inference::{Deployment, DeploymentId};
 
@@ -33,11 +32,11 @@ const INDEX: &[(&str, &str)] = &[
     ),
     (
         "cairn://inference/pools",
-        "each pool's machines, pin and default, and the pool controller's state; patch it to take a pool under Cairn's control",
+        "the pools placement detects from the executors' links, the models resident on each, its warm model, idle window and pins; patch it to set them",
     ),
     (
         "cairn://inference/requests",
-        "the pool controller's queue: append a model to ask for it, and read what each request waits on",
+        "placement's model requests: append a model to ask for it, and read what each request waits on",
     ),
 ];
 
@@ -62,17 +61,6 @@ fn age(seconds: i64) -> String {
 
 fn age_since(view: &InferenceView, ms: i64) -> String {
     age((view.now_ms - ms) / 1_000)
-}
-
-fn set_label(set: &DeploymentSet) -> String {
-    if set.is_empty() {
-        "nothing".to_string()
-    } else {
-        set.iter()
-            .map(|id| format!("`{id}`"))
-            .collect::<Vec<_>>()
-            .join(" + ")
-    }
 }
 
 fn enrolment(view: &InferenceView, machine: &MachineName) -> &'static str {
@@ -127,15 +115,15 @@ pub(crate) fn render_index(view: &InferenceView, params: &[QueryParam]) -> Strin
         Some(other) => return format!("Unknown format='{other}' for {URI}; expected yaml."),
     }
     let mut out = String::from(
-        "# cairn-inference\n\nWhich model each inference machine should run. Profiles say how a model is run, deployments place a profile on named machines, and pools are the sets of machines that share one desired state. Every record is Cairn's own and the operator writes it here: replace this resource with a whole inventory (the document `?format=yaml` reads), or patch it to add, replace or remove records; a write is validated as a whole and refused naming every problem. A pool taken under Cairn's control is decided by the pool controller: a request loads its model, batches waiting for the pool unload an idle one, and an idle pool loads its default. The controller writes desired state; one deployment's page (`cairn://inference/deployments/<id>`) is the act side, starting or stopping it on its head and holding every machine of the gang away from batch work while it does. Cairn powers nothing.\n\n",
+        "# cairn-inference\n\nHow each local model is run and where. Profiles say how a model is run, deployments place a profile on named machines, and machines say where each answers. Every record is Cairn's own and the operator writes it here: replace this resource with a whole inventory (the document `?format=yaml` reads), or patch it to add, replace or remove records; a write is validated as a whole and refused naming every problem. Which model runs is placement's: it detects pools of machines joined by a fast link, holds a running model as a resident on one, loads a model a request asks for, evicts an idle one when other work is refused its room, and places a pool's warm model when the pool is idle. One deployment's page (`cairn://inference/deployments/<id>`) starts or stops it by hand. Cairn powers nothing.\n\n",
     );
     out.push_str(&retired_lines(view));
     let _ = writeln!(
         out,
-        "- records: {} profiles, {} deployments, {} pools\n",
+        "- records: {} profiles, {} deployments, {} machines\n",
         view.inventory.profiles.len(),
         view.inventory.deployments.len(),
-        view.inventory.pools.len()
+        view.inventory.machines.len()
     );
     for (uri, what) in INDEX {
         let _ = writeln!(out, "- `{uri}` — {what}");
@@ -377,10 +365,7 @@ pub(crate) fn render_deployments(view: &InferenceView, params: &[QueryParam]) ->
         let _ = writeln!(out, "## {}\n", deployment.id);
         let _ = writeln!(out, "- source: {}", source_label(deployment.source));
         let _ = writeln!(out, "- profile: {}", deployment.profile);
-        let pool = inventory
-            .pool_of_deployment(deployment)
-            .map_or("none".to_string(), |p| p.id.to_string());
-        let _ = writeln!(out, "- pool: {pool}");
+        let _ = writeln!(out, "- pool: {}", pool_line(view, &deployment.id));
         out.push_str("- machines:\n");
         for machine in &deployment.machines {
             let head = if *machine == deployment.head {
@@ -430,10 +415,22 @@ fn at(view: &InferenceView, ms: i64) -> String {
     format!("{} ({} ago)", when_ms(ms), age_since(view, ms))
 }
 
+/// Where placement may run a deployment now, or why it may not.
+fn pool_line(view: &InferenceView, id: &DeploymentId) -> String {
+    match view.models.placement(id) {
+        Some(placement) => match (&placement.pool, &placement.refused) {
+            (Some(pool), _) => format!("`{pool}`"),
+            (None, Some(why)) => format!("none: {why}"),
+            (None, None) => "none".to_string(),
+        },
+        None => "not known to placement yet".to_string(),
+    }
+}
+
 /// One deployment's phase as Cairn holds it, in one sentence.
 fn phase_summary(view: &InferenceView, id: &DeploymentId) -> String {
     let Some(row) = view.deployment_control.states.get(id) else {
-        return "never acted on by Cairn, so it is neither probed nor reserved; whatever answers there now was not started by Cairn".into();
+        return "never acted on by Cairn; it is probed once, and adopted as a resident if it answers".into();
     };
     match &row.phase {
         DeploymentPhase::Stopped { since_ms } => format!("stopped since {}", at(view, *since_ms)),
@@ -441,7 +438,7 @@ fn phase_summary(view: &InferenceView, id: &DeploymentId) -> String {
             since_ms,
             waiting_on,
         } => format!(
-            "reserving since {}: its machines are held and the start is not sent yet{}",
+            "reserving since {}: placement holds its footprint's room and has not sent the start yet{}",
             at(view, *since_ms),
             waiting_on
                 .as_deref()
@@ -512,7 +509,6 @@ fn load_line(view: &InferenceView, load: &LoadRow) -> String {
 fn machine_line(
     view: &InferenceView,
     deployment: &Deployment,
-    held: &std::collections::HashMap<String, cairn_common::executor_protocol::InferenceHold>,
     machine: &cairn_inference::MachineName,
 ) -> String {
     let head = if *machine == deployment.head {
@@ -520,12 +516,25 @@ fn machine_line(
     } else {
         ""
     };
-    let hold = match held.get(machine.as_str()) {
-        Some(hold) if hold.deployment == deployment.id.as_str() => {
-            "held away from batch work by this deployment".to_string()
+    let resident = view
+        .models
+        .pools
+        .iter()
+        .flat_map(|pool| &pool.residents)
+        .chain(&view.models.stranded)
+        .find(|resident| resident.machines.contains(machine.as_str()));
+    let hold = match resident {
+        Some(resident) if resident.deployment == deployment.id => {
+            match resident.footprint.get(machine.as_str()) {
+                Some(bytes) => format!("resident here, reserving {}", gib(*bytes)),
+                None => "resident here, footprint unmeasured".to_string(),
+            }
         }
-        Some(hold) => format!("held by deployment {} ({})", hold.deployment, hold.phase),
-        None => "not held".to_string(),
+        Some(resident) => format!(
+            "{} (deployment {}) is resident here",
+            resident.model, resident.deployment
+        ),
+        None => "no model resident".to_string(),
     };
     let memory = match view.deployment_control.readings.get(machine.as_str()) {
         None => "no GPU reading (not attached)".to_string(),
@@ -556,16 +565,19 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     let mut out = format!("# Inference deployment {id}\n\n");
     let _ = writeln!(out, "- source: {}", source_label(deployment.source));
     let _ = writeln!(out, "- profile: {}", deployment.profile);
-    let pool = view
-        .inventory
-        .pool_of_deployment(deployment)
-        .map_or("none".to_string(), |p| p.id.to_string());
-    let _ = writeln!(out, "- pool: {pool}");
+    let _ = writeln!(out, "- pool: {}", pool_line(view, &id));
     let _ = writeln!(out, "- phase: {}", phase_summary(view, &id));
-    let held = holds_of(&view.inventory, &view.deployment_control.states);
+    if let Some(resident) = view.models.resident(&id) {
+        let _ = writeln!(
+            out,
+            "- resident: {}; {}",
+            resident.why_said,
+            stays(resident, view.models.now)
+        );
+    }
     out.push_str("- machines:\n");
     for machine in &deployment.machines {
-        let _ = writeln!(out, "{}", machine_line(view, deployment, &held, machine));
+        let _ = writeln!(out, "{}", machine_line(view, deployment, machine));
     }
     match view.inventory.address_of(&deployment.head) {
         Some(address) => {
@@ -594,11 +606,11 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     }
     let footprint = crate::orchestrator::inference_control::last_footprint(loads);
     if footprint.is_empty() {
-        out.push_str("- measured footprint: none yet, so a start checks no memory until one load has settled\n");
+        out.push_str("- measured footprint: none yet; placement reserves what the profile states, or the whole of each machine's batch room while it loads if the profile states nothing\n");
     } else {
         let _ = writeln!(
             out,
-            "- measured footprint (GPU-allocated once settled): {}; a start waits until each machine has this much free",
+            "- measured footprint (GPU-allocated once settled): {}; placement reserves this on each machine, and a start waits until each has this much free",
             footprint_line(&footprint)
         );
     }
@@ -610,44 +622,15 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     }
     let _ = write!(
         out,
-        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` reserves every machine above at once, then runs the profile's start command on the head once each has room.\n- stop: the same with `action:\"stop\"` runs the profile's stop command on the head and waits for the health check to stop answering.\n- While it holds its machines, a write to cairn://inference may not remove it or move it to other machines; stop it first. A changed start or stop command takes effect at the next start or stop.\n"
+        "\n## Acting on it\n\n- start: `write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"start\"}}}}]}})` makes it a resident: placement reserves its footprint on every machine above at once, then runs the profile's start command on the head once each has room. Refused while another model is resident on one of its machines.\n- stop: the same with `action:\"stop\"` lets it go: the profile's stop command runs on the head until the health check stops answering. Refused while it is pinned. A request for it acquires it again.\n- To load it on demand instead, append its model to cairn://inference/requests; to keep it loaded, pin it on cairn://inference/pools.\n- While its model occupies its machines, a write to cairn://inference may not remove it or move it to other machines; stop it first. A changed start or stop command takes effect at the next start or stop.\n"
     );
     out
 }
 
-fn pool_records(out: &mut String, view: &InferenceView, pool: &Pool) {
-    let _ = writeln!(out, "- source: {}", source_label(pool.source));
-    out.push_str("- machines:\n");
-    for machine in &pool.machines {
-        let address = machine.address.as_deref().unwrap_or("address unknown");
-        let _ = writeln!(
-            out,
-            "  - `{}`: {}; {address}",
-            machine.name,
-            enrolment(view, &machine.name)
-        );
-    }
-    let pin = pool.pin.as_ref().map_or("none".to_string(), set_label);
-    let _ = writeln!(out, "- pin (record): {pin}");
-    let _ = writeln!(out, "- default: {}", set_label(&pool.default));
-}
-
-fn control_set(set: &DeploymentSet) -> String {
-    if set.is_empty() {
-        "nothing".to_string()
-    } else {
-        set.iter()
-            .map(|id| format!("`{id}`"))
-            .collect::<Vec<_>>()
-            .join(" + ")
-    }
-}
-
-/// A controller member's phase in a few words; the deployment's own page has
-/// the rest.
+/// A resident's phase in a few words; the deployment's own page has the rest.
 fn phase_label(phase: Option<&DeploymentPhase>) -> String {
     match phase {
-        None => "unknown (Cairn has not acted on it yet)".to_string(),
+        None => "chosen; the start is being asked for".to_string(),
         Some(DeploymentPhase::Reserving {
             waiting_on: Some(on),
             ..
@@ -657,113 +640,150 @@ fn phase_label(phase: Option<&DeploymentPhase>) -> String {
     }
 }
 
-fn plural(count: u32, one: &str, many: &str) -> String {
-    if count == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{count} {many}")
+/// Why a resident keeps its machines, or that it may go.
+fn stays(resident: &ResidentView, now: i64) -> String {
+    match &resident.hold {
+        Some(hold) => format!("stays: {}", hold.describe(now)),
+        None => "idle: evicted when work is refused its room".to_string(),
     }
 }
 
-/// The pool controller's state for `pool`, or how to take control of it.
-fn control_lines(out: &mut String, view: &InferenceView, pool: &Pool) {
-    let control_view = &view.control;
-    let Some(control) = control_view.controls.get(&pool.id) else {
+fn resident_line(out: &mut String, resident: &ResidentView, now: i64) {
+    let held = if resident.footprint.is_empty() {
+        "footprint unmeasured".to_string()
+    } else {
+        let room = footprint_line(&resident.footprint);
+        if resident.unified {
+            format!("reserving {room}")
+        } else {
+            format!("{room} of VRAM, none of the room batches use")
+        }
+    };
+    let _ = writeln!(
+        out,
+        "  - {} (`{}`): {}; {held}; {}; {}",
+        resident.model,
+        resident.deployment,
+        phase_label(resident.phase.as_ref()),
+        resident.why_said,
+        stays(resident, now)
+    );
+}
+
+fn pool_section(out: &mut String, view: &InferenceView, pool: &PoolView) {
+    let models = &view.models;
+    let now = models.now;
+    let _ = writeln!(out, "## {}\n", pool.key);
+    match pool.rate_gbps {
+        Some(rate) => {
+            let _ = writeln!(out, "- link: {rate} Gb/s between its machines");
+        }
+        None => out.push_str("- link: none; a machine with no fast link is a pool of its own\n"),
+    }
+    out.push_str("- machines:\n");
+    for member in &pool.members {
+        let name = MachineName::from(member.machine.as_str());
+        let address = view
+            .inventory
+            .address_of(&name)
+            .map_or("address unknown".to_string(), str::to_string);
+        let link = member
+            .link_address
+            .map(|ip| format!("; link address {ip}"))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "- Cairn's control: not taken, so nothing decides this pool and its deployments start and stop only from their own pages; patch this resource with {{pool:\"{}\", controlled:true}} to take it",
-            pool.id
+            "  - `{}`: {}; {address}{link}",
+            member.machine,
+            enrolment(view, &name)
         );
-        return;
-    };
-    let settings = control_view
-        .settings
-        .get(&pool.id)
-        .copied()
-        .unwrap_or_else(|| control.settings.effective(None));
-    let settings_line = format!(
-        "- settings: model idle window {}; pool idle window {}; minimum residency {}; load bound {}",
-        settings.model_idle, settings.pool_idle, settings.min_residency, settings.load_bound
-    );
-    let Some(planned) = control_view.plans.get(&pool.id) else {
-        out.push_str(
-            "- Cairn's control: handed back, so nothing decides this pool; its settings are kept\n",
-        );
-        let _ = writeln!(out, "{settings_line}");
-        return;
-    };
-    let now = control_view.now;
-    let plan = &planned.plan;
-    out.push_str("- Cairn's control: the pool controller decides this pool\n");
-    let _ = writeln!(
-        out,
-        "- desired (written as desired state): {}; slot {}; {}",
-        control_set(&plan.resolution.desired),
-        plan.resolution.slot.as_str(),
-        plan.resolution.reason.describe(now)
-    );
-    match &plan.control.pin {
-        None => out.push_str("- Cairn pin: none\n"),
-        Some(pin) => {
-            let _ = writeln!(
-                out,
-                "- Cairn pin: {} held by {} since {} ({} ago)",
-                control_set(&pin.set),
-                pin.holder,
-                when_ms(pin.at),
-                age_since(view, pin.at)
-            );
-        }
     }
-    if plan.control.active.members.is_empty() {
-        out.push_str("- controller's set: nothing\n");
+    if pool.residents.is_empty() {
+        out.push_str("- residents: none\n");
     } else {
-        out.push_str("- controller's set:\n");
-        for (id, member) in &plan.control.active.members {
-            let since = match (member.healthy_since, member.loading_since) {
-                (Some(at), _) => format!("; healthy for {}", age((now - at) / 1_000)),
-                (None, Some(at)) => format!("; loading for {}", age((now - at) / 1_000)),
-                (None, None) => format!("; chosen {} ago", age((now - member.chosen_at) / 1_000)),
-            };
-            let _ = writeln!(
-                out,
-                "  - `{id}`: {}{since}",
-                phase_label(control_view.phases.get(id))
-            );
+        out.push_str("- residents:\n");
+        for resident in &pool.residents {
+            resident_line(out, resident, now);
         }
     }
-    let builds = planned.builds;
     let _ = writeln!(
         out,
-        "- batch work: {} and {} running on the pool's machines; {} waiting that they refused; last batch work {} ago",
-        plural(builds.running_turns, "agent turn", "agent turns"),
-        plural(builds.running_other, "other batch", "other batches"),
-        plural(builds.waiting, "batch", "batches"),
-        age((now - plan.control.last_batch_work_at) / 1_000)
+        "- warm model: {}",
+        pool.warm_model.as_deref().unwrap_or("none")
     );
-    let _ = writeln!(out, "{settings_line}");
     let _ = writeln!(
         out,
-        "- requests waiting: {} (cairn://inference/requests)",
-        plan.waits.len()
+        "- idle window: {}; minimum residency {}; load bound {}",
+        pool.settings.idle, pool.settings.min_residency, pool.settings.load_bound
     );
+    if let Some(at) = pool.idle_since {
+        let _ = writeln!(
+            out,
+            "- last batch work on its machines: {} ago",
+            age((now - at) / 1_000)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "- deployable here: {}",
+        if pool.models.is_empty() {
+            "nothing".to_string()
+        } else {
+            pool.models.join(", ")
+        }
+    );
+    out.push('\n');
 }
 
 pub(crate) fn render_pools(view: &InferenceView, params: &[QueryParam]) -> String {
-    if let Some(error) = reject_params("cairn://inference/pools", params, &[]) {
+    const URI: &str = "cairn://inference/pools";
+    if let Some(error) = reject_params(URI, params, &[]) {
         return error;
     }
-    let mut out = String::from("# Inference pools\n\n");
-    if view.inventory.pools.is_empty() {
-        out.push_str("No pools yet. Write them by replacing or patching cairn://inference.\n");
-        return out;
+    let models: &ModelsView = &view.models;
+    let mut out = String::from(
+        "# Inference pools\n\nPlacement detects a pool as machines joined by a fast link, from the links the executors report; a GPU machine with no such link is a pool of its own. A model runs as a resident on one pool: while it loads, its machines keep its footprint off-limits to batches; once healthy, batches run beside it as measured room allows. An idle resident (no request for its idle window, past its minimum residency, unpinned) is evicted when work is refused its room, and a pool with no batch work for its idle window places its warm model.\n\n",
+    );
+    if models.pools.is_empty() {
+        out.push_str("No pools detected: no attached machine reports a GPU.\n\n");
     }
-    for pool in view.inventory.pools.values() {
-        let _ = writeln!(out, "## {}\n", pool.id);
-        pool_records(&mut out, view, pool);
-        control_lines(&mut out, view, pool);
+    for pool in &models.pools {
+        pool_section(&mut out, view, pool);
+    }
+    if !models.stranded.is_empty() {
+        out.push_str("## Residents on no detected pool\n\nTheir machines no longer form the pool they were placed on (a member detached); they are held as they are until they stop.\n\n");
+        for resident in &models.stranded {
+            resident_line(&mut out, resident, models.now);
+        }
         out.push('\n');
     }
+    let refused: Vec<_> = models
+        .deployments
+        .iter()
+        .filter_map(|p| Some((p, p.refused.as_ref()?)))
+        .collect();
+    if !refused.is_empty() {
+        out.push_str("## Deployments placement cannot run now\n\n");
+        for (placement, why) in refused {
+            let _ = writeln!(
+                out,
+                "- {} (`{}`): {why}",
+                placement.model, placement.deployment
+            );
+        }
+        out.push('\n');
+    }
+    if !models.departures.is_empty() {
+        out.push_str("## Recently left\n\n");
+        for departure in models.departures.iter().take(5) {
+            let _ = writeln!(out, "- {}", departure.describe(models.now));
+        }
+        out.push('\n');
+    }
+    let _ = write!(
+        out,
+        "## Setting them\n\nPatch this resource with `{{pool, warm?, idleSecs?, pin?, release?, revoke?}}`, naming the pool by its key:\n- `warm`: the model, by its real name, placed when the pool is idle; `null` clears it.\n- `idleSecs`: the pool's idle window in seconds; `null` derives it from the pool's measured load again.\n- `pin`: a model to keep resident: a standing lease, never evicted for room, acquired at once if absent. Another holder's pin on its machines refuses it.\n- `release`: `true` releases your pins on the pool, or name the model; `revoke` does the same for anyone's pin.\n\ne.g. `write({{changes:[{{target:\"{URI}\",mode:\"patch\",payload:{{pool:\"bginf-sp1+bginf-sp2\",warm:\"deepseek-ai/DeepSeek-V4-Flash\"}}}}]}})`\n"
+    );
     out
 }
 
@@ -773,11 +793,11 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
     if let Some(error) = reject_params("cairn://inference/requests", params, &[]) {
         return error;
     }
-    let control = &view.control;
+    let models = &view.models;
     let mut out = String::from(
-        "# Inference requests\n\nAppend {model} here to ask for a model in a pool under Cairn's control. A request names exactly one deployment and waits until it is healthy, fails to load, or is cancelled; it is never served by another model.\n\n",
+        "# Inference requests\n\nAppend {model} here to ask for a model by its real name (and {pool} to narrow it to one pool). A request leases the model's resident, loading it if it is absent, and waits until it is healthy, fails to load, or is cancelled; it is never served by another model.\n\n",
     );
-    let (waiting, answered): (Vec<_>, Vec<_>) = control
+    let (waiting, answered): (Vec<_>, Vec<_>) = models
         .requests
         .iter()
         .partition(|r| r.request.state == RequestState::Waiting);
@@ -785,17 +805,8 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
     if waiting.is_empty() {
         out.push_str("Nothing is waiting.\n");
     }
-    for stored in &waiting {
-        let line = match control.wait_of(stored) {
-            Some(wait) => {
-                pool_control::describe_waiting(&stored.request, &stored.pool, wait, control.now)
-            }
-            None => format!(
-                "{} on pool {} for {}: the pool is not under Cairn's control, so nothing decides it",
-                stored.request.model, stored.pool, stored.request.requester
-            ),
-        };
-        let _ = writeln!(out, "- #{} {line}", stored.request.id);
+    for request in &waiting {
+        let _ = writeln!(out, "- #{} {}", request.request.id, request.said);
     }
     let _ = writeln!(
         out,
@@ -806,8 +817,8 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
     if answered.is_empty() {
         out.push_str("None.\n");
     }
-    for stored in answered.iter().rev() {
-        let request = &stored.request;
+    for answered in answered.iter().rev() {
+        let request = &answered.request;
         let outcome = match &request.state {
             RequestState::Ready { at } => format!("ready {} ago", age_since(view, *at)),
             RequestState::Failed { at, reason } => {
@@ -819,7 +830,7 @@ pub(crate) fn render_requests(view: &InferenceView, params: &[QueryParam]) -> St
         let _ = writeln!(
             out,
             "- #{} {} on pool {} for {}: {outcome}",
-            request.id, request.model, stored.pool, request.requester
+            request.id, request.model, request.pool, request.requester
         );
     }
     out
@@ -1019,22 +1030,14 @@ pub(crate) fn render_profile(view: &InferenceView, id: &str, params: &[QueryPara
     };
     let mut out = String::new();
     profile_section(&mut out, profile);
+    let links = link_addresses(view.models.pools.iter().flat_map(|pool| &pool.members));
     for deployment in view
         .inventory
         .deployments
         .values()
         .filter(|d| d.profile == profile.id)
     {
-        let pool = view.inventory.pool_of_deployment(deployment);
-        let machines: Vec<cairn_inference::render::MachineAt> = deployment
-            .machines
-            .iter()
-            .map(|name| cairn_inference::render::MachineAt {
-                name: name.clone(),
-                address: pool.and_then(|p| p.address_of(name)).map(str::to_string),
-                link: pool.and_then(|p| p.link_of(name)).map(str::to_string),
-            })
-            .collect();
+        let machines = machines_at(&view.inventory, deployment, &links);
         let _ = writeln!(out, "## As deployment {}\n", deployment.id);
         match cairn_inference::render::render(profile, deployment, &machines) {
             Ok(rendered) => {
@@ -1117,6 +1120,11 @@ pub(crate) fn render_verification(view: &InferenceView, id: &str, params: &[Quer
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::models::requests::{Hold, HoldCause, Request, Wait};
+    use crate::fleet::models::rules::Why;
+    use crate::fleet::models::settings::EffectiveSettings;
+    use crate::fleet::models::{DeploymentPlacement, RequestView};
+    use crate::fleet::pools::PoolMember;
     use cairn_inference::{Inventory, RecordSource};
     use std::collections::BTreeMap;
 
@@ -1124,20 +1132,20 @@ mod tests {
 
     const INVENTORY: &str = r#"
 models:
-  - {name: dsv4f-tp2}
-  - {name: qwen36-fast}
-  - {name: qwen3-embed-4b}
+  - {name: deepseek-ai/DeepSeek-V4-Flash}
+  - {name: nvidia/Qwen3.6-35B}
+  - {name: Qwen/Qwen3-Embedding-4B}
 profiles:
-  - {id: dsv4f-tp2, model: {name: dsv4f-tp2}, servedName: dsv4f-tp2, engine: {kind: command, start: ./start.sh --port 8888, stop: ./stop.sh, description: vllm}, requirements: {machines: 2}}
-  - {id: qwen36-fast, model: {name: qwen36-fast}, servedName: qwen36-fast, engine: {kind: command, start: ./start.sh --port 8001, stop: ./stop.sh}, requirements: {machines: 1}}
-  - {id: qwen3-embed-4b, model: {name: qwen3-embed-4b}, servedName: qwen3-embed-4b, engine: {kind: command, start: ./start.sh --port 8090, stop: ./stop.sh}, requirements: {machines: 1}}
+  - {id: dsv4f-tp2, model: {name: deepseek-ai/DeepSeek-V4-Flash}, servedName: dsv4f-tp2, engine: {kind: command, start: ./start.sh --port 8888, stop: ./stop.sh, description: vllm}, requirements: {machines: 2}}
+  - {id: qwen36-fast, model: {name: nvidia/Qwen3.6-35B}, servedName: qwen36-fast, engine: {kind: command, start: ./start.sh --port 8001, stop: ./stop.sh}, requirements: {machines: 1}}
+  - {id: qwen3-embed-4b, model: {name: Qwen/Qwen3-Embedding-4B}, servedName: qwen3-embed-4b, engine: {kind: command, start: ./start.sh --port 8090, stop: ./stop.sh}, requirements: {machines: 1}}
 deployments:
   - {id: dsv4f-tp2, profile: dsv4f-tp2, machines: [sp1, sp2], head: sp1, apiPort: 8888, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen36-fast, profile: qwen36-fast, machines: [sp1], head: sp1, apiPort: 8001, apiPath: /v1, healthPath: /v1/models}
   - {id: qwen3-embed-4b, profile: qwen3-embed-4b, machines: [fedora], head: fedora, apiPort: 8090, apiPath: /v1, healthPath: /health}
-pools:
-  - {id: sparks, machines: [{name: sp1, address: 192.0.2.40}, {name: sp2}], default: [dsv4f-tp2]}
-  - {id: halo, machines: [{name: fedora, address: 192.0.2.43}], default: [qwen3-embed-4b]}
+machines:
+  - {name: sp1, address: 192.0.2.40}
+  - {name: fedora, address: 192.0.2.43}
 "#;
 
     fn view() -> InferenceView {
@@ -1145,11 +1153,121 @@ pools:
             inventory: Inventory::from_yaml(INVENTORY).unwrap(),
             retired_link_setting: false,
             executors: BTreeMap::from([("fedora".to_string(), true)]),
-            control: Default::default(),
+            models: ModelsView {
+                now: NOW,
+                ..ModelsView::default()
+            },
             deployment_control: Default::default(),
             verifications: Vec::new(),
             now_ms: NOW,
         }
+    }
+
+    fn member(machine: &str) -> PoolMember {
+        PoolMember {
+            machine: machine.into(),
+            link_address: None,
+        }
+    }
+
+    /// The Sparks joined at 200 Gb/s with DeepSeek healthy and requested a
+    /// minute ago, a request for the Qwen model queued behind it, and halo's
+    /// embedder unable to run.
+    fn placed_view() -> InferenceView {
+        let mut view = view();
+        let deepseek = ResidentView {
+            deployment: "dsv4f-tp2".into(),
+            model: "deepseek-ai/DeepSeek-V4-Flash".into(),
+            pool: "sp1+sp2".into(),
+            machines: ["sp1".to_string(), "sp2".to_string()].into(),
+            phase: Some(DeploymentPhase::Healthy {
+                since_ms: NOW - 30 * 60_000,
+                load_ms: None,
+            }),
+            why: Why::Adopted,
+            why_said: "adopted as it was running when placement started, 30m ago".into(),
+            chosen_at: NOW - 30 * 60_000,
+            loading_since: None,
+            healthy_since: Some(NOW - 30 * 60_000),
+            hold: Some(Hold {
+                deployment: "dsv4f-tp2".into(),
+                model: "deepseek-ai/DeepSeek-V4-Flash".into(),
+                because: HoldCause::RecentRequest,
+                until: Some(NOW + 9 * 60_000),
+            }),
+            pin: None,
+            footprint: BTreeMap::from([("sp1".into(), 100 << 30), ("sp2".into(), 98 << 30)]),
+            unified: true,
+        };
+        let queued = Request {
+            id: 2,
+            pool: "sp1+sp2".into(),
+            deployment: "qwen36-fast".into(),
+            model: "nvidia/Qwen3.6-35B".into(),
+            requester: "cairn://p/cairn/9/1/builder".into(),
+            at: NOW - 30_000,
+            state: RequestState::Waiting,
+        };
+        let wait = Wait::Held {
+            by: vec![deepseek.hold.clone().unwrap()],
+        };
+        view.models = ModelsView {
+            now: NOW,
+            passed_at: NOW,
+            pools: vec![PoolView {
+                key: "sp1+sp2".into(),
+                members: vec![member("sp1"), member("sp2")],
+                rate_gbps: Some(200),
+                settings: EffectiveSettings::derive(Some(600), None),
+                warm_model: Some("deepseek-ai/DeepSeek-V4-Flash".into()),
+                idle_override_secs: Some(600),
+                idle_since: Some(NOW - 60_000),
+                residents: vec![deepseek],
+                models: vec![
+                    "deepseek-ai/DeepSeek-V4-Flash".into(),
+                    "nvidia/Qwen3.6-35B".into(),
+                ],
+            }],
+            stranded: Vec::new(),
+            deployments: vec![
+                DeploymentPlacement {
+                    deployment: "dsv4f-tp2".into(),
+                    model: "deepseek-ai/DeepSeek-V4-Flash".into(),
+                    pool: Some("sp1+sp2".into()),
+                    refused: None,
+                },
+                DeploymentPlacement {
+                    deployment: "qwen3-embed-4b".into(),
+                    model: "Qwen/Qwen3-Embedding-4B".into(),
+                    pool: None,
+                    refused: Some(
+                        "fedora is in no detected pool: it is not attached or reports no GPU"
+                            .into(),
+                    ),
+                },
+            ],
+            requests: vec![
+                RequestView {
+                    request: Request {
+                        id: 1,
+                        deployment: "dsv4f-tp2".into(),
+                        model: "deepseek-ai/DeepSeek-V4-Flash".into(),
+                        at: NOW - 60_000,
+                        state: RequestState::Ready { at: NOW - 60_000 },
+                        ..queued.clone()
+                    },
+                    wait: None,
+                    said: String::new(),
+                },
+                RequestView {
+                    said: crate::fleet::models::requests::describe_waiting(&queued, &wait, NOW),
+                    request: queued,
+                    wait: Some(wait),
+                },
+            ],
+            departures: Vec::new(),
+        };
+        view
     }
 
     #[test]
@@ -1207,52 +1325,75 @@ pools:
     }
 
     #[test]
-    fn the_pools_page_shows_each_pools_records() {
-        let page = render_pools(&view(), &[]);
-        assert!(
-            page.contains("- `fedora`: enrolled executor (attached); 192.0.2.43\n"),
-            "{page}"
-        );
-        assert!(
-            page.contains("- `sp2`: not enrolled; address unknown\n"),
-            "{page}"
-        );
-        assert!(page.contains("- default: `dsv4f-tp2`"), "{page}");
-        assert!(page.contains("- pin (record): none"), "{page}");
-        assert!(!page.contains("bginf"), "{page}");
+    fn the_pools_page_shows_each_detected_pool_its_residents_and_settings() {
+        let page = render_pools(&placed_view(), &[]);
+        for line in [
+            "## sp1+sp2\n",
+            "- link: 200 Gb/s between its machines",
+            "  - `sp1`: not enrolled; 192.0.2.40\n",
+            "  - `sp2`: not enrolled; address unknown\n",
+            "  - deepseek-ai/DeepSeek-V4-Flash (`dsv4f-tp2`): healthy; reserving sp1 100.0 GiB, sp2 98.0 GiB; adopted as it was running when placement started, 30m ago; stays: deepseek-ai/DeepSeek-V4-Flash was requested within its idle window and keeps its machines, until in 9m",
+            "- warm model: deepseek-ai/DeepSeek-V4-Flash",
+            "- idle window: 10m (operator); minimum residency 20m (built-in; no load measured yet); load bound 30m (built-in; no load measured yet)",
+            "- last batch work on its machines: 1m ago",
+            "## Deployments placement cannot run now",
+            "- Qwen/Qwen3-Embedding-4B (`qwen3-embed-4b`): fedora is in no detected pool",
+            "Patch this resource with `{pool, warm?, idleSecs?, pin?, release?, revoke?}`",
+        ] {
+            assert!(page.contains(line), "{line}\n---\n{page}");
+        }
+        assert!(!page.contains("controlled"), "{page}");
     }
 
     #[test]
-    fn an_empty_inventory_says_where_records_are_written() {
-        let view = InferenceView {
-            inventory: Default::default(),
-            ..view()
-        };
-        let page = render_pools(&view, &[]);
+    fn no_pool_says_why() {
+        let page = render_pools(&view(), &[]);
         assert!(
-            page.contains("No pools yet. Write them by replacing or patching cairn://inference."),
+            page.contains("No pools detected: no attached machine reports a GPU."),
             "{page}"
         );
-        let index = render_index(&view, &[]);
+        let index = render_index(&view(), &[]);
         assert!(index.contains("- `cairn://inference/pools`"), "{index}");
-        assert!(index.contains("- records: 0 profiles"), "{index}");
+        assert!(
+            index.contains("- records: 3 profiles, 3 deployments, 2 machines"),
+            "{index}"
+        );
     }
 
     #[test]
     fn the_index_says_what_is_left_of_bginf_until_it_is_cleared() {
         let mut view = view();
         assert!(!render_index(&view, &[]).contains("bginf"));
-        view.inventory.pools.get_mut(&"halo".into()).unwrap().source = RecordSource::Bginf;
+        view.inventory
+            .machines
+            .get_mut(&"fedora".into())
+            .unwrap()
+            .source = RecordSource::Bginf;
         view.retired_link_setting = true;
         let index = render_index(&view, &[]);
         assert!(
-            index.contains("- 1 records are still mirrored from bginf and read-only (pool halo (bginf)); adopt them as Cairn's own"),
+            index.contains("- 1 records are still mirrored from bginf and read-only (machine fedora (bginf)); adopt them as Cairn's own"),
             "{index}"
         );
         assert!(index.contains("payload:{adopt:\"bginf\"}"), "{index}");
         assert!(
             index.contains("settings.yaml still names the retired bginf link"),
             "{index}"
+        );
+    }
+
+    #[test]
+    fn the_requests_page_names_the_model_the_pool_and_the_wait() {
+        let page = render_requests(&placed_view(), &[]);
+        assert!(page.contains("## Waiting (1)"), "{page}");
+        assert!(
+            page.contains("- #2 nvidia/Qwen3.6-35B (deployment qwen36-fast) on pool sp1+sp2 for cairn://p/cairn/9/1/builder, waiting 30s: deepseek-ai/DeepSeek-V4-Flash was requested within its idle window and keeps its machines, until in 9m"),
+            "{page}"
+        );
+        assert!(page.contains("## Answered in the last 7d (1)"), "{page}");
+        assert!(
+            page.contains("- #1 deepseek-ai/DeepSeek-V4-Flash on pool sp1+sp2 for cairn://p/cairn/9/1/builder: ready 1m ago"),
+            "{page}"
         );
     }
 
@@ -1282,144 +1423,20 @@ pools:
         );
     }
 
-    /// The sparks pool under Cairn's control with `dsv4f-tp2` healthy and
-    /// requested a minute ago, three batches waiting, and a request for
-    /// `qwen36-fast` queued behind it.
-    fn controlled_view() -> InferenceView {
-        use crate::orchestrator::pool_control::{ControlView, PoolPlan, StoredRequest};
-        use cairn_inference::pool_control::{
-            BuildPressure, Observed, PoolControl, PoolSettings, Request,
-        };
-        let mut view = view();
-        let pool = view.inventory.pools[&"sparks".into()].clone();
-        let phases = BTreeMap::from([(
-            "dsv4f-tp2".into(),
-            DeploymentPhase::Healthy {
-                since_ms: NOW - 30 * 60_000,
-                load_ms: None,
-            },
-        )]);
-        let mut control = PoolControl::begin(
-            &pool,
-            &view.inventory.deployments,
-            &phases,
-            NOW - 30 * 60_000,
-        );
-        control.settings = PoolSettings {
-            model_idle_secs: Some(600),
-            ..PoolSettings::default()
-        };
-        let request = |id, deployment: &str, at, state| StoredRequest {
-            pool: "sparks".into(),
-            request: Request {
-                id,
-                deployment: deployment.into(),
-                model: deployment.to_string(),
-                requester: "cairn://p/cairn/9/1/builder".into(),
-                at,
-                state,
-            },
-        };
-        let requests = vec![
-            request(
-                1,
-                "dsv4f-tp2",
-                NOW - 60_000,
-                RequestState::Ready { at: NOW - 60_000 },
-            ),
-            request(2, "qwen36-fast", NOW - 30_000, RequestState::Waiting),
-        ];
-        let builds = BuildPressure {
-            waiting: 3,
-            ..BuildPressure::default()
-        };
-        let settings = control.settings.effective(None);
-        let mine: Vec<Request> = requests.iter().map(|r| r.request.clone()).collect();
-        let plan = pool_control::plan(
-            &pool,
-            &view.inventory.deployments,
-            &control,
-            &settings,
-            &mine,
-            Observed {
-                now: NOW,
-                phases: &phases,
-                builds,
-            },
-        );
-        view.control = ControlView {
-            now: NOW,
-            controls: BTreeMap::from([("sparks".into(), control)]),
-            plans: BTreeMap::from([(
-                "sparks".into(),
-                PoolPlan {
-                    settings,
-                    builds,
-                    plan,
-                },
-            )]),
-            settings: BTreeMap::from([("sparks".into(), settings)]),
-            phases,
-            requests,
-        };
-        view
-    }
-
     #[test]
-    fn a_controlled_pool_shows_what_the_controller_decided_and_why() {
-        let page = render_pools(&controlled_view(), &[]);
-        assert!(
-            page.contains("- Cairn's control: the pool controller decides this pool"),
-            "{page}"
-        );
-        assert!(
-            page.contains("- desired (written as desired state): `dsv4f-tp2`; slot default; adopted what was running when Cairn took control, 30m ago"),
-            "{page}"
-        );
-        assert!(
-            page.contains("  - `dsv4f-tp2`: healthy; healthy for 30m"),
-            "{page}"
-        );
-        assert!(
-            page.contains("- batch work: 0 agent turns and 0 other batches running on the pool's machines; 3 batches waiting that they refused; last batch work 0s ago"),
-            "{page}"
-        );
-        assert!(
-            page.contains("- settings: model idle window 10m (operator); pool idle window 15m (built-in; no load measured yet);"),
-            "{page}"
-        );
-        assert!(
-            page.contains("- Cairn's control: not taken, so nothing decides this pool and its deployments start and stop only from their own pages; patch this resource with {pool:\"halo\", controlled:true} to take it"),
-            "{page}"
-        );
-    }
-
-    #[test]
-    fn the_requests_page_names_the_model_the_pool_and_the_wait() {
-        let page = render_requests(&controlled_view(), &[]);
-        assert!(page.contains("## Waiting (1)"), "{page}");
-        assert!(
-            page.contains("- #2 qwen36-fast on pool sparks for cairn://p/cairn/9/1/builder, waiting 30s: dsv4f-tp2 was requested within its idle window and keeps the pool, until in 9m"),
-            "{page}"
-        );
-        assert!(page.contains("## Answered in the last 7d (1)"), "{page}");
-        assert!(
-            page.contains(
-                "- #1 dsv4f-tp2 on pool sparks for cairn://p/cairn/9/1/builder: ready 1m ago"
-            ),
-            "{page}"
-        );
-    }
-
-    #[test]
-    fn a_deployment_page_shows_its_phase_holds_memory_and_loads() {
+    fn a_deployment_page_shows_its_phase_residency_memory_and_loads() {
         use crate::orchestrator::inference_control::{MachineReading, StateRow};
-        let mut view = view();
-        let page = render_deployment(&view, "dsv4f-tp2", &[]);
+        let mut view = placed_view();
+        let page = render_deployment(&view, "qwen3-embed-4b", &[]);
         assert!(
-            page.contains("- phase: never acted on by Cairn, so it is neither probed nor reserved"),
+            page.contains("- phase: never acted on by Cairn; it is probed once, and adopted as a resident if it answers"),
             "{page}"
         );
+        assert!(
+            page.contains("- pool: none: fedora is in no detected pool"),
+            "{page}"
+        );
+        let page = render_deployment(&view, "dsv4f-tp2", &[]);
         assert!(page.contains("- last measured load: none yet"), "{page}");
 
         view.deployment_control.states.insert(
@@ -1464,12 +1481,17 @@ pools:
             ),
             "{page}"
         );
+        assert!(page.contains("- pool: `sp1+sp2`"), "{page}");
         assert!(
-            page.contains("  - `sp1` (head; not enrolled); held away from batch work by this deployment; GPU-allocated now 100.0 GiB"),
+            page.contains("- resident: adopted as it was running when placement started, 30m ago; stays: deepseek-ai/DeepSeek-V4-Flash was requested within its idle window"),
             "{page}"
         );
         assert!(
-            page.contains("  - `sp2` (not enrolled); held away from batch work by this deployment; no GPU reading (not attached)"),
+            page.contains("  - `sp1` (head; not enrolled); resident here, reserving 100.0 GiB; GPU-allocated now 100.0 GiB"),
+            "{page}"
+        );
+        assert!(
+            page.contains("  - `sp2` (not enrolled); resident here, reserving 98.0 GiB; no GPU reading (not attached)"),
             "{page}"
         );
         assert!(

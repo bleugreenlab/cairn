@@ -14,11 +14,12 @@ use cairn_common::executor_protocol::{
     ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
 };
 use cairn_inference::generate::{self, Arch, HwMemory, MachineHw, PoolHw};
-use cairn_inference::{AcceleratorFamily, Inventory, MachineName, PoolId};
+use cairn_inference::{AcceleratorFamily, Inventory, MachineName};
 use serde::Deserialize;
 
 use super::inference::{load_inventory, write_inventory, Authoring, Removals};
 use super::inference_models::{weight_sources, Hub};
+use crate::fleet::pools::Pool;
 use crate::storage::LocalDb;
 
 const GIB: u64 = 1 << 30;
@@ -109,28 +110,24 @@ pub fn reported_hardware(
     })
 }
 
-/// A pool's hardware: each machine's stated or reported, and whether every
-/// machine has a fast-link address.
+/// A detected pool's hardware: each machine's stated or reported, and whether
+/// every machine has a fast-link address.
 pub fn pool_hardware(
-    inventory: &Inventory,
-    pool: &PoolId,
+    pool: &Pool,
     snapshots: &BTreeMap<String, ExecutorHealthSnapshot>,
     stated: &BTreeMap<String, StatedHardware>,
 ) -> Result<PoolHw, String> {
-    let pool = inventory
-        .pools
-        .get(pool)
-        .ok_or_else(|| format!("there is no pool {pool}; cairn://inference/pools lists them"))?;
     let mut machines = Vec::new();
     let mut problems = Vec::new();
-    for member in &pool.machines {
-        let machine = match stated.get(member.name.as_str()) {
-            Some(stated) => stated.machine(&member.name),
-            None => match snapshots.get(member.name.as_str()) {
-                Some(snapshot) => reported_hardware(&member.name, snapshot),
+    for member in &pool.members {
+        let name = MachineName::from(member.machine.as_str());
+        let machine = match stated.get(member.machine.as_str()) {
+            Some(stated) => stated.machine(&name),
+            None => match snapshots.get(member.machine.as_str()) {
+                Some(snapshot) => reported_hardware(&name, snapshot),
                 None => Err(format!(
                     "{} is not attached, so its hardware is unknown; attach it or state its hardware",
-                    member.name
+                    member.machine
                 )),
             },
         };
@@ -143,7 +140,7 @@ pub fn pool_hardware(
         return Err(problems.join("; "));
     }
     Ok(PoolHw {
-        linked: pool.machines.len() > 1 && pool.machines.iter().all(|m| m.link.is_some()),
+        linked: pool.members.len() > 1 && pool.members.iter().all(|m| m.link_address.is_some()),
         machines,
     })
 }
@@ -157,7 +154,7 @@ pub async fn generate(
     db: &LocalDb,
     hub: &dyn Hub,
     model: &str,
-    pool: &str,
+    pool: &Pool,
     snapshots: &BTreeMap<String, ExecutorHealthSnapshot>,
     stated: &BTreeMap<String, StatedHardware>,
 ) -> Result<String, String> {
@@ -165,7 +162,8 @@ pub async fn generate(
     let model = inventory.models.get(model).cloned().ok_or_else(|| {
         format!("model {model} is not registered; append it to cairn://inference/models first")
     })?;
-    let hardware = pool_hardware(&inventory, &PoolId::from(pool), snapshots, stated)?;
+    let hardware = pool_hardware(pool, snapshots, stated)?;
+    let pool = &pool.key;
     let (repos, skipped) = weight_sources(hub, &model).await?;
     let generated = generate::generate(&model, &repos, &hardware);
     let mut said = String::new();
@@ -239,20 +237,6 @@ mod tests {
     use super::super::inference_models::{register, HUGGING_FACE};
     use super::*;
 
-    async fn db_with_pool(name: &str, yaml: &str) -> LocalDb {
-        let db = crate::storage::migrated_test_db(name).await;
-        write_inventory(
-            &db,
-            &Authoring::Patch {
-                upsert: Some(yaml.into()),
-                remove: Removals::default(),
-            },
-        )
-        .await
-        .unwrap();
-        db
-    }
-
     fn stated(
         family: AcceleratorFamily,
         gib: f64,
@@ -271,11 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_embedder_generates_for_a_4090_and_writes_its_candidates() {
-        let db = db_with_pool(
-            "inference-generate-bbs",
-            "pools:\n  - {id: bbs, machines: [{name: bbs, address: 10.20.20.30}]}\n",
-        )
-        .await;
+        let db = crate::storage::migrated_test_db("inference-generate-bbs").await;
         let mut hub = FakeHub::fixtures();
         hub.bodies.insert(
             format!("{HUGGING_FACE}/api/models?filter=base_model:quantized:Qwen/Qwen3-Embedding-4B&limit=100"),
@@ -298,7 +278,7 @@ mod tests {
             &db,
             &hub,
             "Qwen/Qwen3-Embedding-4B",
-            "bbs",
+            &Pool::of_one("bbs"),
             &BTreeMap::new(),
             &hardware,
         )
@@ -324,17 +304,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreported_machine_and_an_unregistered_model_are_refused_by_name() {
-        let db = db_with_pool(
-            "inference-generate-refusals",
-            "pools:\n  - {id: halo, machines: [{name: fedora}]}\n",
-        )
-        .await;
+        let db = crate::storage::migrated_test_db("inference-generate-refusals").await;
+        let fedora = Pool::of_one("fedora");
         let hub = FakeHub::fixtures();
         let refusal = generate(
             &db,
             &hub,
             "Qwen/Qwen3-Embedding-4B",
-            "halo",
+            &fedora,
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
@@ -348,23 +325,12 @@ mod tests {
             &db,
             &hub,
             "Qwen/Qwen3-Embedding-4B",
-            "halo",
+            &fedora,
             &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .await
         .unwrap_err();
         assert!(refusal.contains("fedora is not attached"), "{refusal}");
-        let refusal = generate(
-            &db,
-            &hub,
-            "Qwen/Qwen3-Embedding-4B",
-            "nowhere",
-            &BTreeMap::new(),
-            &BTreeMap::new(),
-        )
-        .await
-        .unwrap_err();
-        assert!(refusal.contains("there is no pool nowhere"), "{refusal}");
     }
 }

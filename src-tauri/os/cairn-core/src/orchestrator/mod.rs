@@ -47,7 +47,6 @@ pub mod model_defaults;
 pub mod models;
 pub mod object_plane;
 pub mod parent_wake;
-pub mod pool_control;
 pub mod provider_pool;
 pub mod recipes;
 pub mod replay_base;
@@ -2215,8 +2214,8 @@ impl Orchestrator {
 
     /// Start the process-lifetime workers that hold this orchestrator: thread-era
     /// summary upgrades, tenet evidence evaluation, the wake-condition
-    /// evaluator, and the inference act side and pool controller. Hosts call
-    /// this once;
+    /// evaluator, the inference act side, and placement's model pass. Hosts
+    /// call this once;
     /// `build()` never does, so a dropped test orchestrator releases every
     /// channel it owns.
     pub fn start_background_workers(&self) {
@@ -2224,8 +2223,8 @@ impl Orchestrator {
         crate::tenets::evidence::spawn(self.clone());
         crate::orchestrator::wakes::conditions::install_evaluator(self.clone());
         crate::orchestrator::inference_control::spawn_deployment_control(self.clone());
+        crate::fleet::models::spawn(self.clone());
         crate::orchestrator::inference_verify::spawn_recovery(self.clone());
-        crate::orchestrator::pool_control::spawn_pool_controller(self.clone());
         crate::orchestrator::inference_metrics::spawn_engine_metrics(self.clone());
         // A machine that reconnects holding replicas of closed scratches is
         // told to delete them, whether or not any work has asked for one yet.
@@ -3964,7 +3963,7 @@ mod tests {
         };
         ExecutorHealthSnapshot {
             build_volume: None,
-            inference_hold: None,
+            model_residents: Vec::new(),
             identity: identity.clone(),
             public_name: "bglab-win".into(),
             colocated: false,

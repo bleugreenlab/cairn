@@ -6330,13 +6330,26 @@ pub struct LearnedResourceEstimate {
 /// that executor reports neither edge, so no page-call batch is ever placed
 /// on it, and it is updated by build hash before it takes other work.
 ///
+/// cairn/5728 does not move the number. Placement runs local models itself:
+/// the runner's connection record trades the inference hold (the retired
+/// `InferenceHold`) for the model residents placement holds on the machine
+/// ([`MachineModelResident`]), and [`PlacementRejectionReason`] trades the
+/// `InferenceReserved` drain for `ModelResident`, a machine refusing work for
+/// room a model holds. Both types live only between the runner and its own
+/// desktop, which are built together: no frame either peer of the executor
+/// link sends carries either (cairn-exec names neither type), and a machine
+/// was never told of a hold and is never told of a resident. What a runner
+/// gets wrong talking to an older executor: nothing; the executor sees the same offers, and a machine
+/// beside a healthy model is simply offered the batches its measured room
+/// admits, which its own admission judges as before.
+///
 /// cairn/5732 adds [`HostHealth::interconnects`] without a bump (tenet 1250).
 /// It is defaulted on decode, and [`HostHealth`] refuses no unknown fields. An
 /// older executor reports nothing, which a runner reads as a `NotSampled` gap,
 /// so that machine stays a model pool of its own: the failure is closed, never
 /// a link that is not there. An older runner ignores the field. The runner
-/// derives model pools from it (`fleet::pools`) and only displays them; no
-/// admission, placement, or load-context input reads it.
+/// derives model pools from it (`fleet::pools`); placement (cairn/5728) reads
+/// those pools to decide where a model runs, which crosses no executor frame.
 ///
 /// cairn/5768 does not move the number. No frame, variant, field or
 /// serialized form changes. The executor now also sets `RUST_TEST_THREADS` in
@@ -6361,6 +6374,14 @@ pub struct LearnedResourceEstimate {
 /// script's message. A deployment command still carries its start and stop
 /// scripts, health URL and timeout as before, and no frame, variant, field or
 /// serialized form names a recipe or a profile, so a runner talking to an older
+/// executor gets nothing wrong.
+///
+/// cairn/5800 does not move the number. The runner's SSH enrollment of a
+/// Windows host now sends its executor install script as a `.ps1` file beside
+/// the staged binary, by the same `scp` that sends the binary, and runs it from
+/// there, because inline it exceeded cmd.exe's command-line limit. That is the
+/// runner talking to a host's shell before any executor runs; no frame,
+/// variant, field or serialized form changes, and a runner talking to an older
 /// executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
@@ -13882,10 +13903,10 @@ pub struct ExecutorHealthSnapshot {
     /// one witness: the runner fills it in, and no executor reports it.
     #[serde(default)]
     pub role: MachineRole,
-    /// The inference deployment the runner holds this machine for, if any.
-    /// Like the role, the runner is its only witness.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inference_hold: Option<InferenceHold>,
+    /// The models placement holds resident on this machine. Like the role,
+    /// the runner is its only witness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_residents: Vec<MachineModelResident>,
     #[serde(default)]
     pub resident_processes: ResidentProcessHealth,
     #[serde(default)]
@@ -15737,11 +15758,31 @@ pub enum PlacementRejectionReason {
     /// lands, fails, or is deferred. Work already resident here is exempt, as
     /// for a drain.
     UpdatePending,
-    /// The runner holds this machine for an inference deployment that is
-    /// reserving, starting, healthy or stopping (see [`InferenceHold`]). A
-    /// named drain: it clears when the deployment stops or fails, and work
-    /// already resident here is exempt, as for a drain.
-    InferenceReserved { deployment: String, phase: String },
+    /// A model placement holds resident here keeps the room this work needs:
+    /// a loading model's footprint it has not yet taken, or a model's memory
+    /// that evicting it would return. Filtered rather than offered, and waited
+    /// for: placement evicts the resident for this work once it is idle and
+    /// unpinned, or the work goes elsewhere.
+    ModelResident {
+        model: String,
+        phase: String,
+        held_bytes: u64,
+        #[serde(default)]
+        pinned: bool,
+        #[serde(default)]
+        leased: bool,
+        /// When it may be evicted if nothing changes, as
+        /// [`MachineModelResident::evictable_at_unix_ms`] states it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evictable_at_unix_ms: Option<u64>,
+        /// The work's own memory has never been measured, so it cannot be
+        /// shown to fit beside the room a loading model has reserved and is
+        /// refused it (fails closed, tenet 302). Such a refusal waits for the
+        /// model to be healthy and never evicts it: a guess never displaces
+        /// a model.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        demand_unmeasured: bool,
+    },
     /// This work needs a cell, and the machine has posted that the volume it
     /// keeps cells on is not mounted. Filtered rather than offered, the way a
     /// drain is: another machine taking the work records no failure here.
@@ -15831,6 +15872,27 @@ fn describe_age(at_unix_ms: u64) -> String {
     }
 }
 
+/// When an idle model resident may be evicted, read against now.
+fn describe_until(at_unix_ms: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(at_unix_ms);
+    let seconds = at_unix_ms.saturating_sub(now) / 1_000;
+    match seconds {
+        0 => "it is idle and is evicted for this work".to_string(),
+        1..60 => format!("it goes idle in {seconds}s and is then evicted for this work"),
+        60..3_600 => format!(
+            "it goes idle in {}m and is then evicted for this work",
+            seconds.div_ceil(60)
+        ),
+        _ => format!(
+            "it goes idle in {}h and is then evicted for this work",
+            seconds / 3_600
+        ),
+    }
+}
+
 impl PlacementRejectionReason {
     /// A single line an operator can act on, for the readable surfaces.
     pub fn describe(&self) -> String {
@@ -15912,12 +15974,36 @@ impl PlacementRejectionReason {
             Self::UpdatePending => {
                 "being emptied for an executor update, refusing new work".into()
             }
-            Self::InferenceReserved { deployment, phase } => InferenceHold {
-                deployment: deployment.clone(),
-                phase: phase.clone(),
-                waiting_on: None,
+            Self::ModelResident {
+                model,
+                phase,
+                held_bytes,
+                pinned,
+                leased,
+                evictable_at_unix_ms,
+                demand_unmeasured,
+            } => {
+                if *demand_unmeasured {
+                    return format!(
+                        "room is reserved for {model} ({phase}, {}); this work's memory has never been measured, so it waits until the model is healthy",
+                        describe_gib(*held_bytes)
+                    );
+                }
+                let until = if *pinned {
+                    "it is pinned, so it stays".to_string()
+                } else if *leased {
+                    "requests wait on it, so it stays while they do".to_string()
+                } else {
+                    match evictable_at_unix_ms {
+                        Some(at) => describe_until(*at),
+                        None => "it is loading, so it stays until it is healthy".to_string(),
+                    }
+                };
+                format!(
+                    "room is held by {model} ({phase}, {}); {until}",
+                    describe_gib(*held_bytes)
+                )
             }
-            .describe(),
             Self::BuildVolumeAbsent { path } => format!(
                 "{}: the volume this machine keeps its cells on is not mounted; it takes no work that needs a cell until it returns",
                 build_volume_absent_detail(path)
@@ -17516,34 +17602,51 @@ pub enum DeploymentPhaseReport {
     },
 }
 
-/// A machine the runner holds for an inference deployment while it is
-/// reserving, starting, healthy or stopping: a drain with a named reason, held
-/// by the runner alone. The machine is never told; the deployment's own
-/// commands go to its head, and placement simply offers this machine no batch
-/// work until the hold is released.
+/// A model placement holds resident on one machine, as the runner's placement
+/// weighs it. Runner-side only, like a drain: no executor is ever told, and the
+/// model's own commands go to its deployment's head.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct InferenceHold {
+pub struct MachineModelResident {
+    /// The model's real name.
+    pub model: String,
     pub deployment: String,
-    /// The deployment's phase, as the cairn-inference facet labels it.
+    /// The deployment's phase: reserving, starting, healthy or stopping.
     pub phase: String,
-    /// What a reserving start is waiting on before it loads: its head, or
-    /// the memory the work on its machines holds while they drain.
+    /// The model's footprint on this machine: its last settled load, else
+    /// what its profile states. `None` is unmeasured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub waiting_on: Option<String>,
+    pub held_bytes: Option<u64>,
+    /// Whether the footprint is the memory batch work uses (unified memory).
+    /// False for discrete VRAM, which no batch touches.
+    pub unified: bool,
+    /// A standing lease: never idle, never evicted for room.
+    #[serde(default)]
+    pub pinned: bool,
+    /// A waiting request leases it.
+    #[serde(default)]
+    pub leased: bool,
+    /// When it may be evicted for room if nothing changes: its minimum
+    /// residency and idle window both run out then. `None` while it is
+    /// pinned, leased or loading; a past instant means it may go now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evictable_at_unix_ms: Option<u64>,
 }
 
-impl InferenceHold {
+impl MachineModelResident {
+    /// The model in a few words: "deepseek-ai/DeepSeek-V4-Flash · loading ·
+    /// 101.0 GiB · pinned".
     pub fn describe(&self) -> String {
-        format!(
-            "reserved for inference deployment {} ({}), refusing new work until it stops{}",
-            self.deployment,
-            self.phase,
-            self.waiting_on
-                .as_deref()
-                .map(|on| format!("; its load waits on {on}"))
-                .unwrap_or_default()
-        )
+        let mut parts = vec![self.model.clone(), self.phase.clone()];
+        parts.push(
+            self.held_bytes
+                .map(describe_gib)
+                .unwrap_or_else(|| "footprint unmeasured".to_string()),
+        );
+        if self.pinned {
+            parts.push("pinned".to_string());
+        }
+        parts.join(" · ")
     }
 }
 
@@ -20793,7 +20896,7 @@ mod tests {
             ],
             executors: vec![ExecutorHealthSnapshot {
                 build_volume: None,
-                inference_hold: None,
+                model_residents: Vec::new(),
                 identity: sample_advertisement().identity,
                 public_name: "local".into(),
                 colocated: true,

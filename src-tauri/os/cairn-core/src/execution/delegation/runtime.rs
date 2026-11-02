@@ -3,12 +3,17 @@
 mod common;
 mod results;
 mod resume;
+mod return_followup;
 mod spawn;
+
+#[cfg(test)]
+mod return_followup_tests;
 
 pub(crate) use common::lookup_caller_job_id;
 pub(crate) use resume::{
     is_call_child, resume_parked_parent_after_repair, resume_suspended_parent_after_task_completion,
 };
+pub(crate) use return_followup::{settle_missing_return, MissingReturn};
 pub(crate) use spawn::{
     spawn_call_packets, spawn_task_packets, spawn_workflow_packets, TaskSpawnOutcome,
 };

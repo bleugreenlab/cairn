@@ -259,7 +259,7 @@ mod tests {
             colocated: false,
             health: ExecutorHealthSnapshot {
                 build_volume: None,
-                inference_hold: None,
+                model_residents: Vec::new(),
                 identity: identity.clone(),
                 public_name: name.to_string(),
                 colocated: false,
