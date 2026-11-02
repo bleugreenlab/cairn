@@ -452,6 +452,24 @@ pub struct CommandBatchOwnership {
     pub launched_at_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<CommandItemOwnership>,
+    /// For a per-call batch, the owner its scratch-only repository named
+    /// ([`RepositoryLocator::ScratchOnly`], `page-calls-<project>` for a page
+    /// call). Such a batch runs in a directory of its own beneath the cell's
+    /// scratch ([`crate::executor_paths::per_call_dir_name`]); when its tree
+    /// did not fully end, the cell's drain carries this record, and the cell is
+    /// reported, and its directory reclaimed, under this owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_call_owner: Option<String>,
+}
+
+impl CommandBatchOwnership {
+    /// The name of the per-call directory this batch ran in beneath its cell's
+    /// scratch, when it is a per-call batch.
+    pub fn per_call_dir_name(&self) -> Option<String> {
+        self.per_call_owner
+            .as_ref()
+            .map(|_| crate::executor_paths::per_call_dir_name(&self.request_id, &self.attempt_id))
+    }
 }
 
 /// One requested batch item and every physical launch attempted for it.
@@ -6499,6 +6517,17 @@ pub struct LearnedResourceEstimate {
 /// variant, field or serialized form changes, and a runner talking to an older
 /// executor gets nothing wrong: that executor's diagnostic still names the
 /// authority path, which ends in the cell.
+///
+/// cairn/5756 does not move the number. `CommandBatchOwnership` gains an
+/// optional `perCallOwner`, serde-defaulted and omitted when absent: the owner
+/// a page-call batch's scratch-only repository named, which a cell's drain
+/// carries when that batch's tree did not fully end. A runner talking to an
+/// older executor reads `None` and lists no fenced per-call cell, which is
+/// what that executor reports today; an older runner ignores the key. The rest
+/// is inside the executor and decides nothing a runner does: the per-call
+/// directory's name is derived from the request and attempt rather than drawn
+/// at random, and the directory is kept until its tree is proven gone, then
+/// removed by the release, the drain, the sweep or the pressure ladder.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -22802,8 +22831,10 @@ mod tests {
                     }],
                 }],
             }],
+            per_call_owner: Some("page-calls-p".into()),
         };
         let value = serde_json::to_value(&ownership).unwrap();
+        assert_eq!(value["perCallOwner"], "page-calls-p");
         assert_eq!(value["items"][0]["attempts"][0]["state"], "running");
         assert_eq!(
             value["items"][0]["attempts"][0]["processes"][0]["parent"]["kind"],

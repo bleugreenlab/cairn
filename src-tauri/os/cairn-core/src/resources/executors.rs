@@ -1454,6 +1454,10 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         &capabilities.os,
         executor.captured_at_unix_ms,
     ));
+    out.push_str(&render_fenced_per_call_cells(
+        &executor.occupancy.cells,
+        executor.captured_at_unix_ms,
+    ));
     out.push('\n');
 
     out.push_str("## Occupancy\n");
@@ -3522,6 +3526,77 @@ fn render_stopped_commands(
             age(captured_at_unix_ms.saturating_sub(stop.stopped_at_unix_ms)),
             stop.request_id,
             stop.cause.describe(),
+        ));
+    }
+    out
+}
+
+/// Cells a per-call batch (a page call's) left fenced: the call ended, its
+/// tree did not fully end, and release moved the processes it could not prove
+/// gone into the cell's drain. Keyed by the owner the batch's scratch-only
+/// repository named, which is how an operator finds whose calls they were.
+///
+/// Said only when there is one. The cell leaves the fence only when its drain
+/// proves those processes gone (signalling the ones its launch recorded), and
+/// its per-call directory goes with the drain or, under disk pressure, to the
+/// storage ladder first.
+fn render_fenced_per_call_cells(
+    cells: &[cairn_common::executor_protocol::PersistentCellState],
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut fenced = cells
+        .iter()
+        .filter_map(|cell| {
+            let draining = cell.occupancy.draining.as_ref()?;
+            let owner = draining.ownership.per_call_owner.as_deref()?;
+            Some((owner, cell, draining))
+        })
+        .collect::<Vec<_>>();
+    if fenced.is_empty() {
+        return String::new();
+    }
+    fenced.sort_by(|left, right| {
+        left.0
+            .cmp(right.0)
+            .then_with(|| left.1.cell_id.cmp(&right.1.cell_id))
+    });
+    let mut out = String::from("\n## Fenced per-call cells\n");
+    for (owner, cell, draining) in fenced {
+        let pids = draining
+            .ownership
+            .items
+            .iter()
+            .flat_map(|item| &item.attempts)
+            .flat_map(|attempt| &attempt.processes)
+            .map(|process| process.pid.to_string())
+            .collect::<Vec<_>>();
+        let alive = if pids.is_empty() {
+            "no recorded process left; waiting on what a scan of its directory finds".to_string()
+        } else {
+            format!("pids {} recorded alive", pids.join(", "))
+        };
+        // The scratch's place under the executor's root, never the machine's
+        // absolute path.
+        let directory = draining
+            .ownership
+            .per_call_dir_name()
+            .and_then(|name| {
+                let scratch = cairn_common::executor_paths::cell_scratch_dir(
+                    std::path::Path::new(&cell.authority_path),
+                )?;
+                Some(format!(
+                    "{}/{}/{name}",
+                    cairn_common::executor_paths::SCRATCH_TREES_DIR,
+                    scratch.file_name()?.to_string_lossy()
+                ))
+            })
+            .unwrap_or_else(|| "its per-call directory".into());
+        out.push_str(&format!(
+            "- `{owner}`: {} (project {}), request {}, released {}; its tree did not fully end: {alive}. The cell takes no work until they are gone; `{directory}` goes with them, or to the storage ladder first under disk pressure\n",
+            cell.cell_id,
+            slot_project_name(cell),
+            draining.ownership.request_id,
+            age(captured_at_unix_ms.saturating_sub(draining.released_at_unix_ms)),
         ));
     }
     out
@@ -5753,6 +5828,74 @@ mod tests {
             "occupancy": {}
         }))
         .unwrap()
+    }
+
+    /// A page call whose tree did not fully end leaves its cell fenced, and
+    /// the page names it by the owner the call's batch ran under, with what
+    /// still holds it and where its directory is, and nothing private.
+    #[test]
+    fn a_fenced_per_call_cell_is_named_by_its_owner() {
+        use cairn_common::executor_protocol::{
+            CommandAttemptOwnership, CommandBatchOwnership, CommandItemOwnership,
+            CommandPhysicalProcessIdentity, CommandProcessParentEvidence, DrainingCommandOwnership,
+        };
+        let mut executor = inspection("local", true);
+        let mut ordinary = cached_slot();
+        ordinary.occupancy.draining = Some(DrainingCommandOwnership::default());
+        executor.occupancy.cells = vec![ordinary];
+        assert!(
+            !render_executor(&executor).contains("Fenced per-call cells"),
+            "a drain that is not a per-call batch's is not reported as one"
+        );
+
+        let mut fenced = cached_slot();
+        fenced.authority_path = "/private/machine/build-slots/CAIRN/.authority/slot-1".into();
+        fenced.occupancy.draining = Some(DrainingCommandOwnership {
+            cell_epoch: 3,
+            released_at_unix_ms: CAPTURED_AT - 300_000,
+            ownership: CommandBatchOwnership {
+                request_id: "request-7".into(),
+                attempt_id: "attempt-7".into(),
+                per_call_owner: Some("page-calls-cairn".into()),
+                items: vec![CommandItemOwnership {
+                    attempts: vec![CommandAttemptOwnership {
+                        processes: vec![CommandPhysicalProcessIdentity {
+                            pid: 4242,
+                            process_group_id: Some(4242),
+                            session_id: None,
+                            start_token: "token".into(),
+                            launch_nonce: "nonce".into(),
+                            observed_at_unix_ms: 1,
+                            parent: CommandProcessParentEvidence::Leader,
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        });
+        executor.occupancy.cells = vec![fenced];
+        let rendered = render_executor(&executor);
+        let directory = format!(
+            "tmp/{}/{}",
+            cairn_common::executor_paths::cell_scratch_dir(std::path::Path::new(
+                "/private/machine/build-slots/CAIRN/.authority/slot-1"
+            ))
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+            cairn_common::executor_paths::per_call_dir_name("request-7", "attempt-7")
+        );
+        assert!(rendered.contains("## Fenced per-call cells"), "{rendered}");
+        assert!(
+            rendered.contains(&format!(
+                "- `page-calls-cairn`: slot-1 (project CAIRN), request request-7, released 5m ago; its tree did not fully end: pids 4242 recorded alive. The cell takes no work until they are gone; `{directory}` goes with them"
+            )),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/private/"), "{rendered}");
     }
 
     #[test]

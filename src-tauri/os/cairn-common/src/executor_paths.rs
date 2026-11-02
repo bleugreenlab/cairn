@@ -125,6 +125,45 @@ pub fn cell_scratch_dir(authority: &Path) -> Option<PathBuf> {
         relative.as_os_str().as_encoded_bytes(),
     )))
 }
+
+/// The prefix of a per-call directory's name inside a cell's scratch.
+pub const PER_CALL_DIR_PREFIX: &str = "pc-";
+/// Hex digits of the digest in a per-call directory's name.
+pub const PER_CALL_DIR_DIGEST_HEX: usize = 12;
+
+/// The directory a per-call batch (a page call's) runs in beneath its cell's
+/// scratch, `pc-<hex>`: its items' cwd, `HOME` and `TMPDIR`.
+///
+/// Derived from the request and attempt the batch was placed under, never
+/// recorded, so everything that holds the batch's ownership names the same
+/// directory: the release that removes it once its tree is proven gone, the
+/// drain that waits on a survivor in it, the sweep that discards one nothing
+/// names, and the executor page that reports it. Fixed length for the reason a
+/// scratch tree's name is (see [`SCRATCH_TREES_DIR`]): a socket bound in it
+/// has to fit `sun_path`.
+pub fn per_call_dir_name(request_id: &str, attempt_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(request_id.as_bytes());
+    digest.update([0]);
+    digest.update(attempt_id.as_bytes());
+    format!(
+        "{PER_CALL_DIR_PREFIX}{}",
+        &hex::encode(digest.finalize())[..PER_CALL_DIR_DIGEST_HEX]
+    )
+}
+
+/// Whether `name` has the shape [`per_call_dir_name`] gives. A staged discard
+/// beside one (`<name>.discard-*`) does not.
+pub fn is_per_call_dir_name(name: &str) -> bool {
+    name.strip_prefix(PER_CALL_DIR_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == PER_CALL_DIR_DIGEST_HEX
+                && digest
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 /// Cache home's directory under a configured build root.
 pub const CACHE_HOME_DIR: &str = "cache-home";
 /// The environment variable naming cache home to processes Cairn launches.
@@ -436,6 +475,23 @@ mod tests {
             ScratchTreeKind::Cell,
             &name.to_uppercase()
         ));
+    }
+
+    #[test]
+    fn a_per_call_directory_is_named_by_its_request_and_attempt() {
+        let name = per_call_dir_name("request-1", "attempt-1");
+        assert_eq!(name, per_call_dir_name("request-1", "attempt-1"));
+        assert_eq!(
+            name.len(),
+            PER_CALL_DIR_PREFIX.len() + PER_CALL_DIR_DIGEST_HEX
+        );
+        assert!(is_per_call_dir_name(&name), "{name}");
+        assert_ne!(name, per_call_dir_name("request-1", "attempt-2"));
+        // The separator keeps the two ids from sliding into each other.
+        assert_ne!(per_call_dir_name("ab", "c"), per_call_dir_name("a", "bc"));
+        assert!(!is_per_call_dir_name(&format!("{name}.discard-1-x")));
+        assert!(!is_per_call_dir_name("pc-"));
+        assert!(!is_per_call_dir_name("c0123456789a"));
     }
 
     #[test]
