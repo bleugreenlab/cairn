@@ -20,6 +20,10 @@ pub enum SurfaceKind {
     ThreadChannel,
     UnmanagedHome,
     IssueThread,
+    /// The project's `ambient` text channel: bound to the project root rather
+    /// than to one thread, through an ambient binding. Distinct from
+    /// `UnmanagedHome`, which parents ownerless issue threads.
+    AmbientHome,
 }
 
 fn render_issue_seed(title: &str, description: Option<&str>, target: &str) -> String {
@@ -148,6 +152,74 @@ pub async fn ensure_thread_surface(
     ensure_thread_under(db, guild_id, project_key, thread_target, category.id, now).await
 }
 
+/// Materialize a project's ambient channel under its category.
+pub async fn ensure_ambient_surface(
+    db: &LocalDb,
+    guild_id: u64,
+    project_key: &str,
+    now: i64,
+) -> Result<DiscordSurface, String> {
+    let category = ensure_surface(
+        db,
+        guild_id,
+        SurfaceKind::ProjectCategory,
+        project_key,
+        None,
+        None,
+        now,
+    )
+    .await?;
+    ensure_ambient_under(db, guild_id, project_key, category.id, now).await
+}
+
+/// Materialize the ambient channel of every project whose category is live.
+/// Idempotent, so the surface loop runs it before each reconcile pass; a
+/// category created before ambient channels existed gains one this way.
+pub async fn ensure_ambient_homes(db: &LocalDb, now: i64) -> Result<(), String> {
+    let categories = db
+        .query_all(
+            format!(
+                "SELECT {COLUMNS} FROM discord_surface
+                  WHERE surface_kind = 'project_category' AND observed_state = 'active'
+                  ORDER BY id"
+            ),
+            (),
+            DiscordSurface::from_row,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    for category in categories {
+        ensure_ambient_under(
+            db,
+            category.guild_id,
+            &category.project_key,
+            category.id,
+            now,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_ambient_under(
+    db: &LocalDb,
+    guild_id: u64,
+    project_key: &str,
+    category_id: i64,
+    now: i64,
+) -> Result<DiscordSurface, String> {
+    ensure_surface(
+        db,
+        guild_id,
+        SurfaceKind::AmbientHome,
+        project_key,
+        Some(&cairn_common::uri::build_project_uri(project_key)),
+        Some(category_id),
+        now,
+    )
+    .await
+}
+
 async fn ensure_thread_under(
     db: &LocalDb,
     guild_id: u64,
@@ -257,7 +329,7 @@ mod tests {
             _marker: &str,
         ) -> Result<u64, String> {
             self.created.lock().unwrap().push(name.into());
-            Ok(101)
+            Ok(if name == "ambient" { 103 } else { 101 })
         }
         async fn send_message(&self, _channel_id: u64, body: &str) -> Result<u64, String> {
             self.seeds.fetch_add(1, Ordering::SeqCst);
@@ -347,6 +419,91 @@ mod tests {
         let summary = rendered.split("\n\n").nth(1).unwrap();
         assert!(summary.ends_with("complete…"));
         assert!(!summary.contains("unfinishedword"));
+    }
+
+    /// A live project category gains one `ambient` text channel, bound to the
+    /// project root through exactly one ambient binding that carries agent text
+    /// only and is never focused. Ensuring and reconciling again changes nothing.
+    #[tokio::test]
+    async fn a_live_category_gains_one_ambient_channel_with_one_ambient_binding() {
+        let db = Arc::new(crate::storage::migrated_test_db("discord-ambient-home.db").await);
+        ensure_surface(
+            &db,
+            1,
+            SurfaceKind::ProjectCategory,
+            "Cairn",
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let ambient_surfaces = || async {
+            db.query_all(
+                format!(
+                    "SELECT {COLUMNS} FROM discord_surface WHERE surface_kind = 'ambient_home'"
+                ),
+                (),
+                DiscordSurface::from_row,
+            )
+            .await
+            .unwrap()
+        };
+        ensure_ambient_homes(&db, 10).await.unwrap();
+        assert!(
+            ambient_surfaces().await.is_empty(),
+            "a category not yet created remotely parents nothing"
+        );
+
+        let api = Arc::new(FakeDiscordApi::default());
+        let reconciler = DiscordSurfaceReconciler::new(db.clone(), api.clone());
+        assert_eq!(reconciler.reconcile_due(11).await.unwrap(), 1);
+        ensure_ambient_homes(&db, 12).await.unwrap();
+        assert_eq!(reconciler.reconcile_due(12).await.unwrap(), 1);
+        assert_eq!(&*api.created.lock().unwrap(), &["cairn", "ambient"]);
+
+        let surfaces = ambient_surfaces().await;
+        assert_eq!(surfaces.len(), 1);
+        let surface = &surfaces[0];
+        assert_eq!(surface.target_uri.as_deref(), Some("cairn://p/cairn"));
+        assert_eq!(surface.remote_channel_id, Some(103));
+        assert_eq!(surface.observed_state, "active");
+        assert_eq!(
+            marker(surface),
+            "cairn:surface:ambient_home:cairn://p/cairn"
+        );
+        let bindings = || async {
+            db.query_all(
+                "SELECT conversation, target_uri, binding_kind, message_classes, selected_at
+                   FROM channel_conversation_binding ORDER BY conversation",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.i64(3)?,
+                        row.opt_i64(4)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap()
+        };
+        let expected = vec![(
+            "discord:1/103".to_string(),
+            "cairn://p/cairn".to_string(),
+            "ambient".to_string(),
+            super::super::bindings::MESSAGE_CLASS_AGENT_TEXT,
+            None,
+        )];
+        assert_eq!(bindings().await, expected);
+
+        ensure_ambient_homes(&db, 13).await.unwrap();
+        assert_eq!(reconciler.reconcile_due(13).await.unwrap(), 0);
+        assert_eq!(ambient_surfaces().await.len(), 1);
+        assert_eq!(api.created.lock().unwrap().len(), 2);
+        assert_eq!(bindings().await, expected);
     }
 
     #[tokio::test]
@@ -1021,6 +1178,7 @@ impl SurfaceKind {
             Self::ThreadChannel => "thread_channel",
             Self::UnmanagedHome => "unmanaged_home",
             Self::IssueThread => "issue_thread",
+            Self::AmbientHome => "ambient_home",
         }
     }
 
@@ -1030,6 +1188,7 @@ impl SurfaceKind {
             "thread_channel" => Ok(Self::ThreadChannel),
             "unmanaged_home" => Ok(Self::UnmanagedHome),
             "issue_thread" => Ok(Self::IssueThread),
+            "ambient_home" => Ok(Self::AmbientHome),
             other => Err(format!("unknown Discord surface kind {other:?}")),
         }
     }
@@ -1292,7 +1451,7 @@ impl DiscordSurfaceReconciler {
                 .create_category(row.guild_id, &name, &marker(row))
                 .await
                 .map(|id| (id, None)),
-            SurfaceKind::ThreadChannel | SurfaceKind::UnmanagedHome => {
+            SurfaceKind::ThreadChannel | SurfaceKind::UnmanagedHome | SurfaceKind::AmbientHome => {
                 let parent = self.parent_remote(row).await?;
                 self.api
                     .create_text_channel(row.guild_id, parent, &name, &marker(row))
@@ -1533,15 +1692,30 @@ impl DiscordSurfaceReconciler {
         else {
             return Ok(());
         };
+        let (kind, classes) = match row.kind {
+            // The ambient channel belongs to the whole project: threads may
+            // speak there, and no operator ask is ever carried there.
+            SurfaceKind::AmbientHome => (
+                super::bindings::BindingKind::Ambient,
+                super::bindings::MESSAGE_CLASS_AGENT_TEXT,
+            ),
+            // A thread or issue speaking in its own channel is the point of the
+            // surface, so structural rows carry the agent-text grant too.
+            SurfaceKind::ProjectCategory
+            | SurfaceKind::ThreadChannel
+            | SurfaceKind::UnmanagedHome
+            | SurfaceKind::IssueThread => (
+                super::bindings::BindingKind::Structural,
+                super::bindings::MESSAGE_CLASSES_ALL | super::bindings::MESSAGE_CLASS_AGENT_TEXT,
+            ),
+        };
         super::ledger::bind_target(
             &self.binding_db,
             "discord",
             &format!("discord:{}/{}", row.guild_id, remote),
             target,
-            super::bindings::BindingKind::Structural,
-            // A thread or issue speaking in its own channel is the point of the
-            // surface, so structural rows carry the agent-text grant too.
-            super::bindings::MESSAGE_CLASSES_ALL | super::bindings::MESSAGE_CLASS_AGENT_TEXT,
+            kind,
+            classes,
             now,
             0,
         )
@@ -1571,6 +1745,9 @@ fn marker(row: &DiscordSurface) -> String {
 }
 
 fn surface_name(row: &DiscordSurface) -> String {
+    if row.kind == SurfaceKind::AmbientHome {
+        return "ambient".into();
+    }
     let source = row
         .target_uri
         .as_deref()

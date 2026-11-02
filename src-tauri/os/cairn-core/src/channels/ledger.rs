@@ -119,6 +119,7 @@ pub struct ActiveBinding {
     pub conversation: String,
     pub target_uri: String,
     pub message_classes: i64,
+    pub binding_kind: String,
 }
 
 /// List every persisted binding that currently carries at least one outbound
@@ -127,7 +128,7 @@ pub struct ActiveBinding {
 /// onto it. A zero-class row is a focus placeholder and is not a binding.
 pub async fn list_active_bindings(db: &LocalDb) -> Result<Vec<ActiveBinding>, String> {
     db.query_all(
-        "SELECT provider, conversation, target_uri, message_classes
+        "SELECT provider, conversation, target_uri, message_classes, binding_kind
            FROM channel_conversation_binding
           WHERE message_classes != 0
           ORDER BY provider, conversation, target_uri",
@@ -138,6 +139,7 @@ pub async fn list_active_bindings(db: &LocalDb) -> Result<Vec<ActiveBinding>, St
                 conversation: row.text(1)?,
                 target_uri: row.text(2)?,
                 message_classes: row.i64(3)?,
+                binding_kind: row.text(4)?,
             })
         },
     )
@@ -387,6 +389,24 @@ pub async fn set_message_class(
         return Err(format!("not a single message class bit: {class}"));
     }
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
+    // Ask the row its kind before validating the target: an ambient row's
+    // target is a project root, which the follow-target check below refuses
+    // with an error that would hide why the change is impossible.
+    let kind = db
+        .query_opt_text(
+            "SELECT binding_kind FROM channel_conversation_binding
+              WHERE provider = ?1 AND conversation = ?2 AND target_uri = ?3",
+            params![
+                provider.to_string(),
+                conversation.clone(),
+                cairn_common::uri::canonicalize_uri_identity(uri)
+            ],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if kind.as_deref() == Some(super::bindings::BindingKind::Ambient.as_str()) {
+        return Err(AMBIENT_CLASSES_FIXED.to_string());
+    }
     let uri = canonical_persisted_target(uri)?;
     let (sql, mask) = if granted {
         (
@@ -407,7 +427,22 @@ pub async fn set_message_class(
         .map_err(|error| error.to_string())
 }
 
+/// Why an ambient binding's classes never change: the CHECK pins them to agent
+/// text, and the operator's switch shows this instead of a constraint failure.
+pub const AMBIENT_CLASSES_FIXED: &str =
+    "ambient conversations carry only agent text; their classes can't be changed";
+
 fn canonical_persisted_target(uri: &str) -> Result<String, String> {
+    canonical_binding_target(uri, super::bindings::BindingKind::Follow)
+}
+
+/// The canonical target a binding of `kind` persists. Follow and structural
+/// bindings target a thread or issue; an ambient binding targets exactly a
+/// project root.
+fn canonical_binding_target(
+    uri: &str,
+    kind: super::bindings::BindingKind,
+) -> Result<String, String> {
     let uri = cairn_common::uri::canonicalize_uri_identity(uri);
     if uri == "cairn:~" || uri.starts_with("cairn:~/") || uri.starts_with("cairn:@") {
         return Err(format!(
@@ -415,8 +450,68 @@ fn canonical_persisted_target(uri: &str) -> Result<String, String> {
         ));
     }
 
-    super::bindings::FollowTarget::parse(&uri)?;
+    match kind {
+        super::bindings::BindingKind::Ambient => {
+            ambient_target_project(&uri)
+                .ok_or_else(|| format!("an ambient binding targets a project root: {uri}"))?;
+        }
+        super::bindings::BindingKind::Follow | super::bindings::BindingKind::Structural => {
+            super::bindings::FollowTarget::parse(&uri)?;
+        }
+    }
     Ok(uri)
+}
+
+/// The project key an ambient binding's target names, when it is a project
+/// root.
+fn ambient_target_project(uri: &str) -> Option<String> {
+    match cairn_common::uri::parse_uri(uri)? {
+        cairn_common::uri::CairnResource::Project { project } => Some(project),
+        _ => None,
+    }
+}
+
+/// The project an ambient conversation belongs to, or `None` when the
+/// conversation has no ambient binding.
+pub async fn ambient_project(
+    db: &LocalDb,
+    provider: &str,
+    conversation: &str,
+) -> Result<Option<String>, String> {
+    let conversation = super::bindings::canonical_conversation(provider, conversation)?;
+    let target = db
+        .query_opt_text(
+            "SELECT target_uri FROM channel_conversation_binding
+              WHERE provider = ?1 AND conversation = ?2 AND binding_kind = 'ambient'",
+            params![provider.to_string(), conversation],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(target.as_deref().and_then(ambient_target_project))
+}
+
+/// Every ambient conversation of `provider`, with its project key, in
+/// conversation order.
+pub async fn list_ambient_conversations(
+    db: &LocalDb,
+    provider: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let rows = db
+        .query_all(
+            "SELECT conversation, target_uri FROM channel_conversation_binding
+              WHERE provider = ?1 AND binding_kind = 'ambient'
+              ORDER BY conversation",
+            params![provider.to_string()],
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(conversation, target)| {
+            ambient_target_project(&target).map(|project| (conversation, project))
+        })
+        .collect())
 }
 
 /// When a failed row last failed, as a SQL expression: the start of its latest
@@ -600,7 +695,7 @@ pub async fn bind_target(
     cursor_rowid: i64,
 ) -> Result<bool, String> {
     let conversation = super::bindings::canonical_conversation(provider, conversation)?;
-    let uri = canonical_persisted_target(uri)?;
+    let uri = canonical_binding_target(uri, binding_kind)?;
     db.execute(
         "INSERT OR IGNORE INTO channel_conversation_binding
           (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid)
@@ -1541,7 +1636,18 @@ pub struct InboundRecord {
     pub received_at: i64,
     pub rejection_reason: Option<String>,
     pub acknowledged_at: Option<i64>,
+    /// For an admitted message, the canonical conversation it arrived in.
+    pub conversation: Option<String>,
+    /// For an admitted message, the target it was delivered into (the project
+    /// root for unaddressed ambient text). Set exactly when the message was
+    /// admitted.
+    pub target_uri: Option<String>,
+    /// For an admitted message, the kind of binding that resolved its target:
+    /// `structural`, `follow`, `ambient`, or `none`.
+    pub binding_kind: Option<String>,
 }
+
+const INBOUND_COLUMNS: &str = "id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at, conversation, target_uri, binding_kind";
 
 impl InboundRecord {
     fn from_row(row: &Row) -> DbResult<Self> {
@@ -1554,24 +1660,41 @@ impl InboundRecord {
             received_at: row.i64(5)?,
             rejection_reason: row.opt_text(6)?,
             acknowledged_at: row.opt_i64(7)?,
+            conversation: row.opt_text(8)?,
+            target_uri: row.opt_text(9)?,
+            binding_kind: row.opt_text(10)?,
         })
     }
 }
 
 pub async fn insert_inbound(db: &LocalDb, record: &InboundRecord) -> Result<bool, String> {
     db.execute(
-        "INSERT OR IGNORE INTO channel_inbound (id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at],
+        format!("INSERT OR IGNORE INTO channel_inbound ({INBOUND_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
+        params![record.id.clone(), record.channel.clone(), record.provider_guid.clone(), record.sender.clone(), record.text.clone(), record.received_at, record.rejection_reason.clone(), record.acknowledged_at, record.conversation.clone(), record.target_uri.clone(), record.binding_kind.clone()],
     ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
+/// One inbound row by id, admitted or not.
+pub async fn get_inbound(db: &LocalDb, id: &str) -> Result<Option<InboundRecord>, String> {
+    db.query_opt(
+        format!("SELECT {INBOUND_COLUMNS} FROM channel_inbound WHERE id = ?1"),
+        params![id.to_string()],
+        InboundRecord::from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// A provider's inbound messages that were NOT admitted: rejected and
+/// unsolicited rows, newest first. Admitted messages carry a target and are
+/// left out, so ordinary traffic never floods this list.
 pub async fn list_inbound(
     db: &LocalDb,
     channel: &str,
     limit: i64,
 ) -> Result<Vec<InboundRecord>, String> {
     db.query_all(
-        "SELECT id, channel, provider_guid, sender, text, received_at, rejection_reason, acknowledged_at FROM channel_inbound WHERE channel = ?1 ORDER BY received_at DESC LIMIT ?2",
+        format!("SELECT {INBOUND_COLUMNS} FROM channel_inbound WHERE channel = ?1 AND target_uri IS NULL ORDER BY received_at DESC LIMIT ?2"),
         params![channel.to_string(), limit.max(0)],
         InboundRecord::from_row,
     ).await.map_err(|error| error.to_string())
@@ -1704,15 +1827,153 @@ mod tests {
                     conversation: "imessage:a@example.com".into(),
                     target_uri: "cairn://p/cairn/4026".into(),
                     message_classes: 3,
+                    binding_kind: "follow".into(),
                 },
                 ActiveBinding {
                     provider: "telegram".into(),
                     conversation: "telegram:20".into(),
                     target_uri: "cairn://p/cairn/general".into(),
                     message_classes: 4,
+                    binding_kind: "follow".into(),
                 },
             ]
         );
+    }
+
+    /// An ambient binding targets exactly a project root, is never a follow or
+    /// a structural target, never carries operator attention, and refuses a
+    /// class change instructively rather than with a target or CHECK error.
+    #[tokio::test]
+    async fn ambient_bindings_name_a_project_and_stay_out_of_every_follow_reader() {
+        use super::super::bindings::{
+            BindingKind, MESSAGE_CLASS_AGENT_TEXT, MESSAGE_CLASS_NOTIFY, MESSAGE_CLASS_PERMISSION,
+            MESSAGE_CLASS_QUESTION,
+        };
+        let db = migrated_test_db("channel-ledger-ambient.db").await;
+        assert!(bind_target(
+            &db,
+            "discord",
+            "discord:1/9",
+            "cairn://p/cairn/general",
+            BindingKind::Ambient,
+            MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .unwrap_err()
+        .contains("project root"));
+        assert!(bind_target(
+            &db,
+            "discord",
+            "discord:1/9",
+            "cairn://p/cairn",
+            BindingKind::Structural,
+            MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .is_err());
+        assert!(bind_target(
+            &db,
+            "discord",
+            "discord:1/9",
+            "cairn://p/cairn",
+            BindingKind::Ambient,
+            MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .unwrap());
+        follow_target(&db, "discord", "cairn://p/cairn/general", 2, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ambient_project(&db, "discord", "discord:1/9")
+                .await
+                .unwrap(),
+            Some("cairn".to_string())
+        );
+        assert_eq!(
+            ambient_project(&db, "discord", "discord:1/10")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            list_ambient_conversations(&db, "discord").await.unwrap(),
+            vec![("discord:1/9".to_string(), "cairn".to_string())]
+        );
+        assert_eq!(
+            list_follows(&db, "discord")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|follow| follow.uri)
+                .collect::<Vec<_>>(),
+            vec!["cairn://p/cairn/general".to_string()]
+        );
+        assert!(list_stream_subscriptions(&db, "discord", "discord:1/9")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            lookup_conversation_target(&db, "discord", "discord:1/9")
+                .await
+                .unwrap(),
+            None
+        );
+        for class in [
+            MESSAGE_CLASS_QUESTION,
+            MESSAGE_CLASS_PERMISSION,
+            MESSAGE_CLASS_NOTIFY,
+        ] {
+            // An attention gate's target is a thread or an issue; a project root
+            // is never one, so no gate can reach the ambient row.
+            assert!(
+                list_eligible_bindings(&db, "discord", "cairn://p/cairn", class)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                list_eligible_bindings(&db, "discord", "cairn://p/cairn/general", class)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|binding| binding.binding_kind != "ambient"),
+                "class {class}"
+            );
+        }
+        assert!(list_active_bindings(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|binding| binding.conversation == "discord:1/9"
+                && binding.binding_kind == "ambient"
+                && binding.message_classes == MESSAGE_CLASS_AGENT_TEXT));
+
+        for (class, granted) in [
+            (MESSAGE_CLASS_AGENT_TEXT, false),
+            (MESSAGE_CLASS_AGENT_TEXT, true),
+            (MESSAGE_CLASS_QUESTION, true),
+        ] {
+            assert_eq!(
+                set_message_class(
+                    &db,
+                    "discord",
+                    "discord:1/9",
+                    "cairn://p/cairn",
+                    class,
+                    granted
+                )
+                .await
+                .unwrap_err(),
+                AMBIENT_CLASSES_FIXED
+            );
+        }
     }
 
     #[tokio::test]
@@ -2691,6 +2952,9 @@ mod tests {
             received_at: 20,
             rejection_reason: Some("allowlist".into()),
             acknowledged_at: None,
+            conversation: None,
+            target_uri: None,
+            binding_kind: None,
         };
         assert!(insert_inbound(&db, &inbound).await.unwrap());
         let mut duplicate = inbound.clone();

@@ -6444,6 +6444,162 @@ mod tests {
         }
     }
 
+    /// The ambient-channel migration rebuilds `discord_surface` (which
+    /// references itself) and `channel_conversation_binding` to widen their
+    /// CHECKs. Every row, including a child surface's parent link, a focus
+    /// placeholder, and a structural row's agent-text bit, has to survive; the
+    /// new constraints then fence ambient rows to exactly agent text, unfocused,
+    /// one per conversation, and keep pre-0176 inbound rows unsolicited.
+    #[tokio::test]
+    async fn channel_ambient_rebuild_conserves_rows_and_fences_ambient_bindings() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("channel-ambient.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0328_channel_ambient")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            head.len() < TURSO_MIGRATIONS.len(),
+            "the ambient migration is in the private lineage"
+        );
+        MigrationRunner::new(head).run(&db).await.unwrap();
+
+        db.execute_batch(
+            "INSERT INTO discord_surface (id, guild_id, surface_kind, project_key, updated_at)
+                 VALUES (1, '1', 'project_category', 'cairn', 1);
+             INSERT INTO discord_surface (id, guild_id, surface_kind, project_key, target_uri, parent_surface_id, remote_channel_id, observed_state, updated_at)
+                 VALUES (2, '1', 'thread_channel', 'cairn', 'cairn://p/cairn/general', 1, '102', 'active', 1),
+                        (3, '1', 'issue_thread', 'cairn', 'cairn://p/cairn/7', 2, '103', 'active', 1);
+             INSERT INTO channel_conversation_binding
+                 (provider, conversation, target_uri, binding_kind, message_classes, followed_at, selected_at)
+                 VALUES ('discord', 'discord:1/102', 'cairn://p/cairn/general', 'structural', 15, 1, NULL),
+                        ('telegram', 'telegram:0', 'cairn://p/cairn/general', 'follow', 7, 1, NULL),
+                        ('telegram', 'telegram:0', 'cairn://p/cairn/7', 'follow', 0, 1, 5);
+             INSERT INTO channel_inbound (id, channel, sender, text, received_at)
+                 VALUES ('legacy', 'imessage', '+1555', 'from before 0176', 1);",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || ':' || surface_kind || ':' || COALESCE(parent_surface_id, '-'), ',') FROM (SELECT * FROM discord_surface ORDER BY id)"
+            )
+            .await
+            .unwrap(),
+            "1:project_category:-,2:thread_channel:1,3:issue_thread:2"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(conversation || '|' || target_uri || '|' || binding_kind || '|' || message_classes || '|' || COALESCE(selected_at, '-'), ',') FROM (SELECT * FROM channel_conversation_binding ORDER BY provider, conversation, target_uri)"
+            )
+            .await
+            .unwrap(),
+            "discord:1/102|cairn://p/cairn/general|structural|15|-,telegram:0|cairn://p/cairn/7|follow|0|5,telegram:0|cairn://p/cairn/general|follow|7|-"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM channel_inbound WHERE id = 'legacy' AND rejection_reason IS NULL AND target_uri IS NULL"
+            )
+            .await
+            .unwrap(),
+            1,
+            "a pre-0176 row stays an unsolicited row"
+        );
+
+        let insert_binding = |conversation: &'static str, classes: i64, selected: Option<i64>| {
+            let db = &db;
+            async move {
+                db.execute(
+                    "INSERT INTO channel_conversation_binding
+                       (provider, conversation, target_uri, binding_kind, message_classes, followed_at, selected_at)
+                     VALUES ('discord', ?1, 'cairn://p/cairn', 'ambient', ?2, 1, ?3)",
+                    (conversation, classes, selected),
+                )
+                .await
+            }
+        };
+        insert_binding("discord:1/104", 8, None).await.unwrap();
+        for classes in [0, 7, 15] {
+            assert!(
+                insert_binding("discord:1/105", classes, None)
+                    .await
+                    .is_err(),
+                "an ambient row with classes {classes} must be refused"
+            );
+        }
+        assert!(
+            insert_binding("discord:1/105", 8, Some(1)).await.is_err(),
+            "an ambient row is never focused"
+        );
+        assert!(
+            db.execute(
+                "INSERT INTO channel_conversation_binding
+                   (provider, conversation, target_uri, binding_kind, message_classes, followed_at)
+                 VALUES ('discord', 'discord:1/104', 'cairn://p/site', 'ambient', 8, 1)",
+                (),
+            )
+            .await
+            .is_err(),
+            "a conversation has one ambient row"
+        );
+
+        db.execute(
+            "INSERT INTO discord_surface (guild_id, surface_kind, project_key, target_uri, parent_surface_id, updated_at)
+             VALUES ('1', 'ambient_home', 'cairn', 'cairn://p/cairn', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.execute(
+                "INSERT INTO discord_surface (guild_id, surface_kind, project_key, parent_surface_id, updated_at)
+                 VALUES ('2', 'ambient_home', 'cairn', 1, 1)",
+                (),
+            )
+            .await
+            .is_err(),
+            "an ambient_home surface carries its project root target"
+        );
+        assert!(
+            db.execute(
+                "INSERT INTO channel_inbound (id, channel, sender, text, received_at, binding_kind)
+                 VALUES ('bad', 'discord', 'x', 'y', 1, 'mystery')",
+                (),
+            )
+            .await
+            .is_err(),
+            "an admitted row's binding kind is one the router writes"
+        );
+        db.execute(
+            "INSERT INTO channel_inbound (id, channel, sender, text, received_at, rejection_reason)
+             VALUES ('unbound', 'discord', 'x', 'y', 1, 'unbound_conversation')",
+            (),
+        )
+        .await
+        .expect("the reason the router stores for an unbound Discord channel is admitted");
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_channel_inbound%'"
+            )
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn migrated_memories_default_to_draft_intake() {
         let db = migrated_db().await.unwrap();

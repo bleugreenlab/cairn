@@ -70,8 +70,15 @@ pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
         table: "channel_conversation_binding",
         sweep_where_sql: "target_uri = 'cairn://p/' || ?1 OR substr(target_uri, 1, length(?1) + 11) = 'cairn://p/' || ?1 || '/'",
     },
+    // An admitted inbound message records the target it was delivered into:
+    // a thread, an issue, or (for unaddressed ambient text) the project root.
+    KeyAddressedSpec {
+        table: "channel_inbound",
+        sweep_where_sql: "target_uri = 'cairn://p/' || ?1 OR substr(target_uri, 1, length(?1) + 11) = 'cairn://p/' || ?1 || '/'",
+    },
     // `ensure_issue_surface` builds category → thread_channel/unmanaged_home →
-    // issue_thread. Delete one level at a time because `parent_surface_id` is a
+    // issue_thread, and the category also parents the ambient_home channel.
+    // Delete one level at a time because `parent_surface_id` is a
     // self-reference without an ON DELETE action and row order is unspecified.
     KeyAddressedSpec {
         table: "discord_surface",
@@ -79,7 +86,7 @@ pub(super) const CHANNEL_KEY_ADDRESSED: &[KeyAddressedSpec] = &[
     },
     KeyAddressedSpec {
         table: "discord_surface",
-        sweep_where_sql: "project_key = ?1 AND surface_kind IN ('thread_channel','unmanaged_home')",
+        sweep_where_sql: "project_key = ?1 AND surface_kind IN ('thread_channel','unmanaged_home','ambient_home')",
     },
     KeyAddressedSpec {
         table: "discord_surface",
@@ -1441,6 +1448,13 @@ pub(super) mod tests {
               VALUES ('discord', 'discord:1/103', 'cairn://p/{project_key}/1', 'cairn://p/{project_key}/1', '{project_key}', 'channel-job', 1, 1);
             INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, followed_at)
               VALUES ('discord', 'discord:1/103', 'cairn://p/{project_key}/1', 'structural', 7, 1);
+            INSERT INTO discord_surface(id, guild_id, surface_kind, project_key, target_uri, parent_surface_id, updated_at)
+              VALUES (104, '1', 'ambient_home', '{project_key}', 'cairn://p/{project_key}', 101, 1);
+            INSERT INTO channel_conversation_binding(provider, conversation, target_uri, binding_kind, message_classes, followed_at)
+              VALUES ('discord', 'discord:1/104', 'cairn://p/{project_key}', 'ambient', 8, 1);
+            INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
+              VALUES ('inbound-ambient-{project_key}', 'discord', 'operator', 'who owns this?', 1, 'discord:1/104', 'cairn://p/{project_key}', 'ambient'),
+                     ('inbound-thread-{project_key}', 'discord', 'operator', 'hello', 1, 'discord:1/102', 'cairn://p/{project_key}/general', 'structural');
             "#
         ))
         .await
@@ -1666,9 +1680,12 @@ pub(super) mod tests {
         // The schema cannot distinguish a project URI in `target_uri` from any
         // other string, so this part of the manifest is necessarily maintained
         // by hand rather than discovered through a column or foreign key.
-        assert!(CHANNEL_KEY_ADDRESSED
-            .iter()
-            .any(|spec| spec.table == "channel_conversation_binding"));
+        for table in ["channel_conversation_binding", "channel_inbound"] {
+            assert!(
+                CHANNEL_KEY_ADDRESSED.iter().any(|spec| spec.table == table),
+                "{table} addresses projects by target URI but is absent from the channel sweep"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1895,6 +1912,7 @@ pub(super) mod tests {
             "discord_surface",
             "channel_state_card",
             "channel_conversation_binding",
+            "channel_inbound",
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
@@ -1977,6 +1995,13 @@ pub(super) mod tests {
         )
         .await
         .unwrap();
+        db.execute(
+            "INSERT INTO channel_inbound(id, channel, sender, text, received_at, conversation, target_uri, binding_kind)
+             VALUES ('inbound-neighbour', 'discord', 'operator', 'hi', 1, 'discord:1/998', 'cairn://p/mixedcase_', 'ambient')",
+            (),
+        )
+        .await
+        .unwrap();
 
         sweep_project_channel_surfaces(&db, "MixedCase")
             .await
@@ -1985,6 +2010,13 @@ pub(super) mod tests {
         assert_eq!(count_rows(&db, "discord_surface").await, 0);
         assert_eq!(count_rows(&db, "channel_state_card").await, 0);
         assert_eq!(count_rows(&db, "channel_conversation_binding").await, 1);
+        assert_eq!(
+            db.query_text("SELECT id FROM channel_inbound", ())
+                .await
+                .unwrap(),
+            Some("inbound-neighbour".to_string()),
+            "a project's sweep must leave a neighbouring key's admitted messages"
+        );
         assert_eq!(
             db.query_text("SELECT target_uri FROM channel_conversation_binding", ())
                 .await
@@ -2318,6 +2350,7 @@ pub(super) mod tests {
             "discord_surface",
             "channel_state_card",
             "channel_conversation_binding",
+            "channel_inbound",
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",
@@ -2341,6 +2374,7 @@ pub(super) mod tests {
             "discord_surface",
             "channel_state_card",
             "channel_conversation_binding",
+            "channel_inbound",
             "channel_outbound",
             "channel_ask_action",
             "channel_ask_resolution",

@@ -148,15 +148,10 @@ pub async fn ensure_discord_thread_surface(
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Project not found after thread creation: {project_id}"))?;
-    let target = format!("cairn://p/{}/{}", project.key, thread_name);
-    discord_surfaces::ensure_thread_surface(
-        db,
-        guild_id,
-        &project.key,
-        &target,
-        chrono::Utc::now().timestamp(),
-    )
-    .await?;
+    let target = cairn_common::uri::build_thread_uri(&project.key, thread_name);
+    let now = chrono::Utc::now().timestamp();
+    discord_surfaces::ensure_thread_surface(db, guild_id, &project.key, &target, now).await?;
+    discord_surfaces::ensure_ambient_surface(db, guild_id, &project.key, now).await?;
     wake_discord_surfaces();
     Ok(())
 }
@@ -291,6 +286,9 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
             loop {
                 let now = chrono::Utc::now().timestamp();
                 for db in surface_orch.db.all_dbs().await {
+                    if let Err(error) = discord_surfaces::ensure_ambient_homes(&db, now).await {
+                        log::warn!("could not ensure Discord ambient channels: {error}");
+                    }
                     let reconciler = discord_surfaces::DiscordSurfaceReconciler::with_binding_db(
                         db.clone(),
                         surface_orch.db.local.clone(),
@@ -795,6 +793,150 @@ pub struct ChannelRuntimeStatus {
     /// the reading an escalation bound would eventually be chosen from, which is
     /// why it ships before any bound does.
     pub oldest_held_ask_age_seconds: Option<i64>,
+    /// One entry per ambient conversation of this provider: whether any route
+    /// acts on its unaddressed messages. An ambient channel whose messages
+    /// nothing consumes is still logged, and this is what says so.
+    pub ambient: Vec<AmbientConversationStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmbientConversationStatus {
+    pub project: String,
+    pub conversation: String,
+    /// The enabled routes whose triggers take this conversation's unaddressed
+    /// messages, by id.
+    pub consuming_routes: Vec<String>,
+    pub detail: Option<String>,
+}
+
+/// The fields of a `channel_message` fact that the status row can know without
+/// a message: what every unaddressed message in the conversation carries. A
+/// clause key names its field directly or as `<field>Prefix`.
+const AMBIENT_STATUS_FIELDS: &[&str] = &[
+    "fact",
+    "presence",
+    "project",
+    "provider",
+    "conversation",
+    "bindingKind",
+    "addressed",
+    "target",
+];
+
+/// The enabled routes in `project`'s scope whose triggers take an unaddressed
+/// message in this ambient conversation, under either operator presence. A
+/// clause's conditions on per-message fields (sender, text, ...) are assumed
+/// satisfiable: such a route consumes some of the channel's messages.
+pub(crate) async fn ambient_consuming_routes(
+    orch: &crate::orchestrator::Orchestrator,
+    provider_id: &str,
+    conversation: &str,
+    project: &str,
+) -> Result<Vec<String>, String> {
+    let project_path = orch
+        .db
+        .for_project(project)
+        .await
+        .query_opt_text(
+            "SELECT repo_path FROM projects WHERE lower(key) = ?1",
+            (cairn_common::uri::canonical_project(project),),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .map(std::path::PathBuf::from);
+    let routes = orch.fact_log.index.routes(
+        &orch.config_dir,
+        project_path.as_deref(),
+        orch.services.clock.now(),
+    )?;
+    let fields = std::collections::BTreeMap::from([
+        (
+            "project".to_string(),
+            serde_json::json!(cairn_common::uri::canonical_project(project)),
+        ),
+        ("provider".to_string(), serde_json::json!(provider_id)),
+        ("conversation".to_string(), serde_json::json!(conversation)),
+        (
+            "bindingKind".to_string(),
+            serde_json::json!(bindings::BindingKind::Ambient.as_str()),
+        ),
+        ("addressed".to_string(), serde_json::json!(false)),
+        (
+            "target".to_string(),
+            serde_json::json!(cairn_common::uri::build_project_uri(project)),
+        ),
+    ]);
+    let mut consuming = Vec::new();
+    for route in routes.routes_for("channel_message") {
+        let knowable: Vec<crate::routes::TriggerClause> = route
+            .definition
+            .triggers()
+            .map(|clause| {
+                clause
+                    .iter()
+                    .filter(|(key, _)| {
+                        let field = key.strip_suffix("Prefix").unwrap_or(key);
+                        AMBIENT_STATUS_FIELDS.contains(&field)
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .collect();
+        let consumes = [
+            crate::routes::Presence::Active,
+            crate::routes::Presence::Away,
+        ]
+        .into_iter()
+        .any(|presence| {
+            crate::routes::matches(
+                &knowable,
+                &crate::routes::Fact {
+                    source: "channel_message",
+                    fields: &fields,
+                    presence,
+                },
+            )
+        });
+        if consumes {
+            consuming.push(route.id.clone());
+        }
+    }
+    Ok(consuming)
+}
+
+async fn ambient_status(
+    orch: &crate::orchestrator::Orchestrator,
+    provider_id: &str,
+) -> Vec<AmbientConversationStatus> {
+    let conversations = ledger::list_ambient_conversations(&orch.db.local, provider_id)
+        .await
+        .unwrap_or_default();
+    let mut statuses = Vec::with_capacity(conversations.len());
+    for (conversation, project) in conversations {
+        let (consuming_routes, detail) =
+            match ambient_consuming_routes(orch, provider_id, &conversation, &project).await {
+                Ok(routes) if routes.is_empty() => (
+                    routes,
+                    Some(format!(
+                        "No route consumes this channel; messages are logged to {}/events but not routed.",
+                        cairn_common::uri::build_project_uri(&project)
+                    )),
+                ),
+                Ok(routes) => (routes, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!("Could not read this project's routes: {error}")),
+                ),
+            };
+        statuses.push(AmbientConversationStatus {
+            project,
+            conversation,
+            consuming_routes,
+            detail,
+        });
+    }
+    statuses
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -911,6 +1053,7 @@ pub async fn runtime_status(
         .copied()
         .unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
+    let ambient = ambient_status(orch, provider_id).await;
     ChannelRuntimeStatus {
         provider: provider_id,
         state,
@@ -929,6 +1072,7 @@ pub async fn runtime_status(
         oldest_held_ask_age_seconds: held
             .oldest_held_at
             .map(|raised| now.saturating_sub(raised).max(0)),
+        ambient,
     }
 }
 

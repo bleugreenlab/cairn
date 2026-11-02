@@ -331,6 +331,18 @@ pub async fn hydrate(orch: &Orchestrator, row: &FactRow) -> Result<Hydrated, Str
             .ok_or_else(|| format!("ingress event {id} no longer exists"))?;
         fact.fields.insert("body".into(), Value::String(body));
     }
+    if row.source == "channel_message" {
+        let id = row
+            .record_id
+            .as_deref()
+            .ok_or_else(|| format!("channel_message row {} has no inbound id", row.id))?;
+        let inbound = crate::channels::ledger::get_inbound(&orch.db.local, id)
+            .await?
+            .ok_or_else(|| format!("channel inbound message {id} no longer exists"))?;
+        fact.fields
+            .insert("text".into(), Value::String(inbound.text));
+        occurred_at_ms = Some(inbound.received_at);
+    }
     Ok(Hydrated {
         fact,
         presence: presence_from_str(&row.presence),

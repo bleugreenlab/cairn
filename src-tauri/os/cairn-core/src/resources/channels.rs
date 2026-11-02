@@ -1,7 +1,7 @@
 use crate::{
     channels::{
         bindings::{
-            canonical_conversation, legacy_conversation, MESSAGE_CLASS_AGENT_TEXT,
+            canonical_conversation, legacy_conversation, BindingKind, MESSAGE_CLASS_AGENT_TEXT,
             MESSAGE_CLASS_NOTIFY, MESSAGE_CLASS_PERMISSION, MESSAGE_CLASS_QUESTION,
         },
         conversation_capabilities, ledger, runtime_status, ConversationAddress,
@@ -70,6 +70,11 @@ pub struct ConversationRow {
     /// can ever be sent to it whatever its classes say.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub placeholder: bool,
+    /// Set (and serialized) only on an ambient conversation: one bound to a
+    /// whole project, whose classes are fixed at agent text, so the operator
+    /// has no agent-text switch to flip there.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ambient: bool,
     /// The binding's raw class bits; `classes` is their rendering.
     #[serde(skip)]
     message_classes: i64,
@@ -161,10 +166,12 @@ pub async fn set_agent_text(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_for_status(
     address: ConversationAddress,
     target: String,
     message_classes: i64,
+    ambient: bool,
     state: &'static str,
     detail: Option<String>,
     last_error: Option<String>,
@@ -201,6 +208,7 @@ fn row_for_status(
         failed_count,
         send: None,
         placeholder: is_placeholder(&address),
+        ambient,
         message_classes,
         runtime_state: state,
         runtime_detail: detail,
@@ -277,11 +285,13 @@ where
                 status
             }
         };
+        let ambient = binding.binding_kind == BindingKind::Ambient.as_str();
         match binding.conversation.parse::<ConversationAddress>() {
             Ok(address) => rows.push(row_for_status(
                 address,
                 binding.target_uri,
                 binding.message_classes,
+                ambient,
                 status.state,
                 status.detail,
                 status.last_send_error,
@@ -299,6 +309,7 @@ where
                 failed_count: status.failed_count,
                 send: None,
                 placeholder: false,
+                ambient,
                 message_classes: binding.message_classes,
                 runtime_state: "invalid",
                 runtime_detail: None,
@@ -464,6 +475,7 @@ mod tests {
             address,
             "cairn://p/cairn/general".into(),
             classes,
+            false,
             state,
             detail.map(str::to_string),
             last_error.map(str::to_string),
@@ -669,6 +681,7 @@ mod tests {
             ConversationAddress::discord("1", "2").unwrap(),
             "cairn://p/cairn/general".into(),
             MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT,
+            false,
             RUNTIME_UP,
             None,
             last_error,
@@ -847,6 +860,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// An ambient conversation is enumerated, marked, and sendable like any
+    /// agent-text binding, but the operator's switch cannot change it.
+    #[tokio::test]
+    async fn ambient_conversations_are_marked_sendable_and_fixed() {
+        use crate::channels::bindings::BindingKind;
+        let db = crate::storage::migrated_test_db("channels-ambient-row.db").await;
+        assert!(ledger::bind_target(
+            &db,
+            "discord",
+            "discord:1/9",
+            "cairn://p/cairn",
+            BindingKind::Ambient,
+            MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .unwrap());
+        assert!(ledger::bind_target(
+            &db,
+            "discord",
+            "discord:1/2",
+            "cairn://p/cairn/general",
+            BindingKind::Structural,
+            MESSAGE_CLASSES_ALL | MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .unwrap());
+
+        let rows = conversation_rows(
+            ledger::list_active_bindings(&db).await.unwrap(),
+            |_| true,
+            |_| async {
+                ProviderRowStatus {
+                    state: RUNTIME_UP,
+                    detail: None,
+                    last_send_error: None,
+                    failed_count: 0,
+                }
+            },
+        )
+        .await;
+        let ambient = rows
+            .iter()
+            .find(|row| row.address == "discord:1/9")
+            .unwrap();
+        assert!(ambient.sendable(), "threads reply into the ambient channel");
+        let rendered = serde_json::to_value(ambient).unwrap();
+        assert_eq!(rendered["ambient"], true, "{rendered}");
+        assert_eq!(rendered["target"], "cairn://p/cairn");
+        assert_eq!(rendered["classes"], serde_json::json!(["agent_text"]));
+        let structural = rows
+            .iter()
+            .find(|row| row.address == "discord:1/2")
+            .unwrap();
+        assert!(serde_json::to_value(structural)
+            .unwrap()
+            .get("ambient")
+            .is_none());
+
+        for granted in [false, true] {
+            assert_eq!(
+                set_agent_text(&db, "discord:1/9", "cairn://p/cairn", granted)
+                    .await
+                    .unwrap_err(),
+                ledger::AMBIENT_CLASSES_FIXED
+            );
+        }
     }
 
     #[tokio::test]

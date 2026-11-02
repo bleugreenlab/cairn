@@ -26,6 +26,12 @@ pub const MESSAGE_CLASS_AGENT_TEXT: i64 = 1 << 3;
 pub enum BindingKind {
     Follow,
     Structural,
+    /// A conversation bound to a whole project rather than to one thread: its
+    /// target is the project root, it carries exactly
+    /// [`MESSAGE_CLASS_AGENT_TEXT`], and it is never focused. Unaddressed text
+    /// there is a `channel_message` fact for routes to act on, and threads
+    /// reply into it with agent text. Never resolved as a [`FollowTarget`].
+    Ambient,
 }
 
 impl BindingKind {
@@ -33,6 +39,7 @@ impl BindingKind {
         match self {
             Self::Follow => "follow",
             Self::Structural => "structural",
+            Self::Ambient => "ambient",
         }
     }
 }

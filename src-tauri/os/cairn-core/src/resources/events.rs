@@ -541,6 +541,7 @@ fn record_id_label(source: &str) -> &'static str {
         "post_created" => "posts.id",
         "post_commented" => "post_comments.id",
         "ingress" => "ingress_events.id",
+        "channel_message" => "channel_inbound.id",
         _ => "record id",
     }
 }

@@ -328,12 +328,17 @@ pub struct FactRegistry {
 }
 
 const FILE_CHANGE_STATUSES: &[&str] = &["added", "modified", "deleted", "renamed"];
+/// How a `channel_message` reached its target: the conversation's structural
+/// or ambient binding, a focused follow, or no binding at all (the configured
+/// default thread, or a reply in an unbound conversation).
+const CHANNEL_BINDING_KINDS: &[&str] = &["structural", "follow", "ambient", "none"];
 
 /// The value vocabulary for one fact field. Fields not named here are free text.
 fn vocabulary_for(source: &str, field: &str) -> FieldVocabulary {
     use crate::execution::gates::vocabulary::{GATE_PR_STATES, GATE_RESOLUTIONS, GATE_VERDICTS};
     match (source, field) {
         ("file_changed", "status") => FieldVocabulary::Enum(FILE_CHANGE_STATUSES),
+        ("channel_message", "bindingKind") => FieldVocabulary::Enum(CHANNEL_BINDING_KINDS),
         (_, "status") => FieldVocabulary::Enum(ISSUE_STATUSES),
         (_, "attention") => FieldVocabulary::Enum(ISSUE_ATTENTIONS),
         (_, "label") => FieldVocabulary::Labels,
@@ -508,6 +513,33 @@ impl Default for FactRegistry {
                 ("body", Scalar, HYDRATED),
             ]),
         };
+        // A message a person sent into a channel conversation that the router
+        // admitted: delivered to a target, or unaddressed text in an ambient
+        // conversation (`addressed: false`, target = the project root). The row
+        // points at its `channel_inbound` record, which holds the text. The
+        // sender writes the text, so the summary is built from labels.
+        let channel_message = SourceSpec {
+            dedupe: LogDedupe::Unique,
+            audience: Audience::AllProviders,
+            max_stored_chars: None,
+            addressees: &[],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::Drop,
+            untrusted: Some(&["provider", "bindingKind", "conversation", "sender"]),
+            fields: fields(&[
+                ("project", Scalar, STORED),
+                ("provider", Scalar, STORED),
+                ("conversation", Scalar, STORED),
+                ("sender", Scalar, STORED),
+                ("receivedAt", Scalar, STORED),
+                ("bindingKind", Scalar, STORED),
+                ("target", Scalar, STORED),
+                ("addressed", Scalar, STORED),
+                ("replyOf", Scalar, STORED),
+                ("text", Scalar, HYDRATED),
+            ]),
+        };
         let triggers = [
             ("attention", attention),
             ("thread_stream", thread),
@@ -516,6 +548,7 @@ impl Default for FactRegistry {
             ("post_created", post_created),
             ("post_commented", post_commented),
             ("ingress", ingress),
+            ("channel_message", channel_message),
         ]
         .into_iter()
         .enumerate()
@@ -775,6 +808,7 @@ mod tests {
             described.iter().map(|s| s.fact).collect::<Vec<_>>(),
             vec![
                 "attention",
+                "channel_message",
                 "file_changed",
                 "github_comment",
                 "ingress",
@@ -906,7 +940,10 @@ mod tests {
                 untrusted.push(name);
             }
         }
-        assert_eq!(untrusted, vec!["github_comment", "ingress"]);
+        assert_eq!(
+            untrusted,
+            vec!["channel_message", "github_comment", "ingress"]
+        );
     }
 
     #[test]
@@ -1214,6 +1251,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "attention",
+                "channel_message",
                 "file_changed",
                 "github_comment",
                 "ingress",
@@ -1236,13 +1274,15 @@ mod tests {
                 "file_changed",
                 "post_created",
                 "post_commented",
-                "ingress"
+                "ingress",
+                "channel_message"
             ]
         );
         assert_eq!(
             registry.source_names(),
             vec![
                 "attention",
+                "channel_message",
                 "file_changed",
                 "github_comment",
                 "ingress",
