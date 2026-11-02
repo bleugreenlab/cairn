@@ -31,11 +31,24 @@ use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
 use crate::heartbeat::{with_heartbeat, HEARTBEAT_INTERVAL};
 use crate::output::{
-    assemble_reminders, cap_run_result, cap_text_result, change_callback_result, redact_command,
+    assemble_reminders, cap_text_result, change_callback_result, redact_command,
     run_transport_error_result, CallbackOutcome,
 };
 use crate::schemas::{validate_run_input, ChangeInput, ReadFileInput, RunInput};
 use crate::sink::{CallbackSink, RunPrincipal};
+
+/// The `run` tool's `_meta`: the client carries its results inline up to
+/// [`AGENT_TOOL_RESULT_CHAR_CEILING`] rather than moving a long one to a file.
+///
+/// [`AGENT_TOOL_RESULT_CHAR_CEILING`]: cairn_common::callback_contract::AGENT_TOOL_RESULT_CHAR_CEILING
+fn run_tool_meta() -> rmcp::model::MetaObject {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "anthropic/maxResultSizeChars".into(),
+        cairn_common::callback_contract::AGENT_TOOL_RESULT_CHAR_CEILING.into(),
+    );
+    rmcp::model::MetaObject(meta)
+}
 
 /// Where a server learns which run each tool call belongs to.
 #[derive(Clone, Debug)]
@@ -324,7 +337,8 @@ Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unl
 
 If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on.
 
-A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#
+A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#,
+        meta = run_tool_meta()
     )]
     async fn run(
         &self,
@@ -386,7 +400,9 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
                 data: None,
             },
         };
-        let text = assemble_reminders(cap_run_result(&envelope.text), &outcome.reminders);
+        // Core composes the text within its own cap, and a model door's reply
+        // must arrive whole, so the edge passes it through untouched.
+        let text = assemble_reminders(envelope.text, &outcome.reminders);
         let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
         blocks.push(ContentBlock::text(text));
         for image in envelope.images {
@@ -664,6 +680,26 @@ mod tests {
 
         client.cancel().await.expect("classic client should cancel");
         server.await.expect("server task");
+    }
+
+    /// Claude moves a tool result past about 50,000 characters to a file unless
+    /// the tool declares a larger size, and a model door's reply routinely is.
+    /// Only `run` declares one: `read` composes within its own client ceiling.
+    #[test]
+    fn only_the_run_tool_declares_its_result_size() {
+        let key = "anthropic/maxResultSizeChars";
+        for tool in test_server().tool_router.list_all() {
+            let declared = tool.meta.as_ref().and_then(|meta| meta.0.get(key));
+            match tool.name.as_ref() {
+                "run" => assert_eq!(
+                    declared,
+                    Some(&serde_json::json!(
+                        cairn_common::callback_contract::AGENT_TOOL_RESULT_CHAR_CEILING
+                    ))
+                ),
+                _ => assert_eq!(declared, None, "{}", tool.name),
+            }
+        }
     }
 
     /// The `run` tool's advertised timeout contract is prose in two places — the

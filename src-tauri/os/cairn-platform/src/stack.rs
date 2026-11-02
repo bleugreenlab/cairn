@@ -22,9 +22,15 @@
 //! awaits many times over, as `cairn-db`'s `LocalDb` entry points do. The cost
 //! is one allocation per call.
 //!
-//! `cairn-core`'s `tests/main/stack_headroom.rs` holds the tool path to a stack
-//! budget, so a regression fails there by name instead of as an overflow in
-//! whichever unrelated test happens to run deepest.
+//! On a deep chain, the lowest large child is the one to cut first. A child
+//! held inline is part of its parent's state, and so of every ancestor's, and
+//! each ancestor pays for it again in its poll frame.
+//!
+//! `cairn-core` holds deep paths to one stack budget (its `stack_headroom`
+//! module), so a regression fails a guard by name instead of as an overflow in
+//! whichever unrelated test happens to run deepest: `tests/main/stack_headroom.rs`
+//! guards the tool path, and `execution::checks`'s `write_check_stack_headroom`
+//! guards a write-check wave from its spawned task down to placement.
 
 use std::future::Future;
 use std::pin::Pin;

@@ -120,6 +120,7 @@ async fn run_executor_action(
             images: result.images,
             tracked_modifications: None,
             data: None,
+            whole: false,
         },
         Ok(_) => ItemOutcome::failed(header, "Desktop verbs cannot suspend for follow-up input"),
         Err(error) => ItemOutcome::failed(header, format!("{}: {error}", spec.executor_name)),
@@ -176,7 +177,7 @@ async fn run_model_door(
     interrupt: Option<&crate::responses::InvocationInterrupt>,
 ) -> ItemOutcome {
     use cairn_common::run_contract::ModelDoor;
-    match door {
+    let mut outcome = match door {
         ModelDoor::Decide => run_decide(orch, run_context, header, args, timeout).await,
         ModelDoor::Embed => run_embed(orch, run_context, header, args, timeout).await,
         ModelDoor::Complete => {
@@ -184,7 +185,9 @@ async fn run_model_door(
         }
         ModelDoor::Image => super::media::run_image(orch, run_context, header, args, timeout).await,
         ModelDoor::Speak => super::media::run_speak(orch, run_context, header, args, timeout).await,
-    }
+    };
+    outcome.whole = door.exempt_from_text_cap();
+    outcome
 }
 
 /// Answer a `cairn://models/complete` item. Like a response item, it runs to
@@ -246,32 +249,9 @@ async fn run_complete(
             images: Vec::new(),
             tracked_modifications: None,
             data: serde_json::to_value(&outcome).ok(),
+            whole: false,
         },
     }
-}
-
-/// The most characters an embed reply's text may take with its vectors in it.
-/// Past it the text names what came back and leaves the vectors to the
-/// envelope's `data`, because a vector cut short by the run result's cap reads
-/// as a valid shorter one.
-const EMBED_TEXT_BUDGET: usize = 40_000;
-
-/// The text an agent reads for an embed reply: the reply itself while it
-/// fits, else the reply with its vectors replaced by a sentence saying where
-/// they are.
-pub(super) fn embed_text(outcome: &crate::orchestrator::embed::EmbedOutcome) -> String {
-    let full = serde_json::to_string(outcome).unwrap_or_default();
-    if full.len() <= EMBED_TEXT_BUDGET {
-        return full;
-    }
-    let mut summary = serde_json::to_value(outcome).unwrap_or_default();
-    summary["vectors"] = serde_json::Value::String(format!(
-        "{} vectors of {} dimensions omitted: at {} characters they are more than a run result shows. A script receives them whole from embed() in @cairn/sdk or cairn-sdk.",
-        outcome.vectors.len(),
-        outcome.dims,
-        full.len()
-    ));
-    serde_json::to_string(&summary).unwrap_or_default()
 }
 
 /// Answer a `cairn://models/embed` item, bounded by the item's timeout under
@@ -315,12 +295,13 @@ async fn run_embed(
                 outcome.dims,
                 outcome.latency_ms as f64 / 1000.0
             ),
-            body: embed_text(&outcome),
+            body: serde_json::to_string(&outcome).unwrap_or_default(),
             succeeded: true,
             suspended: false,
             images: Vec::new(),
             tracked_modifications: None,
             data: serde_json::to_value(&outcome).ok(),
+            whole: false,
         },
     }
 }
@@ -374,6 +355,7 @@ async fn run_decide(
             images: Vec::new(),
             tracked_modifications: None,
             data: serde_json::to_value(&outcome).ok(),
+            whole: false,
         },
     }
 }
@@ -564,6 +546,7 @@ pub(crate) async fn run_one(
                         images: Vec::new(),
                         tracked_modifications: None,
                         data: None,
+                        whole: false,
                     }
                 }
                 Err(error) => ItemOutcome::failed(header, error.to_string()),
@@ -701,6 +684,7 @@ pub(crate) async fn run_one(
                             images: Vec::new(),
                             tracked_modifications: None,
                             data: None,
+                            whole: false,
                         }
                     }
                 }
@@ -746,6 +730,7 @@ pub(crate) async fn run_one(
         images: Vec::new(),
         tracked_modifications: None,
         data: None,
+        whole: false,
     }
 }
 
@@ -830,6 +815,7 @@ async fn run_mcp_call(
             images: result.images,
             tracked_modifications: None,
             data: None,
+            whole: false,
         },
         Ok(outcome) => {
             suspend_mcp_call(
@@ -1042,7 +1028,7 @@ async fn suspend_mcp_call(
     // persisted handoff delay prevents a first transition until this suspension
     // marker has reached the provider, without retaining a per-call task or
     // receiver in memory.
-    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None }
+    ItemOutcome { header, body: "MCP call suspended; the same run call remains pending and will resume when the external operation completes.".into(), succeeded: true, suspended: true, images: Vec::new(), tracked_modifications: None, data: None, whole: false }
 }
 
 /// Send inline code to a live REPL session and compose its outcome. Fails
@@ -1121,6 +1107,7 @@ async fn run_repl_send(
                     images: Vec::new(),
                     tracked_modifications: None,
                     data: None,
+                    whole: false,
                 }
             }
             // Died / Timeout / Protocol (and the impossible lingering Pending) all

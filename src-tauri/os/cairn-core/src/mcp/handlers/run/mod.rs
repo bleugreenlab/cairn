@@ -8034,6 +8034,7 @@ mod tests {
             images: Vec::new(),
             tracked_modifications: None,
             data: None,
+            whole: false,
         };
         let tail = ItemOutcome::failed("tail".to_string(), "later failure");
 
@@ -9500,30 +9501,49 @@ mod decide_door_tests {
         assert!(text.contains("{model, input, purpose?, width?}"), "{text}");
     }
 
-    /// Vectors too long for a run result leave the text rather than arriving
-    /// cut short, which would read as valid shorter vectors.
-    #[test]
-    fn an_embed_reply_too_large_for_a_run_result_names_where_its_vectors_are() {
-        let outcome = crate::orchestrator::embed::EmbedOutcome {
-            vectors: vec![vec![0.123_456_79; 1536]; 8],
-            model: "openai/text-embedding-3-small".into(),
-            dims: 1536,
-            provider: "openrouter".into(),
-            usage: crate::orchestrator::embed::EmbedUsage {
-                input_tokens: Some(16),
-            },
-            cost: Some(0.000_001),
-            latency_ms: 420,
+    /// An embed reply is never truncated or summarised: three 1536-wide
+    /// vectors run well past the cap that keeps command output readable, and
+    /// the item's text still carries every number and parses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_embed_reply_past_the_run_result_cap_arrives_whole_in_the_text() {
+        use crate::orchestrator::embed::tests::workspace_with_hub_of;
+        use crate::orchestrator::embed::EmbedOutcome;
+        let vector = |seed: usize| -> Vec<f32> {
+            (0..1536)
+                .map(|i| ((seed * 1536 + i) as f32 * 0.618_034).sin() * 0.087_654_32)
+                .collect()
         };
-        let text = super::process::embed_text(&outcome);
-        assert!(text.len() < 1_000, "{text}");
-        let summary: Value = serde_json::from_str(&text).unwrap();
-        assert!(summary["vectors"]
-            .as_str()
-            .unwrap()
-            .starts_with("8 vectors of 1536 dimensions omitted"));
-        assert_eq!(summary["dims"], 1536);
-        assert_eq!(summary["usage"]["inputTokens"], 16);
+        let data: Vec<Value> = (0..3)
+            .map(|index| json!({"index": index, "embedding": vector(index)}))
+            .collect();
+        let (orch, _, _) = workspace_with_hub_of(
+            1536,
+            vec![
+                json!({"model": "qwen3-embedding-4b", "data": data, "usage": {"prompt_tokens": 3}}),
+            ],
+        )
+        .await;
+        let envelope = super::handle_run(
+            &orch,
+            &request(json!({"commands": [{
+                "target": "cairn://models/embed",
+                "payload": {"args_json": {"model": "qwen/qwen3-embedding-4b", "input": ["one", "two", "three"]}}
+            }]})),
+        )
+        .await;
+        let envelope: cairn_common::read::RunBatchEnvelope =
+            serde_json::from_str(&envelope).unwrap();
+        assert!(
+            envelope.text.len() > 45_000,
+            "the reply is past the cap: {}",
+            envelope.text.len()
+        );
+        let text: EmbedOutcome = serde_json::from_str(&envelope.text)
+            .unwrap_or_else(|error| panic!("the text is the whole reply ({error})"));
+        assert_eq!(text.dims, 1536);
+        assert_eq!(text.vectors, (0..3).map(vector).collect::<Vec<_>>());
+        let data: EmbedOutcome = serde_json::from_value(envelope.data.unwrap()[0].clone()).unwrap();
+        assert_eq!(text, data);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -11,47 +11,23 @@
 //!
 //! Both calls enter through `dispatch_tool`, the one function every
 //! authenticated tool call passes through, so everything from the ownership
-//! fence down to the resource handler is inside the budget.
+//! fence down to the resource handler is inside the budget. The budget and the
+//! runner are `cairn_core`'s `stack_headroom`, shared with the in-crate guard
+//! on the write-check submission path.
 
 use crate::common;
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use cairn_core::internal::dispatch::dispatch_tool;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
+use cairn_core::internal::stack_headroom::within_budget;
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-
-/// Half of the 2 MiB that std gives a spawned thread and tokio gives a worker.
-const BUDGET: usize = 1024 * 1024;
-
-/// Drive `make`'s future to completion on a current-thread runtime, pinned on
-/// the stack of a thread that has only [`BUDGET`] bytes: the shape
-/// `#[tokio::test]` gives a test body, with less room. An overflow aborts the
-/// process with a message naming this thread.
-fn within_budget<F: Future<Output = ()> + 'static>(make: impl FnOnce() -> F + Send + 'static) {
-    let joined = std::thread::Builder::new()
-        .name(format!("served tool call within a {BUDGET}-byte stack"))
-        .stack_size(BUDGET)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let body = std::pin::pin!(make());
-            runtime.block_on(body);
-        })
-        .unwrap()
-        .join();
-    if let Err(panic) = joined {
-        std::panic::resume_unwind(panic);
-    }
-}
 
 async fn issue_fixture() -> (TempDir, Arc<LocalDb>, Orchestrator) {
     let (temp, db) = common::migrated_db().await;
@@ -88,7 +64,7 @@ async fn dispatch(orch: &Orchestrator, tool: &str, payload: Value) -> String {
 
 #[test]
 fn a_served_resource_write_fits_in_half_a_default_stack() {
-    within_budget(|| async {
+    within_budget("served resource write", || async {
         let (_temp, db, orch) = issue_fixture().await;
         let result = dispatch(
             &orch,
@@ -112,7 +88,7 @@ fn a_served_resource_write_fits_in_half_a_default_stack() {
 
 #[test]
 fn a_served_resource_read_fits_in_half_a_default_stack() {
-    within_budget(|| async {
+    within_budget("served resource read", || async {
         let (_temp, _db, orch) = issue_fixture().await;
         let result = dispatch(
             &orch,

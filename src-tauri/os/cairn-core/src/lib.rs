@@ -55,6 +55,9 @@ pub mod transitions;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[cfg(any(test, feature = "test-utils"))]
+mod stack_headroom;
+
 // ── Stable data/config surface ─────────────────────────
 pub mod error;
 pub use error::CairnError;

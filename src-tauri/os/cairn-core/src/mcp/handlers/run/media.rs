@@ -307,6 +307,7 @@ pub(super) async fn run_image(
             images: blocks,
             tracked_modifications: None,
             data: serde_json::to_value(&reply).ok(),
+            whole: false,
         },
     }
 }
@@ -437,6 +438,7 @@ pub(super) async fn run_speak(
             images: Vec::new(),
             tracked_modifications: None,
             data: serde_json::to_value(&reply).ok(),
+            whole: false,
         },
     }
 }

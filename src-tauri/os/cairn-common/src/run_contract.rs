@@ -199,6 +199,16 @@ impl ModelDoor {
             Self::Image | Self::Speak => true,
         }
     }
+
+    /// Whether the door's reply rides the run result's text whole, outside the
+    /// cap that keeps command output readable. A reply is data a caller parses
+    /// (vectors, a structured answer, a media reference), and a reply cut to
+    /// fit reads as a valid shorter one, so no door's is ever cut or summarised.
+    pub fn exempt_from_text_cap(self) -> bool {
+        match self {
+            Self::Decide | Self::Embed | Self::Complete | Self::Image | Self::Speak => true,
+        }
+    }
 }
 
 /// True for an item that runs on the host and cannot suspend past the grace

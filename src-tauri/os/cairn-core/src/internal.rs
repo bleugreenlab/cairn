@@ -43,6 +43,12 @@ pub fn workflow_runtime(
     crate::workflow_host::runtime(orch)
 }
 
+/// The one stack budget every headroom guard runs its path within.
+#[cfg(feature = "test-utils")]
+pub mod stack_headroom {
+    pub use crate::stack_headroom::*;
+}
+
 pub mod account {
     pub use crate::account::*;
 }

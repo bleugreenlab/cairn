@@ -281,6 +281,12 @@ pub(crate) struct ItemOutcome {
     /// run envelope's `data` while `body` is what the agent reads. Only a
     /// model door sets it.
     pub(crate) data: Option<serde_json::Value>,
+    /// The composer carries `body` whole, outside the run result's text cap,
+    /// because the item is a model door whose reply a caller reads as data
+    /// ([`ModelDoor::exempt_from_text_cap`]).
+    ///
+    /// [`ModelDoor::exempt_from_text_cap`]: cairn_common::run_contract::ModelDoor::exempt_from_text_cap
+    pub(crate) whole: bool,
 }
 
 impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutcome {
@@ -297,6 +303,7 @@ impl From<cairn_common::executor_protocol::ProcessBatchItemOutcome> for ItemOutc
                 .collect(),
             tracked_modifications: outcome.tracked_modifications,
             data: None,
+            whole: false,
         }
     }
 }
@@ -313,6 +320,7 @@ impl ItemOutcome {
             images: Vec::new(),
             tracked_modifications: None,
             data: None,
+            whole: false,
         }
     }
 }

@@ -4,10 +4,12 @@
 use super::types::ItemOutcome;
 use cairn_common::read::{ImageBlock, RunBatchEnvelope};
 
-/// Max chars in a composed batch result. Deliberately equal to the CLI's
-/// `MAX_RESULT_CHARS`: `compose_run_output` keeps its result at or under this,
-/// so the CLI's run-result guard passes a core-capped batch through untouched
-/// (no double truncation, no second elision marker).
+/// Max chars the capped items of a composed batch result share: command output
+/// is read end-first, and this keeps it below the size at which an agent CLI
+/// moves a tool result out of the conversation. An item carried whole
+/// ([`ItemOutcome::whole`], a model door's reply) is outside it, so a batch
+/// holding one can compose past it; the agent-facing edges pass the text
+/// through untouched either way.
 const MAX_RUN_RESULT_CHARS: usize = 45_000;
 
 /// Percent of an item's char budget reserved for the head (leading context: the
@@ -108,11 +110,13 @@ fn cap_item_body_tail_biased(body: &str, budget: usize) -> String {
     )
 }
 
-/// Render one item's body block (no header): tail-capped to `body_budget`, with
-/// an empty body shown as `(no output)`.
+/// Render one item's body block (no header): tail-capped to `body_budget`
+/// unless the item is carried whole, with an empty body shown as `(no output)`.
 fn render_item_body(outcome: &ItemOutcome, body_budget: usize) -> String {
     if outcome.body.is_empty() {
         "(no output)".to_string()
+    } else if outcome.whole {
+        outcome.body.clone()
     } else {
         cap_item_body_tail_biased(&outcome.body, body_budget)
     }
@@ -197,16 +201,17 @@ pub(super) fn collect_run_data(outcomes: &mut [ItemOutcome]) -> Option<Vec<serde
     )
 }
 
-/// Compose per-item outcomes into a single result string, bounded by
-/// `MAX_RUN_RESULT_CHARS`. A single item returns its (tail-capped) body directly
-/// with no header. Multiple items are labeled `=== <header> ===` in input order;
-/// the batch cap is divided fairly across them (water-filling) and each item's
-/// body is tail-capped within its share, so every item surfaces meaningful
-/// output. Whole-item omission, with a named note, remains only as a last resort
-/// for pathological item counts where the per-item share falls below a usable
-/// floor. Because each item's body is capped (head + marker + tail) within its
-/// allocation, the composed result stays under `MAX_RUN_RESULT_CHARS` — the CLI's
-/// equal cap then passes it through untouched (no double truncation).
+/// Compose per-item outcomes into a single result string. A single item returns
+/// its (tail-capped) body directly with no header. Multiple items are labeled
+/// `=== <header> ===` in input order; `MAX_RUN_RESULT_CHARS` is divided fairly
+/// across the capped items (water-filling) and each one's body is tail-capped
+/// within its share, so every item surfaces meaningful output. Whole-item
+/// omission, with a named note, remains only as a last resort for pathological
+/// item counts where the per-item share falls below a usable floor.
+///
+/// An item carried whole ([`ItemOutcome::whole`]) is never capped, shared, or
+/// omitted: it renders its full body and takes nothing from the other items'
+/// budget. Without one, the composed result stays under `MAX_RUN_RESULT_CHARS`.
 pub(super) fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
     if outcomes.len() == 1 {
         return render_item_body(&outcomes[0], MAX_RUN_RESULT_CHARS);
@@ -233,7 +238,18 @@ pub(super) fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
         .collect();
 
     let total_budget = MAX_RUN_RESULT_CHARS.saturating_sub(OMISSION_NOTE_RESERVE);
-    let alloc = water_fill_budgets(&natural, total_budget);
+    let capped: Vec<usize> = (0..outcomes.len())
+        .filter(|&i| !outcomes[i].whole)
+        .collect();
+    let shares = water_fill_budgets(
+        &capped.iter().map(|&i| natural[i]).collect::<Vec<_>>(),
+        total_budget,
+    );
+    // A whole item is allotted its natural size, so it always fits below.
+    let mut alloc = natural.clone();
+    for (&i, share) in capped.iter().zip(shares) {
+        alloc[i] = share;
+    }
 
     let mut segments: Vec<String> = Vec::with_capacity(outcomes.len());
     let mut omitted: Vec<String> = Vec::new();
@@ -646,6 +662,7 @@ mod tests {
             images: Vec::new(),
             tracked_modifications: None,
             data: None,
+            whole: false,
         }
     }
 
@@ -674,6 +691,7 @@ mod tests {
                 images: vec![img_a.clone()],
                 tracked_modifications: None,
                 data: None,
+                whole: false,
             },
             // A text-only item contributes no images and is skipped.
             ItemOutcome::failed("echo".to_string(), "out"),
@@ -685,6 +703,7 @@ mod tests {
                 images: vec![img_b.clone()],
                 tracked_modifications: None,
                 data: None,
+                whole: false,
             },
         ];
         assert_eq!(collect_run_images(outcomes), vec![img_a, img_b]);
@@ -779,6 +798,40 @@ mod tests {
         assert!(text.ends_with("TAIL-SENTINEL"));
         assert!(text.contains("--- elided"));
         assert!(text.len() <= MAX_RUN_RESULT_CHARS);
+    }
+
+    fn whole(header: &str, body: &str) -> ItemOutcome {
+        ItemOutcome {
+            whole: true,
+            ..outcome(header, body, true)
+        }
+    }
+
+    // A model door's reply is data: past the cap it arrives byte for byte, with
+    // no elision marker.
+    #[test]
+    fn compose_single_whole_item_is_never_capped() {
+        let body = format!("[{}]", vec!["0.0123456789"; 20_000].join(","));
+        assert!(body.len() > MAX_RUN_RESULT_CHARS * 4);
+        assert_eq!(compose_run_output(&[whole("embed", &body)]), body);
+    }
+
+    // Beside capped items, a whole item renders in full and takes nothing from
+    // their shared budget, so they cap exactly as they would without it.
+    #[test]
+    fn compose_multi_whole_item_renders_in_full_outside_the_shared_budget() {
+        let reply = "7".repeat(MAX_RUN_RESULT_CHARS * 2);
+        let flood = format!("HEAD\n{}\nTAIL", "f".repeat(100_000));
+        let alone = compose_run_output(&[outcome("flood", &flood, true), outcome("b", "B", true)]);
+        let text = compose_run_output(&[
+            outcome("flood", &flood, true),
+            whole("cairn://models/embed", &reply),
+            outcome("b", "B", true),
+        ]);
+        assert!(text.contains(&format!("=== cairn://models/embed ===\n{reply}\n")));
+        assert!(!text.contains("items omitted"));
+        let without_reply = text.replace(&format!("=== cairn://models/embed ===\n{reply}\n"), "");
+        assert_eq!(without_reply, alone);
     }
 
     // A trailing detached-terminal note rides in the tail and is never elided.

@@ -753,6 +753,14 @@ pub(crate) mod tests {
     pub(crate) async fn workspace_with_hub(
         replies: Vec<Value>,
     ) -> (Orchestrator, Arc<Scripted>, String) {
+        workspace_with_hub_of(4, replies).await
+    }
+
+    /// [`workspace_with_hub`] whose embedding model is `dims` wide.
+    pub(crate) async fn workspace_with_hub_of(
+        dims: u32,
+        replies: Vec<Value>,
+    ) -> (Orchestrator, Arc<Scripted>, String) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let scripted = Arc::new(Scripted {
             replies: Mutex::new(replies.into()),
@@ -776,7 +784,7 @@ pub(crate) mod tests {
         .unwrap()
         .with_embedding_models(vec![CustomEmbeddingModel {
             id: "qwen/qwen3-embedding-4b".into(),
-            dims: 4,
+            dims,
             widths: Default::default(),
         }])
         .unwrap();

@@ -6414,6 +6414,13 @@ pub struct LearnedResourceEstimate {
 /// ten-second reading and never the flag, so a run that began on a stale
 /// reading still teaches its speed, de-stalled by that reading, until the
 /// machine runs a build carrying this. An older runner ignores the flag.
+///
+/// cairn/5819 does not move the number. The runner builds the futures on its
+/// own submission and placement path (preparation, execution, each placement
+/// pass and the `select_executor` arm) off-frame, on the heap, so the path fits
+/// a worker's stack in debug builds. The same futures run in the same order
+/// and send the same frames; no frame, variant, field or serialized form
+/// changes, and a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

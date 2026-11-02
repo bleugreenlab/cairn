@@ -224,30 +224,6 @@ pub fn cap_text_result(text: &str, offset: usize) -> String {
     )
 }
 
-/// Final guard for `run` results. Core's `compose_run_output` already caps batch
-/// output to its `MAX_RUN_RESULT_CHARS` (deliberately equal to `MAX_RESULT_CHARS`)
-/// with tail-biased per-item capping, so a well-formed core result is at or under
-/// the cap and passes through untouched. This is a defensive backstop only: an
-/// over-cap result is tail-biased here too — keeping the end (error summaries, the
-/// last `&&` segment) rather than the head — and never carries the `offset=`
-/// continuation footer that `read` uses. A finished command's output is not
-/// re-readable, so the actionable advice is to re-run scoped or use a terminal.
-pub fn cap_run_result(text: &str) -> String {
-    if text.len() <= MAX_RESULT_CHARS {
-        return text.to_string();
-    }
-    const ADVICE: &str =
-        "--- run output exceeded the char cap; showing the tail. Re-run scoped (grep/tail the command) or use a terminal resource for full output. ---\n";
-    // Keep the last bytes, leaving room for the advice prefix so the whole result
-    // stays within the cap. Snap up to a char boundary to avoid splitting UTF-8.
-    let tail_budget = MAX_RESULT_CHARS.saturating_sub(ADVICE.len());
-    let mut start = text.len().saturating_sub(tail_budget);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("{ADVICE}{}", &text[start..])
-}
-
 /// Append each system-reminder body to `content`, wrapped in the
 /// `<system-reminder>` envelope. This is the single assembly point for
 /// augmentation reminders across every verb: the backend ships them as data on
@@ -533,41 +509,6 @@ mod tests {
         for line in content_part.lines() {
             assert!(line.ends_with('é'), "Line should be intact: {:?}", line);
         }
-    }
-
-    #[test]
-    fn test_cap_run_result_passthrough_under_cap() {
-        // Core caps run output at MAX_RUN_RESULT_CHARS == MAX_RESULT_CHARS, so a
-        // well-formed result passes through unchanged.
-        let text = "=== git diff ===\nsome output\n--- elided 10 lines / 200 chars; tail kept below ---\ntail";
-        assert_eq!(cap_run_result(text), text);
-    }
-
-    #[test]
-    fn test_cap_run_result_tail_biased_no_offset_footer() {
-        // Defensive backstop: an over-cap result is tail-biased, never carrying the
-        // read-style offset continuation footer.
-        let text = format!(
-            "HEAD-START\n{}\nTAIL-SIGNAL",
-            "x".repeat(MAX_RESULT_CHARS * 2)
-        );
-        let result = cap_run_result(&text);
-        assert!(result.len() <= MAX_RESULT_CHARS);
-        assert!(
-            result.ends_with("TAIL-SIGNAL"),
-            "keeps the tail, not the head"
-        );
-        assert!(!result.contains("Call again with offset"));
-        assert!(result.contains("Re-run scoped"));
-    }
-
-    #[test]
-    fn test_cap_run_result_multibyte_boundary_safe() {
-        // A long multibyte body must not split a char when tail-slicing.
-        let text = "é".repeat(MAX_RESULT_CHARS); // 2 bytes each → 2x the cap
-        let result = cap_run_result(&text);
-        assert!(result.len() <= MAX_RESULT_CHARS);
-        assert!(!result.contains("Call again with offset"));
     }
 
     fn failure(kind: CallbackFailureKind, secs: u64) -> CallbackFailure {

@@ -89,6 +89,7 @@ pub use cairn_common::executor_protocol::{
     ResourceReservationSource,
 };
 use cairn_common::toolchain_requirements::project_placement_requirements;
+use cairn_platform::stack::off_frame;
 
 use crate::mcp::handlers::permission::HandoffClosed;
 
@@ -11367,10 +11368,10 @@ impl Fleet {
             Self::WRITE_CHECK_SILENCE_BOUND_MS,
         );
         let mut request = request;
-        let executed = match self.prepare_execution(orch, &mut request).await {
+        let preparing = &mut request;
+        let executed = match off_frame(move || self.prepare_execution(orch, preparing)).await {
             Ok(prepared) => {
-                self.execute_prepared_accounted(request, Some(batch), prepared)
-                    .await
+                off_frame(|| self.execute_prepared_accounted(request, Some(batch), prepared)).await
             }
             Err(outcome) => outcome.into(),
         };
@@ -11811,7 +11812,7 @@ impl Fleet {
         prepared: PreparedExecution,
     ) -> ExecutedRequest {
         let key = (request.request_id.clone(), request.attempt_id.clone());
-        let mut executed = self.execute_entry(request, batch, prepared).await;
+        let mut executed = off_frame(|| self.execute_entry(request, batch, prepared)).await;
         executed.account.cancel_cause = self.cancel_causes.lock().unwrap().take(&key);
         executed
     }
@@ -11930,12 +11931,12 @@ impl Fleet {
                     }
                     .into();
                 }
-                selection = self.select_executor(
+                selection = off_frame(|| self.select_executor(
                     &request,
                     Some(&plan),
                     &placement_policy,
                     Some(&entry_id),
-                ) => selection,
+                )) => selection,
             } {
                 Ok(placement) => placement,
                 Err(outcome) => {
@@ -12853,8 +12854,8 @@ impl Fleet {
                         .with_entry(id, |entry| (entry.declined.clone(), entry.admission_view()))
                 })
                 .unwrap_or_else(|| (HashMap::new(), AdmissionView::of_request(request)));
-            let selection = self
-                .select_executor_once_with(
+            let selection = off_frame(|| {
+                self.select_executor_once_with(
                     request,
                     plan,
                     policy,
@@ -12862,7 +12863,8 @@ impl Fleet {
                     &view,
                     repository_sync_cost,
                 )
-                .await;
+            })
+            .await;
             let rejected = match selection {
                 Ok(Selection::Placed(placement)) => return Ok(*placement),
                 Err(refused) => {

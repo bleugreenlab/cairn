@@ -151,6 +151,17 @@ pub const LONGEST_RUN_ANSWER_BOUND: Duration = add(RUN_CEILING, ANSWER_RESERVE);
 /// agent never abandons cairn-cmd mid-await.
 pub const AGENT_MCP_TOOL_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The most text, in characters, Cairn has every agent CLI carry inline from
+/// one `run` result: Claude's per-tool `anthropic/maxResultSizeChars` and
+/// Codex's `tool_output_token_limit`. Cairn's own composer, not the client,
+/// decides what a run result shows. It keeps command output well under this,
+/// and a model door's reply is data that must arrive whole. Without it Claude
+/// moves any result past about 50,000 characters to a file the agent cannot
+/// open, and Codex cuts every tool output to 10,000 tokens. 500,000 is the most
+/// Claude accepts for the annotation, so a reply longer than this still leaves
+/// an agent's conversation, and nothing on Cairn's side can lift that.
+pub const AGENT_TOOL_RESULT_CHAR_CEILING: usize = 500_000;
+
 /// The longest bounded host wait for every other verb: a file-target `write`
 /// queued on the project store lock, then waiting inline for the when:write
 /// checks of the commit it sealed. A `watch` long-poll (290 s) and a `read`

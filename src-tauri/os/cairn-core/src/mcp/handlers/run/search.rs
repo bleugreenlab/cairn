@@ -904,6 +904,7 @@ fn native_search_outcome(header: String, stdout: String) -> ItemOutcome {
             images: Vec::new(),
             tracked_modifications: None,
             data: None,
+            whole: false,
         }
     }
 }
@@ -1382,6 +1383,7 @@ mod tests {
                     images: Vec::new(),
                     tracked_modifications: None,
                     data: None,
+                    whole: false,
                 })
             }
         });
