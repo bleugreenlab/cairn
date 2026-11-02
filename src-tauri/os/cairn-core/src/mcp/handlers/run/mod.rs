@@ -14,6 +14,7 @@ pub(crate) mod held;
 mod hygiene;
 mod media;
 mod output;
+mod pace;
 mod process;
 mod redact;
 mod resolve;
@@ -5584,6 +5585,10 @@ struct PlacementNotes {
     /// so it rides on every outcome: a batch that cannot run there must say
     /// why it was there.
     scratch_affinity: Option<String>,
+    /// What the machine had learned to expect of each item, read before this
+    /// run was learned from, so the result can say when an item ran far past
+    /// it. Only a completed batch carries it.
+    pace: Option<crate::fleet::BatchPace>,
 }
 
 impl PlacementNotes {
@@ -5925,6 +5930,7 @@ async fn place_and_run_attempts(
             *grant_without_result = Some(grant);
         }
         let above_ceiling = executed.above_ceiling;
+        let pace = executed.pace;
         let claimed = executed.account.placement;
         let outcome = executed.outcome;
         if residence == BatchResidence::Home && cannot_hold.is_none() {
@@ -5950,6 +5956,7 @@ async fn place_and_run_attempts(
                 scratch: None,
                 // Filled at settlement, which holds what the affinity did.
                 scratch_affinity: None,
+                pace,
             };
             return PlacedBatch::Cell(Box::new(outcome), residence, notes);
         }
@@ -7209,7 +7216,7 @@ async fn settle_routed_run_batch(
     outcome: CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     ceiling: Option<String>,
-    notes: PlacementNotes,
+    mut notes: PlacementNotes,
 ) -> SettledRunBatch {
     if let CellOutcome::Unavailable { reason, diagnostic } = &outcome {
         // Only a structural refusal reaches here: a capacity-shaped one is a
@@ -7264,11 +7271,20 @@ async fn settle_routed_run_batch(
         Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
     >(&output)
     {
-        Ok(outcomes) => (
-            outcomes.into_iter().map(ItemOutcome::from).collect(),
-            mutation_delta,
-            tracked_modifications,
-        ),
+        Ok(items) => {
+            let (outcomes, took) = pace::time_batch(
+                items,
+                notes.pace.as_ref(),
+                metadata.duration_ms,
+                metadata.load_context.as_ref(),
+            );
+            // Beside the machine's name, which every executed batch opens with.
+            if let Some(line) = notes.ran_on.as_mut() {
+                line.push(' ');
+                line.push_str(&took);
+            }
+            (outcomes, mutation_delta, tracked_modifications)
+        }
         Err(error) => {
             // The commands ran; only their result is unreadable, so this is a
             // publication failure and must classify as one.
@@ -8440,6 +8456,7 @@ mod tests {
             drained_home: None,
             scratch: None,
             scratch_affinity: None,
+            pace: None,
         }
     }
 

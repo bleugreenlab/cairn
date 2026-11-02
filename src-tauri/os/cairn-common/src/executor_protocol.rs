@@ -6421,6 +6421,15 @@ pub struct LearnedResourceEstimate {
 /// a worker's stack in debug builds. The same futures run in the same order
 /// and send the same frames; no frame, variant, field or serialized form
 /// changes, and a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/5775 does not move the number. The runner now also reads each batch
+/// item's existing `durationMs` and `cpu`, and the batch's `durationMs` and
+/// [`ExecutionLoadContext`], to tell the agent how long each item took and,
+/// against what the machine had learned, why one ran far past it. Nothing
+/// crosses the boundary that did not before, no frame or field changes, and no
+/// admission, grant or placement outcome reads what it renders. What a runner
+/// gets wrong talking to an older executor: nothing; an executor that leaves
+/// `cpu` or the load context out gets a clause that names fewer readings.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -597,6 +597,49 @@ pub(super) async fn resolve_duration(
     }
 }
 
+/// What this machine had learned to expect of one run of `identity` as the run
+/// began: its learned speed alone here, times the learned slowdown for the
+/// co-resident work it started beside, plus the stall it started under. These
+/// are the terms placement predicts with, recomputed from the run's own
+/// starting readings, so the run's result can say how far past its prediction
+/// it went. `None` unless the speed is learned: a class prior is a starting
+/// point, not an expectation a run can fall short of.
+///
+/// The caller reads it before the run is folded in, so a run is never measured
+/// against a profile it has already moved.
+pub(super) async fn learned_expectation(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    metadata: &CellExecutionMeta,
+) -> Option<u64> {
+    let warmth = metadata.warmth?;
+    let started = metadata.started_at_unix_ms;
+    let alone = resolve_duration(
+        db.clone(),
+        Some(identity),
+        context,
+        warmth,
+        CellCommandClass::Other,
+        started,
+    )
+    .await;
+    if !alone.is_learned() || alone.predicted_ms == 0 {
+        return None;
+    }
+    let load = metadata.load_context.clone().unwrap_or_default();
+    let contention = resolve_contention(db, context, &load, started).await;
+    let crowded = u64::try_from(
+        u128::from(alone.predicted_ms) * u128::from(contention.multiplier_millis) / 1_000,
+    )
+    .unwrap_or(u64::MAX);
+    let stall = match StartingStall::of(&load) {
+        StartingStall::Measured(full_millis) => stall_penalty_ms(crowded, full_millis),
+        StartingStall::Unmeasured | StartingStall::Stale => 0,
+    };
+    Some(crowded.saturating_add(stall))
+}
+
 /// The upper median of a non-empty window. Integer throughout: a prediction in
 /// whole milliseconds is already finer than anything downstream compares on.
 fn upper_median(samples: &[u64]) -> u64 {
@@ -3825,6 +3868,65 @@ mod tests {
     /// The rule exploration asks before spending a lane: only a run alone on
     /// the machine, on a current stall reading, becomes a baseline sample. A
     /// stall is divided out, so it does not disqualify the run.
+    /// A run's expectation is the speed learned alone, priced for the work it
+    /// began beside, and nothing at all before that speed is learned or when
+    /// the run made no warmth claim.
+    #[tokio::test]
+    async fn a_runs_expectation_is_its_learned_speed_priced_for_its_start() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-expectation.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+        let warmth = ExecutionWarmth::PreparedWarmSlot;
+        let starting = |load: ExecutionLoadContext| {
+            let mut meta = completion(Some(warmth), 10, 1);
+            meta.started_at_unix_ms = 10;
+            meta.load_context = Some(load);
+            meta
+        };
+        let alone = ExecutionLoadContext::default();
+        assert_eq!(
+            learned_expectation(db.clone(), &identity, &context, &starting(alone.clone())).await,
+            None,
+            "nothing learned yet"
+        );
+        for finished in 1..=3 {
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &completion(Some(warmth), finished, 30_000),
+                CompletionKind::Succeeded,
+            )
+            .await;
+        }
+        assert_eq!(
+            learned_expectation(db.clone(), &identity, &context, &starting(alone)).await,
+            Some(30_000)
+        );
+        let beside_two_compiles = ExecutionLoadContext {
+            co_resident_compile_jobs: 2,
+            ..ExecutionLoadContext::default()
+        };
+        let prior = contention_prior(&beside_two_compiles).multiplier_millis;
+        assert_eq!(
+            learned_expectation(
+                db.clone(),
+                &identity,
+                &context,
+                &starting(beside_two_compiles)
+            )
+            .await,
+            Some(30_000 * u64::from(prior) / 1_000),
+            "priced by the slowdown placement prices that load with"
+        );
+        let mut unclaimed = starting(ExecutionLoadContext::default());
+        unclaimed.warmth = None;
+        assert_eq!(
+            learned_expectation(db, &identity, &context, &unclaimed).await,
+            None
+        );
+    }
+
     #[test]
     fn only_a_run_alone_on_a_current_reading_teaches_a_baseline() {
         assert!(teaches_baseline(&ExecutionLoadContext::default()));

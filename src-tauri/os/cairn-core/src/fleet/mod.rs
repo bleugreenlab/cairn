@@ -12287,8 +12287,10 @@ impl Fleet {
                     cancel_cause: None,
                     placement: Some(placement),
                 },
+                pace: None,
             };
         }
+        let mut pace = None;
         if let CellOutcome::Completed {
             output,
             metadata,
@@ -12339,6 +12341,24 @@ impl Fleet {
                 Vec<cairn_common::executor_protocol::ProcessBatchItemOutcome>,
             >(output)
             {
+                // Read before any item is learned from, so no item is measured
+                // against a profile its own run has already moved.
+                let mut expected_ms = Vec::with_capacity(items.len());
+                for (identity, item) in batch_profile_identities.iter().zip(&items) {
+                    expected_ms.push(
+                        resource_profiles::learned_expectation(
+                            db.clone(),
+                            identity,
+                            &profile_context,
+                            &metadata.for_batch_item(item),
+                        )
+                        .await,
+                    );
+                }
+                pace = Some(BatchPace {
+                    lowered: selected.colocated,
+                    expected_ms,
+                });
                 for (identity, item) in batch_profile_identities.iter().zip(items) {
                     let item_meta = metadata.for_batch_item(&item);
                     // An item the batch never ran to an end (handed off as
@@ -12396,6 +12416,7 @@ impl Fleet {
                 cancel_cause: None,
                 placement: Some(placement),
             },
+            pace,
         }
     }
 
@@ -18677,6 +18698,25 @@ pub(crate) struct ExecutedRequest {
     pub(crate) above_ceiling: Option<AboveMemoryCeiling>,
     /// What the runner knows about how the request ended beyond its outcome.
     pub(crate) account: CellAccount,
+    /// For a completed batch, how its items stood against what their machine
+    /// had learned to expect of them.
+    pub(crate) pace: Option<BatchPace>,
+}
+
+/// What a machine had learned to expect of a completed batch's items, read
+/// before the batch was learned from, so its result can say when an item ran
+/// far past it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BatchPace {
+    /// The machine ran the batch at lowered priority behind its own
+    /// default-priority work, as a colocated executor runs everything it
+    /// spawns for a request.
+    pub lowered: bool,
+    /// Index-aligned with the batch's items: the duration the machine's
+    /// learned speed predicted for each, priced for the co-resident work and
+    /// stall it began under (`resource_profiles::learned_expectation`), or
+    /// `None` where nothing is learned.
+    pub expected_ms: Vec<Option<u64>>,
 }
 
 /// An outcome reached before any grant was delivered.
@@ -18688,6 +18728,7 @@ impl From<CellOutcome> for ExecutedRequest {
             abandoned_grant: None,
             above_ceiling: None,
             account: CellAccount::default(),
+            pace: None,
         }
     }
 }
