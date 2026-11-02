@@ -6569,6 +6569,15 @@ pub struct LearnedResourceEstimate {
 /// are unchanged in every variant, field and serialized form. A runner talking
 /// to an older executor gets nothing wrong: that executor reports what its
 /// scripts' exits were, as it always did.
+///
+/// cairn/5739 does not move the number. `EXECUTOR_MANAGED_TOOLS` gains `node`,
+/// and the check environment's toolchain identity gains a `;node=` field that
+/// both peers parse by name. `ToolArtifact` and `ExecutorToolSelection` keep
+/// their shape. An older executor skips a selected name it does not manage, so
+/// it installs no Node and keeps its host's, exactly as before; an older runner
+/// selects no Node, and a newer executor's node probe says so. An older
+/// executor's identity lacks the field, which a check-results row then omits;
+/// no verdict key carries Node, so reuse is unchanged either way.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -6667,9 +6676,10 @@ pub struct SidecarArtifact {
     pub version: String,
 }
 
-/// One third-party tool a headless runner runs beside itself (`jj`, `bun`,
-/// `uv`), re-hosted from the upstream release that `scripts/fetch-{jj,bun,uv}.ts`
-/// pins and verifies at publish time.
+/// One pinned third-party tool (`jj`, `bun`, `uv`, `node`), re-hosted from the
+/// upstream release that `scripts/lib/pinned-tools.ts` pins and verifies at
+/// publish time. A headless runner installs jj, bun, and uv beside itself; an
+/// executor installs every [`EXECUTOR_MANAGED_TOOLS`] name into its own bin.
 ///
 /// The bytes are a raw, already-extracted executable, never an archive. The
 /// digest lives here and nowhere else a checkout-less host could read, so the
@@ -6689,8 +6699,13 @@ pub struct ToolArtifact {
 /// The tools a resident executor keeps in its own home's `bin`, by the name a
 /// [`ToolArtifact`] carries. The executor installs nothing else a selection
 /// names, so no selection can put an arbitrary program first on every cell's
-/// PATH. The same list as `PINNED_TOOLS` in `scripts/lib/pinned-tools.ts`.
-pub const EXECUTOR_MANAGED_TOOLS: &[&str] = &["jj", "bun", "uv"];
+/// PATH. The same list as `PINNED_TOOLS` in `scripts/lib/pinned-tools.ts`, which
+/// `scripts/lib/pinned-tools.test.ts` holds it to.
+///
+/// `node` is the bare executable only: npm, npx, and corepack are JavaScript
+/// trees beside it upstream and are not managed, so a host's npm, if any, runs
+/// under this Node through its `env node` shebang.
+pub const EXECUTOR_MANAGED_TOOLS: &[&str] = &["jj", "bun", "uv", "node"];
 
 /// What [`EXECUTOR_TOOL_SELECTION_PATH`] answers: the tools a runner's
 /// publication names for one target, each pointing at the runner itself.

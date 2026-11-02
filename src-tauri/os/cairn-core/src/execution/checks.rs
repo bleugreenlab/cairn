@@ -8254,8 +8254,11 @@ pub(crate) fn check_platform_identity() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// The host toolchain as every check key on this process is made with: the
+/// keyed instruments only (`cairn_checkenv::keyed_toolchain_identity`), so a
+/// key never moves with a recorded-only instrument such as the host's Node.
 pub fn check_toolchain_identity() -> &'static str {
-    cairn_checkenv::toolchain_identity()
+    cairn_checkenv::keyed_toolchain_identity()
 }
 
 fn check_environment_fingerprint(variable_names: impl IntoIterator<Item = String>) -> String {
@@ -8436,7 +8439,7 @@ impl<'a> ObservedOn<'a> {
             .and_then(|meta| meta.toolchain_fingerprint.clone())
             .or_else(|| {
                 self.is_coordinator()
-                    .then(|| check_toolchain_identity().to_string())
+                    .then(|| cairn_checkenv::toolchain_identity().to_string())
             })
     }
 }
@@ -8652,7 +8655,9 @@ fn check_command_identity(
             arch: arch.to_string(),
             executor_id: None,
             device_id: None,
-            capabilities: vec![toolchain.to_string()],
+            // Projected here as well, so no caller can key a verdict by a
+            // recorded-only instrument.
+            capabilities: vec![cairn_checkenv::keyed_identity(toolchain)],
             runner_build_id: Some(cairn_checkenv::implementation_identity().to_string()),
             variable_names: crate::execution::check_identity::verdict_environment_names(check),
         },
@@ -18401,13 +18406,42 @@ cairn-common = { path = "../cairn-common" }
         check_toolchain_identity()
     }
 
-    /// A declared-variable hash as a test plan's lookup keys it: extended by
-    /// every probed instrument at [`test_expected_toolchain`]'s version.
+    /// The input hash every plan, `/checks` read, and gate coordinate keys by
+    /// does not move with the runner's host Node, and is the key main made
+    /// from a `rustc=…;bun=…` identity.
+    #[test]
+    fn a_check_result_key_ignores_the_hosts_node() {
+        let check: CheckCommand = serde_yaml::from_str("command: bun run test:frontend\n").unwrap();
+        let selector = InputSelector::from_globs(&["**".to_string()]);
+        let key = |toolchain: &str| {
+            check_result_key(&check, &selector, None, "tree", "macos-aarch64", toolchain)
+        };
+        let before_node = "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14);bun=1.4.4";
+        assert_eq!(
+            key(&format!("{before_node};node=26.12.1")),
+            key(before_node)
+        );
+        assert_eq!(
+            key(&format!("{before_node};node=26.12.1")),
+            key(&format!("{before_node};node=27.0.0"))
+        );
+        assert_ne!(
+            key(before_node),
+            key("rustc=rustc 1.97.1 (8bab26f4f 2026-07-14);bun=1.4.5"),
+            "a keyed instrument still moves the key"
+        );
+    }
+
+    /// A declared-variable hash as a test plan's lookup keys it for a check
+    /// that declares no runtime: extended by every declarable instrument at
+    /// [`test_expected_toolchain`]'s version.
     fn test_verdict_environment(declared: &str) -> String {
         cairn_checkenv::verdict_environment_with_runtime(
             declared,
             &cairn_checkenv::runtime_versions(
-                cairn_checkenv::RUNTIME_INSTRUMENTS.iter().copied(),
+                crate::config::project_settings::RuntimeInstrument::ALL
+                    .iter()
+                    .map(|instrument| instrument.as_str()),
                 Some(test_expected_toolchain()),
             ),
         )
@@ -21082,7 +21116,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert_eq!(stored.executor_finished_at_unix_ms, None);
         assert_eq!(
             stored.toolchain_fingerprint.as_deref(),
-            Some(check_toolchain_identity())
+            Some(cairn_checkenv::toolchain_identity())
         );
     }
 
@@ -21149,7 +21183,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert_eq!(stored.executor_finished_at_unix_ms, None);
         assert_eq!(
             stored.toolchain_fingerprint.as_deref(),
-            Some(check_toolchain_identity())
+            Some(cairn_checkenv::toolchain_identity())
         );
         let json = stored
             .target_results_json

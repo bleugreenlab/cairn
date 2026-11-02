@@ -399,12 +399,48 @@ mod tests {
                 "{instrument:?} is declarable but never probed"
             );
         }
-        let mut probed = cairn_checkenv::RUNTIME_INSTRUMENTS.to_vec();
-        probed.sort_unstable();
         assert_eq!(
             verdict_runtime_instruments(&command("command: bun run lint\n")),
-            probed,
-            "an undeclared check depends on every probed toolchain"
+            ["bun", "rustc"],
+            "an undeclared check depends on every declarable toolchain"
+        );
+        let mut declarable = RuntimeInstrument::ALL
+            .iter()
+            .map(|instrument| instrument.as_str())
+            .collect::<Vec<_>>();
+        let mut keyed = cairn_checkenv::KEYED_INSTRUMENTS.to_vec();
+        declarable.sort_unstable();
+        keyed.sort_unstable();
+        assert_eq!(
+            declarable, keyed,
+            "keys and fingerprints carry exactly the declarable instruments"
+        );
+    }
+
+    /// The runner expects the Node its own PATH resolves (Homebrew's 26 on a
+    /// desktop), and an executor's lane records the pinned 24.22.2 in its bin.
+    /// Node is recorded on both sides but keys neither, so the two still name
+    /// one verdict environment; were Node in an undeclared check's key, no
+    /// executor verdict would ever answer this runner's lookup or gate.
+    #[test]
+    fn a_runners_host_node_and_an_executors_pinned_node_key_one_verdict() {
+        let rustc = "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: aarch64-apple-darwin";
+        let expected = format!("{rustc};bun=1.4.4;node=26.12.1");
+        let measured = format!("{rustc};bun=1.4.4;node=24.22.2");
+        let check = command("command: bun run test:frontend:scoped\n");
+        let key = |runtime: &[(String, String)]| {
+            cairn_checkenv::verdict_environment_with_runtime("declared", runtime)
+        };
+        let lookup = key(&expected_verdict_runtime(&check, &expected));
+        let row = key(&cairn_checkenv::runtime_versions(
+            verdict_runtime_instruments(&check),
+            Some(&measured),
+        ));
+        assert_eq!(lookup, row);
+        assert_eq!(
+            cairn_checkenv::instrument_version(&measured, "node"),
+            Some("24.22.2"),
+            "the row still records which Node ran"
         );
     }
 

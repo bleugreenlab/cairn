@@ -300,14 +300,18 @@ fn verdict_platform_line(
 /// The runtime the run measured, beside its platform: a check's runtime
 /// instruments are part of its verdict environment, so two rows a Bun release
 /// apart are different verdicts and the page says which one this is. Every
-/// probed toolchain is named, since the page shows what the run measured
-/// rather than which of it the check declared.
+/// toolchain the run recorded is named, since the page shows what the run
+/// measured rather than which of it the check declared; one the run was never
+/// probed for (node, on a row older than its probe) is left out rather than
+/// called unrecorded on every such row. Where that Node or Bun came from (the
+/// executor's own pinned copy or the host's) is on the executor's page.
 fn verdict_runtime_line(observation: &CheckResultObservationProjection) -> String {
-    let runtime = cairn_checkenv::runtime_versions(
-        cairn_checkenv::RUNTIME_INSTRUMENTS.iter().copied(),
-        observation.toolchain_fingerprint.as_deref(),
-    );
-    if observation.toolchain_fingerprint.is_none() {
+    let runtime = observation
+        .toolchain_fingerprint
+        .as_deref()
+        .map(cairn_checkenv::recorded_runtime)
+        .unwrap_or_default();
+    if runtime.is_empty() {
         return "- Runtime: unrecorded".to_string();
     }
     format!(
@@ -1042,7 +1046,19 @@ mod tests {
             ),
             "{body}"
         );
+        observation.toolchain_fingerprint = Some(
+            "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)\nhost: x86_64-unknown-linux-gnu;bun=1.4.4;node=18.19.1"
+                .into(),
+        );
+        assert!(
+            render(&observation).contains(
+                "- Runtime: rustc 1.97.1 (8bab26f4f 2026-07-14), bun 1.4.4, node 18.19.1\n"
+            ),
+            "a run that measured node names it"
+        );
         observation.toolchain_fingerprint = None;
+        assert!(render(&observation).contains("- Runtime: unrecorded\n"));
+        observation.toolchain_fingerprint = Some("tools-1".into());
         assert!(render(&observation).contains("- Runtime: unrecorded\n"));
     }
 

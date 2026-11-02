@@ -16,8 +16,24 @@ const VERDICT_RUNTIME_IDENTITY_VERSION: &str = "verdict-runtime-v1";
 
 /// The toolchains [`toolchain_identity`] and [`toolchain_identity_in`] probe,
 /// by the name a check declares one as a runtime instrument under (`runtime:`
-/// in its definition). Every composed identity carries exactly these.
-pub const RUNTIME_INSTRUMENTS: &[&str] = &["rustc", "bun"];
+/// in its definition), in the order a composed identity carries them. Every
+/// identity composed now carries exactly these; one recorded before an
+/// instrument joined simply lacks it, and reads it as `unrecorded`.
+///
+/// Probed is not the same as declarable: `node` is measured and recorded on
+/// every row, but no verdict key carries it yet (see `RuntimeInstrument` in
+/// `cairn-domain`), because the runner's expectation cannot resolve the pinned
+/// Node an executor's lane runs.
+pub const RUNTIME_INSTRUMENTS: &[&str] = &["rustc", "bun", "node"];
+
+/// The probed instruments a verdict's keys and environment fingerprints may
+/// carry: the declarable ones (`RuntimeInstrument::ALL` in `cairn-domain`, held
+/// equal by a `cairn-core` test). Every key and fingerprint is built from
+/// [`keyed_identity`]; the full identity, Node included, is the recorded
+/// runtime and nothing else. A runner-side key built from the full identity
+/// would move whenever the runner's host Node did (a `brew upgrade node`) and
+/// strand every stored verdict.
+pub const KEYED_INSTRUMENTS: &[&str] = &["rustc", "bun"];
 
 /// The version an instrument reads as when the run's toolchain was never
 /// measured (a lane whose executor report was lost). No probe produces it, so a
@@ -87,21 +103,86 @@ pub fn verdict_environment_with_runtime(declared: &str, runtime: &[(String, Stri
     digest(hasher)
 }
 
-/// The version of one instrument in a composed identity (`rustc=…;bun=…`).
+/// The version of one instrument in a composed identity
+/// (`rustc=…;bun=…;node=…`).
 ///
 /// rustc's component is `rustc --version --verbose`, whose later lines name the
 /// host triple and LLVM build. Only its first line (`rustc 1.97.1 (8bab26f4f
 /// 2026-07-14)`) is the release, so a Linux run and a macOS run of one pinned
 /// compiler read as the same version, which a check that trusts both platforms
-/// needs. `None` for an instrument this crate does not probe, or for a value
-/// that is not a composed identity.
+/// needs. `None` for an instrument the identity does not record (one composed
+/// before that instrument was probed, such as a `rustc=…;bun=…` row and
+/// `node`), or for a value that is not a composed identity.
 pub fn instrument_version<'a>(identity: &'a str, instrument: &str) -> Option<&'a str> {
-    let (rustc, bun) = identity.strip_prefix("rustc=")?.rsplit_once(";bun=")?;
+    let value = identity_fields(identity)?
+        .into_iter()
+        .find_map(|(name, value)| (name == instrument).then_some(value))?;
     match instrument {
-        "rustc" => rustc.lines().next().map(str::trim),
-        "bun" => Some(bun.trim()),
-        _ => None,
+        "rustc" => value.lines().next().map(str::trim),
+        _ => Some(value.trim()),
     }
+}
+
+/// The `name=value` fields of a composed identity, in order.
+///
+/// A field opens at the start of the identity or after a `;`, and only where a
+/// probed instrument's `name=` follows; any other `;` belongs to the value
+/// before it. So a tool whose version output happened to contain `;` cannot
+/// open a field of its own. `None` unless the identity opens with a field.
+fn identity_fields(identity: &str) -> Option<Vec<(&'static str, &str)>> {
+    let opens = |rest: &str| {
+        RUNTIME_INSTRUMENTS.iter().copied().find(|name| {
+            rest.strip_prefix(*name)
+                .is_some_and(|after| after.starts_with('='))
+        })
+    };
+    let first = opens(identity)?;
+    let mut starts = vec![(0, first)];
+    for (at, _) in identity.match_indices(';') {
+        if let Some(name) = opens(&identity[at + 1..]) {
+            starts.push((at + 1, name));
+        }
+    }
+    let fields = starts
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, name))| {
+            let end = starts
+                .get(index + 1)
+                .map_or(identity.len(), |&(next, _)| next - 1);
+            (name, &identity[start + name.len() + 1..end])
+        })
+        .collect();
+    Some(fields)
+}
+
+/// `identity` with only its [`KEYED_INSTRUMENTS`] fields, each value exactly as
+/// probed, in probe order: `rustc=…;bun=…`, which is byte-for-byte the identity
+/// composed before Node was probed. A value that is not a composed identity is
+/// returned as it is.
+pub fn keyed_identity(identity: &str) -> String {
+    let Some(fields) = identity_fields(identity) else {
+        return identity.to_string();
+    };
+    fields
+        .into_iter()
+        .filter(|(name, _)| KEYED_INSTRUMENTS.contains(name))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The instruments `identity` actually records, each with its version, in
+/// probe order. What a page shows for a stored run: an instrument the run was
+/// never probed for is left out rather than printed as `unrecorded`.
+pub fn recorded_runtime(identity: &str) -> Vec<(String, String)> {
+    RUNTIME_INSTRUMENTS
+        .iter()
+        .filter_map(|instrument| {
+            instrument_version(identity, instrument)
+                .map(|version| (instrument.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 /// Each of `instruments` paired with the version `identity` records for it,
@@ -215,18 +296,45 @@ fn probe(command: &mut Command, program: &str) -> Option<String> {
     }
 }
 
-fn compose_identity(rustc: Option<String>, bun: Option<String>) -> String {
-    format!(
-        "rustc={};bun={}",
-        rustc.as_deref().unwrap_or(UNAVAILABLE),
-        bun.as_deref().unwrap_or(UNAVAILABLE)
-    )
+/// The arguments that make `instrument` print its version.
+fn version_args(instrument: &str) -> &'static [&'static str] {
+    match instrument {
+        "rustc" => RUSTC_VERSION_ARGS,
+        _ => &["--version"],
+    }
+}
+
+/// One probe's output as the identity records it. `node --version` prints
+/// `v24.22.2` where the pin, and every other instrument, says `24.22.2`.
+fn normalized_version<'a>(instrument: &str, output: &'a str) -> &'a str {
+    match instrument {
+        "node" => output.strip_prefix('v').unwrap_or(output),
+        _ => output,
+    }
+}
+
+/// `rustc=…;bun=…;node=…`: every [`RUNTIME_INSTRUMENTS`] entry, probed with
+/// `probe(program, args)`, in order, with `unavailable` for one that could not
+/// be read.
+fn compose_identity(mut probe: impl FnMut(&str, &[&str]) -> Option<String>) -> String {
+    RUNTIME_INSTRUMENTS
+        .iter()
+        .map(|instrument| {
+            let output = probe(instrument, version_args(instrument));
+            let version = output
+                .as_deref()
+                .map_or(UNAVAILABLE, |output| normalized_version(instrument, output));
+            format!("{instrument}={version}")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
 /// The host identity [`toolchain_identity`] last probed. Each value is leaked so
 /// callers keep a `&'static str`; a new one is minted only when
-/// [`refresh_toolchain_identity`] runs, which is once per tool install, so the
-/// leak is bounded by how often a machine's tools actually change.
+/// [`refresh_toolchain_identity`] finds the host's tools changed, so the leak is
+/// bounded by how often a machine's tools actually change, not by how often
+/// they are looked at.
 static IDENTITY: RwLock<Option<&'static str>> = RwLock::new(None);
 
 /// The toolchains this process resolves from its own working directory and the
@@ -254,19 +362,52 @@ pub fn toolchain_identity() -> &'static str {
     *held.get_or_insert_with(|| Box::leak(probe_host_identity().into_boxed_str()))
 }
 
-/// Probe the host identity again and hold the new answer, returning it. Call
-/// after anything that changes which `rustc` or `bun` this process's PATH
-/// resolves.
-pub fn refresh_toolchain_identity() -> &'static str {
-    let identity: &'static str = Box::leak(probe_host_identity().into_boxed_str());
-    *IDENTITY
+/// [`keyed_identity`] of [`toolchain_identity`]: what every key and environment
+/// fingerprint this process computes is made with. Minted again only when the
+/// held identity is replaced.
+pub fn keyed_toolchain_identity() -> &'static str {
+    static KEYED: Mutex<Option<(&'static str, &'static str)>> = Mutex::new(None);
+    let full = toolchain_identity();
+    let mut held = KEYED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((source, keyed)) = *held {
+        if std::ptr::eq(source, full) {
+            return keyed;
+        }
+    }
+    let keyed: &'static str = Box::leak(keyed_identity(full).into_boxed_str());
+    *held = Some((full, keyed));
+    keyed
+}
+
+/// Probe the host identity again and, when it differs from the held one, hold
+/// the new answer and drop every expectation probed under the old one. Returns
+/// the new identity when it changed, `None` when the host still resolves the
+/// same tools.
+///
+/// Cheap enough to call on a timer: it costs one probe of each instrument, and
+/// mints nothing when nothing moved. That is what lets a host-side change no
+/// install of ours made (an `apt install nodejs` on a resident machine) reach
+/// the next verdict's fingerprint without a restart.
+pub fn refresh_toolchain_identity() -> Option<&'static str> {
+    hold_identity(probe_host_identity())
+}
+
+fn hold_identity(probed: String) -> Option<&'static str> {
+    let mut held = IDENTITY
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identity);
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if held.is_some_and(|current| current == probed) {
+        return None;
+    }
+    let identity: &'static str = Box::leak(probed.into_boxed_str());
+    *held = Some(identity);
     EXPECTED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
-    identity
+    Some(identity)
 }
 
 /// Expectations [`expected_toolchain_identity_in`] has probed, keyed by the
@@ -328,13 +469,9 @@ fn rust_toolchain_pin(dir: &Path) -> Option<String> {
 
 fn probe_host_identity() -> String {
     let path = host_probe_path();
-    let host = |program: &str, args: &[&str]| {
+    compose_identity(|program, args| {
         probe(Command::new(program).args(args).env("PATH", &path), program)
-    };
-    compose_identity(
-        host("rustc", RUSTC_VERSION_ARGS),
-        host("bun", &["--version"]),
-    )
+    })
 }
 
 /// The PATH the host identity is probed under: this process's own, which both
@@ -370,7 +507,7 @@ where
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_os_string(), value.as_ref().to_os_string()))
         .collect::<Vec<_>>();
-    let launched = |program: &str, args: &[&str]| {
+    compose_identity(|program, args| {
         probe(
             Command::new(program)
                 .args(args)
@@ -379,18 +516,14 @@ where
                 .env("RUSTUP_AUTO_INSTALL", "0"),
             program,
         )
-    };
-    compose_identity(
-        launched("rustc", RUSTC_VERSION_ARGS),
-        launched("bun", &["--version"]),
-    )
+    })
 }
 
 pub fn local_fingerprint(variable_names: impl IntoIterator<Item = String>) -> String {
     fingerprint(
         std::env::consts::OS,
         std::env::consts::ARCH,
-        [toolchain_identity().to_string()],
+        [keyed_toolchain_identity().to_string()],
         Some(implementation_identity()),
         variable_names,
         |name| std::env::var(name).ok(),
@@ -407,7 +540,7 @@ mod tests {
             fingerprint(
                 "linux",
                 "x86_64",
-                ["rustc=example;bun=example".to_string()],
+                ["rustc=example;bun=example;node=example".to_string()],
                 Some(build),
                 Vec::<String>::new(),
                 |_| None,
@@ -440,6 +573,7 @@ mod tests {
                 "echo \"dir=$(pwd -P) toolchain=${RUSTUP_TOOLCHAIN:-none} auto=${RUSTUP_AUTO_INSTALL:-unset}\"",
             ),
             ("bun", "echo \"bun-from-${0%/*}\""),
+            ("node", "echo \"v24.22.2-from-${0%/*}\""),
         ] {
             let path = bin.join(name);
             std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -469,7 +603,7 @@ mod tests {
         assert_eq!(
             pinned,
             format!(
-                "rustc=dir={} toolchain=1.97.1 auto=0;bun=bun-from-{path}",
+                "rustc=dir={} toolchain=1.97.1 auto=0;bun=bun-from-{path};node=24.22.2-from-{path}",
                 first.display()
             ),
             "the probe runs where the command runs, with its declared variables, without installing"
@@ -477,7 +611,7 @@ mod tests {
         assert_eq!(
             overridden,
             format!(
-                "rustc=dir={} toolchain=stable auto=0;bun=bun-from-{path}",
+                "rustc=dir={} toolchain=stable auto=0;bun=bun-from-{path};node=24.22.2-from-{path}",
                 second.display()
             ),
             "a second launch context is probed afresh rather than served the first one's answer"
@@ -491,29 +625,135 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(
             toolchain_identity_in(root.path(), [("PATH", empty.as_os_str())]),
-            "rustc=unavailable;bun=unavailable"
+            "rustc=unavailable;bun=unavailable;node=unavailable"
         );
     }
 
     /// The held identity is what every verdict this process keys reads, so a
-    /// refresh has to replace it rather than leave the first probe standing.
+    /// refresh has to replace it rather than leave the first probe standing,
+    /// and only when the tools moved, since it runs on every refresh pass.
+    /// One test, because the held identity is process-wide.
     #[test]
-    fn a_refresh_replaces_the_held_identity() {
+    fn a_refresh_replaces_the_held_identity_only_when_it_changed() {
         let held = toolchain_identity();
         assert_eq!(
             toolchain_identity(),
             held,
             "the identity is held, not re-probed"
         );
-        let refreshed = refresh_toolchain_identity();
-        assert_eq!(toolchain_identity(), refreshed);
-        assert!(refreshed.starts_with("rustc=") && refreshed.contains(";bun="));
+        assert!(held.starts_with("rustc=") && held.contains(";bun=") && held.contains(";node="));
+
+        let moved = "rustc=r;bun=1.4.4;node=18.19.1".to_string();
+        assert_eq!(hold_identity(moved.clone()), Some(moved.as_str()));
+        assert_eq!(toolchain_identity(), moved);
+        assert_eq!(
+            hold_identity(moved.clone()),
+            None,
+            "an unchanged probe mints and replaces nothing"
+        );
+        let installed = "rustc=r;bun=1.4.4;node=24.22.2".to_string();
+        assert_eq!(hold_identity(installed.clone()), Some(installed.as_str()));
+        assert_eq!(toolchain_identity(), installed);
+
+        // Back to what this host really resolves, for anything after.
+        refresh_toolchain_identity();
+        assert_eq!(refresh_toolchain_identity(), None);
     }
 
     const RUSTC_VERBOSE: &str = "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.1";
 
     fn identity(rustc: &str, bun: &str) -> String {
-        compose_identity(Some(rustc.to_string()), Some(bun.to_string()))
+        identity_with_node(rustc, bun, "v24.22.2")
+    }
+
+    fn identity_with_node(rustc: &str, bun: &str, node: &str) -> String {
+        compose_identity(|program, _| {
+            Some(
+                match program {
+                    "rustc" => rustc,
+                    "bun" => bun,
+                    "node" => node,
+                    other => panic!("probed {other}"),
+                }
+                .to_string(),
+            )
+        })
+    }
+
+    /// Keys are made from the keyed projection, which drops node and keeps
+    /// rustc and bun byte for byte, so a key is the one main made and does not
+    /// move with the host's Node.
+    #[test]
+    fn the_keyed_identity_is_the_pre_node_identity_whatever_node_is() {
+        let before_node = format!("rustc={RUSTC_VERBOSE};bun=1.4.4");
+        let homebrew = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v26.12.1");
+        let pinned = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v24.22.2");
+        assert_eq!(keyed_identity(&homebrew), before_node);
+        assert_eq!(keyed_identity(&pinned), before_node);
+        assert_eq!(keyed_identity(&before_node), before_node);
+        assert_eq!(keyed_identity("tools-1"), "tools-1");
+        let key = |toolchain: &str| {
+            fingerprint(
+                "linux",
+                "x86_64",
+                [keyed_identity(toolchain)],
+                Some("build"),
+                Vec::<String>::new(),
+                |_| None,
+            )
+        };
+        assert_eq!(key(&homebrew), key(&before_node));
+        assert!(keyed_toolchain_identity().starts_with("rustc="));
+        assert!(!keyed_toolchain_identity().contains(";node="));
+    }
+
+    /// Rows recorded before node was probed are `rustc=…;bun=…`; they must keep
+    /// answering for rustc and bun exactly as before, and read node as absent.
+    #[test]
+    fn an_identity_recorded_before_node_still_reads_rustc_and_bun() {
+        let old = format!("rustc={RUSTC_VERBOSE};bun=1.4.4");
+        assert_eq!(
+            instrument_version(&old, "rustc"),
+            Some("rustc 1.97.1 (8bab26f4f 2026-07-14)")
+        );
+        assert_eq!(instrument_version(&old, "bun"), Some("1.4.4"));
+        assert_eq!(instrument_version(&old, "node"), None);
+        assert_eq!(
+            runtime_versions(["node"], Some(&old)),
+            vec![("node".to_string(), "unrecorded".to_string())]
+        );
+        assert_eq!(
+            recorded_runtime(&old),
+            vec![
+                (
+                    "rustc".to_string(),
+                    "rustc 1.97.1 (8bab26f4f 2026-07-14)".to_string()
+                ),
+                ("bun".to_string(), "1.4.4".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_three_instrument_identity_reads_each_and_drops_nodes_v() {
+        let composed = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v18.19.1");
+        assert!(composed.ends_with(";bun=1.4.4;node=18.19.1"), "{composed}");
+        assert_eq!(instrument_version(&composed, "bun"), Some("1.4.4"));
+        assert_eq!(instrument_version(&composed, "node"), Some("18.19.1"));
+        assert_eq!(
+            instrument_version(&composed, "rustc"),
+            Some("rustc 1.97.1 (8bab26f4f 2026-07-14)")
+        );
+        // A `;` inside a value that does not open an instrument's field stays in
+        // the value.
+        assert_eq!(
+            instrument_version("rustc=a;b;bun=1.4.4;node=24.22.2", "rustc"),
+            Some("a;b")
+        );
+        assert_eq!(
+            instrument_version("rustc=a;bunx=1;bun=1.4.4", "bun"),
+            Some("1.4.4")
+        );
     }
 
     /// The version of each instrument is read from the composed identity, and
@@ -539,14 +779,33 @@ mod tests {
             instrument_version("rustc=unavailable;bun=1.3.14", "rustc"),
             Some("unavailable")
         );
-        assert_eq!(instrument_version(&linux, "node"), None);
+        assert_eq!(instrument_version(&linux, "node"), Some("24.22.2"));
+        assert_eq!(instrument_version(&linux, "deno"), None);
         assert_eq!(instrument_version("tools-1", "bun"), None);
     }
 
     /// Only the declared instruments enter the verdict environment: two runs a
-    /// Bun version apart separate a Bun check and leave a rustc check whole.
+    /// Bun version apart separate a Bun check and leave a rustc check whole, and
+    /// two runs a Node apart separate a Node check and leave a Bun check whole.
     #[test]
     fn only_declared_instruments_enter_the_verdict_environment() {
+        let host_node = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v18.19.1");
+        let pinned_node = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v24.22.2");
+        let runtime_key = |instruments: &[&str], toolchain: &str| {
+            verdict_environment_with_runtime(
+                "declared",
+                &runtime_versions(instruments.iter().copied(), Some(toolchain)),
+            )
+        };
+        assert_ne!(
+            runtime_key(&["node"], &host_node),
+            runtime_key(&["node"], &pinned_node)
+        );
+        assert_eq!(
+            runtime_key(&["bun"], &host_node),
+            runtime_key(&["bun"], &pinned_node)
+        );
+
         let old_bun = identity(RUSTC_VERBOSE, "1.3.14");
         let new_bun = identity(RUSTC_VERBOSE, "1.4.4");
         let key = |instruments: &[&str], toolchain: &str| {
@@ -582,7 +841,10 @@ mod tests {
             unrecorded,
             vec![("bun".to_string(), "unrecorded".to_string())]
         );
-        for probed in ["rustc=unavailable;bun=unavailable", "rustc=x;bun=1.4.4"] {
+        for probed in [
+            "rustc=unavailable;bun=unavailable;node=unavailable",
+            "rustc=x;bun=1.4.4;node=24.22.2",
+        ] {
             assert_ne!(runtime_versions(["bun"], Some(probed)), unrecorded);
         }
     }

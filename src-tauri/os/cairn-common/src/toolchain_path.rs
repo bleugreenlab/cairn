@@ -485,6 +485,33 @@ mod tests {
         );
     }
 
+    /// The bginf-sp2 shape: a package manager's `node` on the user's PATH and
+    /// the publication's in the executor's bin. A cell's bare `node` must be
+    /// the executor's, or every frontend lane runs whatever the host installed.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_cells_bare_node_is_the_executor_bins() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executor_bin = temp.path().join(".cairn-exec/bin");
+        let default_bin = temp.path().join(".cairn/bin");
+        let host_bin = temp.path().join("usr/bin");
+        for dir in [&executor_bin, &default_bin, &host_bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for dir in [&executor_bin, &host_bin] {
+            let node = dir.join("node");
+            std::fs::write(&node, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let composed =
+            compose_executor_path(&executor_bin, &default_bin, host_bin.to_str().unwrap());
+        assert_eq!(
+            resolve_on_path(&composed, PATH_SEP, EXECUTABLE_SUFFIX, "node"),
+            Some(executor_bin.join("node"))
+        );
+    }
+
     /// A colocated executor shares the runner's home, and its PATH is the
     /// runner's agent PATH with no duplicated entry.
     #[test]

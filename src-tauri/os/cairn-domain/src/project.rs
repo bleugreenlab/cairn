@@ -150,6 +150,13 @@ pub const VERDICT_PLATFORMS: &[&str] = &["macos", "linux", "windows"];
 /// under, whose version can change its verdict. Each is a toolchain the
 /// check-environment probe measures on every run (`cairn-checkenv`'s
 /// `RUNTIME_INSTRUMENTS`), since a version nobody measures cannot key a verdict.
+///
+/// The probe also measures `node`, which is recorded on every row but is not
+/// declarable: a key needs the lookup's expected version to resolve the same
+/// pinned build a lane does, and only executors hold the pinned Node. The
+/// runner's expectation probe would name its host's Node, so a Node-keyed
+/// verdict from any executor would never match. Node joins this list once the
+/// runner resolves the pinned Node itself, as it does Bun and rustc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeInstrument {
@@ -438,8 +445,8 @@ pub struct CheckCommand {
     /// Absent means every probed toolchain: a check that says nothing about its
     /// runtime may depend on any of it, and the cost of assuming so is a re-run,
     /// where the cost of assuming otherwise is a verdict from another runtime.
-    /// An empty list declares that no probed toolchain decides it (a suite that
-    /// runs under node alone, say).
+    /// An empty list declares that no probed toolchain decides it (a check
+    /// that only reads files, say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Vec<RuntimeInstrument>>,
 
@@ -760,7 +767,7 @@ impl CheckVocabulary {
                 }
             }
         }
-        // An instrument a later build measures (`node`, say) is a newer word,
+        // An instrument a later build measures (`deno`, say) is a newer word,
         // not a typo this build may drop: dropping it would key the check on
         // fewer toolchains than its author declared.
         if let Some(serde_yaml::Value::Sequence(instruments)) = entry.get("runtime") {
@@ -1023,7 +1030,7 @@ mod check_vocabulary_tests {
                 "verdictPlatforms",
                 "freebsd",
             ),
-            ("command: x\nruntime: [bun, node]\n", "runtime", "node"),
+            ("command: x\nruntime: [bun, deno]\n", "runtime", "deno"),
         ] {
             let DeclaredCheck::Unsupported(unsupported) =
                 read_declared_check(entry(yaml), &vocabulary).unwrap()
