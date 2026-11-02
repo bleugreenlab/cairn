@@ -1479,6 +1479,11 @@ pub struct Fleet {
     /// current session, and an unreported one is worth less than a stale one
     /// resurfacing days later.
     environment_evictions: Arc<Mutex<HashMap<String, EnvironmentEviction>>>,
+    /// Machines withdrawn from an owner's placement after refusing to provision
+    /// its environment, keyed by holder. In memory for the same reason as
+    /// `environment_evictions`: each one is a verdict about a machine session
+    /// this runner is watching, and lapses with it.
+    withdrawn_homes: Arc<Mutex<HashMap<String, Vec<WithdrawnHome>>>>,
     /// When each absent executor was first observed to be absent, which is what
     /// separates a link that flapped from a machine that left. Stamped when a
     /// connection goes away and when an acquisition first finds a route with no
@@ -1927,6 +1932,52 @@ pub(crate) enum EvictionCause {
     /// new work, which a drain refuses, so the idle environment is released
     /// and acquired on a machine that is not draining.
     Drained,
+}
+
+/// How long a machine stays withdrawn from an owner after refusing to provision
+/// its environment, when its session outlasts that. A refusal from its storage
+/// can clear without the machine reconnecting (another process letting go of a
+/// directory), and a withdrawal that outlived its basis would push the owner off
+/// a machine that could now serve it.
+pub(crate) const HOME_WITHDRAWAL_MS: u64 = 15 * 60 * 1000;
+
+/// A machine withdrawn from one owner's placement because it answered that
+/// owner's fresh acquisition with a failure of its own storage.
+///
+/// The verdict is about the machine as that answer found it, so it holds only
+/// while the session that gave the answer lasts and for at most
+/// [`HOME_WITHDRAWAL_MS`]: a reconnect is a re-measured machine, and one that is
+/// not attached at all is placed nowhere anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WithdrawnHome {
+    pub(crate) executor_id: String,
+    pub(crate) generation: u64,
+    pub(crate) withdrawn_at_unix_ms: u64,
+}
+
+impl WithdrawnHome {
+    /// Whether this withdrawal still binds, given the generation the machine
+    /// is attached under now (`None` when it is not attached).
+    pub(crate) fn stands(&self, live_generation: Option<u64>, now_unix_ms: u64) -> bool {
+        live_generation == Some(self.generation)
+            && now_unix_ms.saturating_sub(self.withdrawn_at_unix_ms) < HOME_WITHDRAWAL_MS
+    }
+}
+
+/// The refusal an owner reads when the machine granted its environment refused
+/// to provision it: the machine, its own words (which name the cell), and that
+/// the owner was withdrawn from it and goes elsewhere next.
+fn home_withdrawal_diagnostic(holder: &ResidencyHolder, machine: &str, refusal: &str) -> String {
+    let minutes = HOME_WITHDRAWAL_MS / 60_000;
+    match holder {
+        ResidencyHolder::Job { .. } => format!(
+            "{machine} refused to provision this job's execution environment: {refusal}. The job is withdrawn from {machine}, so its next batch acquires its environment on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes"
+        ),
+        other => format!(
+            "{machine} refused to provision the execution environment of {}: {refusal}. It is withdrawn from {machine}, so its next acquisition is placed on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes",
+            describe_holder(other)
+        ),
+    }
 }
 
 /// Whether the machine a residency route names is answering.
@@ -8793,6 +8844,12 @@ impl Fleet {
             {
                 return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
             }
+            // A machine that just refused to provision this owner's environment
+            // would refuse it again, and an idle one claims every fresh
+            // acquisition first. Placement looks past it until it lapses.
+            placement
+                .avoided_executor_ids
+                .extend(self.withdrawn_home_executors(&original.holder));
             let Ok((entry_id, entry_rx)) = self.queue.enqueue(
                 queue::NewEntry {
                     request: placement.clone(),
@@ -9110,7 +9167,12 @@ impl Fleet {
                         )
                     }
                     ResidencyGrantAnswer::Answered(result) => {
-                        let result = *result;
+                        let result = self.withdraw_refusing_home(
+                            &granted_request.holder,
+                            &selected,
+                            placement.pinned_executor_id.is_some(),
+                            *result,
+                        );
                         self.record_residency_result(&selected.executor_id, &result);
                         // Clear a failed pending route before releasing the identity.
                         drop(dispatch);
@@ -9980,6 +10042,101 @@ impl Fleet {
             .lock()
             .unwrap()
             .remove(&holder.storage_key())
+    }
+
+    /// Withdraw the machine a fresh acquisition was granted to from that
+    /// owner's placement when it answered with a failure of its own storage,
+    /// and say so in the refusal the owner reads.
+    ///
+    /// Such a failure is a fact about the machine (a slot authority it cannot
+    /// quarantine, a checkout it cannot materialize), so an acquisition placed
+    /// the same way meets it again. Before this, an idle machine claimed every
+    /// fresh acquisition of a job whose home it could not build, and every
+    /// batch of that job was refused before it ran, whatever the batch's own
+    /// selector named, because each one starts by acquiring the home.
+    ///
+    /// Work pinned to one machine is not withdrawn from it: it has nowhere else
+    /// to go, and its refusal already says why.
+    fn withdraw_refusing_home(
+        &self,
+        holder: &ResidencyHolder,
+        selected: &SelectedExecutor,
+        pinned: bool,
+        result: ResidencyResult,
+    ) -> ResidencyResult {
+        let ResidencyResult::Failed {
+            kind,
+            diagnostic,
+            cell_outcome,
+        } = result
+        else {
+            return result;
+        };
+        if pinned || !placement::residency_failure_withdraws_home(&kind) {
+            return ResidencyResult::Failed {
+                kind,
+                diagnostic,
+                cell_outcome,
+            };
+        }
+        let now = unix_time_ms();
+        {
+            let mut withdrawn = self.withdrawn_homes.lock().unwrap();
+            // Owners that never acquire again would otherwise keep their
+            // entries for the runner's life.
+            withdrawn.retain(|_, homes| {
+                homes.retain(|home| {
+                    now.saturating_sub(home.withdrawn_at_unix_ms) < HOME_WITHDRAWAL_MS
+                });
+                !homes.is_empty()
+            });
+            let homes = withdrawn.entry(holder.storage_key()).or_default();
+            homes.retain(|home| home.executor_id != selected.executor_id);
+            homes.push(WithdrawnHome {
+                executor_id: selected.executor_id.clone(),
+                generation: selected.generation,
+                withdrawn_at_unix_ms: now,
+            });
+        }
+        let machine = self.executor_name_for_text(&selected.executor_id);
+        tracing::warn!(
+            %holder,
+            executor = %machine,
+            generation = selected.generation,
+            ?kind,
+            %diagnostic,
+            "machine refused to provision an execution environment; withdrawn from this owner's placement"
+        );
+        ResidencyResult::Failed {
+            kind,
+            diagnostic: home_withdrawal_diagnostic(holder, &machine, &diagnostic),
+            cell_outcome,
+        }
+    }
+
+    /// The machines an owner's next fresh acquisition must not be placed on,
+    /// forgetting every withdrawal whose basis has lapsed.
+    pub(crate) fn withdrawn_home_executors(&self, holder: &ResidencyHolder) -> Vec<String> {
+        let key = holder.storage_key();
+        let Some(homes) = self.withdrawn_homes.lock().unwrap().get(&key).cloned() else {
+            return Vec::new();
+        };
+        // Generations are read with the withdrawal map released, so this
+        // never holds it across the connection table.
+        let now = unix_time_ms();
+        let (standing, lapsed): (Vec<_>, Vec<_>) = homes
+            .into_iter()
+            .partition(|home| home.stands(self.live_generation(&home.executor_id), now));
+        if !lapsed.is_empty() {
+            let mut withdrawn = self.withdrawn_homes.lock().unwrap();
+            if let Some(homes) = withdrawn.get_mut(&key) {
+                homes.retain(|home| !lapsed.contains(home));
+                if homes.is_empty() {
+                    withdrawn.remove(&key);
+                }
+            }
+        }
+        standing.into_iter().map(|home| home.executor_id).collect()
     }
 
     /// Whether one live executor satisfies the caller's complete selector.
@@ -37697,6 +37854,159 @@ mod tests {
             assert_eq!(orch.fleet.queue.len(), 0);
         })
         .await;
+    }
+
+    /// A machine that answers a fresh acquisition with a failure of its own
+    /// storage is withdrawn from that owner. The refusal names the machine, the
+    /// cell, and the withdrawal, and the owner's next acquisition is offered to
+    /// another machine and never to it. Before, the idle machine claimed every
+    /// fresh acquisition and refused each the same way (cairn/5868).
+    #[tokio::test]
+    async fn a_machine_that_refuses_to_provision_a_home_is_withdrawn_from_its_owner() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (broken_generation, mut broken) = residency_queue_attach(&orch.fleet, "broken");
+            let mut request = residency_queue_request("thread");
+            request.executor = None;
+            let refusal = r"provision residency checkout: quarantine cell slot-1's authority C:\Users\cairn\.cairn-exec\build-slots\cairn\.authority\slot-1: Access is denied. (os error 5)";
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    let entry = residency_queue_offer(&mut broken).await;
+                    orch.fleet.handle_executor_message(
+                        "broken",
+                        broken_generation,
+                        ExecutorMessage::Claim {
+                            entry_id: entry.clone(),
+                        },
+                    );
+                    let (correlation, _) = residency_queue_grant(&mut broken, Some(&entry)).await;
+                    orch.fleet.handle_executor_message(
+                        "broken",
+                        broken_generation,
+                        ExecutorMessage::ResidencyResponse {
+                            correlation_id: correlation,
+                            result: residency_core_failure(
+                                ResidencyFailureKind::Persistence,
+                                refusal,
+                                None,
+                            ),
+                        },
+                    );
+                }
+            );
+            let machine = orch.fleet.executor_name_for_text("broken");
+            let ResidencyResult::Failed {
+                kind, diagnostic, ..
+            } = &refused
+            else {
+                panic!("the refusing machine's answer is a refusal: {refused:?}");
+            };
+            assert_eq!(*kind, ResidencyFailureKind::Persistence);
+            assert!(
+                diagnostic.starts_with(&format!(
+                    "{machine} refused to provision this job's execution environment: {refusal}."
+                )),
+                "names the machine and keeps its own words, which name the cell: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(&format!("The job is withdrawn from {machine}")),
+                "says the job was withdrawn: {diagnostic}"
+            );
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&request.holder),
+                vec!["broken".to_string()]
+            );
+            assert!(
+                orch.fleet.residency_routes.lock().unwrap().is_empty(),
+                "a refused acquisition leaves no route binding the job to the machine"
+            );
+
+            let (healthy_generation, mut healthy) =
+                residency_queue_attach(&orch.fleet, "healthy");
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    let entry = residency_queue_offer(&mut healthy).await;
+                    orch.fleet.handle_executor_message(
+                        "healthy",
+                        healthy_generation,
+                        ExecutorMessage::Claim {
+                            entry_id: entry.clone(),
+                        },
+                    );
+                    let (correlation, granted) =
+                        residency_queue_grant(&mut healthy, Some(&entry)).await;
+                    residency_queue_reply(
+                        &orch.fleet,
+                        "healthy",
+                        healthy_generation,
+                        correlation,
+                        &granted,
+                    );
+                }
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the next acquisition lands on the other machine: {placed:?}"
+            );
+            while let Ok(frame) = broken.try_recv() {
+                assert!(
+                    !matches!(
+                        frame,
+                        ExecutorMessage::Offer { .. } | ExecutorMessage::ResidencyRequest { .. }
+                    ),
+                    "the withdrawn machine is never offered the job's next acquisition: {frame:?}"
+                );
+            }
+            let recent = orch.fleet.recent_placements.lock().unwrap();
+            let decision = recent
+                .iter()
+                .rev()
+                .find(|decision| decision.request_id == residency_queue_entry_id(&request.holder))
+                .expect("the second acquisition records its placement");
+            assert!(
+                decision.rejected.iter().any(|rejection| rejection.executor_id == "broken"
+                    && rejection.reason == PlacementRejectionReason::AvoidedInfrastructure),
+                "placement passed over the withdrawn machine by name: {:?}",
+                decision.rejected
+            );
+        })
+        .await;
+    }
+
+    /// A withdrawal is a verdict about the session that refused: it lapses when
+    /// the machine reattaches under another generation, when it is not attached,
+    /// and after the withdrawal window, whichever comes first.
+    #[test]
+    fn a_home_withdrawal_lapses_with_the_session_or_the_window() {
+        let home = WithdrawnHome {
+            executor_id: "bgsrv-win".into(),
+            generation: 3,
+            withdrawn_at_unix_ms: 1_000,
+        };
+        assert!(home.stands(Some(3), 1_000));
+        assert!(home.stands(Some(3), 1_000 + HOME_WITHDRAWAL_MS - 1));
+        assert!(!home.stands(Some(3), 1_000 + HOME_WITHDRAWAL_MS));
+        assert!(
+            !home.stands(Some(4), 1_000),
+            "a reattached machine is re-measured"
+        );
+        assert!(
+            !home.stands(None, 1_000),
+            "an absent machine is placed nowhere anyway"
+        );
     }
 
     async fn residency_queue_duplicate_scenario(winner_fails: bool) {

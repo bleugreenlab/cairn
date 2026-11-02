@@ -315,6 +315,29 @@ pub(crate) fn classify_residency_failure(
     }
 }
 
+/// Whether a fresh acquisition's failure, as answered by the machine it was
+/// granted to, withdraws that machine from the owner's next placement.
+///
+/// Only the kinds that mean the machine's own storage refused the cell: it
+/// could not provision or persist a checkout cell (`Persistence`), or could not
+/// bring the cell it held to the declared commit and gave it up (`Cleanup`).
+/// A machine answers those the same way the next time it is asked. Every other
+/// kind is about the request, the queue, or a declaration, which another
+/// machine would answer no differently, or is a wait (`Admission`).
+pub(crate) fn residency_failure_withdraws_home(kind: &ResidencyFailureKind) -> bool {
+    match kind {
+        ResidencyFailureKind::Persistence | ResidencyFailureKind::Cleanup => true,
+        ResidencyFailureKind::InvalidDeclaration
+        | ResidencyFailureKind::ConflictingDeclaration
+        | ResidencyFailureKind::NotFound
+        | ResidencyFailureKind::Unavailable
+        | ResidencyFailureKind::StaleEpoch
+        | ResidencyFailureKind::InvalidState
+        | ResidencyFailureKind::Admission
+        | ResidencyFailureKind::Process => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +620,27 @@ mod tests {
         ];
         for outcome in executed {
             assert!(!classify_cell_outcome(&outcome, LinkRestoration::NotRestoring).is_capacity());
+        }
+    }
+
+    /// Only a failure of the granted machine's own storage withdraws it from
+    /// the owner. A wait, or a fault in the request, would meet any machine.
+    #[test]
+    fn only_a_machine_storage_failure_withdraws_the_home() {
+        assert!(residency_failure_withdraws_home(
+            &ResidencyFailureKind::Persistence
+        ));
+        assert!(residency_failure_withdraws_home(
+            &ResidencyFailureKind::Cleanup
+        ));
+        for kind in [
+            ResidencyFailureKind::Admission,
+            ResidencyFailureKind::InvalidDeclaration,
+            ResidencyFailureKind::ConflictingDeclaration,
+            ResidencyFailureKind::InvalidState,
+            ResidencyFailureKind::NotFound,
+        ] {
+            assert!(!residency_failure_withdraws_home(&kind), "{kind:?}");
         }
     }
 

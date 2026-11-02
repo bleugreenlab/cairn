@@ -6488,6 +6488,17 @@ pub struct LearnedResourceEstimate {
 /// variant changes. A runner talking to an older executor reads `None` and
 /// renders the owner as unreported, which is what that executor is: it
 /// discards nothing itself and leaves its host's timer to do it.
+///
+/// cairn/5868 does not move the number. A runner now withdraws a machine from
+/// one owner's placement after that machine answers the owner's fresh
+/// acquisition with a `Persistence` or `Cleanup` failure, through the existing
+/// runner-side `avoidedExecutorIds` field that no executor reads, and rewrites
+/// that failure's diagnostic to name the machine and the withdrawal. The
+/// executor's quarantine diagnostic now names the cell whose tree or authority
+/// it could not move. Only prose inside existing strings changes; no frame,
+/// variant, field or serialized form changes, and a runner talking to an older
+/// executor gets nothing wrong: that executor's diagnostic still names the
+/// authority path, which ends in the cell.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -8356,8 +8367,11 @@ pub struct CellRequest {
     /// lives.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdict_platforms: Vec<String>,
-    /// Machines this request must NOT land on, because a check it carries is
-    /// infrastructure-suppressed on that machine's current environment.
+    /// Machines this request must NOT land on, because work it carries already
+    /// failed on that machine's current environment: a check that is
+    /// infrastructure-suppressed there, or, for an execution environment's
+    /// acquisition, a machine that refused to provision that owner's
+    /// environment (withdrawn until its session ends or the withdrawal lapses).
     ///
     /// Steering work away from a broken machine is not the same as refusing it:
     /// a suite whose toolchain is missing on one host may be perfectly healthy
@@ -16033,11 +16047,13 @@ pub enum PlacementRejectionReason {
         role: MachineRole,
         work_class: PlacementWorkClass,
     },
-    /// A check this request carries has spent its retry budget on this machine's
-    /// current environment. The machine may be perfectly healthy for other work;
-    /// it is this check that must go elsewhere. Carries no payload because the
-    /// rejection record it rides in already names the machine, which is the
-    /// actionable half — the environment digest behind it is a hash.
+    /// The requester excluded this machine because work it carries already
+    /// failed on the machine's current environment: a check that spent its
+    /// retry budget here, or an execution environment this machine refused to
+    /// provision for the same owner. The machine may be perfectly healthy for
+    /// other work; it is this work that must go elsewhere. Carries no payload
+    /// because the rejection record it rides in already names the machine,
+    /// which is the actionable half, and the requester's own refusal says why.
     AvoidedInfrastructure,
     /// The machine was asked and its own admission said no, on the connection
     /// it still holds. Unlike every structural reason above, this is an answer
@@ -16253,7 +16269,7 @@ impl PlacementRejectionReason {
                 work_class.as_str()
             ),
             Self::AvoidedInfrastructure => {
-                "a check in this request is infrastructure-suppressed on this machine's current environment"
+                "excluded for this request: work it carries already failed on this machine's current environment (a check spent its retry budget here, or this machine refused to provision its execution environment)"
                     .into()
             }
             Self::Declined {
