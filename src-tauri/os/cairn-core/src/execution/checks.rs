@@ -192,6 +192,7 @@ fn producer_failure_marker(lines: &[&str]) -> Option<(usize, CheckFailureKind)> 
             ("CAIRN_ENVIRONMENT_EXIT: ", CheckFailureKind::Environment),
             ("CAIRN_UNCLASSIFIED_EXIT: ", CheckFailureKind::Unclassified),
             ("CAIRN_SELECTION_EXIT: ", CheckFailureKind::Selection),
+            ("CAIRN_PREREQUISITE_EXIT: ", CheckFailureKind::Prerequisite),
         ]
         .into_iter()
         .find_map(|(prefix, kind)| pair[0].starts_with(prefix).then_some((index, kind)))
@@ -210,6 +211,7 @@ fn attach_executor_provenance(
         CheckFailureKind::Environment
             | CheckFailureKind::Unclassified
             | CheckFailureKind::Selection
+            | CheckFailureKind::Prerequisite
     ) {
         if let Some(executor_id) = executor_id.filter(|id| !id.is_empty()) {
             classification
@@ -5400,6 +5402,11 @@ pub enum CheckFailureKind {
     Unclassified,
     /// A recognized test runner reports that the requested selection matched nothing.
     Selection,
+    /// A prerequisite step failed before the suite ran: `ensure-sidecar`, whose
+    /// sidecar build compiles crates the suite never compiles, and only on a
+    /// cell that lacks them. Still a red about the tree, but never the suite's
+    /// reusable verdict, since its key need not cover what the step compiled.
+    Prerequisite,
     /// Fleet admission could not obtain capacity before its knowledge-bounded wait expired.
     Capacity,
     /// A recognized test runner exited abnormally without assertion failures.
@@ -5470,6 +5477,7 @@ impl CheckFailureKind {
             CheckFailureKind::Environment => "environment",
             CheckFailureKind::Unclassified => "unclassified",
             CheckFailureKind::Selection => "selection",
+            CheckFailureKind::Prerequisite => "prerequisite",
             CheckFailureKind::Capacity => "capacity",
             CheckFailureKind::RunnerError => "runner_error",
             CheckFailureKind::NotPlaceable => "not_placeable",
@@ -5490,6 +5498,7 @@ impl CheckFailureKind {
             "environment" => Some(CheckFailureKind::Environment),
             "unclassified" => Some(CheckFailureKind::Unclassified),
             "selection" => Some(CheckFailureKind::Selection),
+            "prerequisite" => Some(CheckFailureKind::Prerequisite),
             "capacity" => Some(CheckFailureKind::Capacity),
             "runner_error" => Some(CheckFailureKind::RunnerError),
             "not_placeable" => Some(CheckFailureKind::NotPlaceable),
@@ -5516,6 +5525,10 @@ impl CheckFailureKind {
                 "failure could not be classified — needs investigation".to_string()
             }
             CheckFailureKind::Selection => "test selection matched no tests".to_string(),
+            CheckFailureKind::Prerequisite => {
+                "a prerequisite step failed before the suite ran — not the suite's verdict"
+                    .to_string()
+            }
             CheckFailureKind::Capacity => "executor capacity unavailable".to_string(),
             CheckFailureKind::RunnerError => "test runner failed".to_string(),
             CheckFailureKind::NotPlaceable => {
@@ -5713,6 +5726,10 @@ fn classify_check_failure(
                 "Cairn: the Rust process failed without enough evidence to assign cause or ownership"
             }
             CheckFailureKind::Selection => "Cairn: the requested test selection matched no tests",
+            CheckFailureKind::Prerequisite => {
+                "Cairn: a prerequisite step failed before the suite ran, so this red is not the \
+                 suite's verdict and is never reused as one"
+            }
             _ => unreachable!("producer failure markers only map to typed Rust process outcomes"),
         };
         return Some(FailureClassification {
@@ -8249,6 +8266,9 @@ fn check_reuse_decision(
         reusable: false,
         reason: Some(reason.to_string()),
     };
+    if failure_kind == Some(CheckFailureKind::Prerequisite) {
+        return reject("a prerequisite step failed before the suite ran");
+    }
     if failure_kind.is_some() {
         return reject("check ended with an infrastructure or process failure");
     }
@@ -13770,28 +13790,79 @@ cairn-common = { path = "../cairn-common" }
 
     #[test]
     fn a_config_error_runs_nothing_and_caches_nothing() {
-        let mut both = check(
-            "bun run test:rust",
-            Some(&["src-tauri/**"]),
+        let mut slice = check(
+            "bun run check:migrations",
+            Some(&["src-tauri/turso_migrations/**"]),
             CheckWhen::Write,
         );
-        both.scope = Some(crate::config::project_settings::CheckScopeSelector::One(
-            "rust:cairn-core".to_string(),
+        slice.tree = crate::config::project_settings::CheckTree::Impact;
+        slice.scope = Some(crate::config::project_settings::CheckScopeSelector::One(
+            "rust:cairn-db".to_string(),
         ));
-        let map = HashMap::from([("rust".to_string(), both)]);
+        let map = HashMap::from([("migrations".to_string(), slice)]);
         let plans = plan_checks(
             &map,
             &inputs(&map),
-            &[change("src-tauri/os/cairn-core/src/lib.rs")],
+            &[change("src-tauri/turso_migrations/0001_x.sql")],
             Path::new("/repo"),
         );
         let plan = plans.first().expect("one plan");
         let error = plan
             .config_error
             .as_deref()
-            .expect("a check with two input definitions is unrunnable");
-        assert!(error.contains("impact"));
+            .expect("an impact slice cannot carry a scope closure");
+        assert!(error.contains("tree: impact"));
         assert!(error.contains("scope"));
+    }
+
+    /// cairn/5268's pin: codex-pin as the REAL config declares it. Its key
+    /// moves when anything the suite compiles moves (a file deep in the
+    /// `rust:cairn-models` closure) or the script it runs, and stays put for
+    /// cairn-orch, which only the `ensure-sidecar` prerequisite compiles and
+    /// whose failure is a non-reusable `prerequisite` red instead.
+    #[test]
+    fn codex_pin_keys_on_what_its_suite_compiles_and_runs() {
+        use crate::execution::inputs::fixtures::real_workspace;
+
+        let config = include_str!("../../../../../.cairn/config.yaml");
+        let (settings, _) = crate::config::project_settings::parse_project_settings(config)
+            .expect("repository project config must parse");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("repository must declare checks");
+        let codex_pin = contract
+            .checks
+            .get("codex-pin")
+            .expect("codex-pin is configured")
+            .clone();
+        let extra_inputs = contract.extra_inputs;
+
+        let key_with = |path: &str, version: &str| {
+            let fixture = real_workspace()
+                .source("scripts/codex-pin.ts", "v1")
+                .source("src-tauri/os/cairn-common/src/lib.rs", "v1")
+                .source("src-tauri/cairn-orch/src/executor_supervisor.rs", "v1")
+                .source(path, version);
+            scoped_key(&codex_pin, &extra_inputs, &fixture)
+        };
+        let base = key_with("docs/checks.md", "v1");
+        assert_eq!(
+            base,
+            key_with("docs/checks.md", "v2"),
+            "a doc edit is no input"
+        );
+        assert_eq!(
+            base,
+            key_with("src-tauri/cairn-orch/src/executor_supervisor.rs", "v2"),
+            "cairn-orch is the sidecar prerequisite's input, not the suite's"
+        );
+        for input in [
+            "src-tauri/os/cairn-common/src/lib.rs",
+            "src-tauri/os/cairn-models/src/session/codex/pin.rs",
+            "src-tauri/os/cairn-models/codex-pin.json",
+            "scripts/codex-pin.ts",
+        ] {
+            assert_ne!(base, key_with(input, "v2"), "{input} must re-key codex-pin");
+        }
     }
 
     #[test]
@@ -21795,6 +21866,10 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                 "CAIRN_SELECTION_EXIT: cargo nextest exited 4 on runner-a\nCause (verbatim):\nno tests matched",
                 CheckFailureKind::Selection,
             ),
+            (
+                "CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora\nCause (verbatim):\nerror[E0603]: function `unix_time_ms` is private",
+                CheckFailureKind::Prerequisite,
+            ),
         ] {
             assert_eq!(
                 classify_check_failure(opaque, Some(1), false, false, None, marker)
@@ -22611,6 +22686,57 @@ mod executor_base_content_tests {
                 String::new()
             )],
             "only the changed-file list rides here, and it rides even when empty"
+        );
+    }
+
+    /// cairn/5268: codex-pin's `ensure-sidecar` step failed compiling cairn-orch,
+    /// a crate the suite never compiles, and that red was served as codex-pin's
+    /// verdict on trees without the break. The step's marker makes the run a red
+    /// that is never reusable, whatever the lane's key covers.
+    #[test]
+    fn a_failed_prerequisite_step_is_a_red_that_is_never_reused() {
+        let command = "bun run codex:pin:check";
+        let output = "$ bun run scripts/ensure-sidecar.ts\n\
+             Source sidecars missing for x86_64-unknown-linux-gnu — building them first\n\
+             error[E0603]: function `unix_time_ms` is private\n\
+             \x20   --> cairn-orch/src/executor_supervisor.rs:1483:31\n\
+             error: could not compile `cairn-orch` due to 1 previous error\n\
+             CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora\n\
+             Cause (verbatim):\n\
+             error[E0603]: function `unix_time_ms` is private\n\
+             error: script \"codex:pin:check\" exited with code 101";
+        let classification =
+            classify_check_failure(command, Some(101), false, false, None, output).unwrap();
+        assert_eq!(classification.kind, CheckFailureKind::Prerequisite);
+        assert!(
+            !classification.kind.is_infrastructure(),
+            "the machine is not to blame"
+        );
+        assert!(
+            classification.kind.is_verdict_about_the_code(),
+            "the tree failed to build, so the run still reads as a red"
+        );
+        let reuse = check_reuse_decision(command, Some(classification.kind), None);
+        assert!(!reuse.reusable);
+        assert_eq!(
+            reuse.reason.as_deref(),
+            Some("a prerequisite step failed before the suite ran")
+        );
+        // Without the marker the same compile error is an ordinary red, which
+        // the reuse decision admits: the marker is what keeps it out.
+        let unmarked = output
+            .lines()
+            .take_while(|line| !line.starts_with("CAIRN_PREREQUISITE_EXIT"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify_check_failure(command, Some(101), false, false, None, &unmarked),
+            None
+        );
+        assert!(check_reuse_decision(command, None, None).reusable);
+        assert_eq!(
+            CheckFailureKind::from_stored(CheckFailureKind::Prerequisite.as_str()),
+            Some(CheckFailureKind::Prerequisite)
         );
     }
 

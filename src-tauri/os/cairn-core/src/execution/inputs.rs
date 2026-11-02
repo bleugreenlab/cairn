@@ -8,6 +8,13 @@
 //! glob list stays correct about (CAIRN-3090: `packages/ui` was missing from the
 //! typecheck lane's globs, so main went red silently).
 //!
+//! A lane whose command both compiles a crate and runs a script declares both,
+//! and its inputs are their union: the closure, plus the path-shaped files the
+//! graph cannot see (cairn/5268: codex-pin compiles `rust:cairn-models` and runs
+//! `scripts/codex-pin.ts`; glob-only, its key omitted the closure, so a compile
+//! red was reused on trees that never had the break). A union can only widen
+//! the input set, never narrow it, so the two never disagree about a path.
+//!
 //! Both resolve here, to one [`InputSelector`] per check, and that single object
 //! answers both questions the checks engine asks about inputs:
 //!
@@ -371,36 +378,23 @@ fn resolve_selector(
         };
     }
     match (check.impact.as_ref(), check.scope.as_ref()) {
-        (Some(globs), Some(scope)) => {
-            // One mechanism per lane. Both declared means the project asked two
-            // different questions about the same check's inputs and there is no
-            // honest answer to run under, so the check reports a config error and
-            // caches nothing — the same treatment an unexpandable placeholder gets.
-            let mut definition = globs.clone();
-            definition.extend(scope.tokens().iter().map(|token| format!("scope:{token}")));
-            definition.sort();
-            InputSelector {
-                kind: SelectorKind::Unresolved,
-                definition,
-                config_error: Some(format!(
-                    "check declares both `impact` ({}) and `scope` ({}). They are two \
-                     different definitions of the same check's inputs and cannot both \
-                     hold. Declare `scope` for a code lane whose inputs are a dependency \
-                     closure, or `impact` for a lane whose inputs genuinely are a path \
-                     shape. Nothing was run.",
-                    globs.join(", "),
-                    scope.tokens().join(", ")
-                )),
-            }
-        }
+        (impact, Some(scope)) => resolve_scope(
+            scope,
+            impact.map_or(&[][..], Vec::as_slice),
+            extra_inputs,
+            graph,
+        ),
         (Some(globs), None) => InputSelector::from_globs(globs),
-        (None, Some(scope)) => resolve_scope(scope, extra_inputs, graph),
         (None, None) => InputSelector::everything(),
     }
 }
 
+/// A `scope` closure, unioned with the check's own `impact` globs when it
+/// declares both. The globs enter the definition as `impact:<glob>`, so adding
+/// or removing one re-keys the check like any other definition change.
 fn resolve_scope(
     scope: &CheckScopeSelector,
+    impact: &[String],
     extra_inputs: &HashMap<String, Vec<String>>,
     graph: Option<&Arc<ProjectGraph>>,
 ) -> InputSelector {
@@ -408,6 +402,7 @@ fn resolve_scope(
     let mut definition: Vec<String> = tokens
         .iter()
         .map(|token| format!("scope:{token}"))
+        .chain(impact.iter().map(|glob| format!("impact:{glob}")))
         .collect();
     definition.sort();
 
@@ -480,13 +475,16 @@ fn resolve_scope(
     definition.extend(extra.iter().map(|glob| format!("extra:{glob}")));
     definition.sort();
 
-    let extra_set = if extra.is_empty() {
+    // The node extras and the check's own globs match the same way, so they
+    // share one set; the definition above keeps them apart.
+    let globs: Vec<String> = extra.iter().chain(impact).cloned().collect();
+    let extra_set = if globs.is_empty() {
         None
     } else {
-        match build_glob_set(&extra) {
+        match build_glob_set(&globs) {
             Ok(set) => Some(set),
             Err(error) => {
-                log::warn!("check scope extra inputs {extra:?} would not compile: {error}");
+                log::warn!("check scope extra inputs {globs:?} would not compile: {error}");
                 return InputSelector::unresolved(definition);
             }
         }
@@ -2087,27 +2085,74 @@ mid = { path = "os/mid", package = "cairn-mid" }
         assert!(!selector.keys_on_whole_tree());
     }
 
-    // --- declaration errors -------------------------------------------------
+    // --- scope and impact together -----------------------------------------
 
+    /// A lane that compiles a crate and runs a script has both kinds of input,
+    /// so declaring both is their union: the closure, plus the globs.
     #[test]
-    fn declaring_both_impact_and_scope_is_a_configuration_error() {
+    fn declaring_both_scope_and_impact_unions_them() {
         let fixture = real_workspace();
-        let selector = resolve(
+        let both = check(
+            "bun run codex:pin:check",
+            Some(&["scripts/codex-pin.ts"]),
+            Some(&["rust:cairn-models"]),
+        );
+        let selector = resolve(&both, &HashMap::new(), &fixture);
+        assert!(selector.config_error().is_none());
+        assert!(selector.narrows());
+        assert!(!selector.keys_on_whole_tree());
+        for input in [
+            "scripts/codex-pin.ts",
+            "src-tauri/os/cairn-models/src/session/codex/pin.rs",
+            // A dependency the check never names.
+            "src-tauri/os/cairn-common/src/lib.rs",
+            "src-tauri/Cargo.lock",
+        ] {
+            assert!(selector.matches(input), "{input} is an input");
+        }
+        for outside in [
+            "scripts/codex-contract.ts",
+            "src-tauri/cairn-orch/src/executor_supervisor.rs",
+            "src-tauri/os/cairn-core/src/lib.rs",
+            "docs/checks.md",
+        ] {
+            assert!(!selector.matches(outside), "{outside} is not an input");
+        }
+
+        // The globs are in the definition, so declaring one re-keys the check.
+        assert!(selector
+            .definition()
+            .contains(&"impact:scripts/codex-pin.ts".to_string()));
+        let scope_only = resolve(
             &check(
-                "cargo test",
-                Some(&["src-tauri/**"]),
-                Some(&["rust:cairn-core"]),
+                "bun run codex:pin:check",
+                None,
+                Some(&["rust:cairn-models"]),
             ),
             &HashMap::new(),
             &fixture,
         );
-        let error = selector
-            .config_error()
-            .expect("two definitions of one check's inputs cannot both hold");
-        assert!(error.contains("impact"));
-        assert!(error.contains("scope"));
-        assert!(!selector.narrows());
+        assert_ne!(selector.definition(), scope_only.definition());
+        assert!(!scope_only.matches("scripts/codex-pin.ts"));
     }
+
+    #[test]
+    fn an_uncompilable_glob_beside_a_scope_degrades_to_the_whole_tree() {
+        let selector = resolve(
+            &check(
+                "cargo test",
+                Some(&["scripts/["]),
+                Some(&["rust:cairn-models"]),
+            ),
+            &HashMap::new(),
+            &real_workspace(),
+        );
+        assert!(selector.is_declared());
+        assert!(!selector.narrows());
+        assert!(selector.matches("anything"));
+    }
+
+    // --- declaration errors -------------------------------------------------
 
     #[test]
     fn a_check_declaring_nothing_keys_on_the_whole_tree() {
