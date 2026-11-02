@@ -366,7 +366,13 @@ impl Orchestrator {
             models: self.provider_models(key),
             tiers: tier_bindings(key, presets),
             serves: self.provider_serves(key, project_id),
-            unable: self.decision_observations.unable(key),
+            unable: {
+                let mut unable = self.decision_observations.unable(key);
+                if key == crate::backends::inference::INFERENCE_BACKEND_KEY {
+                    unable.extend(crate::backends::inference::unable_now());
+                }
+                unable
+            },
         }
     }
 }

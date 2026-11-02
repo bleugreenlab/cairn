@@ -409,11 +409,9 @@ impl Orchestrator {
             EmbedError::Unsupported(format!("the model catalog is unavailable: {error}"))
         })?;
         let (offer, capabilities) = catalog.embedding_offer(Some(model), request)?;
-        let route = self.embed_route(scope, &offer)?;
         // An inference engine answers to its own name for the model; the
         // vectors still carry the name the caller asked by.
-        let sent =
-            crate::backends::backend_for_name(Some(&offer.provider)).sent_model(self, &offer.model);
+        let (route, sent) = self.embed_route(scope, &offer)?;
         let mut embeddings = embed(
             self.models_runtime.complete.as_ref(),
             EmbedCall {
@@ -553,8 +551,24 @@ impl Orchestrator {
         })
     }
 
-    /// Where `offer` is embedded, with this workspace's credentials for it.
+    /// Where `offer` is embedded, with this workspace's credentials for it,
+    /// and the model id it is sent there: the offer's own, except on Cairn's
+    /// inference deployments, whose engines answer to their served names.
     pub(crate) fn embed_route(
+        &self,
+        scope: &ModelScope,
+        offer: &SelectedOffer,
+    ) -> Result<(EmbedRoute, String), EmbedError> {
+        let provider = offer.provider.as_str();
+        if provider == crate::backends::inference::INFERENCE_BACKEND_KEY {
+            return crate::backends::inference::embed_route(self, &offer.model)
+                .map_err(EmbedError::Unsupported);
+        }
+        let route = self.provider_embed_route(scope, offer)?;
+        Ok((route, offer.model.clone()))
+    }
+
+    fn provider_embed_route(
         &self,
         scope: &ModelScope,
         offer: &SelectedOffer,
@@ -577,26 +591,6 @@ impl Orchestrator {
             return self
                 .ollama_embed_route(scope, &offer.model)
                 .map_err(unavailable);
-        }
-        if provider == crate::backends::inference::INFERENCE_BACKEND_KEY {
-            // Asking is demand: an unloaded embedder loads, within the
-            // embedding's own timeout.
-            let route = super::inference_route::ready_blocking(
-                self,
-                &offer.model,
-                "an embedding",
-                Some(EMBED_TIMEOUT),
-                || false,
-                |_| {},
-            )
-            .map_err(EmbedError::Unsupported)?;
-            return Ok(openai::route_for(
-                crate::backends::inference::INFERENCE_BACKEND_KEY,
-                crate::backends::inference::INFERENCE_BACKEND_NAME,
-                &route.api_base,
-                None,
-                &[],
-            ));
         }
         if let Some(account_id) = catalog::custom_account_id(provider) {
             let config =
@@ -689,6 +683,24 @@ pub(crate) mod tests {
     }
 
     impl Scripted {
+        /// A server that answers each request with the next of `replies`.
+        pub(crate) fn answering(replies: Vec<Value>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                ..Self::default()
+            }
+        }
+
+        /// Every request body, in order.
+        pub(crate) fn bodies(&self) -> Vec<Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, body)| body.clone())
+                .collect()
+        }
+
         /// How many texts each request carried, in order.
         pub(crate) fn batch_sizes(&self) -> Vec<usize> {
             self.requests
@@ -770,10 +782,7 @@ pub(crate) mod tests {
         replies: Vec<Value>,
     ) -> (Orchestrator, Arc<Scripted>, String) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
-        let scripted = Arc::new(Scripted {
-            replies: Mutex::new(replies.into()),
-            ..Scripted::default()
-        });
+        let scripted = Arc::new(Scripted::answering(replies));
         orch.models_runtime = ModelRuntime {
             complete: scripted.clone(),
             ..orch.models_runtime.clone()
@@ -854,13 +863,17 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(hub_chat, ["big"]);
 
-        let route = orch
+        let (route, sent) = orch
             .embed_route(
                 &ModelScope::default(),
                 &offer(&key, "qwen/qwen3-embedding-4b"),
             )
             .unwrap();
         assert_eq!(url(&route), "http://hub.invalid/v1/embeddings");
+        assert_eq!(
+            sent, "qwen/qwen3-embedding-4b",
+            "a hub is sent the offer's id"
+        );
         assert!(header_names(&route).contains(&"authorization".to_string()));
     }
 
@@ -1027,13 +1040,14 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let route = orch
+        let (route, sent) = orch
             .embed_route(
                 &scope,
                 &offer("openrouter", "openai/text-embedding-3-small"),
             )
             .unwrap();
         assert_eq!(url(&route), "https://openrouter.ai/api/v1/embeddings");
+        assert_eq!(sent, "openai/text-embedding-3-small");
         let names = header_names(&route);
         assert!(names.contains(&"authorization".to_string()), "{names:?}");
         assert!(names.contains(&"http-referer".to_string()), "{names:?}");
@@ -1045,10 +1059,11 @@ pub(crate) mod tests {
             None,
         )
         .unwrap();
-        let route = orch
+        let (route, sent) = orch
             .embed_route(&scope, &offer("ollama", "nomic-embed-text:latest"))
             .unwrap();
         assert_eq!(url(&route), "http://studio.invalid:11434/v1/embeddings");
+        assert_eq!(sent, "nomic-embed-text:latest");
         assert!(header_names(&route).is_empty());
 
         assert!(orch

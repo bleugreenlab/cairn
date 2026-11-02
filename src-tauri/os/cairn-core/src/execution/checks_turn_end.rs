@@ -335,9 +335,17 @@ pub(crate) async fn current_turn_end_attempt(
     })}).await.map_err(|e|e.to_string())
 }
 
+/// The reason a turn-end attempt is failed with when the process that owned it
+/// is gone. The startup re-arm reads it as "this wave was interrupted and is
+/// owed", which is how a wave cut off by a restart is told apart from one that
+/// is merely slow or hung in the current process (cairn/4690's case): only
+/// the reconciliation below ever writes it, and only for a previous process's
+/// attempts.
+pub(crate) const RESTART_INTERRUPTED_REASON: &str =
+    "host restarted before the turn-end check attempt reached a durable terminal state";
+
 pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) {
-    const REASON: &str =
-        "host restarted before the turn-end check attempt reached a durable terminal state";
+    const REASON: &str = RESTART_INTERRUPTED_REASON;
     for db in orch.db.all_dbs().await {
         if let Err(error)=db.write(|conn| Box::pin(async move {
             conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted')",(REASON,)).await?;
@@ -1738,6 +1746,10 @@ pub(crate) fn review_check_placement_question(
 
 /// The suppression scope sets a review wave for `job_id` at `commit` reads and
 /// charges, one per placement question, in order.
+///
+/// These are the only scopes the lane breaker is armed on: a review wave is
+/// the cadence that re-ran an identically failing lane hundreds of times
+/// (cairn/5357), and every other cadence must stay able to run it.
 pub(crate) async fn review_infra_scopes(
     orch: &Orchestrator,
     project_id: &str,
@@ -1759,6 +1771,12 @@ pub(crate) async fn review_infra_scopes(
         questions,
     )
     .await
+    .into_iter()
+    .map(|scopes| crate::execution::cache::InfraScopes {
+        lane_breaker: true,
+        ..scopes
+    })
+    .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2612,7 +2630,7 @@ mod tests {
 
     async fn launchability_orchestrator(issue_status: &str, job_status: &str) -> Orchestrator {
         let db = crate::storage::migrated_test_db("turn-end-launchability.db").await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
                VALUES('p','w','P','proj','/tmp/repo',1,1);

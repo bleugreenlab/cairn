@@ -574,19 +574,36 @@ async fn resolve_producing_job_for_issue(
     .map_err(|e| e.to_string())
 }
 
+/// How many startup re-arm evaluations run at once. Enough that a runner with
+/// dozens of settled jobs does not spend minutes on them one after another, and
+/// few enough that the boot, when every executor is reattaching, is not handed
+/// a burst of waves (cairn/5357 comment 1: 69 waves serially over 194 s).
+const STARTUP_REARM_PARALLELISM: usize = 4;
+
 /// Startup re-arm (CAIRN-2483). A restart loses every in-memory edge that would
 /// otherwise have created a parent's review wake, so startup re-derives it for
 /// each settled job on a non-terminal issue that still has reviewable output.
 ///
-/// Two things happen per candidate, and the order matters. The review wake is
-/// evaluated DIRECTLY, because it is the durable half and must not depend on the
-/// advisory check cadence: a candidate whose branch ships no PR (a planner parked
-/// at its plan gate) is skipped by that cadence entirely, and routing its wake
-/// through the cadence is exactly the coupling that let plan gates strand
-/// (CAIRN-3347). The turn-end checks are then re-spawned for their own sake — the
-/// in-memory single-flight marker is lost on restart, and the input-hash cache
-/// makes an unchanged re-run cheap. Called once per boot, as post-readiness
-/// background maintenance rather than as blocking recovery (CAIRN-3382).
+/// Two things happen, and the order matters. The review wake is evaluated
+/// DIRECTLY for every candidate's issue, because it is the durable half and must
+/// not depend on the advisory check cadence: a candidate whose branch ships no PR
+/// (a planner parked at its plan gate) is skipped by that cadence entirely, and
+/// routing its wake through the cadence is exactly the coupling that let plan
+/// gates strand (CAIRN-3347).
+///
+/// Turn-end check waves are then re-spawned only where one is owed, because a
+/// restart is not a fact about any lane (cairn/5357). One is owed when the job's
+/// current wave was interrupted by the restart, which
+/// [`reconcile_turn_end_attempts_on_startup`] records by failing the attempt
+/// with [`RESTART_INTERRUPTED_REASON`] before this runs, or when a dormant
+/// failed lane is due by the same fact rule the maintenance cadence applies
+/// ([`bounded_candidate_is_due`]). An attempt still in a moving state belongs
+/// to THIS process (a wave the reconciliation could not have seen, or one that
+/// is hung, cairn/4690's case) and is never re-spawned here. No suppression is
+/// reset: a repaired machine moves its own environment identity, which is the
+/// repair a restart used to stand in for. Called once per boot, as
+/// post-readiness background maintenance (CAIRN-3382), with its evaluations run
+/// [`STARTUP_REARM_PARALLELISM`] at a time.
 ///
 /// Returns the number of turn-end check waves re-spawned, so the caller can log
 /// what this boot actually put on the executor.
@@ -594,26 +611,14 @@ async fn resolve_producing_job_for_issue(
 /// IDEMPOTENT ACROSS BOOTS, and that is load-bearing now that it runs in the
 /// background: an interrupted re-arm leaves the work partially done until the
 /// next boot re-runs it, which is harmless precisely because every step here —
-/// clearing infrastructure suppression, re-deriving a review wake, re-spawning a
-/// fingerprint-deduplicated check wave — converges on the same state when
-/// repeated. An edit that makes any of it order- or once-dependent breaks that
-/// contract and must move it back onto the blocking path.
+/// re-deriving a review wake, re-spawning a wave a restart interrupted or a fact
+/// made due — converges on the same state when repeated. An edit that makes any
+/// of it order- or once-dependent breaks that contract and must move it back
+/// onto the blocking path.
+///
+/// [`reconcile_turn_end_attempts_on_startup`]: crate::execution::checks_turn_end::reconcile_turn_end_attempts_on_startup
+/// [`RESTART_INTERRUPTED_REASON`]: crate::execution::checks_turn_end::RESTART_INTERRUPTED_REASON
 pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
-    // The un-suppression edge (CAIRN-3245). A check bounded off after repeated
-    // infrastructure failures stays bounded off for as long as its inputs are
-    // unchanged, which is correct while the substrate is still broken and wrong
-    // the moment an operator repairs it. A restart is when that repair — a fixed
-    // toolchain, a revived daemon, a corrected wrapper — actually takes effect,
-    // and it is already the edge that re-arms the cadence, so clearing here means
-    // every freed triple is immediately re-evaluated rather than merely eligible.
-    match crate::execution::cache::clear_infra_suppressions(&orch.db.local).await {
-        Ok(0) => {}
-        Ok(freed) => log::info!(
-            "review-checks startup re-arm: cleared infrastructure suppression on {freed} check \
-             result(s); they will be re-evaluated below"
-        ),
-        Err(e) => log::warn!("review-checks startup re-arm: suppression clear failed: {e}"),
-    }
     let candidates = match rearm_candidate_jobs(&orch.db.local).await {
         Ok(jobs) => jobs,
         Err(e) => {
@@ -621,35 +626,135 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
             return 0;
         }
     };
-    if candidates.is_empty() {
-        return 0;
+    let mut issues: Vec<&str> = candidates
+        .iter()
+        .map(|(_, issue_id)| issue_id.as_str())
+        .collect();
+    issues.sort_unstable();
+    issues.dedup();
+    // Bounded by chunk rather than by a stream adaptor: the adaptors' closures
+    // over borrowed items make this future unspawnable, and the caller spawns it.
+    for chunk in issues.chunks(STARTUP_REARM_PARALLELISM) {
+        futures_util::future::join_all(
+            chunk
+                .iter()
+                .map(|issue_id| evaluate_review_readiness(orch, issue_id)),
+        )
+        .await;
     }
-    log::info!(
-        "review-checks startup re-arm: re-deriving the review wake and re-spawning turn-end \
-         checks for {} settled job(s)",
-        candidates.len()
-    );
-    let mut evaluated: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (job_id, issue_id) in &candidates {
-        if evaluated.insert(issue_id.as_str()) {
-            evaluate_review_readiness(orch, issue_id).await;
+
+    let mut interrupted: Vec<&str> = Vec::new();
+    for chunk in candidates.chunks(STARTUP_REARM_PARALLELISM) {
+        let owed = futures_util::future::join_all(
+            chunk
+                .iter()
+                .map(|(job_id, _)| wave_interrupted_by_restart(orch, job_id)),
+        )
+        .await;
+        interrupted.extend(
+            chunk
+                .iter()
+                .zip(owed)
+                .filter(|(_, owed)| *owed)
+                .map(|((job_id, _), _)| job_id.as_str()),
+        );
+    }
+    let dormant = bounded_rearm_candidates(&orch.db)
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!("review-checks startup re-arm: dormant lane lookup failed: {error}");
+            Vec::new()
+        });
+    let mut due: Vec<&BoundedRearmCandidate> = Vec::new();
+    for chunk in dormant.chunks(STARTUP_REARM_PARALLELISM) {
+        let answers = futures_util::future::join_all(
+            chunk
+                .iter()
+                .map(|candidate| bounded_candidate_is_due(orch, candidate)),
+        )
+        .await;
+        for (candidate, answer) in chunk.iter().zip(answers) {
+            match answer {
+                Ok(true) => due.push(candidate),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "review-checks startup re-arm: dormant lane {} of job {} could not be \
+                     evaluated: {error}",
+                    candidate.check_name,
+                    short_job(&candidate.job_id)
+                ),
+            }
         }
+    }
+    let interrupted_count = interrupted.len();
+    let mut waves: Vec<&str> = interrupted;
+    waves.extend(due.iter().map(|candidate| candidate.job_id.as_str()));
+    waves.sort_unstable();
+    waves.dedup();
+    // A held slot already has a wave behind it (cairn/4690), so it is left out
+    // before any counter is released for it.
+    waves.retain(|job_id| !orch.turn_end_checks_in_flight(job_id));
+    for candidate in due
+        .iter()
+        .filter(|candidate| waves.contains(&candidate.job_id.as_str()))
+    {
+        if let Err(error) =
+            release_head_suppression_on_fact_change(orch, &candidate.job_id, &candidate.check_name)
+                .await
+        {
+            log::warn!(
+                "review-checks startup re-arm: could not release the head counter of {} for job \
+                 {}: {error}",
+                candidate.check_name,
+                short_job(&candidate.job_id)
+            );
+        }
+    }
+    for job_id in &waves {
         spawn_turn_end_checks(orch, job_id);
     }
-    candidates.len()
+    log::info!(
+        "review-checks startup re-arm: re-derived the review wake for {} settled job(s); \
+         re-spawned {} turn-end wave(s) for {interrupted_count} wave(s) the restart \
+         interrupted and {} dormant lane(s) due on a changed fact",
+        candidates.len(),
+        waves.len(),
+        due.len()
+    );
+    waves.len()
 }
 
-/// Re-arm at most one dormant review wave whose latest attempt ended because of
-/// a retryable infrastructure or capacity failure. The one-row limit is
-/// deliberate pacing: recovery can free many stranded waves at once, and
+fn short_job(job_id: &str) -> &str {
+    &job_id[..job_id.len().min(8)]
+}
+
+/// Whether the job's current turn-end wave was cut off by the restart: the
+/// startup reconciliation failed it with the restart's reason because the
+/// process that owned it is gone.
+async fn wave_interrupted_by_restart(orch: &Orchestrator, job_id: &str) -> bool {
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return false;
+    };
+    matches!(
+        crate::execution::checks_turn_end::current_turn_end_attempt(&db, job_id).await,
+        Ok(Some(attempt))
+            if attempt.state == "failed"
+                && attempt.reason.as_deref()
+                    == Some(crate::execution::checks_turn_end::RESTART_INTERRUPTED_REASON)
+    )
+}
+
+/// Re-arm at most one dormant review wave whose lane failed without a verdict,
+/// once the fact that failed it has changed. The one-wave limit is deliberate
+/// pacing: a fleet change can make many dormant lanes due at once, and
 /// releasing all of them would recreate the contention that stranded them.
 ///
-/// The durable per-check infrastructure streak remains the hot-loop authority.
-/// A candidate at the bound waits for the cooldown below; only then does this
-/// paced cadence release suppression before going through the normal atomic
-/// execution claim again.
+/// Time alone never makes a lane due (cairn/5357): the cooldown only spaces
+/// how often the question is asked, and [`bounded_candidate_is_due`] answers it
+/// from facts. Only once it says yes is the head counter of that one lane
+/// released, so the wave it receives can execute it.
 pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
-    let Some(job_id) = (match bounded_rearm_candidate_job(orch).await {
+    let Some(candidate) = (match bounded_rearm_candidate(orch).await {
         Ok(candidate) => candidate,
         Err(error) => {
             log::warn!("review-checks bounded re-arm: candidate lookup failed: {error}");
@@ -670,39 +775,45 @@ pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
     };
 
     log::info!(
-        "review-checks bounded re-arm: re-spawning one dormant wave for job {}",
-        &job_id[..job_id.len().min(8)]
+        "review-checks bounded re-arm: re-spawning one dormant wave for job {}: the fact that \
+         failed its {} lane ({}) has changed",
+        short_job(&candidate.job_id),
+        candidate.check_name,
+        candidate.failure_kind
     );
-    if let Err(error) = release_cooled_infrastructure_suppression(orch, &job_id).await {
+    if let Err(error) =
+        release_head_suppression_on_fact_change(orch, &candidate.job_id, &candidate.check_name)
+            .await
+    {
         log::warn!(
-            "review-checks bounded re-arm: failed to release cooled suppression for job {}: {error}",
-            &job_id[..job_id.len().min(8)]
+            "review-checks bounded re-arm: failed to release the head counter of {} for job {}: \
+             {error}",
+            candidate.check_name,
+            short_job(&candidate.job_id)
         );
         return false;
     }
-    spawn_turn_end_checks(orch, &job_id);
+    spawn_turn_end_checks(orch, &candidate.job_id);
     true
 }
 
-/// A dormant shipping branch must not remain permanently suppressed after the
-/// substrate recovers. The ordinary attempt bound still stops a hot failure
-/// loop; the maintenance cadence releases it only after this cooldown and still
-/// dispatches at most one wave per tick.
+/// How long a dormant lane's newest row must have stood before the maintenance
+/// cadence asks whether it is due. It spaces the question; it never answers it.
 pub(super) const DORMANT_INFRA_RETRY_COOLDOWN_SECONDS: i64 = 5 * 60;
 
-/// Zero the cooled counters a dormant wave is bounded by, so the wave it is
-/// about to receive may execute.
+/// Zero the head-domain counters of one dormant lane, so the wave a changed
+/// fact just made due can execute it. Called only after
+/// [`bounded_candidate_is_due`] has said yes.
 ///
-/// Fleet-domain counters are never released here. Time cannot repair "no
-/// machine the fleet has can take this"; the one repair that can (a matching
-/// machine attaching, enrolling, or changing what it advertises) moves the
-/// fleet's capability identity, which mints a fresh scope at zero on its own.
-/// Releasing a fleet counter on a timer only bought three more executions of a
-/// lane that had nowhere to run, every cooldown, for as long as the fleet
-/// stayed as it was (cairn/4983).
-pub(super) async fn release_cooled_infrastructure_suppression(
+/// Only the head forms are released: they are the one counter no fact resets
+/// on a dormant head, because their repair is a new commit. A machine's
+/// environment counter and the fleet counter are reset by their own repairs,
+/// which mint fresh scopes at zero, so a timer or a re-arm never touches them
+/// (cairn/4983).
+pub(super) async fn release_head_suppression_on_fact_change(
     orch: &Orchestrator,
     job_id: &str,
+    check_name: &str,
 ) -> Result<(), String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
@@ -710,16 +821,16 @@ pub(super) async fn release_cooled_infrastructure_suppression(
     db.execute(
         "UPDATE check_result_cache
             SET infra_failure_streak = 0, infra_escalated_at = NULL
-          WHERE job_id = ?1
+          WHERE job_id = ?1 AND check_name = ?2
             AND failure_kind IN ('capacity', 'infrastructure')
-            AND infra_failure_streak >= ?2
-            AND ran_at <= (unixepoch() - ?3) * 1000
+            AND infra_failure_streak > 0
+            AND environment_fingerprint NOT LIKE ?3
             AND environment_fingerprint NOT LIKE ?4",
         (
             job_id,
-            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-            DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+            check_name,
             format!("{}%", crate::execution::cache::INFRA_FLEET_SCOPE_PREFIX),
+            format!("{}%", crate::execution::cache::infra_env_scope("")),
         ),
     )
     .await
@@ -741,9 +852,9 @@ pub(super) struct BoundedRearmCandidate {
     pub(super) environment_fingerprint: String,
 }
 
-pub(super) async fn bounded_rearm_candidate_job(
+pub(super) async fn bounded_rearm_candidate(
     orch: &Orchestrator,
-) -> Result<Option<String>, BoundedRearmLookupError> {
+) -> Result<Option<BoundedRearmCandidate>, BoundedRearmLookupError> {
     let candidates = bounded_rearm_candidates(&orch.db)
         .await
         .map_err(|message| BoundedRearmLookupError {
@@ -751,6 +862,11 @@ pub(super) async fn bounded_rearm_candidate_job(
             message,
         })?;
     for candidate in candidates {
+        // A job whose slot is held has a wave running; its successor is the
+        // slot release's to arm (cairn/4690), never this cadence's.
+        if orch.turn_end_checks_in_flight(&candidate.job_id) {
+            continue;
+        }
         let matches = bounded_candidate_is_due(orch, &candidate)
             .await
             .map_err(|message| BoundedRearmLookupError {
@@ -758,7 +874,7 @@ pub(super) async fn bounded_rearm_candidate_job(
                 message,
             })?;
         if matches {
-            return Ok(Some(candidate.job_id));
+            return Ok(Some(candidate));
         }
     }
     Ok(None)
@@ -844,7 +960,6 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                                lj.branch AS branch, c.tree_hash AS tree_hash,
                                c.input_hash AS input_hash, c.check_name AS check_name,
                                c.ran_at AS ran_at, c.failure_kind AS failure_kind,
-                               c.infra_failure_streak AS infra_failure_streak,
                                COALESCE(c.environment_fingerprint, '') AS environment_fingerprint,
                                ROW_NUMBER() OVER (
                                  PARTITION BY c.job_id, c.check_name
@@ -859,10 +974,7 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                        WHERE recency = 1
                          AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable',
                                               'config_unreadable')
-                         AND (
-                           infra_failure_streak < ?1
-                           OR ran_at <= (unixepoch() - ?2) * 1000
-                         )
+                         AND ran_at <= (unixepoch() - ?1) * 1000
                          AND (
                            SELECT t.state FROM turns t
                             WHERE t.job_id = latest.job_id
@@ -898,10 +1010,7 @@ async fn bounded_rearm_candidates_in_db(
             let mut rows = conn
                 .query(
                     BOUNDED_REARM_CANDIDATES_SQL,
-                    (
-                        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-                        DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
-                    ),
+                    (DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,),
                 )
                 .await?;
             let mut candidates = Vec::new();
@@ -924,18 +1033,28 @@ async fn bounded_rearm_candidates_in_db(
 }
 
 /// Whether a dormant candidate is worth a wave now: its row still describes the
-/// branch's current tree, and the wave it would receive could execute the check.
+/// branch's current tree, and the fact that failed it has changed (cairn/5357).
+/// Never a timer alone.
 ///
-/// For a lane recorded as not placeable, that means a machine that could take
-/// it has since attached or enrolled. For a lane recorded while the project's
-/// config did not load, that means it loads now. For a substrate failure, the
-/// release this cadence performs would leave the check unsuppressed, asked the
-/// way the wave itself asks it (see [`rearm_would_free`]).
+/// The fact depends on how the lane failed:
 ///
-/// Both are recovery edges. Nothing about a machine attaching schedules a wave
-/// for a PR whose agent has gone quiet, so this cadence asks the fleet on its
-/// behalf, using the check's definition at that same commit. Until the answer
-/// changes the candidate is passed over, which costs a config read and no wave.
+/// - `config_unreadable`: the project's config loads now.
+/// - `not_placeable`: a machine that could take the lane has attached or
+///   enrolled.
+/// - `capacity`: room has appeared on the machines the wave would ask
+///   ([`capacity_relief_is_due`]).
+/// - `infrastructure`: a genuine verdict for the same input has landed since
+///   the newest failure, or the lane's placement facts (its fleet scope and
+///   every eligible machine's repair identity) differ from the ones that
+///   failure recorded. A lane the breaker tripped has the same facts by
+///   definition, so it is never due until one moves. A failure recorded
+///   before placement facts were persisted has nothing to compare against and
+///   waits for a verdict, a new commit, or a base advance.
+///
+/// These are recovery edges. Nothing about a machine attaching schedules a wave
+/// for a PR whose agent has gone quiet, so this cadence asks on its behalf,
+/// using the check's definition at that same commit. Until the answer changes
+/// the candidate is passed over, which costs a config read and no wave.
 pub(super) async fn bounded_candidate_is_due(
     orch: &Orchestrator,
     candidate: &BoundedRearmCandidate,
@@ -1005,19 +1124,28 @@ pub(super) async fn bounded_candidate_is_due(
                 .is_none()
         }));
     }
-    // Without a definition there is no placement question, so no fleet or
-    // machine counter can be named; the head counter the SQL already cooled is
-    // the only one left, and the wave decides the rest.
+    // A check the commit no longer declares has nothing for a wave to run.
     let Some(check) = check else {
-        return Ok(true);
+        return Ok(false);
     };
+    let question = crate::execution::checks_turn_end::review_check_placement_question(Some(check));
+    let capacity =
+        candidate.failure_kind == crate::execution::checks::CheckFailureKind::Capacity.as_str();
+    let occupancy = capacity.then(|| {
+        crate::execution::checks::review_placement_occupancy(
+            orch,
+            &coords.project_id,
+            &coords.repository_path,
+            &question,
+        )
+    });
     let scopes = crate::execution::checks_turn_end::review_infra_scopes(
         orch,
         &coords.project_id,
         &candidate.job_id,
         &sealed_commit,
         &coords.repository_path,
-        &[crate::execution::checks_turn_end::review_check_placement_question(Some(check))],
+        &[question],
     )
     .await
     .pop()
@@ -1031,58 +1159,81 @@ pub(super) async fn bounded_candidate_is_due(
     if scopes.fleet.as_deref() == Some(candidate.environment_fingerprint.as_str()) {
         return Ok(false);
     }
-    let bounded = {
+    let current_facts = scopes.placement_facts();
+    let (failure, held) = {
         let project_id = coords.project_id.clone();
         let check_name = candidate.check_name.clone();
         let input_hash = candidate.input_hash.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::execution::cache::get_suppressed_check_result(
-                db,
-                &project_id,
-                &check_name,
-                &input_hash,
-                &scopes,
-            )
+        let failure_kind = candidate.failure_kind.clone();
+        let current_facts = current_facts.clone();
+        db.read(move |conn| {
+            let project_id = project_id.clone();
+            let check_name = check_name.clone();
+            let input_hash = input_hash.clone();
+            let failure_kind = failure_kind.clone();
+            let current_facts = current_facts.clone();
+            Box::pin(async move {
+                let failure = crate::execution::lane_breaker::newest_review_failure_conn(
+                    conn,
+                    &project_id,
+                    &check_name,
+                    &input_hash,
+                    &failure_kind,
+                )
+                .await?;
+                let held = crate::execution::lane_breaker::lane_trip_conn(
+                    conn,
+                    &project_id,
+                    &check_name,
+                    &input_hash,
+                    Some(&current_facts),
+                )
+                .await?
+                .is_some();
+                Ok::<_, crate::storage::DbError>((failure, held))
+            })
         })
         .await
-        .map_err(|error| format!("bounded re-arm suppression read task failed: {error}"))??
+        .map_err(|error| error.to_string())?
     };
-    Ok(rearm_would_free(
-        bounded.as_ref(),
-        chrono::Utc::now().timestamp_millis(),
-    ))
+    // Asked exactly as the wave will ask it: a lane the breaker holds under
+    // the facts it would meet now gets no wave, whatever its newest recorded
+    // failure says. A held lane writes no observation, so that record stops
+    // moving at the hold, and facts that changed and changed back would
+    // otherwise read as a change on every cooldown.
+    if held {
+        return Ok(false);
+    }
+    let Some(failure) = failure else {
+        return Ok(occupancy.as_ref().is_some_and(capacity_relief_is_due));
+    };
+    if failure.answered_since {
+        return Ok(true);
+    }
+    // Occupancy counts only Cairn's own cells, so it cannot see a model that
+    // preempted the lane; that lane waits on the placement facts instead.
+    if let Some(occupancy) = occupancy.as_ref() {
+        if !crate::execution::checks::is_preemption_diagnostic(&failure.output_tail) {
+            return Ok(capacity_relief_is_due(occupancy));
+        }
+    }
+    Ok(failure
+        .placement_facts
+        .is_some_and(|facts| facts != current_facts))
 }
 
-/// Whether [`release_cooled_infrastructure_suppression`] would leave a check
-/// free to execute, given the suppression the wave would read for it now.
-///
-/// This is the question the re-arm has to answer from the bounding rows rather
-/// than from the job's newest row. A suppressed wave re-stamps a head-scoped
-/// row at streak zero (see `record_suppressed_check`), and that row becomes the
-/// newest one, so the candidate statement's `streak < bound` arm nominates the
-/// job on every tick while the counter that actually bounds it sits in another
-/// scope. Re-arming on that basis spends a wave every tick to re-stamp the same
-/// refusal.
-///
-/// A fleet-domain bound is never freed by the release, so it is never due; it
-/// becomes due when the fleet's capability identity moves and the bounding
-/// scope is no longer the one the wave reads. Any other bound is freed only
-/// once every row bounding it has cooled.
-pub(super) fn rearm_would_free(
-    bounded: Option<&crate::execution::cache::SuppressedCheck>,
-    now_unix_ms: i64,
+/// Whether the machines a capacity-refused lane would ask have room now: no
+/// Cairn work holds them, or the work that does is predicted to have let go
+/// already. An unforecastable occupancy is not room, and neither is a relief
+/// still ahead: the lane waits for the fact, not for a timer.
+pub(super) fn capacity_relief_is_due(
+    occupancy: &crate::fleet::occupancy::MachineOccupancy,
 ) -> bool {
-    let Some(bounded) = bounded else {
-        return true;
-    };
-    if bounded.domain == crate::execution::cache::InfraRepairDomain::Fleet {
-        return false;
+    match occupancy {
+        crate::fleet::occupancy::MachineOccupancy::Idle => true,
+        crate::fleet::occupancy::MachineOccupancy::Predicted(forecast) => forecast.relief_ms == 0,
+        crate::fleet::occupancy::MachineOccupancy::Unforecastable => false,
     }
-    let cooled_at = now_unix_ms - DORMANT_INFRA_RETRY_COOLDOWN_SECONDS * 1000;
-    bounded
-        .scopes
-        .iter()
-        .all(|scope| scope.entry.ran_at <= cooled_at)
 }
 
 /// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:

@@ -382,9 +382,8 @@ impl Orchestrator {
         project_id: Option<&str>,
         offer: &SelectedOffer,
     ) -> Result<(DecisionRoute, String), String> {
-        let backend = crate::backends::backend_for_name(Some(&offer.provider));
-        let route = backend.decision_route(self, project_id, offer)?;
-        Ok((route, backend.sent_model(self, &offer.model)))
+        crate::backends::backend_for_name(Some(&offer.provider))
+            .decision_route(self, project_id, offer)
     }
 
     /// Where each decision node in `nodes` stands in `project_id`'s scope,

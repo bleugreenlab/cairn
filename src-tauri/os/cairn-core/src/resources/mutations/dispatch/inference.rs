@@ -463,7 +463,7 @@ pub(super) async fn dispatch(
                 .map_err(fail)?;
             let real = crate::orchestrator::inference_route::resolve_model(&inventory, model)
                 .map_err(fail)?;
-            let handle = models::request(orch, &real, &requester, pool.as_ref())
+            let handle = models::request(orch, &real, None, &requester, pool.as_ref())
                 .await
                 .map_err(fail)?;
             let status = handle.status(orch).await.map_err(fail)?;

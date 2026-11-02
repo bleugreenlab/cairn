@@ -198,7 +198,7 @@ impl AgentBackend for OpenRouterBackend {
         orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &cairn_models::interface::SelectedOffer,
-    ) -> Result<cairn_models::interface::decide::DecisionRoute, String> {
+    ) -> Result<(cairn_models::interface::decide::DecisionRoute, String), String> {
         use cairn_models::interface::decide::DecisionRoute;
         use cairn_models::types::catalog::Wire;
         use cairn_models::wire::decisions::http::DecisionsEndpoint;
@@ -207,13 +207,14 @@ impl AgentBackend for OpenRouterBackend {
                 let api_key = openrouter_api_key(orch).ok_or_else(|| {
                     "OpenRouter needs an API key to answer a decision".to_string()
                 })?;
-                Ok(DecisionRoute::SystemOne(DecisionsEndpoint {
+                let route = DecisionRoute::SystemOne(DecisionsEndpoint {
                     provider_name: OPENROUTER_BACKEND_NAME.to_string(),
                     backend_key: OPENROUTER_BACKEND_KEY.to_string(),
                     url: format!("{OPENROUTER_DECISIONS_BASE}/decisions"),
                     headers: http::openrouter_headers(&api_key),
                     context_limits: None,
-                }))
+                });
+                Ok((route, offer.model.clone()))
             }
             wire => Err(format!("OpenRouter answers no decision over {wire}")),
         }

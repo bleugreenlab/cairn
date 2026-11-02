@@ -1448,6 +1448,8 @@ pub(crate) mod test_support {
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             infra_reset_scopes: Vec::new(),
+            failure_signature: None,
+            placement_facts: None,
             selection: None,
             deferred_count: 0,
             phases: None,

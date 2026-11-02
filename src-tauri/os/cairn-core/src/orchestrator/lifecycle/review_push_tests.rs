@@ -1,7 +1,6 @@
 use super::review_push::{
     bounded_rearm_candidates, finish_superseded_turn_end_checks, rearm_one_bounded_failed_review,
-    release_cooled_infrastructure_suppression, spawn_turn_end_checks, BOUNDED_REARM_CANDIDATES_SQL,
-    DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+    spawn_turn_end_checks, BOUNDED_REARM_CANDIDATES_SQL, DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
 };
 use super::{
     create_review_push_for_pr_open, evaluate_review_readiness, record_bounded_rearm_lookup_failure,
@@ -191,16 +190,22 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
     let orch = test_orchestrator(db);
     let repository = tempfile::tempdir().unwrap();
     crate::jj::tests::init_project(repository.path());
-    let backing = tempfile::tempdir().unwrap();
-    crate::jj::tests::init_project(backing.path());
+    // Backed by the project repository, as in production: the check contract
+    // the due rule reads is read from the project's object database.
     let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
     let jj = crate::jj::environment(&bin, &orch.config_dir);
-    crate::jj::ensure_project_store(&jj, &store, backing.path()).unwrap();
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
     let workspaces = tempfile::tempdir().unwrap();
     let workspace = workspaces.path().join("builder");
     let branch = "agent/cairn-3604-builder-0";
     crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
     std::fs::write(workspace.join("agent-only.rs"), "wave path\n").unwrap();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        "checks:\n  review:\n    command: echo ok\n    when: review\n",
+    )
+    .unwrap();
     crate::jj::seal(&jj, &workspace, "agent branch", None).unwrap();
     let commit = crate::jj::head_commit(&jj, &workspace).unwrap();
     let tree_hash = crate::jj::logical_tree_hash(&jj, &store, &commit).unwrap();
@@ -234,6 +239,17 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
         .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
         .await
         .unwrap();
+    // The lane last failed under placement facts the fleet no longer has.
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-stale",
+        "review",
+        "input",
+        &tree_hash,
+        1,
+        Some("placement-facts-of-a-fleet-since-changed"),
+    )
+    .await;
 
     let candidate = super::review_push::BoundedRearmCandidate {
         job_id: "j-prod".to_string(),
@@ -544,6 +560,18 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
     for _ in 0..6 {
         wave(&detached);
     }
+    // The observation the last of those waves recorded, under the placement
+    // facts it met.
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-detached",
+        check_name,
+        input_hash,
+        &tree_hash,
+        chrono::Utc::now().timestamp_millis(),
+        Some(&detached.placement_facts()),
+    )
+    .await;
     // Every row is now well past the cooldown.
     orch.db
         .local
@@ -555,7 +583,7 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
         .unwrap();
 
     for tick in 0..20 {
-        let nominated = super::review_push::bounded_rearm_candidate_job(&orch)
+        let nominated = super::review_push::bounded_rearm_candidate(&orch)
             .await
             .unwrap();
         assert_eq!(
@@ -563,11 +591,8 @@ async fn a_fleet_bounded_lane_is_never_released_on_a_timer_and_runs_once_its_mac
             "tick {tick}: neither the cooled fleet row nor the re-stamp the suppressed wave \
              left behind makes a fleet-bounded lane due"
         );
-        release_cooled_infrastructure_suppression(&orch, "j-prod")
-            .await
-            .unwrap();
-        if let Some(job) = nominated {
-            assert_eq!(job, "j-prod");
+        if let Some(candidate) = nominated {
+            assert_eq!(candidate.job_id, "j-prod");
             wave(&review_wave_scopes(&orch, &repo_path, &commit, &check).await);
         }
     }
@@ -818,9 +843,10 @@ async fn bounded_rearm_selects_retryable_review_work() {
         .execute("UPDATE turns SET state='complete' WHERE id='t-prod'", ())
         .await
         .unwrap();
-    release_cooled_infrastructure_suppression(&orch, "j-prod")
-        .await
-        .unwrap();
+    assert!(
+        !rearm_one_bounded_failed_review(&orch).await,
+        "a cooled candidate is asked, and nothing about its lane has changed"
+    );
     let streak: i64 = orch
         .db
         .local
@@ -837,7 +863,11 @@ async fn bounded_rearm_selects_retryable_review_work() {
         })
         .await
         .unwrap();
-    assert_eq!(streak, 0, "the paced re-arm must admit a fresh execution");
+    assert_eq!(
+        streak,
+        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+        "cooling is not a fact: no counter is released without one (cairn/5357)"
+    );
 
     orch.db
         .local
@@ -1028,13 +1058,7 @@ async fn query_plan(db: &LocalDb, sql: &str) -> String {
         let sql = sql.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(
-                    &sql,
-                    (
-                        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-                        DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
-                    ),
-                )
+                .query(&sql, (DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,))
                 .await?;
             let mut plan = String::new();
             while let Some(row) = rows.next().await? {
@@ -1089,8 +1113,486 @@ async fn bounded_rearm_enumerates_open_team_databases() {
     assert_eq!(candidates[0].job_id, "j-prod");
 }
 
+/// One review-cadence infrastructure failure of `check` at `input`, as the
+/// runner records it: signed, and carrying the placement facts it met.
+async fn insert_infrastructure_observation(
+    db: &LocalDb,
+    id: &str,
+    check: &str,
+    input: &str,
+    tree: &str,
+    ran_at: i64,
+    placement_facts: Option<&str>,
+) {
+    db.execute(
+        "INSERT INTO check_result_observations
+           (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+            environment_fingerprint, exit_code, verdict, failure_kind, complete, reusable,
+            parser_version, result_schema_version, ran_at, duration_ms, job_id, cadence,
+            output_tail, runner_build_id, failure_signature, placement_facts)
+         VALUES(?1,'p-rev','commit',?2,?3,?4,'',-1,'failed','infrastructure',0,0,
+                1,?5,?6,0,'j-prod','review',
+                'Cairn could not start this check.
+ Failing step:
+ conflicting review check executor selector',
+                ?7,'sig-identical',?8)",
+        (
+            id,
+            tree,
+            check,
+            input,
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            ran_at,
+            cairn_checkenv::implementation_identity(),
+            placement_facts,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// A dormant PR owner `j-prod` whose branch declares one review check, in a
+/// managed store backed by the project repository.
+struct DormantLane {
+    _dirs: Vec<tempfile::TempDir>,
+    repo_path: String,
+    commit: String,
+    tree_hash: String,
+    check: crate::config::project_settings::CheckCommand,
+}
+
+async fn dormant_lane(
+    orch: &Orchestrator,
+    bin: &str,
+    check_name: &str,
+    config: &str,
+) -> DormantLane {
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = format!("agent/cairn-5357-{check_name}-0");
+    crate::jj::add_workspace(&jj, &store, &workspace, &branch, "main", None).unwrap();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(workspace.join(".cairn/config.yaml"), config).unwrap();
+    crate::jj::seal(&jj, &workspace, "declare the lane", None).unwrap();
+    let commit = crate::jj::head_commit(&jj, &workspace).unwrap();
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &store, &commit).unwrap();
+    let repo_path = repository.path().to_string_lossy().to_string();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repo_path.as_str(),),
+        )
+        .await
+        .unwrap();
+    insert_artifact(&orch.db.local, "create-pr", 1).await;
+    attach_planbuild_topology(&orch.db.local, "j-prod", NodeRole::Builder).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE jobs SET branch=?1 WHERE id='j-prod'",
+            (branch.as_str(),),
+        )
+        .await
+        .unwrap();
+    let check =
+        crate::execution::checks::load_checks_contract_at_commit(repository.path(), &commit)
+            .await
+            .and_then(|loaded| loaded.contract.checks.get(check_name).cloned())
+            .expect("the lane is declared at the sealed commit");
+    DormantLane {
+        _dirs: vec![repository, workspaces],
+        repo_path,
+        commit,
+        tree_hash,
+        check,
+    }
+}
+
+/// Attach `executor_id` on `platform`, advertising the rust toolchain.
+fn attach_machine(orch: &Orchestrator, executor_id: &str, platform: &str) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    std::mem::forget(receiver);
+    orch.fleet
+        .attach_advertised_executor(
+            cairn_common::executor_protocol::ExecutorAdvertisement {
+                identity: cairn_common::executor_protocol::ExecutorIdentity {
+                    device_id: format!("{executor_id}-device"),
+                    executor_id: executor_id.into(),
+                    display_name: executor_id.into(),
+                },
+                capabilities: cairn_common::executor_protocol::ExecutorCapabilities {
+                    os: platform.into(),
+                    arch: "x86_64".into(),
+                    logical_cores: 8,
+                    concurrency_capacity: None,
+                    toolchains: vec!["rust".into()],
+                    projects_served: Vec::new(),
+                    disk_budget_bytes: None,
+                    memory_budget_bytes: None,
+                    sandbox: None,
+                    toolchain_detection: None,
+                    build_prerequisites: None,
+                    containment: None,
+                    page_call_programs: None,
+                },
+                current_load: 0,
+                warm_roots: Vec::new(),
+                observed_at_unix_ms: chrono::Utc::now().timestamp_millis() as u64,
+                liveness_observed_at_unix_ms: None,
+                facts_stale_refresh_blocked: None,
+                last_refresh: None,
+                node_scratches: Vec::new(),
+            },
+            sender,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+}
+
+/// A platform the runner's own executor cannot provide.
+fn foreign_platform() -> &'static str {
+    if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    }
+}
+
+/// Every dormant tick, `ticks` times over, with the lane's rows moved one
+/// cooldown further into the past before each: the time that used to re-arm
+/// the wave.
+async fn dormant_ticks(orch: &Orchestrator, ticks: usize) -> usize {
+    let mut waves = 0;
+    for _ in 0..ticks {
+        orch.db
+            .local
+            .execute(
+                "UPDATE check_result_cache SET ran_at = ran_at - ?1 WHERE job_id='j-prod'",
+                ((DORMANT_INFRA_RETRY_COOLDOWN_SECONDS + 1) * 1000,),
+            )
+            .await
+            .unwrap();
+        if rearm_one_bounded_failed_review(orch).await {
+            waves += 1;
+        }
+    }
+    waves
+}
+
+/// cairn/5357, the arb shape: every lane of a dormant job fails as
+/// infrastructure before any machine takes it (a `Dispatch` refusal charged to
+/// the head, no environment, no executor). Nothing about the lane changes
+/// while the job sleeps, so sixty cooldowns re-dispatch nothing. They used to
+/// re-dispatch the whole wave every one of them.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_dormant_lane_that_failed_before_any_machine_took_it_is_never_rearmed_on_a_timer() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let lane = dormant_lane(
+        &orch,
+        &bin,
+        "cargo-fmt",
+        "checks:\n  cargo-fmt:\n    command: cargo fmt --check\n    when: review\n",
+    )
+    .await;
+    insert_failed_check(&orch.db.local, "infrastructure", 1).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1, check_name='cargo-fmt', \
+             environment_fingerprint=?2 WHERE job_id='j-prod'",
+            (
+                lane.tree_hash.as_str(),
+                crate::execution::cache::infra_suppression_scope("j-prod", &lane.commit),
+            ),
+        )
+        .await
+        .unwrap();
+    let facts = review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check)
+        .await
+        .placement_facts();
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-arb",
+        "cargo-fmt",
+        "input",
+        &lane.tree_hash,
+        1,
+        Some(&facts),
+    )
+    .await;
+
+    assert_eq!(
+        dormant_ticks(&orch, 60).await,
+        0,
+        "sixty cooldowns are not a fact about the lane"
+    );
+    assert!(!wave_scheduled(&orch, "j-prod"));
+}
+
+/// cairn/5357, the 5226 shape: a dormant job whose one red lane fails as
+/// infrastructure on every machine the fleet has. Its waves are owed only to a
+/// changed fact, so sixty cooldowns re-run nothing; a machine attaching moves
+/// the lane's placement facts and earns exactly one wave, and once that wave
+/// records its failure under the new facts the job is quiet again.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_dormant_infrastructure_red_rearms_once_per_changed_placement_fact() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let platform = foreign_platform();
+    let lane = dormant_lane(
+        &orch,
+        &bin,
+        "frontend-tests",
+        &format!(
+            "checks:\n  frontend-tests:\n    command: bun run test:frontend\n    executor:\n      requiredToolchains:\n      - rust\n    verdictPlatforms:\n    - {platform}\n    when: review\n"
+        ),
+    )
+    .await;
+    orch.fleet
+        .declare_enrolled_remote("fleet-a", "fleet-a", platform, "x86_64");
+    insert_failed_check(&orch.db.local, "infrastructure", 1).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1, check_name='frontend-tests', \
+             environment_fingerprint=?2 WHERE job_id='j-prod'",
+            (
+                lane.tree_hash.as_str(),
+                crate::execution::cache::infra_suppression_scope("j-prod", &lane.commit),
+            ),
+        )
+        .await
+        .unwrap();
+    let before = review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check).await;
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-before",
+        "frontend-tests",
+        "input",
+        &lane.tree_hash,
+        1,
+        Some(&before.placement_facts()),
+    )
+    .await;
+
+    assert_eq!(dormant_ticks(&orch, 60).await, 0, "no fact moved");
+    assert!(!wave_scheduled(&orch, "j-prod"));
+
+    attach_machine(&orch, "fleet-a", platform);
+    let after = review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check).await;
+    assert_ne!(after.placement_facts(), before.placement_facts());
+    assert!(
+        rearm_one_bounded_failed_review(&orch).await,
+        "the machine attaching is the fact that earns the lane a wave"
+    );
+    assert!(wave_scheduled(&orch, "j-prod"));
+    orch.end_turn_end_checks("j-prod");
+
+    // That wave failed the same way on the machine it met, and says so.
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-after",
+        "frontend-tests",
+        "input",
+        &lane.tree_hash,
+        2,
+        Some(&after.placement_facts()),
+    )
+    .await;
+    assert_eq!(
+        dormant_ticks(&orch, 60).await,
+        0,
+        "one wave per changed fact, then quiet"
+    );
+}
+
+/// The breaker's own hold must not read as a fact change. Live waves trip the
+/// lane under facts A; a machine leaves (facts B), the lane earns its one wave
+/// and fails again under B; the machine returns (A). The newest recorded
+/// failure still says B, because a held lane records nothing, so a due rule
+/// that compared only against it would re-arm every cooldown for as long as
+/// the fleet stayed at A. It asks the breaker under A instead.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_held_lane_stays_quiet_when_its_facts_change_and_change_back() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let platform = foreign_platform();
+    let lane = dormant_lane(
+        &orch,
+        &bin,
+        "frontend-tests",
+        &format!(
+            "checks:\n  frontend-tests:\n    command: bun run test:frontend\n    executor:\n      requiredToolchains:\n      - rust\n    verdictPlatforms:\n    - {platform}\n    when: review\n"
+        ),
+    )
+    .await;
+    orch.fleet
+        .declare_enrolled_remote("fleet-a", "fleet-a", platform, "x86_64");
+    insert_failed_check(&orch.db.local, "infrastructure", 1).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1, check_name='frontend-tests', \
+             environment_fingerprint=?2 WHERE job_id='j-prod'",
+            (
+                lane.tree_hash.as_str(),
+                crate::execution::cache::infra_suppression_scope("j-prod", &lane.commit),
+            ),
+        )
+        .await
+        .unwrap();
+    let facts_a = review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check)
+        .await
+        .placement_facts();
+    for (id, ran_at) in [("obs-a1", 1), ("obs-a2", 2), ("obs-a3", 3)] {
+        insert_infrastructure_observation(
+            &orch.db.local,
+            id,
+            "frontend-tests",
+            "input",
+            &lane.tree_hash,
+            ran_at,
+            Some(&facts_a),
+        )
+        .await;
+    }
+    insert_infrastructure_observation(
+        &orch.db.local,
+        "obs-b",
+        "frontend-tests",
+        "input",
+        &lane.tree_hash,
+        4,
+        Some("facts-while-a-machine-was-away"),
+    )
+    .await;
+
+    assert_eq!(
+        dormant_ticks(&orch, 60).await,
+        0,
+        "the breaker holds the lane under the facts the wave would meet now"
+    );
+    assert!(!wave_scheduled(&orch, "j-prod"));
+}
+
+/// A capacity-refused dormant lane waits for room, never for a timer.
+#[test]
+fn a_capacity_refused_lane_is_due_only_once_room_appears() {
+    use super::review_push::capacity_relief_is_due;
+    use crate::fleet::occupancy::{MachineOccupancy, OccupancyForecast};
+    let forecast = |relief_ms| {
+        MachineOccupancy::Predicted(OccupancyForecast {
+            relief_ms,
+            blocking: "a sibling's rust-tests".to_string(),
+            occupant_count: 1,
+        })
+    };
+    assert!(!capacity_relief_is_due(&MachineOccupancy::Unforecastable));
+    assert!(!capacity_relief_is_due(&forecast(30_000)));
+    assert!(capacity_relief_is_due(&forecast(0)));
+    assert!(capacity_relief_is_due(&MachineOccupancy::Idle));
+
+    // Occupancy cannot see a model that took the machine, so a preempted
+    // lane is told apart by its own diagnostic and waits on the fleet.
+    use crate::execution::checks::{
+        is_preemption_diagnostic, SubstrateFailure, SubstrateFailureShape,
+    };
+    let preempted = SubstrateFailure::new(SubstrateFailureShape::CommandPreempted, "model load")
+        .agent_message();
+    let no_room = SubstrateFailure::new(SubstrateFailureShape::Capacity, "no room").agent_message();
+    assert!(is_preemption_diagnostic(&preempted), "{preempted}");
+    assert!(!is_preemption_diagnostic(&no_room), "{no_room}");
+}
+
+/// cairn/5357 comment 1. A restart re-spawns a wave only where one is owed: a
+/// wave the restart interrupted. A wave still moving in this process (hung or
+/// slow, cairn/4690's case) is not re-spawned, and no counter is reset.
+#[tokio::test]
+async fn startup_respawns_only_the_waves_a_restart_interrupted_and_resets_nothing() {
+    async fn streak(orch: &Orchestrator) -> i64 {
+        orch.db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT infra_failure_streak FROM check_result_cache \
+                             WHERE job_id='j-prod'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.expect("check result").i64(0)
+                })
+            })
+            .await
+            .unwrap()
+    }
+    for (interrupted, expected) in [(false, 0), (true, 1)] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+        insert_artifact(&db, "create-pr", 1).await;
+        insert_failed_check(
+            &db,
+            "infrastructure",
+            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+        )
+        .await;
+        let orch = test_orchestrator(db);
+        let attempt =
+            crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod").unwrap();
+        crate::execution::checks_turn_end::transition_turn_end_attempt(
+            &orch,
+            "j-prod",
+            &attempt,
+            "runtime_started",
+            None,
+        )
+        .unwrap();
+        if interrupted {
+            crate::execution::checks_turn_end::reconcile_turn_end_attempts_on_startup(&orch).await;
+        }
+
+        assert_eq!(
+            super::rearm_review_checks_on_startup(&orch).await,
+            expected,
+            "interrupted={interrupted}: a wave is owed only to an attempt the restart cut off"
+        );
+        assert_eq!(wave_scheduled(&orch, "j-prod"), interrupted);
+        assert_eq!(
+            streak(&orch).await,
+            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+            "a restart is not a fact about the lane, so its counter stands"
+        );
+    }
+}
+
 async fn insert_failed_check(db: &LocalDb, kind: &str, streak: i64) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO check_result_cache
            (project_id, tree_hash, input_hash, check_name, exit_code, passed,
             output_tail, duration_ms, ran_at, job_id, failure_kind, infra_failure_streak)
@@ -1117,7 +1619,7 @@ fn test_orchestrator(db: LocalDb) -> Orchestrator {
 /// `j-watch`, and an active issue subscription for BOTH so the producing
 /// node's self-exclusion is exercised.
 async fn seed(db: &LocalDb, start_reason: &str) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -1233,7 +1735,7 @@ async fn insert_open_pr(db: &LocalDb) {
 }
 
 async fn insert_artifact(db: &LocalDb, artifact_type: &str, confirmed: i64) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
             "INSERT INTO artifacts
                (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
              VALUES('a-rev','j-prod','{artifact_type}',1,'{{}}',1,'{artifact_type}',{confirmed},1,1);"
@@ -2273,7 +2775,7 @@ async fn set_prod_head_turn(db: &LocalDb, state: &str, reason: Option<&str>) {
     let reason = reason
         .map(|r| format!("'{r}'"))
         .unwrap_or_else(|| "NULL".to_string());
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "DELETE FROM turns WHERE job_id='j-prod';
          INSERT INTO turns(id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at)
            VALUES('t-prod','s-prod','j-prod',1,'{state}',{reason},'initial',1,1);"
@@ -2485,7 +2987,7 @@ async fn every_settled_status_is_a_rearm_candidate() {
         let db = test_db().await;
         seed(&db, "initial").await;
         attach_planbuild_topology(&db, "j-prod", NodeRole::Planner).await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "UPDATE jobs SET status='{status}', branch=NULL WHERE id='j-prod';
              INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
                                    output_name, created_at, updated_at)
@@ -2544,9 +3046,9 @@ async fn a_detached_rearm_converges_and_stays_convergent_across_boots() {
     }
     .await
     .expect("the background re-arm task runs to completion");
-    assert!(
-        first_waves >= 1,
-        "the settled candidate must be counted for the boot log"
+    assert_eq!(
+        first_waves, 0,
+        "a settled job with no interrupted wave and no dormant lane due owes no wave"
     );
     let after_first = review_wakes(&orch).await;
     assert_eq!(

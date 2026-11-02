@@ -913,6 +913,7 @@ impl Act for Live {
             let handle = models::request(
                 &self.orch,
                 &model,
+                None,
                 &requester,
                 Some(&PoolKey::from(pool.as_str())),
             )

@@ -73,17 +73,19 @@ fn by_real_name<'a>(asked: &str, served: &'a [ServedModel]) -> Option<&'a Served
 }
 
 /// The real name another name stands for, when `asked` is one: an engine's
-/// served name (a name for the engine, not the model), or a name bgllm
-/// answered to.
+/// served name (a name for the engine, not the model; a model deployed in
+/// several places has one per deployment), or a name bgllm answered to.
 fn renamed(asked: &str, served: &[ServedModel]) -> Option<String> {
     if by_real_name(asked, served).is_some() {
         return None;
     }
     let bare = unqualified(asked);
-    if let Some(model) = served
-        .iter()
-        .find(|model| model.served_name.eq_ignore_ascii_case(bare))
-    {
+    if let Some(model) = served.iter().find(|model| {
+        model
+            .deployments
+            .iter()
+            .any(|deployment| deployment.served_name.eq_ignore_ascii_case(bare))
+    }) {
         return Some(model.id.clone());
     }
     let (_, slug) = RETIRED_NAMES
@@ -92,7 +94,7 @@ fn renamed(asked: &str, served: &[ServedModel]) -> Option<String> {
     Some(
         served
             .iter()
-            .find(|model| model.upstream_id.as_deref() == Some(*slug))
+            .find(|model| model.upstream_id() == Some(*slug))
             .map(|model| model.id.clone())
             .unwrap_or_else(|| slug.to_string()),
     )

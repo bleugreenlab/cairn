@@ -594,13 +594,13 @@ mod tests {
             let entry = find(&decoded, &model.id);
             assert_eq!(
                 entry.modalities.as_ref(),
-                Some(&model.modalities),
+                Some(&model.modalities()),
                 "{}",
                 model.id
             );
             assert_eq!(
                 entry.context_window,
-                model.context_length.map(|tokens| tokens as i64),
+                model.context_length().map(|tokens| tokens as i64),
                 "{}",
                 model.id
             );

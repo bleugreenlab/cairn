@@ -9,9 +9,12 @@
 //! the engine boundary's detail: a request by real name reaches the engine
 //! under it.
 //!
-//! A served name must mean exactly one deployment. A model with deployments in
-//! several places needs a pool to say which, which a caller of the served API
-//! cannot give, so it is not served there until placement chooses for it.
+//! A model is one entry however many deployments it has. It serves the union
+//! of what its deployments' profiles serve, each judged by one rule
+//! ([`profile_verbs`]), and placement routes a request only to a deployment
+//! whose profile serves the request's verb. Where deployments disagree, the
+//! entry advertises the conservative fact: the inputs every deployment takes,
+//! and the smallest context any measured.
 //!
 //! The context a deployment advertises is the engine's own limit clamped to
 //! the KV cache it measured at start ([`EngineMeasure`]). An advertised
@@ -26,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::deployment::DeploymentId;
 use crate::inventory::Inventory;
-use crate::profile::{InferenceProfile, InferenceProfileId};
+use crate::profile::{InferenceProfile, InferenceProfileId, WeightFile};
 
 /// The deployments of the model a caller names: every deployment of a profile
 /// whose model has that real name, case-insensitively. A deployment id, profile
@@ -85,56 +88,181 @@ pub fn max_model_len(models: &str, served_name: &str) -> Option<u64> {
     entry.get("max_model_len")?.as_u64()
 }
 
-/// One model Cairn serves, and the deployment that answers for it.
+/// The verbs a conversation with a model is had through.
+const CONVERSATION: [VerbKind; 3] = [VerbKind::Complete, VerbKind::Session, VerbKind::Decide];
+
+/// The verbs `profile` serves: those it declares; else conversation and
+/// decide for a model that outputs text, as an OpenAI-compatible chat server
+/// is offered when it says nothing, embed for one that outputs only
+/// embeddings, and nothing for any other. Nothing is inferred from a name.
+/// Placement routes by this rule and the catalog offers by it.
+pub fn profile_verbs(profile: &InferenceProfile) -> BTreeSet<VerbKind> {
+    if let Some(verbs) = &profile.verbs {
+        return verbs.clone();
+    }
+    let output = modalities(profile).output;
+    if output.contains(&Modality::Text) {
+        CONVERSATION.into()
+    } else if output == [Modality::Embeddings] {
+        BTreeSet::from([VerbKind::Embed])
+    } else {
+        BTreeSet::new()
+    }
+}
+
+/// One deployment of a served model, as its profile describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedDeployment {
+    pub deployment: DeploymentId,
+    pub profile: InferenceProfileId,
+    /// The name the engine answers to: a request routed here reaches the
+    /// engine under this name.
+    pub served_name: String,
+    pub upstream_id: Option<String>,
+    /// What the profile serves, by [`profile_verbs`].
+    pub verbs: BTreeSet<VerbKind>,
+    pub modalities: Modalities,
+    /// The context the engine can hold, when it has been measured.
+    pub context_length: Option<u64>,
+    pub quantization: Option<String>,
+    /// The weight files the profile pins; none for a profile that pins none.
+    pub weights: Vec<WeightFile>,
+}
+
+impl ServedDeployment {
+    /// Whether this deployment's vectors are the same weights' as `other`'s:
+    /// the same files at the same revisions and the same quantization. A
+    /// profile that pins no files is never shown to match, since what its
+    /// engine loads is unknown.
+    pub fn same_weights(&self, other: &ServedDeployment) -> bool {
+        !self.weights.is_empty()
+            && self.quantization == other.quantization
+            && self.weights == other.weights
+    }
+}
+
+/// One model Cairn serves, and every deployment that answers for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedModel {
     /// The model's real name, which a caller asks for and a tokenizer is
     /// looked up by.
     pub id: String,
-    pub deployment: DeploymentId,
-    pub profile: InferenceProfileId,
-    /// The name the engine answers to: every request for `id` reaches the
-    /// engine under this name.
-    pub served_name: String,
-    pub upstream_id: Option<String>,
-    /// The verbs the profile declares; `None` when it doesn't say.
-    pub verbs: Option<BTreeSet<VerbKind>>,
-    pub modalities: Modalities,
-    /// The context to advertise, when the engine has been measured.
-    pub context_length: Option<u64>,
+    /// In deployment-id order; never empty.
+    pub deployments: Vec<ServedDeployment>,
 }
 
-/// Every model Cairn serves, by deployment id, each under its real name with
-/// its deployment's measured context.
+impl ServedModel {
+    /// What the model serves: the union of its deployments'.
+    pub fn verbs(&self) -> BTreeSet<VerbKind> {
+        self.deployments
+            .iter()
+            .flat_map(|deployment| deployment.verbs.iter().copied())
+            .collect()
+    }
+
+    /// The deployments a request for `verb` may be routed to.
+    pub fn serving(&self, verb: VerbKind) -> impl Iterator<Item = &ServedDeployment> {
+        self.deployments
+            .iter()
+            .filter(move |deployment| deployment.verbs.contains(&verb))
+    }
+
+    /// The OpenRouter slug catalog matching uses: the first deployment's
+    /// profile that names one.
+    pub fn upstream_id(&self) -> Option<&str> {
+        self.deployments
+            .iter()
+            .find_map(|deployment| deployment.upstream_id.as_deref())
+    }
+
+    /// What the model takes and gives: the inputs every deployment takes, and
+    /// the outputs any gives, since each output is served by the deployments
+    /// that give it.
+    pub fn modalities(&self) -> Modalities {
+        let mut deployments = self.deployments.iter();
+        let mut merged = deployments
+            .next()
+            .map(|first| first.modalities.clone())
+            .unwrap_or_default();
+        for deployment in deployments {
+            merged
+                .input
+                .retain(|modality| deployment.modalities.input.contains(modality));
+            for modality in &deployment.modalities.output {
+                if !merged.output.contains(modality) {
+                    merged.output.push(modality.clone());
+                }
+            }
+        }
+        merged
+    }
+
+    /// The smallest context any deployment serving `verb` measured.
+    pub fn context_serving(&self, verb: VerbKind) -> Option<u64> {
+        self.serving(verb)
+            .filter_map(|deployment| deployment.context_length)
+            .min()
+    }
+
+    /// The context to advertise: the smallest any deployment serving a
+    /// conversation measured, or any deployment at all for a model that
+    /// converses on none.
+    pub fn context_length(&self) -> Option<u64> {
+        let converses = |deployment: &&ServedDeployment| {
+            CONVERSATION
+                .iter()
+                .any(|verb| deployment.verbs.contains(verb))
+        };
+        let conversing: Vec<&ServedDeployment> =
+            self.deployments.iter().filter(converses).collect();
+        let measured = if conversing.is_empty() {
+            self.deployments.iter().collect()
+        } else {
+            conversing
+        };
+        measured
+            .into_iter()
+            .filter_map(|deployment| deployment.context_length)
+            .min()
+    }
+}
+
+/// Every model Cairn serves, once each under its real name (compared
+/// case-insensitively), in the order of its first deployment's id, with every
+/// deployment's measured context.
 pub fn served_models(
     inventory: &Inventory,
     measures: &BTreeMap<DeploymentId, EngineMeasure>,
 ) -> Vec<ServedModel> {
-    let mut served = Vec::new();
-    let mut named = BTreeSet::new();
+    let mut served: Vec<ServedModel> = Vec::new();
     for deployment in inventory.deployments.values() {
         let Some(profile) = inventory.profiles.get(&deployment.profile) else {
             continue;
         };
         let name = profile.model.name.trim();
-        if !named.insert(name.to_ascii_lowercase()) {
-            continue;
-        }
-        if deployments_serving(inventory, name).as_slice() != std::slice::from_ref(&deployment.id) {
-            continue;
-        }
-        served.push(ServedModel {
-            id: name.to_string(),
+        let entry = ServedDeployment {
             deployment: deployment.id.clone(),
             profile: profile.id.clone(),
             served_name: profile.served_name.clone(),
             upstream_id: profile.upstream_id.clone(),
-            verbs: profile.verbs.clone(),
+            verbs: profile_verbs(profile),
             modalities: modalities(profile),
             context_length: measures
                 .get(&deployment.id)
                 .and_then(EngineMeasure::context_length),
-        });
+            quantization: profile.quantization.clone(),
+            weights: profile.model.weights.clone(),
+        };
+        match served
+            .iter_mut()
+            .find(|model| model.id.eq_ignore_ascii_case(name))
+        {
+            Some(model) => model.deployments.push(entry),
+            None => served.push(ServedModel {
+                id: name.to_string(),
+                deployments: vec![entry],
+            }),
+        }
     }
     served
 }
@@ -185,6 +313,7 @@ pub fn listing(models: &[ServedModel]) -> Value {
 }
 
 fn listing_entry(model: &ServedModel) -> Value {
+    let modalities = model.modalities();
     let mut entry = json!({
         "id": model.id,
         "object": "model",
@@ -192,11 +321,11 @@ fn listing_entry(model: &ServedModel) -> Value {
         "owned_by": "cairn-inference",
         "root": model.id,
         "architecture": {
-            "input_modalities": model.modalities.input,
-            "output_modalities": model.modalities.output,
+            "input_modalities": modalities.input,
+            "output_modalities": modalities.output,
         },
     });
-    if let Some(context) = model.context_length {
+    if let Some(context) = model.context_length() {
         entry["context_length"] = json!(context);
         entry["max_model_len"] = json!(context);
     }
@@ -274,31 +403,181 @@ mod tests {
         let served = served_models(&sparks(), &measures);
         assert_eq!(ids(&served), [DSV4, "qwen3-embed-4b", "qwen36-fast"]);
         let deepseek = &served[0];
-        assert_eq!(deepseek.served_name, "deepseek-v4-flash-vision-exp");
-        assert_eq!(deepseek.deployment.as_str(), "dsv4f-tp2");
-        assert_eq!(deepseek.context_length, Some(1_048_576));
+        assert_eq!(deepseek.deployments.len(), 1);
+        assert_eq!(
+            deepseek.deployments[0].served_name,
+            "deepseek-v4-flash-vision-exp"
+        );
+        assert_eq!(deepseek.deployments[0].deployment.as_str(), "dsv4f-tp2");
+        assert_eq!(deepseek.context_length(), Some(1_048_576));
         // An unmeasured deployment advertises no context.
         let fast = served.iter().find(|s| s.id == "qwen36-fast").unwrap();
-        assert_eq!(fast.context_length, None);
+        assert_eq!(fast.context_length(), None);
+    }
+
+    /// `profile`'s model renamed `name`, its weights pinned to `quantization`.
+    fn pinned(inventory: &mut Inventory, profile: &str, name: &str, quantization: &str) {
+        let profile = inventory
+            .profiles
+            .get_mut(&InferenceProfileId::from(profile))
+            .unwrap();
+        profile.model.name = name.into();
+        profile.quantization = Some(quantization.into());
+        profile.model.weights = vec![WeightFile {
+            repo: format!("{name}-GGUF"),
+            revision: "f460253".into(),
+            path: format!("model-{quantization}.gguf"),
+            sha256: format!("sha-{quantization}"),
+            size: None,
+        }];
+    }
+
+    /// A model deployed twice is one entry, by its real name in any case,
+    /// carrying both deployments, serving the union of what their profiles
+    /// serve and advertising the conservative facts.
+    #[test]
+    fn a_model_deployed_twice_is_one_entry_serving_the_union() {
+        let mut inventory = sparks();
+        // Its name differs in case, and its deployment sorts after the
+        // first, whose profile names the entry.
+        let copy = deployment("dsv4f-zcopy", &["halo"]);
+        let mut profile = command_profile("dsv4f-zcopy", 1);
+        profile.model.name = DSV4.to_ascii_lowercase();
+        profile.served_name = "copy".into();
+        profile.upstream_id = Some("deepseek/deepseek-v4-flash-vision-exp".into());
+        profile.verbs = Some(BTreeSet::from([VerbKind::Embed]));
+        inventory.insert_profile(profile);
+        inventory.insert_deployment(copy);
+        inventory
+            .profiles
+            .get_mut(&InferenceProfileId::from("dsv4f-tp2"))
+            .unwrap()
+            .modalities = Some(Modalities {
+            input: vec![Modality::Text, Modality::Image],
+            output: vec![Modality::Text],
+        });
+        let measures = BTreeMap::from([
+            (
+                DeploymentId::from("dsv4f-tp2"),
+                EngineMeasure {
+                    max_model_len: Some(1_048_576),
+                    kv_cache_tokens: None,
+                },
+            ),
+            (
+                DeploymentId::from("dsv4f-zcopy"),
+                EngineMeasure {
+                    max_model_len: Some(8_192),
+                    kv_cache_tokens: None,
+                },
+            ),
+        ]);
+        let served = served_models(&inventory, &measures);
+        assert_eq!(ids(&served), [DSV4, "qwen3-embed-4b", "qwen36-fast"]);
+        let deepseek = &served[0];
+        assert_eq!(
+            deepseek
+                .deployments
+                .iter()
+                .map(|d| d.deployment.as_str())
+                .collect::<Vec<_>>(),
+            ["dsv4f-tp2", "dsv4f-zcopy"]
+        );
+        assert_eq!(
+            deepseek.verbs(),
+            BTreeSet::from([
+                VerbKind::Complete,
+                VerbKind::Session,
+                VerbKind::Decide,
+                VerbKind::Embed
+            ])
+        );
+        let embedders: Vec<_> = deepseek
+            .serving(VerbKind::Embed)
+            .map(|d| d.served_name.as_str())
+            .collect();
+        assert_eq!(embedders, ["copy"]);
+        // Only text is taken by both; each output is given by one.
+        assert_eq!(deepseek.modalities().to_string(), "text → text+embeddings");
+        // The conversation's context is its own deployment's, the embedder's
+        // its own.
+        assert_eq!(deepseek.context_length(), Some(1_048_576));
+        assert_eq!(deepseek.context_serving(VerbKind::Embed), Some(8_192));
+        assert_eq!(
+            deepseek.upstream_id(),
+            Some("deepseek/deepseek-v4-flash-vision-exp")
+        );
+        // Every listed name resolves to every deployment it lists.
+        for model in &served {
+            let mut listed: Vec<_> = model
+                .deployments
+                .iter()
+                .map(|d| d.deployment.clone())
+                .collect();
+            listed.sort();
+            let mut serving = deployments_serving(&inventory, &model.id);
+            serving.sort();
+            assert_eq!(serving, listed, "{}", model.id);
+        }
     }
 
     #[test]
-    fn a_model_deployed_twice_is_not_served_until_something_chooses() {
+    fn a_profile_serves_what_it_declares_else_what_its_output_says() {
+        let mut profile = command_profile("r", 1);
+        let conversation = BTreeSet::from(CONVERSATION);
+        assert_eq!(profile_verbs(&profile), conversation, "says nothing: text");
+        profile.modalities = Some(Modalities {
+            input: vec![Modality::Text],
+            output: vec![Modality::Embeddings],
+        });
+        assert_eq!(profile_verbs(&profile), BTreeSet::from([VerbKind::Embed]));
+        profile.modalities = Some(Modalities {
+            input: vec![Modality::Text],
+            output: vec![Modality::Audio],
+        });
+        assert!(profile_verbs(&profile).is_empty());
+        // A declaration is believed whatever the modalities say.
+        profile.verbs = Some(BTreeSet::from([VerbKind::Decide]));
+        assert_eq!(profile_verbs(&profile), BTreeSet::from([VerbKind::Decide]));
+    }
+
+    #[test]
+    fn only_pinned_identical_weights_are_the_same_weights() {
         let mut inventory = sparks();
-        let mut copy = deployment("dsv4f-copy", &["halo"]);
-        copy.profile = "dsv4f-tp2".into();
-        inventory.insert_deployment(copy);
-        let served = served_models(&inventory, &BTreeMap::new());
-        assert_eq!(ids(&served), ["qwen3-embed-4b", "qwen36-fast"]);
-        // Every listed name resolves to exactly the deployment it lists.
-        for model in &served {
-            assert_eq!(
-                deployments_serving(&inventory, &model.id),
-                vec![model.deployment.clone()],
-                "{}",
-                model.id
-            );
-        }
+        pinned(
+            &mut inventory,
+            "qwen3-embed-4b",
+            "Qwen/Qwen3-Embedding-4B",
+            "q8_0",
+        );
+        inventory.insert_profile(command_profile("embed-twin", 1));
+        inventory.insert_deployment(deployment("embed-twin", &["sp1"]));
+        pinned(
+            &mut inventory,
+            "embed-twin",
+            "Qwen/Qwen3-Embedding-4B",
+            "q8_0",
+        );
+        let deployments = |inventory: &Inventory| {
+            served_models(inventory, &BTreeMap::new())
+                .into_iter()
+                .find(|model| model.id == "Qwen/Qwen3-Embedding-4B")
+                .unwrap()
+                .deployments
+        };
+        let both = deployments(&inventory);
+        assert!(both[0].same_weights(&both[1]));
+        pinned(
+            &mut inventory,
+            "embed-twin",
+            "Qwen/Qwen3-Embedding-4B",
+            "q4_k_m",
+        );
+        let both = deployments(&inventory);
+        assert!(!both[0].same_weights(&both[1]), "another quantization");
+        let mut unpinned = both[0].clone();
+        unpinned.weights.clear();
+        assert!(!unpinned.same_weights(&unpinned.clone()), "nothing pinned");
     }
 
     #[test]

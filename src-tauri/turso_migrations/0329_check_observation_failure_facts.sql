@@ -1,0 +1,23 @@
+-- lineage: shared
+-- cairn/5357: two facts on each failing check observation, so a dormant review
+-- wave re-arms only when the fact that failed it has changed, and a review lane
+-- that fails as infrastructure the same way over and over is held by name.
+--
+-- `failure_signature` is a sha256 over how the run failed: its failure kind,
+-- the substrate shape or classifier reason, the exit code, and the evidence
+-- line with per-run noise (digits, long hex runs, absolute paths) normalized
+-- out (`execution::lane_breaker::failure_signature`). Attempts that failed the
+-- same way share it.
+--
+-- `placement_facts` is a sha256 over the fleet capability scope and every
+-- eligible machine's repair identity the lane was attempted under
+-- (`execution::lane_breaker::placement_facts`). It moves when a machine
+-- attaches, detaches, is re-measured, or is declared repaired.
+--
+-- Both are written only on observations whose run ended with a failure kind,
+-- and are NULL on every row recorded before them. Reads seek
+-- `idx_check_result_observations_reusable_lookup`
+-- (project_id, check_name, input_hash, result_schema_version, ran_at), so no
+-- new index is needed.
+ALTER TABLE check_result_observations ADD COLUMN failure_signature TEXT;
+ALTER TABLE check_result_observations ADD COLUMN placement_facts TEXT;

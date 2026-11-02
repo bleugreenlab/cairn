@@ -299,12 +299,15 @@ impl AgentBackend for TypeSafeBackend {
         orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &SelectedOffer,
-    ) -> Result<DecisionRoute, String> {
+    ) -> Result<(DecisionRoute, String), String> {
         match offer.served.wire {
             Wire::SystemOne => {
                 let api_key = typesafe_api_key(orch)
                     .ok_or_else(|| "TypeSafe needs an API key to answer a decision".to_string())?;
-                Ok(DecisionRoute::SystemOne(decision_endpoint(&api_key)))
+                Ok((
+                    DecisionRoute::SystemOne(decision_endpoint(&api_key)),
+                    offer.model.clone(),
+                ))
             }
             wire => Err(format!("TypeSafe answers no decision over {wire}")),
         }

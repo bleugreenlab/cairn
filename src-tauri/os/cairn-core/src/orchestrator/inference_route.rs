@@ -4,10 +4,12 @@
 //! A caller's name is turned into the model's real name here
 //! ([`resolve_model`]: a deployment id, profile id or served name names no
 //! model), and every call is then a request to placement
-//! ([`crate::fleet::models::request`]), which never sees anything but the real
-//! name: a loaded model answers on the same pass, and an unloaded one loads
-//! while the caller waits on what its request waits on. A model is never
-//! served by another. Every call counts as demand, which is what keeps a model
+//! ([`crate::fleet::models::request`]), which sees only the real name and the
+//! verb the call serves: it chooses among the model's deployments whose
+//! profile serves that verb, a loaded one answers on the same pass, and an
+//! unloaded one loads while the caller waits on what its request waits on. A
+//! model is never served by another, nor a verb by a deployment that does not
+//! serve it. Every call counts as demand, which is what keeps a model
 //! in use from looking idle to placement.
 //!
 //! The wait belongs to the caller. A caller with a cancel signal (an agent
@@ -29,11 +31,13 @@ use std::time::{Duration, Instant};
 
 use cairn_config::inference::InferenceProfileDeclaration;
 use cairn_inference::control::Phase;
-use cairn_inference::served::{self, deployments_serving, EngineMeasure, ServedModel};
+use cairn_inference::served::{
+    self, deployments_serving, profile_verbs, EngineMeasure, ServedModel,
+};
 use cairn_inference::{
     unknown_address, Addresses, Deployment, DeploymentId, InferenceProfileId, Inventory, Network,
 };
-use cairn_models::types::catalog::Modalities;
+use cairn_models::types::catalog::{Modalities, VerbKind};
 
 use super::inference::load_inventory;
 use super::inference_control::deployment_phases;
@@ -174,20 +178,23 @@ pub(crate) fn resolve_model(inventory: &Inventory, name: &str) -> Result<String,
     }
 }
 
-/// The name the engine serving `model` answers to, when a deployment serves
-/// it.
-pub(crate) async fn served_name_of(orch: &Orchestrator, model: &str) -> Option<String> {
-    let inventory = served_inventory(orch).await.ok()?;
-    let deployment = deployments_serving(&inventory, model).into_iter().next()?;
-    let profile = &inventory.deployments.get(&deployment)?.profile;
-    Some(inventory.profiles.get(profile)?.served_name.clone())
+/// Whether `deployment`'s profile serves `verb`.
+fn deployment_serves(inventory: &Inventory, deployment: &DeploymentId, verb: VerbKind) -> bool {
+    inventory
+        .deployments
+        .get(deployment)
+        .and_then(|record| inventory.profiles.get(&record.profile))
+        .is_some_and(|profile| profile_verbs(profile).contains(&verb))
 }
 
-/// Ask once for `model` on behalf of `requester`. While one of the
-/// requester's requests for the model still waits, it is reused.
+/// Ask once for `model` to serve `verb`, on behalf of `requester`: placement
+/// routes it only to a deployment whose profile serves `verb`. While one of
+/// the requester's requests for the model still waits on such a deployment,
+/// it is reused.
 pub(crate) async fn ask(
     orch: &Orchestrator,
     model: &str,
+    verb: VerbKind,
     requester: &str,
 ) -> Result<Asked, String> {
     let inventory = served_inventory(orch).await?;
@@ -199,6 +206,7 @@ pub(crate) async fn ask(
             request.model.eq_ignore_ascii_case(&real)
                 && request.requester == requester
                 && request.state == RequestState::Waiting
+                && deployment_serves(&inventory, &request.deployment, verb)
         });
     let handle = match queued {
         Some(request) => RequestHandle {
@@ -207,7 +215,7 @@ pub(crate) async fn ask(
             deployment: request.deployment,
             model: request.model,
         },
-        None => models::request(orch, &real, requester, None).await?,
+        None => models::request(orch, &real, Some(verb), requester, None).await?,
     };
     answer(orch, &inventory, handle).await
 }
@@ -283,7 +291,8 @@ async fn route(
     })
 }
 
-/// Wait until `model` is ready for `requester`, then say where to send it.
+/// Wait until `model` is ready to serve `verb` for `requester`, then say
+/// where to send it.
 ///
 /// `budget` bounds the wait (`None` waits until the request is answered or
 /// cancelled), `cancelled` is polled throughout, and `waiting` hears each new
@@ -292,12 +301,13 @@ async fn route(
 pub(crate) fn ready_blocking(
     orch: &Orchestrator,
     model: &str,
+    verb: VerbKind,
     requester: &str,
     budget: Option<Duration>,
     cancelled: impl Fn() -> bool,
     waiting: impl FnMut(&str),
 ) -> Result<Route, String> {
-    let first = run_db_blocking(|| ask(orch, model, requester))?;
+    let first = run_db_blocking(|| ask(orch, model, verb, requester))?;
     wait(
         first,
         &PACE,
@@ -489,7 +499,7 @@ async fn probe(deployment: &Deployment, address: &str, served_name: &str) -> (En
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
 
@@ -540,6 +550,18 @@ mod tests {
             cancelled,
             waiting: move |said: &str| heard.borrow_mut().push(said.to_string()),
         }
+    }
+
+    /// Wait on `first` as an uncancelled caller does, each later read of its
+    /// request answered by `polls`, at a pace a test can wait for.
+    pub(crate) fn waited_for(
+        first: Asked,
+        heard: &RefCell<Vec<String>>,
+        polls: impl FnMut(&RequestHandle) -> Result<Asked, String>,
+    ) -> Result<Route, String> {
+        wait(first, &FAST, patience(None, || false, heard), polls, |_| {
+            panic!("an uncancelled caller cancels nothing")
+        })
     }
 
     #[test]

@@ -2098,6 +2098,9 @@ async fn render_resource_body(
                         &orch.fleet.blocked_questions(None, captured_at),
                         orch.fleet.purpose_debt_journal_error().as_deref(),
                     ));
+                    rendered.push_str(&crate::resources::executors::render_held_lanes(
+                        &crate::execution::lane_breaker::held_review_lanes(&orch.db).await,
+                    ));
                     rendered.push_str(&crate::resources::executors::render_colocated_supervision(
                         orch.fleet.colocated_substrate().as_ref(),
                         &orch.fleet.colocated_supervision(),

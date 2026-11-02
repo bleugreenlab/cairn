@@ -42,10 +42,7 @@ pub fn compose(served: &[ServedModel], catalog: &Catalog, may_use: impl Fn(&str)
         push(entry, &mut entries);
     }
 
-    let run_locally: BTreeSet<&str> = served
-        .iter()
-        .filter_map(|model| model.upstream_id.as_deref())
-        .collect();
+    let run_locally: BTreeSet<&str> = served.iter().filter_map(ServedModel::upstream_id).collect();
     for provider in catalog.providers.iter().filter(|provider| {
         let key = provider.descriptor.key.as_ref();
         provider.installed && key != LOCAL_PROVIDER && relays_to(key) && may_use(key)

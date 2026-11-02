@@ -349,6 +349,11 @@ pub(crate) struct LaneRow {
     /// A newer attempt at the same inputs that ended without a verdict, kept
     /// so a surface can say it happened without letting it stand for the lane.
     pub(crate) newer_attempt: Option<CheckResultCacheEntry>,
+    /// The lane breaker holding this review lane, when its newest
+    /// infrastructure failure belongs to a tripped group
+    /// ([`crate::execution::lane_breaker::held_lane_conn`]). A held lane is
+    /// rendered as held, never as its last colour.
+    pub(crate) held: Option<crate::execution::cache::SuppressedCheck>,
 }
 
 impl From<CheckResultCacheEntry> for LaneRow {
@@ -356,6 +361,7 @@ impl From<CheckResultCacheEntry> for LaneRow {
         Self {
             row,
             newer_attempt: None,
+            held: None,
         }
     }
 }
@@ -393,7 +399,11 @@ pub(crate) fn select_lane_row(
     }
     let (answers, row) = best?;
     let newer_attempt = newest_attempt.filter(|attempt| answers && attempt.ran_at > row.ran_at);
-    Some(LaneRow { row, newer_attempt })
+    Some(LaneRow {
+        row,
+        newer_attempt,
+        held: None,
+    })
 }
 
 /// The sentence a lane carries beside its answer when a newer attempt at the
@@ -1397,6 +1407,15 @@ fn assemble_statuses(
                 );
                 status.verified_on = verified_on.get(&name).cloned();
                 status.notice = newer_attempt_note(lane);
+                if let Some(held) = &lane.held {
+                    // Held, not red: the breaker's count is the lane's
+                    // suppression, and its sentence says what releases it.
+                    status.suppressed_after = Some(held.streak());
+                    status.notice = Some(format!(
+                        "Not run: {}.",
+                        crate::execution::checks::lane_breaker_sentence(held)
+                    ));
+                }
                 return status;
             }
 

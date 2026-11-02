@@ -1155,7 +1155,7 @@ pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String
             }
         ));
     }
-    let handle = models::request(orch, model, OPERATOR, Some(&PoolKey::from(pool))).await?;
+    let handle = models::request(orch, model, None, OPERATOR, Some(&PoolKey::from(pool))).await?;
     let status = handle.status(orch).await?;
     Ok(format!("Request #{}: {}", handle.id, status.describe()))
 }

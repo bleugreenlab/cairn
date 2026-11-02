@@ -38,6 +38,7 @@ pub mod gates;
 pub(crate) mod impact_slice;
 pub mod inputs;
 pub mod jobs;
+pub(crate) mod lane_breaker;
 pub mod model_routing;
 pub mod operator_compact;
 pub mod ownership;

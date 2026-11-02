@@ -248,25 +248,19 @@ pub trait AgentBackend: Send + Sync {
     /// that discovery has not reported.
     fn serves(&self, orch: &Orchestrator, project_id: Option<&str>) -> Vec<ServedVerb>;
 
-    /// The deployment that measures `offer`'s decisions: the catalog chose
-    /// `offer` because this backend's catalog said it serves `decide` over
-    /// `offer.served.wire`, and the backend knows where that wire is reached
-    /// and with what credentials. A backend that serves no `decide` keeps the
-    /// refusal.
+    /// The deployment that measures `offer`'s decisions, and the id it is
+    /// sent there: the catalog chose `offer` because this backend's catalog
+    /// said it serves `decide` over `offer.served.wire`, and the backend knows
+    /// where that wire is reached, with what credentials, and under what name
+    /// (the offer's own, except where an engine answers to its own name). A
+    /// backend that serves no `decide` keeps the refusal.
     fn decision_route(
         &self,
         _orch: &Orchestrator,
         _project_id: Option<&str>,
         offer: &SelectedOffer,
-    ) -> Result<DecisionRoute, String> {
+    ) -> Result<(DecisionRoute, String), String> {
         Err(format!("{} cannot answer a decision", offer.provider))
-    }
-
-    /// The id this backend sends on the wire for `model`: the model itself,
-    /// except on a provider that serves one model under several names, which
-    /// sends the one its engine answers to.
-    fn sent_model(&self, _orch: &Orchestrator, model: &str) -> String {
-        model.to_string()
     }
 
     /// Models Cairn itself declares this backend serves, whatever discovery

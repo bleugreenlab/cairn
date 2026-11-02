@@ -35,6 +35,18 @@ pub(super) fn endpoint(route: &Route) -> Endpoint {
     }
 }
 
+/// The embeddings endpoint of `route`'s deployment, which takes no credential
+/// either.
+pub(super) fn embed_route(route: &Route) -> cairn_models::interface::embed::EmbedRoute {
+    cairn_models::embed::openai::route_for(
+        INFERENCE_BACKEND_KEY,
+        INFERENCE_BACKEND_NAME,
+        &route.api_base,
+        None,
+        &[],
+    )
+}
+
 /// The relay route to `route`'s deployment: its API base, no credential, and
 /// the engine's own name for the model, whatever name the client asked by.
 pub(super) fn relay_route(route: &Route) -> cairn_models::interface::relay::RelayRoute {
@@ -186,6 +198,7 @@ impl WireAdapter for InferenceAdapter {
         let route = ready_blocking(
             orch,
             &model,
+            cairn_models::types::catalog::VerbKind::Session,
             &self.requester,
             None,
             || cancel.load(Ordering::SeqCst),

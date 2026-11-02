@@ -3085,6 +3085,7 @@ pub(crate) async fn plan_infra_scopes(
                     &placement.verdict_platforms,
                 ),
                 fleet_blind: Vec::new(),
+                lane_breaker: false,
             })
             .collect();
     };
@@ -3152,9 +3153,41 @@ pub(crate) async fn plan_infra_scopes(
                     .map(|machine| machine.name)
                     .collect(),
                 environments,
+                lane_breaker: false,
             }
         })
         .collect()
+}
+
+/// What the machines a review lane could be placed on are running now: the
+/// fact a lane refused for capacity waits on. Asked of the same placement
+/// scope a review wave's lanes are placed under.
+pub(crate) fn review_placement_occupancy(
+    orch: &Orchestrator,
+    project_id: &str,
+    repository: &str,
+    placement: &CheckPlacementQuestion,
+) -> crate::fleet::occupancy::MachineOccupancy {
+    let locator = RepositoryLocator::ColocatedPath {
+        project_id: project_id.to_string(),
+        repository_id: project_id.to_string(),
+        absolute_path: repository.to_string(),
+    };
+    let project_requirements = crate::fleet::project_requirements_at(Path::new(repository));
+    orch.fleet.occupancy_for(crate::fleet::PlacementScope {
+        project_id,
+        repository: &locator,
+        selector: placement
+            .selector
+            .as_ref()
+            .filter(|selector| !selector.is_empty()),
+        pinned_executor_id: None,
+        mobility: batch_placement_mobility(&MutationPolicy::PureVerdict),
+        verdict_platforms: &placement.verdict_platforms,
+        avoided_executor_ids: &[],
+        project_requirements: &project_requirements,
+        work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
+    })
 }
 
 /// Head-only scopes for every plan in a wave.
@@ -5564,6 +5597,39 @@ struct FailureClassification {
     /// artifact. This is deliberately separate from the broad infrastructure
     /// bucket so only this reviewed failure shape can trigger an uncached rerun.
     cache_corruption: bool,
+}
+
+/// What a failure signature is computed over besides the kind and exit code:
+/// the cause (the substrate shape, or the classifier's reason) and the line the
+/// classification rests on (a substrate failure's first diagnostic line, which
+/// is its `Failing step`, or the classifier's evidence line). Report rows the
+/// classifier blanked are never the evidence line, so a test name cannot sign a
+/// failure.
+fn failure_cause_and_evidence(
+    substrate: Option<&SubstrateFailure>,
+    classification: Option<&FailureClassification>,
+    output: &str,
+) -> (String, String) {
+    if let Some(substrate) = substrate {
+        let step = substrate
+            .diagnostic()
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default();
+        return (
+            format!("substrate:{:?}", substrate.shape()),
+            step.to_string(),
+        );
+    }
+    let Some(classification) = classification else {
+        return (String::new(), String::new());
+    };
+    let evidence = classification
+        .evidence_line
+        .and_then(|index| output.lines().nth(index))
+        .unwrap_or_default();
+    (classification.reason.clone(), evidence.to_string())
 }
 
 /// Name the way a failing check DIED when the death is not an ordinary test
@@ -8246,7 +8312,41 @@ pub(crate) fn suppressed_check_message(suppressed: &SuppressedCheck) -> String {
                 format!("{head}\n\nLast diagnostic:\n{last}")
             }
         }
+        InfraRepairDomain::Lane => {
+            let entry = suppressed.evidence();
+            let head = format!(
+                "Not run: {}. Re-running it cannot produce a verdict, so review waves hold it; run it by hand with `cairn check run {}` to re-test it now.",
+                lane_breaker_sentence(suppressed),
+                entry.check_name
+            );
+            let last = entry.output_tail.trim();
+            if last.is_empty() {
+                head
+            } else {
+                format!("{head}\n\nLast diagnostic:\n{last}")
+            }
+        }
     }
+}
+
+/// Whether a stored capacity diagnostic is a preemption: an inference model
+/// took the machine's memory. Machine occupancy counts only Cairn's own cells,
+/// so it reads such a machine as idle; a preempted lane cannot wait on room.
+pub(crate) fn is_preemption_diagnostic(output_tail: &str) -> bool {
+    output_tail.contains(SubstrateFailureShape::CommandPreempted.lead())
+}
+
+/// The one sentence a held review lane is named by, on every surface: how
+/// many identical failures tripped it, the persisted signature they share and
+/// the line it was computed from, and the facts that release it.
+pub(crate) fn lane_breaker_sentence(suppressed: &SuppressedCheck) -> String {
+    let signature = suppressed.lane_signature().unwrap_or_default();
+    format!(
+        "tripped after {} identical infrastructure failures (sig {}: \"{}\"); waits for a new input, a change in the machines that can run it, or a genuine verdict for this input",
+        suppressed.streak(),
+        crate::execution::lane_breaker::short_signature(signature),
+        crate::execution::lane_breaker::evidence_excerpt(&suppressed.evidence().output_tail),
+    )
 }
 
 /// Versioned identity of the host tools that can affect project-check outcomes.
@@ -8592,6 +8692,9 @@ fn fresh_observation_write(
             .and_then(|allocation| allocation.build_jobs),
         tests,
         infra_reset_scopes,
+        // Set by the runner, which holds the classification and the scopes.
+        failure_signature: None,
+        placement_facts: None,
     }
 }
 
@@ -8987,6 +9090,20 @@ pub(crate) async fn head_verdicts_conn(
         }
     }
     let mut rows: Vec<LaneRow> = by_name.into_values().collect();
+    // A lane shown by an infrastructure failure may be one the breaker holds;
+    // only then is it worth the observation reads that say so.
+    for lane in &mut rows {
+        if lane.row.failure_kind.as_deref() == Some(CheckFailureKind::Infrastructure.as_str()) {
+            lane.held = crate::execution::lane_breaker::held_lane_conn(
+                conn,
+                project_id,
+                &lane.row.check_name,
+                &lane.row.input_hash,
+                lane.row.cached == Some(true),
+            )
+            .await?;
+        }
+    }
     rows.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
     Ok(rows)
 }
@@ -9643,7 +9760,7 @@ where
                         };
                         let reuse =
                             check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
-                        let observation = fresh_observation_write(
+                        let mut observation = fresh_observation_write(
                             project_id,
                             &sealed_coordinates[index],
                             plan,
@@ -9663,6 +9780,21 @@ where
                                     .and_then(|meta| meta.verdict_platform.as_deref()),
                             ),
                         );
+                        if let Some(kind) = failure_kind {
+                            let (cause, evidence) = failure_cause_and_evidence(
+                                substrate_failure.as_ref(),
+                                classification.as_ref(),
+                                &output,
+                            );
+                            observation.failure_signature =
+                                Some(crate::execution::lane_breaker::failure_signature(
+                                    kind.as_str(),
+                                    &cause,
+                                    exit_code.unwrap_or(-1),
+                                    &evidence,
+                                ));
+                            observation.placement_facts = Some(infra_scopes.placement_facts());
+                        }
                         let identity = crate::execution::cache::RecordedCheckObservation {
                             id: observation.id.clone(),
                             public_handle: observation.public_handle.clone(),
@@ -9725,7 +9857,9 @@ where
                                 "lastDiagnostic": output_tail,
                                 "consequence": "Cairn has stopped executing this check for these inputs. It \
                                                 runs again when its inputs change, or for these same inputs \
-                                                after the substrate is repaired and Cairn restarts.",
+                                                once the repair this failure names moves its identity: \
+                                                a machine re-measured or declared repaired, or the \
+                                                fleet that can run it changing.",
                             })
                         ),
                         Ok(false) => {}
@@ -18594,6 +18728,8 @@ cairn-common = { path = "../cairn-common" }
             id: format!("obs-{check_name}"),
             public_handle: format!("handle-{check_name}"),
             infra_reset_scopes: Vec::new(),
+            failure_signature: None,
+            placement_facts: None,
             selection: None,
             deferred_count: 0,
             phases: None,
@@ -20381,6 +20517,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             fleet: Some(infra_fleet_scope("empty-eligible-set")),
             environments: Vec::new(),
             fleet_blind: Vec::new(),
+            lane_breaker: false,
         };
         let run = |tree: &'static str, failure: CheckExecutionFailure| {
             let db = db.clone();
@@ -22316,6 +22453,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     ("machine-b".into(), "env-b".into()),
                 ],
                 fleet_blind: Vec::new(),
+                lane_breaker: false,
             },
             avoid_executor_ids: vec![avoid.to_string()],
         };
@@ -22366,6 +22504,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     ("machine-b".into(), "env-b".into()),
                 ],
                 fleet_blind: Vec::new(),
+                lane_breaker: false,
             },
             avoid_executor_ids: vec![avoid.to_string()],
         };

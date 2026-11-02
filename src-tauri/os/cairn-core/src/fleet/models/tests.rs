@@ -43,6 +43,7 @@ fn acquirable(id: &str, model: &str, machines: &[&str], pool: &str) -> Acquirabl
         head: machines[0].to_string(),
         pool: Some(pool.into()),
         refused: None,
+        verbs: BTreeSet::new(),
     }
 }
 
@@ -886,20 +887,20 @@ fn a_request_names_a_real_model_and_is_never_served_by_another() {
     let catalog = super::rules::catalog(&inventory(), &pools, &BTreeMap::new());
     let none = BTreeMap::new();
     assert_eq!(
-        choose_deployment(&catalog, &none, "DEEPSEEK-AI/deepseek-v4-flash", None),
+        choose_deployment(&catalog, &none, "DEEPSEEK-AI/deepseek-v4-flash", None, None),
         Ok(d("dsv4f-tp2")),
         "exact, case-insensitive"
     );
     for not_a_name in ["dsv4-flash", "deepseek-v4-flash", "dsv4f-tp2", "deepseek"] {
         assert!(
-            choose_deployment(&catalog, &none, not_a_name, None).is_err(),
+            choose_deployment(&catalog, &none, not_a_name, None, None).is_err(),
             "{not_a_name}: an alias, a served name, an id or a partial name is not a model"
         );
     }
     // Two pools serve the embedder: an idle pool is preferred over one
     // already holding a model, then the lowest id; a named pool narrows it.
     assert_eq!(
-        choose_deployment(&catalog, &none, "Qwen/Qwen3-Embedding-4B", None),
+        choose_deployment(&catalog, &none, "Qwen/Qwen3-Embedding-4B", None, None),
         Ok(d("embed-bbs"))
     );
     assert_eq!(
@@ -907,6 +908,7 @@ fn a_request_names_a_real_model_and_is_never_served_by_another() {
             &catalog,
             &none,
             "Qwen/Qwen3-Embedding-4B",
+            None,
             Some(&"fedora".into())
         ),
         Ok(d("embed-fedora"))
@@ -925,8 +927,96 @@ fn a_request_names_a_real_model_and_is_never_served_by_another() {
         },
     )]);
     assert_eq!(
-        choose_deployment(&catalog, &busy_bbs, "Qwen/Qwen3-Embedding-4B", None),
+        choose_deployment(&catalog, &busy_bbs, "Qwen/Qwen3-Embedding-4B", None, None),
         Ok(d("embed-fedora"))
+    );
+}
+
+/// A request made to serve a verb goes only to a deployment whose profile
+/// serves it, whatever placement would otherwise prefer; when none does it
+/// is refused naming what each serves.
+#[test]
+fn a_request_for_a_verb_goes_only_to_a_deployment_that_serves_it() {
+    use cairn_models::types::catalog::VerbKind;
+    let pools = [pool(&["sp1", "sp2"]), pool(&["fedora"]), pool(&["bbs"])];
+    // fedora's profile says nothing, so it is offered for conversation; the
+    // bbs copy declares itself an embedder.
+    let mut inventory = inventory();
+    let mut embedder =
+        inventory.profiles[&cairn_inference::InferenceProfileId::from("embed")].clone();
+    embedder.id = "embed-declared".into();
+    embedder.verbs = Some(BTreeSet::from([VerbKind::Embed]));
+    inventory.insert_profile(embedder);
+    let mut bbs = inventory.deployments[&d("embed-bbs")].clone();
+    bbs.profile = "embed-declared".into();
+    inventory.insert_deployment(bbs);
+    let catalog = super::rules::catalog(&inventory, &pools, &BTreeMap::new());
+    assert_eq!(
+        catalog[&d("embed-fedora")].verbs,
+        BTreeSet::from([VerbKind::Complete, VerbKind::Session, VerbKind::Decide])
+    );
+    assert_eq!(
+        catalog[&d("embed-bbs")].verbs,
+        BTreeSet::from([VerbKind::Embed])
+    );
+
+    let embed = "Qwen/Qwen3-Embedding-4B";
+    // fedora resident would be preferred, but it does not embed.
+    let fedora_resident = BTreeMap::from([(
+        d("embed-fedora"),
+        super::rules::Resident {
+            deployment: d("embed-fedora"),
+            model: embed.into(),
+            pool: "fedora".into(),
+            machines: machines(&["fedora"]),
+            chosen_at: 0,
+            loading_since: None,
+            healthy_since: Some(0),
+            why: Why::Adopted,
+        },
+    )]);
+    assert_eq!(
+        choose_deployment(
+            &catalog,
+            &fedora_resident,
+            embed,
+            Some(VerbKind::Embed),
+            None
+        ),
+        Ok(d("embed-bbs"))
+    );
+    assert_eq!(
+        choose_deployment(
+            &catalog,
+            &fedora_resident,
+            embed,
+            Some(VerbKind::Session),
+            None
+        ),
+        Ok(d("embed-fedora"))
+    );
+    // Narrowed to a pool whose deployment does not embed.
+    let refusal = choose_deployment(
+        &catalog,
+        &fedora_resident,
+        embed,
+        Some(VerbKind::Embed),
+        Some(&"fedora".into()),
+    )
+    .unwrap_err();
+    assert!(refusal.contains("no deployment of"), "{refusal}");
+    // No deployment of the model serves the verb at all.
+    let refusal = choose_deployment(
+        &catalog,
+        &fedora_resident,
+        embed,
+        Some(VerbKind::Image),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal,
+        "no deployment of 'Qwen/Qwen3-Embedding-4B' serves image: embed-bbs serves embed; embed-fedora serves complete, session, decide; a profile serves what it declares (inference.profiles.<id>.verbs), else what its outputs say"
     );
 }
 
@@ -1015,7 +1105,7 @@ mod host {
         host.heads.run(SP1, "check-small", true, 5);
         host.heads.run(SP1, "turn", false, 30);
 
-        let handle = request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+        let handle = request_with(&db, &host, DSV4F, None, "agent-1", None, 1_000)
             .await
             .unwrap();
         assert_eq!(handle.pool.as_str(), SPARKS);
@@ -1297,7 +1387,7 @@ mod host {
         )
         .await
         .unwrap();
-        let handle = request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+        let handle = request_with(&db, &host, DSV4F, None, "agent-1", None, 1_000)
             .await
             .unwrap();
         let status = status_with(&db, &host, handle.id).await.unwrap();

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_inference::DeploymentId;
+use cairn_models::types::catalog::VerbKind;
 use serde::{Deserialize, Serialize};
 
 use super::rules::{Acquirable, Resident};
@@ -218,17 +219,31 @@ pub fn describe_waiting(request: &Request, wait: &Wait, now: Ms) -> String {
     )
 }
 
+fn verbs_said(verbs: &BTreeSet<VerbKind>) -> String {
+    if verbs.is_empty() {
+        return "nothing".to_string();
+    }
+    verbs
+        .iter()
+        .map(|verb| verb.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The deployment a request for `model` leases: one whose profile's real name
 /// is `model` (case-insensitive, exact: an alias or a partial name is never
-/// matched, and another model never serves it), narrowed to `pool` when the
-/// caller names one. A deployment already resident or loading is preferred,
-/// then one on a pool holding no other resident, then the lowest id. A
-/// resident serves requests whether or not its machines form a detected pool
-/// now; only acquiring a model anew needs one.
+/// matched, and another model never serves it) and, for a request made to
+/// serve `verb`, whose profile serves it, so an embedding never reaches an
+/// engine that only chats nor the reverse; narrowed to `pool` when the caller
+/// names one. A deployment already resident or loading is preferred, then one
+/// on a pool holding no other resident, then the lowest id. A resident serves
+/// requests whether or not its machines form a detected pool now; only
+/// acquiring a model anew needs one.
 pub fn choose_deployment(
     catalog: &BTreeMap<DeploymentId, Acquirable>,
     residents: &BTreeMap<DeploymentId, Resident>,
     model: &str,
+    verb: Option<VerbKind>,
     pool: Option<&PoolKey>,
 ) -> Result<DeploymentId, String> {
     let model = model.trim();
@@ -244,6 +259,31 @@ pub fn choose_deployment(
             "no deployment serves '{model}'; models go by their real names, and cairn://inference/deployments lists them"
         ));
     }
+    let serving = match verb {
+        None => serving,
+        Some(verb) => {
+            let serving_verb: Vec<&Acquirable> = serving
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.verbs.contains(&verb))
+                .collect();
+            if serving_verb.is_empty() {
+                return Err(format!(
+                    "no deployment of '{model}' serves {verb}: {}; a profile serves what it declares (inference.profiles.<id>.verbs), else what its outputs say",
+                    serving
+                        .iter()
+                        .map(|candidate| format!(
+                            "{} serves {}",
+                            candidate.deployment,
+                            verbs_said(&candidate.verbs)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+            serving_verb
+        }
+    };
     let pool_of = |candidate: &Acquirable| {
         residents
             .get(&candidate.deployment)

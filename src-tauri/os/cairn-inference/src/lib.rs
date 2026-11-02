@@ -60,7 +60,9 @@ pub use profile::{
     WeightFile,
 };
 pub use record::RecordSource;
-pub use served::{deployments_serving, served_models, EngineMeasure, ServedModel};
+pub use served::{
+    deployments_serving, profile_verbs, served_models, EngineMeasure, ServedDeployment, ServedModel,
+};
 
 /// A string identifier newtype: transparent in serde, ordered, displayable.
 macro_rules! string_id {

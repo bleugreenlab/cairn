@@ -666,6 +666,11 @@ pub(crate) enum InfraRepairDomain {
     /// Repairing one machine. Reaching the bound here means AVOID that machine,
     /// not refuse the check: somewhere else may still be healthy.
     Environment,
+    /// Changing the input, the machines the lane can be placed on, or a genuine
+    /// verdict landing for the input. Read from observations rather than
+    /// counted, and only for review lanes: see [`crate::execution::lane_breaker`].
+    /// Never a domain a failure is written under.
+    Lane,
     /// Changing what the fleet can do at all. Reaching the bound here means
     /// refuse — there is nowhere to run.
     Fleet,
@@ -695,6 +700,10 @@ pub(crate) struct InfraScopes {
     /// fleet suppression read under it lifts the moment their telemetry is
     /// fresh again, and this is how its message names that repair.
     pub(crate) fleet_blind: Vec<String>,
+    /// Whether the lane breaker ([`crate::execution::lane_breaker`]) holds this
+    /// lane. Set only on the scopes a turn-end review wave reads, so a manual
+    /// run and the write and main cadences are never held by it.
+    pub(crate) lane_breaker: bool,
 }
 
 impl InfraScopes {
@@ -707,7 +716,23 @@ impl InfraScopes {
             environments: Vec::new(),
             platform_heads: Vec::new(),
             fleet_blind: Vec::new(),
+            lane_breaker: false,
         }
+    }
+
+    /// The digest of where this lane can be placed: the fleet scope and every
+    /// eligible machine's scope, without the head scopes that name this job.
+    /// Persisted on each failing observation, and compared by the dormant
+    /// re-arm and the lane breaker to tell whether the machines moved.
+    pub(crate) fn placement_facts(&self) -> String {
+        crate::execution::lane_breaker::placement_facts(
+            self.fleet.as_deref(),
+            &self
+                .environments
+                .iter()
+                .map(|(_, scope)| scope.as_str())
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// One head scope per platform this request counts.
@@ -796,7 +821,9 @@ impl InfraScopes {
         platform: Option<&str>,
     ) -> String {
         match domain {
-            InfraRepairDomain::Head => self.head.clone(),
+            // A lane trip is read from observations, never charged, so a
+            // failure is never classified into it; the head is the narrow answer.
+            InfraRepairDomain::Head | InfraRepairDomain::Lane => self.head.clone(),
             InfraRepairDomain::HeadOnPlatform => self
                 .platform_head(platform)
                 .unwrap_or_else(|| self.head.clone()),
@@ -975,6 +1002,45 @@ impl SuppressedCheck {
     pub(crate) fn streak(&self) -> i64 {
         self.evidence().infra_failure_streak
     }
+
+    /// The failure signature a lane-breaker suppression was tripped on.
+    pub(crate) fn lane_signature(&self) -> Option<&str> {
+        (self.domain == InfraRepairDomain::Lane)
+            .then(|| {
+                self.scopes.first().and_then(|scope| {
+                    scope
+                        .scope
+                        .strip_prefix(crate::execution::lane_breaker::LANE_SCOPE_PREFIX)
+                })
+            })
+            .flatten()
+    }
+}
+
+/// The suppression bounding a triple: a spent counter in some repair domain,
+/// else, for a review lane, a tripped lane breaker.
+async fn bounding_suppression(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    scopes: &InfraScopes,
+    rows: &[(String, CheckResultCacheEntry)],
+) -> Result<Option<SuppressedCheck>, crate::storage::DbError> {
+    if let Some(suppressed) = bounding_domain(scopes, rows) {
+        return Ok(Some(suppressed));
+    }
+    if !scopes.lane_breaker {
+        return Ok(None);
+    }
+    crate::execution::lane_breaker::lane_trip_conn(
+        conn,
+        project_id,
+        check_name,
+        input_hash,
+        Some(&scopes.placement_facts()),
+    )
+    .await
 }
 
 /// Which domain, if any, bounds this triple, given the rows its live scopes hold.
@@ -1133,7 +1199,8 @@ pub(crate) fn get_suppressed_check_result(
                     &scopes.all(),
                 )
                 .await?;
-                Ok(bounding_domain(&scopes, &rows))
+                bounding_suppression(conn, &project_id, &check_name, &input_hash, &scopes, &rows)
+                    .await
             })
         })
         .await
@@ -1256,7 +1323,16 @@ pub(crate) fn claim_check_execution(
                     &scopes.all(),
                 )
                 .await?;
-                if let Some(suppressed) = bounding_domain(&scopes, &rows) {
+                if let Some(suppressed) = bounding_suppression(
+                    conn,
+                    &project_id,
+                    &check_name,
+                    &input_hash,
+                    &scopes,
+                    &rows,
+                )
+                .await?
+                {
                     return Ok(CheckExecutionClaim::Suppressed(Box::new(suppressed)));
                 }
                 let avoid = avoided_environments(&scopes, &rows);
@@ -1298,29 +1374,6 @@ pub(crate) fn claim_check_execution(
         .await
         .map_err(|e| format!("Failed to claim check execution: {e}"))
     })
-}
-
-/// Clear every infrastructure suppression, returning how many triples were freed.
-///
-/// This is the un-suppression trigger for a triple whose inputs have NOT changed.
-/// A new input hash starts fresh at zero for free, because the counter lives on
-/// the input-hash-keyed row; the case that needs a deliberate answer is the
-/// operator who repaired the substrate while the inputs stayed byte-identical. A
-/// Cairn restart is that answer: it is the same edge on which an operator's fix
-/// to a toolchain, a daemon, or a wrapper actually takes effect, and it is
-/// already the edge that re-arms the review cadence, so the clear and the
-/// re-evaluation happen together rather than leaving the counter zeroed with
-/// nothing scheduled to prove it.
-pub(crate) async fn clear_infra_suppressions(db: &LocalDb) -> Result<u64, String> {
-    let sql = format!(
-        "UPDATE check_result_cache
-         SET infra_failure_streak = 0, infra_escalated_at = NULL
-         WHERE {} AND infra_failure_streak > 0",
-        RowFamily::InfraSuppression.predicate("row_family"),
-    );
-    db.execute(&sql, ())
-        .await
-        .map_err(|e| format!("Failed to clear check infrastructure suppressions: {e}"))
 }
 
 /// Store a project-declared check result keyed by `(project_id, check_name,
@@ -2048,6 +2101,14 @@ pub(crate) struct FreshCheckObservationWrite {
     /// happened and what its selector could reach — names them rather than
     /// letting the cache infer a scope from the job id.
     pub infra_reset_scopes: Vec<String>,
+    /// How a run that ended with a failure kind failed, normalized so attempts
+    /// that failed the same way share it
+    /// ([`crate::execution::lane_breaker::failure_signature`]). `None` for a
+    /// verdict.
+    pub failure_signature: Option<String>,
+    /// Where a run that ended with a failure kind could have been placed
+    /// ([`InfraScopes::placement_facts`]). `None` for a verdict.
+    pub placement_facts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2479,6 +2540,8 @@ pub(crate) fn record_fresh_check_observation(
                     "buildJobs": observation.build_jobs.map(|jobs| jobs.jobs),
                     "buildJobsJson": observation.build_jobs
                         .and_then(|jobs| serde_json::to_string(&jobs).ok()),
+                    "failureSignature": observation.failure_signature,
+                    "placementFacts": observation.placement_facts,
                 })
                 .to_string();
                 let mut existing = conn
@@ -2515,7 +2578,9 @@ pub(crate) fn record_fresh_check_observation(
                            AND cell_origin_distance_files IS json_extract(?31,'$.cellOriginDistanceFiles')
                            AND cell_origin_distance_crates IS json_extract(?31,'$.cellOriginDistanceCrates')
                            AND build_jobs IS json_extract(?31,'$.buildJobs')
-                           AND build_jobs_json IS json_extract(?31,'$.buildJobsJson')",
+                           AND build_jobs_json IS json_extract(?31,'$.buildJobsJson')
+                           AND failure_signature IS json_extract(?31,'$.failureSignature')
+                           AND placement_facts IS json_extract(?31,'$.placementFacts')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2578,7 +2643,8 @@ pub(crate) fn record_fresh_check_observation(
                         phase_setup_ms, phase_compile_ms, phase_test_ms, phase_doctest_ms,
                         phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
-                        cell_origin_distance_crates, build_jobs, build_jobs_json
+                        cell_origin_distance_crates, build_jobs, build_jobs_json,
+                        failure_signature, placement_facts
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2601,7 +2667,9 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.cellOriginDistanceFiles'),
                               json_extract(?31,'$.cellOriginDistanceCrates'),
                               json_extract(?31,'$.buildJobs'),
-                              json_extract(?31,'$.buildJobsJson'))
+                              json_extract(?31,'$.buildJobsJson'),
+                              json_extract(?31,'$.failureSignature'),
+                              json_extract(?31,'$.placementFacts'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -3512,6 +3580,8 @@ mod tests {
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             infra_reset_scopes: Vec::new(),
+            failure_signature: None,
+            placement_facts: None,
             selection: None,
             deferred_count: 0,
             phases: None,
@@ -4170,6 +4240,7 @@ mod tests {
             environments: Vec::new(),
             platform_heads: Vec::new(),
             fleet_blind: Vec::new(),
+            lane_breaker: false,
         }
     }
 
@@ -4183,6 +4254,7 @@ mod tests {
                 .collect(),
             platform_heads: Vec::new(),
             fleet_blind: Vec::new(),
+            lane_breaker: false,
         }
     }
 
@@ -5519,33 +5591,154 @@ mod tests {
         );
     }
 
-    /// The un-suppression trigger: a Cairn restart frees every suppressed triple,
-    /// including its escalation stamp, so a repaired substrate is re-proven rather
-    /// than assumed still broken.
+    /// One infrastructure failure of `rust` as the runner records it: signed,
+    /// carrying the placement facts it met, at the current result schema.
+    fn lane_failure(
+        id: &str,
+        ran_at: i64,
+        cadence: &str,
+        input: &str,
+        signature: &str,
+        facts: &str,
+    ) -> FreshCheckObservationWrite {
+        let mut failure = observation(id, &format!("commit-{id}"), "env-a");
+        failure.input_hash = input.to_string();
+        failure.ran_at = ran_at;
+        failure.cadence = cadence.to_string();
+        failure.exit_code = -1;
+        failure.verdict = "failed".to_string();
+        failure.failure_kind = Some("infrastructure".to_string());
+        failure.complete = false;
+        failure.reusable = false;
+        failure.non_reusable_reason = Some("infrastructure".to_string());
+        failure.result_schema_version =
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64;
+        failure.output_tail =
+            "Cairn: infrastructure\nFailing step:\nskip-ledger: unknown reason".to_string();
+        failure.tests = Vec::new();
+        failure.failure_signature = Some(signature.to_string());
+        failure.placement_facts = Some(facts.to_string());
+        failure
+    }
+
+    /// cairn/5357. Three identical infrastructure reds of a review lane are a
+    /// verdict about the lane: it is held in every review wave until its input,
+    /// its placement facts, or a genuine verdict moves. Only review waves are
+    /// held, and only review-cadence failures count.
     #[tokio::test]
-    async fn clearing_suppressions_frees_every_triple_and_reopens_escalation() {
+    async fn identical_review_infrastructure_reds_trip_the_lane_until_a_fact_moves() {
         let db = cache_db().await;
-        for check in ["rust", "frontend"] {
-            drive_to_bound(&db, check, &format!("ih-{check}"));
-            assert!(claim_infra_escalation(
-                db.clone(),
-                "project-a",
-                check,
-                &format!("ih-{check}"),
-                &infra_suppression_scope("job-test", "commit-test"),
-            )
-            .unwrap());
+        let review = InfraScopes {
+            lane_breaker: true,
+            ..InfraScopes::head_only("job-test", "commit-test")
+        };
+        let facts = review.placement_facts();
+        let held = |scopes: &InfraScopes, input: &str| {
+            get_suppressed_check_result(db.clone(), "project-a", "rust", input, scopes).unwrap()
+        };
+        for (index, id) in ["r1", "r2"].into_iter().enumerate() {
+            let failure = lane_failure(id, 100 + index as i64, "review", "in", "sig-a", &facts);
+            record_fresh_check_observation(db.clone(), failure).unwrap();
         }
+        // A main-cadence red of the same shape is never counted.
+        let main = lane_failure("m1", 103, "main", "in", "sig-a", &facts);
+        record_fresh_check_observation(db.clone(), main).unwrap();
+        // Nor is a review red that failed some other way.
+        let other = lane_failure("o1", 104, "review", "in", "sig-b", &facts);
+        record_fresh_check_observation(db.clone(), other).unwrap();
+        assert!(
+            held(&review, "in").is_none(),
+            "two identical reds are not three"
+        );
 
-        assert_eq!(clear_infra_suppressions(&db).await.unwrap(), 2);
-        for check in ["rust", "frontend"] {
-            assert!(!suppressed(&db, check, &format!("ih-{check}")));
-            assert_eq!(streak_of(&db, &format!("ih-{check}"), check).await, 0);
-        }
+        let third = lane_failure("r3", 110, "review", "in", "sig-a", &facts);
+        record_fresh_check_observation(db.clone(), third).unwrap();
+        let tripped = held(&review, "in").expect("three identical review reds trip the lane");
+        assert_eq!(tripped.domain, InfraRepairDomain::Lane);
+        assert_eq!(tripped.streak(), 3);
+        assert_eq!(tripped.lane_signature(), Some("sig-a"));
+        assert_eq!(
+            tripped.evidence().ran_at,
+            110,
+            "the newest failure stands for it"
+        );
+        let sentence = crate::execution::checks::lane_breaker_sentence(&tripped);
+        assert!(
+            sentence.starts_with(
+                "tripped after 3 identical infrastructure failures (sig sig-a: \"skip-ledger: unknown reason\")"
+            ),
+            "{sentence}"
+        );
+        assert!(
+            matches!(
+                claim_check_execution(db.clone(), "project-a", "rust", "in", &review).unwrap(),
+                CheckExecutionClaim::Suppressed(_)
+            ),
+            "submission refuses a held lane, so no review wave can run it"
+        );
 
-        // A second sweep with nothing suppressed is a no-op, so the startup path
-        // stays silent on a healthy install.
-        assert_eq!(clear_infra_suppressions(&db).await.unwrap(), 0);
+        let manual = InfraScopes {
+            lane_breaker: false,
+            ..review.clone()
+        };
+        assert!(held(&manual, "in").is_none(), "a manual run is never held");
+        assert!(held(&review, "in-new").is_none(), "a new input lifts it");
+        let moved = InfraScopes {
+            environments: vec![("machine-a".to_string(), infra_env_scope("repaired"))],
+            ..review.clone()
+        };
+        assert!(
+            held(&moved, "in").is_none(),
+            "moved placement facts lift it"
+        );
+        let shown = |db: Arc<LocalDb>, restamped: bool| async move {
+            db.read(move |conn| {
+                Box::pin(async move {
+                    crate::execution::lane_breaker::held_lane_conn(
+                        conn,
+                        "project-a",
+                        "rust",
+                        "in",
+                        restamped,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            shown(db.clone(), false).await.map(|held| held.streak()),
+            Some(3),
+            "the lane projection shows the hold under the facts it last failed under"
+        );
+        // A wave under other machines ran the lane and failed once: that
+        // fresh red is not held. A later wave back under the tripped facts
+        // only re-stamps the lane, and the projection reads that as held.
+        let elsewhere = lane_failure("r4", 115, "review", "in", "sig-a", "facts-b");
+        record_fresh_check_observation(db.clone(), elsewhere).unwrap();
+        assert!(shown(db.clone(), false).await.is_none());
+        assert_eq!(
+            shown(db.clone(), true).await.map(|held| held.streak()),
+            Some(3)
+        );
+        assert!(
+            held(&review, "in").is_some(),
+            "and the wave, asking under the tripped facts, still holds it"
+        );
+
+        let mut verdict = observation("v1", "commit-v1", "env-a");
+        verdict.input_hash = "in".to_string();
+        verdict.ran_at = 120;
+        verdict.reusable = false;
+        verdict.result_schema_version =
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64;
+        record_fresh_check_observation(db.clone(), verdict).unwrap();
+        assert!(held(&review, "in").is_none(), "a genuine verdict lifts it");
+        assert!(
+            shown(db.clone(), true).await.is_none(),
+            "and the projection says so"
+        );
     }
 
     #[tokio::test]

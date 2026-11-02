@@ -13,24 +13,34 @@
 //! decision does not wait, since it has no cancel signal, and is refused with
 //! what its request waits on while the model loads.
 //!
-//! What a model serves is its profile's word, as the operator's declaration
-//! states it: the verbs it names (those this provider carries, conversation and
-//! decide over openai-chat), or, when it names none, the provider-wide claim of
-//! those verbs for a model that outputs text and nothing for one that does not.
-//! Embeddings through this provider need a route into the embed door, which
-//! does not exist yet; until it does, a profile declared as an embedder is
-//! listed here and serves nothing.
+//! What a model serves is what its deployments' profiles serve, each judged by
+//! one rule ([`cairn_inference::profile_verbs`]: the verbs the operator's
+//! declaration names, else conversation and decide for a model that outputs
+//! text, embed for one that outputs only embeddings), of the verbs this
+//! provider carries: conversation and decide over openai-chat, embed over
+//! openai-embeddings. Every call asks for its verb, so placement routes it only
+//! to a deployment that serves it. An embedder's offer declares what the facet
+//! checks every reply against: its family's native width and purpose handling
+//! ([`cairn_models::embed::families`], looked up by the model's real name), the
+//! native width only, and a local server's batch limits. Embedding deployments
+//! of one model that disagree on width or weights are not offered for embed,
+//! and the catalog says why. An embedding waits for its model as a completion
+//! does, within the embedding timeout ([`embed_route`]).
 
 mod adapter;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Mutex;
 use std::time::Duration;
 
-use cairn_inference::ServedModel;
+use cairn_inference::{ServedDeployment, ServedModel};
+use cairn_models::embed::{families, local_server_limits};
 use cairn_models::interface::decide::DecisionRoute;
-use cairn_models::interface::SelectedOffer;
-use cairn_models::types::catalog::{DiscoveredModel, Modality, ServedVerb, Verb, Wire};
+use cairn_models::interface::embed::{EmbedRoute, EMBED_TIMEOUT};
+use cairn_models::interface::{SelectedOffer, Unable};
+use cairn_models::types::catalog::{DiscoveredModel, ServedVerb, Verb, VerbKind, Wire};
+use cairn_models::types::embedding::EmbeddingCapabilities;
 use cairn_models::types::tokenizers::tokenizer_for;
 
 pub(crate) use cairn_models::types::catalog::INFERENCE_BACKEND_KEY;
@@ -46,8 +56,8 @@ use crate::storage::run_db_blocking;
 /// The name diagnostics and transcripts give this provider.
 pub(crate) const INFERENCE_BACKEND_NAME: &str = "Cairn inference";
 
-/// Conversation and decide over OpenAI chat: everything this provider
-/// carries, and what it serves for a model whose profile does not say.
+/// Conversation and decide over OpenAI chat: the provider-wide claim, what a
+/// model whose profile does not say serves when it outputs text.
 fn provider_serves() -> Vec<ServedVerb> {
     let wire = Wire::OpenAiChatCompletions;
     let mut serves = ServedVerb::conversation(wire);
@@ -58,20 +68,132 @@ fn provider_serves() -> Vec<ServedVerb> {
     serves
 }
 
-/// What `served` serves here: the verbs its profile declares that this
-/// provider carries; else the provider's claim (`None`) for a model that
-/// outputs text, and nothing for one that does not.
-fn serves_for(served: &ServedModel) -> Option<Vec<ServedVerb>> {
-    match &served.verbs {
-        Some(verbs) => Some(
-            provider_serves()
-                .into_iter()
-                .filter(|carried| verbs.contains(&carried.verb.kind()))
-                .collect(),
-        ),
-        None if served.modalities.output.contains(&Modality::Text) => None,
-        None => Some(Vec::new()),
+/// The width and purpose `deployment` of the model `model_id` embeds with,
+/// from the model's family, found by its real name, else by the upstream id
+/// the deployment's profile names.
+fn family_embedding(model_id: &str, deployment: &ServedDeployment) -> EmbeddingCapabilities {
+    let family_id = match &deployment.upstream_id {
+        Some(upstream) if families::family(model_id).is_none() => upstream.as_str(),
+        _ => model_id,
+    };
+    families::capabilities(family_id, None, false, local_server_limits(None))
+}
+
+/// What `served`'s embedding offer declares, from the deployments whose
+/// profiles embed, or why it cannot be offered; `None` when none embeds.
+///
+/// Only the native width is offered: whether an engine honours `dimensions`
+/// is not on the record (llama.cpp's server ignores it), and one that ignores
+/// it would answer every shorter request at full width. The limits are any
+/// local server's, with the smallest context an embedding deployment measured
+/// as each text's token limit. Vectors are keyed by model and width (tenets
+/// 1151, 1163), so deployments that would return different widths, or that
+/// are not shown to load the same weights, cannot share one offer: a placement
+/// choice between them would mix vectors of different weights under one id.
+fn embedding_offer(served: &ServedModel) -> Option<Result<EmbeddingCapabilities, String>> {
+    let embedders: Vec<&ServedDeployment> = served.serving(VerbKind::Embed).collect();
+    let (first, others) = embedders.split_first()?;
+    let mut capabilities = family_embedding(&served.id, first);
+    for other in others {
+        let theirs = family_embedding(&served.id, other);
+        if (theirs.native_dims, &theirs.purpose)
+            != (capabilities.native_dims, &capabilities.purpose)
+        {
+            return Some(Err(format!(
+                "cannot embed: its deployments {} and {} embed differently ({} against {}), so their vectors cannot share one model id",
+                first.deployment,
+                other.deployment,
+                capabilities.summary(),
+                theirs.summary()
+            )));
+        }
+        if !first.same_weights(other) {
+            return Some(Err(format!(
+                "cannot embed: its deployments {} and {} are not shown to load the same weights (the same pinned files and quantization), so their vectors cannot share one model id; pin the same weights on both, or declare embed on one",
+                first.deployment, other.deployment
+            )));
+        }
     }
+    let context = served
+        .context_serving(VerbKind::Embed)
+        .and_then(|tokens| u32::try_from(tokens).ok());
+    capabilities.limits = local_server_limits(context);
+    Some(Ok(capabilities))
+}
+
+/// What `served` serves here: of the verbs its deployments' profiles serve,
+/// those this provider carries (conversation and decide over openai-chat,
+/// embed over openai-embeddings), embed only while its embedding deployments
+/// agree.
+fn serves_for(served: &ServedModel) -> Vec<ServedVerb> {
+    let verbs = served.verbs();
+    let mut serves: Vec<ServedVerb> = provider_serves()
+        .into_iter()
+        .filter(|carried| verbs.contains(&carried.verb.kind()))
+        .collect();
+    if let Some(Ok(capabilities)) = embedding_offer(served) {
+        serves.push(ServedVerb {
+            verb: Verb::Embed(capabilities),
+            wire: Wire::OpenAiEmbeddings,
+        });
+    }
+    serves
+}
+
+/// Every verb a served model's deployments serve that its offer cannot, and
+/// why: the catalog's refusal names the reason.
+fn unable(served: &[ServedModel]) -> Vec<Unable> {
+    served
+        .iter()
+        .filter_map(|model| match embedding_offer(model)? {
+            Ok(_) => None,
+            Err(why) => Some(Unable {
+                model: model.id.clone(),
+                verb: VerbKind::Embed,
+                why,
+            }),
+        })
+        .collect()
+}
+
+/// What the last catalog refresh found unable, held for the catalog to read
+/// beside the models it listed.
+static UNABLE: Mutex<Vec<Unable>> = Mutex::new(Vec::new());
+
+/// The verbs served models could not be offered for at the last refresh.
+pub(crate) fn unable_now() -> Vec<Unable> {
+    UNABLE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// Where an embedding with `model` goes, and the name its engine is sent. It
+/// asks for the model to embed, as every call here asks for its verb, so only
+/// a deployment whose profile embeds is chosen and an unloaded one loads; it
+/// waits up to the embedding timeout, and a wait that runs out leaves the
+/// request queued, so the model still loads and a later call answers.
+/// Blocking.
+pub(crate) fn embed_route(
+    orch: &Orchestrator,
+    model: &str,
+) -> Result<(EmbedRoute, String), String> {
+    let route = ready_blocking(
+        orch,
+        model,
+        VerbKind::Embed,
+        "an embedding",
+        Some(EMBED_TIMEOUT),
+        || false,
+        |said| log::info!("inference: an embedding waits for {model}: {said}"),
+    )?;
+    Ok(embedding_target(route))
+}
+
+/// The embeddings endpoint of a ready deployment, and the engine's own name
+/// for the model, which the embedding is sent under.
+fn embedding_target(route: inference_route::Route) -> (EmbedRoute, String) {
+    (adapter::embed_route(&route), route.served_name)
 }
 
 /// One served model as the catalog lists it, by its real name.
@@ -86,18 +208,18 @@ fn discovered(served: &ServedModel) -> DiscoveredModel {
         default_reasoning_effort: None,
         supported_reasoning_efforts: vec![],
         context_window: served
-            .context_length
+            .context_length()
             .and_then(|tokens| i64::try_from(tokens).ok()),
         // A profile's upstream id is the OpenRouter slug of what it runs.
-        canonical_slug: served.upstream_id.clone(),
+        canonical_slug: served.upstream_id().map(str::to_string),
         serving_account_ids: vec![],
         pricing: None,
         // Whether the model makes tool calls is the first turn's to find out;
         // nothing here checked it.
         supported_parameters: vec![],
         router: false,
-        modalities: Some(served.modalities.clone()),
-        serves: serves_for(served),
+        modalities: Some(served.modalities()),
+        serves: Some(serves_for(served)),
         tokenizer: tokenizer_for(INFERENCE_BACKEND_KEY, &served.id, Some(&served.id)),
     }
 }
@@ -108,7 +230,10 @@ pub(crate) fn discover_catalog_blocking(
     orch: &Orchestrator,
 ) -> (Vec<DiscoveredModel>, Option<String>) {
     match run_db_blocking(|| inference_route::served_now(orch)) {
-        Ok(served) => (served.iter().map(discovered).collect(), None),
+        Ok(served) => {
+            *UNABLE.lock().unwrap_or_else(|error| error.into_inner()) = unable(&served);
+            (served.iter().map(discovered).collect(), None)
+        }
         Err(error) => (Vec::new(), Some(error)),
     }
 }
@@ -148,28 +273,26 @@ impl AgentBackend for InferenceBackend {
         provider_serves()
     }
 
+    /// The deployment placement chose to decide, sent the engine's own name.
     fn decision_route(
         &self,
         orch: &Orchestrator,
         project_id: Option<&str>,
         offer: &SelectedOffer,
-    ) -> Result<DecisionRoute, String> {
+    ) -> Result<(DecisionRoute, String), String> {
         let route = ready_blocking(
             orch,
             &offer.model,
+            VerbKind::Decide,
             &decision_requester(project_id),
             Some(Duration::ZERO),
             || false,
             |_| {},
         )?;
-        Ok(DecisionRoute::Logprobs(adapter::endpoint(&route)))
-    }
-
-    fn sent_model(&self, orch: &Orchestrator, model: &str) -> String {
-        run_db_blocking(|| async { Ok(inference_route::served_name_of(orch, model).await) })
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| model.to_string())
+        Ok((
+            DecisionRoute::Logprobs(adapter::endpoint(&route)),
+            route.served_name,
+        ))
     }
 
     fn response_completion_availability(
@@ -201,6 +324,7 @@ impl AgentBackend for InferenceBackend {
         let route = ready_blocking(
             orch,
             &request.model,
+            VerbKind::Complete,
             &completion_requester(request.project_id.as_deref()),
             Some(request.timeout),
             || false,
@@ -231,9 +355,9 @@ impl AgentBackend for InferenceBackend {
     {
         let crate::backends::relay::RelayRequest {
             model,
+            door,
             requester,
             wait,
-            ..
         } = request;
         let started = std::time::Instant::now();
         let cancel = wait.cancel.clone();
@@ -241,6 +365,7 @@ impl AgentBackend for InferenceBackend {
         let route = ready_blocking(
             orch,
             model,
+            door.verb(),
             requester,
             Some(budget),
             || cancel.load(std::sync::atomic::Ordering::Relaxed),

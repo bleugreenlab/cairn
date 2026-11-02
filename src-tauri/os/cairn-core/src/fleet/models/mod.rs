@@ -37,6 +37,7 @@ use std::time::Duration;
 use cairn_common::executor_protocol::{MachineModelResident, MachineRole};
 use cairn_inference::control::{self as act, Phase, Request as Act};
 use cairn_inference::{DeploymentId, Inventory};
+use cairn_models::types::catalog::VerbKind;
 use serde::Serialize;
 
 use self::requests::{choose_deployment, describe_waiting, Hold, HoldCause, Request, RequestId};
@@ -579,11 +580,14 @@ impl RequestStatus {
 }
 
 /// Ask for the model whose real name is `model`, on behalf of `requester`,
-/// narrowed to `pool` when one is named. Placement decides at once, so the
-/// returned handle's status already says what the request waits on.
+/// to serve `verb` when the caller is serving one (a deployment whose profile
+/// does not serve it is never chosen), narrowed to `pool` when one is named.
+/// Placement decides at once, so the returned handle's status already says
+/// what the request waits on.
 pub async fn request(
     orch: &Orchestrator,
     model: &str,
+    verb: Option<VerbKind>,
     requester: &str,
     pool: Option<&PoolKey>,
 ) -> Result<RequestHandle, String> {
@@ -591,6 +595,7 @@ pub async fn request(
         &orch.db.local,
         orch.fleet.as_ref(),
         model,
+        verb,
         requester,
         pool,
         now_ms(),
@@ -602,6 +607,7 @@ pub(crate) async fn request_with(
     db: &LocalDb,
     host: &dyn Host,
     model: &str,
+    verb: Option<VerbKind>,
     requester: &str,
     pool: Option<&PoolKey>,
     now: Ms,
@@ -609,7 +615,7 @@ pub(crate) async fn request_with(
     let mut book = passed_book(db, host, now).await?;
     let inventory = load_inventory(db).await?;
     let (_, catalog) = catalog_now(&inventory, host);
-    let deployment = choose_deployment(&catalog, &book.state.residents, model, pool)?;
+    let deployment = choose_deployment(&catalog, &book.state.residents, model, verb, pool)?;
     let chosen = &catalog[&deployment];
     let pool = book
         .state
@@ -740,7 +746,7 @@ pub(crate) async fn pin_inner(
     let (_, catalog) = catalog_now(&inventory, host);
     let deployment = match &target {
         PinTarget::Model { name, pool } => {
-            choose_deployment(&catalog, &book.state.residents, name, pool.as_ref())?
+            choose_deployment(&catalog, &book.state.residents, name, None, pool.as_ref())?
         }
         PinTarget::Deployment(id) => {
             let acquirable = catalog.get(id).ok_or_else(|| {

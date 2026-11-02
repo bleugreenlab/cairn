@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use cairn_common::executor_protocol::MachineRole;
 use cairn_inference::control::Phase;
 use cairn_inference::{DeploymentId, Inventory};
+use cairn_models::types::catalog::VerbKind;
 use serde::{Deserialize, Serialize};
 
 use super::requests::{Hold, HoldCause, Request, RequestId, RequestState, Wait};
@@ -63,6 +64,9 @@ pub struct Acquirable {
     pub pool: Option<PoolKey>,
     /// Why it may not run now, when it may not.
     pub refused: Option<String>,
+    /// What its profile serves ([`cairn_inference::profile_verbs`]): a
+    /// request for any other verb is never routed here.
+    pub verbs: BTreeSet<VerbKind>,
 }
 
 impl Acquirable {
@@ -133,6 +137,9 @@ pub fn catalog(
                     .then(|| pool.map(|p| p.key.clone()))
                     .flatten(),
                 refused,
+                verbs: profile
+                    .map(cairn_inference::profile_verbs)
+                    .unwrap_or_default(),
             };
             (deployment.id.clone(), acquirable)
         })

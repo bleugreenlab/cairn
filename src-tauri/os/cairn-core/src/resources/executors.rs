@@ -480,6 +480,42 @@ pub(crate) fn render_executors(
     out
 }
 
+/// The review lanes the lane breaker holds, or nothing when there are none.
+///
+/// They belong beside the machines because "is this lane failing because of a
+/// machine?" is the question an operator brings here, and a held lane is the
+/// answer that it fails the same way on every machine it can reach.
+pub(crate) fn render_held_lanes(
+    held: &Result<Vec<crate::execution::lane_breaker::HeldLane>, String>,
+) -> String {
+    let lanes = match held {
+        Ok(lanes) if lanes.is_empty() => return String::new(),
+        Ok(lanes) => lanes,
+        Err(error) => {
+            return format!("## Lanes held by the breaker\n\nUnavailable: {error}\n\n");
+        }
+    };
+    let mut out = format!(
+        "## Lanes held by the breaker ({})\n\nReview lanes that failed as infrastructure the same way {} times on the same input and the same machines. Review waves do not run them until their input, the machines that can run them, or a genuine verdict changes; `cairn check run <check>` re-tests one by hand.\n\n",
+        lanes.len(),
+        crate::execution::lane_breaker::LANE_IDENTICAL_FAILURE_BOUND
+    );
+    for lane in lanes {
+        out.push_str(&format!(
+            "- {} / {}{}: {}\n",
+            lane.project,
+            lane.check_name,
+            lane.job_id
+                .as_deref()
+                .map(|job| format!(" (job {})", &job[..job.len().min(8)]))
+                .unwrap_or_default(),
+            lane.sentence
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 /// The fleet-wide line for machines refused on protocol that this runner
 /// cannot repair, or nothing when there are none.
 ///
@@ -7432,6 +7468,26 @@ mod tests {
 
     /// An empty fleet says what is true and what to do about it, rather than
     /// rendering an empty list an agent has to interpret.
+    #[test]
+    fn held_lanes_are_listed_by_name_and_quiet_when_there_are_none() {
+        assert_eq!(render_held_lanes(&Ok(Vec::new())), "");
+        let rendered = render_held_lanes(&Ok(vec![crate::execution::lane_breaker::HeldLane {
+            project: "cairn".to_string(),
+            check_name: "frontend-tests".to_string(),
+            job_id: Some("e5d80163-aaaa".to_string()),
+            sentence: "tripped after 3 identical infrastructure failures (sig 1a2b3c: \"x\")"
+                .to_string(),
+        }]));
+        assert!(
+            rendered.contains("## Lanes held by the breaker (1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- cairn / frontend-tests (job e5d80163): tripped after 3"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn an_empty_fleet_renders_an_explanation_not_an_empty_list() {
         let rendered = render_executors(&[], &[], &[], None, CAPTURED_AT, false);

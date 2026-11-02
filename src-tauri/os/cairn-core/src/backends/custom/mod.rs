@@ -386,9 +386,12 @@ impl AgentBackend for CustomBackend {
         &self,
         orch: &Orchestrator,
         project_id: Option<&str>,
-        _offer: &cairn_models::interface::SelectedOffer,
-    ) -> Result<DecisionRoute, String> {
-        self.config(orch, project_id)?.decision_route()
+        offer: &cairn_models::interface::SelectedOffer,
+    ) -> Result<(DecisionRoute, String), String> {
+        Ok((
+            self.config(orch, project_id)?.decision_route()?,
+            offer.model.clone(),
+        ))
     }
 
     fn response_completion_availability(
