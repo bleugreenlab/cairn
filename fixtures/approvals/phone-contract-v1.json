@@ -102,6 +102,16 @@
     "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9yZXZvY2F0aW9uLnYxAAAAAEBjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkAAAADW9yZy1maXh0dXJlLTEAAAAOdXNlci1maXh0dXJlLTEAAAAfY2FlX2ZpeHR1cmUwMDAwMDAwMDAwMDAwMDAwMDAwMQAAAAdyZXZva2Vk",
     "canonicalBytesSha256": "bca91004a1db9b2fe582518f898296a8b3a3eaa2666007a85c1e4b2eb0f5eb4e"
   },
+  "bearerRenewalBinding": {
+    "binding": {
+      "attestation_challenge": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "org_id": "org-fixture-1",
+      "user_id": "user-fixture-1",
+      "enrollment_id": "cae_fixture00000000000000000001"
+    },
+    "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuYmVhcmVyX3JlbmV3YWwudjEAAAAAQGVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWYAAAANb3JnLWZpeHR1cmUtMQAAAA51c2VyLWZpeHR1cmUtMQAAAB9jYWVfZml4dHVyZTAwMDAwMDAwMDAwMDAwMDAwMDAx",
+    "canonicalBytesSha256": "2711a7c47315d1e17ced9616c61ca2745167a317a4ae7713bda0b84d8200ed41"
+  },
   "p256Vectors": {
     "messageBase64": "Y2Fpcm4uYXBwcm92YWwua2V5X3Bvc3Nlc3Npb24udjEAY2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9iaW5kaW5nLnYxAAAAAAZlbnJvbGwAAABAYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYgAAAA1vcmctZml4dHVyZS0xAAAADnVzZXItZml4dHVyZS0xAAAADmluc3RhbGxhdGlvbi0xAAAADmFwcC1pbnN0YW5jZS0xAAAALGtqc0F1R2VOdlQ0dk00ZGorVVJ1VFVJTklEZmFRRGpGZjdMdDRBMGtRa3c9AAAACnByb2R1Y3Rpb24AAAAfdXNlcl9wcmVzZW5jZV9wcml2YXRlX2tleV91c2FnZQAAAHxNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRFFnQUVsTWhzTmF4UzFCNHQ0cEVIOERyTUIxWEhiVWFhNFh6ZTRWNVRGbHp0YlpxQUE4UkRpaXdCVUJYTmk3WVQ2M3pObjJwWVJsSzltZ1VPWXViTkU2Z0Jsdz09AA==",
     "publicKeySpkiBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAElMhsNaxS1B4t4pEH8DrMB1XHbUaa4Xze4V5TFlztbZqAA8RDiiwBUBXNi7YT63zNn2pYRlK9mgUOYubNE6gBlw==",
