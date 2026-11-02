@@ -10,7 +10,8 @@ use cairn_common::executor_protocol::{
     CellOwnerRef, ExecutorSelector, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation,
     ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
     ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize,
-    ResidentSandboxPolicy, RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
+    ResidentSandboxPolicy, ResidentStreamFraming, RESIDENT_PROCESS_DEFAULT_SHELL,
+    RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
 };
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
@@ -3059,6 +3060,7 @@ async fn spawn_terminal_session(
                 // charge would tax the idle prompt at a compile's rate.
                 reservation: None,
                 process: ResidentProcessSpec {
+                    stdout_framing: ResidentStreamFraming::Bytes,
                     runtime_packages: Vec::new(),
                     program,
                     args,

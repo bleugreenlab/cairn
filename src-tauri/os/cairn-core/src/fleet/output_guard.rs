@@ -17,11 +17,18 @@
 //! stream that is dropped without one loses whatever the scrubber was still
 //! withholding, and that failure reads as a rendering glitch rather than a bug,
 //! which is why every caller here drains at its terminal outcome.
+//!
+//! A resident process whose stdout is a newline-delimited protocol declares
+//! `Lines` framing in its spec, and that stdout stream is scrubbed line-framed
+//! here too ([`StreamingScrubber::line_framed`]). The runner registers its MCP
+//! secret as raw random bytes, so on one install in 256 that secret begins with
+//! a newline, and a byte-stream pass would hold back the terminator of every
+//! frame the process writes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cairn_common::executor_protocol::ResidentProcessStream;
+use cairn_common::executor_protocol::{ResidentProcessStream, ResidentStreamFraming};
 
 use crate::security::StreamingScrubber;
 
@@ -29,6 +36,16 @@ use crate::security::StreamingScrubber;
 #[derive(Default)]
 pub(crate) struct RelayedOutput {
     streams: HashMap<String, StreamingScrubber>,
+    /// Resident processes whose start declared line-framed stdout, keyed by
+    /// [`resident_process_key`], with the generation that start became once its
+    /// stdout first speaks.
+    ///
+    /// Recorded before the start goes out, so its first chunk already sees it,
+    /// and held for the life of that process rather than of one scrubber: a
+    /// resident process outlives its executor link, and the scrubbers a lost
+    /// link drops are rebuilt from this when the process speaks again. It ends
+    /// with the generation it is bound to, or when the next start declares.
+    line_framed_stdout: HashMap<String, Option<u64>>,
 }
 
 /// A guard shared between the callback that feeds it and the batch that drains
@@ -89,6 +106,85 @@ impl RelayedOutput {
         self.stream(key).push(chunk)
     }
 
+    /// Record how the next start of one resident process frames its stdout.
+    ///
+    /// Every start declares, so a process restarted as a byte stream drops a
+    /// line-framed declaration its previous start left unclaimed.
+    pub(crate) fn declare_stdout_framing(
+        &mut self,
+        executor_id: &str,
+        holder_key: &str,
+        process_key: &str,
+        framing: ResidentStreamFraming,
+    ) {
+        let key = resident_process_key(executor_id, holder_key, process_key);
+        match framing {
+            ResidentStreamFraming::Lines => {
+                self.line_framed_stdout.insert(key, None);
+            }
+            ResidentStreamFraming::Bytes => {
+                self.line_framed_stdout.remove(&key);
+            }
+        }
+    }
+
+    /// Scrub a chunk of one resident process's stream.
+    ///
+    /// Only a stdout stream whose start declared `Lines` is scrubbed
+    /// line-framed; stderr, a PTY, and an undeclared stdout stay byte streams.
+    pub(crate) fn settle_resident_bytes(
+        &mut self,
+        executor_id: &str,
+        holder_key: &str,
+        process_key: &str,
+        generation: u64,
+        stream: ResidentProcessStream,
+        chunk: &[u8],
+    ) -> Vec<u8> {
+        let key = resident_stream_key(executor_id, holder_key, process_key, generation, stream);
+        if !self.streams.contains_key(&key) {
+            let line_framed = stream == ResidentProcessStream::Stdout
+                && self.bind_line_framing(
+                    &resident_process_key(executor_id, holder_key, process_key),
+                    generation,
+                );
+            let scrubber = StreamingScrubber::new();
+            let scrubber = if line_framed {
+                scrubber.line_framed()
+            } else {
+                scrubber
+            };
+            self.streams.insert(key.clone(), scrubber);
+        }
+        self.stream(&key).push(chunk)
+    }
+
+    /// Whether this generation's stdout is line-framed, binding an unclaimed
+    /// declaration to the first generation that speaks.
+    ///
+    /// A declaration bound to another generation belongs to that start, so a
+    /// stream of an older generation still draining after a restart stays a
+    /// byte stream.
+    fn bind_line_framing(&mut self, process: &str, generation: u64) -> bool {
+        match self.line_framed_stdout.get_mut(process) {
+            Some(bound @ None) => {
+                *bound = Some(generation);
+                true
+            }
+            Some(Some(bound)) => *bound == generation,
+            None => false,
+        }
+    }
+
+    /// Forget a line-framed declaration once the generation it is bound to
+    /// exits. An unbound declaration is a start still to speak, so an older
+    /// generation's exit leaves it alone.
+    fn end_line_framing(&mut self, process: &str, generation: u64) {
+        if self.line_framed_stdout.get(process) == Some(&Some(generation)) {
+            self.line_framed_stdout.remove(process);
+        }
+    }
+
     /// Text form of [`Self::settle_bytes`].
     ///
     /// The scrubber releases only on character boundaries, so the conversion is
@@ -125,10 +221,22 @@ impl RelayedOutput {
     /// A link that dies mid-stream never delivers the exits that would have
     /// drained its processes, so without this the map keeps a scrubber per
     /// process that will never speak again.
+    ///
+    /// Framing declarations are kept. The processes themselves outlive the
+    /// link, and a stream rebuilt after a reconnect must be framed as its start
+    /// declared; a byte-stream rebuild would bring back the stall line framing
+    /// exists to prevent.
     pub(crate) fn forget_executor(&mut self, executor_id: &str) {
         let prefix = format!("{executor_id}{KEY_SEPARATOR}");
         self.streams.retain(|key, _| !key.starts_with(&prefix));
     }
+}
+
+/// Identity of one resident process across its starts: the stream key without
+/// a generation or a stream, because a framing declaration is made before the
+/// executor names the generation.
+fn resident_process_key(executor_id: &str, holder_key: &str, process_key: &str) -> String {
+    format!("{executor_id}{KEY_SEPARATOR}{holder_key}{KEY_SEPARATOR}{process_key}")
 }
 
 /// Identity of one resident process's stream, stable across its lifetime.
@@ -162,6 +270,10 @@ pub(crate) fn finish_resident_process(
     generation: u64,
 ) -> Vec<(ResidentProcessStream, Vec<u8>)> {
     let mut guard = output.lock().unwrap();
+    guard.end_line_framing(
+        &resident_process_key(executor_id, holder_key, process_key),
+        generation,
+    );
     RESIDENT_STREAMS
         .into_iter()
         .filter_map(|stream| {
@@ -377,6 +489,141 @@ mod tests {
         let first = resident_stream_key("exec", "job:1", "main", 1, ResidentProcessStream::Pty);
         let second = resident_stream_key("exec", "job:1", "main", 2, ResidentProcessStream::Pty);
         assert_ne!(first, second);
+    }
+
+    /// A value beginning with a newline, as one raw random secret in 256 does.
+    fn register_leading_newline(id: &str) -> SecretGuard<'static> {
+        registry()
+            .register(
+                SecretId::new(id),
+                SecretCategory::BatchCapability,
+                "unit test",
+                SecretMaterial::from_bytes(b"\nQ7m2Zx9-RedTeam-relay"),
+            )
+            .expect("registerable")
+    }
+
+    const FRAME: &[u8] = b"{\"type\":\"success\"}\n";
+
+    fn settle(output: &mut RelayedOutput, stream: ResidentProcessStream) -> Vec<u8> {
+        output.settle_resident_bytes("exec", "job:1", "repl:a", 1, stream, FRAME)
+    }
+
+    #[test]
+    fn a_declared_line_framed_stdout_releases_each_frame_at_once() {
+        let _guard = register_leading_newline("relay-lines-declared");
+        let mut output = RelayedOutput::default();
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Lines);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), FRAME);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), FRAME);
+    }
+
+    /// Without a declaration, and on stderr even with one, the stream keeps the
+    /// byte-stream rule and withholds a terminator that begins the value.
+    #[test]
+    fn undeclared_stdout_and_stderr_stay_byte_streams() {
+        let _guard = register_leading_newline("relay-lines-undeclared");
+        let held = &FRAME[..FRAME.len() - 1];
+
+        let mut output = RelayedOutput::default();
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), held);
+
+        let mut output = RelayedOutput::default();
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Lines);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stderr), held);
+
+        // A restart declared as bytes replaces the line-framed declaration.
+        let mut output = RelayedOutput::default();
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Lines);
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Bytes);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), held);
+    }
+
+    /// A declaration belongs to the start that made it: the first stdout
+    /// stream claims it, and the next generation is framed only if its own
+    /// start declares again.
+    #[test]
+    fn a_declaration_binds_to_the_first_generation_that_speaks() {
+        let _guard = register_leading_newline("relay-lines-generation");
+        let mut output = RelayedOutput::default();
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Lines);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), FRAME);
+        let next = output.settle_resident_bytes(
+            "exec",
+            "job:1",
+            "repl:a",
+            2,
+            ResidentProcessStream::Stdout,
+            FRAME,
+        );
+        assert_eq!(next, &FRAME[..FRAME.len() - 1]);
+    }
+
+    /// A resident process outlives its executor link. The scrubbers a lost
+    /// link drops are rebuilt when the process speaks again, and the rebuilt
+    /// stdout must still be line-framed, or the stall comes back on every
+    /// reconnect.
+    #[test]
+    fn line_framing_survives_a_lost_link() {
+        let _guard = register_leading_newline("relay-lines-reconnect");
+        let mut output = RelayedOutput::default();
+        output.declare_stdout_framing("exec", "job:1", "repl:a", ResidentStreamFraming::Lines);
+        assert_eq!(settle(&mut output, ResidentProcessStream::Stdout), FRAME);
+        output.forget_executor("exec");
+        assert!(
+            output.streams.is_empty(),
+            "the link's scrubbers are dropped"
+        );
+        assert_eq!(
+            settle(&mut output, ResidentProcessStream::Stdout),
+            FRAME,
+            "the same generation, rebuilt after the reconnect, is still line-framed"
+        );
+    }
+
+    /// A declaration ends with the generation it is bound to, but an older
+    /// generation's exit arriving after a restart has declared does not take
+    /// the new start's declaration with it.
+    #[test]
+    fn only_the_bound_generations_exit_ends_its_declaration() {
+        let _guard = register_leading_newline("relay-lines-exit");
+        let shared = RelayedOutput::shared();
+        let process = resident_process_key("exec", "job:1", "repl:a");
+        shared.lock().unwrap().declare_stdout_framing(
+            "exec",
+            "job:1",
+            "repl:a",
+            ResidentStreamFraming::Lines,
+        );
+        assert_eq!(
+            settle(&mut shared.lock().unwrap(), ResidentProcessStream::Stdout),
+            FRAME
+        );
+
+        // Restart: generation 2 declares before generation 1's exit arrives.
+        shared.lock().unwrap().declare_stdout_framing(
+            "exec",
+            "job:1",
+            "repl:a",
+            ResidentStreamFraming::Lines,
+        );
+        finish_resident_process(&shared, "exec", "job:1", "repl:a", 1);
+        assert_eq!(
+            shared.lock().unwrap().line_framed_stdout.get(&process),
+            Some(&None)
+        );
+        let second = shared.lock().unwrap().settle_resident_bytes(
+            "exec",
+            "job:1",
+            "repl:a",
+            2,
+            ResidentProcessStream::Stdout,
+            FRAME,
+        );
+        assert_eq!(second, FRAME);
+
+        finish_resident_process(&shared, "exec", "job:1", "repl:a", 2);
+        assert!(shared.lock().unwrap().line_framed_stdout.is_empty());
     }
 
     #[test]

@@ -1115,6 +1115,7 @@ mod resident_callback_tests {
 
     fn spec(env: Vec<(String, String)>) -> ResidentProcessSpec {
         ResidentProcessSpec {
+            stdout_framing: cairn_common::executor_protocol::ResidentStreamFraming::Bytes,
             runtime_packages: Vec::new(),
             program: "/bin/sh".into(),
             args: Vec::new(),

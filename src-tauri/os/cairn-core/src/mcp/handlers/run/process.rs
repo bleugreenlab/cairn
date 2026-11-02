@@ -1705,9 +1705,10 @@ struct HostPipeSinks {
 /// Reading is line-oriented because that is the shape both the capture and the
 /// live payload want, but scrubbing is not: one streaming scrubber spans the
 /// whole pipe, because a registered value containing a newline would otherwise
-/// straddle two lines and be invisible to a per-line pass. The scrubber releases
-/// on any byte outside the registered alphabet, so a newline-terminated line
-/// still goes out the moment it arrives.
+/// straddle two lines and be invisible to a per-line pass. A byte-stream
+/// scrubber can hold back a line's terminator when a registered value begins
+/// with a newline; a host batch tolerates that, because the line still goes out
+/// with the next output or at the end-of-stream flush.
 fn drain_host_pipe<R: std::io::Read + Send + 'static>(
     pipe: Option<R>,
     stream: &'static str,

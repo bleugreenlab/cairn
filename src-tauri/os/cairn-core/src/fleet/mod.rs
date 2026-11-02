@@ -2401,18 +2401,14 @@ impl Fleet {
         let holder_key = event.holder.storage_key();
         match &mut event.event {
             ResidentProcessEventKind::Output { stream, data, .. } => {
-                let key = output_guard::resident_stream_key(
+                let settled = self.resident_output.lock().unwrap().settle_resident_bytes(
                     executor_id,
                     &holder_key,
                     &event.process_key,
                     event.process_generation,
                     *stream,
+                    data,
                 );
-                let settled = self
-                    .resident_output
-                    .lock()
-                    .unwrap()
-                    .settle_bytes(&key, data);
                 if settled.is_empty() {
                     return Vec::new();
                 }
@@ -9424,6 +9420,22 @@ impl Fleet {
         };
         if let (Some(request), Some(plane)) = (&object_request, &object_plane) {
             plane.authorize_request(request, &selected.executor_id, selected.generation);
+        }
+        // How the start frames its stdout is recorded before the start goes
+        // out, so the relay guard scrubs even its first chunk accordingly.
+        if let ResidencyOperation::StartProcess {
+            fence,
+            process_key,
+            process,
+            ..
+        } = &operation
+        {
+            self.resident_output.lock().unwrap().declare_stdout_framing(
+                &selected.executor_id,
+                &fence.holder.storage_key(),
+                process_key,
+                process.stdout_framing,
+            );
         }
         // A terminal or REPL that holds its node's scratch syncs it over this
         // connection's object channel, at start and again when it exits.

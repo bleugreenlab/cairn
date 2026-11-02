@@ -35,7 +35,7 @@ use cairn_common::executor_protocol::{
     ExecutorSelector, ProcessSandboxMode, ResidencyFence, ResidencyHolder, ResidencyOperation,
     ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEventKind, ResidentProcessIoMode,
     ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream,
-    ResidentRuntimeAsset,
+    ResidentRuntimeAsset, ResidentStreamFraming,
 };
 use store::{ReplExitReason, ReplRowStatus};
 
@@ -733,6 +733,7 @@ pub async fn process_spec(
     .await
     .map(|(grant, _, _)| grant);
     Ok(ResidentProcessSpec {
+        stdout_framing: ResidentStreamFraming::Lines,
         runtime_packages,
         program,
         args,

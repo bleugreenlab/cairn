@@ -1486,7 +1486,7 @@ async fn setup_without_jj(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator,
 /// thread behavior is the exact false confidence this sweep exists to remove.
 async fn convert_run_to_thread_session(db: &LocalDb, run_id: &str, thread_name: &str) {
     let issue_id = format!("issue-{run_id}");
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) \
          SELECT id,project_id,'{thread_name}','active','none',created_at,updated_at \
          FROM issues WHERE id='{issue_id}'; \
@@ -3223,6 +3223,11 @@ async fn a_repl_ships_only_cairn_identity_to_its_executor() {
     ] {
         assert!(value(machine_fact).is_none(), "{machine_fact} crossed");
     }
+    // The eval-server's stdout is one JSON frame per line.
+    assert_eq!(
+        spec.stdout_framing,
+        cairn_common::executor_protocol::ResidentStreamFraming::Lines
+    );
     // The deps still reach the interpreter's own launch, not its environment.
     assert_eq!(spec.program, "uv");
     assert!(spec.args.windows(2).any(|pair| pair == ["--with", "numpy"]));
@@ -3270,12 +3275,15 @@ async fn repl_state_persists_across_handle_run_calls() {
     orch.repl_state
         .insert(ctx.job_id.clone(), "analysis".to_string(), session);
 
+    // The trailing bare `x` makes the first send answer with its value, so a
+    // send that timed out (and took the session with it) fails here, naming
+    // the timeout, rather than surfacing later as a missing session.
     let first = handle_run(
         &orch,
         &request(
             &cwd,
             Some(run_id),
-            json!({ "commands": [{ "code": "x = 41", "interpreter": "python", "repl": "analysis" }] }),
+            json!({ "commands": [{ "code": "x = 41\nx", "interpreter": "python", "repl": "analysis" }] }),
         ),
     )
     .await;
@@ -3287,6 +3295,7 @@ async fn repl_state_persists_across_handle_run_calls() {
         !first.contains("died"),
         "first send reported a dead REPL: {first}"
     );
+    assert!(first.contains("41"), "first send did not evaluate: {first}");
 
     let second = handle_run(
         &orch,
@@ -3301,6 +3310,82 @@ async fn repl_state_persists_across_handle_run_calls() {
         second.contains("42"),
         "REPL state must persist across handle_run calls: {second}"
     );
+
+    if let Some(session) = orch.repl_state.remove(&ctx.job_id, "analysis") {
+        session.stop_and_release(&orch).await;
+    }
+}
+
+// A REPL answers every send even when a registered secret begins with a
+// newline.
+//
+// The runner registers its MCP secret as 32 raw random bytes, so one install in
+// 256 has a secret whose first byte is `\n`. A byte-stream scrubber withholds
+// any trailing run that is a proper prefix of a registered form, which for that
+// install is the newline closing every response frame: the eval-server has
+// answered, but the line never completes, and the send waits out its bound.
+// Registering such a value here makes that install deterministic. The guard is
+// held for the test's lifetime, and nextest runs each test in its own process.
+#[tokio::test]
+async fn repl_answers_when_a_registered_secret_begins_with_a_newline() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+    use cairn_core::security::{registry, SecretCategory, SecretId, SecretMaterial};
+
+    let _leading_newline = registry()
+        .register(
+            SecretId::new("test:leading-newline"),
+            SecretCategory::CallbackCredential,
+            "unit test",
+            SecretMaterial::from_bytes(b"\nQ7m2Zx9-RedTeam-leading-newline"),
+        )
+        .expect("registerable");
+
+    let run_id = "run-repl-leading-newline";
+    let (_temp, _db, orch, cwd) = setup(run_id).await;
+    let ctx = repl_ctx(run_id, &cwd);
+    let Ok(session) = repl::spawn_session(
+        &orch,
+        &ctx.job_id,
+        &ctx.project_id,
+        &cwd,
+        Some(&ctx),
+        ReplLang::Python,
+        "analysis",
+        &[],
+        None,
+    )
+    .await
+    else {
+        eprintln!("skipping repl_answers_when_a_registered_secret_begins_with_a_newline: no python/uv available");
+        return;
+    };
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "analysis".to_string(), session);
+
+    let first = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x = 41\nx", "interpreter": "python", "repl": "analysis", "timeout": 15000 }] }),
+        ),
+    )
+    .await;
+    assert!(
+        first.contains("41") && !first.contains("timed out"),
+        "a response frame was held back by the scrubber: {first}"
+    );
+
+    let second = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x + 1", "interpreter": "python", "repl": "analysis", "timeout": 15000 }] }),
+        ),
+    )
+    .await;
+    assert!(second.contains("42"), "the session must survive: {second}");
 
     if let Some(session) = orch.repl_state.remove(&ctx.job_id, "analysis") {
         session.stop_and_release(&orch).await;
@@ -3395,12 +3480,14 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
     orch.repl_state
         .insert(ctx.job_id.clone(), "ts".to_string(), session);
 
+    // As in the python test: the trailing bare `x` is the completion value,
+    // so the first send must answer `41` rather than merely not report a loss.
     let first = handle_run(
         &orch,
         &request(
             &cwd,
             Some(run_id),
-            json!({ "commands": [{ "code": "x = 41", "interpreter": "typescript", "repl": "ts" }] }),
+            json!({ "commands": [{ "code": "x = 41;\nx", "interpreter": "typescript", "repl": "ts" }] }),
         ),
     )
     .await;
@@ -3412,6 +3499,7 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
         !first.contains("died"),
         "first send reported a dead REPL: {first}"
     );
+    assert!(first.contains("41"), "first send did not evaluate: {first}");
 
     let second = handle_run(
         &orch,

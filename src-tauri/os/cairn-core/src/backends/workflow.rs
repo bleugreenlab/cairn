@@ -235,6 +235,7 @@ pub(crate) async fn spawn_workflow_process(
                     source: ResourceReservationSource::Declared,
                 }),
                 process: ResidentProcessSpec {
+                    stdout_framing: ResidentStreamFraming::Bytes,
                     runtime_packages: Vec::new(),
                     program: "bun".into(),
                     args: vec!["-e".into(), loader],

@@ -6430,6 +6430,19 @@ pub struct LearnedResourceEstimate {
 /// admission, grant or placement outcome reads what it renders. What a runner
 /// gets wrong talking to an older executor: nothing; an executor that leaves
 /// `cpu` or the load context out gets a clause that names fewer readings.
+///
+/// cairn/5465 does not move the number. [`ResidentProcessSpec`] gains a
+/// defaulted `stdoutFraming` ([`ResidentStreamFraming`]), left out when it is
+/// `bytes`. A piped process whose stdout is newline-delimited JSON declares
+/// `lines`, and the executor's stdout scrubber then releases each complete line
+/// at once rather than withholding a terminator that begins a registered value.
+/// The spec refuses no unknown fields. What a runner gets wrong talking to an
+/// older executor: nothing it decodes differently; that executor ignores the
+/// field and keeps byte-stream release, which withholds and never leaks, so the
+/// cost is the stall this fixes and only when one of that executor's own
+/// registered values begins with a newline. The runner's relay guard, which
+/// holds the runner's own credentials, frames by the declaration whatever the
+/// executor runs. An older runner sends no field.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -10165,6 +10178,11 @@ pub struct ResidentProcessSpec {
     pub runtime_packages: Vec<ResidentRuntimeAsset>,
     #[serde(default)]
     pub io: ResidentProcessIoMode,
+    /// How stdout is framed, which decides when its scrubber may release.
+    /// Meaningful only for [`ResidentProcessIoMode::Pipe`]; stderr and a PTY
+    /// are always byte streams.
+    #[serde(default, skip_serializing_if = "ResidentStreamFraming::is_bytes")]
+    pub stdout_framing: ResidentStreamFraming,
     /// The node scratch this process's `$TMPDIR` is. Brought current at start
     /// and written back when the process exits; while it lives, the replica
     /// advertises `inUse` and the node's batches are placed beside it.
@@ -10237,6 +10255,34 @@ pub enum ResidentProcessIoMode {
     Pty {
         size: ResidentPtySize,
     },
+}
+
+/// How a resident process frames a piped output stream.
+///
+/// A byte stream's scrubber withholds any trailing run that could be the head
+/// of a registered value, which is right for arbitrary output and wrong for a
+/// newline-delimited protocol: a value beginning with a newline holds back every
+/// frame's terminator until more output arrives, and a peer waiting on that
+/// frame sends none. `Lines` declares that no frame contains a raw newline, so
+/// each complete line is scrubbed and released as it arrives
+/// (`StreamingScrubber::line_framed`). Declare it only for a stream whose every
+/// line is one JSON frame. Where that holds by convention rather than by
+/// construction, a registered value containing a raw newline written raw to the
+/// stream is released as unmatched pieces; a REPL's eval server writes its
+/// protocol to a private descriptor and is sound, a project service is not yet
+/// (cairn/5852).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ResidentStreamFraming {
+    #[default]
+    Bytes,
+    Lines,
+}
+
+impl ResidentStreamFraming {
+    pub fn is_bytes(&self) -> bool {
+        matches!(self, Self::Bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -20086,6 +20132,7 @@ mod tests {
             generation: 4,
             kind,
             spec: Some(ResidentProcessSpec {
+                stdout_framing: ResidentStreamFraming::Bytes,
                 runtime_packages: Vec::new(),
                 program: "bun".into(),
                 args: vec!["run".into(), "dev".into()],
@@ -22445,6 +22492,7 @@ mod tests {
     #[test]
     fn lifetime_pipe_runtime_shape_round_trips_with_stream_tags() {
         let process = ResidentProcessSpec {
+            stdout_framing: ResidentStreamFraming::Bytes,
             runtime_packages: Vec::new(),
             program: "bun".into(),
             args: vec!["main.ts".into()],

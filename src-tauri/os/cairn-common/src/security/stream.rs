@@ -28,6 +28,16 @@
 //! of printable ASCII, so a single echoed keystroke was withheld in four installs
 //! out of five. The rule now tests what it actually means to test.
 //!
+//! Withholding a proper prefix still stalls one shape of stream: a line-framed
+//! protocol whose reader acts only on a complete line. A registered value that
+//! *begins* with a newline makes every line terminator a one-byte proper prefix
+//! of it, so each frame's `\n` waits for output that a quiet peer never sends.
+//! A raw random credential begins with `0x0A` one time in 256, and on that
+//! install every frame stalls. A stream whose frames cannot contain a raw
+//! newline declares so with [`StreamingScrubber::line_framed`], and then each
+//! complete line is scrubbed and released, terminator included, the moment it
+//! arrives.
+//!
 //! Every consumer must call [`StreamingScrubber::flush`] at end of stream. A
 //! finalize path that skips it truncates the withheld suffix, and that failure
 //! reads as a rendering glitch rather than as a bug.
@@ -49,6 +59,7 @@ pub struct StreamingScrubber {
     carry: Vec<u8>,
     carry_bound: usize,
     found: Detections,
+    line_framed: bool,
 }
 
 impl Default for StreamingScrubber {
@@ -84,7 +95,24 @@ impl StreamingScrubber {
             carry: Vec::new(),
             carry_bound,
             found: Detections::new(),
+            line_framed: false,
         }
+    }
+
+    /// Release each complete line, terminator included, as soon as it arrives.
+    ///
+    /// Sound only for a stream in which no registered form can straddle a line
+    /// break. A newline-delimited JSON protocol is such a stream: a frame holds
+    /// no raw newline, every JSON-string spelling of a registered value is itself
+    /// registered, and each frame begins with `{`, so no form starts on one line
+    /// and ends on the next. Within a line nothing changes: a value split across
+    /// chunks still waits in the carry until its line completes. Applied to
+    /// arbitrary output, a raw value containing a newline would be released in
+    /// two unmatched halves, which is why this is a declaration a caller makes
+    /// about its stream and never a default.
+    pub fn line_framed(mut self) -> Self {
+        self.line_framed = true;
+        self
     }
 
     pub fn detections(&self) -> &Detections {
@@ -103,6 +131,23 @@ impl StreamingScrubber {
             // add latency to output that has nothing to hide.
             return chunk.to_vec();
         }
+        if !self.line_framed {
+            return self.push_settled(chunk);
+        }
+        let mut out = Vec::new();
+        let mut rest = chunk;
+        while let Some(end) = memchr::memchr(b'\n', rest) {
+            let (line, tail) = rest.split_at(end + 1);
+            self.carry.extend_from_slice(line);
+            out.extend(self.flush());
+            rest = tail;
+        }
+        out.extend(self.push_settled(rest));
+        out
+    }
+
+    /// The byte-stream release rule: append, scrub, and emit what is settled.
+    fn push_settled(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.carry.extend_from_slice(chunk);
         if let Some(scrubbed) = self.snapshot.scrub_bytes(&self.carry, &mut self.found) {
             self.carry = scrubbed;
@@ -408,6 +453,75 @@ mod tests {
         }
         out.extend(scrubber.flush());
         assert_eq!(String::from_utf8(out).unwrap(), text);
+    }
+
+    /// A value that begins with a newline, as one raw random credential in 256
+    /// does.
+    const LEADING_NEWLINE: &str = "\nQ7m2Zx9-RedTeam";
+    const FRAME: &[u8] = b"{\"type\":\"success\",\"value\":\"41\"}\n";
+
+    /// Why line framing exists: under the byte-stream rule the terminator of
+    /// every frame is a proper prefix of the value, so the frame never
+    /// completes until more output or end of stream releases it.
+    #[test]
+    fn a_leading_newline_value_holds_back_every_frame_terminator() {
+        let snapshot = snapshot_with(&[LEADING_NEWLINE]);
+        let mut scrubber = StreamingScrubber::with_snapshot(snapshot);
+        let emitted = scrubber.push(FRAME);
+        assert_eq!(emitted, &FRAME[..FRAME.len() - 1]);
+        assert_eq!(scrubber.pending(), 1, "the terminator is withheld");
+    }
+
+    #[test]
+    fn a_line_framed_stream_releases_a_whole_frame_at_once() {
+        let snapshot = snapshot_with(&[LEADING_NEWLINE]);
+        let mut scrubber = StreamingScrubber::with_snapshot(snapshot).line_framed();
+        assert_eq!(scrubber.push(FRAME), FRAME);
+        assert_eq!(scrubber.pending(), 0);
+        // Several frames in one chunk each go out whole.
+        let three = FRAME.repeat(3);
+        assert_eq!(scrubber.push(&three), three);
+        assert_eq!(scrubber.pending(), 0);
+    }
+
+    /// Framing changes when a line goes out, not what is redacted in it: a
+    /// value split across chunks inside one line is caught in both its raw and
+    /// its JSON-escaped spelling, at every split point.
+    #[test]
+    fn a_line_framed_stream_still_redacts_a_value_split_within_a_line() {
+        let snapshot = snapshot_with(&[LEADING_NEWLINE, SECRET]);
+        let encoded = serde_json::to_string(LEADING_NEWLINE).unwrap();
+        let escaped = &encoded[1..encoded.len() - 1];
+        let full = format!("{{\"a\":\"{SECRET}\",\"b\":\"{escaped}\"}}\n");
+        for split in 0..=full.len() {
+            let (left, right) = full.split_at(split);
+            let mut scrubber = StreamingScrubber::with_snapshot(snapshot.clone()).line_framed();
+            let mut out = scrubber.push(left.as_bytes());
+            out.extend(scrubber.push(right.as_bytes()));
+            assert_eq!(scrubber.pending(), 0, "split {split}: the line is complete");
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(
+                out, "{\"a\":\"[REDACTED]\",\"b\":\"[REDACTED]\"}\n",
+                "split {split}"
+            );
+        }
+    }
+
+    /// Until its newline arrives a line is an ordinary byte stream, so the head
+    /// of a value at the end of a partial line still waits.
+    #[test]
+    fn a_line_framed_stream_withholds_an_unsettled_tail_until_its_line_ends() {
+        let snapshot = snapshot_with(&[SECRET]);
+        let mut scrubber = StreamingScrubber::with_snapshot(snapshot).line_framed();
+        let head = &SECRET[..6];
+        assert_eq!(
+            scrubber.push(format!("{{\"v\":\"{head}").as_bytes()),
+            b"{\"v\":\""
+        );
+        assert_eq!(scrubber.pending(), head.len());
+        let rest = format!("{}\"}}\n", &SECRET[6..]);
+        assert_eq!(scrubber.push(rest.as_bytes()), b"[REDACTED]\"}\n");
+        assert_eq!(scrubber.pending(), 0);
     }
 
     #[test]

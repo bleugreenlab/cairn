@@ -6,6 +6,7 @@ use cairn_common::executor_protocol::{
     ResidencyHolder, ResidencyOperation, ResidencyResult, ResidentProcessCwdRoot,
     ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode, ResidentProcessKind,
     ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
+    ResidentStreamFraming,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,6 +86,9 @@ pub(crate) struct ResidentLaunch {
     pub cwd_root: ResidentProcessCwdRoot,
     /// The relay a process on another machine calls this runner through.
     pub relay: Option<cairn_common::executor_protocol::ResidentRelayGrant>,
+    /// `Lines` only for a process whose stdout is a newline-delimited JSON
+    /// protocol; see [`ResidentStreamFraming`].
+    pub stdout_framing: ResidentStreamFraming,
 }
 
 impl ResidentLaunch {
@@ -98,11 +102,13 @@ impl ResidentLaunch {
             sandbox_mode: ProcessSandboxMode::Unconfined,
             cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
             relay: None,
+            stdout_framing: ResidentStreamFraming::Bytes,
         }
     }
 
     pub(crate) fn spec(&self) -> ResidentProcessSpec {
         ResidentProcessSpec {
+            stdout_framing: self.stdout_framing,
             runtime_packages: self.runtime_packages.clone(),
             program: self.program.clone(),
             args: self.args.clone(),

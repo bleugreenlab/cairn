@@ -13,7 +13,7 @@ use cairn_common::executor_protocol::{
     ResidencyAcquireRequest, ResidencyFootprint, ResidencyHolder, ResidencyOperation,
     ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEvent, ResidentProcessEventKind,
     ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
-    ResourceReservation, ResourceReservationSource,
+    ResidentStreamFraming, ResourceReservation, ResourceReservationSource,
 };
 use cairn_common::uri::CairnResource;
 use cairn_db::turso::params;
@@ -1263,6 +1263,7 @@ pub async fn run_launch_session(
                     source: ResourceReservationSource::Declared,
                 }),
                 process: ResidentProcessSpec {
+                    stdout_framing: ResidentStreamFraming::Bytes,
                     runtime_packages: Vec::new(),
                     program: "bun".into(),
                     args,

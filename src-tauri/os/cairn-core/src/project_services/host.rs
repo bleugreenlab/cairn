@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use cairn_common::executor_protocol::{
     OwnerDeathPolicy, ProcessSandboxMode, ResidencyFootprint, ResidentProcessCwdRoot,
     ResidentProcessEventKind, ResidentProcessStatus, ResidentProcessStream, ResidentRuntimeAsset,
+    ResidentStreamFraming,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -89,6 +90,11 @@ fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
         sandbox_mode: ProcessSandboxMode::Confined,
         cwd_root: ResidentProcessCwdRoot::ResidencyScratch,
         relay: None,
+        // The service protocol is one JSON frame per stdout line. That holds by
+        // `serve()`'s convention, not by construction: a raw write to fd 1 lands
+        // here too, and a multi-line secret in it would be released in pieces
+        // (cairn/5852).
+        stdout_framing: ResidentStreamFraming::Lines,
     }
 }
 
@@ -419,6 +425,40 @@ mod tests {
             .await;
     }
 
+    /// The service protocol is scrubbed line by line. With a registered value
+    /// that begins with a newline, a byte-stream pass withholds the `ready`
+    /// frame's terminator and the service sends nothing more to release it.
+    #[tokio::test]
+    async fn a_service_answers_when_a_registered_secret_begins_with_a_newline() {
+        use crate::security::{registry, SecretCategory, SecretId, SecretMaterial};
+        let _guard = registry()
+            .register(
+                SecretId::new("service-test:leading-newline"),
+                SecretCategory::CallbackCredential,
+                "unit test",
+                SecretMaterial::from_bytes(b"\nQ7m2Zx9-RedTeam-service"),
+            )
+            .expect("registerable");
+        let (orch, _config) = crate::fleet::service_placement::tests::attached_orchestrator().await;
+        let host = LeaseHost::default();
+        let spec = echo_spec();
+        let mut process = host
+            .launch(&orch, &spec)
+            .await
+            .expect("the service launches");
+        let mut stderr = String::new();
+        let mut hello = serde_json::to_vec(&serde_json::json!({
+            "type": "hello", "protocol": 1, "project": "cairn", "service": "echo", "source": "s-1"
+        }))
+        .unwrap();
+        hello.push(b'\n');
+        process.input.write(&hello).await.unwrap();
+        let ready = next_stdout_frame(&mut process.events, &mut stderr).await;
+        assert_eq!(ready["type"], "ready", "{ready}");
+        host.release(&orch, "p", &ServiceOwner::Project, "echo")
+            .await;
+    }
+
     /// Only the substrate's own refusal reaches the supervisor as `Unplaced`.
     #[test]
     fn only_an_unroutable_start_is_unplaced() {
@@ -484,6 +524,7 @@ mod tests {
         assert!(launch.args[1].contains("/service/main.ts"));
         let process = launch.spec();
         assert_eq!(process.io, ResidentProcessIoMode::Pipe);
+        assert_eq!(process.stdout_framing, ResidentStreamFraming::Lines);
         assert!(process.sandbox_policy.is_none());
     }
 
