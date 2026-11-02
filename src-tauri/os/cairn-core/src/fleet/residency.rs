@@ -933,6 +933,30 @@ pub(crate) fn parse_resident_selector(
     Ok(selector)
 }
 
+/// The selector a terminal was created with, as its `job_terminals` row keeps
+/// it: the JSON `executor` takes, or nothing when the create named no machine.
+/// Recovery reads it back through [`resident_selector_from_row`] so a terminal
+/// that comes back is placed by the rule its create was.
+pub(crate) fn persisted_resident_selector(selector: Option<&ExecutorSelector>) -> Option<String> {
+    selector
+        .filter(|selector| !selector.is_empty())
+        .and_then(|selector| serde_json::to_string(selector).ok())
+}
+
+/// Read back what [`persisted_resident_selector`] wrote. A column that does not
+/// parse is an error, not "no selector": recovering without it could place the
+/// terminal on a machine its create would have refused.
+pub(crate) fn resident_selector_from_row(
+    column: Option<&str>,
+) -> Result<Option<ExecutorSelector>, String> {
+    match column {
+        None => Ok(None),
+        Some(json) => serde_json::from_str(json)
+            .map(Some)
+            .map_err(|error| format!("its recorded `executor` could not be read ({error})")),
+    }
+}
+
 /// The machine a residency is on, by the name an operator uses, for a page that
 /// must say where its process runs.
 pub(crate) fn residency_machine_name(
@@ -1342,5 +1366,62 @@ mod resident_placement_tests {
         );
         assert!(many.contains("Stop them first"), "{many}");
         assert!(many.contains("an executor matching"), "{many}");
+    }
+
+    /// Recovery places with the selector the create used, read back off the
+    /// terminal's row. With the environment no longer on that machine, an idle
+    /// one is re-homed and a live one refuses naming what holds it, exactly as
+    /// the create would have. A terminal created without a selector recovers by
+    /// joining the environment wherever it is.
+    #[test]
+    fn recovery_places_with_the_selector_its_create_persisted() {
+        let created = named("bgsrv-mac");
+        let column = persisted_resident_selector(Some(&created));
+        let recovered = resident_selector_from_row(column.as_deref()).unwrap();
+        assert_eq!(recovered.as_ref(), Some(&created));
+
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                recovered.as_ref(),
+                Some(&home(Some(false), &[]))
+            ),
+            ResidentPlacement::Rehome {
+                from: "bginf-halo".to_string()
+            }
+        );
+        let ResidentPlacement::Refuse(refusal) = decide_resident_placement(
+            "terminal `lab`",
+            recovered.as_ref(),
+            Some(&home(Some(false), &["REPL `py`"])),
+        ) else {
+            panic!("a live REPL on the wrong machine refuses the recovery");
+        };
+        assert!(refusal.contains("REPL `py` holds"), "{refusal}");
+        assert!(refusal.contains("**bginf-halo**"), "{refusal}");
+        assert!(refusal.contains("**bgsrv-mac**"), "{refusal}");
+
+        assert_eq!(persisted_resident_selector(None), None);
+        assert_eq!(
+            persisted_resident_selector(Some(&ExecutorSelector::default())),
+            None
+        );
+        let unpinned = resident_selector_from_row(None).unwrap();
+        assert_eq!(
+            decide_resident_placement(
+                "terminal `lab`",
+                unpinned.as_ref(),
+                Some(&home(Some(false), &["REPL `py`"]))
+            ),
+            ResidentPlacement::Acquire
+        );
+    }
+
+    /// A recorded selector that cannot be read is not taken for "none".
+    #[test]
+    fn an_unreadable_persisted_selector_is_an_error_not_an_unpinned_terminal() {
+        assert!(resident_selector_from_row(Some("{\"name\":"))
+            .unwrap_err()
+            .contains("recorded `executor`"));
     }
 }

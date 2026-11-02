@@ -3,16 +3,21 @@
 //!
 //! Two daemons need this: `cairn-orch` (the always-on local runner) and
 //! `cairn-exec` (the resident executor a bootstrapped machine runs). Both want
-//! the same thing from an operating system — a per-user, zero-elevation
-//! autostart entry that survives logout and reboot — and all three platforms
-//! express it differently: a launchd LaunchAgent plist, a systemd user unit, an
-//! HKCU Run-key value. What differs between the two daemons is not the
-//! mechanism but the [`ServiceSpec`]: the identity it registers under, the
-//! command it launches, and how the service manager should supervise it.
+//! the same thing from an operating system — a per-user autostart entry that
+//! survives logout and reboot — and the platforms express it differently: a
+//! launchd LaunchAgent plist, a systemd user unit, and on Windows one of two
+//! shapes ([`WindowsAutostart`]). The runner keeps an HKCU Run-key value, which
+//! starts it at the user's logon. The executor runs on a headless account that
+//! never logs on, so it is a Task Scheduler task an administrator registers
+//! once per machine and the executor account then operates
+//! ([`windows_task`]). What differs between the two daemons is otherwise the
+//! [`ServiceSpec`]: the identity it registers under, the command it launches,
+//! and how the service manager should supervise it.
 //!
 //! Only the pure unit *generators* ([`plist_contents`], [`systemd_unit_contents`],
-//! [`windows_run_command`]) are compiled on every platform so their output can be
-//! asserted cross-platform; the side-effectful register/unregister/query code is
+//! [`windows_run_command`], [`windows_task::executor_task_xml`]) and the task
+//! sequencing are compiled on every platform so they can be asserted
+//! cross-platform; the side-effectful register/unregister/query code is
 //! `cfg`-gated to the platform that owns the relevant service manager and reached
 //! through the [`sys`] alias.
 //!
@@ -36,6 +41,7 @@ mod macos;
 mod other;
 #[cfg(target_os = "windows")]
 mod windows;
+pub mod windows_task;
 
 // The active platform's service-manager backend. Every backend exposes the same
 // surface: `install`, `restart`, `uninstall`, `is_installed`, `is_loaded`,
@@ -51,15 +57,15 @@ use other as sys;
 use windows as sys;
 
 /// Everything a generated unit needs. One spec produces the launchd plist, the
-/// systemd unit, and the Windows Run-key command for a single daemon identity.
+/// systemd unit, and the Windows autostart for a single daemon identity.
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
     /// launchd LaunchAgent label / reverse-DNS service id (macOS).
     pub label: String,
     /// systemd user unit file name, including the `.service` suffix (Linux).
     pub unit_name: String,
-    /// HKCU Run-key value name (Windows).
-    pub run_value: String,
+    /// How the daemon starts on Windows.
+    pub windows: WindowsAutostart,
     /// systemd `Description=`.
     pub description: String,
     /// Absolute path to the executable the unit launches.
@@ -81,6 +87,27 @@ pub struct ServiceSpec {
     pub supervision: Supervision,
     /// A previous identity to stop and remove before registering this one.
     pub legacy: Option<LegacyIdentity>,
+}
+
+/// A daemon's Windows autostart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowsAutostart {
+    /// An HKCU Run value of this name, which Explorer starts at the user's
+    /// logon: the runner, which serves a person who logs on.
+    RunValue(String),
+    /// The scheduled task of this name, running `supervise --config <config>`
+    /// from the executor-task template: the executor, whose account never logs
+    /// on. Registered by an administrator, operated by the account.
+    ScheduledTask { name: String, config: PathBuf },
+}
+
+impl WindowsAutostart {
+    /// The name the registration goes by on Windows.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::RunValue(name) | Self::ScheduledTask { name, .. } => name,
+        }
+    }
 }
 
 /// A pre-rename identity that must be evicted before the current one starts, so
@@ -118,7 +145,11 @@ impl LegacyIdentity {
 /// still registered on a host.
 pub const EXECUTOR_LABEL: &str = "computer.cairn.exec";
 pub const EXECUTOR_UNIT: &str = "cairn-exec.service";
-pub const EXECUTOR_RUN_VALUE: &str = "CairnExec";
+pub const EXECUTOR_TASK_NAME: &str = "CairnExecutor";
+/// The HKCU Run value the executor registered before it was a scheduled task.
+/// Kept only so an install or uninstall can remove it and end what it started.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const RETIRED_EXECUTOR_RUN_VALUE: &str = "CairnExec";
 
 /// The runner's service identity (cairn/4377 onward).
 pub const RUNNER_LABEL: &str = "computer.cairn.orch";
@@ -150,6 +181,16 @@ pub fn pre_rename_runner_identity() -> LegacyIdentity {
 pub struct TerminatedProcess {
     pub pid: u32,
     pub start_token: String,
+    /// Its command line, where the process listing gave one.
+    pub command_line: Option<String>,
+}
+
+/// What an install or uninstall did beyond the registration itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceChange {
+    /// Processes it ended because nothing else would: an earlier generation's
+    /// Run-value daemon, or a stray instance of the executor.
+    pub ended: Vec<TerminatedProcess>,
 }
 
 /// What a registration says it launches, read from the registration itself.
@@ -864,13 +905,34 @@ pub use linux::{current_user, SystemLinger};
 
 // ─── Public lifecycle API (dispatches to the active `sys` backend) ───────────
 
-/// Register the daemon as a per-user OS service and start it.
-pub fn install(spec: &ServiceSpec) -> Result<(), String> {
-    sys::install(spec)
+/// Register the daemon as a per-user OS service and start it. For a Windows
+/// scheduled task, which only an administrator can register, this confirms
+/// the registration instead and starts the daemon through it.
+pub fn install(spec: &ServiceSpec) -> Result<ServiceChange, String> {
+    #[cfg(windows)]
+    return sys::install(spec);
+    #[cfg(not(windows))]
+    sys::install(spec).map(|()| ServiceChange::default())
 }
 
 /// Unregister and remove the per-user OS service.
-pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
+pub fn uninstall(spec: &ServiceSpec) -> Result<ServiceChange, String> {
+    #[cfg(windows)]
+    return sys::uninstall(spec);
+    #[cfg(not(windows))]
+    sys::uninstall(spec).map(|()| ServiceChange::default())
+}
+
+/// Remove the registration from inside the process it supervises, which is
+/// about to exit. The difference from [`uninstall`] is Windows's: ending the
+/// executor's scheduled task would end the caller through the supervisor's
+/// job, and the account could never register it again, so the task is neither
+/// ended nor deleted; the home's removal (with the installed marker in it) is
+/// what keeps the tick from starting anything. Elsewhere the two are the same.
+pub fn unregister_from_within(spec: &ServiceSpec) -> Result<(), String> {
+    #[cfg(windows)]
+    return sys::unregister_from_within(spec);
+    #[cfg(not(windows))]
     sys::uninstall(spec)
 }
 
@@ -883,8 +945,9 @@ pub fn uninstall(spec: &ServiceSpec) -> Result<(), String> {
 /// service again. What makes a person's stop durable is the marker in
 /// [`crate::operator_stop`], which the caller records first.
 ///
-/// On Windows there is no supervisor to tell. The Run value acts only at logon,
-/// so the caller ends the running process itself.
+/// On Windows a Run value has no supervisor to tell: it acts only at logon, so
+/// the caller ends the running process itself. A scheduled task's instance is
+/// ended, and its next tick starts it again.
 pub fn stop(spec: &ServiceSpec) -> Result<(), String> {
     sys::stop(spec)
 }
@@ -916,7 +979,7 @@ fn stop_each<'a>(
 /// works.
 pub fn restart(spec: &ServiceSpec) -> Result<(), String> {
     if !sys::is_installed(spec) {
-        return sys::install(spec);
+        return install(spec).map(|_| ());
     }
     sys::restart(spec)
 }
@@ -938,13 +1001,16 @@ pub fn location(spec: &ServiceSpec) -> Option<PathBuf> {
 
 /// The service manager's account of the supervised process. `None` where the
 /// platform has no manager that tracks one (the Windows Run key starts a
-/// process at logon and forgets it), or the manager could not be asked.
+/// process at logon and forgets it), or the manager could not be asked. For a
+/// Windows scheduled task it is the scheduler's account of the supervisor's
+/// instance; the daemon's own pid and restarts are the supervisor's to add.
 pub fn runtime(spec: &ServiceSpec) -> Option<ServiceRuntime> {
     sys::runtime(spec)
 }
 
 /// The last `lines` lines the service's process wrote to its error stream, as
-/// the platform keeps them: launchd's error log, or the systemd user journal.
+/// the platform keeps them: launchd's error log, the systemd user journal, or
+/// the error log a Windows supervisor writes the daemon's stderr to.
 pub fn recent_log(spec: &ServiceSpec, lines: usize) -> Option<String> {
     sys::recent_log(spec, lines).filter(|log| !log.trim().is_empty())
 }

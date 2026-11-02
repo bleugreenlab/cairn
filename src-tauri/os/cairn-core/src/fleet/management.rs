@@ -114,12 +114,19 @@ impl LeftOnHost {
                 cairn_common::service::EXECUTOR_LABEL
             ),
             RemotePlatform::WindowsX86_64 => format!(
-                "the {} Run value",
-                cairn_common::service::EXECUTOR_RUN_VALUE
+                "the {} scheduled task",
+                cairn_common::service::EXECUTOR_TASK_NAME
             ),
         };
+        // The executor account can never register the task again, so the
+        // executor stops it and leaves it registered; without the binary its
+        // tick runs nothing.
+        let registration = match config.platform {
+            RemotePlatform::WindowsX86_64 => " The scheduled task stays registered, running nothing once the binary is gone, until an administrator removes it with the Windows setup script.",
+            _ => "",
+        };
         let summary = format!(
-            "{host} still holds the executor binary at {binary}, its home at {home} with its credential, and {service}. The executor removes them itself the next time it dials in and is refused as revoked. A build from before self-uninstall (cairn/5705) only stops on that refusal and keeps retrying, so on such a machine, or one that never comes back, remove them by hand.",
+            "{host} still holds the executor binary at {binary}, its home at {home} with its credential, and {service}. The executor removes them itself the next time it dials in and is refused as revoked.{registration} A build from before self-uninstall (cairn/5705) only stops on that refusal and keeps retrying, so on such a machine, or one that never comes back, remove them by hand.",
             host = config.host,
             binary = config.binary_path,
             home = config.cairn_home,

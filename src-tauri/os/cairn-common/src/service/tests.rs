@@ -9,7 +9,7 @@ fn spec() -> ServiceSpec {
     ServiceSpec {
         label: "computer.cairn.test".to_string(),
         unit_name: "cairn-test.service".to_string(),
-        run_value: "CairnTest".to_string(),
+        windows: WindowsAutostart::RunValue("CairnTest".to_string()),
         description: "Cairn test daemon".to_string(),
         exe: PathBuf::from("/opt/cairn/cairn-test"),
         args: vec!["run".to_string()],
@@ -416,7 +416,7 @@ fn legacy_runner_spec(windows: bool) -> ServiceSpec {
     ServiceSpec {
         label: PRE_RENAME_RUNNER_LABEL.to_string(),
         unit_name: PRE_RENAME_RUNNER_UNIT.to_string(),
-        run_value: PRE_RENAME_RUNNER_RUN_VALUE.to_string(),
+        windows: WindowsAutostart::RunValue(PRE_RENAME_RUNNER_RUN_VALUE.to_string()),
         exe: PathBuf::from(if windows {
             r"C:\Users\Dev User\AppData\Local\cairn\cairn-runner.exe"
         } else {
@@ -509,6 +509,19 @@ fn the_runner_identities_are_distinct_on_every_platform() {
     assert_ne!(current.unit_name, legacy.unit_name);
     assert_ne!(current.run_value, legacy.run_value);
     assert!(legacy.platform_name().is_some());
+}
+
+/// The executor's task never shares a name with any Run value, current or
+/// retired, so evicting one can never remove the other.
+#[test]
+fn the_executor_task_is_named_apart_from_every_run_value() {
+    for run_value in [
+        RUNNER_RUN_VALUE,
+        PRE_RENAME_RUNNER_RUN_VALUE,
+        RETIRED_EXECUTOR_RUN_VALUE,
+    ] {
+        assert_ne!(EXECUTOR_TASK_NAME, run_value);
+    }
 }
 
 /// A logind stand-in: whether the user lingers, whether this session may turn

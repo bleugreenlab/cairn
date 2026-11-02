@@ -6461,6 +6461,16 @@ pub struct LearnedResourceEstimate {
 /// by a silent unwind instead of a printed panic. Both are inside the
 /// executor process, no frame, variant, field or serialized form changes, and
 /// a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/5836 does not move the number. On Windows the resident executor runs
+/// under a Task Scheduler task and a `cairn-exec supervise` process instead of
+/// an HKCU Run value, and its self-update exits with the restart code like
+/// every other platform instead of spawning a detached successor. Neither
+/// crosses the link. `service status --json` fills the existing
+/// `serviceRuntime` on Windows where it was absent; a runner reads it exactly
+/// as it reads launchd's and systemd's, and an older executor that leaves it
+/// out is judged as before. No frame, variant, field or serialized form
+/// changes, and a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

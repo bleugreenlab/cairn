@@ -37,6 +37,9 @@ memchr = "2"
 reflink-copy = "0.1.30"
 thiserror = "2"
 zeroize = "1"
+# Reading a scheduled task's exported definition, which `service install`
+# verifies field by field against the executor-task template.
+quick-xml = "0.38"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

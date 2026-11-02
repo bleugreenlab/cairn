@@ -236,11 +236,18 @@ fn executor_lost_notice(machine: Option<&str>) -> String {
     )
 }
 
-fn terminal_restarted_notice(machine: Option<&str>) -> String {
-    match machine {
-        Some(machine) => format!("\r\nCairn started this terminal again, on {machine}.\r\n"),
-        None => "\r\nCairn started this terminal again.\r\n".to_string(),
+fn terminal_restarted_notice(machine: Option<&str>, rehomed_from: Option<&str>) -> String {
+    let mut notice = match machine {
+        Some(machine) => format!("\r\nCairn started this terminal again, on {machine}."),
+        None => "\r\nCairn started this terminal again.".to_string(),
+    };
+    if let Some(from) = rehomed_from {
+        notice.push_str(&format!(
+            " Its environment moved here from {from} to stay on the executor it was created for; uncommitted files and installed packages there did not move."
+        ));
     }
+    notice.push_str("\r\n");
+    notice
 }
 
 /// The machine a live terminal session runs on, by the name an operator uses.
@@ -349,10 +356,61 @@ fn exit_disposition(
 /// Record that this terminal was started again, and say so where it happened.
 /// The record is what bounds the next recovery: a terminal that dies again
 /// before this restart settles is left stopped rather than started once more.
-fn note_terminal_restart(orch: &Orchestrator, terminal_uri: &str, session_id: &str) {
+fn note_terminal_restart(
+    orch: &Orchestrator,
+    terminal_uri: &str,
+    session_id: &str,
+    rehomed_from: Option<&str>,
+) {
     orch.pty_state.note_terminal_restart(terminal_uri);
-    let notice = terminal_restarted_notice(terminal_machine_name(orch, session_id).as_deref());
+    let notice = terminal_restarted_notice(
+        terminal_machine_name(orch, session_id).as_deref(),
+        rehomed_from,
+    );
     announce_in_terminal(orch, session_id, &notice);
+}
+
+/// End a terminal recovery could not start again, saying why.
+///
+/// The reason goes on the row, so a read of the terminal, its exit wake, and a
+/// `waitFor` on its exit all carry it. Nothing is released here: whatever
+/// environment the terminal was bound to belongs to its owner.
+async fn settle_refused_recovery(
+    orch: &Orchestrator,
+    terminal_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let terminal_id = terminal_id.to_string();
+    let reason = reason.to_string();
+    let settled = orch
+        .db
+        .local
+        .write(|conn| {
+            let terminal_id = terminal_id.clone();
+            let reason = reason.clone();
+            Box::pin(async move {
+                let now = chrono::Utc::now().timestamp();
+                Ok(conn
+                    .execute(
+                        "UPDATE job_terminals
+                         SET status = 'exited', exited_at = COALESCE(exited_at, ?3), exit_reason = ?2
+                         WHERE id = ?1 AND status != 'closing'",
+                        params![terminal_id.as_str(), reason.as_str(), now],
+                    )
+                    .await?
+                    > 0)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if settled {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "job_terminals", "action": "update"}),
+        );
+        reconcile_exited_terminal_wakes(orch).await?;
+    }
+    Ok(())
 }
 
 /// Restart every terminal an execution environment still owes a shell, which is
@@ -456,7 +514,7 @@ async fn restart_terminal_process(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT job_id, project_id, slug, command, title, residency_holder
+                        "SELECT job_id, project_id, slug, command, title, residency_holder, id, executor_selector
                  FROM job_terminals
                  WHERE slug = ?2 AND ((residency_holder = ?1 AND residency_incarnation_id = ?3 AND cell_epoch = ?4)
                     OR (status = 'exited'
@@ -477,11 +535,26 @@ async fn restart_terminal_process(
                     row.text(3)?,
                     row.opt_text(4)?,
                     row.opt_text(5)?,
+                    row.text(6)?,
+                    row.opt_text(7)?,
                 ))
             })
         })
         .await
         .map_err(|error| error.to_string())?;
+    let terminal_id = row.6.clone();
+    // The executor the terminal was created with is part of it for as long as
+    // it lives: a restart places with it, and the row it re-mints keeps it.
+    let selector = match crate::fleet::residency::resident_selector_from_row(row.7.as_deref()) {
+        Ok(selector) => selector,
+        Err(error) => {
+            let reason = format!(
+                "recovery refused: terminal `{slug}` was not started again because {error}. Nothing was started."
+            );
+            settle_refused_recovery(orch, &terminal_id, &reason).await?;
+            return Err(reason);
+        }
+    };
 
     let resource = if let Some(job_id) = row.0.as_deref() {
         terminal_resource_for_job(&orch.db.local, job_id, row.2.clone()).await?
@@ -501,6 +574,7 @@ async fn restart_terminal_process(
     let mut target = resolve_terminal_resource_target(&orch.db.local, &resource)
         .await
         .map_err(|error| error.to_string())?;
+    target.selector = selector;
     // This is the fenced recovery of the row that already owns the slug, not a
     // competing create. New terminal creation performs the live-slug admission
     // check before it reaches this path.
@@ -537,7 +611,23 @@ async fn restart_terminal_process(
             .await
             .map_err(|error| error.to_string())?;
         }
-        let (target, _) = materialize_terminal_lease(orch, target, None).await?;
+        // The environment is acquired again, by the rule the create used: on a
+        // machine its selector accepts, or not at all. The row is no longer
+        // recovery's by now, so a terminal that cannot come back where it was
+        // created to run ends here with the refusal as its reason, rather than
+        // starting somewhere else or ending without saying why.
+        let (target, landing) = match materialize_terminal_lease(orch, target).await {
+            Ok(placed) => placed,
+            Err(refusal) => {
+                settle_refused_recovery(
+                    orch,
+                    &terminal_id,
+                    &format!("recovery refused: {refusal}"),
+                )
+                .await?;
+                return Err(refusal);
+            }
+        };
         let session_id = spawn_terminal_session(
             orch,
             resource,
@@ -554,7 +644,12 @@ async fn restart_terminal_process(
             },
         )
         .await?;
-        note_terminal_restart(orch, &terminal_uri, &session_id);
+        note_terminal_restart(
+            orch,
+            &terminal_uri,
+            &session_id,
+            landing.rehomed_from.as_deref(),
+        );
         return Ok(session_id);
     };
     let lease = cell
@@ -601,7 +696,7 @@ async fn restart_terminal_process(
         },
     )
     .await?;
-    note_terminal_restart(orch, &terminal_uri, &session_id);
+    note_terminal_restart(orch, &terminal_uri, &session_id, None);
     Ok(session_id)
 }
 
@@ -981,7 +1076,7 @@ pub(crate) async fn create_interactive_terminal_from_resource(
         .await
         .map_err(|error| error.to_string())?;
     let lease_started_at = std::time::Instant::now();
-    let (target, _) = materialize_terminal_lease(orch, target, None).await?;
+    let (target, _) = materialize_terminal_lease(orch, target).await?;
     let lease_ms = lease_started_at.elapsed().as_millis();
     let spawn_started_at = std::time::Instant::now();
     // The title rides into the row's own insert rather than a follow-up update:
@@ -1014,13 +1109,14 @@ pub(crate) async fn create_interactive_terminal_from_resource(
     Ok(session_id)
 }
 
-/// Acquire the environment a terminal runs in, on a machine that satisfies
-/// `selector` when one is given (see `fleet::residency::place_for_resident_process`
-/// for the rule), and say where it came up.
+/// Acquire the environment a terminal runs in, on a machine that satisfies the
+/// target's selector when it has one (see
+/// `fleet::residency::place_for_resident_process` for the rule), and say where
+/// it came up. Create and recovery both come through here, so a terminal that
+/// comes back is placed exactly as it was first placed.
 async fn materialize_terminal_lease(
     orch: &Orchestrator,
     mut target: TerminalResourceTarget,
-    selector: Option<&ExecutorSelector>,
 ) -> Result<
     (
         TerminalResourceTarget,
@@ -1028,6 +1124,8 @@ async fn materialize_terminal_lease(
     ),
     String,
 > {
+    let selector = target.selector.clone();
+    let selector = selector.as_ref();
     let mut request = terminal_residency_acquisition(orch, &target).await?;
     let holder = request.holder.clone();
     let surface = format!("terminal `{}`", target.slug);
@@ -1345,6 +1443,9 @@ struct TerminalResourceTarget {
     repo_path: String,
     owner_ref: Option<CellOwnerRef>,
     lease: Option<ResidencyFence>,
+    /// The `executor` the terminal was created with. Written on its row and
+    /// read back by recovery, so it holds for the terminal's whole life.
+    selector: Option<ExecutorSelector>,
 }
 
 async fn resolve_terminal_resource_target(
@@ -1415,6 +1516,7 @@ async fn resolve_terminal_resource_target(
                             node_kind: Some(node_id),
                         }),
                         lease: None,
+                        selector: None,
                     })
                 }
                 CairnResource::TaskTerminal {
@@ -1480,6 +1582,7 @@ async fn resolve_terminal_resource_target(
                             node_kind: Some(task_name),
                         }),
                         lease: None,
+                        selector: None,
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
@@ -1503,6 +1606,7 @@ async fn resolve_terminal_resource_target(
                         repo_path: row.text(1)?,
                         owner_ref: None,
                         lease: None,
+                        selector: None,
                     })
                 }
                 _ => Err(crate::storage::DbError::Row(
@@ -1561,6 +1665,7 @@ async fn insert_terminal_resource(
     let command = command.to_string();
     let description = description.map(ToOwned::to_owned);
     let lease = target.lease.clone();
+    let selector = crate::fleet::residency::persisted_resident_selector(target.selector.as_ref());
 
     db.write(|conn| {
         let job_id = job_id.clone();
@@ -1572,6 +1677,7 @@ async fn insert_terminal_resource(
         let title = title.clone();
         let description = description.clone();
         let lease = lease.clone();
+        let selector = selector.clone();
         let holder_key = lease.as_ref().map(|fence| fence.holder.storage_key());
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp() as i32;
@@ -1600,9 +1706,9 @@ async fn insert_terminal_resource(
                 INSERT INTO job_terminals (
                     id, job_id, project_id, run_id, session_id, command, title,
                     description, status, exit_code, created_at, exited_at, slug,
-                    residency_holder, residency_incarnation_id, cell_epoch
+                    residency_holder, residency_incarnation_id, cell_epoch, executor_selector
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', NULL, ?9, NULL, ?10, ?11, ?12, ?13, ?14)
                 ",
                 params![
                     id.as_str(),
@@ -1622,6 +1728,7 @@ async fn insert_terminal_resource(
                     holder_key.as_deref(),
                     lease.as_ref().map(|fence| fence.incarnation_id.as_str()),
                     lease.as_ref().map(|fence| fence.cell_epoch as i64),
+                    selector.as_deref(),
                 ],
             )
             .await?;
@@ -2471,9 +2578,10 @@ pub(crate) async fn create_terminal_from_resource(
     caller_run_id: Option<&str>,
     selector: Option<&ExecutorSelector>,
 ) -> Result<String, String> {
-    let target = resolve_terminal_resource_target(&orch.db.local, resource)
+    let mut target = resolve_terminal_resource_target(&orch.db.local, resource)
         .await
         .map_err(|e| e.to_string())?;
+    target.selector = selector.cloned();
     let subscriber_job_id =
         match (&wake, target.job_id.as_deref()) {
             (Some(_), Some(job_id)) => Some(job_id.to_string()),
@@ -2491,7 +2599,7 @@ pub(crate) async fn create_terminal_from_resource(
     ensure_terminal_slug_available(&orch.db.local, &target)
         .await
         .map_err(|e| e.to_string())?;
-    let (target, landing) = materialize_terminal_lease(orch, target, selector).await?;
+    let (target, landing) = materialize_terminal_lease(orch, target).await?;
     let session_id = spawn_terminal_session(
         orch,
         resource.clone(),
@@ -3592,6 +3700,7 @@ mod terminal_finalize_tests {
             repo_path: repo_path.to_string_lossy().into_owned(),
             owner_ref: Some(owner_ref),
             lease: None,
+            selector: None,
         }
     }
 
@@ -4226,6 +4335,7 @@ mod terminal_finalize_tests {
                 repo_path: "/tmp".into(),
                 owner_ref: None,
                 lease: Some(fence.clone()),
+                selector: None,
             },
             fence,
         )
@@ -5443,6 +5553,92 @@ mod terminal_finalize_tests {
             spec.args
         );
         executor.abort();
+    }
+
+    async fn persisted_terminal_selector(db: &LocalDb, slug: &str) -> Option<ExecutorSelector> {
+        let column: Option<String> = db
+            .query_opt(
+                "SELECT executor_selector FROM job_terminals WHERE slug = ?1",
+                params![slug.to_string()],
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+            .flatten();
+        crate::fleet::residency::resident_selector_from_row(column.as_deref()).unwrap()
+    }
+
+    /// The executor a terminal was created with is part of it for as long as it
+    /// lives. Its row carries the selector from the create, and a restart
+    /// re-mints a row that still carries it, so the recovery after that one is
+    /// placed by the same rule.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_terminal_keeps_the_executor_it_was_created_with_across_a_restart() {
+        let db = crate::storage::migrated_test_db("term_restart_selector.db").await;
+        let orch = test_orchestrator(db);
+        let checkout = tempdir().unwrap();
+        seed_managed_job_terminal_checkout(&orch, checkout.path()).await;
+        let resource = node_terminal_resource("direct");
+        let target = resolve_terminal_resource_target(&orch.db.local, &resource)
+            .await
+            .unwrap();
+        let request = terminal_residency_acquisition(&orch, &target)
+            .await
+            .unwrap();
+        let cell = terminal_slot_for_request(&request, checkout.path());
+        let fence = fence_from_cell(&cell);
+        let (executor, _releases, _ops, _start_process) =
+            attach_fake_terminal_executor_with_cell(&orch, cell, FakeTerminalStart::StaysRunning);
+        let selector = ExecutorSelector {
+            os: Some(std::env::consts::OS.to_string()),
+            ..ExecutorSelector::default()
+        };
+
+        create_terminal_from_resource(
+            &orch,
+            &resource,
+            "sleep 100",
+            None,
+            None,
+            None,
+            Some(&selector),
+        )
+        .await
+        .expect("a create naming the platform its environment is on starts");
+        assert_eq!(
+            persisted_terminal_selector(&orch.db.local, "direct").await,
+            Some(selector.clone()),
+            "the create must write the selector on the terminal's row"
+        );
+
+        orch.pty_state.sessions.lock().unwrap().clear();
+        crate::terminal_host::prepare_terminal_recovery(&orch)
+            .await
+            .unwrap();
+        restart_terminal_process(&orch, fence, "direct")
+            .await
+            .expect("recovery restarts the terminal");
+        assert_eq!(
+            persisted_terminal_selector(&orch.db.local, "direct").await,
+            Some(selector),
+            "a restarted terminal must still carry the executor it was created with"
+        );
+        executor.abort();
+    }
+
+    /// What a restart says where it happened: the machine it came back on, and,
+    /// when honouring the terminal's selector moved its environment, where from.
+    #[test]
+    fn the_restart_notice_names_the_machine_and_any_move_it_took() {
+        assert_eq!(
+            terminal_restarted_notice(Some("bbs"), None),
+            "\r\nCairn started this terminal again, on bbs.\r\n"
+        );
+        let moved = terminal_restarted_notice(Some("bbs"), Some("local"));
+        assert!(moved.contains("on bbs."), "{moved}");
+        assert!(moved.contains("moved here from local"), "{moved}");
+        assert!(moved.ends_with("\r\n"), "{moved}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
