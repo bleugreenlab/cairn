@@ -154,6 +154,10 @@ pub struct Crossing {
     /// refusal, never for grant matching. Kept beside the descriptor because
     /// normalizing collapses the newlines that separate a script's commands.
     command: Option<String>,
+    /// The output's own denial line, for a crossing whose path was not
+    /// recovered. The agent's code wrote it, so like `command` it is consulted
+    /// only for the instructive refusal, never for grant matching.
+    reported: Option<String>,
 }
 
 impl Crossing {
@@ -168,6 +172,7 @@ impl Crossing {
             summary: format!("read a sensitive denied path: {descriptor}"),
             descriptor,
             command: None,
+            reported: None,
         }
     }
 
@@ -179,6 +184,7 @@ impl Crossing {
             summary: format!("write an external host path: {descriptor}"),
             descriptor,
             command: None,
+            reported: None,
         }
     }
 
@@ -197,6 +203,7 @@ impl Crossing {
             summary: format!("command references an external host path: {descriptor}"),
             descriptor,
             command: Some(command.to_string()),
+            reported: None,
         }
     }
 
@@ -216,6 +223,7 @@ impl Crossing {
             descriptor: normalize_command_for_descriptor(command),
             summary,
             command: Some(command.to_string()),
+            reported: None,
         }
     }
 
@@ -227,7 +235,8 @@ impl Crossing {
     /// the item as what was blocked would blame a wrapper that started fine.
     /// `reported` is the output's own denial line, quoted for whoever answers;
     /// the command wrote it, so it stays in the summary and never reaches the
-    /// descriptor a grant is scoped by.
+    /// descriptor a grant is scoped by. It may still select a refusal (see
+    /// [`Crossing::route_refusal`]), because a refusal only narrows.
     pub(crate) fn unattributed_denial(label: &str, command: &str, reported: Option<&str>) -> Self {
         let mut summary = format!(
             "the sandbox denied an access made inside this item, and the denied path could not be recovered: {label}"
@@ -235,7 +244,10 @@ impl Crossing {
         if let Some(line) = reported {
             summary.push_str(&format!("\nthe item's output reports (unverified): {line}"));
         }
-        Self::shell_command(summary, command)
+        Crossing {
+            reported: reported.map(str::to_string),
+            ..Self::shell_command(summary, command)
+        }
     }
 
     /// The exact `tool_input` [`raise_fence`] would store for this crossing.
@@ -271,12 +283,24 @@ impl Crossing {
             .then(|| Path::new(self.descriptor.as_str()))
     }
 
-    /// The instructive refusal for a command whose blocked step has an
+    /// The instructive refusal for a crossing whose blocked step has an
     /// ordinary route inside the sandbox, or `None`.
-    fn command_refusal(&self) -> Option<String> {
+    ///
+    /// The command text is read first, because it can name the exact git
+    /// subcommand. A git call made from an inline interpreter or a script is
+    /// not in that text, so the output's reported denial line is read next.
+    /// That line is unverified, which is why it may only choose a refusal: a
+    /// refusal gives the agent less than the escape prompt it replaces, so a
+    /// forged line can cost its author an answer but never widen access.
+    fn route_refusal(&self) -> Option<String> {
         self.command
             .as_deref()
             .and_then(command_refusal::denied_command_refusal)
+            .or_else(|| {
+                self.reported
+                    .as_deref()
+                    .and_then(command_refusal::reported_git_write_refusal)
+            })
     }
 }
 
@@ -344,22 +368,23 @@ pub(crate) async fn raise_fence_with_handoff(
     }
 
     // A blocked command whose blocked step has an ordinary route inside the
-    // sandbox (a git index or ref write, see `command_refusal`) is answered
-    // with that route instead of a prompt, so no operator is asked a question
+    // sandbox (a git index or ref write, named by the command or by the
+    // output's denial line; see `command_refusal`) is answered with that
+    // route instead of a prompt, so no operator is asked a question
     // whose only answers are harmful or futile. Unlike the protected-path
     // refusal above it leaves an `allow` fence alone: an agent trusted to
     // escape is spending nobody's attention, and its command does what it
     // says once unsandboxed.
     match fence {
         Fence::Allow => FenceDecision::Allow,
-        Fence::Deny => FenceDecision::Deny(crossing.command_refusal().unwrap_or_else(|| {
+        Fence::Deny => FenceDecision::Deny(crossing.route_refusal().unwrap_or_else(|| {
             format!(
                 "Denied by agent fence policy (fence: deny): {}",
                 crossing.summary
             )
         })),
         Fence::Ask => {
-            if let Some(refusal) = crossing.command_refusal() {
+            if let Some(refusal) = crossing.route_refusal() {
                 return FenceDecision::Deny(refusal);
             }
             // A session grant for this descriptor short-circuits to allow.
@@ -529,6 +554,67 @@ mod tests {
 
         let bare = Crossing::unattributed_denial("bun -e", "bun -e", None);
         assert!(!bare.summary.contains("unverified"), "{}", bare.summary);
+    }
+
+    /// posts/518: an inline `uv run -` script's git was denied its worktree
+    /// index lock, the path was not recovered, and the operator got an escape
+    /// prompt no answer could help. The output's denial line now selects the
+    /// git-writer refusal, and still scopes nothing.
+    #[tokio::test]
+    async fn an_unattributed_git_internal_write_is_refused_with_its_route_and_scopes_nothing() {
+        let reported = "fatal: Unable to create '/home/dev/.cairn-exec/managed-objects/e2e056b6025ecec5f1bbfb1d6fc1026e8a3b75fa93873322d535a125c6742df7/repository.git/worktrees/slot-6/index.lock': Permission denied";
+        let crossing = || Crossing::unattributed_denial("uv run -", "uv run -", Some(reported));
+
+        // Nothing a grant could be scoped by comes from the text.
+        let c = crossing();
+        assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
+        assert_eq!(c.descriptor, normalize_command_for_descriptor("uv run -"));
+        assert!(c.host_path().is_none());
+
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        for fence in [Fence::Ask, Fence::Deny] {
+            match raise_fence(&orch, "run-1", fence, &run_request(), crossing()).await {
+                FenceDecision::Deny(refusal) => {
+                    assert!(
+                        refusal.contains("git's staging records or refs"),
+                        "{refusal}"
+                    );
+                    assert!(refusal.contains("unverified"), "{refusal}");
+                    assert!(refusal.contains("plain `mv`"), "{refusal}");
+                    assert!(
+                        refusal.contains("`commit_msg` on the `run` or `write`"),
+                        "{refusal}"
+                    );
+                    assert!(!refusal.contains("slot-6"), "{refusal}");
+                }
+                other => panic!("{fence:?}: expected the git-writer refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            permission_rows(&orch).await,
+            0,
+            "the refusal must not put an escape prompt on anyone's desk"
+        );
+
+        // An agent trusted to escape is left alone, as for a named git writer.
+        assert!(matches!(
+            raise_fence(&orch, "run-1", Fence::Allow, &run_request(), crossing()).await,
+            FenceDecision::Allow
+        ));
+    }
+
+    /// An unattributed denial whose output names anything other than a git
+    /// directory's own records keeps today's escape prompt.
+    #[test]
+    fn an_unattributed_denial_elsewhere_keeps_the_escape_prompt() {
+        for reported in [
+            "error: cannot open '/Users/x/.ssh/known_hosts': Permission denied",
+            "fatal: Unable to create '/home/dev/project/build/index.lock': Permission denied",
+        ] {
+            let c = Crossing::unattributed_denial("uv run -", "uv run -", Some(reported));
+            assert_eq!(c.kind, CrossingKind::ShellCommandEscape);
+            assert_eq!(c.route_refusal(), None, "{reported}");
+        }
     }
 
     async fn permission_rows(orch: &Orchestrator) -> i64 {

@@ -32,6 +32,12 @@
 //! A git writer later in a chain (`... && git mv a b`) is still recognized. The
 //! step is blocked wherever it appears, so naming it is true regardless of what
 //! else the command does.
+//!
+//! A git call an inline interpreter (`uv run -`, `bun -e`) or a script makes is
+//! not in the command text at all. For those, [`reported_git_write_refusal`]
+//! reads the denial line the item's own output carries and answers with one
+//! generic refusal when that line names a write to git's staging records or
+//! refs ([`is_git_internal_write`]).
 
 /// The refusal for a blocked command whose blocked step has an ordinary route
 /// inside the sandbox, or `None` to leave the crossing to the fence policy.
@@ -61,6 +67,84 @@ pub(crate) fn denied_command_refusal(command: &str) -> Option<String> {
     None
 }
 
+/// The refusal for a denial whose path was not recovered but whose output
+/// reports a write to git's staging records or refs, or `None`.
+///
+/// This is the route for a git call the command text cannot show: one made
+/// from an inline interpreter or a script. `reported` is the item's own denial
+/// line, which the agent's code wrote, so it is trusted only in the narrowing
+/// direction. It can turn an escape prompt into this refusal, which gives the
+/// agent less than the prompt could, and nothing read from it is echoed back or
+/// reaches what a grant would be scoped by.
+pub(crate) fn reported_git_write_refusal(reported: &str) -> Option<String> {
+    reported_paths(reported)
+        .any(is_git_internal_write)
+        .then(reported_git_write_text)
+}
+
+/// Whether `path` is a file git writes to change its staging records or refs:
+/// inside a git directory (a component ending in `.git`), a linked worktree's
+/// own index, `HEAD` and refs under `worktrees/<name>/`, or the repository's
+/// shared refs, reflogs and `packed-refs`.
+///
+/// Matched by structure, not by substring, so a file merely named
+/// `index.lock`, or one under a directory that only mentions `.git`, is not
+/// one, and only an absolute path counts, as git always names these files.
+/// The repository's top-level `index.lock` is left out on purpose: it is the
+/// main checkout's index, which no build slot's git writes.
+pub(crate) fn is_git_internal_write(path: &str) -> bool {
+    let drive = path.as_bytes();
+    let absolute = path.starts_with('/')
+        || (drive.len() > 2
+            && drive[0].is_ascii_alphabetic()
+            && drive[1] == b':'
+            && matches!(drive[2], b'/' | b'\\'));
+    if !absolute {
+        return false;
+    }
+    let parts: Vec<&str> = path.split(['/', '\\']).collect();
+    parts.iter().enumerate().any(|(at, part)| {
+        part.ends_with(".git")
+            && match &parts[at + 1..] {
+                ["worktrees", name, record @ ..] if is_name(name) => {
+                    matches!(record, ["index.lock" | "HEAD.lock" | "ORIG_HEAD.lock"])
+                        || is_ref_record(record)
+                }
+                ["packed-refs.lock"] => true,
+                shared => is_ref_record(shared),
+            }
+    })
+}
+
+/// A ref or reflog file: `refs/...` or `logs/...`, kept both by the repository
+/// and by each worktree.
+fn is_ref_record(record: &[&str]) -> bool {
+    matches!(record, ["refs" | "logs", rest @ ..] if !rest.is_empty() && rest.iter().all(|part| is_name(part)))
+}
+
+fn is_name(part: &str) -> bool {
+    !part.is_empty() && part != "." && part != ".."
+}
+
+/// The candidate paths a denial line names: each quoted span, and each
+/// whitespace-separated word stripped of the punctuation that error formats put
+/// around a path (`open /x: permission denied`, `Unable to create '/x'`).
+fn reported_paths(line: &str) -> impl Iterator<Item = &str> {
+    let quoted = ['\'', '"']
+        .into_iter()
+        .flat_map(move |quote| line.split(quote).skip(1).step_by(2));
+    let bare = line
+        .split_whitespace()
+        .map(|word| word.trim_matches(['\'', '"', '`', ':', ',', ';']));
+    quoted.chain(bare)
+}
+
+fn reported_git_write_text() -> String {
+    format!(
+        "This item's own output reports that the sandbox denied a write to git's staging records or refs. That report is unverified, since the item wrote it; the usual cause is a git call made from an inline interpreter or a script, where the command text does not show it. Those records live outside your working directory, so the sandbox blocks every write to them, and {COMMIT_IS_DERIVED} {CAIRN_OWNS_THE_BRANCH} The route is `commit_msg` on the `run` or `write` that makes the change: it stages and commits your working tree for you. {MV_ROUTE} {RM_ROUTE} Then run the item again without its git writes; anything before them may already have run."
+    )
+}
+
 /// What a git subcommand writes outside the working directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Writes {
@@ -78,6 +162,16 @@ struct GitWrite {
     route: &'static str,
 }
 
+/// Why approving a blocked write to the staging records would not help.
+const COMMIT_IS_DERIVED: &str = "approving it would not help: when a batch carries a `commit_msg`, Cairn commits your working tree exactly as it stands and ignores anything staged or committed by hand.";
+
+/// Why a blocked write to refs needs nothing done by hand.
+const CAIRN_OWNS_THE_BRANCH: &str = "Cairn owns your branch: it brings an advanced base into your work itself and tells you when it does, so there is nothing to fetch, merge, or rebase by hand.";
+
+const MV_ROUTE: &str = "Move files with plain `mv` instead; git recognizes a rename from the file's content when the change is committed.";
+
+const RM_ROUTE: &str = "Delete files with plain `rm` instead (`rm -r` for a directory); a deletion is committed like any other change.";
+
 const RESTORE_ROUTE: &str = "To put a file back the way a revision has it, write it from that revision: `git show <rev>:<path> > <path>`. To look at another branch without changing anything, `read` `file:<path>?branch=<name>`.";
 
 const BRANCH_ROUTE: &str = "To look at another branch without changing anything, `read` `file:<path>?branch=<name>`. If an advance of your base left conflicts, open `cairn:~/rebase`, commit the merged files, and then request the replay there, because only the replay moves your branch onto the base. The git-workflow skill (cairn://skills/git-workflow) covers both.";
@@ -94,12 +188,12 @@ const GIT_WRITES: &[GitWrite] = &[
     GitWrite {
         subcommand: "mv",
         writes: Writes::Index,
-        route: "Move it with plain `mv` instead; git recognizes the rename from the file's content when the change is committed.",
+        route: MV_ROUTE,
     },
     GitWrite {
         subcommand: "rm",
         writes: Writes::Index,
-        route: "Delete it with plain `rm` instead (`rm -r` for a directory); the deletion is committed like any other change.",
+        route: RM_ROUTE,
     },
     GitWrite {
         subcommand: "commit",
@@ -197,10 +291,10 @@ impl GitWrite {
         let sub = self.subcommand;
         let why = match self.writes {
             Writes::Index => format!(
-                "This command runs `git {sub}`, which writes git's own staging records. Those live outside your working directory, so the sandbox blocked that step, and approving it would not help: when a batch carries a `commit_msg`, Cairn commits your working tree exactly as it stands and ignores anything staged or committed by hand."
+                "This command runs `git {sub}`, which writes git's own staging records. Those live outside your working directory, so the sandbox blocked that step, and {COMMIT_IS_DERIVED}"
             ),
             Writes::Refs => format!(
-                "This command runs `git {sub}`, which moves branches or fetches history into the repository outside your working directory, so the sandbox blocked that step. Cairn owns your branch: it brings an advanced base into your work itself and tells you when it does, so there is nothing to fetch, merge, or rebase by hand."
+                "This command runs `git {sub}`, which moves branches or fetches history into the repository outside your working directory, so the sandbox blocked that step. {CAIRN_OWNS_THE_BRANCH}"
             ),
         };
         format!(
@@ -761,6 +855,84 @@ mod tests {
             "{BRANCH_ROUTE}"
         );
         assert!(BRANCH_ROUTE.contains("?branch="), "{BRANCH_ROUTE}");
+    }
+
+    /// A posts/518 specimen: an inline `uv run -` script's git, denied its
+    /// linked worktree's index lock on a Linux executor.
+    const SPECIMEN: &str = "fatal: Unable to create '/home/dev/.cairn-exec/managed-objects/e2e056b6025ecec5f1bbfb1d6fc1026e8a3b75fa93873322d535a125c6742df7/repository.git/worktrees/slot-6/index.lock': Permission denied";
+
+    #[test]
+    fn git_internal_writes_are_recognized_by_structure() {
+        for path in [
+            "/home/dev/.cairn-exec/managed-objects/k/repository.git/worktrees/slot-6/index.lock",
+            "/home/dev/.cairn-exec/managed-objects/k/repository.git/worktrees/slot-6/HEAD.lock",
+            "/home/dev/.cairn-exec/managed-objects/k/repository.git/worktrees/slot-6/logs/HEAD",
+            "/home/dev/.cairn-exec/managed-objects/k/repository.git/refs/heads/agent/x.lock",
+            "/home/dev/.cairn-exec/managed-objects/k/repository.git/packed-refs.lock",
+            "/Users/dev/projects/app/.git/worktrees/APP-1-builder-0/index.lock",
+            "/Users/dev/projects/app/.git/logs/refs/heads/main",
+            "C:\\cairn\\repository.git\\worktrees\\slot-2\\index.lock",
+        ] {
+            assert!(is_git_internal_write(path), "{path}");
+        }
+        for path in [
+            // A file merely named like a git lock.
+            "/home/dev/project/build/index.lock",
+            "/home/dev/project/index.lock",
+            // A path that only mentions `.git`.
+            "/home/dev/project.git.bak/worktrees/x/index.lock",
+            "/home/dev/.gitconfig",
+            "/home/dev/repository.git/objects/ab/cdef",
+            "/home/dev/repository.git/config.lock",
+            // The main checkout's own index is not a slot's.
+            "/home/dev/project/.git/index.lock",
+            // No worktree name, or no ref under `refs/`.
+            "/home/dev/repository.git/worktrees/index.lock",
+            "/home/dev/repository.git/refs",
+            "/home/dev/repository.git/refs/../../etc/passwd",
+            "/home/dev/.ssh/known_hosts",
+            // Git names these files absolutely.
+            "repository.git/worktrees/slot-6/index.lock",
+        ] {
+            assert!(!is_git_internal_write(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_reported_git_internal_write_is_refused_with_the_shared_route() {
+        for line in [
+            SPECIMEN,
+            "error: cannot lock ref 'refs/heads/main': Unable to create '/r/repository.git/refs/heads/main.lock': Permission denied",
+            "open /r/repository.git/worktrees/slot-1/index.lock: permission denied",
+            "PermissionError: [Errno 13] Permission denied: \"/r/.git/worktrees/w/HEAD.lock\"",
+        ] {
+            let refusal = reported_git_write_refusal(line).unwrap_or_else(|| panic!("{line}"));
+            for shared in [COMMIT_IS_DERIVED, CAIRN_OWNS_THE_BRANCH, MV_ROUTE, RM_ROUTE] {
+                assert!(refusal.contains(shared), "{refusal}");
+            }
+            assert!(refusal.contains("unverified"), "{refusal}");
+            assert!(refusal.contains("inline interpreter or a script"), "{refusal}");
+            assert!(
+                refusal.contains("`commit_msg` on the `run` or `write`"),
+                "{refusal}"
+            );
+            // The output's text is never echoed back.
+            assert!(!refusal.contains("/r/"), "{refusal}");
+            assert!(!refusal.contains("managed-objects"), "{refusal}");
+            crate::system_prompt::assert_no_substrate_vocabulary("reported git write refusal", &refusal);
+        }
+    }
+
+    #[test]
+    fn a_reported_denial_elsewhere_has_no_refusal() {
+        for line in [
+            "error: cannot open '/Users/x/.ssh/known_hosts': Permission denied",
+            "cp: cannot create regular file '/home/dev/project/build/index.lock': Permission denied",
+            "mention of repository.git/worktrees/slot-6/index.lock in prose: EPERM",
+            "Permission denied (os error 13)",
+        ] {
+            assert_eq!(reported_git_write_refusal(line), None, "{line}");
+        }
     }
 
     #[test]
