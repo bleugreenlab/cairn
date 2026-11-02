@@ -27,8 +27,8 @@ use cairn_common::executor_protocol::{
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_common::executor_protocol::{
-    DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
-    QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, SkippedEntry,
+    DiskDecline, DiskReliefOutlook, ExternalCacheBreakdown, OccupancyLineageReport, OccupancyRule,
+    OccupiedTreeSkip, QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, SkippedEntry,
     StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
     StorageWithheld, StorageWithheldReason,
 };
@@ -1834,6 +1834,32 @@ fn build_root_line(
     }
 }
 
+/// Where the external caches' bytes sit, so the dependency catalog and dev
+/// targets, which are Cairn's own regenerable output, read apart from the
+/// caches whose writers keep their own retention. A catalog staging tree an
+/// abandoned population left once sat inside the single figure, beside a
+/// "next action" that named only the owner-retained part. Empty from an
+/// executor that predates the split.
+fn external_cache_breakdown(caches: &ExternalCacheBreakdown) -> String {
+    let parts = [
+        ("catalog staging", caches.catalog_staging_bytes),
+        ("catalog generations", caches.catalog_generations_bytes),
+        ("dev targets", caches.dev_targets_bytes),
+        ("CI targets", caches.ci_targets_bytes),
+        ("asset cache", caches.asset_cache_bytes),
+        ("sccache", caches.sccache_bytes),
+    ]
+    .into_iter()
+    .filter(|(_, size)| *size > 0)
+    .map(|(name, size)| format!("{name} {}", bytes(size)))
+    .collect::<Vec<_>>();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
 /// What Cairn holds on one volume, and what that volume holds outside it.
 fn render_holdings(
     out: &mut String,
@@ -1871,8 +1897,9 @@ fn render_holdings(
             } else {
                 String::new()
             };
+            let external_caches = external_cache_breakdown(&categories.external_caches);
             out.push_str(&format!(
-                "- Cairn holds{on} {} (logical bytes, accounting {}): live cells {} · external caches {} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
+                "- Cairn holds{on} {} (logical bytes, accounting {}): live cells {} · external caches {}{external_caches} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
                 bytes(accounting.used_bytes),
                 age(captured.saturating_sub(accounting_reading.measured_at_unix_ms)),
                 bytes(categories.live_cells_bytes),
@@ -2037,7 +2064,7 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
             let retired = by_rung(StorageReclaimRung::RetiredCells);
             let retired_homes = by_rung(StorageReclaimRung::RetiredHomes);
             out.push_str(&format!(
-                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · managed caches {} · quarantine targets {} · idle cell scratch {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
+                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · catalog staging {} · managed caches {} · quarantine targets {} · idle cell scratch {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
                 age(captured.saturating_sub(pressure.at_unix_ms)),
                 pressure.band,
                 bytes(pressure.target_bytes),
@@ -2048,6 +2075,7 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                     String::new()
                 },
                 bytes(by_rung(StorageReclaimRung::RetiredTrees).bytes),
+                bytes(by_rung(StorageReclaimRung::CatalogStaging).bytes),
                 bytes(by_rung(StorageReclaimRung::ManagedCaches).bytes),
                 bytes(by_rung(StorageReclaimRung::QuarantineTargets).bytes),
                 bytes(by_rung(StorageReclaimRung::IdleCellScratch).bytes),
@@ -4693,14 +4721,15 @@ fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
 
 #[cfg(test)]
 mod storage_section_tests {
-    use super::render_executor;
     use super::tests::inspection;
+    use super::{external_cache_breakdown, render_executor};
     use cairn_common::executor_protocol::{
-        DiskAccounting, DiskCategoryAccounting, DiskHealthStatus, DiskPathUsage, MachineVolume,
-        Measurement, OccupiedTreeSkip, PersistentCellLifecycle, QuarantineTargetStrip,
-        SkippedEntry, SkippedEntryOperation, SkippedEntryReason, SlotState, StoragePressureBand,
-        StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
-        StorageWithheld, StorageWithheldReason,
+        DiskAccounting, DiskCategoryAccounting, DiskHealthStatus, DiskPathUsage,
+        ExternalCacheBreakdown, MachineVolume, Measurement, OccupiedTreeSkip,
+        PersistentCellLifecycle, QuarantineTargetStrip, SkippedEntry, SkippedEntryOperation,
+        SkippedEntryReason, SlotState, StoragePressureBand, StoragePressureOutcome,
+        StoragePressureReport, StorageReclaimRung, StorageRungReclaim, StorageWithheld,
+        StorageWithheldReason,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -4732,6 +4761,7 @@ mod storage_section_tests {
                     quarantines_bytes: 104 * GIB,
                     temporary_other_bytes: 125 * GIB,
                     node_scratch_bytes: 0,
+                    external_caches: ExternalCacheBreakdown::default(),
                 },
                 other_top: vec![DiskPathUsage {
                     path: "cairn.db".into(),
@@ -4741,6 +4771,29 @@ mod storage_section_tests {
             },
         );
         executor
+    }
+
+    /// bgsrv-mac on 10-31: the external caches were one figure, almost all of
+    /// it an abandoned catalog staging tree, while the page's next action
+    /// named only the owner-retained part. Split, the staging reads first.
+    #[test]
+    fn external_caches_are_broken_down_by_the_cache_holding_them() {
+        assert_eq!(
+            external_cache_breakdown(&ExternalCacheBreakdown {
+                catalog_staging_bytes: 182 * GIB,
+                catalog_generations_bytes: 0,
+                dev_targets_bytes: 0,
+                ci_targets_bytes: 2 * GIB,
+                asset_cache_bytes: GIB,
+                sccache_bytes: 2 * GIB,
+            }),
+            " (catalog staging 182.0 GiB, CI targets 2.0 GiB, asset cache 1.0 GiB, sccache 2.0 GiB)"
+        );
+        assert_eq!(
+            external_cache_breakdown(&ExternalCacheBreakdown::default()),
+            "",
+            "an executor that predates the split reports nothing to break down"
+        );
     }
 
     /// The section the CAIRN-4860 operator had to reconstruct by hand: the
@@ -5057,6 +5110,7 @@ mod storage_section_tests {
             free_bytes_before: 54 * GIB,
             free_bytes_after: 54 * GIB + 31 * GIB,
             reclaimed_by_rung: vec![
+                rung(StorageReclaimRung::CatalogStaging, 0, 0),
                 rung(StorageReclaimRung::QuarantineTargets, 31 * GIB, 2),
                 rung(StorageReclaimRung::IdleCellScratch, 3 * GIB, 4),
                 rung(StorageReclaimRung::IdleTargets, 0, 0),
@@ -5099,11 +5153,13 @@ mod storage_section_tests {
         assert!(
             rendered.contains(
                 "Last pressure pass 3m ago: band Pressure, asked 74.0 GiB, reclaimed 34.0 GiB"
-            ) && rendered.contains(
-                "quarantine targets 31.0 GiB · idle cell scratch 3.0 GiB · idle targets 0 B"
-            ) && rendered.contains(
-                "— Unrelieved; 5.0 GiB held by policy; next pressure pass when free < 46.0 GiB"
-            ),
+            ) && rendered.contains("retired trees 0 B · catalog staging 0 B · managed caches 0 B")
+                && rendered.contains(
+                    "quarantine targets 31.0 GiB · idle cell scratch 3.0 GiB · idle targets 0 B"
+                )
+                && rendered.contains(
+                    "— Unrelieved; 5.0 GiB held by policy; next pressure pass when free < 46.0 GiB"
+                ),
             "{rendered}"
         );
         assert!(

@@ -6545,7 +6545,22 @@ pub struct LearnedResourceEstimate {
 /// end-of-stream flush. No frame, variant, field or serialized form changes,
 /// and a runner talking to an older executor gets nothing wrong: that
 /// executor already flushes the same tail.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
+///
+/// Version 162 (cairn/5716) adds [`StorageReclaimRung::CatalogStaging`]: on
+/// every sweep the executor removes each dependency-catalog staging tree whose
+/// population is no longer running (its `.publish-<key>` claim is not held),
+/// whatever its key, and reports those bytes under the new rung. A 161 runner
+/// cannot decode a pressure report that names it, which is why this is a
+/// version. [`DiskCategoryAccounting`] also gains a defaulted
+/// `externalCaches` ([`ExternalCacheBreakdown`]) splitting
+/// `externalManagedCachesBytes` into catalog generations, catalog staging,
+/// dev targets, CI targets, the asset cache and the sccache store; an older
+/// executor leaves it out and the runner reads all zeros, rendering no
+/// breakdown, and an older runner ignores the key. The rest stays inside the
+/// executor: a failed population removes its own staging, and a population
+/// whose volume is at its pressure line, or whose target would not fit above
+/// the critical reserve, is skipped and names why.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12846,6 +12861,55 @@ pub struct DiskCategoryAccounting {
     /// Node scratch replicas: each node's `$TMPDIR` copy on this machine.
     #[serde(default)]
     pub node_scratch_bytes: u64,
+    /// Where `external_managed_caches_bytes` sits. All zeros from an executor
+    /// that predates it.
+    #[serde(default)]
+    pub external_caches: ExternalCacheBreakdown,
+}
+
+/// [`DiskCategoryAccounting::external_managed_caches_bytes`] by the cache
+/// holding it. From an executor that reports it, the parts sum to that total.
+///
+/// The split exists because the parts are not alike: the dependency catalog
+/// and the dev targets are Cairn's own regenerable build output, which the
+/// executor reclaims; the last three belong to writers that keep their own
+/// retention, which it accounts and never deletes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExternalCacheBreakdown {
+    /// Published dependency-catalog partitions: generations, their pointers
+    /// and claims. The managed-cache rung reclaims these least recently used
+    /// first.
+    pub catalog_generations_bytes: u64,
+    /// Dependency-catalog `.populate-*` trees: a population still running, or
+    /// one abandoned since the last sweep, which the catalog-staging rung
+    /// removes.
+    pub catalog_staging_bytes: u64,
+    /// Per-branch dev build targets, reclaimed by the managed-cache rung.
+    pub dev_targets_bytes: u64,
+    /// CI targets, owner-retained.
+    pub ci_targets_bytes: u64,
+    /// The immutable asset cache, owner-retained.
+    pub asset_cache_bytes: u64,
+    /// The sccache store, owner-retained: its daemon enforces its own ceiling.
+    pub sccache_bytes: u64,
+}
+
+impl ExternalCacheBreakdown {
+    /// The part whose writers keep their own retention, which the executor
+    /// never deletes.
+    pub fn owner_retained_bytes(&self) -> u64 {
+        self.ci_targets_bytes
+            .saturating_add(self.asset_cache_bytes)
+            .saturating_add(self.sccache_bytes)
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.catalog_generations_bytes
+            .saturating_add(self.catalog_staging_bytes)
+            .saturating_add(self.dev_targets_bytes)
+            .saturating_add(self.owner_retained_bytes())
+    }
 }
 
 /// Whether a sweep in the executor's current process has actually retried an
@@ -13156,6 +13220,10 @@ pub enum StorageReclaimRung {
     RetiredHomes,
     /// Discards and quarantines past their forensic window.
     RetiredTrees,
+    /// Dependency-catalog staging trees whose population is no longer
+    /// running. Runs on every sweep, pressured or not: nothing will read or
+    /// finish them.
+    CatalogStaging,
     /// Cairn-managed caches outside the executor home.
     ManagedCaches,
     /// Build output inside quarantines still in their forensic window.
@@ -20796,6 +20864,7 @@ mod tests {
                         quarantines_bytes: 4,
                         temporary_other_bytes: 5,
                         node_scratch_bytes: 0,
+                        external_caches: ExternalCacheBreakdown::default(),
                     },
                     skipped: vec![SkippedEntry {
                         path: "build-slots/slot-3".into(),
