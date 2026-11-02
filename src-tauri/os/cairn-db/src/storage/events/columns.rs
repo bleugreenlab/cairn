@@ -52,3 +52,53 @@ pub fn event_from_row(row: &Row) -> DbResult<Event> {
         read_segments: None,
     })
 }
+
+/// The shape of an event whose stored body is prose: the predicate of the
+/// partial index `idx_events_home_prose` (migration `0225_home_prose_index`),
+/// written against an `e` alias.
+///
+/// Turso substitutes a partial index only while the query's WHERE terms imply
+/// the index's, so every query that walks the index repeats this text verbatim.
+/// A rewording on either side keeps every result correct while silently
+/// dropping the query back to opening and parsing each row's JSON only to
+/// discover the row was never a candidate. `prose_shape_matches_its_index`
+/// holds the two spellings together. Project Home's transcript and the catch-up
+/// attention line both read through it.
+///
+/// An archived (`zstd`) row qualifies on its envelope alone, because its prose
+/// lives in a compressed blob SQL cannot open. Readers decompress through
+/// [`super::reconstruct_events`] and drop the empties afterwards, so the
+/// predicate is generous rather than wrong.
+///
+/// The `CASE` is load-bearing and cannot be flattened into an `AND` chain.
+/// Turso's JSON functions raise `malformed JSON` instead of returning NULL, and
+/// its `AND` evaluates both sides rather than short-circuiting, so a guard
+/// written as `json_valid(data) AND json_type(data, ...)` still reaches
+/// `json_type` with the body that cannot be parsed. `CASE` is the one form that
+/// does short-circuit. Because an index predicate runs on the WRITE path, the
+/// difference is not a failed read but an event the database refuses to store.
+pub const PROSE_SHAPE: &str = "((CASE WHEN json_valid(e.data) AND (e.storage_mode IS NULL OR e.storage_mode='full') THEN json_type(e.data,'$.content')='text' AND trim(json_extract(e.data,'$.content'))<>'' ELSE 0 END) OR (e.storage_mode='zstd' AND e.data_blob IS NOT NULL AND e.codec IS NOT NULL))";
+
+#[cfg(test)]
+mod tests {
+    use super::PROSE_SHAPE;
+
+    /// The index predicate and the query predicate are one fact spelled twice.
+    ///
+    /// Turso substitutes a partial index only while the query's WHERE terms
+    /// imply the index's, and it reports nothing when they stop matching: every
+    /// reader keeps returning exactly the same rows, having gone back to
+    /// reading the whole corpus to produce them. Nothing but this equality
+    /// catches a reworded predicate on either side.
+    #[test]
+    fn prose_shape_matches_its_index() {
+        let migration = include_str!("../../../../../turso_migrations/0225_home_prose_index.sql");
+        let unaliased = PROSE_SHAPE.replace("e.", "");
+        assert!(
+            migration.contains(&unaliased),
+            "idx_events_home_prose must carry the query's prose predicate \
+             verbatim, or Turso silently stops substituting it.\n\
+             query wants: {unaliased}\nmigration has: {migration}"
+        );
+    }
+}

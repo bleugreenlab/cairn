@@ -1209,7 +1209,10 @@ pub async fn read_cursor_updated_at(
 /// events for that one job's runs). Runs on a caller-supplied connection so the
 /// catch-up cursor advance can compute the delivery-time tail inside the stamp
 /// transaction.
-async fn count_job_chat_turns(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<i64> {
+pub(crate) async fn count_job_chat_turns(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT COUNT(DISTINCT e.turn_id) FROM events e

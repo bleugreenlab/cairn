@@ -1,4 +1,5 @@
 use super::common::{lookup_project_by_key, read_resource};
+use crate::storage::events::columns::PROSE_SHAPE;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use serde::Serialize;
@@ -158,30 +159,6 @@ fn home_entry_body(row: &cairn_db::turso::Row) -> Option<String> {
         .or(Some(body))
         .filter(|body| !body.trim().is_empty())
 }
-/// The shape of an event whose stored body Project Home can render as prose.
-///
-/// This is spelled twice on purpose: here, and as the predicate of
-/// `idx_events_home_prose` in migration `0225_home_prose_index`. Turso
-/// substitutes a partial index only while the query's WHERE terms imply the
-/// index's, so the two must stay identical apart from this query's `e.` alias.
-/// A rewording on either side keeps every entry correct while silently dropping
-/// Home back to a full scan of `events` that deserializes each row's JSON only
-/// to discover the row was never a candidate.
-/// `home_prose_shape_matches_its_index` holds the two spellings together.
-///
-/// An archived (`zstd`) row qualifies on its envelope alone, because its prose
-/// lives in a compressed blob SQL cannot open. [`home_entry_body`] decompresses
-/// and drops the empties afterwards, so this is generous rather than wrong --
-/// the same bargain the query struck before the index existed.
-///
-/// The `CASE` is load-bearing and cannot be flattened into an `AND` chain.
-/// Turso's JSON functions raise `malformed JSON` instead of returning NULL, and
-/// its `AND` evaluates both sides rather than short-circuiting, so a guard
-/// written as `json_valid(data) AND json_type(data, ...)` still reaches
-/// `json_type` with the body that cannot be parsed. `CASE` is the one form that
-/// does short-circuit. Because an index predicate runs on the WRITE path, the
-/// difference is not a failed read but an event the database refuses to store.
-const HOME_PROSE_SHAPE: &str = "((CASE WHEN json_valid(e.data) AND (e.storage_mode IS NULL OR e.storage_mode='full') THEN json_type(e.data,'$.content')='text' AND trim(json_extract(e.data,'$.content'))<>'' ELSE 0 END) OR (e.storage_mode='zstd' AND e.data_blob IS NOT NULL AND e.codec IS NOT NULL))";
 
 /// The merged transcript, newest first, as one page.
 ///
@@ -195,7 +172,7 @@ const HOME_PROSE_SHAPE: &str = "((CASE WHEN json_valid(e.data) AND (e.storage_mo
 ///   candidate body in the sorter to return fifty of them, and event bodies are
 ///   the largest column in the database.
 /// - **Renderability is answered by `idx_events_home_prose`, not by parsing.**
-///   [`HOME_PROSE_SHAPE`] is the index's predicate, so the walk visits only rows
+///   [`PROSE_SHAPE`] is the index's predicate, so the walk visits only rows
 ///   that already qualify.
 /// - **Every filter that can drop a row sits above that branch's `LIMIT`.** The
 ///   turn join, the turn's `start_reason`, and the attention-push exclusion all
@@ -210,7 +187,7 @@ const HOME_PROSE_SHAPE: &str = "((CASE WHEN json_valid(e.data) AND (e.storage_mo
 /// global top-N; `pagination_merges_branches_in_global_order` walks a cursor
 /// across a page boundary to prove it.
 fn home_sql() -> String {
-    let prose = HOME_PROSE_SHAPE;
+    let prose = PROSE_SHAPE;
     format!(
         r#"
 WITH thread_runs AS (
@@ -358,25 +335,6 @@ mod tests {
         );
     }
 
-    /// The index predicate and the query predicate are one fact spelled twice.
-    ///
-    /// Turso substitutes a partial index only while the query's WHERE terms
-    /// imply the index's, and it reports nothing when they stop matching: Home
-    /// keeps returning exactly the same entries, having gone back to reading the
-    /// whole corpus to produce them. Nothing but this equality catches a
-    /// reworded predicate on either side.
-    #[test]
-    fn home_prose_shape_matches_its_index() {
-        let migration = include_str!("../../../../turso_migrations/0225_home_prose_index.sql");
-        let unaliased = HOME_PROSE_SHAPE.replace("e.", "");
-        assert!(
-            migration.contains(&unaliased),
-            "idx_events_home_prose must carry the query's prose predicate \
-             verbatim, or Turso silently stops substituting it.\n\
-             query wants: {unaliased}\nmigration has: {migration}"
-        );
-    }
-
     /// The prose predicate must answer "not prose" for a body that is not JSON,
     /// rather than raising.
     ///
@@ -389,7 +347,7 @@ mod tests {
     /// index, and Home should not quietly acquire a second, differently-worded
     /// reason to refuse an agent's transcript if it ever moves.
     ///
-    /// The `CASE` in [`HOME_PROSE_SHAPE`] is what makes this hold. Turso's `AND`
+    /// The `CASE` in [`PROSE_SHAPE`] is what makes this hold. Turso's `AND`
     /// evaluates both sides instead of short-circuiting, so the more obvious
     /// `json_valid(data) AND json_type(data, ...)` spelling still reaches
     /// `json_type` with the body that cannot be parsed.
@@ -397,7 +355,7 @@ mod tests {
     async fn the_prose_predicate_tolerates_a_body_that_is_not_json() {
         let db = migrated_test_db("home-prose-nonjson.db").await;
         let sql = format!(
-            "SELECT {HOME_PROSE_SHAPE} FROM (SELECT 'this is not json' AS data, \
+            "SELECT {PROSE_SHAPE} FROM (SELECT 'this is not json' AS data, \
              NULL AS storage_mode, NULL AS data_blob, NULL AS codec) e"
         );
         let verdict = db

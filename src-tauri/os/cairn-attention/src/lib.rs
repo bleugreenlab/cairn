@@ -11,4 +11,6 @@ pub mod runtime;
 pub mod wakes;
 
 #[cfg(test)]
+mod delivery_tests;
+#[cfg(test)]
 mod runtime_tests;

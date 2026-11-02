@@ -13,10 +13,12 @@
 //!    [`push_to_issue_watchers`].
 //! 2. **Render pushes at resume time.** [`render_pushes_resolved`] gives every
 //!    drained push a compact reference-first summary. Cheap, targeted database
-//!    details are retained for direct messages, catch-up digests, terminal
-//!    resolutions, check verdicts, and posts — the referents whose point is lost
-//!    when only their address arrives; full resources are read by the agent only
-//!    when needed.
+//!    details are retained for direct messages, catch-up digests and the
+//!    child's own chat line, review titles and summaries, terminal resolutions,
+//!    check verdicts, and posts — the referents whose point is lost when only
+//!    their address arrives. Each detail is a few indexed statements bounded by
+//!    what it shows, and any miss degrades to the bare pointer rather than an
+//!    error; full resources are read by the agent only when needed.
 
 use cairn_db::turso::params;
 
@@ -418,52 +420,69 @@ async fn job_id_for_child_uri(db: &LocalDb, child_uri: &str) -> Option<String> {
             } => (project, number, exec_seq, node_id, Some(task_name)),
             _ => return None,
         };
-    let project = cairn_common::uri::canonical_project(project);
-    let number = number as i64;
-    let exec_seq = exec_seq as i64;
     db.read(|conn| {
         let project = project.clone();
         let node_id = node_id.clone();
         let task_name = task_name.clone();
         Box::pin(async move {
-            // The top-level node job (the rendered job for a node URI, or the
-            // task's parent for a task URI).
-            let mut rows = conn
-                .query(
-                    "SELECT j.id FROM jobs j
-                     JOIN executions e ON j.execution_id = e.id
-                     JOIN issues i ON j.issue_id = i.id
-                     JOIN projects p ON i.project_id = p.id
-                     WHERE p.key=?1 AND i.number=?2 AND e.seq=?3
-                       AND j.uri_segment=?4 AND j.parent_job_id IS NULL
-                     LIMIT 1",
-                    params![project.as_str(), number, exec_seq, node_id.as_str()],
-                )
-                .await?;
-            let node_job_id = match rows.next().await? {
-                Some(row) => row.text(0)?,
-                None => return Ok::<Option<String>, crate::storage::DbError>(None),
-            };
-            // A node URI renders the node job itself; a task URI renders the
-            // addressed sub-task job under it.
-            let Some(task_name) = task_name else {
-                return Ok(Some(node_job_id));
-            };
-            let mut task_rows = conn
-                .query(
-                    "SELECT id FROM jobs WHERE parent_job_id=?1 AND uri_segment=?2 LIMIT 1",
-                    params![node_job_id.as_str(), task_name.as_str()],
-                )
-                .await?;
-            match task_rows.next().await? {
-                Some(row) => Ok(Some(row.text(0)?)),
-                None => Ok(None),
-            }
+            job_id_for_node_coordinates(
+                conn,
+                &project,
+                number,
+                exec_seq,
+                &node_id,
+                task_name.as_deref(),
+            )
+            .await
         })
     })
     .await
     .ok()
     .flatten()
+}
+
+/// The agent job a node or task address names: the top-level node job (issue +
+/// execution seq + node `uri_segment`), or, given a `task_name`, the sub-task job
+/// with that `uri_segment` under it. `None` when either does not resolve. The one
+/// resolver behind every node/task URI attention reads through.
+async fn job_id_for_node_coordinates(
+    conn: &cairn_db::turso::Connection,
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> crate::storage::DbResult<Option<String>> {
+    let project = cairn_common::uri::canonical_project(project);
+    let mut rows = conn
+        .query(
+            "SELECT j.id FROM jobs j
+             JOIN executions e ON j.execution_id = e.id
+             JOIN issues i ON j.issue_id = i.id
+             JOIN projects p ON i.project_id = p.id
+             WHERE p.key=?1 AND i.number=?2 AND e.seq=?3
+               AND j.uri_segment=?4 AND j.parent_job_id IS NULL
+             LIMIT 1",
+            params![project.as_str(), number as i64, exec_seq as i64, node_id],
+        )
+        .await?;
+    let node_job_id = match rows.next().await? {
+        Some(row) => row.text(0)?,
+        None => return Ok(None),
+    };
+    let Some(task_name) = task_name else {
+        return Ok(Some(node_job_id));
+    };
+    let mut task_rows = conn
+        .query(
+            "SELECT id FROM jobs WHERE parent_job_id=?1 AND uri_segment=?2 LIMIT 1",
+            params![node_job_id.as_str(), task_name],
+        )
+        .await?;
+    match task_rows.next().await? {
+        Some(row) => Ok(Some(row.text(0)?)),
+        None => Ok(None),
+    }
 }
 
 /// Distinct turns recorded across one job's runs — the job-scoped chat tail that
@@ -473,20 +492,7 @@ async fn count_job_chat_turns(db: &LocalDb, job_id: &str) -> i64 {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(DISTINCT e.turn_id) FROM events e
-                     JOIN runs r ON e.run_id = r.id
-                     WHERE r.job_id = ?1 AND e.turn_id IS NOT NULL",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => Ok(row.i64(0)?),
-                None => Ok(0),
-            }
-        })
+        Box::pin(async move { super::push::count_job_chat_turns(conn, &job_id).await })
     })
     .await
     .unwrap_or(0)
@@ -697,14 +703,320 @@ struct OperatorMessage {
     read_by_node: bool,
 }
 
-/// Collapse a message to one line of at most [`CATCHUP_DIGEST_CHARS`].
+/// Collapse a message to one line of at most [`CATCHUP_DIGEST_CHARS`], plus an
+/// ellipsis when it was cut.
+///
+/// A cut lands where the reader can stop: after the last sentence end inside the
+/// bound, else at the last word break, provided either keeps at least half the
+/// bound; only a single unbroken run is cut mid-token.
 pub fn one_line_excerpt(content: &str) -> String {
     let flattened = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if flattened.chars().count() <= CATCHUP_DIGEST_CHARS {
         return flattened;
     }
-    let truncated: String = flattened.chars().take(CATCHUP_DIGEST_CHARS).collect();
-    format!("{truncated}…")
+    // One character past the bound, so a sentence or word that ends exactly at
+    // the bound is still seen to end there.
+    let probe: String = flattened.chars().take(CATCHUP_DIGEST_CHARS + 1).collect();
+    let byte_at = |chars: usize| {
+        probe
+            .char_indices()
+            .nth(chars)
+            .map_or(probe.len(), |(index, _)| index)
+    };
+    let bound = byte_at(CATCHUP_DIGEST_CHARS);
+    let floor = byte_at(CATCHUP_DIGEST_CHARS / 2);
+    let sentence = [". ", "! ", "? "]
+        .iter()
+        .filter_map(|end| {
+            probe
+                .rmatch_indices(end)
+                .map(|(index, _)| index + 1)
+                .find(|cut| *cut <= bound)
+        })
+        .max()
+        .filter(|cut| *cut >= floor);
+    let word = || {
+        probe
+            .rmatch_indices(' ')
+            .map(|(index, _)| index)
+            .find(|cut| *cut <= bound)
+            .filter(|cut| *cut >= floor)
+    };
+    let cut = sentence.or_else(word).unwrap_or(bound);
+    format!("{}…", probe[..cut].trim_end())
+}
+
+/// How many of a catch-up window's newest turns the chat line searches for
+/// assistant text before settling for the turn count alone.
+const CATCHUP_SCAN_TURNS: i64 = 8;
+
+/// Prose candidates one turn offers the chat line, newest first. A candidate is
+/// passed over only when it is a sub-agent's reply or an archived row that
+/// decodes empty, so a handful is plenty.
+const CATCHUP_TURN_CANDIDATES: i64 = 4;
+
+/// A job's newest `?2` turns that ran, newest first. `idx_turns_job_id` holds a
+/// job's turns in insertion order, so this walks the index backwards with no
+/// sort over the job's history.
+pub(crate) const WINDOW_TURNS_SQL: &str = "SELECT id, run_id, created_at FROM turns
+     WHERE job_id = ?1 AND run_id IS NOT NULL
+     ORDER BY rowid DESC LIMIT ?2";
+
+/// One turn's newest top-level-assistant prose candidates as keys: run `?1`,
+/// from the turn's start `?2`, turn `?3`, at most `?4`. Through the prose index
+/// this is a range of index entries that never opens a row.
+pub(crate) fn prose_candidates_sql(index: &str) -> String {
+    use cairn_db::storage::events::columns::PROSE_SHAPE;
+    format!(
+        "SELECT e.id, e.created_at, e.rowid FROM events e INDEXED BY {index}
+         WHERE e.run_id = ?1 AND e.event_type = 'assistant' AND e.created_at >= ?2
+           AND e.turn_id = ?3 AND {PROSE_SHAPE}
+         ORDER BY e.created_at DESC, e.id DESC LIMIT ?4"
+    )
+}
+
+/// The newest version of artifact `?1` written by job `?2`: the same lookup the
+/// named artifact read makes, served by `idx_artifacts_output_job_version`.
+pub(crate) const REVIEW_ARTIFACT_SQL: &str = "SELECT data FROM artifacts
+     WHERE output_name = ?1 AND job_id = ?2
+     ORDER BY version DESC LIMIT 1";
+
+/// One line naming what a child's own chat has accrued since the reader's
+/// catch-up cursor: the node, the number of new turns, and the opening of the
+/// newest assistant text among them, then the window's address.
+///
+/// The window starts at the `offset` the push's `content_ref` carries, which is
+/// the reader's cursor (or one lead-in turn on a first catch-up), so the count
+/// and the address always describe the same turns. Only assistant prose is
+/// quoted: a `user` event is a role, not an author, and quoting it would echo a
+/// launch prompt back as news (CAIRN-3408). `None` when the window is empty or
+/// anything fails to read, so the caller keeps the pointer.
+async fn catchup_chat_line(db: &LocalDb, content_ref: &str, child_job_id: &str) -> Option<String> {
+    use cairn_common::uri::CairnResource;
+    let (address, query) = content_ref.split_once('?')?;
+    let offset: i64 = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("offset="))?
+        .parse()
+        .ok()?;
+    let node = match cairn_common::uri::parse_uri(address)? {
+        CairnResource::NodeChat { node_id, .. } => node_id,
+        CairnResource::TaskChat {
+            node_id, task_name, ..
+        } => format!("{node_id}/task/{task_name}"),
+        _ => return None,
+    };
+    let job_id = child_job_id.to_string();
+    let (new_turns, candidates) = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let new_turns = super::push::count_job_chat_turns(conn, &job_id).await? - offset;
+                if new_turns <= 0 {
+                    return Ok::<_, crate::storage::DbError>((new_turns, Vec::new()));
+                }
+                let scan = new_turns.min(CATCHUP_SCAN_TURNS);
+                let candidates = newest_assistant_prose(conn, &job_id, scan).await?;
+                Ok((new_turns, candidates))
+            })
+        })
+        .await
+        .map_err(|error| log::debug!("catch-up chat line for {child_job_id}: {error}"))
+        .ok()?;
+    if new_turns <= 0 {
+        return None;
+    }
+    let text = cairn_db::storage::events::reconstruct_events(db, candidates)
+        .await
+        .into_iter()
+        .find_map(|event| assistant_text(&event.data));
+    let noun = if new_turns == 1 { "turn" } else { "turns" };
+    Some(match text {
+        Some(text) => format!(
+            "{node} · {new_turns} new {noun} · \"{}\" Read {content_ref}",
+            one_line_excerpt(&text)
+        ),
+        None => format!("{node} · {new_turns} new {noun}. Read {content_ref}"),
+    })
+}
+
+/// The newest top-level assistant prose in a job's newest `scan` turns, as stored
+/// rows for [`reconstruct_events`] to decode, newest first.
+///
+/// Every step is bounded by the window, never by the job's history. The turns
+/// come off `idx_turns_job_id` newest first, which needs no sort because that
+/// index holds a job's turns in insertion order. Each turn's candidates are a
+/// range of the prose index from the turn's own start, read as keys alone. A
+/// row's body is read only for a candidate. The walk stops at the first plain
+/// (`full`) row, which the index predicate guarantees holds text; archived rows
+/// met before it are kept for the decoder to settle.
+///
+/// [`reconstruct_events`]: cairn_db::storage::events::reconstruct_events
+async fn newest_assistant_prose(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    scan: i64,
+) -> crate::storage::DbResult<Vec<crate::models::Event>> {
+    use cairn_db::storage::events::columns::{event_from_row, EVENT_COLUMNS};
+    let mut turns = Vec::new();
+    let mut rows = conn.query(WINDOW_TURNS_SQL, params![job_id, scan]).await?;
+    while let Some(row) = rows.next().await? {
+        turns.push((row.text(0)?, row.text(1)?, row.i64(2)?));
+    }
+    drop(rows);
+    let candidates_sql = prose_candidates_sql(prose_walk_index(conn).await?);
+    let row_sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1");
+    let mut found = Vec::new();
+    for (turn_id, run_id, started) in turns {
+        let mut keys = Vec::new();
+        let mut rows = conn
+            .query(
+                &candidates_sql,
+                params![
+                    run_id.as_str(),
+                    started,
+                    turn_id.as_str(),
+                    CATCHUP_TURN_CANDIDATES
+                ],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            keys.push((row.i64(1)?, row.i64(2)?, row.text(0)?));
+        }
+        drop(rows);
+        // The index breaks a same-second tie by id, a UUID; the chat breaks it by
+        // insertion order.
+        keys.sort_by_key(|(created_at, rowid, _)| std::cmp::Reverse((*created_at, *rowid)));
+        for (_, _, id) in keys {
+            let mut rows = conn.query(&row_sql, params![id.as_str()]).await?;
+            let Some(row) = rows.next().await? else {
+                continue;
+            };
+            let event = event_from_row(&row)?;
+            if event.parent_tool_use_id.is_some() {
+                continue;
+            }
+            let plain = matches!(event.storage_mode.as_deref(), None | Some("full"));
+            found.push(event);
+            if plain {
+                return Ok(found);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The index a turn's prose candidates are read through. `idx_events_home_prose`
+/// belongs to the private lineage, and `INDEXED BY` a missing index is an error
+/// rather than a hint, so a team database reads the turn's own events instead:
+/// still bounded by the turn, at the cost of opening its rows.
+async fn prose_walk_index(
+    conn: &cairn_db::turso::Connection,
+) -> crate::storage::DbResult<&'static str> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_home_prose'",
+            (),
+        )
+        .await?;
+    Ok(if rows.next().await?.is_some() {
+        "idx_events_home_prose"
+    } else {
+        "idx_events_turn_id"
+    })
+}
+
+/// The model's text in a stored assistant event: the canonical
+/// `{"eventType":"assistant","content":"…"}` shape. Tool calls and thinking
+/// blocks carry no `content` string and yield nothing.
+fn assistant_text(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let content = value.get("content")?.as_str()?;
+    (!content.trim().is_empty()).then(|| content.to_string())
+}
+
+/// The artifact a review push's generic `.../artifact` alias stands for. The
+/// open-PR review arm addresses a node's PR that way, and "the newest artifact of
+/// any name" could be a later working document such as a `plan` (CAIRN-1953).
+const REVIEW_ALIAS_ARTIFACT: &str = "create-pr";
+
+/// What a review push asks the reader to look at, from the artifact's own
+/// `title` and optional `summary`, each one bounded line, then the address. The
+/// body is never inlined. `None` for an address that is not a node or task
+/// artifact, an artifact that does not resolve or parse, or one with no title.
+async fn review_artifact_line(runtime: &AttentionRuntime, content_ref: &str) -> Option<String> {
+    use cairn_common::uri::CairnResource;
+    let (project, number, exec_seq, node_id, task_name, name) =
+        match cairn_common::uri::parse_uri(content_ref)? {
+            CairnResource::NodeArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                name,
+            } => (project, number, exec_seq, node_id, None, name),
+            CairnResource::TaskArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                name,
+            } => (project, number, exec_seq, node_id, Some(task_name), name),
+            _ => return None,
+        };
+    let name = name.unwrap_or_else(|| REVIEW_ALIAS_ARTIFACT.to_string());
+    let db = runtime
+        .host
+        .database_for_project(&cairn_common::uri::canonical_project(&project))
+        .await;
+    let data = db
+        .read(|conn| {
+            let project = project.clone();
+            let node_id = node_id.clone();
+            let task_name = task_name.clone();
+            let name = name.clone();
+            Box::pin(async move {
+                let Some(job_id) = job_id_for_node_coordinates(
+                    conn,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    task_name.as_deref(),
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                let mut rows = conn
+                    .query(REVIEW_ARTIFACT_SQL, params![name.as_str(), job_id.as_str()])
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(row.text(0)?)),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|error| log::debug!("review line for {content_ref}: {error}"))
+        .ok()
+        .flatten()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(one_line_excerpt)
+    };
+    let title = field("title")?;
+    let summary = field("summary")
+        .map(|summary| format!("{summary}\n"))
+        .unwrap_or_default();
+    Some(format!(
+        "Work product ready for review: {title}\n{summary}Read {content_ref} for the current content."
+    ))
 }
 
 async fn resolved_issue_confirmation(
@@ -834,13 +1146,15 @@ async fn pushed_direct_message(
 
 /// Render a drained attention push as a compact, reference-first update.
 ///
-/// Direct messages, catch-up digests, terminal resolutions, check verdicts, and
-/// posts have bounded, targeted database lookups because their essential detail
-/// is not represented by the resource URI alone. Other push kinds deliberately do not
-/// render their full resource here: resume prompt assembly holds the launch lock,
-/// and making a resource read per pending push made user messages wait tens of
-/// seconds. The URI remains the canonical route to the live content through the
-/// read tool.
+/// Direct messages, catch-up digests and the child's own chat line, review
+/// titles and summaries, terminal resolutions, check verdicts, and posts have
+/// bounded, targeted database lookups because their essential detail is not
+/// represented by the resource URI alone. Each is at most a few indexed
+/// statements, and any miss degrades to the bare pointer, never an error. Other
+/// push kinds deliberately do not render their full resource here: resume
+/// prompt assembly holds the launch lock, and making a resource read per pending
+/// push made user messages wait tens of seconds. The URI remains the canonical
+/// route to the live content through the read tool.
 pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push::Push) -> String {
     let header = format!(
         "Attention update ({}): {}",
@@ -942,21 +1256,34 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
             _ => header,
         };
     }
-    // A `catchup:` push carries the operator-message digest without rendering the
-    // potentially enormous chat window. The URI remains available for follow-up.
-    let digest = match push.key.strip_prefix("catchup:") {
-        Some(child_job_id) => {
-            let db = runtime
-                .host
-                .database_for_job(child_job_id)
-                .await
-                .unwrap_or_else(|_| runtime.private_db.clone());
-            catchup_operator_digest(&db, &push.recipient, child_job_id).await
+    // A `catchup:` push says what the child has been doing without rendering the
+    // potentially enormous chat window: the operator messages the reader has not
+    // caught up on, then one line from the child's own chat since the cursor.
+    // With neither, the pointer stands. The URI remains available for follow-up.
+    if let Some(child_job_id) = push.key.strip_prefix("catchup:") {
+        let db = runtime
+            .host
+            .database_for_job(child_job_id)
+            .await
+            .unwrap_or_else(|_| runtime.private_db.clone());
+        let digest = catchup_operator_digest(&db, &push.recipient, child_job_id).await;
+        let line = catchup_chat_line(&db, &push.content_ref, child_job_id).await;
+        let body = [digest, line]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !body.is_empty() {
+            return format!("{header}\n\n{body}");
         }
-        None => None,
-    };
-    if let Some(digest) = digest {
-        return format!("{header}\n\n{digest}");
+    }
+    // A `review:` push's fingerprint is a source-state marker (`artifact:`,
+    // `sha:`), never a message, so it skips the direct-message lookup below.
+    if push.key.starts_with("review:") {
+        return match review_artifact_line(runtime, &push.content_ref).await {
+            Some(body) => format!("{header}\n\n{body}"),
+            None => pointer_update(&header, push),
+        };
     }
     // A system direct push under its own coalescing key (`automation:`,
     // `condition:`, `gate:`, `tenet-verdict:`, `tenet-contradiction:`, ...) has
@@ -968,12 +1295,17 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
         let body = crate::message_render::render_direct_message(&msg);
         return format!("{header}\n\n{body}");
     }
+    pointer_update(&header, push)
+}
+
+/// The bare reference-first update: the push kind's headline and the address to
+/// read. What every detail lookup degrades to.
+fn pointer_update(header: &str, push: &crate::push::Push) -> String {
     let prefix = push
         .key
         .split_once(':')
         .map(|(prefix, _)| prefix)
         .unwrap_or(&push.key);
-
     let (_, headline) = super::push::push_kind_headline(prefix);
     format!(
         "{header}\n\n{headline}. Read {} for the current content.",
