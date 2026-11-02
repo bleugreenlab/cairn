@@ -903,6 +903,142 @@ async fn render_live_pr_section_includes_actions_and_honors_diff_full() {
     assert!(full.contains("+new"));
 }
 
+/// A merged pull request as GitHub reports it, carrying the merge commit.
+fn merged_pr_response(merge_commit: &str) -> HttpResponse {
+    HttpResponse::new(
+        200,
+        serde_json::to_vec(&serde_json::json!({
+            "title": "My PR",
+            "body": "A description",
+            "state": "closed",
+            "draft": false,
+            "mergeable": null,
+            "mergeable_state": "unknown",
+            "additions": 12,
+            "deletions": 3,
+            "merged": true,
+            "merge_commit_sha": merge_commit,
+            "head": { "sha": "abc123" }
+        }))
+        .unwrap(),
+    )
+}
+
+async fn text_column(db: &LocalDb, sql: &'static str, id: &str) -> Option<String> {
+    let id = id.to_string();
+    db.read(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(sql, params![id.as_str()]).await?;
+            match rows.next().await? {
+                Some(row) => row.opt_text(0),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// A merge made in GitHub's web UI resolves the merge request the first time a
+/// refresh sees it, exactly as a Cairn merge would: the row with GitHub's merge
+/// commit, the issue, and the `pr` node's blocked action run. The first reader
+/// here is the `pr` node itself, addressed by its action run, which owns no
+/// row and used to fail with "No merge request found". A second refresh changes
+/// nothing.
+#[tokio::test]
+async fn a_merge_made_on_github_resolves_on_refresh_exactly_once() {
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_git_repo();
+    insert_github_app(&db).await;
+    let project = create_project(&db, "gh", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    insert_execution(&db, "exec-gh", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-gh")).await;
+    let action_run = create_action_run(&db, &project, "exec-gh", &job).await;
+    db.execute(
+        "UPDATE action_runs SET status = 'blocked' WHERE id = ?1",
+        params![action_run.as_str()],
+    )
+    .await
+    .unwrap();
+    let mr = create_merge_request(&db, &job, &project, &issue, 43).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/43/reviews", empty_array_response())
+        .respond_to("/pulls/43/files", files_response())
+        .respond_to("/check-runs", check_runs_response())
+        .respond_to("/pulls/43", merged_pr_response("b77e76577b"));
+    let (_cfg, orch) = orchestrator_with_http(db, http).await;
+    let db = &orch.db.local;
+
+    let section = actions::render_live_pr_section(&orch, &action_run, "cairn://p/gh/1/1/pr", false)
+        .await
+        .expect("the pr node renders its pull request");
+    assert!(!section.contains("failed to refresh"), "{section}");
+    assert!(section.contains("State: MERGED"), "{section}");
+    assert!(
+        section.contains("Merged by someone outside Cairn (observed on GitHub)"),
+        "{section}"
+    );
+
+    assert_eq!(mr_status(db, &mr).await, "merged");
+    assert_eq!(
+        text_column(
+            db,
+            "SELECT merged_commit FROM merge_requests WHERE id = ?1",
+            &mr
+        )
+        .await
+        .as_deref(),
+        Some("b77e76577b")
+    );
+    let merged_at = text_column(
+        db,
+        "SELECT CAST(merged_at AS TEXT) FROM merge_requests WHERE id = ?1",
+        &mr,
+    )
+    .await;
+    assert!(merged_at.is_some());
+    assert_eq!(issue_status(db, &issue).await, "merged");
+    assert_eq!(
+        text_column(
+            db,
+            "SELECT status FROM action_runs WHERE id = ?1",
+            &action_run
+        )
+        .await
+        .as_deref(),
+        Some("complete")
+    );
+    let observations = "SELECT CAST(COUNT(*) AS TEXT) FROM pr_resolution_attributions
+                         WHERE merge_request_id = ?1 AND actor_kind = 'unjournaled'
+                           AND surface = 'github-refresh-observation'";
+    assert_eq!(
+        text_column(db, observations, &mr).await.as_deref(),
+        Some("1")
+    );
+
+    let cache = actions::refresh_pr_for_job(&orch, &job).await.unwrap();
+    assert_eq!(cache.state.to_string(), "MERGED");
+    assert_eq!(
+        text_column(db, observations, &mr).await.as_deref(),
+        Some("1"),
+        "a second refresh journals nothing"
+    );
+    assert_eq!(
+        text_column(
+            db,
+            "SELECT CAST(merged_at AS TEXT) FROM merge_requests WHERE id = ?1",
+            &mr
+        )
+        .await,
+        merged_at,
+        "a second refresh moves nothing"
+    );
+}
+
 #[tokio::test]
 async fn close_pr_for_job_marks_closed() {
     let (_temp, db) = common::migrated_db().await;

@@ -26,6 +26,8 @@ pub(crate) struct ParsedPrDetails {
     pub(crate) additions: Option<i32>,
     pub(crate) deletions: Option<i32>,
     pub(crate) head_sha: String,
+    /// The commit the merge wrote to the base, for a merged pull request only.
+    pub(crate) merge_commit: Option<String>,
 }
 
 // ── Pure Computation ───────────────────────────────────────────
@@ -197,6 +199,7 @@ async fn fetch_pr_via_api_with_backoff(
         additions: Some(pr.additions),
         deletions: Some(pr.deletions),
         head_sha: pr.head.sha,
+        merge_commit: pr.merge_commit_sha.filter(|_| pr.merged),
     })
 }
 

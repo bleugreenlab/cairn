@@ -29,7 +29,7 @@ use super::context::{
     db_error, load_mr_branches, load_mr_issue_id, resolve_mr_context_for_job,
     try_resolve_mr_context_for_job, MrContext, PrNodeResolution,
 };
-use super::resolution::resolve_pr_node;
+use super::resolution::{resolution_actor_label, resolve_observed_pr_node, resolve_pr_node};
 
 /// The mergeability an artifact may publish for a live pull request.
 ///
@@ -402,6 +402,102 @@ pub(crate) struct PrSnapshot {
     /// When this snapshot stops describing the live world on its own, or `None`
     /// for a settled change that only an exact invalidation can move.
     expires_at: Option<i64>,
+    /// A merge or close GitHub reported that the row had not recorded when this
+    /// snapshot was computed.
+    observed: Option<ObservedResolution>,
+}
+
+/// GitHub says a pull request is merged or closed, and its `merge_requests` row
+/// does not: someone other than Cairn resolved it.
+struct ObservedResolution {
+    /// The row's owner (`merge_requests.job_id`), which the resolution keys on.
+    owner_id: String,
+    resolution: PrNodeResolution,
+    merged_commit: Option<String>,
+    project_id: String,
+    target_branch: Option<String>,
+}
+
+/// What a fetched pull request says the row has not recorded yet, if anything.
+///
+/// Asked only of a pull request GitHub reports merged or closed, so an open one
+/// pays nothing for it.
+async fn observe_resolution(
+    db: &LocalDb,
+    mr_context: &MrContext,
+    pr_details: &ParsedPrDetails,
+    branches: Option<&(String, String)>,
+) -> Option<ObservedResolution> {
+    let resolution = match pr_details.state {
+        PrState::Merged => PrNodeResolution::Merge,
+        PrState::Closed => PrNodeResolution::Close,
+        PrState::Open | PrState::Unpublished => return None,
+    };
+    let recorded = db
+        .query_opt_text(
+            "SELECT status FROM merge_requests WHERE id = ?1",
+            params![mr_context.mr_id.as_str()],
+        )
+        .await
+        .ok()
+        .flatten()?;
+    let unrecorded = match resolution {
+        PrNodeResolution::Merge => recorded != "merged",
+        PrNodeResolution::Close => recorded == "open",
+    };
+    unrecorded.then(|| ObservedResolution {
+        owner_id: mr_context.job_id.clone(),
+        resolution,
+        merged_commit: pr_details.merge_commit.clone(),
+        project_id: mr_context.project_id.clone(),
+        target_branch: branches.map(|(_, target)| target.clone()),
+    })
+}
+
+/// Resolve the pull request a snapshot saw GitHub resolve.
+///
+/// This runs after the single flight rather than inside it. The resolution
+/// invalidates this job's snapshot, and an invalidation inside the computation
+/// would reject the very computation that observed it and fetch GitHub again.
+/// Every reader that joined the flight arrives here with the same observation;
+/// the row's claim lets exactly one of them resolve it.
+async fn settle_observed_resolution(orch: &Orchestrator, snapshot: &PrSnapshot) {
+    let Some(observed) = snapshot.observed.as_ref() else {
+        return;
+    };
+    match resolve_observed_pr_node(
+        orch,
+        &observed.owner_id,
+        observed.resolution,
+        observed.merged_commit.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => {
+            log::info!(
+                "Resolved PR for owner {} as {:?} on GitHub's word: Cairn did not perform it",
+                observed.owner_id,
+                observed.resolution
+            );
+            // A merge Cairn did not perform moved the target on origin and
+            // nothing told the store. Take it now rather than at the next poll.
+            if let (PrNodeResolution::Merge, Some(target)) =
+                (observed.resolution, observed.target_branch.clone())
+            {
+                let project_id = observed.project_id.clone();
+                let orch = orch.clone();
+                tokio::spawn(async move {
+                    crate::orchestrator::base_branch_sync::sync(&orch, &project_id, &target).await;
+                });
+            }
+        }
+        Ok(false) => {}
+        Err(error) => log::error!(
+            "GitHub reports the PR for owner {} {:?}d, but resolving it failed: {error}",
+            observed.owner_id,
+            observed.resolution
+        ),
+    }
 }
 
 /// A change whose remote signals are still resolving — GitHub computes
@@ -494,7 +590,10 @@ pub(crate) async fn pr_snapshot_for_job(
     };
 
     match snapshot {
-        Some(snapshot) => Ok(snapshot),
+        Some(snapshot) => {
+            settle_observed_resolution(orch, &snapshot).await;
+            Ok(snapshot)
+        }
         None => Err(failure
             .lock()
             .ok()
@@ -556,6 +655,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
                         heads: HeadComparison::Unknown,
                         conflict: None,
                         files: Vec::new(),
+                        observed: None,
                     });
                 }
             }
@@ -624,6 +724,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
     if write.changed {
         emit_merge_request_change(orch, &mr_context, "update");
     }
+    let observed = observe_resolution(&db, &mr_context, &pr_details, branches.as_ref()).await;
 
     let cache = PrCache {
         id: mr_id.clone(),
@@ -655,6 +756,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
         heads,
         conflict,
         files,
+        observed,
     })
 }
 
@@ -992,7 +1094,7 @@ pub async fn close_pr_for_job(
         api::close_pr(http, &auth, &owner, &repo, pr_number).await?;
     }
 
-    resolve_pr_node(orch, job_id, PrNodeResolution::Close, attribution).await?;
+    resolve_pr_node(orch, job_id, PrNodeResolution::Close, attribution, None).await?;
 
     // Release runtime resources and apply the established branch cleanup policy.
     // This runs after the cascade above has stopped the issue's agents: killing
@@ -1119,7 +1221,9 @@ pub async fn render_live_pr_section(
         Err(e) => return Some(format!("## Pull Request\n\n(failed to resolve PR: {e})\n")),
     };
 
-    let snapshot = match pr_snapshot_for_job(orch, job_id, None).await {
+    // The snapshot is keyed by the row's owner. `job_id` may be the `pr` action
+    // run the node surface addresses, which owns no row of its own.
+    let snapshot = match pr_snapshot_for_job(orch, &mr_context.job_id, None).await {
         Ok(snapshot) => snapshot,
         Err(e) => return Some(format!("## Pull Request\n\n(failed to refresh: {e})\n")),
     };
@@ -1148,46 +1252,15 @@ pub async fn render_live_pr_section(
         PrState::Closed => Some("close"),
         _ => None,
     };
-    let mut attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
-    if matches!(cache.state, PrState::Merged)
-        && attribution
-            .as_ref()
-            .is_none_or(|event| event.action != "merge")
-    {
-        log::error!(
-            "merge performed by an unjournaled path: merge_request={}",
-            mr_context.mr_id
-        );
-        if let Err(error) =
-            super::ensure_unjournaled_merge_observation(orch, &db, &mr_context.mr_id, job_id).await
-        {
-            log::error!("{error}");
-        }
-        // A merge Cairn did not perform moved the target on origin and nothing
-        // told the store. Take it now rather than at the next poll.
-        if let Some((_, target)) = source_branches.clone() {
-            let project_id = mr_context.project_id.clone();
-            let orch = orch.clone();
-            tokio::spawn(async move {
-                crate::orchestrator::base_branch_sync::sync(&orch, &project_id, &target).await;
-            });
-        }
-        attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
-    }
+    let attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
     if let Some(attribution) =
         attribution.filter(|event| expected_action.is_some_and(|expected| event.action == expected))
     {
-        let actor = match (
-            attribution.actor_kind.as_str(),
+        let actor = resolution_actor_label(
+            Some(attribution.actor_kind.as_str()),
             attribution.actor_identity.as_deref(),
-        ) {
-            ("operator-ui", _) => "operator (UI)".to_string(),
-            ("operator-cli", _) => "operator (CLI)".to_string(),
-            ("agent", Some(uri)) => uri.to_string(),
-            ("unjournaled", _) => "merge performed by an unjournaled path".to_string(),
-            (_, Some(identity)) => identity.to_string(),
-            _ => attribution.surface.clone(),
-        };
+            Some(attribution.surface.as_str()),
+        );
         let verb = if attribution.action == "close" {
             "Closed"
         } else {

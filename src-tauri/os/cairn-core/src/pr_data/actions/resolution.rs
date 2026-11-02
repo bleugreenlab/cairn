@@ -6,7 +6,9 @@ use crate::storage::{LocalDb, RowExt};
 use crate::transitions::Resolution;
 use cairn_db::turso::params;
 
-use super::context::{db_error, resolve_merge_mr_context_for_job, PrNodeResolution};
+use super::context::{
+    db_error, resolve_merge_mr_context_for_job, MergeMrContext, PrNodeResolution,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrResolutionAttribution {
@@ -72,6 +74,40 @@ impl PrResolutionAttribution {
             surface: path,
         }
     }
+    /// A merge or close Cairn did not perform, seen on GitHub by a refresh.
+    /// Nobody inside Cairn acted, so there is no principal to name.
+    fn github_observation() -> Self {
+        Self {
+            actor_kind: "unjournaled",
+            actor_identity: None,
+            surface: GITHUB_OBSERVATION_SURFACE,
+        }
+    }
+}
+
+/// The surface a refresh journals when it observes a resolution Cairn did not
+/// perform.
+const GITHUB_OBSERVATION_SURFACE: &str = "github-refresh-observation";
+
+/// Who a journaled resolution names, as the PR artifact and the issue summary
+/// both render it.
+pub fn resolution_actor_label(
+    actor_kind: Option<&str>,
+    actor_identity: Option<&str>,
+    surface: Option<&str>,
+) -> String {
+    match (actor_kind, actor_identity) {
+        (Some("operator-ui"), _) => "operator (UI)".to_string(),
+        (Some("operator-cli"), _) => "operator (CLI)".to_string(),
+        (Some("unjournaled"), _) if surface == Some(GITHUB_OBSERVATION_SURFACE) => {
+            "someone outside Cairn (observed on GitHub)".to_string()
+        }
+        (_, Some(identity)) => identity.to_string(),
+        (Some("unjournaled"), _) | (None, _) => {
+            "merge performed by an unjournaled path".to_string()
+        }
+        (Some(kind), _) => kind.to_string(),
+    }
 }
 
 async fn lane_snapshot_for_job(orch: &Orchestrator, db: &LocalDb, job_id: &str) -> String {
@@ -93,59 +129,82 @@ pub async fn latest_resolution_attribution(
     mr_id: &str,
 ) -> Option<StoredPrResolutionAttribution> {
     let mr_id = mr_id.to_string();
-    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: row.text(5)? })).await.ok().flatten()
+    // A Cairn merge can land on GitHub and be observed by a refresh before its
+    // own resolution journals, inside the same second. The principal that acted
+    // outranks the observation of its act.
+    db.query_opt("SELECT action, actor_kind, actor_identity, surface, created_at, lane_snapshot FROM pr_resolution_attributions WHERE merge_request_id = ?1 ORDER BY created_at DESC, CASE WHEN actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1", (mr_id,), |row| Ok(StoredPrResolutionAttribution { action: row.text(0)?, actor_kind: row.text(1)?, actor_identity: row.opt_text(2)?, surface: row.text(3)?, created_at: row.i64(4)?, lane_snapshot: row.text(5)? })).await.ok().flatten()
 }
 
-pub async fn ensure_unjournaled_merge_observation(
-    orch: &Orchestrator,
+/// Move a `merge_requests` row to its terminal status, returning whether this
+/// call moved it.
+///
+/// The conditional update is the claim on the resolution. A refresh that saw
+/// GitHub's merge and Cairn's own merge path can both reach one row, as can two
+/// readers that shared one refresh; only the call that moves the row runs the
+/// terminal cascade. A closed row may still become merged, because GitHub can
+/// merge a pull request that was closed and reopened. Nothing moves a merged row.
+async fn claim_merge_request_resolution(
     db: &LocalDb,
     mr_id: &str,
-    job_id: &str,
-) -> Result<(), String> {
-    let lane_snapshot = lane_snapshot_for_job(orch, db, job_id).await;
-    let now = chrono::Utc::now().timestamp();
-    db.execute(
-        "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, actor_identity, surface, lane_snapshot, created_at)
-         SELECT ?1, ?2, 'merge', 'unjournaled', NULL, 'github-refresh-observation', ?3, ?4
-         WHERE NOT EXISTS (
-             SELECT 1 FROM pr_resolution_attributions
-             WHERE merge_request_id = ?2 AND action = 'merge' AND actor_kind = 'unjournaled'
-         )",
-        params![uuid::Uuid::new_v4().to_string(), mr_id, lane_snapshot, now],
-    )
-    .await
-    .map_err(|e| db_error("Failed to journal unjournaled GitHub merge observation", e))?;
-    Ok(())
-}
-
-async fn mark_merge_request_closed_and_resolve_issue(
-    orch: &Orchestrator,
-    db: &LocalDb,
-    mr_id: &str,
-    issue_id: Option<&str>,
+    resolution: PrNodeResolution,
+    merged_commit: Option<&str>,
     now: i64,
-) -> Result<(), String> {
-    let mr_id = mr_id.to_string();
-    db.write(|conn| {
-        let mr_id = mr_id.clone();
-        Box::pin(async move {
-            conn.execute(
+) -> Result<bool, String> {
+    let moved = match resolution {
+        PrNodeResolution::Merge => {
+            db.execute(
+                "UPDATE merge_requests
+                 SET status = 'merged', merged_at = ?1, updated_at = ?1,
+                     merged_commit = COALESCE(?2, merged_commit)
+                 WHERE id = ?3 AND status IN ('open', 'closed')",
+                params![now, merged_commit, mr_id],
+            )
+            .await
+        }
+        PrNodeResolution::Close => {
+            db.execute(
                 "UPDATE merge_requests
                  SET status = 'closed', closed_at = ?1, updated_at = ?1
-                 WHERE id = ?2",
-                params![now, mr_id.as_str()],
+                 WHERE id = ?2 AND status = 'open'",
+                params![now, mr_id],
             )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
+            .await
+        }
+    }
     .map_err(|e| db_error("Failed to update merge request", e))?;
+    Ok(moved > 0)
+}
 
-    let Some(issue_id) = issue_id else {
-        return Ok(());
+/// Whether an observed resolution of `mr_id` speaks for its issue: the issue is
+/// still unresolved, and no other pull request of the issue is open or newer.
+///
+/// A person who closed the issue keeps that decision, and a pull request that a
+/// newer one superseded does not close the issue the newer one serves.
+async fn observation_resolves_issue(
+    db: &LocalDb,
+    issue_id: &str,
+    mr_id: &str,
+) -> Result<bool, String> {
+    let Some(status) = db
+        .query_opt_text(
+            "SELECT i.status FROM issues i
+              WHERE i.id = ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM merge_requests other
+                     WHERE other.issue_id = i.id AND other.id <> ?2
+                       AND (other.status = 'open'
+                            OR other.opened_at > (SELECT opened_at FROM merge_requests WHERE id = ?2))
+                )",
+            params![issue_id, mr_id],
+        )
+        .await
+        .map_err(|e| db_error("Failed to load the issue an observed resolution belongs to", e))?
+    else {
+        return Ok(false);
     };
-    resolve_issue_for_pr(orch, db, issue_id, Resolution::Closed).await
+    Ok(status
+        .parse::<crate::models::IssueStatus>()
+        .is_ok_and(|status| !status.is_terminal()))
 }
 
 /// Resolve the PR's issue through the one terminal cascade.
@@ -173,14 +232,73 @@ async fn resolve_issue_for_pr(
     .map_err(|refusal| refusal.to_string())
 }
 
+/// Who brought a pull request to its terminal state.
+enum Resolver {
+    /// A Cairn action that performed the merge or close. `None` is a boundary
+    /// that did not say whom it acted for, which is journaled loudly.
+    Performed(Option<PrResolutionAttribution>),
+    /// A refresh that saw GitHub report a merge or close Cairn did not perform.
+    Observed,
+}
+
 /// Resolve a `pr` node by its owner id (`merge_requests.job_id`): the producing
 /// `pr` action_run (CAIRN-1220) or a legacy `create_pr` producing job.
+///
+/// `merged_commit` is the commit a merge wrote to the target branch, when the
+/// caller knows it.
 pub async fn resolve_pr_node(
     orch: &Orchestrator,
     owner_id: &str,
     resolution: PrNodeResolution,
     attribution: Option<PrResolutionAttribution>,
+    merged_commit: Option<&str>,
 ) -> Result<(), String> {
+    resolve_pr_node_as(
+        orch,
+        owner_id,
+        resolution,
+        merged_commit,
+        Resolver::Performed(attribution),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Resolve a pull request that GitHub reports merged or closed by someone other
+/// than Cairn: the operator in GitHub's web UI, an integration agent using the
+/// GitHub CLI, a teammate.
+///
+/// It is the resolution a Cairn merge or close runs. The row moves, the `pr`
+/// node's terminal cascade runs, and the observation is journaled once as the
+/// resolution's provenance. It differs in one respect: a Cairn action resolves
+/// the issue because it acted on the issue's behalf, while an observation only
+/// knows the pull request moved, so it resolves the issue only when
+/// [`observation_resolves_issue`] says the pull request speaks for it.
+///
+/// Returns whether this call resolved the row; `false` means it already was.
+pub(super) async fn resolve_observed_pr_node(
+    orch: &Orchestrator,
+    owner_id: &str,
+    resolution: PrNodeResolution,
+    merged_commit: Option<&str>,
+) -> Result<bool, String> {
+    resolve_pr_node_as(
+        orch,
+        owner_id,
+        resolution,
+        merged_commit,
+        Resolver::Observed,
+    )
+    .await
+}
+
+async fn resolve_pr_node_as(
+    orch: &Orchestrator,
+    owner_id: &str,
+    resolution: PrNodeResolution,
+    merged_commit: Option<&str>,
+    resolver: Resolver,
+) -> Result<bool, String> {
     // Route to the database that owns this PR's producing job (team replica or
     // private DB). Every row this resolution reads or writes — the merge_requests
     // status transition, the issue resolution, the pr action_run completion, and
@@ -195,46 +313,69 @@ pub async fn resolve_pr_node(
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
     let lane_snapshot = lane_snapshot_for_job(orch, &db, owner_id).await;
-    let attribution = attribution.unwrap_or_else(|| {
-        log::error!(
-            "merge performed by an unjournaled path: owner={owner_id} resolution={resolution:?}"
-        );
-        PrResolutionAttribution {
-            actor_kind: "unjournaled",
-            actor_identity: None,
-            surface: "unjournaled-path",
+    let performed = matches!(resolver, Resolver::Performed(_));
+    let claimed =
+        claim_merge_request_resolution(&db, &mr_id, resolution, merged_commit, now).await?;
+    let attribution = match resolver {
+        Resolver::Performed(attribution) => Some(attribution.unwrap_or_else(|| {
+            log::error!(
+                "merge performed by an unjournaled path: owner={owner_id} resolution={resolution:?}"
+            );
+            PrResolutionAttribution {
+                actor_kind: "unjournaled",
+                actor_identity: None,
+                surface: "unjournaled-path",
+            }
+        })),
+        // Only the call that resolved the row journals the observation, so a
+        // resolution observed by many readers is recorded once.
+        Resolver::Observed => claimed.then(PrResolutionAttribution::github_observation),
+    };
+    if let Some(attribution) = attribution {
+        db.execute(
+            "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, actor_identity, surface, lane_snapshot, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![uuid::Uuid::new_v4().to_string(), mr_id.as_str(), if matches!(resolution, PrNodeResolution::Merge) { "merge" } else { "close" }, attribution.actor_kind, attribution.actor_identity.as_deref(), attribution.surface, lane_snapshot.as_str(), now],
+        ).await.map_err(|e| db_error("Failed to journal PR resolution attribution", e))?;
+    }
+
+    if !claimed {
+        if !performed {
+            return Ok(false);
         }
-    });
-    db.execute(
-        "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, actor_identity, surface, lane_snapshot, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![uuid::Uuid::new_v4().to_string(), mr_id.as_str(), if matches!(resolution, PrNodeResolution::Merge) { "merge" } else { "close" }, attribution.actor_kind, attribution.actor_identity.as_deref(), attribution.surface, lane_snapshot.as_str(), now],
-    ).await.map_err(|e| db_error("Failed to journal PR resolution attribution", e))?;
-    // Marking the PR resolved resolves its issue, and resolving an issue runs
-    // the terminal cascade: the issue's live work is stopped, its queued work is
+        // Cairn performed this merge or close, but the row was already resolved:
+        // by a refresh that saw this same merge land on GitHub while this call
+        // was in flight, or by an earlier resolution. The cascade ran then. What
+        // this call adds is who acted and, for a merge, the commit it produced.
+        if let (PrNodeResolution::Merge, Some(commit)) = (resolution, merged_commit) {
+            db.execute(
+                "UPDATE merge_requests SET merged_commit = ?1
+                 WHERE id = ?2 AND status = 'merged' AND merged_commit IS NULL",
+                params![commit, mr_id.as_str()],
+            )
+            .await
+            .map_err(|e| db_error("Failed to record the merged commit", e))?;
+        }
+        announce_pr_resolution(orch, &merge_context);
+        return Ok(false);
+    }
+
+    let issue_to_resolve = match merge_context.issue_id.as_deref() {
+        Some(issue_id) if performed => Some(issue_id),
+        Some(issue_id) => observation_resolves_issue(&db, issue_id, &mr_id)
+            .await?
+            .then_some(issue_id),
+        None => None,
+    };
+    // Resolving the PR resolves its issue, and resolving an issue runs the
+    // terminal cascade: the issue's live work is stopped, its queued work is
     // cancelled, its sessions close, and any in-flight turn-end review suite is
     // quit (CAIRN-2648, CAIRN-3253).
-    match resolution {
-        PrNodeResolution::Merge => {
-            mark_merge_request_merged_and_resolve_issue(
-                orch,
-                &db,
-                &mr_id,
-                merge_context.issue_id.as_deref(),
-                None,
-                now,
-            )
-            .await?
-        }
-        PrNodeResolution::Close => {
-            mark_merge_request_closed_and_resolve_issue(
-                orch,
-                &db,
-                &mr_id,
-                merge_context.issue_id.as_deref(),
-                now,
-            )
-            .await?
-        }
+    if let Some(issue_id) = issue_to_resolve {
+        let issue_resolution = match resolution {
+            PrNodeResolution::Merge => Resolution::Merged,
+            PrNodeResolution::Close => Resolution::Closed,
+        };
+        resolve_issue_for_pr(orch, &db, issue_id, issue_resolution).await?;
     }
 
     // A numbered thread branch uses the same merge-request owner coordinate as
@@ -243,7 +384,7 @@ pub async fn resolve_pr_node(
     // once, and only after the external operation has succeeded.
     advance_thread_branch_lifecycle(&db, owner_id, resolution, now).await?;
 
-    if let Some(issue_id) = merge_context.issue_id.as_deref() {
+    if let Some(issue_id) = issue_to_resolve {
         if merge_context.has_triage_batch {
             let result = match resolution {
                 PrNodeResolution::Merge => {
@@ -312,7 +453,7 @@ pub async fn resolve_pr_node(
     }
 
     if matches!(resolution, PrNodeResolution::Merge) {
-        if let Some(issue_id) = merge_context.issue_id.clone() {
+        if let Some(issue_id) = issue_to_resolve.map(str::to_string) {
             let orch_for_memories = orch.clone();
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
@@ -369,8 +510,14 @@ pub async fn resolve_pr_node(
         });
     }
 
-    // Merged/closed is the settled terminal state the snapshot caches without an
-    // expiry, so the transition into it must advance the generation exactly once.
+    announce_pr_resolution(orch, &merge_context);
+    Ok(true)
+}
+
+/// Merged/closed is the settled terminal state the PR snapshot caches without
+/// an expiry, so every write that moves a resolved row advances the generation
+/// and tells the row's readers.
+fn announce_pr_resolution(orch: &Orchestrator, merge_context: &MergeMrContext) {
     orch.invalidate_pr_refresh(&merge_context.mr.job_id, "pull-request-resolved");
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -388,8 +535,6 @@ pub async fn resolve_pr_node(
             crate::notify::issue_db_change_ids("update", issue_id, Some(&merge_context.project_id)),
         );
     }
-
-    Ok(())
 }
 
 /// If `owner_id` is a producing job with a blocked `pr` action_run child, mark
@@ -516,78 +661,6 @@ pub async fn advance_producing_execution_after_pr_resolution(
     }
 
     Ok(())
-}
-
-pub(super) async fn persist_merged_commit(
-    db: &LocalDb,
-    mr_id: &str,
-    merged_commit: &str,
-) -> Result<(), String> {
-    let mr_id = mr_id.to_string();
-    let merged_commit = merged_commit.to_string();
-    db.write(|conn| {
-        let mr_id = mr_id.clone();
-        let merged_commit = merged_commit.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE merge_requests SET merged_commit = ?1 WHERE id = ?2",
-                params![merged_commit.as_str(), mr_id.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| db_error("Failed to persist merged commit", e))
-}
-
-async fn mark_merge_request_merged_and_resolve_issue(
-    orch: &Orchestrator,
-    db: &LocalDb,
-    mr_id: &str,
-    issue_id: Option<&str>,
-    merged_commit: Option<&str>,
-    now: i64,
-) -> Result<(), String> {
-    let mr_id = mr_id.to_string();
-    let _source_branch = db
-        .read(|conn| {
-            let mr_id = mr_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT source_branch FROM merge_requests WHERE id = ?1 LIMIT 1",
-                        params![mr_id.as_str()],
-                    )
-                    .await?;
-                crate::storage::next_text(&mut rows, 0).await
-            })
-        })
-        .await
-        .map_err(|e| db_error("Failed to query merge request source branch", e))?;
-
-    db.write(|conn| {
-        let mr_id = mr_id.clone();
-        let merged_commit = merged_commit.map(ToOwned::to_owned);
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE merge_requests
-                 SET status = 'merged', merged_at = ?1, updated_at = ?1,
-                     merged_commit = COALESCE(?2, merged_commit)
-                 WHERE id = ?3",
-                params![now, merged_commit.as_deref(), mr_id.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| db_error("Failed to update merge request", e))?;
-
-    let Some(issue_id) = issue_id else {
-        return Ok(());
-    };
-    resolve_issue_for_pr(orch, db, issue_id, Resolution::Merged).await
 }
 
 #[cfg(test)]
@@ -782,6 +855,7 @@ mod tests {
                 "builder-job",
                 PrNodeResolution::Merge,
                 Some(PrResolutionAttribution::operator_ui()),
+                None,
             )
             .await
             .expect("the operator UI merge resolves the child");
@@ -822,6 +896,7 @@ mod tests {
             "builder-job",
             PrNodeResolution::Close,
             Some(PrResolutionAttribution::operator_ui()),
+            None,
         )
         .await
         .expect("the operator UI close resolves the child");
@@ -853,6 +928,7 @@ mod tests {
             "builder-job",
             PrNodeResolution::Merge,
             Some(PrResolutionAttribution::operator_ui()),
+            None,
         )
         .await
         .expect("the merge resolves the child");
@@ -913,6 +989,7 @@ mod tests {
             Some(PrResolutionAttribution::agent(
                 "cairn://p/prj/1/1/thread".to_string(),
             )),
+            None,
         )
         .await
         .expect("the merge resolution lands");
@@ -1019,7 +1096,7 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None)
+        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None, None)
             .await
             .expect("the merge resolution lands");
 
@@ -1066,7 +1143,7 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
 
-        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None)
+        resolve_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None, None)
             .await
             .expect("the merge resolution lands");
 
@@ -1082,42 +1159,250 @@ mod tests {
         assert_eq!(unsettled, 0, "a merged issue holds no unsettled job");
     }
 
+    async fn observation_count(db: &LocalDb) -> i64 {
+        db.query_opt_i64(
+            "SELECT COUNT(*) FROM pr_resolution_attributions
+              WHERE merge_request_id = 'mr-pr-node' AND actor_kind = 'unjournaled'",
+            (),
+        )
+        .await
+        .unwrap()
+        .unwrap_or(0)
+    }
+
+    /// A merge made on GitHub by someone other than Cairn resolves exactly as a
+    /// Cairn merge does: the row, its merge commit, the issue, and the `pr`
+    /// node's blocked action run. The observation is journaled once, and seeing
+    /// it again changes nothing.
     #[tokio::test(flavor = "current_thread")]
-    async fn observed_github_merge_is_journaled_once_after_an_old_close() {
+    async fn an_observed_merge_resolves_the_row_and_the_pr_node_once() {
         let db = migrated_db().await;
         seed_pr_node_merge_request_for_artifact_job(&db).await;
         let orch = test_orchestrator(db, MockGitClient::new());
         let db = &orch.db.local;
+
+        let resolved = resolve_observed_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some("b77e7657"),
+        )
+        .await
+        .expect("the observed merge resolves");
+        assert!(resolved, "the first observation resolves the row");
+
+        let row = |column: &'static str| {
+            let sql = format!("SELECT {column} FROM merge_requests WHERE id = ?1");
+            async move { scalar(db, &sql, "mr-pr-node").await }
+        };
+        assert_eq!(row("status").await.as_deref(), Some("merged"));
+        assert_eq!(row("merged_commit").await.as_deref(), Some("b77e7657"));
+        let merged_at = row("CAST(merged_at AS TEXT)").await;
+        assert!(merged_at.is_some(), "merged_at is recorded");
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM issues WHERE id = ?1",
+                "issue-pr-node"
+            )
+            .await
+            .as_deref(),
+            Some("merged")
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM action_runs WHERE id = ?1",
+                "pr-action-run"
+            )
+            .await
+            .as_deref(),
+            Some("complete"),
+            "the pr node's blocked action run completes"
+        );
+        let observed = latest_resolution_attribution(db, "mr-pr-node")
+            .await
+            .expect("the observation is journaled");
+        assert_eq!(observed.action, "merge");
+        assert_eq!(observed.actor_kind, "unjournaled");
+        assert_eq!(observed.surface, "github-refresh-observation");
+        assert_eq!(observation_count(db).await, 1);
+
+        let again = resolve_observed_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some("b77e7657"),
+        )
+        .await
+        .expect("a repeat observation is harmless");
+        assert!(!again, "a resolved row is not resolved twice");
+        assert_eq!(observation_count(db).await, 1, "journaled once");
+        assert_eq!(row("CAST(merged_at AS TEXT)").await, merged_at);
+    }
+
+    /// GitHub closing a pull request says nothing about an issue somebody has
+    /// already resolved, so an observed close never rewrites a merged issue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_observed_close_leaves_an_already_resolved_issue_alone() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+        crate::issues::status::resolve_terminal(
+            &orch,
+            db,
+            "issue-pr-node",
+            Resolution::Merged,
+            crate::issues::status::StopFailure::Escalates,
+        )
+        .await
+        .expect("the issue resolves merged");
+
+        assert!(
+            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Close, None)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM merge_requests WHERE id = ?1",
+                "mr-pr-node"
+            )
+            .await
+            .as_deref(),
+            Some("closed")
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM issues WHERE id = ?1",
+                "issue-pr-node"
+            )
+            .await
+            .as_deref(),
+            Some("merged"),
+            "the observed close does not overwrite the issue's resolution"
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT status FROM action_runs WHERE id = ?1",
+                "pr-action-run"
+            )
+            .await
+            .as_deref(),
+            Some("complete"),
+            "the pr node still resolves"
+        );
+    }
+
+    /// A pull request a newer one superseded does not close the issue the newer
+    /// one serves.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_observed_close_of_a_superseded_pull_request_keeps_the_issue_open() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
         db.execute(
-            "INSERT INTO pr_resolution_attributions (id, merge_request_id, action, actor_kind, surface, lane_snapshot, created_at)
-             VALUES ('old-close', 'mr-pr-node', 'close', 'operator-ui', 'operator-ui', '{}', 1)",
+            "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-newer', 'builder-job-2', 'proj-pr-node', 'issue-pr-node', 'Retry', 'agent/proj-3-builder-1', 'main', 'open', 5, 5)",
             (),
         )
         .await
         .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
 
-        ensure_unjournaled_merge_observation(&orch, db, "mr-pr-node", "builder-job")
-            .await
-            .unwrap();
-        ensure_unjournaled_merge_observation(&orch, db, "mr-pr-node", "builder-job")
-            .await
-            .unwrap();
+        assert!(
+            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Close, None)
+                .await
+                .unwrap()
+        );
 
-        let observed = latest_resolution_attribution(db, "mr-pr-node")
-            .await
-            .expect("the observed merge is durable");
-        assert_eq!(observed.action, "merge");
-        assert_eq!(observed.actor_kind, "unjournaled");
-        assert_eq!(observed.surface, "github-refresh-observation");
         assert_eq!(
-            db.query_opt_i64(
-                "SELECT COUNT(*) FROM pr_resolution_attributions WHERE merge_request_id = 'mr-pr-node' AND action = 'merge' AND actor_kind = 'unjournaled'",
-                (),
+            scalar(
+                db,
+                "SELECT status FROM merge_requests WHERE id = ?1",
+                "mr-pr-node"
             )
             .await
-            .unwrap()
-            .unwrap(),
-            1
+            .as_deref(),
+            Some("closed")
+        );
+        let issue_status = scalar(
+            db,
+            "SELECT status FROM issues WHERE id = ?1",
+            "issue-pr-node",
+        )
+        .await
+        .and_then(|status| status.parse::<crate::models::IssueStatus>().ok())
+        .expect("the issue has a status");
+        assert!(
+            !issue_status.is_terminal(),
+            "the issue stays unresolved, got {issue_status}"
+        );
+    }
+
+    /// Cairn's own GitHub merge can be observed by a refresh before it resolves
+    /// the row itself. The observation then owns the cascade, and Cairn's late
+    /// resolution records only what it knows better: who acted, and the commit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cairn_merge_overtaken_by_its_observation_records_its_actor_and_commit() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let db = &orch.db.local;
+
+        assert!(
+            resolve_observed_pr_node(&orch, "builder-job", PrNodeResolution::Merge, None)
+                .await
+                .unwrap()
+        );
+        let merged_at = scalar(
+            db,
+            "SELECT CAST(merged_at AS TEXT) FROM merge_requests WHERE id = ?1",
+            "mr-pr-node",
+        )
+        .await;
+
+        resolve_pr_node(
+            &orch,
+            "builder-job",
+            PrNodeResolution::Merge,
+            Some(PrResolutionAttribution::operator_ui()),
+            Some("cafe1234"),
+        )
+        .await
+        .expect("the late resolution lands");
+
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT merged_commit FROM merge_requests WHERE id = ?1",
+                "mr-pr-node"
+            )
+            .await
+            .as_deref(),
+            Some("cafe1234")
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT CAST(merged_at AS TEXT) FROM merge_requests WHERE id = ?1",
+                "mr-pr-node"
+            )
+            .await,
+            merged_at,
+            "the row moved once"
+        );
+        let latest = latest_resolution_attribution(db, "mr-pr-node")
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.actor_kind, "operator-ui",
+            "the actor outranks the observation"
         );
     }
 
@@ -1238,7 +1523,7 @@ mod tests {
             .unwrap();
         }
 
-        resolve_pr_node(&orch, job_id, PrNodeResolution::Close, None)
+        resolve_pr_node(&orch, job_id, PrNodeResolution::Close, None, None)
             .await
             .expect("a team PR resolves its close transition against the injected replica");
 

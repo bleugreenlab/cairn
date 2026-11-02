@@ -385,6 +385,10 @@ pub struct PullRequest {
     pub(crate) additions: i32,
     pub(crate) deletions: i32,
     pub(crate) merged: bool,
+    /// The commit a merged pull request wrote to its base. GitHub also fills
+    /// this for an open pull request (a test merge), so it means nothing unless
+    /// `merged` is set.
+    pub(crate) merge_commit_sha: Option<String>,
     pub(crate) head: PrHead,
 }
 

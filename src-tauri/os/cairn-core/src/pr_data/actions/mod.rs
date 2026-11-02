@@ -40,6 +40,6 @@ pub use refresh::{
     close_pr_for_job, refresh_pr_for_job, refresh_pr_for_job_live, render_live_pr_section,
 };
 pub use resolution::{
-    advance_producing_execution_after_pr_resolution, ensure_unjournaled_merge_observation,
-    latest_resolution_attribution, resolve_pr_node, PrResolutionAttribution,
+    advance_producing_execution_after_pr_resolution, latest_resolution_attribution,
+    resolution_actor_label, resolve_pr_node, PrResolutionAttribution,
 };

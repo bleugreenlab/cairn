@@ -20,6 +20,7 @@ struct IssuePrSummary {
     action: Option<String>,
     actor_kind: Option<String>,
     actor_identity: Option<String>,
+    surface: Option<String>,
     resolved_at: Option<i64>,
 }
 
@@ -281,9 +282,9 @@ async fn render_issue_parts(
     let pr: Option<IssuePrSummary> = match conn
         .query(
             "
-            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, a.action, a.actor_kind, a.actor_identity, a.created_at
+            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, a.action, a.actor_kind, a.actor_identity, a.created_at, a.surface
             FROM merge_requests mr
-            LEFT JOIN pr_resolution_attributions a ON a.id = (SELECT a2.id FROM pr_resolution_attributions a2 WHERE a2.merge_request_id = mr.id ORDER BY a2.created_at DESC LIMIT 1)
+            LEFT JOIN pr_resolution_attributions a ON a.id = (SELECT a2.id FROM pr_resolution_attributions a2 WHERE a2.merge_request_id = mr.id ORDER BY a2.created_at DESC, CASE WHEN a2.actor_kind = 'unjournaled' THEN 1 ELSE 0 END LIMIT 1)
             WHERE mr.issue_id = ?1
             ORDER BY mr.opened_at DESC
             LIMIT 1
@@ -301,6 +302,7 @@ async fn render_issue_parts(
                 actor_kind: row.opt_text(4).ok()?,
                 actor_identity: row.opt_text(5).ok()?,
                 resolved_at: row.opt_i64(6).ok()?,
+                surface: row.opt_text(7).ok()?,
             })
         }),
         Err(_) => None,
@@ -316,6 +318,7 @@ async fn render_issue_parts(
         action,
         actor_kind,
         actor_identity,
+        surface,
         resolved_at,
     }) = pr.filter(|pr| pr.number.is_some_and(|number| number > 0))
     {
@@ -325,13 +328,11 @@ async fn render_issue_parts(
             ("merged", Some("merge")) | ("closed", Some("close"))
         );
         if action_matches_state {
-            let actor = match (actor_kind.as_deref(), actor_identity.as_deref()) {
-                (Some("operator-ui"), _) => "operator (UI)",
-                (Some("operator-cli"), _) => "operator (CLI)",
-                (_, Some(identity)) => identity,
-                (Some("unjournaled"), _) | (None, _) => "merge performed by an unjournaled path",
-                (Some(kind), _) => kind,
-            };
+            let actor = crate::pr_data::actions::resolution_actor_label(
+                actor_kind.as_deref(),
+                actor_identity.as_deref(),
+                surface.as_deref(),
+            );
             let verb = if pr_status == "merged" {
                 "Merged"
             } else {

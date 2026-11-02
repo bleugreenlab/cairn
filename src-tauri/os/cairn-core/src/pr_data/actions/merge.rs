@@ -269,7 +269,7 @@ use super::context::{
     db_error, resolve_merge_mr_context_for_job, MergeMrContext, PrNodeResolution,
 };
 use super::refresh::refresh_pr_for_job;
-use super::resolution::{persist_merged_commit, resolve_pr_node};
+use super::resolution::resolve_pr_node;
 use super::store_merge::{
     land_verified_store_merge_child, prospective_store_merge_child, VerifiedLanding,
 };
@@ -699,6 +699,7 @@ async fn after_github_merge(
     merge_context: MergeMrContext,
     merge_started: std::time::Instant,
     attribution: Option<super::PrResolutionAttribution>,
+    merged_commit: Option<String>,
 ) -> Result<String, String> {
     let repo_path = merge_context.mr.repo_path.clone();
     let source_branch = merge_context.source_branch.clone();
@@ -711,14 +712,20 @@ async fn after_github_merge(
     // through the terminal cascade (live work stopped, sessions closed, warm
     // processes evicted). Runs only after the GitHub call succeeded.
     let resolve_started = std::time::Instant::now();
-    resolve_pr_node(orch, job_id, PrNodeResolution::Merge, attribution)
-        .await
-        .map_err(|error| {
-            log::error!(
-                "GitHub merged PR but failed to mark merge request merged for job {job_id}: {error}"
-            );
-            error
-        })?;
+    resolve_pr_node(
+        orch,
+        job_id,
+        PrNodeResolution::Merge,
+        attribution,
+        merged_commit.as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        log::error!(
+            "GitHub merged PR but failed to mark merge request merged for job {job_id}: {error}"
+        );
+        error
+    })?;
     log::info!(
         "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
         resolve_started.elapsed()
@@ -1093,9 +1100,17 @@ async fn merge_pr_for_job_past_barrier(
         if via_github {
             super::default_landing::record_allocations(orch, &db, &merge_context, &landed).await;
             let notice = config_notice.clone();
-            return after_github_merge(orch, db, job_id, merge_context, merge_started, attribution)
-                .await
-                .map(|reply| with_merge_notice(reply, notice.as_deref()));
+            return after_github_merge(
+                orch,
+                db,
+                job_id,
+                merge_context,
+                merge_started,
+                attribution,
+                landed.landed_commit.clone(),
+            )
+            .await
+            .map(|reply| with_merge_notice(reply, notice.as_deref()));
         }
         let commit = landed
             .landed_commit
@@ -1181,7 +1196,6 @@ async fn merge_pr_for_job_past_barrier(
                 .to_string()
         })?
     };
-    persist_merged_commit(&db, &merge_context.mr.mr_id, &merged_commit).await?;
     log::info!(
         "merge_pr_for_job[{job_id}]: store_merge_child (fold + origin) took {:?}",
         fold_started.elapsed()
@@ -1215,10 +1229,16 @@ async fn merge_pr_for_job_past_barrier(
     }
 
     let resolve_started = std::time::Instant::now();
-    resolve_pr_node(orch, job_id, PrNodeResolution::Merge, attribution)
-        .await
-        .map_err(|error| {
-            log::error!(
+    resolve_pr_node(
+        orch,
+        job_id,
+        PrNodeResolution::Merge,
+        attribution,
+        Some(merged_commit.as_str()),
+    )
+    .await
+    .map_err(|error| {
+        log::error!(
                 "Merged git branch but failed to mark merge request merged for job/action {}: {}",
                 job_id,
                 error
