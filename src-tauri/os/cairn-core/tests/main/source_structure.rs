@@ -897,8 +897,10 @@ fn logical_reads_cannot_acquire_or_refresh_materializations() {
 /// removed, which is the difference between a test and a decoration.
 ///
 /// A scrubber whose owner deliberately spans functions — handed to a long-lived
-/// registry that drains it elsewhere — is built through a constructor reference
-/// rather than a call, and is covered by that registry's own tests instead.
+/// registry that drains it elsewhere — is built through `Default`
+/// (`or_default()`, `StreamingScrubber::default()`) or a constructor reference
+/// rather than a `new()` call, next to a comment naming the drain, and is
+/// covered by that registry's own tests instead.
 #[test]
 fn every_stream_scrubber_is_flushed_in_the_block_that_builds_it() {
     let mut offenders = Vec::new();

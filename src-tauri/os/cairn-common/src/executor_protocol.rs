@@ -6537,6 +6537,14 @@ pub struct LearnedResourceEstimate {
 /// runner-side readings of frames every executor already sends; no frame,
 /// variant, field or serialized form changes, and a runner talking to an older
 /// executor gets nothing wrong.
+///
+/// cairn/5856 does not move the number. The executor's resident pipe reader
+/// builds its stream scrubber in the block that flushes it, so the
+/// structural flush audit can see the drain; the bytes it emits are the same,
+/// a line-framed stream's unterminated tail still released by the
+/// end-of-stream flush. No frame, variant, field or serialized form changes,
+/// and a runner talking to an older executor gets nothing wrong: that
+/// executor already flushes the same tail.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

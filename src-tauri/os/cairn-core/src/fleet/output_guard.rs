@@ -142,19 +142,18 @@ impl RelayedOutput {
         chunk: &[u8],
     ) -> Vec<u8> {
         let key = resident_stream_key(executor_id, holder_key, process_key, generation, stream);
-        if !self.streams.contains_key(&key) {
-            let line_framed = stream == ResidentProcessStream::Stdout
-                && self.bind_line_framing(
-                    &resident_process_key(executor_id, holder_key, process_key),
-                    generation,
-                );
-            let scrubber = StreamingScrubber::new();
-            let scrubber = if line_framed {
-                scrubber.line_framed()
-            } else {
-                scrubber
-            };
-            self.streams.insert(key.clone(), scrubber);
+        // Built into the registry like every stream here, and drained by
+        // `finish_bytes` at the process's exit or `finish_all_text` at the
+        // batch's end.
+        if !self.streams.contains_key(&key)
+            && stream == ResidentProcessStream::Stdout
+            && self.bind_line_framing(
+                &resident_process_key(executor_id, holder_key, process_key),
+                generation,
+            )
+        {
+            self.streams
+                .insert(key.clone(), StreamingScrubber::default().line_framed());
         }
         self.stream(&key).push(chunk)
     }
@@ -623,6 +622,53 @@ mod tests {
         assert_eq!(second, FRAME);
 
         finish_resident_process(&shared, "exec", "job:1", "repl:a", 2);
+        assert!(shared.lock().unwrap().line_framed_stdout.is_empty());
+    }
+
+    /// A line-framed stdout that ends without a newline, as a process that
+    /// dies mid-frame leaves it: the unterminated line waits like any byte
+    /// stream's tail, and the exit drains it scrubbed rather than dropping it.
+    #[test]
+    fn a_line_framed_stdout_tail_is_scrubbed_and_released_at_exit() {
+        let _newline = register_leading_newline("relay-lines-tail-newline");
+        let _guard = register("relay-lines-tail", LONG);
+        let shared = RelayedOutput::shared();
+        shared.lock().unwrap().declare_stdout_framing(
+            "exec",
+            "job:1",
+            "repl:a",
+            ResidentStreamFraming::Lines,
+        );
+        assert_eq!(
+            settle(&mut shared.lock().unwrap(), ResidentProcessStream::Stdout),
+            FRAME,
+            "the stream is line-framed"
+        );
+
+        let prefix = &LONG[..10];
+        let settled = shared.lock().unwrap().settle_resident_bytes(
+            "exec",
+            "job:1",
+            "repl:a",
+            1,
+            ResidentProcessStream::Stdout,
+            format!("{{\"v\":\"{LONG}\",\"w\":\"{prefix}").as_bytes(),
+        );
+        assert_eq!(
+            settled, b"{\"v\":\"[REDACTED]\",\"w\":\"",
+            "an unsettled tail must not go out early"
+        );
+
+        let residue = finish_resident_process(&shared, "exec", "job:1", "repl:a", 1);
+        assert_eq!(
+            residue,
+            vec![(ResidentProcessStream::Stdout, prefix.as_bytes().to_vec())],
+            "the exit owes the caller the bytes the line-framed stream withheld"
+        );
+        assert_eq!(
+            String::from_utf8([settled, residue[0].1.clone()].concat()).unwrap(),
+            format!("{{\"v\":\"[REDACTED]\",\"w\":\"{prefix}")
+        );
         assert!(shared.lock().unwrap().line_framed_stdout.is_empty());
     }
 

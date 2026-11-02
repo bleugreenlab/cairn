@@ -524,6 +524,37 @@ mod tests {
         assert_eq!(scrubber.pending(), 0);
     }
 
+    /// A line-framed stream is still flushed at its end. A process that dies
+    /// mid-frame leaves an unterminated last line; its unsettled tail waits
+    /// under the byte-stream rule, and the flush scrubs and releases it.
+    #[test]
+    fn a_line_framed_stream_scrubs_an_unterminated_tail_at_flush() {
+        let snapshot = snapshot_with(&[LEADING_NEWLINE, SECRET]);
+        let head = &SECRET[..6];
+        let mut full = FRAME.to_vec();
+        full.extend_from_slice(format!("{{\"v\":\"{SECRET}\",\"w\":\"{head}").as_bytes());
+        let mut expected = FRAME.to_vec();
+        expected.extend_from_slice(format!("{{\"v\":\"[REDACTED]\",\"w\":\"{head}").as_bytes());
+        let full = String::from_utf8(full).unwrap();
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let (left, right) = full.split_at(split);
+            let mut scrubber = StreamingScrubber::with_snapshot(snapshot.clone()).line_framed();
+            let mut out = scrubber.push(left.as_bytes());
+            out.extend(scrubber.push(right.as_bytes()));
+            assert_eq!(
+                out,
+                &expected[..expected.len() - head.len()],
+                "split {split}: the unsettled tail is withheld, not lost"
+            );
+            out.extend(scrubber.flush());
+            assert_eq!(scrubber.pending(), 0, "split {split}");
+            assert_eq!(out, expected, "split {split}");
+        }
+    }
+
     #[test]
     fn withheld_suffix_stays_bounded() {
         let snapshot = snapshot_with(&[SECRET]);
