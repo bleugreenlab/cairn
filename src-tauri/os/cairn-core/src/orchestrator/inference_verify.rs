@@ -8,9 +8,17 @@
 //! `verify:<id>`: placement acquires it as it acquires any pinned model,
 //! displacing the unpinned residents on its machines, reserving its room and
 //! draining batches as for any load. A pool another holder has pinned is
-//! refused, naming them. Every path ends with the deployment unloaded (its pin
-//! revoked and it stopped); placement's own rules bring the pool's models back
-//! (a request reacquires one, an idle pool places its warm model).
+//! refused, naming them. A verification on its own ends with the deployment
+//! unloaded (its pin revoked and it stopped); placement's own rules bring the
+//! pool's models back (a request reacquires one, an idle pool places its warm
+//! model).
+//!
+//! A load of a model with no deployment on the pool verifies first and keeps
+//! what passes: the requester's request for the deployment is recorded while
+//! the verification's pin still holds it, then the pin is released, so the
+//! model stays resident and serving, its idle clock running as for any load,
+//! and is never stopped and started again. A load whose verification fails
+//! ends unloaded like any other.
 //!
 //! A start that fails because the context does not fit the KV cache (vLLM
 //! names the cache's size) is recorded, the profile is revised in place with
@@ -52,6 +60,17 @@ pub trait Act: Send + Sync {
     fn pin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
     /// Unload `deployment` for `holder`: revoke its pin and stop it.
     fn unload(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
+    /// Request `model` on `pool` for `requester`, as a load does; refused
+    /// unless placement leases `deployment` for it.
+    fn request(
+        &self,
+        deployment: String,
+        model: String,
+        pool: String,
+        requester: String,
+    ) -> Pending<'_, Result<String, String>>;
+    /// Release `holder`'s pin on `deployment`, leaving it resident.
+    fn unpin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>>;
     /// A GET's body, `None` when it did not answer successfully.
     fn get(&self, url: String) -> Pending<'_, Option<String>>;
     fn chat(&self, api_base: String, model: String) -> Pending<'_, Result<ChatSample, String>>;
@@ -234,6 +253,9 @@ pub struct Planned {
     pub profile: InferenceProfileId,
     pub pool: PoolKey,
     pub deployment: DeploymentId,
+    /// Who the deployment stays loaded for once it passes, when a load of its
+    /// model started it; `None` unloads it after measuring.
+    pub then_keep: Option<String>,
 }
 
 fn port_for(profile: &InferenceProfile) -> u16 {
@@ -402,6 +424,7 @@ pub async fn begin(
         profile: profile.id,
         pool: pool_id.clone(),
         deployment: deployment.id,
+        then_keep: None,
     })
 }
 
@@ -462,6 +485,47 @@ async fn release(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Vec<String> {
     problems
 }
 
+/// Keep a passed verification's deployment loaded for `requester`: record
+/// their request for it while the verification's pin still holds it, then
+/// release the pin, so it is never stopped and started again. A request that
+/// cannot be recorded leaves it to be unloaded as a verification on its own
+/// is. What went wrong, if anything.
+async fn keep(db: &LocalDb, act: &dyn Act, plan: &Planned, requester: &str) -> Vec<String> {
+    let model = load_inventory(db).await.and_then(|inventory| {
+        inventory
+            .profiles
+            .get(&plan.profile)
+            .map(|profile| profile.model.name.clone())
+            .ok_or_else(|| "the profile is gone".to_string())
+    });
+    let requested = match model {
+        Ok(model) => {
+            act.request(
+                plan.deployment.to_string(),
+                model,
+                plan.pool.to_string(),
+                requester.to_string(),
+            )
+            .await
+        }
+        Err(why) => Err(why),
+    };
+    if let Err(why) = requested {
+        let mut problems = vec![format!(
+            "it could not be kept loaded for {requester}: {why}"
+        )];
+        problems.extend(release(db, act, plan).await);
+        return problems;
+    }
+    match act
+        .unpin(plan.deployment.to_string(), holder(&plan.id))
+        .await
+    {
+        Ok(_) => Vec::new(),
+        Err(why) => vec![why],
+    }
+}
+
 /// Run one verification to its end.
 pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome, String> {
     set_stage(db, &plan.id, Stage::Start).await?;
@@ -470,7 +534,10 @@ pub async fn run(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Outcome,
         return Ok(Outcome::Failed(why));
     }
     let measured = measure(db, act, plan).await;
-    let problems = release(db, act, plan).await;
+    let problems = match (&measured, &plan.then_keep) {
+        (Ok(_), Some(requester)) => keep(db, act, plan, requester).await,
+        _ => release(db, act, plan).await,
+    };
     let (outcome, reason) = match measured {
         Ok(m) => {
             record(db, &plan.id, &m).await?;
@@ -695,19 +762,20 @@ pub async fn recover(db: &LocalDb, act: &dyn Act) -> Result<Vec<String>, String>
     Ok(recovered)
 }
 
-/// The profiles of `model` to try on a pool of `family` hardware, imported
-/// first, then generated, more precise before less and fewer machines first.
+/// The profiles of `model` (its real name, case-insensitive) to try on a pool
+/// of `size` machines of `family` hardware, imported first, then generated,
+/// more precise before less and fewer machines first.
 pub fn candidates(
     inventory: &Inventory,
     model: &str,
-    pool: &Pool,
+    size: usize,
     family: Option<AcceleratorFamily>,
 ) -> Vec<InferenceProfileId> {
-    let size = pool.members.len();
     let mut profiles: Vec<&InferenceProfile> = inventory
         .profiles
         .values()
-        .filter(|r| r.model.name == model && matches!(r.engine, Engine::Container(_)))
+        .filter(|r| r.model.name.trim().eq_ignore_ascii_case(model.trim()))
+        .filter(|r| matches!(r.engine, Engine::Container(_)))
         .filter(|r| r.requirements.machines as usize <= size)
         .filter(|r| match (family, r.requirements.accelerator) {
             (Some(family), Some(accelerator)) => accelerator.family == family,
@@ -735,7 +803,9 @@ pub fn candidates(
 }
 
 /// Verify `profiles` in order on `pool`, each once more after a clamp, until
-/// one passes (or every one, with `all`). Each verification is its own row.
+/// one passes (or every one, with `all`, unless what passes is kept loaded
+/// for `then_keep`). Each verification is its own row.
+#[allow(clippy::too_many_arguments)]
 pub async fn verify_in_order(
     db: &LocalDb,
     act: &dyn Act,
@@ -743,6 +813,7 @@ pub async fn verify_in_order(
     pool: &Pool,
     requested_by: &str,
     all: bool,
+    then_keep: Option<&str>,
     first: Option<Planned>,
 ) -> Result<Vec<(String, Outcome)>, String> {
     let mut results = Vec::new();
@@ -750,7 +821,7 @@ pub async fn verify_in_order(
     for profile in profiles {
         let mut clamps = 0;
         loop {
-            let plan = match first.take() {
+            let mut plan = match first.take() {
                 Some(plan) if plan.profile == profile => plan,
                 _ => match begin(db, profile.as_str(), pool, requested_by, act.now_ms()).await {
                     Ok(plan) => plan,
@@ -760,11 +831,12 @@ pub async fn verify_in_order(
                     }
                 },
             };
+            plan.then_keep = then_keep.map(str::to_string);
             let outcome = run(db, act, &plan).await?;
             results.push((plan.id.clone(), outcome.clone()));
             match outcome {
                 Outcome::Clamped { .. } if clamps == 0 => clamps += 1,
-                Outcome::Passed if !all => return Ok(results),
+                Outcome::Passed if !all || then_keep.is_some() => return Ok(results),
                 _ => break,
             }
         }
@@ -803,6 +875,45 @@ impl Act for Live {
     fn unload(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
         Box::pin(async move {
             models::unload(&self.orch, &DeploymentId::new(deployment), &holder).await
+        })
+    }
+
+    fn request(
+        &self,
+        deployment: String,
+        model: String,
+        pool: String,
+        requester: String,
+    ) -> Pending<'_, Result<String, String>> {
+        Box::pin(async move {
+            let handle = models::request(
+                &self.orch,
+                &model,
+                &requester,
+                Some(&PoolKey::from(pool.as_str())),
+            )
+            .await?;
+            if handle.deployment.as_str() != deployment {
+                let _ = models::cancel(&self.orch, handle.id, &requester).await;
+                return Err(format!(
+                    "placement leased {} for {model}, not {deployment}",
+                    handle.deployment
+                ));
+            }
+            Ok(handle.status(&self.orch).await?.describe())
+        })
+    }
+
+    fn unpin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
+        Box::pin(async move {
+            let target = PinTarget::Deployment(DeploymentId::new(deployment.clone()));
+            match models::release(&self.orch, target, &holder, false).await {
+                // Someone revoked it already: it is resident all the same.
+                Err(why) if why == models::NOTHING_PINNED => {
+                    Ok(format!("{deployment} is not pinned"))
+                }
+                said => said,
+            }
         })
     }
 
@@ -948,12 +1059,14 @@ pub fn spawn_recovery(orch: super::Orchestrator) {
 
 /// Start verifying `profiles` on `pool` in the background, the first planned
 /// now so a refusal is answered at once; return the first verification's id.
+/// With `then_keep`, the first that passes stays loaded for them.
 pub async fn spawn(
     orch: &super::Orchestrator,
     profiles: Vec<InferenceProfileId>,
     pool: Pool,
     requested_by: &str,
     all: bool,
+    then_keep: Option<String>,
 ) -> Result<String, String> {
     let first = profiles
         .first()
@@ -972,8 +1085,17 @@ pub async fn spawn(
     let requested_by = requested_by.to_string();
     let db = orch.db.local.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            verify_in_order(&db, &live, profiles, &pool, &requested_by, all, Some(plan)).await
+        if let Err(error) = verify_in_order(
+            &db,
+            &live,
+            profiles,
+            &pool,
+            &requested_by,
+            all,
+            then_keep.as_deref(),
+            Some(plan),
+        )
+        .await
         {
             log::warn!(
                 "inference: a verification on pool {} stopped: {error}",
@@ -1051,6 +1173,8 @@ machines:
         refuse_pin: Mutex<Option<String>>,
         /// The pinned deployment placement starts on its next pass.
         pending: Mutex<Option<String>>,
+        /// Placement refuses a request with this.
+        refuse_request: Mutex<Option<String>>,
     }
 
     impl<'a> Fake<'a> {
@@ -1062,6 +1186,7 @@ machines:
                 now: Mutex::new(1_000_000),
                 refuse_pin: Mutex::default(),
                 pending: Mutex::default(),
+                refuse_request: Mutex::default(),
             }
         }
 
@@ -1151,6 +1276,35 @@ machines:
                 )
                 .await;
                 Ok("unloaded".into())
+            })
+        }
+
+        fn request(
+            &self,
+            deployment: String,
+            model: String,
+            pool: String,
+            requester: String,
+        ) -> Pending<'_, Result<String, String>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("request {deployment} {model} {pool} {requester}"));
+                match self.refuse_request.lock().unwrap().clone() {
+                    Some(why) => Err(why),
+                    None => Ok("requested".into()),
+                }
+            })
+        }
+
+        fn unpin(&self, deployment: String, holder: String) -> Pending<'_, Result<String, String>> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("unpin {deployment} {holder}"));
+                Ok("released".into())
             })
         }
 
@@ -1245,6 +1399,105 @@ machines:
         assert!(!row.stale(&load_inventory(&db).await.unwrap()));
     }
 
+    /// A verification a load started, planned on `box`.
+    async fn load_plan(db: &LocalDb, profile: &str) -> Planned {
+        Planned {
+            then_keep: Some("operator".into()),
+            ..begin(db, profile, &solo(), "operator", 1).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_load_s_pass_hands_the_pin_to_a_request_and_never_stops_it() {
+        let db = seeded("inference-verify-keep").await;
+        let fake = Fake::new(&db);
+        let plan = load_plan(&db, "embed").await;
+        assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
+        let holder = format!("verify:{}", plan.id);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("pin verify-embed-box {holder}"),
+                "request verify-embed-box Qwen/Qwen3-Embedding-4B box operator".to_string(),
+                format!("unpin verify-embed-box {holder}"),
+            ],
+            "the request is recorded while the pin holds it, and nothing unloads it"
+        );
+        assert!(matches!(
+            phase(&db, &plan.deployment).await.unwrap(),
+            Some(Phase::Healthy { .. })
+        ));
+        let row = &load_verifications(&db).await.unwrap()[0];
+        assert_eq!(
+            (row.outcome.as_str(), row.reason.as_deref()),
+            ("passed", None)
+        );
+        assert_eq!(row.embed_tps, Some(2_000.0));
+    }
+
+    #[tokio::test]
+    async fn a_load_s_failure_unloads_as_any_verification_does() {
+        let db = seeded("inference-verify-keep-fail").await;
+        let fake = Fake::new(&db);
+        fake.failures
+            .lock()
+            .unwrap()
+            .push("CUDA driver version is insufficient for CUDA runtime version".into());
+        let plan = load_plan(&db, "chat").await;
+        assert!(matches!(
+            run(&db, &fake, &plan).await.unwrap(),
+            Outcome::Failed(_)
+        ));
+        let holder = format!("verify:{}", plan.id);
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("pin verify-chat-box {holder}"),
+                format!("unload verify-chat-box {holder}"),
+            ]
+        );
+        assert_eq!(load_verifications(&db).await.unwrap()[0].outcome, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_load_s_pass_placement_will_not_lease_is_unloaded_and_says_why() {
+        let db = seeded("inference-verify-keep-refused").await;
+        let fake = Fake::new(&db);
+        *fake.refuse_request.lock().unwrap() = Some("verify-embed-box is in no pool".into());
+        let plan = load_plan(&db, "embed").await;
+        assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
+        assert_eq!(
+            fake.calls().last().unwrap(),
+            &format!("unload verify-embed-box verify:{}", plan.id)
+        );
+        let row = &load_verifications(&db).await.unwrap()[0];
+        assert_eq!(
+            row.reason.as_deref(),
+            Some("passed; afterwards: it could not be kept loaded for operator: verify-embed-box is in no pool")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_load_stops_at_the_first_pass_even_when_asked_for_every_profile() {
+        let db = seeded("inference-verify-keep-first").await;
+        let fake = Fake::new(&db);
+        let results = verify_in_order(
+            &db,
+            &fake,
+            vec!["embed".into(), "chat".into()],
+            &solo(),
+            "operator",
+            true,
+            Some("operator"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].1, Outcome::Passed);
+        assert!(fake.calls().iter().all(|call| !call.starts_with("unload")));
+    }
+
     #[tokio::test]
     async fn a_pin_waits_for_this_runs_load_not_the_last_ones_failure() {
         let db = seeded("inference-verify-this-run").await;
@@ -1277,6 +1530,7 @@ machines:
             &Pool::of_one("box"),
             "operator",
             false,
+            None,
             None,
         )
         .await
@@ -1456,12 +1710,7 @@ machines:
         };
         inventory.insert_profile(imported);
         assert_eq!(
-            candidates(
-                &inventory,
-                "chat/Model",
-                &Pool::of_one("box"),
-                Some(AcceleratorFamily::Nvidia)
-            ),
+            candidates(&inventory, "chat/model", 1, Some(AcceleratorFamily::Nvidia)),
             vec![
                 InferenceProfileId::from("chat-imp"),
                 "chat".into(),

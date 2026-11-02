@@ -148,6 +148,144 @@ async fn acting_thread_id(
         .flatten()
 }
 
+/// The thread a queue order is for, and who placed it.
+pub(super) type QueueOrderer = (
+    std::sync::Arc<cairn_db::storage::LocalDb>,
+    cairn_db::models::Thread,
+    String,
+);
+
+/// Who orders a thread's queue (cairn/5848): the thread itself (its sessions
+/// and their tasks, or a page it owns) or the operator, whose requests carry no
+/// run. Returns the project's database, the thread, and the name a hold moved
+/// ahead records as having placed it. A reorder skips no cap and moves no
+/// other thread's place, so this identification is proportionate.
+pub(super) async fn queue_orderer(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    thread: &str,
+) -> Result<QueueOrderer, String> {
+    let (db, project_id) = project_id(orch, project).await?;
+    let target = thread_by_name(&db, &project_id, thread).await?;
+    let no_run = request
+        .run_id
+        .as_deref()
+        .filter(|run| !run.is_empty())
+        .is_none();
+    if no_run && request.page_write_origin().is_none() {
+        return Ok((db, target, "the operator".to_string()));
+    }
+    let acting = acting_thread_id(orch, request, project, &db, &project_id).await;
+    if acting.as_deref() == Some(target.id.as_str()) {
+        let name = target.name.clone();
+        return Ok((db, target, name));
+    }
+    let other = match acting {
+        Some(id) => crate::threads::crud::list(&db, &project_id)
+            .await
+            .ok()
+            .and_then(|threads| threads.into_iter().find(|thread| thread.id == id))
+            .map_or(id, |thread| thread.name),
+        None => "no thread".to_string(),
+    };
+    Err(format!(
+        "Only {thread} (its sessions and their tasks) or the operator orders {thread}'s queue; \
+         this run acts for {other}. Nothing changed."
+    ))
+}
+
+/// Why `place:"head"` and `after:` never go together.
+pub(super) const HEAD_WITH_AFTER: &str = "place:\"head\" orders cap-held work; an after:-gated \
+     execution has no place until its gates clear. File it without after:, or order it later \
+     with cairn:~/queue {order:[N]}. Nothing changed.";
+
+/// The upfront checks of `place:\"head\"` at filing, run before anything is
+/// written: it orders cap-held work only, in the queue of the thread the
+/// filed issue belongs to, and only that thread or the operator may ask.
+/// Returns who placed it.
+pub(super) async fn head_placed_by(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+    parent_thread: Option<&str>,
+    filing: &str,
+    has_after: bool,
+) -> Result<String, String> {
+    if has_after {
+        return Err(HEAD_WITH_AFTER.to_string());
+    }
+    let Some(thread) = parent_thread else {
+        return Err(format!(
+            "place:\"head\" files an execution at the head of its parent thread's own queue, and \
+             {filing} has no parent thread. File it without place. Nothing changed."
+        ));
+    };
+    let (_, _, placed_by) = queue_orderer(orch, request, project, thread).await?;
+    Ok(placed_by)
+}
+
+/// The name of the thread issue `number` of `project` is a child of.
+pub(super) async fn issue_parent_thread(
+    orch: &Orchestrator,
+    project: &str,
+    number: i32,
+) -> Result<Option<String>, String> {
+    let db = orch.db.for_project(project).await;
+    db.query_opt_text(
+        "SELECT t.name FROM issues i
+           JOIN projects p ON p.id = i.project_id
+           JOIN threads t ON t.id = i.parent_thread_id
+          WHERE p.key = ?1 AND i.number = ?2",
+        (cairn_common::uri::canonical_project(project), number),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The name of the thread a write acts in, if it acts in one.
+pub(super) async fn acting_thread_name(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+) -> Option<String> {
+    let (db, project_id) = project_id(orch, project).await.ok()?;
+    let acting = acting_thread_id(orch, request, project, &db, &project_id).await?;
+    crate::threads::crud::list(&db, &project_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|thread| thread.id == acting)
+        .map(|thread| thread.name)
+}
+
+/// `Ordered harness's queue: 5841 (fleet 3rd, thread 1st), 5829 (thread 2nd)`.
+fn ordered_summary(
+    thread: &str,
+    listed: &[i64],
+    queue: &[crate::execution::gates::reorder::ThreadQueued],
+) -> String {
+    let (front, rest): (Vec<_>, Vec<_>) = queue
+        .iter()
+        .partition(|queued| listed.contains(&queued.issue_number));
+    let named: Vec<String> = front
+        .iter()
+        .map(|queued| {
+            let places = crate::execution::gates::reorder::places_phrase(queued, ", ");
+            format!("{} ({places})", queued.issue_number)
+        })
+        .collect();
+    let mut summary = format!("Ordered {thread}'s queue: {}", named.join(", "));
+    if !rest.is_empty() {
+        summary.push_str(&format!(
+            "; {} more behind them in their current order",
+            rest.len()
+        ));
+    }
+    summary.push('.');
+    summary
+}
+
 /// A structured row write's payload: a column map, absent meaning empty.
 fn row_payload(item: &ChangeItem) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     match item.payload.as_ref() {
@@ -207,6 +345,79 @@ pub(super) async fn dispatch(
     applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
+        (CairnResource::ThreadQueue { project, thread }, ChangeMode::Patch) => {
+            let order = item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("order"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    build_failure(
+                        index,
+                        item,
+                        "payload.order is this thread's children by issue number, first to start \
+                         first: {order:[5841, 5829]}. Nothing changed.",
+                    )
+                })?;
+            let (db, target, placed_by) = queue_orderer(orch, request, project, thread)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            if dry_run {
+                format!(
+                    "Would order {thread}'s queue: {}",
+                    serde_json::Value::from(order.clone())
+                )
+            } else {
+                let (thread_id, thread_name) = (target.id.clone(), target.name.clone());
+                let entries = order.clone();
+                let outcome = db
+                    .write(move |conn| {
+                        let (thread_id, thread_name) = (thread_id.clone(), thread_name.clone());
+                        let (entries, placed_by) = (entries.clone(), placed_by.clone());
+                        Box::pin(async move {
+                            crate::execution::gates::reorder::order_thread_queue_conn(
+                                conn,
+                                &thread_id,
+                                &thread_name,
+                                &entries,
+                                &placed_by,
+                            )
+                            .await
+                        })
+                    })
+                    .await
+                    .map_err(|error| build_failure(index, item, error.to_string()))?;
+                let rotation = match outcome {
+                    Ok(rotation) => rotation,
+                    Err(refusals) => {
+                        let lines: Vec<String> = refusals
+                            .iter()
+                            .map(|refusal| format!("- {refusal}"))
+                            .collect();
+                        return Err(build_failure(
+                            index,
+                            item,
+                            format!(
+                                "{thread}'s queue was not ordered:\n{}\nNothing changed.",
+                                lines.join("\n")
+                            ),
+                        ));
+                    }
+                };
+                for execution_id in &rotation.moved {
+                    let change = crate::notify::execution_gates_db_change_for_execution(
+                        &db,
+                        execution_id,
+                        "update",
+                    )
+                    .await;
+                    let _ = orch.services.emitter.emit("db-change", change);
+                }
+                let listed: Vec<i64> = order.iter().filter_map(serde_json::Value::as_i64).collect();
+                ordered_summary(thread, &listed, &rotation.queue)
+            }
+        }
         (CairnResource::ThreadBranches { project, thread }, ChangeMode::Append) => {
             let _payload = append_payload(index, item)?;
             if dry_run {

@@ -277,10 +277,34 @@ pub async fn set_gate_seq_conn(conn: &Connection, gate_id: &str, seq: i64) -> Db
 /// gate, so a census lists what the filer wrote first.
 pub const CAPACITY_GATE_SEQ_BASE: i64 = 1_000;
 
+/// A queue key is its second scaled by this, so keys minted in one second stay
+/// distinct and still sort with the second they were minted in. Spelled as a
+/// literal in [`queue_key_sql!`] and in the migration that backfilled the keys.
+pub const QUEUE_KEY_SCALE: i64 = 1_000_000;
+
+/// The newest queue key in this database. Ordered down to it rather than read
+/// as `MAX(queue_key)`, which Turso answers by walking the whole index; NULL
+/// keys (authored gates) sort last descending.
+const LAST_QUEUE_KEY_SQL: &str =
+    "SELECT queue_key FROM execution_gates ORDER BY queue_key DESC LIMIT 1";
+
+/// The key a capacity row filed at `now` takes: its second's, or one past the
+/// newest key in this database when that is later, so every key is unique.
+async fn mint_queue_key_conn(conn: &Connection, now: i64) -> DbResult<i64> {
+    let last = match conn.query(LAST_QUEUE_KEY_SQL, ()).await?.next().await? {
+        Some(row) => row.opt_i64(0)?,
+        None => None,
+    };
+    let scaled = now.saturating_mul(QUEUE_KEY_SCALE);
+    Ok(last.map_or(scaled, |last| scaled.max(last.saturating_add(1))))
+}
+
 /// Record that a capacity cap holds this execution now: its row exists, reads
-/// `no_evidence`, and carries `detail` as its facts (`CapacityHold` JSON). Inserted on first block;
-/// a later block rewrites the same row, so its `created_at` (the execution's
-/// place in line) survives the queue moving. Returns whether anything changed.
+/// `no_evidence`, and carries `detail` as its facts (`CapacityHold` JSON).
+/// Inserted on first block, with a freshly minted `queue_key` (its place in
+/// line) and `created_at` (its age held). A later block rewrites the same row's
+/// facts and touches neither, so a re-decided hold keeps its place. Returns
+/// whether anything changed.
 pub async fn hold_capacity_gate_conn(
     conn: &Connection,
     execution_id: &str,
@@ -314,14 +338,39 @@ pub async fn hold_capacity_gate_conn(
         return Ok(false);
     }
     let id = cairn_common::ids::mint_child(execution_id);
+    let queue_key = mint_queue_key_conn(conn, now).await?;
     conn.execute(
         "INSERT INTO execution_gates (
-             id, execution_id, seq, predicate_json, last_outcome, detail, created_at
-         ) VALUES (?1, ?2, ?3, ?4, 'no_evidence', ?5, ?6)",
-        params![id.as_str(), execution_id, seq, predicate_json, detail, now],
+             id, execution_id, seq, predicate_json, last_outcome, detail, created_at, queue_key
+         ) VALUES (?1, ?2, ?3, ?4, 'no_evidence', ?5, ?6, ?7)",
+        params![
+            id.as_str(),
+            execution_id,
+            seq,
+            predicate_json,
+            detail,
+            now,
+            queue_key
+        ],
     )
     .await?;
     Ok(true)
+}
+
+/// Move a capacity gate to another place in its queue, as a thread's own
+/// reorder does. Only ever a permutation of keys its thread's set already
+/// holds, so keys stay unique.
+pub async fn set_gate_queue_key_conn(
+    conn: &Connection,
+    gate_id: &str,
+    queue_key: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE execution_gates SET queue_key = ?2 WHERE id = ?1",
+        params![gate_id, queue_key],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Record that a capacity cap no longer blocks this execution, WITHOUT
@@ -385,8 +434,8 @@ pub struct BlockingCapacityGate {
     pub issue_id: Option<String>,
     pub predicate_json: String,
     pub detail: Option<String>,
-    /// When the execution first held on this cap: its place in line.
-    pub created_at: i64,
+    /// Its place in line on this cap: the queue's one order key.
+    pub queue_key: i64,
 }
 
 /// Every capacity gate currently blocking an execution that can still start
@@ -398,7 +447,8 @@ pub async fn list_blocking_capacity_gates_conn(
     let mut rows = conn
         .query(
             concat!(
-                "SELECT g.id, g.execution_id, e.issue_id, g.predicate_json, g.detail, g.created_at
+                "SELECT g.id, g.execution_id, e.issue_id, g.predicate_json, g.detail,
+                        COALESCE(g.queue_key, g.created_at * 1000000)
                    FROM execution_gates g
                    JOIN executions e ON e.id = g.execution_id
                   WHERE g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
@@ -407,7 +457,7 @@ pub async fn list_blocking_capacity_gates_conn(
                 cairn_db::awaiting_release_sql!(),
                 " AND NOT ",
                 cairn_db::awaits_authored_gate_sql!(),
-                " ORDER BY g.created_at, g.id"
+                " ORDER BY 6, g.id"
             ),
             (),
         )
@@ -420,14 +470,15 @@ pub async fn list_blocking_capacity_gates_conn(
             issue_id: row.opt_text(2)?,
             predicate_json: row.text(3)?,
             detail: row.opt_text(4)?,
-            created_at: row.i64(5)?,
+            queue_key: row.i64(5)?,
         });
     }
     Ok(gates)
 }
 
-/// An execution `e`'s place in the queue (see [`HeldExecution::held_since`]):
-/// the oldest capacity row's `created_at`, else the oldest gate's.
+/// How long execution `e` has been held (see [`HeldExecution::held_since`]):
+/// the oldest capacity row's `created_at`, else the oldest gate's. An age for
+/// display; the queue's order is [`queue_key_sql!`].
 #[macro_export]
 macro_rules! held_since_sql {
     () => {
@@ -435,6 +486,24 @@ macro_rules! held_since_sql {
             "COALESCE((SELECT MIN(g.created_at) FROM execution_gates g WHERE g.execution_id = e.id AND ",
             cairn_db::capacity_gate_sql!(),
             "), (SELECT MIN(first_gate.created_at) FROM execution_gates first_gate WHERE first_gate.execution_id = e.id))"
+        )
+    };
+}
+
+/// Execution `e`'s place in the queue (see [`HeldExecution::queue_key`]): its
+/// earliest BLOCKING capacity row's `queue_key` (the place a decision counts),
+/// else its earliest capacity row's (one whose cap cleared, which it wakes on
+/// when that cap blocks again), else its oldest gate's `created_at` on the same
+/// scale. The literal is [`QUEUE_KEY_SCALE`].
+#[macro_export]
+macro_rules! queue_key_sql {
+    () => {
+        concat!(
+            "COALESCE((SELECT MIN(g.queue_key) FROM execution_gates g WHERE g.execution_id = e.id AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
+            cairn_db::capacity_gate_sql!(),
+            "), (SELECT MIN(g.queue_key) FROM execution_gates g WHERE g.execution_id = e.id AND ",
+            cairn_db::capacity_gate_sql!(),
+            "), (SELECT MIN(first_gate.created_at) * 1000000 FROM execution_gates first_gate WHERE first_gate.execution_id = e.id))"
         )
     };
 }
@@ -447,16 +516,23 @@ pub struct HeldExecution {
     pub issue_id: Option<String>,
     pub issue_number: Option<i64>,
     pub seq: Option<i64>,
-    /// Its place in the queue: when it first held on a CAPACITY cap, or, with
-    /// no capacity row yet, its oldest gate's `created_at`. The sweep releases
-    /// oldest-held first across every database. An execution that waited on
-    /// its `after:` gates takes a place in the queue only when those clear, so
-    /// this agrees with the place in line a capacity row renders.
+    /// How long it has been held: when it first held on a CAPACITY cap, or,
+    /// with no capacity row yet, its oldest gate's `created_at`. The age a
+    /// surface shows; never the order.
     pub held_since: i64,
+    /// Its place in the queue: its earliest capacity row's `queue_key`, unique
+    /// within its database, or, with no capacity row yet, its oldest gate's
+    /// `created_at` on the key's scale. The sweep releases in this order across
+    /// every database, ties broken by database, then issue number (none last),
+    /// then seq: only executions with no capacity row can tie, as a burst
+    /// filed in one second does. An execution that waited on its `after:`
+    /// gates takes a capacity key only when those clear, so this agrees with
+    /// the place in line a capacity row renders.
+    pub queue_key: i64,
 }
 
-/// Every held execution that can still be released, in RELEASE order:
-/// ascending issue number, then execution seq. The set is
+/// Every held execution that can still be released, in queue order (see
+/// [`HeldExecution::queue_key`]). The set is
 /// [`cairn_db::awaiting_release_sql!`] — the same predicate the gate census
 /// lists as held — so a superseded execution, or one whose issue is already
 /// resolved, is excluded here AND rendered as `won't start` there.
@@ -471,12 +547,14 @@ pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldEx
             concat!(
                 "SELECT e.id, e.issue_id, i.number, e.seq, ",
                 held_since_sql!(),
+                ", ",
+                queue_key_sql!(),
                 "
                    FROM executions e
                    LEFT JOIN issues i ON i.id = e.issue_id
                   WHERE ",
                 cairn_db::awaiting_release_sql!(),
-                " ORDER BY i.number IS NULL, i.number, e.seq, e.id"
+                " ORDER BY 6, i.number IS NULL, i.number, e.seq, e.id"
             ),
             (),
         )
@@ -489,6 +567,7 @@ pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldEx
             issue_number: row.opt_i64(2)?,
             seq: row.opt_i64(3)?,
             held_since: row.opt_i64(4)?.unwrap_or(0),
+            queue_key: row.opt_i64(5)?.unwrap_or(0),
         });
     }
     Ok(held)
@@ -754,6 +833,141 @@ mod tests {
             None,
             "a lost race must not retroactively brand a release as an override"
         );
+    }
+
+    async fn queue_keys(db: &LocalDb) -> Vec<(String, String, i64)> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT execution_id, json_extract(predicate_json, '$.fact'), queue_key
+                           FROM execution_gates ORDER BY queue_key",
+                        (),
+                    )
+                    .await?;
+                let mut keys = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    keys.push((row.text(0)?, row.text(1)?, row.i64(2)?));
+                }
+                Ok(keys)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn hold(
+        db: &LocalDb,
+        execution_id: &'static str,
+        fact: &'static str,
+        detail: &'static str,
+        now: i64,
+    ) {
+        db.write(move |conn| {
+            Box::pin(async move {
+                let predicate = format!("{{\"fact\":\"{fact}\"}}");
+                hold_capacity_gate_conn(conn, execution_id, &predicate, 1000, detail, now).await
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// cairn/5848: a burst filed in one second still gets one distinct key per
+    /// hold, in filing order; a re-decided hold keeps its key; a later second
+    /// starts at its own scale.
+    #[tokio::test]
+    async fn queue_keys_are_unique_within_a_second_and_kept_across_decisions() {
+        let db = seeded_db().await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('i2', 'p', 2, 'Second', 'backlog', 'backlog', 'none', 1, 1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e2', 'recipe', 'i2', 'p', 'held', 1, 1);",
+        )
+        .await
+        .unwrap();
+        hold(&db, "e", "fleet_slot", "{}", 50).await;
+        hold(&db, "e", "thread_focus", "{}", 50).await;
+        hold(&db, "e2", "fleet_slot", "{}", 50).await;
+        // Re-decided with new facts, a second later: the same key.
+        hold(&db, "e", "fleet_slot", "{\"place\":1}", 51).await;
+        hold(&db, "e2", "thread_focus", "{}", 60).await;
+        assert_eq!(
+            queue_keys(&db).await,
+            vec![
+                (
+                    "e".to_string(),
+                    "fleet_slot".to_string(),
+                    50 * QUEUE_KEY_SCALE
+                ),
+                (
+                    "e".to_string(),
+                    "thread_focus".to_string(),
+                    50 * QUEUE_KEY_SCALE + 1
+                ),
+                (
+                    "e2".to_string(),
+                    "fleet_slot".to_string(),
+                    50 * QUEUE_KEY_SCALE + 2
+                ),
+                (
+                    "e2".to_string(),
+                    "thread_focus".to_string(),
+                    60 * QUEUE_KEY_SCALE
+                ),
+            ]
+        );
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT created_at FROM execution_gates WHERE execution_id = 'e' AND seq = 1000
+                  AND json_extract(predicate_json, '$.fact') = 'fleet_slot'",
+                ()
+            )
+            .await
+            .unwrap(),
+            Some(50),
+            "the age held is never rewritten"
+        );
+    }
+
+    /// Minting reads the newest key on every capacity filing, so it must
+    /// reach it through the index, never by sorting the table.
+    #[tokio::test]
+    async fn the_newest_queue_key_is_read_through_its_index() {
+        let db = seeded_db().await;
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(&format!("EXPLAIN QUERY PLAN {LAST_QUEUE_KEY_SQL}"), ())
+                        .await?;
+                    let mut plan = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        plan.push(row.text(3)?);
+                    }
+                    Ok(plan)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_execution_gates_queue_key")),
+            "the newest key is read through idx_execution_gates_queue_key: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.to_ascii_uppercase().contains("SORT")
+                    || line.to_ascii_uppercase().contains("B-TREE")),
+            "the newest key is not found by sorting: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn the_queue_key_macro_spells_the_scale() {
+        assert!(queue_key_sql!().contains(&format!("* {QUEUE_KEY_SCALE} ")));
     }
 
     /// Gates belong to their execution: deleting it takes them with it.

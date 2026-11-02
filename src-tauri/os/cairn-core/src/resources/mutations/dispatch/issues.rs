@@ -60,7 +60,37 @@ pub(super) async fn dispatch(
             } else {
                 None
             };
-            let execution = parse_create_execution_spec(index, item, payload)?;
+            let mut execution = parse_create_execution_spec(index, item, payload)?;
+            // `place:"head"` is checked before the issue exists, against the
+            // thread the new issue will be a child of: the one `parent` names,
+            // or else the thread this write acts in, which a thread's filing
+            // is parented under.
+            if let Some(spec) = execution
+                .as_mut()
+                .filter(|spec| spec.place != crate::execution::recipe::QueuePlace::Tail)
+            {
+                let parent_thread =
+                    match parent.as_deref() {
+                        Some(uri) => match cairn_common::uri::parse_uri(uri) {
+                            Some(cairn_common::uri::CairnResource::Thread {
+                                name, path, ..
+                            }) if path.is_empty() => Some(name),
+                            _ => None,
+                        },
+                        None => super::threads::acting_thread_name(orch, request, project).await,
+                    };
+                let placed_by = super::threads::head_placed_by(
+                    orch,
+                    request,
+                    project,
+                    parent_thread.as_deref(),
+                    "the new issue",
+                    !spec.after.is_empty(),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                spec.place = crate::execution::recipe::QueuePlace::Head { placed_by };
+            }
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
             if dry_run {
                 match &execution {
@@ -419,7 +449,7 @@ fn parse_create_execution_spec(
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe, backend?, overrides?, after?}",
+            "payload.execution must be an object {recipe, backend?, overrides?, after?, place?}",
         )
     })?;
     if let Some(refusal) =
@@ -458,6 +488,20 @@ fn parse_create_execution_spec(
             obj.get("after"),
             "payload.execution.after",
         )?,
+        // Who placed it is settled once the parent thread is known; until
+        // then `Head` only records that the head was asked for.
+        place: if super::executions::parse_place(
+            index,
+            item,
+            obj.get("place"),
+            "payload.execution.place",
+        )? {
+            crate::execution::recipe::QueuePlace::Head {
+                placed_by: String::new(),
+            }
+        } else {
+            crate::execution::recipe::QueuePlace::Tail
+        },
     }))
 }
 

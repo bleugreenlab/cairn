@@ -11,6 +11,18 @@
 //! The sweep numbers the places; a filing never does, so a just-filed hold
 //! reads `Queued · 39/30 running` until the next pass.
 //!
+//! ## One order
+//!
+//! Every reader of the queue — the sweep's release order, the places in line,
+//! the ahead-counts [`decide`] reads, the queue page — orders by one key: the
+//! capacity row's `queue_key`, unique within its database, then the database,
+//! then the execution id (the sweep, which also releases executions with no
+//! capacity row yet, breaks their same-second ties by issue number first). It
+//! is minted when a row first holds and never
+//! touched by a re-decision, so a hold keeps its place; the row's `created_at`
+//! stays the true age held. A thread may permute the keys its own cap-held set
+//! already occupies (`reorder`), which moves nobody else.
+//!
 //! Being a gate row, a cap-held execution is held by the one definition every surface already reads
 //! (`cairn_db::awaiting_release_sql!`): it has no jobs, so it takes no slot and
 //! no cell and placement never sees it, and it is released by the same guarded,
@@ -422,13 +434,17 @@ impl Drop for AdmissionGuard {
 }
 
 /// A fresh decision stored over a row that already has a place, carrying that
-/// place so re-deciding a hold does not churn its row between sweeps.
-pub(crate) fn carry_place(fact: &str, prior: Option<&str>, hold: &CapacityHold) -> String {
+/// place and who placed it there, so re-deciding a hold neither churns its row
+/// between sweeps nor forgets a thread's reorder.
+pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &CapacityHold) -> String {
     let mut hold = hold.clone();
-    hold.set_place(
+    let prior = prior.and_then(|detail| decode_hold(fact, detail));
+    hold.set_place(prior.as_ref().and_then(CapacityHold::place));
+    hold.set_placed_by(
         prior
-            .and_then(|detail| decode_hold(fact, detail))
-            .and_then(|prior| prior.place()),
+            .as_ref()
+            .and_then(CapacityHold::placed_by)
+            .map(str::to_string),
     );
     encode_hold(&hold)
 }
@@ -705,7 +721,8 @@ async fn open_thread_children_conn(
 /// whether it is in line at all (awaiting release, and not waiting on an
 /// authored gate of its own), and its issue's thread.
 const CAPACITY_ROWS_SQL: &str = concat!(
-    "SELECT g.execution_id, json_extract(g.predicate_json, '$.fact'), g.created_at,
+    "SELECT g.execution_id, json_extract(g.predicate_json, '$.fact'),
+            COALESCE(g.queue_key, g.created_at * 1000000),
             g.last_outcome,
             CASE WHEN COALESCE(e.runner_device_id, ?1) = ?1 THEN 1 ELSE 0 END,
             CASE WHEN ",
@@ -724,7 +741,8 @@ const CAPACITY_ROWS_SQL: &str = concat!(
 struct CapacityRow {
     execution_id: String,
     fact: &'static str,
-    created_at: i64,
+    /// Its place in line: the queue's one order key.
+    queue_key: i64,
     /// `last_outcome = 'no_evidence'`: the cap holds it now. A cleared row
     /// reads `satisfied` and only keeps the execution's place.
     blocking: bool,
@@ -753,7 +771,7 @@ async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<Vec<CapacityRow>>
                 out.push(CapacityRow {
                     execution_id: row.text(0)?,
                     fact,
-                    created_at: row.i64(2)?,
+                    queue_key: row.i64(2)?,
                     blocking: row.opt_text(3)?.as_deref() == Some("no_evidence"),
                     on_device: row.i64(4)? != 0,
                     in_line: row.i64(5)? != 0,
@@ -774,11 +792,12 @@ pub(crate) struct Start<'a> {
     pub execution_id: Option<&'a str>,
 }
 
-/// An execution's oldest unsatisfied row on one cap: its place in line, and
-/// whether the cap holds it now.
+/// An execution's earliest unsatisfied row on one cap: its place in line (its
+/// `queue_key`), and whether the cap holds it now. A row whose cap has cleared
+/// still keeps its place: it holds again on the same key.
 #[derive(Debug, Clone, Copy)]
 struct StoredHold {
-    since: i64,
+    queue_key: i64,
     blocking: bool,
 }
 
@@ -792,14 +811,17 @@ pub(crate) struct QueueSnapshot {
     thread_limit: usize,
     load: FleetLoad,
     stored: HashMap<(String, &'static str), StoredHold>,
-    /// Fleet holds in line on this device: execution -> since.
+    /// Fleet holds in line on this device: execution -> queue key.
     fleet_line: HashMap<String, i64>,
-    /// Thread holds in line, per thread: execution -> since.
+    /// Thread holds in line, per thread: execution -> queue key.
     thread_lines: HashMap<String, HashMap<String, i64>>,
     issues: HashMap<String, IssueThread>,
     open_children: HashMap<String, Vec<(i64, String)>>,
     /// Whether a start's execution runs on this device's fleet.
     on_device: HashMap<String, bool>,
+    /// The newest queue key this read has seen, so a hold first recorded
+    /// during a pass takes a place behind everything already in line.
+    newest_key: i64,
 }
 
 impl QueueSnapshot {
@@ -829,6 +851,7 @@ impl QueueSnapshot {
             issues: HashMap::new(),
             open_children: HashMap::new(),
             on_device: HashMap::new(),
+            newest_key: 0,
         };
         for db in orch.db.all_dbs().await {
             for row in capacity_rows(&db, &device).await.map_err(reading)? {
@@ -898,14 +921,15 @@ impl QueueSnapshot {
     }
 
     fn add_row(&mut self, row: CapacityRow) {
+        self.newest_key = self.newest_key.max(row.queue_key);
         let key = (row.execution_id.clone(), row.fact);
         let stored = self.stored.entry(key).or_insert(StoredHold {
-            since: row.created_at,
+            queue_key: row.queue_key,
             blocking: row.blocking,
         });
-        if row.created_at < stored.since {
+        if row.queue_key < stored.queue_key {
             *stored = StoredHold {
-                since: row.created_at,
+                queue_key: row.queue_key,
                 blocking: row.blocking,
             };
         }
@@ -914,28 +938,39 @@ impl QueueSnapshot {
         }
         match row.fact {
             FLEET_SLOT_FACT if row.on_device => {
-                self.fleet_line.insert(row.execution_id, row.created_at);
+                self.fleet_line.insert(row.execution_id, row.queue_key);
             }
             THREAD_FOCUS_FACT => {
                 if let Some(thread_id) = row.thread_id {
                     self.thread_lines
                         .entry(thread_id)
                         .or_default()
-                        .insert(row.execution_id, row.created_at);
+                        .insert(row.execution_id, row.queue_key);
                 }
             }
             _ => {}
         }
     }
 
-    /// A start's place in line on `fact`: when it first held on that cap, or
-    /// last of all for one that has not queued on it (a new filing, or one
-    /// whose `after:` gates just cleared).
+    /// The key a hold first recorded during a pass takes, as
+    /// `hold_capacity_gate_conn` mints it: its second's, or one past the newest
+    /// key seen.
+    fn mint_key(&mut self, now: i64) -> i64 {
+        let key = now
+            .saturating_mul(cairn_workflow::gates::store::QUEUE_KEY_SCALE)
+            .max(self.newest_key.saturating_add(1));
+        self.newest_key = key;
+        key
+    }
+
+    /// A start's place in line on `fact`: its earliest row's queue key on that
+    /// cap, or last of all for one that has not queued on it (a new filing, or
+    /// one whose `after:` gates just cleared).
     fn place(&self, start: &Start<'_>, fact: &'static str) -> i64 {
         start
             .execution_id
             .and_then(|id| self.stored.get(&(id.to_string(), fact)))
-            .map_or(i64::MAX, |stored| stored.since)
+            .map_or(i64::MAX, |stored| stored.queue_key)
     }
 
     /// Which caps hold `start` now.
@@ -961,6 +996,7 @@ impl QueueSnapshot {
                 limit: self.fleet_limit,
                 unplaced: self.load.waiting_for_machine,
                 place: None,
+                placed_by: None,
             });
         }
         let thread = start.issue_id.and_then(|issue_id| {
@@ -984,6 +1020,7 @@ impl QueueSnapshot {
                     open: open.iter().map(|(number, _)| *number).collect(),
                     limit: self.thread_limit,
                     place: None,
+                    placed_by: None,
                 });
             }
         }
@@ -1062,17 +1099,18 @@ impl QueueSnapshot {
             let since = match self.stored.get_mut(&key) {
                 Some(stored) => {
                     stored.blocking = holds;
-                    stored.since
+                    stored.queue_key
                 }
                 None if holds => {
+                    let minted = self.mint_key(now);
                     self.stored.insert(
                         key,
                         StoredHold {
-                            since: now,
+                            queue_key: minted,
                             blocking: true,
                         },
                     );
-                    now
+                    minted
                 }
                 None => continue,
             };
@@ -1157,8 +1195,8 @@ pub async fn decide(
 // ---------------------------------------------------------------------------
 
 /// Rewrite every blocking capacity gate's place in line: the fleet's in one
-/// order across every database, each thread's within the thread. Oldest held
-/// first, by when the execution first held on that cap. With the `queue` a
+/// order across every database, each thread's within the thread, in the
+/// queue's one order (`queue_key`, then database, then execution). With the `queue` a
 /// sweep pass decided against, as it stood once the pass was done, the counts
 /// each hold shows are rewritten too, so a hold the pass left as it was does
 /// not have to be written under the admission lock to stay current. Neither
@@ -1172,12 +1210,13 @@ pub async fn refresh_places(
 ) -> Result<Vec<String>, String> {
     struct Blocking {
         db: Arc<LocalDb>,
+        db_index: usize,
         gate_id: String,
         execution_id: String,
         fact: &'static str,
         group: Option<(usize, String)>,
         detail: Option<String>,
-        created_at: i64,
+        queue_key: i64,
     }
     let mut blocking = Vec::new();
     for (index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
@@ -1217,24 +1256,28 @@ pub async fn refresh_places(
                 .map(|thread| (index, thread));
             blocking.push(Blocking {
                 db: db.clone(),
+                db_index: index,
                 gate_id: gate.gate_id,
                 execution_id: gate.execution_id,
                 fact,
                 group,
                 detail: gate.detail,
-                created_at: gate.created_at,
+                queue_key: gate.queue_key,
             });
         }
     }
     blocking.sort_by(|a, b| {
-        (a.created_at, &a.execution_id, &a.gate_id).cmp(&(
-            b.created_at,
+        (a.queue_key, a.db_index, &a.execution_id, &a.gate_id).cmp(&(
+            b.queue_key,
+            b.db_index,
             &b.execution_id,
             &b.gate_id,
         ))
     });
 
-    let mut places: HashMap<(&'static str, Option<(usize, String)>), usize> = HashMap::new();
+    // (cap, the thread a thread cap's place counts within) -> places so far.
+    type PlaceCounter = HashMap<(&'static str, Option<(usize, String)>), usize>;
+    let mut places: PlaceCounter = HashMap::new();
     let mut moved = HashSet::new();
     for gate in &blocking {
         let key = match gate.fact {
@@ -1316,57 +1359,76 @@ pub struct QueueView {
     pub unclassified_yields: BTreeMap<String, u64>,
 }
 
-/// Held executions a cap holds right now: a blocking capacity gate (the same
-/// `no_evidence` row [`FLEET_AHEAD_SQL`] counts as ahead), and no unmet
-/// authored gate of their own.
+/// True when execution `e` is in the queue: a cap holds it right now through a
+/// blocking capacity gate (the same `no_evidence` row [`FLEET_AHEAD_SQL`]
+/// counts as ahead), and no unmet authored gate of its own holds it. The queue
+/// page and a thread's own queue list exactly this set.
+macro_rules! cap_held_sql {
+    () => {
+        concat!(
+            cairn_db::awaiting_release_sql!(),
+            " AND EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
+                   AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
+            cairn_db::capacity_gate_sql!(),
+            ") AND NOT ",
+            cairn_db::awaits_authored_gate_sql!()
+        )
+    };
+}
+pub(crate) use cap_held_sql;
+
+/// Every execution a cap holds right now, with its age and its place.
 const QUEUE_ROWS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, e.seq, i.number, i.title, p.id, p.key, t.name, ",
     cairn_workflow::held_since_sql!(),
+    ", ",
+    cairn_workflow::queue_key_sql!(),
     "
        FROM executions e
        LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN projects p ON p.id = i.project_id
        LEFT JOIN threads t ON t.id = i.parent_thread_id
       WHERE ",
-    cairn_db::awaiting_release_sql!(),
-    " AND EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
-                   AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
-    cairn_db::capacity_gate_sql!(),
-    ") AND NOT ",
-    cairn_db::awaits_authored_gate_sql!()
+    cap_held_sql!()
 );
 
-/// Every cap-held execution across every database, in release order, with
-/// the fleet's load.
+/// Every cap-held execution across every database, in release order (the
+/// queue's one order: `queue_key`, then database, then execution), with the
+/// fleet's load.
 pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
     let settings = orch.get_settings();
     let fleet = fleet_load(orch).await?;
     let mut held = Vec::new();
-    for db in orch.db.all_dbs().await {
+    for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
         let rows = db
             .read(|conn| {
                 Box::pin(async move {
                     let mut rows = conn.query(QUEUE_ROWS_SQL, ()).await?;
                     let mut out = Vec::new();
                     while let Some(row) = rows.next().await? {
-                        out.push(QueuedExecution {
-                            execution_id: row.text(0)?,
-                            issue_id: row.opt_text(1)?,
-                            seq: row.opt_i64(2)?,
-                            issue_number: row.opt_i64(3)?,
-                            issue_title: row.opt_text(4)?,
-                            project_id: row.opt_text(5)?,
-                            project_key: row.opt_text(6)?,
-                            thread_name: row.opt_text(7)?,
-                            held_since: row.opt_i64(8)?.unwrap_or(0),
-                            census: None,
-                        });
+                        let queue_key = row.opt_i64(9)?.unwrap_or(0);
+                        out.push((
+                            queue_key,
+                            QueuedExecution {
+                                execution_id: row.text(0)?,
+                                issue_id: row.opt_text(1)?,
+                                seq: row.opt_i64(2)?,
+                                issue_number: row.opt_i64(3)?,
+                                issue_title: row.opt_text(4)?,
+                                project_id: row.opt_text(5)?,
+                                project_key: row.opt_text(6)?,
+                                thread_name: row.opt_text(7)?,
+                                held_since: row.opt_i64(8)?.unwrap_or(0),
+                                census: None,
+                            },
+                        ));
                     }
                     drop(rows);
-                    let ids: Vec<String> = out.iter().map(|q| q.execution_id.clone()).collect();
+                    let ids: Vec<String> =
+                        out.iter().map(|(_, q)| q.execution_id.clone()).collect();
                     let mut censuses =
                         super::census::census_for_executions_conn(conn, &ids).await?;
-                    for queued in &mut out {
+                    for (_, queued) in &mut out {
                         queued.census = censuses.remove(&queued.execution_id);
                     }
                     Ok(out)
@@ -1374,16 +1436,15 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
             })
             .await
             .map_err(|error| format!("failed to list the execution queue: {error}"))?;
-        held.extend(rows);
+        held.extend(
+            rows.into_iter()
+                .map(|(queue_key, queued)| (queue_key, db_index, queued)),
+        );
     }
-    held.sort_by(|a, b| {
-        (a.held_since, a.issue_number, a.seq, &a.execution_id).cmp(&(
-            b.held_since,
-            b.issue_number,
-            b.seq,
-            &b.execution_id,
-        ))
+    held.sort_by(|(a_key, a_db, a), (b_key, b_db, b)| {
+        (a_key, a_db, &a.execution_id).cmp(&(b_key, b_db, &b.execution_id))
     });
+    let held: Vec<QueuedExecution> = held.into_iter().map(|(_, _, queued)| queued).collect();
     Ok(QueueView {
         in_progress: fleet.in_progress,
         limit: settings.max_concurrent_executions.max(1) as usize,
@@ -1395,7 +1456,7 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::execution::gates::sweep::tests::{
         advanced, count, env, execution, file, now, resolve_issue, Env,
@@ -1410,7 +1471,7 @@ mod tests {
 
     // -- the test world ----------------------------------------------------
 
-    fn caps(env: &Env, fleet: i32, children: i32) {
+    pub(crate) fn caps(env: &Env, fleet: i32, children: i32) {
         env.orch
             .update_settings(crate::models::UpdateSettings {
                 max_concurrent_executions: Some(fleet),
@@ -1420,9 +1481,9 @@ mod tests {
             .unwrap();
     }
 
-    async fn add_thread(env: &Env, id: &str, name: &str) {
+    pub(crate) async fn add_thread(env: &Env, id: &str, name: &str) {
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO threads(id, project_id, name, created_at, updated_at)
                    VALUES('{id}', 'p', '{name}', 1, 1);"
             ))
@@ -1431,12 +1492,12 @@ mod tests {
     }
 
     /// An issue with no execution: a backlog child when `thread` is given.
-    async fn add_issue(env: &Env, number: i32, thread: Option<&str>) {
+    pub(crate) async fn add_issue(env: &Env, number: i32, thread: Option<&str>) {
         let thread = thread
             .map(|thread| format!("'{thread}'"))
             .unwrap_or_else(|| "NULL".to_string());
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
                                     parent_thread_id, created_at, updated_at)
                    VALUES('si{number}', 'p', {number}, 'Issue {number}', 'backlog', 'backlog',
@@ -1448,10 +1509,10 @@ mod tests {
 
     /// An issue with a started execution whose one job `sj{number}` has
     /// `status`: what the fleet and the thread see as work already under way.
-    async fn add_started(env: &Env, number: i32, thread: Option<&str>, status: &str) {
+    pub(crate) async fn add_started(env: &Env, number: i32, thread: Option<&str>, status: &str) {
         add_issue(env, number, thread).await;
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "UPDATE issues SET status = 'active', progress = 'active' WHERE id = 'si{number}';
                  INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                    VALUES('se{number}', 'recipe', 'si{number}', 'p', 'running', 1, 1);
@@ -1469,7 +1530,7 @@ mod tests {
             .map(|reason| format!("'{reason}'"))
             .unwrap_or_else(|| "NULL".to_string());
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO sessions(id, job_id, status, backend_id, created_at, updated_at)
                    VALUES('ss{number}', 'sj{number}', 'open', 'backend', 1, 1);
                  INSERT INTO runs(id, project_id, job_id, issue_id, status, session_id, created_at, updated_at)
@@ -1487,7 +1548,7 @@ mod tests {
     /// A PR on issue `number`, owned by its job `sj{number}`.
     async fn merge_request(env: &Env, number: i32, status: &str) {
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
                                             target_branch, status, opened_at, updated_at)
                    VALUES('smr{number}', 'sj{number}', 'p', 'si{number}', 'PR', 'b', 'main',
@@ -1501,7 +1562,7 @@ mod tests {
     async fn park_on(env: &Env, number: i32, condition: Value) {
         turn(env, number, "yielded", Some("wait")).await;
         env.db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "INSERT INTO agent_waits(id, job_id, run_id, session_id, predecessor_turn_id,
                                          tool_use_id, condition_json, state, created_at)
                    VALUES('sw{number}', 'sj{number}', 'sr{number}', 'ss{number}', 'st{number}',
@@ -1552,7 +1613,7 @@ mod tests {
             .remove(execution_id)
     }
 
-    async fn summary(env: &Env, execution_id: &str) -> String {
+    pub(crate) async fn summary(env: &Env, execution_id: &str) -> String {
         census_of(env, execution_id)
             .await
             .map(|census| census.summary)
@@ -1560,14 +1621,14 @@ mod tests {
     }
 
     /// A queued execution's hover detail.
-    async fn detail(env: &Env, execution_id: &str) -> String {
+    pub(crate) async fn detail(env: &Env, execution_id: &str) -> String {
         census_of(env, execution_id)
             .await
             .and_then(|census| census.detail)
             .unwrap_or_default()
     }
 
-    async fn is_held(env: &Env, number: i32) -> bool {
+    pub(crate) async fn is_held(env: &Env, number: i32) -> bool {
         let (_, status, released_at, jobs) = execution(env, number).await;
         status == "held" && released_at.is_none() && jobs == 0
     }
@@ -1590,7 +1651,7 @@ mod tests {
 
     /// Five started executions beside the parent issue's live coordinator: a
     /// full fleet at the default cap of 6.
-    async fn full_fleet(env: &Env) {
+    pub(crate) async fn full_fleet(env: &Env) {
         for number in 100..105 {
             add_started(env, number, None, "running").await;
         }
@@ -2142,7 +2203,7 @@ mod tests {
         // 1003 has waited longer, though its number is higher.
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 100 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 100, queue_key = queue_key - 100000000 WHERE execution_id = ?1",
                 (older.clone(),),
             )
             .await
@@ -2187,7 +2248,7 @@ mod tests {
         let (queued, ..) = execution(&env, 3).await;
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 50 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 50, queue_key = queue_key - 50000000 WHERE execution_id = ?1",
                 (queued.clone(),),
             )
             .await
@@ -2232,7 +2293,7 @@ mod tests {
         let (patched, ..) = execution(&env, 1).await;
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 100 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 100, queue_key = queue_key - 100000000 WHERE execution_id = ?1",
                 (patched.clone(),),
             )
             .await
@@ -2284,7 +2345,7 @@ mod tests {
         let (older, ..) = execution(&env, 1).await;
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 100 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 100, queue_key = queue_key - 100000000 WHERE execution_id = ?1",
                 (older.clone(),),
             )
             .await
@@ -2319,7 +2380,7 @@ mod tests {
         let (older, ..) = execution(&env, 105).await;
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 100 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 100, queue_key = queue_key - 100000000 WHERE execution_id = ?1",
                 (older.clone(),),
             )
             .await
@@ -2349,7 +2410,7 @@ mod tests {
         let (fleet_held, ..) = execution(&env, 1002).await;
         env.db
             .execute(
-                "UPDATE execution_gates SET created_at = created_at - 100 WHERE execution_id = ?1",
+                "UPDATE execution_gates SET created_at = created_at - 100, queue_key = queue_key - 100000000 WHERE execution_id = ?1",
                 (thread_held.clone(),),
             )
             .await
@@ -2833,7 +2894,7 @@ mod tests {
     }
 
     /// A hold's stored form round-trips, and a re-decided hold keeps the place
-    /// its row already had.
+    /// its row already had, and who placed it there.
     #[test]
     fn a_stored_hold_keeps_its_place_across_decisions() {
         let decided = CapacityHold::Fleet {
@@ -2841,18 +2902,20 @@ mod tests {
             limit: 6,
             unplaced: 2,
             place: None,
+            placed_by: None,
         };
         let stored = encode_hold(&CapacityHold::Fleet {
             running: 7,
             limit: 6,
             unplaced: 0,
             place: Some(3),
+            placed_by: None,
         });
         assert_eq!(
             stored,
             r#"{"cap":"fleet","running":7,"limit":6,"unplaced":0,"place":3}"#
         );
-        let carried = carry_place(FLEET_SLOT_FACT, Some(&stored), &decided);
+        let carried = carry_queue_facts(FLEET_SLOT_FACT, Some(&stored), &decided);
         assert_eq!(
             decode_hold(FLEET_SLOT_FACT, &carried),
             Some(CapacityHold::Fleet {
@@ -2860,12 +2923,33 @@ mod tests {
                 limit: 6,
                 unplaced: 2,
                 place: Some(3),
+                placed_by: None,
             })
+        );
+        let placed = encode_hold(&CapacityHold::Fleet {
+            running: 7,
+            limit: 6,
+            unplaced: 0,
+            place: Some(1),
+            placed_by: Some("harness".to_string()),
+        });
+        assert_eq!(
+            placed,
+            r#"{"cap":"fleet","running":7,"limit":6,"unplaced":0,"place":1,"placedBy":"harness"}"#
         );
         assert_eq!(
             decode_hold(
                 FLEET_SLOT_FACT,
-                &carry_place(FLEET_SLOT_FACT, None, &decided)
+                &carry_queue_facts(FLEET_SLOT_FACT, Some(&placed), &decided)
+            )
+            .and_then(|hold| hold.placed_by().map(str::to_string)),
+            Some("harness".to_string()),
+            "a re-decision keeps the thread's reorder"
+        );
+        assert_eq!(
+            decode_hold(
+                FLEET_SLOT_FACT,
+                &carry_queue_facts(FLEET_SLOT_FACT, None, &decided)
             ),
             Some(decided.clone()),
             "a first hold has no place yet"
@@ -2888,6 +2972,7 @@ mod tests {
             open: vec![5783, 5790],
             limit: 2,
             place: Some(1),
+            placed_by: None,
         };
         assert_eq!(
             decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),

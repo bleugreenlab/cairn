@@ -93,6 +93,81 @@ fn branchless_refusal(name: &str, segment: &str) -> String {
     )
 }
 
+/// `cairn://p/<P>/<thread>/queue`: the thread's children's cap-held
+/// executions, in the order they start, as of `now`.
+pub(crate) async fn read_thread_queue(
+    db: &LocalDb,
+    project_key: &str,
+    thread: &str,
+    now: i64,
+) -> String {
+    let project_key = project_key.to_owned();
+    let thread = thread.to_owned();
+    read_resource(db, move |conn| {
+        let (project_key, thread) = (project_key.clone(), thread.clone());
+        Box::pin(async move {
+            let project = match lookup_project_by_key(conn, &project_key).await {
+                Ok(project) => project,
+                Err(error) => return Ok(error),
+            };
+            let thread_id = match crate::storage::query_opt_text_conn(
+                conn,
+                "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2",
+                params![project.project_id.as_str(), thread.as_str()],
+            )
+            .await
+            {
+                Ok(Some(thread_id)) => thread_id,
+                Ok(None) => return Ok(format!("Thread '{thread}' not found")),
+                Err(error) => return Ok(format!("Failed to load thread '{thread}': {error}")),
+            };
+            let queue =
+                match crate::execution::gates::reorder::thread_queue_conn(conn, &thread_id).await {
+                    Ok(queue) => queue,
+                    Err(error) => return Ok(format!("Failed to load {thread}'s queue: {error}")),
+                };
+            Ok(render_thread_queue(&project_key, &thread, &queue, now))
+        })
+    })
+    .await
+    .unwrap_or_else(|error| error)
+}
+
+fn render_thread_queue(
+    project_key: &str,
+    thread: &str,
+    queue: &[crate::execution::gates::reorder::ThreadQueued],
+    now: i64,
+) -> String {
+    let mut out = format!(
+        "# Queue — {thread}\n\n{thread}'s children that the execution queue's caps hold, in the order they start.\n\n"
+    );
+    if queue.is_empty() {
+        out.push_str("No cap-held executions.\n");
+        return out;
+    }
+    for (index, queued) in queue.iter().enumerate() {
+        let mut parts = vec![format!(
+            "[{number}](cairn://p/{project_key}/{number}) {title}",
+            number = queued.issue_number,
+            title = queued.issue_title
+        )];
+        let places = crate::execution::gates::reorder::places_phrase(queued, " · ");
+        if !places.is_empty() {
+            parts.push(places);
+        }
+        parts.push(format!(
+            "held {}",
+            crate::clock::format_elapsed((now - queued.held_since).max(0))
+        ));
+        if let Some(by) = queued.placed_by() {
+            parts.push(format!("placed ahead by {by}"));
+        }
+        out.push_str(&format!("{}. {}\n", index + 1, parts.join(" · ")));
+    }
+    out
+}
+
 pub(super) async fn read_thread_branches(db: &LocalDb, project_key: &str, thread: &str) -> String {
     let project_key = project_key.to_owned();
     let thread = thread.to_owned();
@@ -307,6 +382,10 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
             })
         }
         ["branches"] => CairnResource::ThreadBranches {
+            project,
+            thread: name,
+        },
+        ["queue"] => CairnResource::ThreadQueue {
             project,
             thread: name,
         },

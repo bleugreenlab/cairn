@@ -185,6 +185,7 @@ pub(crate) async fn start_recipe_execution_and_advance(
     intent: LaunchIntent,
     after: &[crate::routes::TriggerClause],
     starter: Starter,
+    place: QueuePlace,
 ) -> Result<Launched, String> {
     let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
     let launched = launch_recipe_execution(
@@ -203,6 +204,7 @@ pub(crate) async fn start_recipe_execution_and_advance(
         intent,
         &gates,
         starter,
+        place,
     )
     .await?;
     let execution = &launched.execution;
@@ -294,9 +296,22 @@ pub async fn start_recipe_execution_impl(
         intent,
         &[],
         starter,
+        QueuePlace::Tail,
     )
     .await
     .map(|launched| launched.execution)
+}
+
+/// Where a capped start that holds takes its place in line (cairn/5848).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum QueuePlace {
+    /// Behind everything already held.
+    #[default]
+    Tail,
+    /// At the head of its thread's own cap-held set: the earliest places that
+    /// set already occupies, never ahead of another thread's work. `placed_by`
+    /// is who asked, as the hold's hover names it.
+    Head { placed_by: String },
 }
 
 /// [`start_recipe_execution_impl`] with `after:` gates: `gates` are canonical
@@ -321,6 +336,7 @@ async fn launch_recipe_execution(
     intent: LaunchIntent,
     gates: &[String],
     starter: Starter,
+    place: QueuePlace,
 ) -> Result<Launched, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let this_device = orch.anon_device_manager.device_id();
@@ -589,6 +605,7 @@ async fn launch_recipe_execution(
             satisfied,
             caps: caps.clone(),
             filed_at: orch.services.clock.now(),
+            place,
         },
     )
     .await?;
@@ -1243,6 +1260,7 @@ pub(crate) async fn file_held_with_observed_satisfaction(
             satisfied,
             caps: Vec::new(),
             filed_at: orch.services.clock.now(),
+            place: QueuePlace::Tail,
         },
     )
     .await?;
@@ -1259,12 +1277,17 @@ pub(crate) async fn file_held_with_observed_satisfaction(
 /// clock's instant, stamped on every gate row: it is the execution's place in
 /// the queue (oldest held first), so it reads the one clock everything else
 /// does rather than the wall clock.
+///
+/// `place` is where a capped hold takes its place in line: a `Head` filing
+/// rotates its thread's cap-held set in the same transaction, so the hold is
+/// never visible at the tail.
 #[derive(Default)]
 struct LaunchGates {
     predicates: Vec<String>,
     satisfied: std::collections::HashSet<String>,
     caps: Vec<crate::models::CapacityHold>,
     filed_at: i64,
+    place: QueuePlace,
 }
 
 /// What starting an issue's execution actually did to its lineage.
@@ -1310,6 +1333,7 @@ async fn insert_issue_execution_atomic(
         satisfied,
         caps,
         filed_at,
+        place,
     } = gates;
     if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
         return Err(
@@ -1325,6 +1349,7 @@ async fn insert_issue_execution_atomic(
         let gates = gates.clone();
         let satisfied = satisfied.clone();
         let caps = caps.clone();
+        let place = place.clone();
         let dbs = dbs.clone();
         let own_db = own_db.clone();
         let mut execution = NewExecution {
@@ -1401,6 +1426,27 @@ async fn insert_issue_execution_atomic(
                     filed_at,
                 )
                 .await?;
+            }
+            // A filing at the head of its thread's queue takes the earliest
+            // places its thread's cap-held set holds, in this transaction:
+            // statements beside the inserts, under the lock the filing
+            // already holds, and nothing that waits on anything else.
+            if let (QueuePlace::Head { placed_by }, false) = (&place, caps.is_empty()) {
+                let thread_id = crate::storage::query_opt_text_conn(
+                    conn,
+                    "SELECT parent_thread_id FROM issues WHERE id = ?1",
+                    params![issue_id.as_str()],
+                )
+                .await?;
+                if let Some(thread_id) = thread_id {
+                    crate::execution::gates::reorder::rotate_to_front_conn(
+                        conn,
+                        &thread_id,
+                        std::slice::from_ref(&execution.id),
+                        placed_by,
+                    )
+                    .await?;
+                }
             }
             if held {
                 let gate_ids = cairn_workflow::gates::store::insert_gates_conn(

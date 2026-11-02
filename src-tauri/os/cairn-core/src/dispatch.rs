@@ -471,7 +471,18 @@ async fn execute_tool(
     let request = checked.request();
     match request.tool.as_str() {
         // File and resource mutation tool
-        "write" => off_frame(|| crate::mcp::handlers::write::handle_write(orch, request)).await,
+        // Type-erased, not just boxed: the transport requires the whole
+        // tool-dispatch future to be `Send`, and proving that walks every
+        // concrete future nested inside it. Every resource-write arm nests
+        // beneath `handle_write`, so its concrete type is the deepest; on
+        // Windows (deeper `mio` types) it overflowed the trait solver's
+        // recursion limit. A `dyn Future + Send` here proves the write subtree
+        // once, from this shallower root.
+        "write" => {
+            let write: std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> =
+                off_frame(|| crate::mcp::handlers::write::handle_write(orch, request));
+            write.await
+        }
         "read" => off_frame(|| crate::mcp::handlers::read::handle_read_file(orch, request)).await,
         "read_batch" => {
             off_frame(|| crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors))

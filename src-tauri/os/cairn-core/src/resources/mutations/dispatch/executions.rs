@@ -6,6 +6,28 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
 
+/// `place`, on a filing: `"head"` asks for the head of the issue's thread's
+/// own queue; absent queues it behind what is already held.
+pub(super) fn parse_place(
+    index: usize,
+    item: &ChangeItem,
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> ResourceMutationResult<bool> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(value) if value.as_str() == Some("head") => Ok(true),
+        Some(other) => Err(build_failure(
+            index,
+            item,
+            format!(
+                "{key} takes only \"head\" (file it at the head of its thread's own queue), not \
+                 {other}; omit it to queue behind what is already held. Nothing changed."
+            ),
+        )),
+    }
+}
+
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -88,6 +110,30 @@ pub(super) async fn dispatch(
                 },
                 None => crate::execution::recipe::LaunchIntent::NewAttempt,
             };
+            let head = parse_place(
+                index,
+                item,
+                item.payload.as_ref().and_then(|p| p.get("place")),
+                "payload.place",
+            )?;
+            let place = if head {
+                let parent = super::threads::issue_parent_thread(orch, project, *number)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                let placed_by = super::threads::head_placed_by(
+                    orch,
+                    request,
+                    project,
+                    parent.as_deref(),
+                    &format!("{project}/{number}"),
+                    !after.is_empty(),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                crate::execution::recipe::QueuePlace::Head { placed_by }
+            } else {
+                crate::execution::recipe::QueuePlace::Tail
+            };
             if dry_run {
                 format!(
                     "Would {} an execution for {project}/{number}{}",
@@ -112,6 +158,7 @@ pub(super) async fn dispatch(
                     overrides,
                     intent,
                     after,
+                    place,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?

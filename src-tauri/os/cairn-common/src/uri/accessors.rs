@@ -137,6 +137,7 @@ impl CairnResource {
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
             | Self::ThreadBranches { .. }
+            | Self::ThreadQueue { .. }
             | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }
@@ -484,6 +485,7 @@ impl CairnResource {
             | Self::ProjectThreads { project, .. }
             | Self::Thread { project, .. }
             | Self::ThreadBranches { project, .. }
+            | Self::ThreadQueue { project, .. }
             | Self::ThreadBranch { project, .. }
             | Self::ThreadDb { project, .. }
             | Self::ThreadDbSchema { project, .. }
@@ -709,6 +711,7 @@ impl CairnResource {
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
             | Self::ThreadBranches { .. }
+            | Self::ThreadQueue { .. }
             | Self::ThreadBranch { .. }
             | Self::ThreadDb { .. }
             | Self::ThreadDbSchema { .. }

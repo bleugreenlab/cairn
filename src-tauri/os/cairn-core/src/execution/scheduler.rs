@@ -597,6 +597,7 @@ async fn fire_scheduled_recipe(
         // Nobody is present at a schedule's trigger: the execution queue's caps
         // apply, and the held start releases on its own when they clear.
         crate::execution::recipe::Starter::Capped,
+        crate::execution::recipe::QueuePlace::Tail,
     )
     .await?;
 

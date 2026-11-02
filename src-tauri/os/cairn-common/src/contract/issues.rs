@@ -115,6 +115,27 @@ pub(crate) const THREAD_BRANCHES_CONTRACT: ResourceContract = ResourceContract {
     }],
 };
 
+pub(crate) const THREAD_QUEUE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ThreadQueue,
+    uri_template: "cairn://p/{project}/{thread}/queue",
+    name: "Thread queue",
+    description: "This thread's children's executions that the execution queue's caps hold, in the order they start: each with its issue, its place on each cap holding it (fleet, thread), and how long it has been held. Patch `order` to put children first: the listed children take the earliest places this thread's cap-held set already occupies, in both the fleet order and the thread order, and unlisted ones follow in their current order. No other thread's place moves and no cap is skipped; only the operator's Start now skips the queue. Ordered by the thread itself (its sessions and their tasks) or the operator. To file straight to the head, pass place:\"head\" with the execution.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[KeySpec::new(
+            "order",
+            KeyType::Array,
+            "this thread's children by issue number, first to start first; each takes its cap-held executions with it",
+        )],
+        optional: &[],
+        label: "order this thread's held children",
+        example: "write({changes:[{target:\"cairn:~/queue\",mode:\"patch\",payload:{order:[5841,5829]}}]})",
+    }],
+};
+
 pub(crate) const THREAD_BRANCH_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ThreadBranch,
     uri_template: "cairn://p/{project}/{thread}/branches/{number}",
@@ -262,7 +283,7 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
     // resolves to a node-family kind whose template spells an issue coordinate a
     // thread does not have. Reading any of these addresses returns that family's
     // own affordance block, so this line only has to say the addresses exist.
-    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /branches, /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no default branch; numbered branches are explicit resources beneath /branches. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
+    description: "A first-class thread overview. Its session owns the same job-scoped resources an execution node does, addressed beneath the thread name: /chat, /arc, /branches, /queue (its children's cap-held executions in start order; patch {order:[N,...]} to reorder), /todos, /tasks, /task/{task}, /memories, /messages, /wakes, /questions, /permissions, /terminal/{slug}, /browser, /repl/{slug}, /calls, /progress, /symbols, /db, /pages, /services. The session has no default branch; numbered branches are explicit resources beneath /branches. Branch-shaped resources (diff, changed, checks, rebase) do not apply to the thread session itself.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -347,7 +368,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
+        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -381,6 +402,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 ),
                 LAUNCH_OVERRIDES,
                 AFTER_GATES,
+                QUEUE_PLACE,
             ],
             label: "start execution",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"planbuild\",overrides:{without:[\"review\"]}}}]})",

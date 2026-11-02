@@ -25,9 +25,10 @@
 //! ## A burst is released in order, and never rate-limited
 //!
 //! One merge can release every execution a plan filed after it. They are
-//! released in ascending issue number, then execution seq, because admission
-//! ranks by queue time and a nondeterministic release order would turn a plan's
-//! implicit priority into a coin flip. There is deliberately NO stagger, cap,
+//! released in the queue's one order (`queue_key`, then database, then
+//! execution; see `capacity`), because admission ranks by queue time and a
+//! nondeterministic release order would turn a plan's implicit priority into a
+//! coin flip. There is deliberately NO stagger, cap,
 //! or rate limit here: a count cap wearing a schedule would be a second brake
 //! masking the admission defects it compensates for (ruled by the execution
 //! thread). A thread that wants serialization chains its `after:` edges.
@@ -185,29 +186,37 @@ pub(crate) async fn sweep_with(
     now: i64,
 ) -> Result<SweepReport, String> {
     let mut report = SweepReport::default();
-    // Oldest held first, across every database: a fleet slot that frees goes
-    // to whatever has waited longest, wherever it lives. A burst filed at one
-    // instant keeps its issue order. An older execution held only by its own
-    // thread's cap does not stop a younger one from another thread taking a
-    // free fleet slot: each is decided on its own caps.
+    // The queue's order, across every database: a fleet slot that frees goes
+    // to whatever is first in line, wherever it lives. An earlier execution
+    // held only by its own thread's cap does not stop a later one from another
+    // thread taking a free fleet slot: each is decided on its own caps.
     let mut held = Vec::new();
-    for db in orch.db.all_dbs().await {
+    for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
         let listed = db
             .read(|conn| Box::pin(async move { list_held_executions_conn(conn).await }))
             .await
             .map_err(|error| format!("failed to list held executions: {error}"))?;
-        held.extend(listed.into_iter().map(|execution| (db.clone(), execution)));
+        held.extend(
+            listed
+                .into_iter()
+                .map(|execution| (db_index, db.clone(), execution)),
+        );
     }
-    held.sort_by(|(_, a), (_, b)| {
+    // Capacity keys never tie. An execution with no capacity row yet (one
+    // that waits on its own `after:` gates) keys on the second it was filed,
+    // so a burst filed at one instant ties and keeps its issue order.
+    held.sort_by(|(a_db, _, a), (b_db, _, b)| {
         (
-            a.held_since,
+            a.queue_key,
+            a_db,
             a.issue_number.is_none(),
             a.issue_number,
             a.seq,
             &a.execution_id,
         )
             .cmp(&(
-                b.held_since,
+                b.queue_key,
+                b_db,
                 b.issue_number.is_none(),
                 b.issue_number,
                 b.seq,
@@ -219,7 +228,7 @@ pub(crate) async fn sweep_with(
     // is a candidate; whether the queue's caps let it start is the release
     // phase's to decide.
     let mut candidates = Vec::new();
-    for (db, execution) in held {
+    for (_, db, execution) in held {
         // One execution whose evidence cannot be read must not hold up the
         // rest of the burst behind it.
         match resolve_held(orch, &db, vocabulary, &execution, now).await {
@@ -887,7 +896,7 @@ pub(crate) async fn release_conn(
                         .iter()
                         .find(|gate| gate.predicate_json == predicate)
                         .and_then(|gate| gate.detail.as_deref());
-                    let detail = super::capacity::carry_place(fact, prior, block);
+                    let detail = super::capacity::carry_queue_facts(fact, prior, block);
                     moved |= store::hold_capacity_gate_conn(
                         conn,
                         execution_id,
@@ -1442,6 +1451,7 @@ pub(crate) mod tests {
             None,
             LaunchIntent::NewAttempt,
             clauses,
+            crate::execution::recipe::QueuePlace::Tail,
         )
         .await
     }

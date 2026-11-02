@@ -1,7 +1,8 @@
 //! Programmatic execution start via an issue's executions collection.
 //!
-//! Appending `{recipe?, backend?, branch?, continuity?, overrides?}` to
-//! `cairn://p/PROJECT/NUMBER/executions` starts a new execution. This is the external-driver entry point: it shares
+//! Appending `{recipe?, backend?, branch?, continuity?, lifecycle?, overrides?,
+//! after?, place?}` to `cairn://p/PROJECT/NUMBER/executions` starts a new
+//! execution. This is the external-driver entry point: it shares
 //! the same start sequence as the user-facing Tauri command
 //! (`start_recipe_execution_and_advance`) and stamps `initiated_via="external"`
 //! attribution on the snapshot. Local-secret auth (which already gates every
@@ -62,6 +63,7 @@ pub(crate) async fn start_execution_from_collection(
     overrides: Option<crate::models::LaunchDeltas>,
     intent: crate::execution::recipe::LaunchIntent,
     after: Vec<crate::routes::TriggerClause>,
+    place: crate::execution::recipe::QueuePlace,
 ) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
@@ -111,6 +113,7 @@ pub(crate) async fn start_execution_from_collection(
         // start: agents, the CLI, issue creation and the route dispatcher all
         // file here, so the execution queue's caps apply (cairn/5802).
         crate::execution::recipe::Starter::Capped,
+        place.clone(),
     )
     .await?;
     let execution = launched.execution;
@@ -148,10 +151,27 @@ pub(crate) async fn start_execution_from_collection(
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
-        // Held by the queue alone. The line carries no place in line: places
-        // are numbered at the end of a sweep pass, never on the filing path.
-        let queued = (evaluation.waiting.is_empty() && !evaluation.held_by.is_empty())
-            .then(|| crate::execution::gates::census::queued_summary(&evaluation.held_by));
+        // Held by the queue alone. A tail filing's line carries no place in
+        // line: places are numbered at the end of a sweep pass, never on the
+        // filing path. A head filing took places its thread's set already had
+        // in its own insert transaction, and its census says which.
+        let queued = if evaluation.waiting.is_empty() && !evaluation.held_by.is_empty() {
+            Some(match place {
+                crate::execution::recipe::QueuePlace::Head { .. } => {
+                    crate::execution::gates::census::queued_summary_for(
+                        &owning_db,
+                        &execution.id,
+                        &evaluation.held_by,
+                    )
+                    .await
+                }
+                crate::execution::recipe::QueuePlace::Tail => {
+                    crate::execution::gates::census::queued_summary(&evaluation.held_by)
+                }
+            })
+        } else {
+            None
+        };
         return Ok(held_filing_summary(
             &key,
             number,
@@ -184,9 +204,13 @@ pub(crate) async fn start_execution_from_collection(
         }
         None => String::new(),
     };
+    let placed = match place {
+        crate::execution::recipe::QueuePlace::Head { .. } => " It started now; nothing to place.",
+        crate::execution::recipe::QueuePlace::Tail => "",
+    };
     Ok(format!(
-        "Started execution {} for {}-{} (recipe '{}').{} Watch {} for attention.",
-        seq, key, number, execution.recipe_id, standing, issue_uri
+        "Started execution {} for {}-{} (recipe '{}').{}{} Watch {} for attention.",
+        seq, key, number, execution.recipe_id, standing, placed, issue_uri
     ))
 }
 

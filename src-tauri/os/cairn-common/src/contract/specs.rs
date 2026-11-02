@@ -232,7 +232,14 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe, backend?, overrides?, after?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied",
+    "{recipe, backend?, overrides?, after?, place?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `place` takes the same value the executions collection does",
+);
+/// `place` on a filing, shared verbatim by the executions-collection append and
+/// the issue-create `execution` block.
+pub(crate) const QUEUE_PLACE: KeySpec = KeySpec::new(
+    "place",
+    KeyType::Str,
+    "head — if the execution queue's caps hold this execution, it takes the earliest places its parent thread's cap-held set already occupies (fleet and thread order), never ahead of another thread's work and skipping no cap. Only for a child of a thread, filed by that thread or the operator, and never with `after`. Omit to queue behind what is already held; reorder later with cairn://p/PROJECT/THREAD/queue {order:[N,...]}",
 );
 /// `after:` gates, shared verbatim by the executions-collection append, the
 /// issue-create `execution` block, and the execution patch — one grammar,

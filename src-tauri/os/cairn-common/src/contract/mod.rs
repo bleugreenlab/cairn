@@ -152,6 +152,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     issues::PROJECT_THREADS_CONTRACT,
     issues::THREAD_CONTRACT,
     issues::THREAD_BRANCHES_CONTRACT,
+    issues::THREAD_QUEUE_CONTRACT,
     issues::THREAD_BRANCH_CONTRACT,
     issues::THREAD_DB_CONTRACT,
     issues::THREAD_DB_SCHEMA_CONTRACT,

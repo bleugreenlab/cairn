@@ -6471,6 +6471,16 @@ pub struct LearnedResourceEstimate {
 /// as it reads launchd's and systemd's, and an older executor that leaves it
 /// out is judged as before. No frame, variant, field or serialized form
 /// changes, and a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/5821 does not move the number. A Linux executor enumerating one
+/// command's session now skips a neighbour pid whose `/proc/<pid>/stat` it
+/// cannot read or parse (truncated mid-exit, empty, gone, refused) instead of
+/// failing the whole enumeration and with it the command's teardown. That is a
+/// local `/proc` read inside the executor's own reap; no frame, variant, field
+/// or serialized form changes. What a runner gets wrong talking to an older
+/// executor: nothing it would decode differently; that executor can still
+/// report a trivial command's teardown as unproven under host load until it
+/// runs a build carrying this.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

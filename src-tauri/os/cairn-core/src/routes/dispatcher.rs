@@ -415,6 +415,7 @@ async fn fire_issue_sink(
             // A freshly dispatched issue has no prior attempt to supersede.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             Vec::new(),
+            crate::execution::recipe::QueuePlace::Tail,
         )
         .await
         .map_err(|error| {

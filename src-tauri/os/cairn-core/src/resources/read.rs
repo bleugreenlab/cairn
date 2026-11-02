@@ -2391,6 +2391,14 @@ async fn render_resource_body(
             )
             .await
         }
+        CairnResource::ThreadQueue { project, thread } => {
+            if let Some(error) = reject_query_params("thread queue", &params) {
+                error
+            } else {
+                super::threads::read_thread_queue(db, &project, &thread, orch.services.clock.now())
+                    .await
+            }
+        }
         CairnResource::ThreadBranches { project, thread } => {
             if let Some(error) = reject_query_params("thread branches", &params) {
                 error

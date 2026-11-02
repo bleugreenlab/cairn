@@ -578,7 +578,8 @@ pub(super) async fn dispatch(
             let family = pool_hardware(&detected, &snapshots(orch), &Default::default())
                 .ok()
                 .and_then(|hw| hw.machines.first().map(|m| m.family));
-            let profiles = inference_verify::candidates(&inventory, name, &detected, family);
+            let profiles =
+                inference_verify::candidates(&inventory, name, detected.members.len(), family);
             if profiles.is_empty() {
                 return Err(fail(format!(
                     "model {name} has no container profile that suits pool {pool}; import one or generate candidates at cairn://inference/profiles"
@@ -586,7 +587,7 @@ pub(super) async fn dispatch(
             }
             let requester = actor(orch, request, None).await;
             let count = profiles.len();
-            let id = inference_verify::spawn(orch, profiles, detected, &requester, all)
+            let id = inference_verify::spawn(orch, profiles, detected, &requester, all, None)
                 .await
                 .map_err(fail)?;
             Ok(Some(format!(
@@ -692,6 +693,7 @@ pub(super) async fn dispatch(
                 detected,
                 &requester,
                 false,
+                None,
             )
             .await
             .map_err(fail)?;

@@ -314,13 +314,21 @@ pub fn census_with(
                 place,
                 unmet_caps.iter().map(|entry| entry.predicate.clone()),
             );
-            let detail: Vec<String> = unmet_caps
+            let mut detail: Vec<String> = unmet_caps
                 .iter()
                 .map(|entry| match &entry.hold {
                     Some(hold) => hold_detail(hold),
                     None => entry.predicate.clone(),
                 })
                 .collect();
+            // A thread's own reorder moved it ahead (cairn/5848): said once,
+            // on hover, never on the terse line.
+            if let Some(by) = unmet_caps
+                .iter()
+                .find_map(|entry| entry.hold.as_ref().and_then(CapacityHold::placed_by))
+            {
+                detail.push(format!("placed ahead by {by}"));
+            }
             (line, Some(detail.join("\n")))
         }
         None => (
@@ -992,7 +1000,7 @@ mod tests {
         for (column, resolution) in [("merged_at", "merged"), ("closed_at", "closed")] {
             let db = issue_with_two_executions().await;
             db.execute(
-                &format!("UPDATE issues SET status = '{resolution}', {column} = 5 WHERE id = 'i'"),
+                format!("UPDATE issues SET status = '{resolution}', {column} = 5 WHERE id = 'i'"),
                 (),
             )
             .await
@@ -1256,12 +1264,14 @@ mod tests {
             limit: 30,
             unplaced: 1,
             place: Some(3),
+            placed_by: None,
         };
         let thread = CapacityHold::Thread {
             thread: "harness".into(),
             open: vec![5783, 5790, 5791, 5792, 5793],
             limit: 5,
             place: Some(1),
+            placed_by: None,
         };
         let fleet_gate = capacity_gate("gf", FLEET_SLOT_FACT, 1000, Some(&fleet));
         let thread_gate = capacity_gate("gt", THREAD_FOCUS_FACT, 1001, Some(&thread));
@@ -1303,11 +1313,35 @@ mod tests {
         );
         rendered.push(both);
 
+        // A thread's reorder: one hover line naming it, and the terse line
+        // unchanged.
+        let mut moved_fleet = fleet.clone();
+        moved_fleet.set_placed_by(Some("harness".into()));
+        let mut moved_thread = thread.clone();
+        moved_thread.set_placed_by(Some("harness".into()));
+        let moved = read(&[
+            capacity_gate("gf", FLEET_SLOT_FACT, 1000, Some(&moved_fleet)),
+            capacity_gate("gt", THREAD_FOCUS_FACT, 1001, Some(&moved_thread)),
+        ]);
+        assert_eq!(
+            moved.summary,
+            "Queued · 3rd · 39/30 running · harness 5/5 open"
+        );
+        assert_eq!(
+            moved.detail.as_deref(),
+            Some(
+                "Fleet · 3rd · 1 unplaced\nharness · 1st · 5783, 5790, 5791, 5792, 5793\n\
+                 placed ahead by harness"
+            )
+        );
+        rendered.push(moved);
+
         let unnumbered = CapacityHold::Fleet {
             running: 6,
             limit: 6,
             unplaced: 0,
             place: None,
+            placed_by: None,
         };
         let fresh = read(&[capacity_gate(
             "gn",

@@ -18,12 +18,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cairn_common::executor_protocol::{ExecutorHealthSnapshot, GpuMemory, MeasurementReading};
+use cairn_common::executor_protocol::{
+    ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
+};
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
 use cairn_inference::served::{self, EngineMeasure};
 use cairn_inference::{
-    DeploymentId, Engine, InferenceProfile, Inventory, MemoryPerMachine, Model, Server,
+    AcceleratorFamily, DeploymentId, Engine, InferenceProfile, InferenceProfileId, Inventory,
+    MemoryPerMachine, Model, Server,
 };
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
@@ -131,11 +134,16 @@ pub struct Rates {
 #[serde(rename_all = "camelCase")]
 pub struct LoadableModel {
     pub model: String,
-    /// The profile a load runs, when a deployment of it is on the pool.
+    /// The profile a load runs: its deployment's on the pool, or the one it
+    /// verifies first.
     pub profile: Option<String>,
     pub size_bytes: Option<u64>,
     /// Why it cannot load on this pool, in a few words; `None` when it can.
     pub blocked: Option<String>,
+    /// No deployment of it is on the pool yet, but a container profile of it
+    /// fits: a load verifies `profile` there first and keeps it loaded if it
+    /// passes.
+    pub verifies: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -234,6 +242,8 @@ pub struct TryAnswer {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MachineFacts {
     pub gpu: Option<String>,
+    /// Its first GPU's maker, which decides the profiles that suit it.
+    pub family: Option<AcceleratorFamily>,
     /// Total and free bytes of the memory a model lives in.
     pub memory: Option<(u64, u64)>,
     /// What the machine's GPUs hold now.
@@ -249,6 +259,10 @@ impl MachineFacts {
         let gpu = devices.first().map(|first| match devices.len() {
             1 => first.model.clone(),
             n => format!("{n}× {}", first.model),
+        });
+        let family = devices.first().map(|first| match first.vendor {
+            GpuVendor::Nvidia => AcceleratorFamily::Nvidia,
+            GpuVendor::Apple => AcceleratorFamily::Apple,
         });
         let mut discrete: Option<(u64, u64)> = None;
         let mut allocated: Option<u64> = None;
@@ -287,6 +301,7 @@ impl MachineFacts {
         };
         Self {
             gpu,
+            family,
             memory,
             gpu_allocated_bytes: allocated,
         }
@@ -466,6 +481,12 @@ impl Sources<'_> {
                 footprint.values().max().copied(),
             );
         }
+        Self::declared_size(profile)
+    }
+
+    /// What `profile` declares it takes: its whole size and its size on one
+    /// machine.
+    fn declared_size(profile: &InferenceProfile) -> (Option<u64>, Option<u64>) {
         let per_machine = profile.requirements.memory.map(|memory| match memory {
             MemoryPerMachine::Unified { system } => system.0,
             MemoryPerMachine::Discrete { vram, .. } => vram.0,
@@ -597,8 +618,62 @@ impl Sources<'_> {
             })
             .map(|group| self.offer(pool, deployments, group))
             .collect();
-        offered.sort_by_key(|offer| offer.blocked.is_some());
+        offered.sort_by_key(|offer| (offer.blocked.is_some(), offer.verifies));
         offered
+    }
+
+    /// The hardware family of `pool`'s machines, from the first that reports.
+    fn family(&self, pool: &PoolView) -> Option<AcceleratorFamily> {
+        pool.members
+            .iter()
+            .find_map(|m| self.machines.get(m.machine.as_str())?.family)
+    }
+
+    /// The container profiles of `group` that suit `pool`'s machines, in the
+    /// order verification tries them, each with whether its declared size
+    /// fits the pool.
+    fn verifiable_here<'s>(
+        &'s self,
+        pool: &PoolView,
+        group: &ModelGroup<'_>,
+    ) -> Vec<(&'s InferenceProfile, bool)> {
+        super::inference_verify::candidates(
+            self.inventory,
+            &group.name,
+            pool.members.len(),
+            self.family(pool),
+        )
+        .iter()
+        .filter_map(|id| self.inventory.profiles.get(id))
+        .map(|profile| {
+            let (_, per_machine) = Self::declared_size(profile);
+            (profile, self.fits(pool, profile, per_machine))
+        })
+        .collect()
+    }
+
+    /// The profiles a load of `model` on `pool` verifies before it keeps the
+    /// first that passes, in order; `None` when the load is a plain request
+    /// (a deployment of it is here) or cannot load at all. The menu offers it
+    /// as verifying first by the same rule.
+    pub(crate) fn load_verifies(
+        &self,
+        pool: &PoolKey,
+        model: &str,
+    ) -> Option<Vec<InferenceProfileId>> {
+        let pool = self.models.pools.iter().find(|p| &p.key == pool)?;
+        let groups = self.model_groups();
+        let group = groups.iter().find(|g| same_model(&g.name, model))?;
+        if !self.offer(pool, &self.deployments_of(pool), group).verifies {
+            return None;
+        }
+        Some(
+            self.verifiable_here(pool, group)
+                .into_iter()
+                .filter(|(_, fits)| *fits)
+                .map(|(profile, _)| profile.id.clone())
+                .collect(),
+        )
     }
 
     fn offer(
@@ -632,17 +707,36 @@ impl Sources<'_> {
                 profile: Some(profile.id.to_string()),
                 size_bytes: size,
                 blocked,
+                verifies: false,
             },
-            None => LoadableModel {
-                model: group.name.clone(),
-                profile: None,
-                size_bytes: None,
-                blocked: Some(self.not_here(pool, group)),
-            },
+            None => self.unverified(pool, group),
         }
     }
 
-    /// Why `group` has no deployment on `pool`, in a few words.
+    /// How `pool` offers `group`, which has no deployment there: loadable,
+    /// verifying first, when a container profile of it fits, else greyed with
+    /// why.
+    fn unverified(&self, pool: &PoolView, group: &ModelGroup<'_>) -> LoadableModel {
+        let verifiable = self.verifiable_here(pool, group);
+        let (profile, verifies) = match verifiable.iter().find(|(_, fits)| *fits) {
+            Some((profile, _)) => (Some(*profile), true),
+            None => (verifiable.first().map(|(profile, _)| *profile), false),
+        };
+        LoadableModel {
+            model: group.name.clone(),
+            profile: profile.map(|p| p.id.to_string()),
+            size_bytes: profile.and_then(|p| Self::declared_size(p).0),
+            blocked: match (verifies, profile) {
+                (true, _) => None,
+                (false, Some(_)) => Some("won't fit".to_string()),
+                (false, None) => Some(self.not_here(pool, group)),
+            },
+            verifies,
+        }
+    }
+
+    /// Why `group`, with no deployment on `pool` and no container profile that
+    /// suits it, cannot load there, in a few words.
     fn not_here(&self, pool: &PoolView, group: &ModelGroup<'_>) -> String {
         let members: BTreeSet<&str> = pool.members.iter().map(|m| m.machine.as_str()).collect();
         // A gang reaching past this pool's machines: they are not linked.
@@ -673,15 +767,7 @@ impl Sources<'_> {
         {
             return format!("needs ×{fewest}");
         }
-        if group
-            .profiles
-            .iter()
-            .any(|profile| matches!(profile.engine, Engine::Container(_)))
-        {
-            "unverified here".to_string()
-        } else {
-            "no deployment here".to_string()
-        }
+        "no deployment here".to_string()
     }
 
     /// Why none of `group`'s deployments can run now, in a few words; `None`
@@ -1004,8 +1090,38 @@ pub async fn running_detail(
 }
 
 /// Load `model` (its real name) on `pool`: a request, so the model loads and
-/// its idle clock starts.
+/// its idle clock starts. A model with no deployment on the pool whose
+/// container profiles fit it is verified there first, in the background, and
+/// the first profile that passes stays loaded for the operator as if the
+/// request had loaded it.
 pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String, String> {
+    let key = PoolKey::from(pool);
+    let verifies = with_sources(orch, |sources| sources.load_verifies(&key, model)).await?;
+    if let Some(profiles) = verifies {
+        let detected = super::inference_generate::detected_pool(orch, pool)?;
+        let first = profiles
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let others = profiles.len().saturating_sub(1);
+        let id = super::inference_verify::spawn(
+            orch,
+            profiles,
+            detected,
+            OPERATOR,
+            false,
+            Some(OPERATOR.to_string()),
+        )
+        .await?;
+        return Ok(format!(
+            "{model} has no deployment on {pool} yet, so loading verifies profile {first} there first (verification {id}){}; the first that passes stays loaded",
+            match others {
+                0 => String::new(),
+                1 => ", then 1 more profile if it fails".to_string(),
+                n => format!(", then {n} more profiles in turn if it fails"),
+            }
+        ));
+    }
     let handle = models::request(orch, model, OPERATOR, Some(&PoolKey::from(pool))).await?;
     let status = handle.status(orch).await?;
     Ok(format!("Request #{}: {}", handle.id, status.describe()))
@@ -1185,10 +1301,11 @@ pub async fn verify_profile(
     let detected = super::inference_generate::detected_pool(orch, pool)?;
     let id = super::inference_verify::spawn(
         orch,
-        vec![cairn_inference::InferenceProfileId::from(profile)],
+        vec![InferenceProfileId::from(profile)],
         detected,
         OPERATOR,
         false,
+        None,
     )
     .await?;
     Ok(format!("Verifying {profile} on {pool} (verification {id})"))
@@ -1310,6 +1427,7 @@ deployments:
     fn spark(allocated: Option<u64>) -> MachineFacts {
         MachineFacts {
             gpu: Some("NVIDIA GB10".into()),
+            family: Some(AcceleratorFamily::Nvidia),
             memory: Some((122 * GIB, 20 * GIB)),
             gpu_allocated_bytes: allocated,
         }
@@ -1479,6 +1597,7 @@ deployments:
             "fedora".into(),
             MachineFacts {
                 gpu: Some("RTX 4090".into()),
+                family: Some(AcceleratorFamily::Nvidia),
                 memory: Some((24 * GIB, 20 * GIB)),
                 gpu_allocated_bytes: Some(4 * GIB),
             },
@@ -1845,8 +1964,120 @@ deployments:
                 .clone()
         };
         assert_eq!(blocked(&world).as_deref(), Some("failed verify"));
+        world.verifications = vec![verification("qwen3-embed-4b", SPARKS, "running")];
+        assert_eq!(blocked(&world).as_deref(), Some("verifying"));
         world.verifications = vec![verification("qwen3-embed-4b", SPARKS, "passed")];
         assert_eq!(blocked(&world), None);
+    }
+
+    /// A llama.cpp profile of the embedder declaring `bytes` of unified memory
+    /// on its one machine.
+    fn embed_container(bytes: u64) -> InferenceProfile {
+        Inventory::from_yaml(&format!(
+            r#"
+models:
+  - {{name: Qwen/Qwen3-Embedding-4B}}
+profiles:
+  - id: qwen3-embed-4b-gguf
+    model:
+      name: Qwen/Qwen3-Embedding-4B
+      weights: [{{repo: Qwen/Qwen3-Embedding-4B-GGUF, revision: f4602530db1d980e16da9d7d3a70294cf5c190be, path: Qwen3-Embedding-4B-Q8_0.gguf, sha256: b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d}}]
+    servedName: Qwen/Qwen3-Embedding-4B
+    verbs: [embed]
+    quantization: q8_0
+    engine:
+      kind: container
+      image: ghcr.io/ggml-org/llama.cpp@sha256:afdc5265d1cfc729ad3ebaac59fd60e5d15c3b7aef455d7dc16bc1dccbc4dc64
+      server: llamaCpp
+      args: [-m, "{{weights}}", --port, "{{port}}"]
+    requirements: {{machines: 1, memory: {{kind: unified, system: {bytes}}}}}
+"#
+        ))
+        .unwrap()
+        .profiles
+        .into_values()
+        .next()
+        .unwrap()
+    }
+
+    /// The Sparks reporting their memory, with the embedder's container
+    /// profile declaring `bytes`.
+    fn sparks_with_embed_container(bytes: u64) -> World {
+        let mut world = World::new();
+        world.machines.insert("sp1".into(), spark(None));
+        world.machines.insert("sp2".into(), spark(None));
+        world.inventory.insert_profile(embed_container(bytes));
+        world
+    }
+
+    #[test]
+    fn a_fitting_container_profile_with_no_deployment_here_loads_by_verifying_first() {
+        let world = sparks_with_embed_container(10 * GIB);
+        let overview = world.overview();
+        let sparks = pool(&overview, SPARKS);
+        assert_eq!(
+            sparks
+                .loadable
+                .iter()
+                .map(|l| (l.model.as_str(), l.blocked.as_deref(), l.verifies))
+                .collect::<Vec<_>>(),
+            [
+                (DSV4, None, false),
+                (EMBED, None, true),
+                (QWEN, Some("won't fit"), false)
+            ],
+            "what loads at once first, then what verifies first, then what cannot"
+        );
+        assert_eq!(
+            sparks.loadable[1],
+            LoadableModel {
+                model: EMBED.into(),
+                profile: Some("qwen3-embed-4b-gguf".into()),
+                size_bytes: Some(10 * GIB),
+                blocked: None,
+                verifies: true,
+            }
+        );
+        let sources = world.sources();
+        assert_eq!(
+            sources.load_verifies(&PoolKey::from(SPARKS), EMBED),
+            Some(vec![InferenceProfileId::from("qwen3-embed-4b-gguf")])
+        );
+        // Deployed here already: a load is a plain request.
+        assert_eq!(sources.load_verifies(&PoolKey::from(SPARKS), DSV4), None);
+        let fedora = pool(&overview, "fedora");
+        let embed = fedora.loadable.iter().find(|l| l.model == EMBED).unwrap();
+        assert_eq!(
+            (embed.profile.as_deref(), embed.verifies),
+            (Some("qwen3-embed-4b"), false)
+        );
+        assert_eq!(sources.load_verifies(&PoolKey::from("fedora"), EMBED), None);
+        // A model with only command profiles has nothing to verify.
+        let qwen = fedora.loadable.iter().find(|l| l.model == QWEN).unwrap();
+        assert_eq!(
+            (qwen.blocked.as_deref(), qwen.verifies),
+            (Some("no deployment here"), false)
+        );
+        assert_eq!(sources.load_verifies(&PoolKey::from("fedora"), QWEN), None);
+    }
+
+    #[test]
+    fn a_container_profile_too_big_for_the_pool_stays_greyed() {
+        let world = sparks_with_embed_container(200 * GIB);
+        let overview = world.overview();
+        let embed = pool(&overview, SPARKS)
+            .loadable
+            .iter()
+            .find(|l| l.model == EMBED)
+            .unwrap();
+        assert_eq!(
+            (embed.blocked.as_deref(), embed.verifies, embed.size_bytes),
+            (Some("won't fit"), false, Some(200 * GIB))
+        );
+        assert_eq!(
+            world.sources().load_verifies(&PoolKey::from(SPARKS), EMBED),
+            None
+        );
     }
 
     #[test]

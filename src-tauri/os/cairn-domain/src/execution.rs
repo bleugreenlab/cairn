@@ -114,7 +114,9 @@ pub enum GateEvidenceState {
 /// the capacity gate row's `execution_gates.detail`, and carried on the census,
 /// so the one renderer (`execution::gates::census`) turns the same facts into
 /// words on every surface. `place` is the execution's place in line on this
-/// cap, `None` until the queue has numbered it.
+/// cap, `None` until the queue has numbered it. `placed_by` names the thread
+/// whose own reorder moved this hold ahead of where it was filed (cairn/5848),
+/// `None` for a hold in the place it was filed into.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cap", rename_all = "camelCase")]
 pub enum CapacityHold {
@@ -127,6 +129,8 @@ pub enum CapacityHold {
         unplaced: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placed_by: Option<String>,
     },
     /// The thread focus cap: the thread's open children, by issue number,
     /// against its limit.
@@ -137,6 +141,8 @@ pub enum CapacityHold {
         limit: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         place: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placed_by: Option<String>,
     },
 }
 
@@ -150,6 +156,18 @@ impl CapacityHold {
     pub fn set_place(&mut self, to: Option<usize>) {
         match self {
             Self::Fleet { place, .. } | Self::Thread { place, .. } => *place = to,
+        }
+    }
+
+    pub fn placed_by(&self) -> Option<&str> {
+        match self {
+            Self::Fleet { placed_by, .. } | Self::Thread { placed_by, .. } => placed_by.as_deref(),
+        }
+    }
+
+    pub fn set_placed_by(&mut self, to: Option<String>) {
+        match self {
+            Self::Fleet { placed_by, .. } | Self::Thread { placed_by, .. } => *placed_by = to,
         }
     }
 }

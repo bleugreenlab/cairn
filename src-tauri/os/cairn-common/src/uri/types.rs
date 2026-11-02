@@ -245,6 +245,12 @@ pub enum CairnResource {
         project: String,
         thread: String,
     },
+    /// The thread's children's cap-held executions, in the order they start
+    /// (cairn/5848).
+    ThreadQueue {
+        project: String,
+        thread: String,
+    },
     ThreadBranch {
         project: String,
         thread: String,
@@ -1141,6 +1147,7 @@ impl CairnResource {
             Self::ProjectThreads { .. } => ResourceKind::ProjectThreads,
             Self::Thread { .. } => ResourceKind::Thread,
             Self::ThreadBranches { .. } => ResourceKind::ThreadBranches,
+            Self::ThreadQueue { .. } => ResourceKind::ThreadQueue,
             Self::ThreadBranch { .. } => ResourceKind::ThreadBranch,
             Self::ThreadDb { .. } => ResourceKind::ThreadDb,
             Self::ThreadDbSchema { .. } => ResourceKind::ThreadDbSchema,
