@@ -510,6 +510,7 @@ pub(super) mod tests {
     use std::time::Duration;
 
     use cairn_common::uri::{parse_uri, CairnResource};
+    use cairn_models::interface::speak::AudioEncoding;
     use serde_json::{json, Value};
 
     use super::super::types::ItemOutcome;
@@ -700,6 +701,57 @@ pub(super) mod tests {
             "{}",
             outcome.body
         );
+    }
+
+    /// The format to ask the speak door for, and a first chunk the voicebox
+    /// answers with, for each encoding speak can emit. The match is exhaustive
+    /// so a new encoding cannot join speak's table without a sample here.
+    fn sample_clip(encoding: AudioEncoding) -> (&'static str, &'static [u8]) {
+        match encoding {
+            AudioEncoding::Mp3 => ("mp3", b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb\x90\x64"),
+            AudioEncoding::Opus => ("opus", b"OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00"),
+            AudioEncoding::PcmS16le => ("pcm", b"\x01\x00\x02\x00"),
+        }
+    }
+
+    /// Speak's encoder table and the attachment sniffer agree: every clip
+    /// reads back under the media type the door named for it, not as
+    /// `application/octet-stream`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_spoken_encoding_reads_back_under_the_media_type_it_was_stored_as() {
+        for encoding in [
+            AudioEncoding::Mp3,
+            AudioEncoding::Opus,
+            AudioEncoding::PcmS16le,
+        ] {
+            let (format, chunk) = sample_clip(encoding);
+            let voicebox =
+                crate::orchestrator::speak::tests::Voicebox::new(&[chunk], Duration::ZERO);
+            let (orch, _, _) = crate::orchestrator::speak::tests::workspace(voicebox).await;
+            seed_run(&orch).await;
+            let outcome = item(
+                &orch,
+                true,
+                "cairn://models/speak",
+                json!({"model": "tts-1", "text": "Hi.", "voice": "alloy", "format": format}),
+            )
+            .await;
+            assert!(outcome.succeeded, "{format}: {}", outcome.body);
+            let reply: SpeakReply = serde_json::from_value(outcome.data.unwrap()).unwrap();
+            assert!(
+                reply.media_type.starts_with("audio/"),
+                "{format}: {reply:?}"
+            );
+            let reference = match parse_uri(&reply.uri) {
+                Some(CairnResource::ProjectAttachment { reference, .. }) => reference,
+                other => panic!("'{}' is not an attachment: {other:?}", reply.uri),
+            };
+            let fetched =
+                crate::attachments::fetch_attachment(&orch.db.local, "p", "prj", &reference)
+                    .await
+                    .unwrap();
+            assert_eq!(fetched.media_type, reply.media_type, "{format}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

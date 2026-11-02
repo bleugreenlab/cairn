@@ -298,6 +298,12 @@ fn sniff_binary_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.starts_with(b"OggS\0") {
+        Some("audio/ogg")
+    } else if is_mp3(bytes) {
+        Some("audio/mpeg")
     } else if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
     } else if bytes.starts_with(b"PK\x03\x04") {
@@ -306,6 +312,24 @@ fn sniff_binary_media_type(bytes: &[u8]) -> Option<&'static str> {
         Some("application/gzip")
     } else {
         None
+    }
+}
+
+/// MP3: an ID3v2 tag (`ID3` and a major version of 2, 3 or 4), or a bare MPEG
+/// Layer III frame header. The frame check reads the version, layer, bitrate
+/// and sample-rate fields rather than the eleven-bit sync alone, because
+/// `FF FE` — the UTF-16LE byte order mark — also opens with eleven set bits.
+fn is_mp3(bytes: &[u8]) -> bool {
+    match bytes {
+        [b'I', b'D', b'3', 2..=4, ..] => true,
+        [0xFF, second, third, _, ..] => {
+            second & 0xE0 == 0xE0
+                && (second >> 3) & 0b11 != 0b01
+                && (second >> 1) & 0b11 == 0b01
+                && third >> 4 != 0b1111
+                && (third >> 2) & 0b11 != 0b11
+        }
+        _ => false,
     }
 }
 
@@ -1361,6 +1385,48 @@ mod tests {
         assert_eq!(
             measure_media_type(&[0u8, 1, 2, 3, 200], "x.txt"),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn audio_is_measured_from_its_container_signature() {
+        let id3 = b"ID3\x04\x00\x00\x00\x00\x00\x00\xff\xfb\x90\x64";
+        assert_eq!(measure_media_type(id3, "clip.bin"), "audio/mpeg");
+        // MPEG-1 and MPEG-2 Layer III frames with no tag in front.
+        let frame = [0xFFu8, 0xFB, 0x90, 0x64, 0x00, 0x00];
+        assert_eq!(measure_media_type(&frame, "clip"), "audio/mpeg");
+        let frame = [0xFFu8, 0xF3, 0x64, 0xC4, 0x00, 0x00];
+        assert_eq!(measure_media_type(&frame, "clip"), "audio/mpeg");
+        assert_eq!(
+            measure_media_type(b"OggS\x00\x02\x00\x00\x00\x00", "clip"),
+            "audio/ogg"
+        );
+        assert_eq!(
+            measure_media_type(b"RIFF\x24\x00\x00\x00WAVEfmt ", "clip"),
+            "audio/wav"
+        );
+        assert_eq!(
+            measure_media_type(b"RIFF\x24\x00\x00\x00WEBPVP8 ", "clip"),
+            "image/webp"
+        );
+    }
+
+    /// The audio signatures are narrow enough not to claim neighbours: JPEG's
+    /// `FF D8 FF` stays an image, a UTF-16LE byte order mark is not an MPEG
+    /// frame, and text that merely begins with the letters `ID3` stays text.
+    #[test]
+    fn audio_signatures_do_not_claim_neighbouring_bytes() {
+        assert_eq!(
+            measure_media_type(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10], "photo"),
+            "image/jpeg"
+        );
+        assert_eq!(
+            measure_media_type(&[0xFF, 0xFE, b'h', 0x00, b'i', 0x00], "notes.txt"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            measure_media_type(b"ID3 tags, a primer", "notes.md"),
+            "text/markdown"
         );
     }
 
