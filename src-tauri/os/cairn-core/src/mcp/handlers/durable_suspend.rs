@@ -229,6 +229,18 @@ pub(crate) async fn await_inner_wait_release(db: &LocalDb, record: &Record) {
 }
 
 impl Condition {
+    /// The serde tag this condition is stored under, which is also the row's
+    /// `kind` column.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Condition::Duration => "duration",
+            Condition::Terminal { .. } => "terminal",
+            Condition::Checks { .. } => "checks",
+            Condition::McpContinuation { .. } => "mcp_continuation",
+            Condition::RunBatch { .. } => "run_batch",
+        }
+    }
+
     /// A short, human-readable name for the call this suspension parked.
     ///
     /// It exists to distinguish one result from another when a turn resumes
@@ -256,6 +268,82 @@ impl Condition {
             Condition::RunBatch { label: None, .. } => "run batch".to_string(),
         }
     }
+}
+
+/// A wait's condition as one `agent_waits` row stores it: the JSON and the
+/// columns the scheduler reads instead of opening it.
+///
+/// The derived columns are a function of the condition and the row's
+/// `deadline_ms` alone, never of its `state`, so a state transition cannot make
+/// them stale. They are written only by [`INSERT_WAIT_SQL`] and
+/// [`STORE_CONDITION_SQL`], in the same statement as the JSON they derive from.
+#[derive(Clone)]
+pub(crate) struct ConditionColumns {
+    pub(crate) json: String,
+    pub(crate) kind: &'static str,
+    pub(crate) due_at_ms: Option<i64>,
+    pub(crate) next_poll_at_ms: Option<i64>,
+    pub(crate) pending_prompt_id: Option<String>,
+}
+
+impl ConditionColumns {
+    pub(crate) fn of(condition: &Condition, deadline_ms: Option<i64>) -> Result<Self, String> {
+        let json = serde_json::to_string(condition).map_err(|error| error.to_string())?;
+        let schedule = match condition {
+            Condition::McpContinuation { state } => {
+                super::mcp_continuation::schedule(state, deadline_ms)
+            }
+            _ => super::mcp_continuation::McpSchedule::default(),
+        };
+        Ok(Self {
+            json,
+            kind: condition.kind(),
+            due_at_ms: schedule.due_at_ms,
+            next_poll_at_ms: schedule.next_poll_at_ms,
+            pending_prompt_id: schedule.pending_prompt_id,
+        })
+    }
+}
+
+/// The one statement that creates a wait row.
+const INSERT_WAIT_SQL: &str = "INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,kind,due_at_ms,next_poll_at_ms,pending_prompt_id,state,created_at,hold) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'pending',?13,?14)";
+
+/// The one statement that rewrites an active wait's condition.
+const STORE_CONDITION_SQL: &str = "UPDATE agent_waits SET condition_json=?2,deadline_ms=?3,kind=?4,due_at_ms=?5,next_poll_at_ms=?6,pending_prompt_id=?7 WHERE id=?1 AND state IN ('pending','resolving')";
+
+/// Rewrite an active wait's condition and deadline, reporting whether the row
+/// was still active.
+pub(crate) async fn store_condition(
+    db: &LocalDb,
+    wait_id: &str,
+    condition: &Condition,
+    deadline_ms: Option<i64>,
+) -> Result<bool, String> {
+    let columns = ConditionColumns::of(condition, deadline_ms)?;
+    let wait_id = wait_id.to_owned();
+    db.write(|conn| {
+        let wait_id = wait_id.clone();
+        let columns = columns.clone();
+        Box::pin(async move {
+            Ok(conn
+                .execute(
+                    STORE_CONDITION_SQL,
+                    params![
+                        wait_id,
+                        columns.json,
+                        deadline_ms,
+                        columns.kind,
+                        columns.due_at_ms,
+                        columns.next_poll_at_ms,
+                        columns.pending_prompt_id
+                    ],
+                )
+                .await?
+                == 1)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// One suspended call: the parked turn, the tool call awaiting a result, and
@@ -750,9 +838,9 @@ async fn insert_as(db: &LocalDb, r: &Record, establish: Establish) -> Result<boo
                 return Err(DbError::internal("permission request already owns this tool call"));
             }
         }
-        let json=serde_json::to_string(&r.condition).map_err(|e|DbError::internal(e.to_string()))?;
+        let columns=ConditionColumns::of(&r.condition,r.deadline).map_err(DbError::internal)?;
         let hold = (establish == Establish::Hold).then_some("inline");
-        c.execute("INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at,hold) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,?10)",params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),json,r.deadline,r.created,hold]).await?;
+        c.execute(INSERT_WAIT_SQL,params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),columns.json.as_str(),r.deadline,columns.kind,columns.due_at_ms,columns.next_poll_at_ms,columns.pending_prompt_id.as_deref(),r.created,hold]).await?;
         if establish == Establish::Hold {
             return Ok(false);
         }
@@ -2330,6 +2418,10 @@ pub(crate) async fn sweep_stuck_resolutions(orch: &Orchestrator) -> SweepOutcome
     outcome
 }
 
+/// The sweep's candidates, read through `idx_agent_waits_resolving` so a pass
+/// touches only the rows in `resolving`.
+const STALE_RESOLVING_SQL: &str = "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,resolution_json FROM agent_waits WHERE state='resolving' AND COALESCE(resolving_at,created_at)<=?1";
+
 /// `resolving` rows that entered that state at or before `cutoff_ms`, with
 /// their stored resolution.
 async fn stale_resolving(
@@ -2338,12 +2430,7 @@ async fn stale_resolving(
 ) -> Result<Vec<(Record, Option<String>)>, String> {
     db.read(move |conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,resolution_json FROM agent_waits WHERE state='resolving' AND COALESCE(resolving_at,created_at)<=?1",
-                    params![cutoff_ms],
-                )
-                .await?;
+            let mut rows = conn.query(STALE_RESOLVING_SQL, params![cutoff_ms]).await?;
             let mut found = Vec::new();
             while let Some(row) = rows.next().await? {
                 found.push((record_from_row(&row)?, row.opt_text(9)?));
@@ -3225,6 +3312,479 @@ mod tests {
         assert_eq!(gateway.calls.lock().unwrap().len(), 1);
         assert_eq!(tool_result_count(&orch).await, 1);
         assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+    }
+
+    // ---- The schedule columns and the scheduler that reads them ------------
+
+    #[test]
+    fn every_condition_kind_is_its_serde_tag() {
+        for condition in [
+            Condition::Duration,
+            Condition::Terminal {
+                uri: "cairn:~/terminal/t".into(),
+                slug: "t".into(),
+                on: TerminalWaitEvent::Exit,
+                phrase: None,
+            },
+            Condition::Checks {
+                uri: "cairn:~/checks".into(),
+                job_id: "job-1".into(),
+                suite: None,
+            },
+            Condition::McpContinuation { state: mcp_state() },
+            run_batch_condition(false, None),
+        ] {
+            let json = serde_json::to_value(&condition).unwrap();
+            assert_eq!(json["kind"], condition.kind(), "{json}");
+        }
+    }
+
+    /// The plan's `detail` column for `sql`, with its placeholders replaced by
+    /// literals.
+    async fn query_plan(db: &LocalDb, sql: String) -> Vec<String> {
+        db.read(move |conn| {
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                let mut steps = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    steps.push(row.text(3)?);
+                }
+                Ok(steps)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    fn due_sql_with_literals(sql: &str) -> String {
+        sql.replace("?1", "1000000")
+            .replace("?2", "1000")
+            .replace("?3", "64")
+    }
+
+    /// The scheduler's tick and the stuck-resolution sweep read their partial
+    /// indexes rather than the table, and a lookup by id still goes through
+    /// the primary key. Every one of these returns correct rows on a full scan
+    /// too, so only the plan witnesses a regression.
+    #[tokio::test]
+    async fn scheduler_and_sweep_reads_use_their_partial_indexes() {
+        use super::super::mcp_continuation::{DUE_SQL, LOAD_RECORD_SQL, REFERENCE_DUE_SQL};
+        let (orch, _, _) = durable_env().await;
+        let db = &orch.db.local;
+
+        let reference = query_plan(db, due_sql_with_literals(REFERENCE_DUE_SQL)).await;
+        eprintln!("reference due plan:\n{}", reference.join("\n"));
+        let due = query_plan(db, due_sql_with_literals(DUE_SQL)).await;
+        eprintln!("due_wait_ids plan:\n{}", due.join("\n"));
+        assert!(
+            due.iter()
+                .any(|step| step.contains("idx_agent_waits_mcp_due")),
+            "{due:#?}"
+        );
+        assert!(
+            !due.iter()
+                .any(|step| step.starts_with("SCAN agent_waits") && !step.contains("INDEX")),
+            "the tick must not scan the table: {due:#?}"
+        );
+        assert!(
+            !due.iter().any(|step| step.starts_with("SCAN prompts")),
+            "the awaited prompt is probed by primary key: {due:#?}"
+        );
+
+        let sweep = query_plan(db, STALE_RESOLVING_SQL.replace("?1", "1000")).await;
+        eprintln!("sweep plan:\n{}", sweep.join("\n"));
+        assert!(
+            sweep
+                .iter()
+                .any(|step| step.contains("idx_agent_waits_resolving")),
+            "{sweep:#?}"
+        );
+
+        let load = query_plan(db, LOAD_RECORD_SQL.replace("?1", "'wait-1'")).await;
+        assert!(
+            load.iter()
+                .any(|step| step.contains("sqlite_autoindex_agent_waits_1")),
+            "a pending lookup by id must stay on the primary key: {load:#?}"
+        );
+    }
+
+    async fn answer_through_the_real_path(orch: &Orchestrator, prompt_id: &str) {
+        let answers = crate::models::question::PromptAnswers::new(
+            1,
+            vec![crate::models::question::QuestionAnswer {
+                index: 0,
+                answer: r#"{"approval":true}"#.into(),
+            }],
+        )
+        .unwrap();
+        crate::mcp::handlers::planning::answer_prompt_id(
+            orch,
+            prompt_id,
+            answers,
+            crate::turns::queries::ResolutionProvenance::new(
+                cairn_common::identity::AppearanceTransport::ResourcePatch,
+                Some("operator:test".into()),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// An MCP continuation that asked for input and is awaiting the answer.
+    async fn awaiting_mcp_answer() -> (Orchestrator, String, Arc<FakeMcpGateway>) {
+        let (orch, mut record, _) = durable_env().await;
+        register_warm(&orch);
+        let gateway = Arc::new(FakeMcpGateway::default());
+        gateway
+            .call_outcomes
+            .lock()
+            .unwrap()
+            .push_back(McpCallOutcome::Complete(McpToolCallResult::from_text(
+                "answered",
+            )));
+        assert!(orch.set_mcp_gateway(gateway.clone()).is_ok());
+        let mut state = mcp_state();
+        state.pending_input_requests = Some(serde_json::json!([{"id":"approval"}]));
+        record.condition = Condition::McpContinuation { state };
+        record.deadline = None;
+        insert(&orch.db.local, &record).await.unwrap();
+        let prompt_id = leave_prompt_pending_after_host_loss(&orch, &record).await;
+        (orch, prompt_id, gateway)
+    }
+
+    async fn due_now(orch: &Orchestrator) -> Vec<String> {
+        // Past the park handoff for a wait created just now.
+        let after_handoff = chrono::Utc::now().timestamp_millis() + 2_000;
+        super::super::mcp_continuation::due_wait_ids(&orch.db.local, after_handoff)
+            .await
+            .unwrap()
+    }
+
+    /// The answer is level-triggered durable state: committing it makes the
+    /// wait due, and the next tick drives it to its result. Nothing arms it.
+    #[tokio::test]
+    async fn a_committed_answer_to_the_awaited_prompt_makes_its_wait_due() {
+        let (orch, prompt_id, gateway) = awaiting_mcp_answer().await;
+        assert!(!due_now(&orch).await.contains(&"wait-1".to_string()));
+
+        answer_through_the_real_path(&orch, &prompt_id).await;
+        assert!(due_now(&orch).await.contains(&"wait-1".to_string()));
+
+        wait_for_reconciled_resolution(&orch).await;
+        assert_eq!(gateway.calls.lock().unwrap().len(), 1);
+        assert_eq!(tool_result_count(&orch).await, 1);
+    }
+
+    /// An answer committed while no host was driving the wait is found after a
+    /// restart from the row alone: reconciliation's store rewrites the
+    /// schedule columns, and they still lead the tick to the answer.
+    #[tokio::test]
+    async fn an_answer_committed_across_a_restart_is_found_from_the_row() {
+        let (orch, prompt_id, gateway) = awaiting_mcp_answer().await;
+        answer_through_the_real_path(&orch, &prompt_id).await;
+
+        reconcile(&orch).await;
+        let (pending_prompt, due_at) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT pending_prompt_id,due_at_ms FROM agent_waits WHERE id='wait-1'",
+                (),
+                |row| Ok((row.opt_text(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending_prompt.as_deref(), Some(prompt_id.as_str()));
+        assert!(
+            due_at.is_some_and(|at| at > chrono::Utc::now().timestamp_millis()),
+            "its own state makes it due only at its deadline; the answer is what makes it due now"
+        );
+
+        wait_for_reconciled_resolution(&orch).await;
+        assert_eq!(gateway.calls.lock().unwrap().len(), 1);
+        assert_eq!(tool_result_count(&orch).await, 1);
+        assert_eq!(wait_resolved_turns(&orch).await.len(), 1);
+    }
+
+    /// `source` without its inline `#[cfg(test)]` modules, whatever they are
+    /// named. A module's extent is found by counting braces outside string
+    /// literals, which the SQL in test fixtures is full of.
+    fn production_portion(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut kept = String::new();
+        let mut from = 0;
+        while let Some(at) = source[from..].find("#[cfg(test)]") {
+            let start = from + at;
+            let after = source[start + "#[cfg(test)]".len()..].trim_start();
+            let after = after
+                .strip_prefix("pub(crate) ")
+                .or_else(|| after.strip_prefix("pub(super) "))
+                .or_else(|| after.strip_prefix("pub "))
+                .unwrap_or(after);
+            let header_end = after.find(['{', ';']).unwrap_or(after.len());
+            if !after.starts_with("mod ") || !after[header_end..].starts_with('{') {
+                kept.push_str(&source[from..start + 1]);
+                from = start + 1;
+                continue;
+            }
+            kept.push_str(&source[from..start]);
+            let mut i = source.len() - after.len() + header_end;
+            let mut depth = 0_usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+                    b'r' if bytes.get(i + 1) == Some(&b'#') && bytes.get(i + 2) == Some(&b'"') => {
+                        i += source[i + 3..]
+                            .find("\"#")
+                            .map_or(bytes.len(), |end| end + 4);
+                    }
+                    b'"' => {
+                        i += 1;
+                        while i < bytes.len() && bytes[i] != b'"' {
+                            i += if bytes[i] == b'\\' { 2 } else { 1 };
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            from = i.min(bytes.len());
+        }
+        kept.push_str(&source[from..]);
+        kept
+    }
+
+    /// Each string literal in `source` from an `agent_waits` insert or update
+    /// to the literal's closing quote.
+    fn agent_wait_writes(source: &str) -> Vec<&str> {
+        let bytes = source.as_bytes();
+        let mut statements = Vec::new();
+        for needle in ["INSERT INTO agent_waits", "UPDATE agent_waits"] {
+            let mut from = 0;
+            while let Some(at) = source[from..].find(needle) {
+                let start = from + at;
+                let mut end = start;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                statements.push(&source[start..end.min(bytes.len())]);
+                from = start + needle.len();
+            }
+        }
+        statements
+    }
+
+    /// The schedule columns are only as true as the one writer that derives
+    /// them, so no other production statement may write a wait's condition or
+    /// deadline, and both writer statements carry every derived column.
+    #[test]
+    fn only_the_condition_writer_writes_a_waits_condition() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut writers = Vec::new();
+        let mut dirs = vec![root.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                for statement in agent_wait_writes(&production_portion(&source)) {
+                    if statement.contains("condition_json") || statement.contains("deadline_ms") {
+                        writers.push((
+                            path.strip_prefix(&root).unwrap().display().to_string(),
+                            statement.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        let mut found: Vec<&str> = writers.iter().map(|(_, sql)| sql.as_str()).collect();
+        found.sort_unstable();
+        let mut expected = vec![INSERT_WAIT_SQL, STORE_CONDITION_SQL];
+        expected.sort_unstable();
+        assert_eq!(found, expected, "{writers:#?}");
+        for sql in expected {
+            for column in ["kind", "due_at_ms", "next_poll_at_ms", "pending_prompt_id"] {
+                assert!(sql.contains(column), "{sql} must write {column}");
+            }
+        }
+    }
+
+    /// A tick against a long history: `resolved` finished rows with large
+    /// results, `others` pending non-MCP rows with large conditions, five due
+    /// continuations and two that are not. Times both selections over `ticks`
+    /// ticks and prints them.
+    async fn tick_cost(resolved: usize, others: usize, ticks: u32) {
+        use super::super::mcp_continuation::{
+            due_wait_ids, query_due, DUE_SQL, REFERENCE_DUE_SQL, SCHEDULER_SCAN_LIMIT,
+        };
+        let (orch, _, _) = durable_env().await;
+        let db = orch.db.local.clone();
+        let now = chrono::Utc::now().timestamp_millis();
+        let old = now - 60_000;
+        let deadline = Some(now + 3_600_000);
+        let result = format!(
+            r#"{{"outcome":"completed","result":"{}"}}"#,
+            "x".repeat(6_000)
+        );
+        let phrase = "y".repeat(8_192);
+
+        let mut rows: Vec<(String, Condition, Option<i64>, bool)> = Vec::new();
+        for n in 0..resolved {
+            rows.push((
+                format!("resolved-{n}"),
+                run_batch_condition(false, Some("cargo test")),
+                None,
+                true,
+            ));
+        }
+        for n in 0..others {
+            rows.push((
+                format!("terminal-{n}"),
+                Condition::Terminal {
+                    uri: "cairn:~/terminal/t".into(),
+                    slug: "t".into(),
+                    on: TerminalWaitEvent::Output,
+                    phrase: Some(phrase.clone()),
+                },
+                None,
+                false,
+            ));
+        }
+        let mut due = Vec::new();
+        for n in 0..5 {
+            let mut state = mcp_state();
+            state.pending_operation = Some(
+                super::super::mcp_continuation::PendingOperation::ContinueTool {
+                    operation_id: format!("op-{n}"),
+                    input_responses: serde_json::json!({}),
+                    request_state: None,
+                },
+            );
+            due.push(format!("due-{n}"));
+            rows.push((
+                format!("due-{n}"),
+                Condition::McpContinuation { state },
+                deadline,
+                false,
+            ));
+        }
+        let mut awaiting = mcp_state();
+        awaiting.pending_input_requests = Some(serde_json::json!([{"id":"q"}]));
+        awaiting.pending_prompt_id = Some("prompt-unanswered".into());
+        let mut polling = mcp_state();
+        super::super::mcp_continuation::set_task(&mut polling, "task".into(), 600_000, now, None);
+        for (id, state) in [("not-due-prompt", awaiting), ("not-due-poll", polling)] {
+            rows.push((
+                id.into(),
+                Condition::McpContinuation { state },
+                deadline,
+                false,
+            ));
+        }
+
+        for chunk in rows.chunks(500) {
+            let chunk = chunk.to_vec();
+            let result = result.clone();
+            db.write(|conn| {
+                let (chunk, result) = (chunk.clone(), result.clone());
+                Box::pin(async move {
+                    for (id, condition, deadline, finished) in &chunk {
+                        let columns =
+                            ConditionColumns::of(condition, *deadline).map_err(DbError::internal)?;
+                        conn.execute(
+                            INSERT_WAIT_SQL,
+                            params![
+                                id.as_str(),
+                                "job-1",
+                                "run-1",
+                                "session-1",
+                                "pred-turn",
+                                id.as_str(),
+                                columns.json,
+                                *deadline,
+                                columns.kind,
+                                columns.due_at_ms,
+                                columns.next_poll_at_ms,
+                                columns.pending_prompt_id,
+                                old,
+                                None::<String>
+                            ],
+                        )
+                        .await?;
+                        if *finished {
+                            conn.execute(
+                                "UPDATE agent_waits SET state='resolved',resolution_json=?2,resolved_at=?3 WHERE id=?1",
+                                params![id.as_str(), result.as_str(), old],
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut selected = due_wait_ids(&db, now).await.unwrap();
+        selected.sort();
+        assert_eq!(selected, due);
+        let mut reference = query_due(&db, REFERENCE_DUE_SQL, now, SCHEDULER_SCAN_LIMIT)
+            .await
+            .unwrap();
+        reference.sort();
+        assert_eq!(reference, due);
+        let plan = query_plan(&db, due_sql_with_literals(DUE_SQL)).await;
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_agent_waits_mcp_due")),
+            "{plan:#?}"
+        );
+
+        let mut elapsed = Vec::new();
+        for sql in [REFERENCE_DUE_SQL, DUE_SQL] {
+            let started = std::time::Instant::now();
+            for _ in 0..ticks {
+                query_due(&db, sql, now, SCHEDULER_SCAN_LIMIT)
+                    .await
+                    .unwrap();
+            }
+            elapsed.push(started.elapsed() / ticks);
+        }
+        eprintln!(
+            "tick cost with {resolved} resolved and {others} pending non-MCP rows, over {ticks} ticks: \
+             reference {:?} per tick, schedule columns {:?} per tick",
+            elapsed[0], elapsed[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_selects_only_the_due_continuations_from_a_history() {
+        tick_cost(2_000, 50, 3).await;
+    }
+
+    /// The full-size measurement quoted on cairn/5866. Run explicitly:
+    /// `bun run test:rust -p cairn-core --lib mcp::handlers::durable_suspend::tests::tick_cost_against_a_long_history -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement: 20,000 resolved rows take a while to seed"]
+    async fn tick_cost_against_a_long_history() {
+        tick_cost(20_000, 500, 20).await;
     }
 
     type OwnedContinuationBarrier = (
