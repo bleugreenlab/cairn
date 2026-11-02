@@ -64,6 +64,10 @@ pub(crate) enum LinkRestoration {
 #[derive(Debug, Clone)]
 pub(crate) struct PlacementRefusal {
     pub(crate) verdict: PlacementVerdict,
+    /// The executor's typed kind, for a caller that answers kinds rather than
+    /// verdicts; `None` for a refusal the runner made without an executor's
+    /// answer. Like the verdict, it never reaches the agent.
+    pub(crate) kind: Option<ResidencyFailureKind>,
     /// The agent-facing sentence. Typed machinery an agent cannot act on stays
     /// in the log; this is what reaches the surface that asked.
     pub(crate) diagnostic: String,
@@ -79,6 +83,7 @@ impl PlacementRefusal {
     pub(crate) fn structural(diagnostic: impl Into<String>) -> Self {
         Self {
             verdict: PlacementVerdict::Structural,
+            kind: None,
             diagnostic: diagnostic.into(),
         }
     }

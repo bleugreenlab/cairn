@@ -123,11 +123,14 @@ fn service_selector(spec: &LaunchSpec) -> cairn_common::executor_protocol::Execu
     }
 }
 
-/// What the supervisor is told about a refused start. Only a refusal the
-/// substrate made without judging the process is `Unplaced`.
+/// What the supervisor is told about a refused placement or start. Only a
+/// refusal the substrate made without judging the service is `Unplaced`: a
+/// residency the fleet would not grant, or a start it could not route.
 fn launch_error(error: ServicePlacementError) -> LaunchError {
     match &error {
-        ServicePlacementError::Unroutable(_) => LaunchError::Unplaced(error.to_string()),
+        ServicePlacementError::Unroutable(_) | ServicePlacementError::Ungranted(_) => {
+            LaunchError::Unplaced(error.to_string())
+        }
         _ => LaunchError::Failed(error.to_string()),
     }
 }
@@ -137,7 +140,7 @@ impl LeaseHost {
         &self,
         orch: &Orchestrator,
         spec: &LaunchSpec,
-    ) -> Result<Arc<ServiceLease>, String> {
+    ) -> Result<Arc<ServiceLease>, LaunchError> {
         let id = holder_id(&spec.project_id, &spec.owner, &spec.service);
         let mut leases = self.leases.lock().await;
         if let Some(lease) = leases.get(&id) {
@@ -163,7 +166,7 @@ impl LeaseHost {
                 },
             )
             .await
-            .map_err(|error| error.to_string())?,
+            .map_err(launch_error)?,
         );
         lease.spawn_renewal();
         leases.insert(id, lease.clone());
@@ -177,7 +180,7 @@ impl ServiceHost for LeaseHost {
         &self,
         orch: &Orchestrator,
         spec: &LaunchSpec,
-    ) -> Result<crate::fleet::residency::ResidentCallback, String> {
+    ) -> Result<crate::fleet::residency::ResidentCallback, LaunchError> {
         let lease = self.lease(orch, spec).await?;
         Ok(crate::fleet::residency::resident_callback(
             orch,
@@ -459,13 +462,16 @@ mod tests {
             .await;
     }
 
-    /// Only the substrate's own refusal reaches the supervisor as `Unplaced`.
+    /// Only the substrate's own refusals reach the supervisor as `Unplaced`:
+    /// a start it could not route, and a residency it would not grant.
     #[test]
-    fn only_an_unroutable_start_is_unplaced() {
-        assert!(matches!(
-            launch_error(ServicePlacementError::Unroutable("lagging".into())),
-            LaunchError::Unplaced(_)
-        ));
+    fn only_the_substrates_refusals_are_unplaced() {
+        for unplaced in [
+            ServicePlacementError::Unroutable("lagging".into()),
+            ServicePlacementError::Ungranted("no executor is currently attached".into()),
+        ] {
+            assert!(matches!(launch_error(unplaced), LaunchError::Unplaced(_)));
+        }
         for refused in [
             ServicePlacementError::Operation("spawn failed".into()),
             ServicePlacementError::Unavailable("no admission".into()),

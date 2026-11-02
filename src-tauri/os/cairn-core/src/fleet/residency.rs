@@ -391,7 +391,8 @@ async fn acquire_with_logging(
         // that asked for the environment, so it carries the diagnostic sentence
         // alone. The typed kind describes machinery an agent cannot act on and
         // belongs in the log; what survives into the return value is the verdict
-        // derived from it and from the placement evidence it carries.
+        // derived from it and from the placement evidence it carries, and the
+        // kind itself for a caller that answers kinds, never as text.
         ResidencyResult::Failed {
             kind,
             diagnostic,
@@ -422,6 +423,7 @@ async fn acquire_with_logging(
             }
             return Err(PlacementRefusal {
                 verdict,
+                kind: Some(kind),
                 diagnostic,
             });
         }

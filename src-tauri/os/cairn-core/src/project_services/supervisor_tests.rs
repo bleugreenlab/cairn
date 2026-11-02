@@ -28,6 +28,9 @@ pub(crate) struct FakeHost {
     release_slow: Arc<Notify>,
     /// Refusals the next launches answer, in order, before any launch starts.
     refuse: StdMutex<VecDeque<LaunchError>>,
+    /// Refusals the next placements answer, in order, before any bearer is
+    /// minted, as a lease host refuses an acquisition.
+    refuse_placement: StdMutex<VecDeque<LaunchError>>,
 }
 
 impl FakeHost {
@@ -67,6 +70,19 @@ fn out(events: &mpsc::UnboundedSender<HostEvent>, frame: Value) {
 
 #[async_trait]
 impl ServiceHost for Arc<FakeHost> {
+    async fn callback(
+        &self,
+        orch: &Orchestrator,
+        _spec: &LaunchSpec,
+    ) -> Result<crate::fleet::residency::ResidentCallback, LaunchError> {
+        if let Some(refusal) = self.refuse_placement.lock().unwrap().pop_front() {
+            return Err(refusal);
+        }
+        Ok(crate::fleet::residency::ResidentCallback::Direct {
+            url: crate::fleet::residency::runner_callback_url(orch),
+        })
+    }
+
     async fn launch(
         &self,
         _orch: &Orchestrator,
@@ -1848,6 +1864,92 @@ async fn a_launch_failure_of_the_service_fails_its_occurrence_at_once() {
     h.host.refuse.lock().unwrap().push_back(LaunchError::Failed(
         "service package and runtime rejected".into(),
     ));
+    assert_eq!(run_due(&h.orch, &tutor(), due).await, 1);
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("failed"));
+    assert_eq!(row.consecutive_failures, 1);
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("start_failed")),
+        "{row:?}"
+    );
+    assert_eq!(count(&h, STREAK_NOTICES).await, 1);
+    assert_eq!(retrying_rows(&tutor_log(&h).await), 0);
+    assert!(tutor()
+        .status(&h.orch)
+        .unwrap()
+        .placement_retries
+        .is_empty());
+}
+
+/// The fleet's refusal to grant a residency at all, as the lease host answers
+/// it when the occurrence fires before the runner's executor has attached.
+fn ungranted() -> LaunchError {
+    LaunchError::Unplaced(
+        "service residency was not granted: select execution environment executor: no live \
+         enrolled executor satisfies executor local for project p. Known executors: no \
+         executor is currently attached."
+            .into(),
+    )
+}
+
+/// A residency refused before any process exists, for the fleet's reasons, is
+/// retried exactly as a start the substrate could not route: no failure, no
+/// streak, one retrying row, and the recheck makes the call.
+#[tokio::test]
+async fn an_ungranted_residency_is_retried_and_wakes_no_one() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    h.host
+        .refuse_placement
+        .lock()
+        .unwrap()
+        .push_back(ungranted());
+
+    assert_eq!(run_due(&h.orch, &tutor(), due).await, 0);
+    let row = tutor_row(&h).await;
+    assert_eq!(row.due_at(due), Some(due), "its claim was given back");
+    assert_eq!(row.last_status, None);
+    assert_eq!(row.consecutive_failures, 0);
+    let retry = tutor().status(&h.orch).unwrap().placement_retries[&row.entry_key].clone();
+    assert_eq!((retry.due, retry.refusals), (due, 1));
+    assert!(
+        retry.refusal.contains("no executor is currently attached"),
+        "{retry:?}"
+    );
+    assert_eq!(retrying_rows(&tutor_log(&h).await), 1);
+    assert_eq!(h.host.launches.load(Ordering::Acquire), 0);
+
+    assert_eq!(run_due(&h.orch, &tutor(), due + 60).await, 1);
+    assert_eq!(h.host.frames_of("call").len(), 1, "the retry made the call");
+    let row = tutor_row(&h).await;
+    assert_eq!(row.last_status.as_deref(), Some("ok"));
+    assert_eq!(row.last_fired_occurrence_at, Some(due));
+    assert_eq!(row.consecutive_failures, 0);
+    assert_eq!(
+        retrying_rows(&tutor_log(&h).await),
+        1,
+        "one refusal, one row"
+    );
+    assert_eq!(count(&h, STREAK_NOTICES).await, 0);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM messages").await, 0);
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM attention_pushes").await, 0);
+}
+
+/// A placement that refuses the service's own declaration is the service's
+/// failure: settled at once as `start_failed`, with no retry.
+#[tokio::test]
+async fn a_placement_refusing_the_declaration_fails_its_occurrence_at_once() {
+    let h = thread_harness().await;
+    let due = scheduled_tutor_with_no_process(&h).await;
+    h.host
+        .refuse_placement
+        .lock()
+        .unwrap()
+        .push_back(LaunchError::Failed(
+            "service residency is unavailable: conflicting residency declaration".into(),
+        ));
     assert_eq!(run_due(&h.orch, &tutor(), due).await, 1);
     let row = tutor_row(&h).await;
     assert_eq!(row.last_status.as_deref(), Some("failed"));

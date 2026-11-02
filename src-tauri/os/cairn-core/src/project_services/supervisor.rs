@@ -112,18 +112,19 @@ impl std::fmt::Display for CallError {
     }
 }
 
-/// The code of a call refused because the placement substrate could not route
-/// the service's start to the executor holding its residency. The refusal says
-/// nothing about the service, so a scheduled occurrence it refuses is retried
-/// rather than counted as the service's failure.
+/// The code of a call refused because the placement substrate would not grant
+/// the service a residency, or could not route its start to the executor
+/// holding one. The refusal says nothing about the service, so a scheduled
+/// occurrence it refuses is retried rather than counted as the service's
+/// failure.
 pub(crate) const PLACEMENT_UNAVAILABLE: &str = "placement_unavailable";
 
 /// Why a host did not start a service process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchError {
-    /// The placement substrate could not route the start to the executor
-    /// holding the service's residency: a fact about the substrate, not the
-    /// service.
+    /// The placement substrate refused without judging the service: it would
+    /// not grant the service a residency, or could not route the start to the
+    /// executor holding it. A fact about the substrate, not the service.
     Unplaced(String),
     /// Anything else: the launch itself failed.
     Failed(String),
@@ -132,6 +133,18 @@ pub(crate) enum LaunchError {
 impl From<String> for LaunchError {
     fn from(error: String) -> Self {
         Self::Failed(error)
+    }
+}
+
+impl LaunchError {
+    /// The call this refusal ends, classified the same at every step of a
+    /// start that places the service.
+    fn into_call_error(self) -> CallError {
+        let code = match &self {
+            Self::Unplaced(_) => PLACEMENT_UNAVAILABLE,
+            Self::Failed(_) => "start_failed",
+        };
+        CallError::new(code, format!("could not place the service: {self}"))
     }
 }
 
@@ -185,7 +198,7 @@ pub(crate) trait ServiceHost: Send + Sync {
         &self,
         orch: &Orchestrator,
         _spec: &LaunchSpec,
-    ) -> Result<crate::fleet::residency::ResidentCallback, String> {
+    ) -> Result<crate::fleet::residency::ResidentCallback, LaunchError> {
         Ok(crate::fleet::residency::ResidentCallback::Direct {
             url: crate::fleet::residency::runner_callback_url(orch),
         })
@@ -781,10 +794,7 @@ async fn boot_incarnation(
         Ok(callback) => callback,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "start failed").await;
-            let error = CallError::new(
-                "start_failed",
-                format!("could not place the service: {error}"),
-            );
+            let error = error.into_call_error();
             lifecycle(orch, cell, generation, &error.message, actor).await;
             return Err(error);
         }
@@ -847,11 +857,7 @@ async fn boot_incarnation(
         Ok(process) => process,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "start failed").await;
-            let code = match &error {
-                LaunchError::Unplaced(_) => PLACEMENT_UNAVAILABLE,
-                LaunchError::Failed(_) => "start_failed",
-            };
-            let error = CallError::new(code, format!("could not place the service: {error}"));
+            let error = error.into_call_error();
             lifecycle(orch, cell, generation, &error.message, actor).await;
             return Err(error);
         }

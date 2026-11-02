@@ -1,3 +1,4 @@
+use crate::fleet::placement::PlacementRefusal;
 use crate::fleet::unix_time_ms;
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
@@ -36,6 +37,11 @@ pub(crate) enum ServicePlacementError {
     /// operation was for.
     #[error("service process could not be routed to its executor: {0}")]
     Unroutable(String),
+    /// The fleet would not grant the residency for a reason about the fleet:
+    /// no executor attached, none satisfying the selector, or none with room.
+    /// Like `Unroutable`, it says nothing about the service it was for.
+    #[error("service residency was not granted: {0}")]
+    Ungranted(String),
     #[error("service process `{process_key}` did not exit within {timeout:?}")]
     Timeout {
         process_key: String,
@@ -258,7 +264,7 @@ pub(crate) async fn acquire_service_lease(
     let acquire_request = service_acquire_request(service.id, selector, footprint, death_policy);
     let fence = super::residency::acquire_quietly(orch, acquire_request.clone())
         .await
-        .map_err(|error| ServicePlacementError::Unavailable(error.to_string()))?;
+        .map_err(acquire_refusal)?;
     let executor_name = placed_executor_name(orch, &fence, pinned_executor.as_deref());
 
     let fence = Arc::new(RwLock::new(fence));
@@ -467,7 +473,7 @@ impl LeaseCore {
         request.wait_horizon_unix_ms = now.saturating_add(ACQUIRE_WAIT.as_millis() as u64);
         let fence = super::residency::acquire(&self.orch, request)
             .await
-            .map_err(|error| ServicePlacementError::Unavailable(error.to_string()))?;
+            .map_err(acquire_refusal)?;
         if self.released.load(Ordering::Acquire) {
             let _ = super::residency::release(&self.orch, &fence).await;
             return Err(ServicePlacementError::Operation(
@@ -802,6 +808,36 @@ fn process_generation(
         other => Err(ServicePlacementError::Operation(format!(
             "unexpected start result: {other:?}"
         ))),
+    }
+}
+
+/// A refused acquisition as the error a lease reports, decided on the
+/// executor's typed kind. A refusal made before any process exists judges the
+/// service only when it is the service's declaration being refused; the
+/// fleet's own refusals are `Ungranted`, so a service schedule retries them
+/// as it retries an `Unroutable` start. cairn/5754 refines `Unavailable` into
+/// a snapshot lagging its grant versus a route whose executor is gone; key the
+/// substrate's refusals on the kinds it lands.
+fn acquire_refusal(refusal: PlacementRefusal) -> ServicePlacementError {
+    let PlacementRefusal {
+        kind, diagnostic, ..
+    } = refusal;
+    match kind {
+        Some(
+            ResidencyFailureKind::Unavailable
+            | ResidencyFailureKind::Admission
+            | ResidencyFailureKind::NotFound,
+        ) => ServicePlacementError::Ungranted(diagnostic),
+        Some(
+            ResidencyFailureKind::InvalidDeclaration
+            | ResidencyFailureKind::ConflictingDeclaration
+            | ResidencyFailureKind::StaleEpoch
+            | ResidencyFailureKind::InvalidState
+            | ResidencyFailureKind::Process
+            | ResidencyFailureKind::Cleanup
+            | ResidencyFailureKind::Persistence,
+        )
+        | None => ServicePlacementError::Unavailable(diagnostic),
     }
 }
 
@@ -1342,6 +1378,47 @@ pub(crate) mod tests {
             process_generation(&refused(ResidencyFailureKind::Admission), "svc-1"),
             Err(ServicePlacementError::Unavailable(_))
         ));
+    }
+
+    /// An acquisition the fleet refused for the fleet's reasons is `Ungranted`;
+    /// one refusing the service's declaration, or made by the runner itself
+    /// without an executor's answer, is not.
+    #[test]
+    fn only_the_fleets_own_acquire_refusals_are_ungranted() {
+        let refused = |kind| PlacementRefusal {
+            verdict: crate::fleet::placement::PlacementVerdict::Structural,
+            kind,
+            diagnostic: "select execution environment executor: no executor is currently attached"
+                .into(),
+        };
+        for kind in [
+            ResidencyFailureKind::Unavailable,
+            ResidencyFailureKind::Admission,
+            ResidencyFailureKind::NotFound,
+        ] {
+            assert!(
+                matches!(
+                    acquire_refusal(refused(Some(kind.clone()))),
+                    ServicePlacementError::Ungranted(ref diagnostic)
+                        if diagnostic.contains("no executor is currently attached")
+                ),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            Some(ResidencyFailureKind::InvalidDeclaration),
+            Some(ResidencyFailureKind::ConflictingDeclaration),
+            Some(ResidencyFailureKind::Persistence),
+            None,
+        ] {
+            assert!(
+                matches!(
+                    acquire_refusal(refused(kind.clone())),
+                    ServicePlacementError::Unavailable(_)
+                ),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
