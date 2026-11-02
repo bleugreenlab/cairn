@@ -2215,6 +2215,12 @@ async fn render_resource_body(
                                 None,
                             ));
                             if executor.colocated {
+                                rendered.push_str(
+                                    &crate::resources::executors::render_runner_scratch(
+                                        &orch.host_scratch.report(),
+                                        captured_at,
+                                    ),
+                                );
                                 let configured =
                                     crate::config::settings::load_fleet(&orch.config_dir)
                                         .colocated_build_root

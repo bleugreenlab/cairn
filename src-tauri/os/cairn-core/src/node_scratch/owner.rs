@@ -193,6 +193,72 @@ pub async fn open_for(
         .await
 }
 
+/// Every scratch that has not closed.
+pub async fn open_all(local: &LocalDb) -> DbResult<Vec<NodeScratch>> {
+    local
+        .query_all(
+            format!("SELECT {COLUMNS} FROM node_scratches WHERE closed_at IS NULL"),
+            (),
+            from_row,
+        )
+        .await
+}
+
+/// Whether the node an issue or a thread stands for has ended, which is when
+/// everything it owns on disk ends with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnerFate {
+    Live,
+    /// Ended, and why, in words a log line can carry.
+    Ended(&'static str),
+    /// The owner's database could not be asked: a team replica that is not
+    /// open, or a failed query. Never read as ended.
+    Unknown(String),
+}
+
+/// The fate of the node `issue_id` (or, with no issue, `thread_id`) owns.
+///
+/// An issue decides when there is one: a job working an issue answers to the
+/// issue even when a thread parents it. A job tied to neither answers to
+/// nothing that ends, so it reads as live.
+pub async fn owner_fate(
+    dbs: &crate::db::DbState,
+    issue_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> OwnerFate {
+    let (id, sql, missing, resolved): (&str, &str, &'static str, &[(&str, &'static str)]) =
+        match (issue_id, thread_id) {
+            (Some(issue), _) => (
+                issue,
+                "SELECT status FROM issues WHERE id = ?1",
+                "its issue no longer exists",
+                &[
+                    ("merged", "its issue merged"),
+                    ("closed", "its issue closed"),
+                ],
+            ),
+            (None, Some(thread)) => (
+                thread,
+                "SELECT status FROM threads WHERE id = ?1",
+                "its thread no longer exists",
+                &[("closed", "its thread closed")],
+            ),
+            (None, None) => return OwnerFate::Live,
+        };
+    let db = match crate::execution::routing::routing_db_for_id(dbs, id).await {
+        Ok(db) => db,
+        Err(error) => return OwnerFate::Unknown(error.to_string()),
+    };
+    match db.query_opt(sql, (id.to_owned(),), |row| row.text(0)).await {
+        Ok(None) => OwnerFate::Ended(missing),
+        Ok(Some(status)) => resolved
+            .iter()
+            .find(|(ended, _)| *ended == status)
+            .map_or(OwnerFate::Live, |(_, why)| OwnerFate::Ended(why)),
+        Err(error) => OwnerFate::Unknown(error.to_string()),
+    }
+}
+
 pub async fn open_in_project(local: &LocalDb, project_id: &str) -> DbResult<Vec<NodeScratch>> {
     local
         .query_all(

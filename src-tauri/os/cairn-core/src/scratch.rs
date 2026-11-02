@@ -35,6 +35,8 @@
 //! sanctioned dir. We therefore do **not** narrow the platform temp write-allow
 //! to gain a false sense of containment.
 //!
+pub mod residences;
+
 use cairn_common::scratch::scratch_root;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -51,6 +53,9 @@ const SCRATCH_NAME_MAX_BYTES: usize = 220;
 /// Hidden sibling of the job directories holding the job-id -> name registry.
 /// Hidden so `ls <cairn_home>/scratch` shows nothing but readable job names.
 const SCRATCH_MAP_DIR: &str = ".jobs";
+/// Hidden sibling holding one-shot response working directories, each removed
+/// by its own guard when the response ends.
+pub(crate) const RESPONSE_SCRATCH_DIR: &str = ".responses";
 
 /// The directory a job gets before its canonical node URI is known. Job
 /// preparation provisions a residence before session startup has resolved the
@@ -83,6 +88,32 @@ fn encode_component(value: &str) -> String {
         }
     }
     encoded
+}
+
+/// The inverse of [`encode_component`], or `None` for a name it never produces.
+fn decode_component(encoded: &str) -> Option<String> {
+    let raw = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while at < raw.len() {
+        match raw[at] {
+            b'.' => {
+                decoded.push(b'/');
+                at += 1;
+            }
+            b'_' => {
+                let hex = encoded.get(at + 1..at + 3)?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                at += 3;
+            }
+            byte @ (b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-') => {
+                decoded.push(byte);
+                at += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn scratch_map_path(job_id: &str) -> PathBuf {
@@ -436,6 +467,26 @@ mod tests {
         assert!(!unnamed.exists());
         assert_eq!(std::fs::read(named.join("report.pdf")).unwrap(), b"fixture");
         remove_job_scratch_dir(&job_id);
+    }
+
+    /// Reconciliation reads job ids back out of registry file names and
+    /// unnamed residence directories, so every id must survive the round trip.
+    #[test]
+    fn an_encoded_component_decodes_to_what_was_encoded() {
+        for value in [
+            "5e4c1f8a-0b8e-4b3c-9d0f-2a1b3c4d5e6f",
+            "team-a~5e4c1f8a-0b8e-4b3c-9d0f-2a1b3c4d5e6f",
+            "cairn/2695/1/a b/%2F._2F",
+            "",
+        ] {
+            assert_eq!(
+                decode_component(&encode_component(value)).as_deref(),
+                Some(value)
+            );
+        }
+        for foreign in ["tm81_merge", "has space", "trailing_4"] {
+            assert_eq!(decode_component(foreign), None, "{foreign}");
+        }
     }
 
     #[test]

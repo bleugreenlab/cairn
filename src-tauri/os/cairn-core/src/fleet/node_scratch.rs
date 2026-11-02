@@ -98,6 +98,23 @@ impl Fleet {
             .collect()
     }
 
+    /// The colocated machine's pressure and critical free-space lines, as it
+    /// last reported them. The runner's scratch root shares that machine's
+    /// volume, so it answers to the same lines. `None` while no colocated
+    /// machine is attached, or one that does not report its thresholds.
+    pub(crate) fn colocated_storage_lines(&self) -> Option<(u64, u64)> {
+        self.lock_connections()
+            .values()
+            .find(|entry| entry.colocated && !entry.sender.is_closed())
+            .map(|entry| {
+                (
+                    entry.health.disk.pressure_free_bytes,
+                    entry.health.disk.critical_free_bytes,
+                )
+            })
+            .filter(|(pressure, critical)| *pressure > 0 && *critical > 0)
+    }
+
     /// The public name of a connected machine, for run-result text.
     pub(crate) fn executor_display_name(&self, executor_id: &str) -> Option<String> {
         self.lock_connections()

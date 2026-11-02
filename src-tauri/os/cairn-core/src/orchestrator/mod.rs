@@ -702,6 +702,7 @@ impl OrchestratorBuilder {
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
             approval_keys: Arc::default(),
             page_renders: Arc::default(),
+            host_scratch: Arc::default(),
             relay: Arc::default(),
             private_lanes,
             provider_admission_cache,
@@ -1175,6 +1176,9 @@ pub struct Orchestrator {
     /// Rendered page reads in flight: the concurrency bound and the readers
     /// holding a render.
     pub(crate) page_renders: Arc<crate::pages::RenderSlots>,
+    /// The runner's scratch root: one maintenance pass at a time, and what the
+    /// last one found and removed.
+    pub(crate) host_scratch: Arc<crate::scratch::residences::ResidenceState>,
     /// This install's relay coordination: the operation lock and the signals
     /// its sync loop and doorbell wait on.
     pub relay: Arc<crate::ingress::channel::RelaySignals>,
@@ -2610,6 +2614,22 @@ impl Orchestrator {
                 crate::orchestrator::attention_retirement::run_retirement_backfill(&db).await
             {
                 log::warn!("attention retirement backfill failed: {e}");
+            }
+        });
+    }
+
+    /// Spawn the scratch maintenance pass on its own task: one pass now, which
+    /// reclaims what nodes that ended while the runner was down left behind,
+    /// then one every [`crate::scratch::residences::MAINTENANCE_INTERVAL`].
+    pub fn spawn_scratch_maintenance(&self) {
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(crate::scratch::residences::MAINTENANCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                crate::scratch::residences::maintain(&orch).await;
             }
         });
     }

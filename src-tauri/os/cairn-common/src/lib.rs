@@ -48,4 +48,5 @@ pub mod token_meter;
 pub mod toolchain_path;
 pub mod toolchain_requirements;
 pub mod uri;
+pub mod volume;
 pub mod write_contract;

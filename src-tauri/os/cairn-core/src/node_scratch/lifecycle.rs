@@ -7,6 +7,8 @@
 //! machine that was offline is told the next time its advertisement names the
 //! closed scratch. An advertisement naming a scratch this runner never had is
 //! answered the same way, so nothing outlives the authority that described it.
+//! A node that ended while the runner was down has its scratch closed by
+//! [`close_ended`] at the next start.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,6 +262,40 @@ pub async fn close_for_issue(orch: &Orchestrator, issue_id: &str) {
         }
         Err(error) => log::warn!("list node scratches of issue {issue_id}: {error}"),
     }
+}
+
+/// Close every open scratch whose node has ended: its issue resolved or its
+/// thread closed while the runner was down, or by a path that never reached
+/// [`close_for_issue`] or [`close_for_thread`]. Runs at runner start and on
+/// every scratch maintenance tick. A scratch whose owner cannot be judged (a
+/// team replica that is not open) stays open. Returns how many closed.
+pub async fn close_ended(orch: &Orchestrator) -> usize {
+    let open = match owner::open_all(&orch.db.local).await {
+        Ok(open) => open,
+        Err(error) => {
+            log::warn!("list open node scratches: {error}");
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for scratch in open {
+        if let owner::OwnerFate::Ended(reason) = owner::owner_fate(
+            &orch.db,
+            scratch.issue_id.as_deref(),
+            scratch.thread_id.as_deref(),
+        )
+        .await
+        {
+            log::info!(
+                "closing node scratch {} of {}: {reason}",
+                scratch.id,
+                scratch.owner_uri
+            );
+            close_scratch(orch, &scratch).await;
+            closed += 1;
+        }
+    }
+    closed
 }
 
 /// Close every scratch of a project, as the project is deleted.

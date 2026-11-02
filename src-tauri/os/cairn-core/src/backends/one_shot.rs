@@ -54,7 +54,7 @@ impl Drop for ScratchGuard {
 /// is never mistaken for a job's scratch directory.
 pub(crate) fn response_scratch_dir() -> Result<ScratchGuard, CompletionError> {
     let dir = cairn_common::scratch::scratch_root()
-        .join(".responses")
+        .join(crate::scratch::RESPONSE_SCRATCH_DIR)
         .join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(&dir).map_err(|error| {
         CompletionError::Upstream(format!(

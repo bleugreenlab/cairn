@@ -1957,6 +1957,136 @@ fn render_holdings(
     }
 }
 
+/// The runner's own scratch root on the colocated machine: who owns what is in
+/// it, what went when its owner ended, and what the last pass under disk
+/// pressure took. Exclusive bytes are what a removal frees at least; logical
+/// bytes overstate a tree of clones.
+pub(crate) fn render_runner_scratch(
+    report: &crate::scratch::residences::Report,
+    captured_at_unix_ms: u64,
+) -> String {
+    use crate::scratch::residences::{Footprint, Owner};
+    let footprint_text = |footprint: &Footprint| {
+        format!(
+            "{}, frees at least {}",
+            bytes(footprint.logical_bytes),
+            bytes(footprint.exclusive_bytes)
+        )
+    };
+    let mut out = String::from(
+        "## Runner scratch\n- `scratch/` in the runner's Cairn home: each job's residence (its agent's working directory, removed when its node ends) and anything else agents made beside one. A node's `$TMPDIR` is its node scratch replica, counted under Storage\n",
+    );
+    match &report.census {
+        None => out.push_str("- Not measured yet: the first maintenance pass has not finished\n"),
+        Some(census) => {
+            let mut live = (0_usize, 0_u64, 0_u64);
+            let mut ended = 0_usize;
+            let mut unowned = (0_usize, 0_u64, 0_u64);
+            for entry in &census.entries {
+                let footprint = entry.footprint.unwrap_or_default();
+                let tally = match entry.owner {
+                    Owner::Live { .. } => &mut live,
+                    Owner::Unowned => &mut unowned,
+                    Owner::Ended { .. } => {
+                        ended += 1;
+                        continue;
+                    }
+                };
+                tally.0 += 1;
+                tally.1 = tally.1.saturating_add(footprint.logical_bytes);
+                tally.2 = tally.2.saturating_add(footprint.exclusive_bytes);
+            }
+            out.push_str(&format!(
+                "- Measured {}: {} live ({}, frees at least {}) · {} unowned ({}, frees at least {}) · {} ended awaiting removal\n",
+                age(captured_at_unix_ms.saturating_sub(census.measured_at_unix_ms)),
+                live.0,
+                bytes(live.1),
+                bytes(live.2),
+                unowned.0,
+                bytes(unowned.1),
+                bytes(unowned.2),
+                ended,
+            ));
+            let largest = |wanted: fn(&Owner) -> bool| {
+                let mut entries = census
+                    .entries
+                    .iter()
+                    .filter(|entry| wanted(&entry.owner) && entry.footprint.is_some())
+                    .collect::<Vec<_>>();
+                entries.sort_by(|a, b| {
+                    let (a, b) = (a.footprint.unwrap(), b.footprint.unwrap());
+                    b.exclusive_bytes
+                        .cmp(&a.exclusive_bytes)
+                        .then(b.logical_bytes.cmp(&a.logical_bytes))
+                });
+                entries.truncate(5);
+                entries
+            };
+            let unowned_largest = largest(|owner| matches!(owner, Owner::Unowned));
+            if !unowned_largest.is_empty() {
+                out.push_str("- Unowned, taken under disk pressure coldest first once nothing has been written for 24h (1h at the critical line):\n");
+                for entry in unowned_largest {
+                    let footprint = entry.footprint.unwrap_or_default();
+                    out.push_str(&format!(
+                        "  - `{}`: {}, last written {}\n",
+                        entry.name,
+                        footprint_text(&footprint),
+                        age(captured_at_unix_ms.saturating_sub(footprint.newest_write_unix_ms))
+                    ));
+                }
+            }
+            let live_largest = largest(|owner| matches!(owner, Owner::Live { .. }));
+            if !live_largest.is_empty() {
+                out.push_str("- Largest live, never taken:\n");
+                for entry in live_largest {
+                    out.push_str(&format!(
+                        "  - `{}`: {}\n",
+                        entry.name,
+                        footprint_text(&entry.footprint.unwrap_or_default())
+                    ));
+                }
+            }
+        }
+    }
+    if !report.removals.is_empty() {
+        out.push_str("- Removed as their node ended, newest last:\n");
+        for removal in report.removals.iter().rev().take(5).rev() {
+            out.push_str(&format!(
+                "  - `{}` {}: {}, {}\n",
+                removal.name,
+                age(captured_at_unix_ms.saturating_sub(removal.at_unix_ms)),
+                footprint_text(&removal.footprint),
+                removal.why
+            ));
+        }
+    }
+    if let Some(pass) = &report.pressure {
+        out.push_str(&format!(
+            "- Last pressure pass {}: band {:?}, asked {}, credited {} from {} unowned entr{}; free {} → {}; kept {} live ({}) and {} unowned written inside the quiet floor ({})\n",
+            age(captured_at_unix_ms.saturating_sub(pass.at_unix_ms)),
+            pass.band,
+            bytes(pass.asked_bytes),
+            bytes(pass.credited_bytes),
+            pass.removed.len(),
+            if pass.removed.len() == 1 { "y" } else { "ies" },
+            bytes(pass.free_bytes_before),
+            bytes(pass.free_bytes_after),
+            pass.kept_live.count,
+            bytes(pass.kept_live.logical_bytes),
+            pass.kept_quiet.count,
+            bytes(pass.kept_quiet.logical_bytes),
+        ));
+        for removal in &pass.removed {
+            out.push_str(&format!(
+                "  - Took `{}`: {}\n",
+                removal.name,
+                footprint_text(&removal.footprint)
+            ));
+        }
+    }
+    out
+}
+
 /// A build-root change the runner holds but its executor has not started with
 /// yet, or nothing when the two agree. Only the colocated machine has one.
 pub(crate) fn render_pending_build_root(
@@ -9730,5 +9860,100 @@ mod running_now_tests {
         // An executor that does not report build jobs leaves the row as it was.
         let silent = render_running_now(&running(None), None, 60_000);
         assert!(silent.contains("usage not measured yet\n"), "{silent}");
+    }
+}
+
+#[cfg(test)]
+mod runner_scratch_tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+
+    use cairn_common::executor_protocol::StoragePressureBand;
+
+    use super::render_runner_scratch;
+    use crate::scratch::residences::{
+        Census, Entry, Footprint, Owner, PressurePass, Removal, Report, Tally,
+    };
+
+    const GIB: u64 = 1 << 30;
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+    const AT: u64 = 1_800_000_000_000;
+
+    fn entry(name: &str, owner: Owner, logical: u64, exclusive: u64) -> Entry {
+        Entry {
+            name: name.into(),
+            path: PathBuf::from(name),
+            owner,
+            footprint: Some(Footprint {
+                logical_bytes: logical,
+                exclusive_bytes: exclusive,
+                newest_write_unix_ms: AT - 48 * HOUR_MS,
+            }),
+        }
+    }
+
+    /// The colocated machine's page names who owns what, in exclusive bytes
+    /// beside logical ones, and what the last pass under pressure took.
+    #[test]
+    fn the_runner_scratch_section_names_owners_removals_and_the_last_pass() {
+        assert!(render_runner_scratch(&Report::default(), AT)
+            .contains("- Not measured yet: the first maintenance pass has not finished\n"));
+
+        let report = Report {
+            census: Some(Census {
+                measured_at_unix_ms: AT - 60_000,
+                entries: vec![
+                    entry("triome-45-measure", Owner::Unowned, 146 * GIB, 12 * GIB),
+                    entry("fishlab", Owner::Unowned, 85 * GIB, 85 * GIB),
+                    entry(
+                        "cairn.5727.1.builder",
+                        Owner::Live {
+                            jobs: vec!["j".into()],
+                        },
+                        GIB,
+                        GIB,
+                    ),
+                ],
+            }),
+            removals: VecDeque::from([Removal {
+                name: "cairn.4897.1.builder".into(),
+                why: "its issue merged".into(),
+                footprint: Footprint::default(),
+                at_unix_ms: AT - 3 * HOUR_MS,
+            }]),
+            pressure: Some(PressurePass {
+                at_unix_ms: AT - 120_000,
+                band: StoragePressureBand::Pressure,
+                free_bytes_before: 22 * GIB,
+                free_bytes_after: 34 * GIB,
+                asked_bytes: 42 * GIB,
+                credited_bytes: 12 * GIB,
+                removed: Vec::new(),
+                kept_live: Tally::default(),
+                kept_quiet: Tally::default(),
+            }),
+        };
+
+        let rendered = render_runner_scratch(&report, AT);
+
+        for expected in [
+            "## Runner scratch\n",
+            "- Measured 1m ago: 1 live (1.0 GiB, frees at least 1.0 GiB) · 2 unowned (231.0 GiB, frees at least 97.0 GiB) · 0 ended awaiting removal\n",
+            "  - `triome-45-measure`: 146.0 GiB, frees at least 12.0 GiB, last written 48h ago\n",
+            "  - `cairn.5727.1.builder`: 1.0 GiB, frees at least 1.0 GiB\n",
+            "  - `cairn.4897.1.builder` 3h ago: 0 B, frees at least 0 B, its issue merged\n",
+            "- Last pressure pass 2m ago: band Pressure, asked 42.0 GiB, credited 12.0 GiB from 0 unowned entries; free 22.0 GiB → 34.0 GiB",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in\n{rendered}"
+            );
+        }
+        let fishlab = rendered.find("`fishlab`").unwrap();
+        let triome = rendered.find("`triome-45-measure`").unwrap();
+        assert!(
+            fishlab < triome,
+            "85 GiB that frees 85 ranks above 146 GiB of clones that frees 12:\n{rendered}"
+        );
     }
 }

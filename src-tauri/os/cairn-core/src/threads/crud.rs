@@ -34,12 +34,13 @@ pub async fn update_with_lifecycle(
 ) -> Result<ThreadUpdate, CairnError> {
     let selection = input.model.clone();
     let outcome = update(db, input).await?;
-    // Closing a thread closes its node's scratch everywhere; reopening it
-    // later starts a fresh one.
+    // Closing a thread closes its node's scratch everywhere and removes its
+    // jobs' residences on the runner; reopening it later starts fresh ones.
     if outcome.thread.status == crate::models::ThreadStatus::Closed
         && outcome.previous.status != crate::models::ThreadStatus::Closed
     {
         crate::node_scratch::lifecycle::close_for_thread(orch, &outcome.thread.id).await;
+        crate::scratch::residences::end_thread(orch, db, &outcome.thread.id).await;
     }
     if let Some(selection) = selection {
         let thread_id = outcome.thread.id.clone();
