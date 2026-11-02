@@ -1286,6 +1286,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             ));
         }
     }
+    out.push_str(&render_volume_discards(executor));
     out.push('\n');
 
     out.push_str("## Admission\n");
@@ -4017,6 +4018,87 @@ fn age(ms: u64) -> String {
     format!("{}h ago", minutes / 60)
 }
 
+/// A span of time as the coarsest unit that keeps it readable: a week reads
+/// as days, not as ten thousand minutes.
+fn span(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
+
+/// Who discards (TRIMs) the executor's volumes, and how far each has got.
+/// The distribution's weekly timer stalled bbs's build volume for an hour
+/// (cairn/5811), so the page says who owns the job and when it last ran.
+fn render_volume_discards(executor: &ExecutorInspection) -> String {
+    use cairn_common::executor_protocol::{VolumeDiscardOwner, VolumeDiscardRefusalKind};
+    let Some(report) = executor.health.disk.volume_discards.as_ref() else {
+        return "- Volume discards: not reported by this executor (on Linux the host's own fstrim.timer still trims its volumes)\n".into();
+    };
+    if report.owner == VolumeDiscardOwner::Platform {
+        return "- Volume discards: left to the operating system's filesystem, which discards on its own\n".into();
+    }
+    let captured = executor.captured_at_unix_ms;
+    let mut out = String::from(
+        "- Volume discards: owned by this executor, in bounded ranges while it is idle, in place of the host's fstrim.timer\n",
+    );
+    if report.volumes.is_empty() {
+        out.push_str("  - No pass has started yet; the first begins at the next idle window\n");
+    }
+    for volume in &report.volumes {
+        let mut parts = Vec::new();
+        match &volume.last_pass {
+            Some(pass) => parts.push(format!(
+                "last trimmed {}, {} discarded in {} of trimming over {}",
+                age(captured.saturating_sub(pass.finished_at_unix_ms)),
+                bytes(pass.trimmed_bytes),
+                duration_ms(pass.busy_ms),
+                span(
+                    pass.finished_at_unix_ms
+                        .saturating_sub(pass.started_at_unix_ms)
+                ),
+            )),
+            None => parts.push("no pass has reached the end yet".to_string()),
+        }
+        if let Some(progress) = &volume.in_progress {
+            parts.push(format!(
+                "pass started {} at {} of {}, {} discarded so far, resuming at the next idle window",
+                age(captured.saturating_sub(progress.started_at_unix_ms)),
+                bytes(progress.next_offset_bytes),
+                bytes(progress.total_bytes),
+                bytes(progress.trimmed_bytes),
+            ));
+        }
+        if let Some(refusal) = &volume.refusal {
+            let (kind, again) = match refusal.kind {
+                VolumeDiscardRefusalKind::NotPermitted => {
+                    ("NOT PERMITTED", "at the next attach or in")
+                }
+                VolumeDiscardRefusalKind::Unsupported => ("unsupported", "in"),
+                VolumeDiscardRefusalKind::Failed => ("failed", "in"),
+            };
+            parts.push(format!(
+                "{kind} {}: {} (asks again {again} {})",
+                age(captured.saturating_sub(refusal.at_unix_ms)),
+                refusal.detail,
+                span(refusal.retry_after_unix_ms.saturating_sub(captured)),
+            ));
+        } else if let Some(due) = volume.next_due_unix_ms {
+            parts.push(format!(
+                "next pass due in {}",
+                span(due.saturating_sub(captured))
+            ));
+        }
+        out.push_str(&format!("  - `{}`: {}\n", volume.path, parts.join("; ")));
+    }
+    out
+}
+
 fn bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = value as f64;
@@ -4811,6 +4893,79 @@ mod storage_section_tests {
                 "missing {expected:?} in {rendered}"
             );
         }
+    }
+
+    /// The page says who trims the executor's volumes, when each last finished
+    /// and what it cost, where a paused pass resumes, and a refusal's remedy.
+    #[test]
+    fn volume_discards_name_their_owner_last_pass_resume_point_and_refusal() {
+        use cairn_common::executor_protocol::{
+            VolumeDiscardOwner, VolumeDiscardPass, VolumeDiscardProgress, VolumeDiscardRefusal,
+            VolumeDiscardRefusalKind, VolumeDiscardReport, VolumeDiscardVolume,
+        };
+        const HOUR: u64 = 60 * 60 * 1_000;
+        let mut executor = tight_local();
+        let at = 1_800_000_000_000;
+        executor.captured_at_unix_ms = at;
+        assert!(
+            render_executor(&executor).contains("- Volume discards: not reported by this executor")
+        );
+
+        executor.health.disk.volume_discards = Some(VolumeDiscardReport {
+            owner: VolumeDiscardOwner::Executor,
+            volumes: vec![
+                VolumeDiscardVolume {
+                    path: "/home/bleu/.cairn-exec".into(),
+                    in_progress: None,
+                    last_pass: Some(VolumeDiscardPass {
+                        started_at_unix_ms: at - 3 * HOUR,
+                        finished_at_unix_ms: at - 2 * HOUR,
+                        total_bytes: 3_400 * GIB,
+                        trimmed_bytes: 3_000 * GIB,
+                        busy_ms: 480_000,
+                    }),
+                    refusal: None,
+                    next_due_unix_ms: Some(at + 166 * HOUR),
+                },
+                VolumeDiscardVolume {
+                    path: "/cairn-data".into(),
+                    in_progress: Some(VolumeDiscardProgress {
+                        started_at_unix_ms: at - HOUR,
+                        next_offset_bytes: 64 * GIB,
+                        total_bytes: 1_024 * GIB,
+                        trimmed_bytes: 60 * GIB,
+                        busy_ms: 30_000,
+                    }),
+                    last_pass: None,
+                    refusal: Some(VolumeDiscardRefusal {
+                        kind: VolumeDiscardRefusalKind::NotPermitted,
+                        detail: "Fix, as root: `sudo scripts/setup-self-hosted-runner-linux.sh --executor-user bleu`".into(),
+                        at_unix_ms: at - 60_000,
+                        retry_after_unix_ms: at + 23 * HOUR,
+                    }),
+                    next_due_unix_ms: Some(at + 23 * HOUR),
+                },
+            ],
+        });
+        let rendered = render_executor(&executor);
+        for expected in [
+            "- Volume discards: owned by this executor, in bounded ranges while it is idle, in place of the host's fstrim.timer\n",
+            "  - `/home/bleu/.cairn-exec`: last trimmed 2h ago, 2.9 TiB discarded in 8.0m of trimming over 1h; next pass due in 6d\n",
+            "  - `/cairn-data`: no pass has reached the end yet; pass started 1h ago at 64.0 GiB of 1.0 TiB, 60.0 GiB discarded so far, resuming at the next idle window; NOT PERMITTED 1m ago: Fix, as root: `sudo scripts/setup-self-hosted-runner-linux.sh --executor-user bleu` (asks again at the next attach or in 23h)\n",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in {rendered}"
+            );
+        }
+
+        executor.health.disk.volume_discards = Some(VolumeDiscardReport {
+            owner: VolumeDiscardOwner::Platform,
+            volumes: Vec::new(),
+        });
+        assert!(render_executor(&executor).contains(
+            "- Volume discards: left to the operating system's filesystem, which discards on its own\n"
+        ));
     }
 
     /// An unrelieved pass says what it asked for, what each rung gave, what it

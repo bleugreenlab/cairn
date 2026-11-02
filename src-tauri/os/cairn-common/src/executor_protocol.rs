@@ -6481,6 +6481,13 @@ pub struct LearnedResourceEstimate {
 /// executor: nothing it would decode differently; that executor can still
 /// report a trivial command's teardown as unproven under host load until it
 /// runs a build carrying this.
+///
+/// cairn/5811 does not move the number. `DiskHealth` gains an optional
+/// `volume_discards`, serde-defaulted and omitted when absent, naming who
+/// discards the executor's volumes and where each pass stopped. No frame or
+/// variant changes. A runner talking to an older executor reads `None` and
+/// renders the owner as unreported, which is what that executor is: it
+/// discards nothing itself and leaves its host's timer to do it.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -12861,6 +12868,102 @@ pub struct StorageAccountingCadence {
     pub consecutive_failures: u32,
 }
 
+/// Who discards (TRIMs) the free space on an executor's volumes, and how far
+/// each volume's current pass has got.
+///
+/// An SSD whose filesystem never says which blocks it has freed slows down
+/// as it runs out of blocks it knows are empty, so something must discard
+/// them. A distribution's weekly `fstrim.timer` does it whole and at a fixed
+/// instant, and on a build machine that instant lands on running work: SATA
+/// TRIM drains the device queue, so every other I/O waits behind it. On Linux
+/// the executor owns the job instead, in bounded ranges and only while
+/// nothing is running; elsewhere the platform's filesystem does it on its own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDiscardReport {
+    pub owner: VolumeDiscardOwner,
+    /// Each volume the executor has started discarding. Empty before its first
+    /// idle window, and always for [`VolumeDiscardOwner::Platform`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeDiscardVolume>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VolumeDiscardOwner {
+    /// The executor trims its volumes in idle windows, and provisioning masks
+    /// the distribution's timer.
+    Executor,
+    /// The operating system's filesystem discards on its own (APFS, NTFS).
+    Platform,
+}
+
+/// One volume the executor discards, named by the executor path on it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDiscardVolume {
+    pub path: String,
+    /// The pass under way, which resumes at the next idle window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_progress: Option<VolumeDiscardProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pass: Option<VolumeDiscardPass>,
+    /// Why the last step did not discard anything, while it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<VolumeDiscardRefusal>,
+    /// When the next pass, or the retry after a refusal, may start. `None`
+    /// while a pass is in progress or before the first one: due at the next
+    /// idle window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDiscardProgress {
+    pub started_at_unix_ms: u64,
+    /// Where in the filesystem's address space the next range begins.
+    pub next_offset_bytes: u64,
+    pub total_bytes: u64,
+    /// Free space the filesystem reported discarded so far.
+    pub trimmed_bytes: u64,
+    /// Time spent inside discard ranges: what the pass has cost the device,
+    /// as opposed to the wall time it has spanned across idle windows.
+    pub busy_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDiscardPass {
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+    pub total_bytes: u64,
+    pub trimmed_bytes: u64,
+    pub busy_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeDiscardRefusal {
+    pub kind: VolumeDiscardRefusalKind,
+    pub detail: String,
+    pub at_unix_ms: u64,
+    pub retry_after_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VolumeDiscardRefusalKind {
+    /// Discarding needs `CAP_SYS_ADMIN`, and neither the executor nor its
+    /// provisioned `sudo -n fstrim` grant has it.
+    NotPermitted,
+    /// The filesystem or device cannot discard, or not in ranges the executor
+    /// can bound.
+    Unsupported,
+    /// Anything else; retried sooner than the two above.
+    Failed,
+}
+
 /// Storage governance: the budget, the derived pressure verdict, and the
 /// janitor's state.
 ///
@@ -12905,6 +13008,10 @@ pub struct DiskHealth {
     /// does not report it.
     #[serde(default)]
     pub accounting_cadence: Option<StorageAccountingCadence>,
+    /// Who discards this executor's volumes, or `None` from a peer that does
+    /// not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_discards: Option<VolumeDiscardReport>,
     /// The admission floor `status` was computed against: `pressured` below it.
     /// Zero from a peer that does not report its thresholds.
     #[serde(default)]
@@ -13195,6 +13302,7 @@ impl Default for DiskHealth {
             cleanup_skipped_truncated: 0,
             reclamation: None,
             accounting_cadence: None,
+            volume_discards: None,
             watermark_bytes: 0,
             critical_free_bytes: 0,
             pressure_free_bytes: 0,
@@ -20696,6 +20804,7 @@ mod tests {
             cleanup_skipped_truncated: 1,
             reclamation: None,
             accounting_cadence: None,
+            volume_discards: None,
             watermark_bytes: 2,
             critical_free_bytes: 16,
             pressure_free_bytes: 64,
@@ -21887,6 +21996,61 @@ mod tests {
         };
         assert!(!clean.reclamation.as_ref().unwrap().is_outstanding());
         assert_ne!(clean.reclamation, DiskHealth::default().reclamation);
+    }
+
+    /// Who trims a volume crosses the wire with its resume point, and a peer
+    /// that predates the report says nothing about it rather than claiming
+    /// the platform does.
+    #[test]
+    fn volume_discards_round_trip_and_an_older_peer_reports_none() {
+        let legacy = serde_json::json!({
+            "budgetBytes": null,
+            "status": "ok",
+            "sweepStatus": "completed",
+            "sweepGeneration": 3,
+            "cleanupBlocked": false,
+            "cleanupLastError": null,
+            "cleanupFailingPath": null,
+            "cleanupSkippedEntries": null
+        });
+        let decoded: DiskHealth = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.volume_discards.is_none());
+        assert!(serde_json::to_value(&decoded)
+            .unwrap()
+            .get("volumeDiscards")
+            .is_none());
+
+        let health = DiskHealth {
+            volume_discards: Some(VolumeDiscardReport {
+                owner: VolumeDiscardOwner::Executor,
+                volumes: vec![VolumeDiscardVolume {
+                    path: "/home/bleu/.cairn-exec".into(),
+                    in_progress: Some(VolumeDiscardProgress {
+                        started_at_unix_ms: 1_000,
+                        next_offset_bytes: 64 << 30,
+                        total_bytes: 3_700_000_000_000,
+                        trimmed_bytes: 60 << 30,
+                        busy_ms: 9_000,
+                    }),
+                    last_pass: None,
+                    refusal: Some(VolumeDiscardRefusal {
+                        kind: VolumeDiscardRefusalKind::NotPermitted,
+                        detail: "sudo: a password is required".into(),
+                        at_unix_ms: 2_000,
+                        retry_after_unix_ms: 3_000,
+                    }),
+                    next_due_unix_ms: Some(3_000),
+                }],
+            }),
+            ..DiskHealth::default()
+        };
+        let value = serde_json::to_value(&health).unwrap();
+        let volume = &value["volumeDiscards"]["volumes"][0];
+        assert_eq!(value["volumeDiscards"]["owner"], "executor");
+        assert_eq!(volume["inProgress"]["nextOffsetBytes"], 64_u64 << 30);
+        assert_eq!(volume["refusal"]["kind"], "notPermitted");
+        assert!(volume.get("lastPass").is_none());
+        assert_eq!(serde_json::from_value::<DiskHealth>(value).unwrap(), health);
     }
 
     /// A report that predates the machine section decodes as unsampled rather
