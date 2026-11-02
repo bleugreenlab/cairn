@@ -15,11 +15,13 @@
 //! from the links executors report ([`crate::fleet::pools`]).
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use cairn_db::turso::params;
 use cairn_inference::control::Phase;
 use cairn_inference::{
-    DeploymentId, InferenceProfileId, Inventory, MachineName, RecordSource, YamlError,
+    DeploymentId, InferenceProfile, InferenceProfileId, Inventory, MachineName, RecordSource,
+    ValidationError, YamlError,
 };
 use serde::Serialize;
 
@@ -240,35 +242,78 @@ pub enum Authoring {
     },
 }
 
-fn document_problems(error: YamlError) -> Vec<String> {
-    match error {
-        YamlError::Parse(error) => vec![format!("the document does not parse: {error}")],
-        YamlError::Invalid(problems) => problems.iter().map(ToString::to_string).collect(),
+/// One reason a write is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The inventory the write would leave does not cohere.
+    Invalid(ValidationError),
+    /// The document written does not parse.
+    Unparsed(String),
+    /// A profile written as new under an id another profile has.
+    Taken(InferenceProfileId),
+    /// Anything else, in words: a record that is not Cairn's, one to remove
+    /// that is not there, a running deployment it would take away.
+    Said(String),
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(problem) => problem.fmt(f),
+            Self::Unparsed(error) => write!(f, "the document does not parse: {error}"),
+            Self::Taken(id) => write!(f, "there is already a profile {id}"),
+            Self::Said(said) => f.write_str(said),
+        }
     }
 }
 
-fn remove_each<K: Ord + std::fmt::Display, T>(
+/// Why a write did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// Refused, with every reason; nothing was written.
+    Refused(Vec<Refusal>),
+    /// The records could not be read or written.
+    Failed(String),
+}
+
+impl From<WriteError> for String {
+    fn from(error: WriteError) -> Self {
+        match error {
+            WriteError::Refused(refusals) => refused(refusals),
+            WriteError::Failed(error) => error,
+        }
+    }
+}
+
+fn document_refusals(error: YamlError) -> Vec<Refusal> {
+    match error {
+        YamlError::Parse(error) => vec![Refusal::Unparsed(error)],
+        YamlError::Invalid(problems) => problems.into_iter().map(Refusal::Invalid).collect(),
+    }
+}
+
+fn remove_each<K: Ord + fmt::Display, T>(
     kind: &str,
     records: &mut BTreeMap<K, T>,
     ids: &[K],
-    problems: &mut Vec<String>,
+    problems: &mut Vec<Refusal>,
 ) {
     for id in ids {
         if records.remove(id).is_none() {
-            problems.push(format!("there is no {kind} {id} to remove"));
+            problems.push(Refusal::Said(format!("there is no {kind} {id} to remove")));
         }
     }
 }
 
 /// The inventory `authoring` leaves, or every reason it is refused.
-fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec<String>> {
+fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec<Refusal>> {
     let foreign = current.foreign_records();
     if !foreign.is_empty() {
-        return Err(vec![format!(
+        return Err(vec![Refusal::Said(format!(
             "{} records are still mirrored from bginf and read-only ({}); adopt them first: patch cairn://inference {{adopt:\"bginf\"}}",
             foreign.len(),
             foreign.join(", ")
-        )]);
+        ))]);
     }
     let mut problems = Vec::new();
     let next = match authoring {
@@ -276,15 +321,15 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
             Ok(next) => next,
             Err(YamlError::Invalid(found)) => {
                 // Still name any record that is not Cairn's, below.
-                problems.extend(found.iter().map(ToString::to_string));
+                problems.extend(found.into_iter().map(Refusal::Invalid));
                 Inventory::parse_yaml(text).unwrap_or_default()
             }
-            Err(error) => return Err(document_problems(error)),
+            Err(error) => return Err(document_refusals(error)),
         },
         Authoring::Patch { upsert, remove } => {
             let mut next = current.clone();
             if let Some(text) = upsert {
-                next.upsert(Inventory::parse_yaml(text).map_err(document_problems)?);
+                next.upsert(Inventory::parse_yaml(text).map_err(document_refusals)?);
             }
             remove_each("model", &mut next.models, &remove.models, &mut problems);
             remove_each(
@@ -305,12 +350,12 @@ fn authored(current: &Inventory, authoring: &Authoring) -> Result<Inventory, Vec
                 &remove.machines,
                 &mut problems,
             );
-            problems.extend(next.problems().iter().map(ToString::to_string));
+            problems.extend(next.problems().into_iter().map(Refusal::Invalid));
             next
         }
     };
     problems.extend(next.foreign_records().into_iter().map(|record| {
-        format!("{record} is not Cairn's; a record written here says `source: cairn` or names no source")
+        Refusal::Said(format!("{record} is not Cairn's; a record written here says `source: cairn` or names no source"))
     }));
     if problems.is_empty() {
         Ok(next)
@@ -350,29 +395,113 @@ fn running_refusals(
     refusals
 }
 
-fn refused(problems: Vec<String>) -> String {
+fn refused(problems: Vec<Refusal>) -> String {
+    let problems: Vec<String> = problems.iter().map(ToString::to_string).collect();
     format!("Refused; nothing was written:\n- {}", problems.join("\n- "))
 }
 
-/// Write Cairn's own records, or refuse with every problem and write nothing.
-pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<String, String> {
+/// Write what `authoring` makes of the current records, holding the inventory
+/// while it reads them, decides and writes: validated as a whole, refused with
+/// every problem, and never taking away what is running.
+async fn write_checked(
+    db: &LocalDb,
+    authoring: impl FnOnce(&Inventory) -> Result<Authoring, Vec<Refusal>>,
+) -> Result<String, WriteError> {
     let _held = INVENTORY.lock().await;
-    let current = load_inventory(db).await?;
-    let next = authored(&current, authoring).map_err(refused)?;
-    let phases = super::inference_control::deployment_phases(db).await?;
+    let current = load_inventory(db).await.map_err(WriteError::Failed)?;
+    let next = authoring(&current)
+        .and_then(|authoring| authored(&current, &authoring))
+        .map_err(WriteError::Refused)?;
+    let phases = super::inference_control::deployment_phases(db)
+        .await
+        .map_err(WriteError::Failed)?;
     let running = running_refusals(&current, &next, &phases);
     if !running.is_empty() {
-        return Err(refused(running));
+        return Err(WriteError::Refused(
+            running.into_iter().map(Refusal::Said).collect(),
+        ));
     }
     let report = Inventory::changes(&current, &next);
     if !report.has_changes() {
         return Ok("The inventory is unchanged.".to_string());
     }
-    save_rows(db, diff_rows(&current, &next), now_ms()).await?;
+    save_rows(db, diff_rows(&current, &next), now_ms())
+        .await
+        .map_err(WriteError::Failed)?;
     Ok(format!(
         "Wrote the inventory:\n- {}\nRead cairn://inference?format=yaml for the whole of it.",
         report.lines().join("\n- ")
     ))
+}
+
+/// Write Cairn's own records, or refuse with every problem and write nothing.
+pub async fn write_inventory(db: &LocalDb, authoring: &Authoring) -> Result<String, String> {
+    Ok(write_checked(db, |_| Ok(authoring.clone())).await?)
+}
+
+/// One profile in Cairn's record format, as its editor shows it.
+pub async fn profile_yaml(db: &LocalDb, id: &str) -> Result<String, String> {
+    let inventory = load_inventory(db).await?;
+    let profile = inventory
+        .profiles
+        .get(&InferenceProfileId::from(id))
+        .ok_or_else(|| format!("there is no profile {id}"))?;
+    serde_yaml::to_string(profile)
+        .map_err(|error| format!("profile {id} does not serialize: {error}"))
+}
+
+/// Write one profile from its record YAML, in place of `replacing` (its id
+/// before the edit, so an edit may rename it), or as a new profile when
+/// `replacing` is `None`, which refuses an id already in use. It is validated
+/// with the whole inventory, as every write is.
+pub async fn save_profile(
+    db: &LocalDb,
+    replacing: Option<&str>,
+    yaml: &str,
+) -> Result<String, WriteError> {
+    let profile: InferenceProfile = serde_yaml::from_str(yaml)
+        .map_err(|error| WriteError::Refused(vec![Refusal::Unparsed(error.to_string())]))?;
+    let replacing = replacing.map(InferenceProfileId::from);
+    write_checked(db, move |current| {
+        let id = profile.id.clone();
+        if replacing.as_ref() != Some(&id) && current.profiles.contains_key(&id) {
+            return Err(vec![Refusal::Taken(id)]);
+        }
+        let mut records = Inventory::default();
+        records.insert_profile(profile);
+        Ok(Authoring::Patch {
+            upsert: Some(records.to_yaml()),
+            remove: Removals {
+                // An edit under a new id renames it.
+                profiles: replacing.into_iter().filter(|old| *old != id).collect(),
+                ..Removals::default()
+            },
+        })
+    })
+    .await
+}
+
+/// Remove a profile and every deployment of it, refused while one of those
+/// deployments runs.
+pub async fn delete_profile(db: &LocalDb, id: &str) -> Result<String, WriteError> {
+    let id = InferenceProfileId::from(id);
+    write_checked(db, move |current| {
+        let deployments = current
+            .deployments
+            .values()
+            .filter(|deployment| deployment.profile == id)
+            .map(|deployment| deployment.id.clone())
+            .collect();
+        Ok(Authoring::Patch {
+            upsert: None,
+            remove: Removals {
+                profiles: vec![id],
+                deployments,
+                ..Removals::default()
+            },
+        })
+    })
+    .await
 }
 
 /// Everything the `cairn://inference` pages render.
@@ -424,7 +553,6 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_inference::ValidationError;
 
     /// The Sparks and halo as bginf mirrored them, written as the retired
     /// poller wrote them.
@@ -727,6 +855,162 @@ machines:
             .unwrap()
             .notes = Some("a new start command takes effect at the next start".into());
         assert!(running_refusals(&current, &restarted, &phases).is_empty());
+    }
+
+    fn refusals(result: Result<String, WriteError>) -> Vec<Refusal> {
+        match result {
+            Err(WriteError::Refused(refusals)) => refusals,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_saves_from_its_yaml_and_a_new_id_duplicates_or_renames_it() {
+        let db = seeded("inference-save-profile").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let yaml = profile_yaml(&db, "qwen3-embed-4b").await.unwrap();
+        assert!(yaml.starts_with("id: qwen3-embed-4b\n"), "{yaml}");
+
+        let edited = yaml.replace("podman run bginf-embed", "podman run cairn-embed");
+        let said = save_profile(&db, Some("qwen3-embed-4b"), &edited)
+            .await
+            .unwrap();
+        assert!(
+            said.contains("updated profile qwen3-embed-4b: engine"),
+            "{said}"
+        );
+        assert_eq!(profile_yaml(&db, "qwen3-embed-4b").await.unwrap(), edited);
+
+        // A new profile may not take an id in use: duplicating needs a new one.
+        assert_eq!(
+            refusals(save_profile(&db, None, &edited).await),
+            vec![Refusal::Taken("qwen3-embed-4b".into())]
+        );
+        let copy = edited.replace("id: qwen3-embed-4b", "id: embed-copy");
+        let said = save_profile(&db, None, &copy).await.unwrap();
+        assert!(said.contains("added profile embed-copy"), "{said}");
+
+        let renamed = copy.replace("id: embed-copy", "id: embed-renamed");
+        let said = save_profile(&db, Some("embed-copy"), &renamed)
+            .await
+            .unwrap();
+        assert!(said.contains("added profile embed-renamed"), "{said}");
+        assert!(said.contains("removed profile embed-copy"), "{said}");
+        let profiles: Vec<String> = load_inventory(&db)
+            .await
+            .unwrap()
+            .profiles
+            .into_keys()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(profiles, ["dsv4f-tp2", "embed-renamed", "qwen3-embed-4b"]);
+
+        // Renaming one a deployment names would leave the deployment dangling.
+        let refused = refusals(
+            save_profile(
+                &db,
+                Some("qwen3-embed-4b"),
+                &edited.replace("id: qwen3-embed-4b", "id: embed-elsewhere"),
+            )
+            .await,
+        );
+        assert_eq!(
+            refused,
+            vec![Refusal::Invalid(ValidationError::UnknownProfile {
+                deployment: "qwen3-embed-4b".into(),
+                profile: "qwen3-embed-4b".into(),
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_profile_names_each_problem_and_writes_nothing() {
+        let db = seeded("inference-save-profile-refused").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        let before = load_inventory(&db).await.unwrap();
+        assert!(matches!(
+            refusals(save_profile(&db, Some("dsv4f-tp2"), "id: [").await).as_slice(),
+            [Refusal::Unparsed(_)]
+        ));
+        let container = r#"
+id: dsv4-container
+model:
+  name: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+  weights:
+  - {repo: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp, revision: main, path: model.safetensors, sha256: ''}
+servedName: dsv4
+engine: {kind: container, image: 'vllm/vllm-openai:latest', server: vllm}
+requirements: {machines: 1}
+"#;
+        assert_eq!(
+            refusals(save_profile(&db, None, container).await),
+            vec![
+                Refusal::Invalid(ValidationError::BadWeightFile {
+                    profile: "dsv4-container".into(),
+                    index: 0,
+                    problem: "sha256 is not 64 lowercase hex digits",
+                }),
+                Refusal::Invalid(ValidationError::BadImageDigest {
+                    profile: "dsv4-container".into(),
+                    image: "vllm/vllm-openai:latest".into(),
+                }),
+            ]
+        );
+        assert_eq!(load_inventory(&db).await.unwrap(), before);
+    }
+
+    async fn set_phase(db: &LocalDb, deployment: &str, phase: &Phase) {
+        db.execute(
+            "INSERT INTO inference_deployment_state (deployment_id, phase_json, updated_at)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(deployment_id) DO UPDATE SET phase_json = excluded.phase_json",
+            params![deployment, serde_json::to_string(phase).unwrap()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_profile_is_deleted_with_its_deployments_but_not_while_one_runs() {
+        let db = seeded("inference-delete-profile").await;
+        adopt(&db, RecordSource::Bginf).await.unwrap();
+        set_phase(
+            &db,
+            "qwen3-embed-4b",
+            &Phase::Healthy {
+                since_ms: 0,
+                load_ms: None,
+            },
+        )
+        .await;
+        let refused = refusals(delete_profile(&db, "qwen3-embed-4b").await);
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0]
+                .to_string()
+                .starts_with("deployment qwen3-embed-4b is healthy on fedora; stop it first"),
+            "{refused:?}"
+        );
+        assert_eq!(load_inventory(&db).await.unwrap(), adopted());
+
+        set_phase(&db, "qwen3-embed-4b", &Phase::Stopped { since_ms: 1 }).await;
+        let said = delete_profile(&db, "qwen3-embed-4b").await.unwrap();
+        assert!(said.contains("removed profile qwen3-embed-4b"), "{said}");
+        assert!(said.contains("removed deployment qwen3-embed-4b"), "{said}");
+        let stored = load_inventory(&db).await.unwrap();
+        assert!(!stored
+            .profiles
+            .contains_key(&InferenceProfileId::from("qwen3-embed-4b")));
+        assert!(!stored
+            .deployments
+            .contains_key(&DeploymentId::from("qwen3-embed-4b")));
+
+        assert_eq!(
+            refusals(delete_profile(&db, "qwen3-embed-4b").await),
+            vec![Refusal::Said(
+                "there is no profile qwen3-embed-4b to remove".into()
+            )]
+        );
     }
 
     #[test]

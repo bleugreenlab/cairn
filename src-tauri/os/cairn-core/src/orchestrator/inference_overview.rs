@@ -26,11 +26,12 @@ use cairn_inference::metrics::EngineSummary;
 use cairn_inference::served::{self, EngineMeasure};
 use cairn_inference::{
     AcceleratorFamily, DeploymentId, Engine, InferenceProfile, InferenceProfileId, Inventory,
-    MemoryPerMachine, Model, Server,
+    MemoryPerMachine, Model, Server, ValidationError, WeightFile,
 };
 use cairn_models::types::catalog::Modality;
 use serde::Serialize;
 
+use super::inference::{Refusal, WriteError};
 use super::inference_control::{self, LoadRow};
 use super::inference_verify::VerificationRow;
 use super::Orchestrator;
@@ -189,6 +190,9 @@ pub struct ModelProfile {
     pub in_use: bool,
     /// A container profile, which verification can measure on a pool.
     pub verifiable: bool,
+    /// Verified before, but only as it was before an edit: those
+    /// verifications no longer count, and a load verifies it first.
+    pub edited: bool,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
 }
@@ -322,6 +326,9 @@ pub(crate) struct Sources<'a> {
     /// The verifications, newest first, without those of a profile changed
     /// since they ran.
     pub verifications: &'a [VerificationRow],
+    /// The profiles edited since they were verified: every verification of
+    /// one ran against content it no longer has.
+    pub edited: &'a BTreeSet<String>,
     pub now: i64,
 }
 
@@ -686,6 +693,9 @@ impl Sources<'_> {
             .iter()
             .filter_map(|id| Some((id, self.model_of(id)?)))
             .filter(|(_, profile)| same_model(&profile.model.name, &group.name))
+            // A deployment of a profile edited since it was verified runs
+            // content nothing has vouched for: a load verifies it first.
+            .filter(|(_, profile)| !self.edited.contains(profile.id.as_str()))
             .map(|(id, profile)| {
                 let (size, per_machine) = self.size(id, profile);
                 let blocked = if !self.fits(pool, profile, per_machine) {
@@ -981,6 +991,7 @@ impl Sources<'_> {
                             origin: profile.origin.label().to_string(),
                             in_use: in_use.contains(profile.id.as_str()),
                             verifiable: matches!(profile.engine, Engine::Container(_)),
+                            edited: self.edited.contains(profile.id.as_str()),
                             fit: self.profile_fit(profile),
                         })
                         .collect(),
@@ -1057,11 +1068,10 @@ async fn with_sources<T>(
     // Staleness is judged against the records as written: the served inventory
     // lays settings declarations over them, which would read as a change.
     let records = super::inference::load_inventory(db).await?;
-    let verifications: Vec<VerificationRow> = super::inference_verify::load_verifications(db)
-        .await?
-        .into_iter()
-        .filter(|row| !row.stale(&records))
-        .collect();
+    let (verifications, stale) = current_verifications(
+        super::inference_verify::load_verifications(db).await?,
+        &records,
+    );
     Ok(with(&Sources {
         inventory: &inventory,
         phases: &phases,
@@ -1071,8 +1081,30 @@ async fn with_sources<T>(
         engines: &engines,
         measures: &measures,
         verifications: &verifications,
+        edited: &stale,
         now: crate::fleet::unix_time_ms() as i64,
     }))
+}
+
+/// The verifications of each profile as its records are now, and the profiles
+/// edited since they were verified: verified only as they were before.
+fn current_verifications(
+    rows: Vec<VerificationRow>,
+    records: &Inventory,
+) -> (Vec<VerificationRow>, BTreeSet<String>) {
+    let (current, stale): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| !row.stale(records));
+    let vouched: BTreeSet<&str> = current.iter().map(|row| row.profile.as_str()).collect();
+    let edited = stale
+        .into_iter()
+        .map(|row| row.profile)
+        .filter(|profile| {
+            !vouched.contains(profile.as_str())
+                && records
+                    .profiles
+                    .contains_key(&InferenceProfileId::from(profile.as_str()))
+        })
+        .collect();
+    (current, edited)
 }
 
 pub async fn overview(orch: &Orchestrator) -> Result<InferenceOverview, String> {
@@ -1293,6 +1325,145 @@ pub async fn generate_profiles(
     .await
 }
 
+/// One profile's record YAML, for its editor.
+pub async fn profile_yaml(orch: &Orchestrator, profile: &str) -> Result<String, String> {
+    super::inference::profile_yaml(&orch.db.local, profile).await
+}
+
+/// One reason a profile's save was refused, at the editor field it is about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileProblem {
+    /// `id`, `image`, `args`, `env`, `weights`, `weights.<n>`, or `yaml` for
+    /// the rest of the profile; `None` when it is about another record.
+    pub field: Option<String>,
+    pub message: String,
+}
+
+/// How a profile's save went: written, or every problem at its field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProfile {
+    pub message: String,
+    /// Empty once it is written.
+    pub problems: Vec<ProfileProblem>,
+}
+
+/// The editor field one refusal of a profile's save is about.
+fn problem_field(
+    refusal: &Refusal,
+    profile: Option<&InferenceProfile>,
+    replacing: Option<&str>,
+) -> Option<String> {
+    use ValidationError as V;
+    let problem = match refusal {
+        Refusal::Unparsed(_) => return Some("yaml".into()),
+        Refusal::Taken(_) => return Some("id".into()),
+        Refusal::Said(_) => return None,
+        Refusal::Invalid(problem) => problem,
+    };
+    let about = match problem {
+        // A deployment left naming the profile's old id: the rename did it.
+        V::UnknownProfile { profile: id, .. } => {
+            return (replacing == Some(id.as_str())).then(|| "id".into());
+        }
+        V::ProfileZeroMachines { profile }
+        | V::UnpinnedWeights { profile }
+        | V::BadWeightFile { profile, .. }
+        | V::BadImageDigest { profile, .. }
+        | V::BadArtifactSha { profile }
+        | V::EmptyStart { profile }
+        | V::UnknownPlaceholder { profile, .. }
+        | V::RanksMismatch { profile, .. }
+        | V::UnpinnedSourceMount { profile, .. }
+        | V::BadSourceCommit { profile, .. }
+        | V::ProfileModelUnregistered { profile, .. }
+        | V::MachineCount { profile, .. } => profile,
+        _ => return None,
+    };
+    let profile = profile.filter(|profile| &profile.id == about)?;
+    Some(match problem {
+        V::BadImageDigest { .. } => "image".into(),
+        V::UnpinnedWeights { .. } => "weights".into(),
+        V::BadWeightFile { index, .. } => format!("weights.{index}"),
+        V::UnknownPlaceholder { placeholder, .. } => {
+            let braced = format!("{{{placeholder}}}");
+            match &profile.engine {
+                Engine::Container(container)
+                    if container.args.iter().any(|arg| arg.contains(&braced)) =>
+                {
+                    "args".into()
+                }
+                Engine::Container(container)
+                    if container.env.values().any(|value| value.contains(&braced)) =>
+                {
+                    "env".into()
+                }
+                _ => "yaml".into(),
+            }
+        }
+        _ => "yaml".into(),
+    })
+}
+
+/// Every refusal of a profile's save, each at its field. A problem placed at
+/// a field drops the `profile <id> ` its sentence opens with, which the
+/// field already says.
+fn profile_problems(
+    refusals: &[Refusal],
+    yaml: &str,
+    replacing: Option<&str>,
+) -> Vec<ProfileProblem> {
+    let profile: Option<InferenceProfile> = serde_yaml::from_str(yaml).ok();
+    refusals
+        .iter()
+        .map(|refusal| {
+            let field = problem_field(refusal, profile.as_ref(), replacing);
+            let mut message = refusal.to_string();
+            if let (Some(_), Some(profile)) = (&field, &profile) {
+                if let Some(rest) = message.strip_prefix(&format!("profile {} ", profile.id)) {
+                    message = rest.to_string();
+                }
+            }
+            ProfileProblem { field, message }
+        })
+        .collect()
+}
+
+/// Save a profile from its editor: its record YAML in place of `replacing`
+/// (its id before the edit), or as a new profile when that is `None`. It is
+/// validated with the whole inventory as every `cairn://inference` write is,
+/// and a refusal is an answer naming each problem at its field, not an error.
+pub async fn save_profile(
+    orch: &Orchestrator,
+    replacing: Option<&str>,
+    yaml: &str,
+) -> Result<SavedProfile, String> {
+    match super::inference::save_profile(&orch.db.local, replacing, yaml).await {
+        Ok(message) => Ok(SavedProfile {
+            message,
+            problems: Vec::new(),
+        }),
+        Err(WriteError::Refused(refusals)) => Ok(SavedProfile {
+            message: "Refused; nothing was written.".into(),
+            problems: profile_problems(&refusals, yaml, replacing),
+        }),
+        Err(WriteError::Failed(error)) => Err(error),
+    }
+}
+
+/// Remove a profile and its deployments, refused while one of them runs.
+pub async fn delete_profile(orch: &Orchestrator, profile: &str) -> Result<String, String> {
+    Ok(super::inference::delete_profile(&orch.db.local, profile).await?)
+}
+
+/// A weight file as Hugging Face lists it, pinned: its revision's sha, its
+/// sha256 and its size.
+pub async fn weight_file(repo: &str, revision: &str, path: &str) -> Result<WeightFile, String> {
+    let hub = super::inference_models::Web::new()?;
+    super::inference_models::weight_file(&hub, repo.trim(), revision.trim(), path.trim()).await
+}
+
 /// Verify `profile` on `pool` in the background, as
 /// `patch cairn://inference/profiles/<id> {verify}` does.
 pub async fn verify_profile(
@@ -1476,6 +1647,7 @@ deployments:
         engines: BTreeMap<DeploymentId, EngineSummary>,
         measures: BTreeMap<DeploymentId, EngineMeasure>,
         verifications: Vec<VerificationRow>,
+        edited: BTreeSet<String>,
     }
 
     impl World {
@@ -1489,6 +1661,7 @@ deployments:
                 engines: BTreeMap::new(),
                 measures: BTreeMap::new(),
                 verifications: Vec::new(),
+                edited: BTreeSet::new(),
             }
         }
 
@@ -1506,6 +1679,7 @@ deployments:
                 engines: &self.engines,
                 measures: &self.measures,
                 verifications: &self.verifications,
+                edited: &self.edited,
                 now: 600_000,
             }
         }
@@ -2096,5 +2270,160 @@ profiles:
         assert_eq!(detail.config.port, 8888);
         let json = serde_json::to_string(&detail).unwrap();
         assert!(!json.contains("start.sh"), "{json}");
+    }
+
+    #[test]
+    fn a_profile_edited_since_it_was_verified_says_so_and_loads_by_verifying_first() {
+        const GGUF: &str = "qwen3-embed-4b-gguf";
+        const VERIFY: &str = "verify-qwen3-embed-4b-gguf-sp1+sp2";
+        let mut world = sparks_with_embed_container(10 * GIB);
+        world
+            .inventory
+            .insert_deployment(cairn_inference::Deployment {
+                id: VERIFY.into(),
+                source: cairn_inference::RecordSource::Cairn,
+                profile: GGUF.into(),
+                head: "sp1".into(),
+                machines: vec!["sp1".into()],
+                api_port: 8090,
+                api_path: "/v1".into(),
+                health_path: "/v1/models".into(),
+            });
+        world.models.deployments.push(placed(VERIFY, EMBED, SPARKS));
+        let mut passed = verification(GGUF, SPARKS, "passed");
+        passed.profile_digest = super::super::inference_verify::digest(
+            &world.inventory.profiles[&InferenceProfileId::from(GGUF)],
+        );
+        let observe = |world: &mut World, rows: Vec<VerificationRow>| {
+            (world.verifications, world.edited) = current_verifications(rows, &world.inventory);
+            let overview = world.overview();
+            let profile = overview
+                .models
+                .iter()
+                .find(|m| m.name == EMBED)
+                .unwrap()
+                .profiles
+                .iter()
+                .find(|p| p.id == GGUF)
+                .unwrap()
+                .clone();
+            let offer = pool(&overview, SPARKS)
+                .loadable
+                .iter()
+                .find(|l| l.model == EMBED)
+                .unwrap()
+                .clone();
+            (profile, offer)
+        };
+
+        let (profile, offer) = observe(&mut world, vec![passed.clone()]);
+        assert!(!profile.edited);
+        assert_eq!(profile.fit.len(), 1, "the pass is its fit");
+        assert_eq!(
+            (offer.blocked, offer.verifies),
+            (None, false),
+            "a plain load"
+        );
+
+        let Engine::Container(container) = &mut world
+            .inventory
+            .profiles
+            .get_mut(&InferenceProfileId::from(GGUF))
+            .unwrap()
+            .engine
+        else {
+            unreachable!()
+        };
+        container.args.extend(["--parallel".into(), "4".into()]);
+        let (profile, offer) = observe(&mut world, vec![passed]);
+        assert!(profile.edited);
+        assert!(
+            profile.fit.is_empty(),
+            "the pass measured what it no longer is"
+        );
+        assert_eq!(
+            (offer.profile.as_deref(), offer.blocked, offer.verifies),
+            (Some(GGUF), None, true),
+            "loading it verifies the edit first"
+        );
+        assert_eq!(
+            world.sources().load_verifies(&PoolKey::from(SPARKS), EMBED),
+            Some(vec![InferenceProfileId::from(GGUF)])
+        );
+    }
+
+    #[test]
+    fn each_refusal_of_a_save_lands_at_the_field_it_is_about() {
+        use ValidationError as V;
+        let profile = embed_container(10 * GIB);
+        let yaml = serde_yaml::to_string(&profile).unwrap();
+        let id = profile.id.clone();
+        let refusals = [
+            Refusal::Invalid(V::BadImageDigest {
+                profile: id.clone(),
+                image: "llama.cpp:latest".into(),
+            }),
+            Refusal::Invalid(V::BadWeightFile {
+                profile: id.clone(),
+                index: 1,
+                problem: "no path",
+            }),
+            Refusal::Invalid(V::UnknownPlaceholder {
+                profile: id.clone(),
+                placeholder: "port".into(),
+            }),
+            Refusal::Invalid(V::RanksMismatch {
+                profile: id.clone(),
+                ranks: 2,
+                machines: 1,
+            }),
+            Refusal::Invalid(V::UnknownProfile {
+                deployment: "embed".into(),
+                profile: "embed-before".into(),
+            }),
+            Refusal::Invalid(V::EmptyStart {
+                profile: "another".into(),
+            }),
+            Refusal::Taken(id.clone()),
+            Refusal::Said("deployment embed is healthy; stop it first".into()),
+        ];
+        let problems = profile_problems(&refusals, &yaml, Some("embed-before"));
+        assert_eq!(
+            problems
+                .iter()
+                .map(|p| p.field.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                Some("image"),
+                Some("weights.1"),
+                Some("args"),
+                Some("yaml"),
+                Some("id"),
+                None,
+                Some("id"),
+                None
+            ]
+        );
+        assert_eq!(
+            problems[0].message,
+            "image llama.cpp:latest is not pinned by digest (@sha256:<64 hex>)",
+            "the field already names the profile"
+        );
+        assert_eq!(problems[1].message, "weight file 1: no path");
+        assert_eq!(
+            problems[5].message,
+            "profile another has an empty start command"
+        );
+        assert_eq!(
+            profile_problems(
+                &[Refusal::Unparsed("bad indentation".into())],
+                "id: [",
+                None
+            ),
+            [ProfileProblem {
+                field: Some("yaml".into()),
+                message: "the document does not parse: bad indentation".into(),
+            }]
+        );
     }
 }

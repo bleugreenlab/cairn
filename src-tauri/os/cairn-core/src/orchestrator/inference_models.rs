@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use cairn_inference::hf::{self, HfRepo};
-use cairn_inference::{Inventory, Model};
+use cairn_inference::{Inventory, Model, WeightFile};
 
 use super::inference::{write_inventory, Authoring, Removals};
 use crate::storage::LocalDb;
@@ -297,6 +297,35 @@ pub async fn weight_sources(
     Ok((sources, skipped))
 }
 
+/// One weight file as Hugging Face lists it at `revision` (a sha or a ref),
+/// pinned: the revision resolved to its sha, and the file's sha256 and size
+/// read rather than typed.
+pub async fn weight_file(
+    hub: &dyn Hub,
+    repo: &str,
+    revision: &str,
+    path: &str,
+) -> Result<WeightFile, String> {
+    let read = read_repo(hub, repo, Some(revision).filter(|r| !r.is_empty())).await?;
+    let file = read
+        .weights
+        .iter()
+        .find(|file| file.path == path)
+        .ok_or_else(|| {
+            format!(
+                "{repo} at {} has no weight file {path}",
+                &read.revision[..read.revision.len().min(12)]
+            )
+        })?;
+    Ok(WeightFile {
+        repo: read.repo.clone(),
+        revision: read.revision.clone(),
+        path: file.path.clone(),
+        sha256: file.sha256.clone(),
+        size: Some(file.size),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -445,6 +474,30 @@ pub(crate) mod tests {
         );
         let refusal = read_repo(&hub, "meta-llama/Gated", None).await.unwrap_err();
         assert!(refusal.contains("is gated"), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_weight_file_is_read_back_pinned_to_its_revision() {
+        let hub = FakeHub::fixtures();
+        let repo = "Qwen/Qwen3-Embedding-4B-GGUF";
+        let file = weight_file(&hub, repo, "main", "Qwen3-Embedding-4B-Q8_0.gguf")
+            .await
+            .unwrap();
+        assert_eq!(
+            file,
+            WeightFile {
+                repo: repo.into(),
+                revision: "f4602530db1d980e16da9d7d3a70294cf5c190be".into(),
+                path: "Qwen3-Embedding-4B-Q8_0.gguf".into(),
+                sha256: "b60ae5ce2dd6a0b77f82cadf21def1f310a3e10cde380ad0081b07a9d416949d".into(),
+                size: Some(4_279_660_224),
+            }
+        );
+        let missing = weight_file(&hub, repo, "", "nope.gguf").await.unwrap_err();
+        assert_eq!(
+            missing,
+            format!("{repo} at f4602530db1d has no weight file nope.gguf")
+        );
     }
 
     #[tokio::test]

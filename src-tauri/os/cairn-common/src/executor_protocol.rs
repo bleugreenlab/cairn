@@ -6560,6 +6560,15 @@ pub struct LearnedResourceEstimate {
 /// executor: a failed population removes its own staging, and a population
 /// whose volume is at its pressure line, or whose target would not fit above
 /// the critical reserve, is skipped and names why.
+///
+/// cairn/5884 does not move the number. The executor writes a deployment's
+/// start or stop script to `<operation>.sh` beside its log and runs that file
+/// from its login shell with `exec bash`, so a login shell's `~/.bash_logout`
+/// can no longer turn the script's exit 0 into a failure. The
+/// `DeploymentCommand` the runner sends and the `DeploymentReport`s it reads
+/// are unchanged in every variant, field and serialized form. A runner talking
+/// to an older executor gets nothing wrong: that executor reports what its
+/// scripts' exits were, as it always did.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
