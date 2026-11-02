@@ -6443,6 +6443,16 @@ pub struct LearnedResourceEstimate {
 /// registered values begins with a newline. The runner's relay guard, which
 /// holds the runner's own credentials, frames by the declaration whatever the
 /// executor runs. An older runner sends no field.
+///
+/// cairn/5804 does not move the number. No frame, variant, field or serialized
+/// form changes. An executor's liveness pass now delivers its snapshot through
+/// the serialized publication every other snapshot takes, read at delivery,
+/// instead of the pool-state read it made before its host probes. The same
+/// `SnapshotUpdated` frame carries it, only never older than one already sent.
+/// What a runner gets wrong talking to an older executor: nothing it did not
+/// already get wrong; that executor can still deliver a pass's stale snapshot
+/// after a newer one, briefly hiding a cell acquired in between, until it runs
+/// a build carrying this.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

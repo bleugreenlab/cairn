@@ -558,7 +558,7 @@ impl Node {
         if let Some(machine) = machine {
             create["executor"] = json!({ "name": machine });
         }
-        handle_write(
+        let reply = handle_write(
             self.orch(),
             &McpCallbackRequest {
                 answer_bound_ms: None,
@@ -575,7 +575,14 @@ impl Node {
                 origin: None,
             },
         )
-        .await
+        .await;
+        // A create that did not start fails here, by its own reply, rather than
+        // later as a holder that is missing or a file that never appears.
+        assert!(
+            reply.contains("Started terminal"),
+            "the terminal did not start: {reply}"
+        );
+        reply
     }
 
     /// Attach a third machine, neither of the node's first two.
@@ -913,30 +920,23 @@ async fn two_terminals_on_two_machines_both_start_and_their_writes_merge() {
             go = go.display()
         )
     };
-    let on_a = node
-        .start_terminal_of(
-            "r-1",
-            OWNER,
-            "left",
-            Some(MACHINE_A),
-            &script("a.txt", "from-a"),
-        )
-        .await;
-    let on_b = node
-        .start_terminal_of(
-            &task,
-            &format!("{OWNER}/task/side"),
-            "right",
-            Some(MACHINE_B),
-            &script("b.txt", "from-b"),
-        )
-        .await;
-    for started in [&on_a, &on_b] {
-        assert!(
-            !started.contains("held by") && !started.contains("two machines at once"),
-            "a live process never refuses another: {started}"
-        );
-    }
+    // Both start: a live process never refuses another.
+    node.start_terminal_of(
+        "r-1",
+        OWNER,
+        "left",
+        Some(MACHINE_A),
+        &script("a.txt", "from-a"),
+    )
+    .await;
+    node.start_terminal_of(
+        &task,
+        &format!("{OWNER}/task/side"),
+        "right",
+        Some(MACHINE_B),
+        &script("b.txt", "from-b"),
+    )
+    .await;
     let holders = cairn_core::internal::node_scratch::holders::holders(
         node.orch(),
         &node.machines.db,
