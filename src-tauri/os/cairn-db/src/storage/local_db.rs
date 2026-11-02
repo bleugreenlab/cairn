@@ -74,7 +74,7 @@ fn emit_transaction_contention(
 }
 
 use super::blocking::panic_message;
-use super::content_store::{ContentStore, PrivateContentStore, TeamReplicaContext};
+use super::content_store::{ContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
 use crate::storage::TeamId;
 
@@ -646,9 +646,12 @@ pub struct LocalDb {
     /// Set ONLY for a team replica: its intrinsic team id plus the per-team
     /// content store archival offloads to and reconstruction fetches from. The
     /// private DB carries `None`, so archival/reconstruct branch on
-    /// `content_store()` and the local-run inline path is byte-for-byte unchanged.
+    /// `team_content_store()` and the local-run inline path is byte-for-byte
+    /// unchanged.
     team: Option<Arc<TeamReplicaContext>>,
-    content_store: Arc<dyn ContentStore>,
+    /// Set with `team`. The private database's content lives in its own
+    /// `cas_cache` table, reached through the pool like any other row.
+    team_content_store: Option<Arc<dyn ContentStore>>,
     /// Connections that hold no open transaction and are free to be reused.
     ///
     /// The first `BEGIN CONCURRENT` on a fresh turso connection pays a one-time
@@ -702,7 +705,13 @@ impl std::fmt::Debug for LocalDb {
             .field("database", &self.database)
             .field("retry", &self.retry)
             .field("team", &self.team)
-            .field("content_store", &"<dyn ContentStore>")
+            .field(
+                "team_content_store",
+                &self
+                    .team_content_store
+                    .as_ref()
+                    .map(|_| "<dyn ContentStore>"),
+            )
             .finish()
     }
 }
@@ -729,14 +738,14 @@ impl LocalDb {
         let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
-            database: database.clone(),
+            database,
             retry,
             commit_signal: Arc::new(Notify::new()),
             provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
+            team_content_store: None,
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -790,14 +799,14 @@ impl LocalDb {
         let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
-            database: database.clone(),
+            database,
             retry,
             commit_signal: Arc::new(Notify::new()),
             provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
+            team_content_store: None,
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -847,14 +856,14 @@ impl LocalDb {
         let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
-            database: database.clone(),
+            database,
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
+            team_content_store: None,
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -883,10 +892,13 @@ impl LocalDb {
         self.team.as_ref().map(|ctx| &ctx.team_id)
     }
 
-    /// The content store owned by this database. Private databases use
-    /// `cas_cache`; team replicas use their brokered team store.
-    pub fn content_store(&self) -> &Arc<dyn ContentStore> {
-        &self.content_store
+    /// A team replica's brokered content store; `None` on the private database.
+    /// Reading and writing content goes through [`Self::put_content`] and
+    /// [`Self::get_content`], which choose the store; this is for the team-only
+    /// paths (archival offload, pack catalog, reconstruction) that hand the
+    /// store onward.
+    pub fn team_content_store(&self) -> Option<&Arc<dyn ContentStore>> {
+        self.team_content_store.as_ref()
     }
 
     /// The private database that owns machine-local route metadata for this team
@@ -900,7 +912,7 @@ impl LocalDb {
     /// handle is shared behind an `Arc`.
     pub fn set_team_context(&mut self, ctx: TeamReplicaContext, store: Arc<dyn ContentStore>) {
         self.team = Some(Arc::new(ctx));
-        self.content_store = store;
+        self.team_content_store = Some(store);
     }
 
     /// The commit signal fired after each successful synced-replica transaction.
@@ -1093,7 +1105,7 @@ impl LocalDb {
     /// The escape hatch for writers that need a connection of their own for
     /// longer than one pooled transaction (`MigrationRunner::run_fk_off`, which
     /// toggles `PRAGMA foreign_keys` around a transaction and must not have that
-    /// pragma outlive its own use; the content store's `put`), and for probes.
+    /// pragma outlive its own use), and for probes.
     /// Never for a read: a reader goes through [`Self::read`] or the `query_*`
     /// helpers, which bound the statement and cut a read that parks. Nothing
     /// can cut a `connect` holder parked in an open transaction: the engine's
@@ -3648,14 +3660,14 @@ mod tests {
         let gate = Arc::new(ConnectionGate::new());
         let db = LocalDb {
             path: PathBuf::from(":memory:"),
-            database: database.clone(),
+            database,
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
             provider_admission_changes: watch::channel(0).0,
             instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
+            team_content_store: None,
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),

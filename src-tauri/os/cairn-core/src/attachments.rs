@@ -570,8 +570,7 @@ pub async fn store_attachment_bytes(
     let byte_size = bytes.len();
 
     let hash = content_hash(&bytes);
-    db.content_store()
-        .put(&hash, &bytes)
+    db.put_content(&hash, &bytes)
         .await
         .map_err(|message| AttachmentError::Store {
             operation: "write",
@@ -725,8 +724,7 @@ pub async fn resolve_content_hash(
 /// treated as absence rather than served.
 pub async fn fetch_bytes(db: &LocalDb, hash: &str) -> Result<Vec<u8>, AttachmentError> {
     let bytes = db
-        .content_store()
-        .get(hash)
+        .get_content(hash)
         .await
         .map_err(|message| AttachmentError::Store {
             operation: "read",
@@ -1484,7 +1482,7 @@ mod tests {
             db.execute(sql, ()).await.unwrap();
         }
         let hash = content_hash(&png());
-        db.content_store().put(&hash, &png()).await.unwrap();
+        db.put_content(&hash, &png()).await.unwrap();
         db.execute(
             "INSERT INTO image_refs (project_id, issue_number, ordinal, content_hash, created_at)
              VALUES ('p', 3242, 1, ?1, 5), ('p', 3242, 2, ?1, 6), ('p', 0, 1, ?1, 7)",

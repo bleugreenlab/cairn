@@ -22,8 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::storage::local_db::{ConnectionGate, DbHandle, Holder, HolderKind, TrackedConnection};
 use crate::storage::LocalDb;
+use crate::storage::RowExt;
 use crate::storage::TeamId;
 use crate::turso::Value;
 
@@ -59,78 +59,50 @@ pub trait ContentStore: Send + Sync {
     async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// Private-database content store backed by the durable `cas_cache` table.
-pub(crate) struct PrivateContentStore {
-    database: Arc<DbHandle>,
-    gate: Arc<ConnectionGate>,
-}
-
-impl PrivateContentStore {
-    pub(super) fn new(database: Arc<DbHandle>, gate: Arc<ConnectionGate>) -> Self {
-        Self { database, gate }
-    }
-
-    /// A connection for one content-store statement.
+/// The database's own content store: the brokered team store on a team
+/// replica, and the durable `cas_cache` table on the private database.
+impl LocalDb {
+    /// Store `bytes` under `hash`. Idempotent, like [`ContentStore::put`].
     ///
-    /// This is the only connection in the process that does not come from
-    /// `LocalDb` — it reaches `DbHandle` directly — which makes it the one path
-    /// that would silently defeat the quiesce if it were left out. The
-    /// statements below run in autocommit, and an autocommit statement is an
-    /// MVCC transaction like any other, so it registers with the
-    /// [`ConnectionGate`] exactly as a pooled connection does.
-    async fn connect(&self) -> Result<TrackedConnection, String> {
-        // Not the caller: an `#[async_trait]` method cannot be
-        // `#[track_caller]`, so every content-store connection is recorded at
-        // this line. That still names the content store, and the statement
-        // label each `query`/`execute` records says which operation it is.
-        let caller = std::panic::Location::caller();
-        let slot = self
-            .gate
-            .admit(caller, HolderKind::Connect, Holder::new(caller, None))
-            .await;
-        let conn = match self.database.as_ref() {
-            DbHandle::Local(db) => db.connect().map_err(|error| error.to_string())?,
-            DbHandle::Synced(db) => db.connect().await.map_err(|error| error.to_string())?,
-        };
-        Ok(TrackedConnection::new(conn, slot))
-    }
-}
-
-#[async_trait]
-impl ContentStore for PrivateContentStore {
-    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
-        let connection = self.connect().await?;
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO cas_cache(hash, content, fetched_at) VALUES (?1, ?2, unixepoch())",
-                (hash.to_string(), Value::Blob(bytes.to_vec())),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
+    /// The private arm is an ordinary pooled write: a `BEGIN CONCURRENT`
+    /// transaction retried on contention. A lone autocommit statement on a
+    /// connection of its own is not equivalent. Under MVCC an autocommit write
+    /// is an exclusive transaction, so it fails at once with `database is
+    /// locked` against any other exclusive writer, including a second upload,
+    /// and a busy timeout only trades that for being starved by the stream of
+    /// concurrent commits that every other writer in the process produces.
+    pub async fn put_content(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
+        if let Some(store) = self.team_content_store() {
+            return store.put(hash, bytes).await;
+        }
+        self.execute(
+            "INSERT OR IGNORE INTO cas_cache(hash, content, fetched_at) VALUES (?1, ?2, unixepoch())",
+            (hash.to_string(), Value::Blob(bytes.to_vec())),
+        )
+        .await
+        .map(drop)
+        .map_err(|error| error.to_string())
     }
 
-    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
-        let connection = self.connect().await?;
-        let mut rows = connection
-            .query(
-                "SELECT content FROM cas_cache WHERE hash = ?1 LIMIT 1",
-                (hash.to_string(),),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let Some(row) = rows.next().await.map_err(|error| error.to_string())? else {
-            return Ok(None);
-        };
-        row.get::<Vec<u8>>(0)
-            .map(Some)
-            .map_err(|error| error.to_string())
+    /// Fetch the bytes stored under `hash`. `Ok(None)` means not found.
+    pub async fn get_content(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        if let Some(store) = self.team_content_store() {
+            return store.get(hash).await;
+        }
+        self.query_opt(
+            "SELECT content FROM cas_cache WHERE hash = ?1 LIMIT 1",
+            (hash.to_string(),),
+            |row| row.opt_blob(0),
+        )
+        .await
+        .map(Option::flatten)
+        .map_err(|error| error.to_string())
     }
 }
 
 /// A team replica's intrinsic team identity plus its content store. Attached to a
 /// [`LocalDb`] only when the handle is a team replica (the private DB carries
-/// `None`), so archival and reconstruction can branch on `db.content_store()`
+/// `None`), so archival and reconstruction can branch on `db.team_content_store()`
 /// without any out-of-band team lookup — the handle knows its own scope.
 pub struct TeamReplicaContext {
     pub team_id: TeamId,
@@ -233,6 +205,75 @@ mod tests {
     fn empty_pack_and_idx_round_trip() {
         let framed = frame_pack(&[], &[]);
         assert_eq!(unframe_pack(&framed), Some((Vec::new(), Vec::new())));
+    }
+
+    /// An upload that arrives while another writer holds an exclusive
+    /// transaction waits for it rather than failing. On a connection of its
+    /// own in autocommit, this put returned `database is locked` in well under
+    /// a millisecond.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_put_waits_out_an_exclusive_writer() {
+        let db = crate::storage::migrated_test_db("exclusive-writer.db").await;
+        let holder = db.connect().await.unwrap();
+        holder.execute("BEGIN", ()).await.unwrap();
+        holder
+            .execute(
+                "INSERT INTO cas_cache(hash, content, fetched_at) VALUES ('held', x'00', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            holder.execute("COMMIT", ()).await.unwrap();
+        });
+
+        db.put_content("waited", b"waited").await.unwrap();
+        release.await.unwrap();
+
+        assert_eq!(
+            db.get_content("waited").await.unwrap().as_deref(),
+            Some(&b"waited"[..])
+        );
+        assert_eq!(
+            db.get_content("held").await.unwrap().as_deref(),
+            Some(&[0u8][..])
+        );
+    }
+
+    /// Simultaneous uploads all land, identical bytes included. As exclusive
+    /// autocommits on connections of their own, 376 of these 400 failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_private_puts_all_land() {
+        let db = Arc::new(crate::storage::migrated_test_db("concurrent-puts.db").await);
+        let uploads = (0..16).map(|uploader| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for n in 0..25 {
+                    // Every fifth key is shared by all uploaders.
+                    let hash = if n % 5 == 0 {
+                        format!("shared-{n}")
+                    } else {
+                        format!("own-{uploader}-{n}")
+                    };
+                    db.put_content(&hash, hash.as_bytes()).await.unwrap();
+                }
+            })
+        });
+        for upload in uploads.collect::<Vec<_>>() {
+            upload.await.unwrap();
+        }
+
+        let stored = db
+            .query_all("SELECT COUNT(*) FROM cas_cache", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(stored, vec![5 + 16 * 20]);
+        assert_eq!(
+            db.get_content("shared-10").await.unwrap().as_deref(),
+            Some(&b"shared-10"[..])
+        );
+        assert_eq!(db.get_content("absent").await.unwrap(), None);
     }
 
     #[tokio::test]

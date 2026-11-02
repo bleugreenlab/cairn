@@ -17,7 +17,7 @@ use crate::account::team_token_minter::TeamTokenMinter;
 use crate::api::ApiConfig;
 use crate::db::TeamId;
 use crate::storage::content_store::{content_hash, ContentStore, ContentStoreFactory};
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::LocalDb;
 
 /// Production [`ContentStore`]: proxies bytes through the api/ broker
 /// (`PUT`/`GET /teams/:id/cas/:hash`) authed with a per-request minted team sync
@@ -52,33 +52,13 @@ impl BrokeredContentStore {
     /// Read-through cache lookup. Best-effort: a cache miss or error returns
     /// `None` and the caller falls through to the broker.
     async fn cache_get(&self, hash: &str) -> Option<Vec<u8>> {
-        let hash = hash.to_string();
-        let rows = self
-            .local
-            .query_all(
-                "SELECT content FROM cas_cache WHERE hash = ?1 LIMIT 1",
-                (hash,),
-                |row| row.opt_blob(0),
-            )
-            .await
-            .ok()?;
-        rows.into_iter().next().flatten()
+        self.local.get_content(hash).await.ok().flatten()
     }
 
     /// Populate the read-through cache. Content-addressed, so `INSERT OR IGNORE`
     /// is safe and concurrent fetches converge. Best-effort; errors are ignored.
     async fn cache_put(&self, hash: &str, bytes: &[u8]) {
-        let _ = self
-            .local
-            .execute(
-                "INSERT OR IGNORE INTO cas_cache(hash, content, fetched_at)
-                 VALUES (?1, ?2, unixepoch())",
-                (
-                    hash.to_string(),
-                    cairn_db::turso::Value::Blob(bytes.to_vec()),
-                ),
-            )
-            .await;
+        let _ = self.local.put_content(hash, bytes).await;
     }
 }
 

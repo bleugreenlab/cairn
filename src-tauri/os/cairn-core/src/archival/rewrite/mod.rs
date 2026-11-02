@@ -344,8 +344,8 @@ pub async fn archive_execution(
     // A team replica offloads its heavy pack and system blobs to the shared team
     // store and writes only pointers into the synced replica. The private
     // database keeps them inline.
-    if db.team_id().is_some() {
-        apply_offloaded(db, db.content_store().as_ref(), updates, history, blobs).await?;
+    if let Some(store) = db.team_content_store() {
+        apply_offloaded(db, store.as_ref(), updates, history, blobs).await?;
     } else {
         apply(db, updates, history, blobs).await?;
     }

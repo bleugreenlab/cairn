@@ -539,7 +539,7 @@ pub(crate) async fn publish_sealed_commit_pack(
     repository: &Path,
     sealed_commit: &str,
 ) -> Result<(), String> {
-    let Some(store) = db.team_id().map(|_| db.content_store().clone()) else {
+    let Some(store) = db.team_content_store().cloned() else {
         return Ok(());
     };
     let project_id = project_id.to_string();

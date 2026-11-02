@@ -897,6 +897,14 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
     })
 }
 
+/// The thread a limit was set on, resolved from the id or name the operator
+/// gave, so the caller can emit a change scoped to that row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadLimitSet {
+    pub thread_id: String,
+    pub name: String,
+}
+
 /// Set (or clear, with `None`) one thread's own limit on open started
 /// children, and tell the queue its focus cap may have moved.
 pub async fn set_thread_max_open_children(
@@ -904,7 +912,7 @@ pub async fn set_thread_max_open_children(
     project_id: &str,
     thread: &str,
     value: Option<i64>,
-) -> Result<(), String> {
+) -> Result<ThreadLimitSet, String> {
     if value.is_some_and(|value| value < 1) {
         return Err("a thread's limit on open children is at least 1".to_string());
     }
@@ -913,22 +921,30 @@ pub async fn set_thread_max_open_children(
         .write(move |conn| {
             let (project_id, thread) = (project_id.clone(), thread.clone());
             Box::pin(async move {
-                Ok(conn
-                    .execute(
+                let mut rows = conn
+                    .query(
                         "UPDATE threads SET max_open_children = ?3
-                          WHERE project_id = ?1 AND (id = ?2 OR name = ?2)",
+                          WHERE project_id = ?1 AND (id = ?2 OR name = ?2)
+                          RETURNING id, name",
                         params![project_id.as_str(), thread.as_str(), value],
                     )
-                    .await?)
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(ThreadLimitSet {
+                        thread_id: row.text(0)?,
+                        name: row.text(1)?,
+                    })),
+                    None => Ok(None),
+                }
             })
         })
         .await
         .map_err(|error| error.to_string())?;
-    if updated == 0 {
+    let Some(updated) = updated else {
         return Err("no such thread in this project".to_string());
-    }
+    };
     super::sweep::notify_gate_evidence_changed();
-    Ok(())
+    Ok(updated)
 }
 
 #[cfg(test)]
@@ -965,6 +981,28 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn setting_a_thread_limit_by_name_resolves_the_row_it_wrote() {
+        let env = env("cap-set-thread-limit.db").await;
+        add_thread(&env, "th", "harness").await;
+        let set = set_thread_max_open_children(&env.db, "p", "harness", Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            set,
+            ThreadLimitSet {
+                thread_id: "th".to_string(),
+                name: "harness".to_string(),
+            }
+        );
+        let by_id = set_thread_max_open_children(&env.db, "p", "th", None)
+            .await
+            .unwrap();
+        assert_eq!(by_id, set);
+        let missing = set_thread_max_open_children(&env.db, "p", "nope", Some(2)).await;
+        assert_eq!(missing, Err("no such thread in this project".to_string()));
     }
 
     /// An issue with no execution: a backlog child when `thread` is given.

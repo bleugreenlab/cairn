@@ -143,7 +143,7 @@ async fn reconstruct_with(
 /// The store a team replica's offloaded packs and blobs are fetched from. The
 /// private database returns `None`: its packs and blobs are inline.
 fn team_store(db: &LocalDb) -> Option<&dyn ContentStore> {
-    db.team_id().map(|_| db.content_store().as_ref())
+    db.team_content_store().map(|store| store.as_ref())
 }
 
 /// What reconstruction made of one event: whether the `data` it now carries is
