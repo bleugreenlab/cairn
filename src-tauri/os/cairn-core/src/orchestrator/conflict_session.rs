@@ -19,7 +19,7 @@ use cairn_db::turso::params;
 
 use crate::jj::{
     assess_paths, ConflictCondition, ConflictDiagnostic, DroppedWork, IncomingClassification,
-    JjEnv, PathAssessment, RestoreVerdict,
+    IncomingCommit, JjEnv, PathAssessment, RestoreVerdict,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -187,6 +187,18 @@ pub(crate) struct ReplayPass {
 pub(crate) struct ResolvedSide {
     pub(crate) base: String,
     pub(crate) theirs: String,
+    /// What earned this side. `None` is content evidence: the path changed
+    /// while a session was open, or its content holds both sides. `Some` is the
+    /// requester's `drop_incoming_reason` for a path the tip DELETES, which no
+    /// content can ever show holding the incoming side, so the statement is the
+    /// only evidence there is. A later content change to the path replaces it.
+    pub(crate) attested: Option<String>,
+}
+
+impl ResolvedSide {
+    fn is_against(&self, base: &str, theirs: &str) -> bool {
+        self.base == base && self.theirs == theirs
+    }
 }
 
 /// What each path of a branch's committed resolution was made against.
@@ -206,6 +218,8 @@ struct StoredPathBasis {
     path: String,
     base: String,
     theirs: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attested: Option<String>,
 }
 
 fn encode_basis(basis: &ResolutionBasis) -> Result<Option<String>, String> {
@@ -218,6 +232,7 @@ fn encode_basis(basis: &ResolutionBasis) -> Result<Option<String>, String> {
             path: path.clone(),
             base: side.base.clone(),
             theirs: side.theirs.clone(),
+            attested: side.attested.clone(),
         })
         .collect();
     serde_json::to_string(&rows)
@@ -238,6 +253,7 @@ fn decode_basis(json: Option<&str>) -> ResolutionBasis {
                 ResolvedSide {
                     base: row.base,
                     theirs: row.theirs,
+                    attested: row.attested,
                 },
             )
         })
@@ -308,23 +324,104 @@ impl ConflictSession {
     /// session's sides: each of this session's conflicting paths among them
     /// takes those sides, and every other path keeps what it had. Pure, so the
     /// per-path rule is provable without a store.
-    pub(crate) fn basis_after(&self, resolved: &BTreeSet<String>) -> ResolutionBasis {
+    ///
+    /// A content change replaces a statement, with one exception: a path whose
+    /// entry is already attested against these very sides and which is in
+    /// `still_deleted` (absent at the tip). That "change" is the attested
+    /// deletion itself, made while this session was open, so it differs from
+    /// `ours` on every read; replacing it would erase the statement the
+    /// moment it was recorded. A file that comes back is not in
+    /// `still_deleted`, and its content takes over.
+    pub(crate) fn basis_after(
+        &self,
+        resolved: &BTreeSet<String>,
+        still_deleted: &BTreeSet<String>,
+    ) -> ResolutionBasis {
         let mut basis = self.resolution_basis.clone();
         if let (Some(base), Some(theirs)) = (self.base.as_ref(), self.theirs.as_ref()) {
             for file in self
                 .conflicting()
                 .filter(|file| resolved.contains(&file.path))
             {
+                let attested_here = basis
+                    .get(&file.path)
+                    .is_some_and(|side| side.attested.is_some() && side.is_against(base, theirs));
+                if attested_here && still_deleted.contains(&file.path) {
+                    continue;
+                }
                 basis.insert(
                     file.path.clone(),
                     ResolvedSide {
                         base: base.clone(),
                         theirs: theirs.clone(),
+                        attested: None,
                     },
                 );
             }
         }
         basis
+    }
+
+    /// `basis` with the requester's statement entered as the resolution of
+    /// every replay path in `deleted` not already attested against this
+    /// session's own sides, and which paths that newly covered.
+    ///
+    /// `deleted` is the paths present at this session's `theirs` and absent at
+    /// the assessed tip — see [`Self::deleted_at`]. A path both sides deleted
+    /// is not among them, so it is never attested. A path attested against an
+    /// older side is re-attested; one already attested against these sides
+    /// keeps the statement it was attested with. Pure, so the per-path rule is
+    /// provable without a store.
+    pub(crate) fn attest_deletions(
+        &self,
+        mut basis: ResolutionBasis,
+        deleted: &BTreeSet<String>,
+        reason: &str,
+    ) -> (ResolutionBasis, Vec<String>) {
+        let (false, Some(base), Some(theirs)) = (
+            self.is_base_drift(),
+            self.base.as_deref(),
+            self.theirs.as_deref(),
+        ) else {
+            return (basis, Vec::new());
+        };
+        let mut attested = Vec::new();
+        for path in self.replay_paths(&basis) {
+            let covered = basis
+                .get(&path)
+                .is_some_and(|side| side.attested.is_some() && side.is_against(base, theirs));
+            if !deleted.contains(&path) || covered {
+                continue;
+            }
+            basis.insert(
+                path.clone(),
+                ResolvedSide {
+                    base: base.to_string(),
+                    theirs: theirs.to_string(),
+                    attested: Some(reason.to_string()),
+                },
+            );
+            attested.push(path);
+        }
+        (basis, attested)
+    }
+
+    /// Which of `paths` the tip deletes while this session's `theirs` still
+    /// has them. A failed probe is an error, never "absent everywhere": an
+    /// empty answer would attest or excuse paths nobody looked at.
+    pub(crate) fn deleted_at(
+        &self,
+        jj: &JjEnv,
+        store: &Path,
+        tip: &str,
+        paths: &[String],
+    ) -> Result<BTreeSet<String>, String> {
+        let Some(theirs) = self.theirs.as_deref() else {
+            return Ok(BTreeSet::new());
+        };
+        let at_theirs = crate::jj::paths_present_at(jj, store, theirs, paths)?;
+        let at_tip = crate::jj::paths_present_at(jj, store, tip, paths)?;
+        Ok(at_theirs.difference(&at_tip).cloned().collect())
     }
 
     /// What each path of `tip` was resolved against.
@@ -368,7 +465,30 @@ impl ConflictSession {
                 jj, store, base, tip, theirs, &unchanged,
             ));
         }
-        Ok(self.basis_after(&resolved))
+        // Only a changed path already attested against these sides can keep
+        // its statement, so only those are probed; usually there are none.
+        let attested_here: Vec<String> = match (self.base.as_deref(), self.theirs.as_deref()) {
+            (Some(base), Some(theirs)) => resolved
+                .iter()
+                .filter(|path| {
+                    self.resolution_basis.get(*path).is_some_and(|side| {
+                        side.attested.is_some() && side.is_against(base, theirs)
+                    })
+                })
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let still_deleted = if attested_here.is_empty() {
+            BTreeSet::new()
+        } else {
+            let present = crate::jj::paths_present_at(jj, store, tip, &attested_here)?;
+            attested_here
+                .into_iter()
+                .filter(|path| !present.contains(path))
+                .collect()
+        };
+        Ok(self.basis_after(&resolved, &still_deleted))
     }
 
     /// Every path a take-committed-tip replay has to place: the paths this
@@ -528,6 +648,102 @@ pub(crate) struct TipAssessment {
     /// What a resolution is measured from, so both the page and the refusal
     /// can say what would count as one.
     pub(crate) recorded: RecordedConflict,
+    /// Every ASSESSED replay path the tip deletes while this session's `theirs`
+    /// still has it, and whether a statement covers that deletion: like
+    /// [`Self::paths`], capped on a read and exhaustive for the guard. A deletion is
+    /// never in [`Self::unresolved`]: no commit to an absent file can resolve
+    /// it, so what it needs is named here instead.
+    pub(crate) deletions: BTreeMap<String, DeletionStanding>,
+    /// How many of this session's conflicting paths are deletions no basis
+    /// entry covers at all — neither resolved nor unresolved.
+    pub(crate) uncovered_deletions: usize,
+    /// Every attested entry of the basis this assessment used, so a request
+    /// can persist exactly those and the page can name them.
+    pub(crate) attested: BTreeMap<String, ResolvedSide>,
+    /// The paths this assessment's own request attested.
+    pub(crate) newly_attested: Vec<String>,
+}
+
+/// Whether a deletion of a file the base still has is covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeletionStanding {
+    /// A statement covers the deletion against this session's own sides.
+    Attested,
+    /// Nothing covers what the base did to the file since the deletion was
+    /// last measured.
+    Outpaced(OutpacedDeletion),
+}
+
+/// A branch's deletion of a file the base has edited since `from`.
+///
+/// The one shape the guard, the carry, and the rebase page all describe, so
+/// [`describe_outpaced_deletion`] can word it once for all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutpacedDeletion {
+    /// What the deletion is measured from: the side a statement covered, or
+    /// the fork when nothing did.
+    pub(crate) from: String,
+    /// The statement, when `from` is the side it covered.
+    pub(crate) attested: Option<String>,
+    /// The version of the file the deletion would land over.
+    pub(crate) to: String,
+    /// The commits in `from..to` that changed the file, newest first.
+    pub(crate) commits: Result<Vec<IncomingCommit>, String>,
+}
+
+/// How many incoming commits one outpaced deletion lists before summarizing.
+const DELETION_COMMITS_LISTED: usize = 10;
+
+/// What the base did to a file the branch deletes, written for the agent.
+/// Never implies a stale resolution: a deletion with no statement has none.
+pub(crate) fn describe_outpaced_deletion(deletion: &OutpacedDeletion) -> String {
+    let OutpacedDeletion {
+        from,
+        attested,
+        to,
+        commits,
+    } = deletion;
+    let mut out = match attested {
+        Some(reason) => format!(
+            "your branch deletes this file. Your statement (\"{reason}\") covered the base's \
+             version of it at `{from}`, and the base has changed it again since, up to `{to}`"
+        ),
+        None => format!(
+            "your branch deletes this file, and the base changed it between `{from}` and `{to}`; \
+             nothing records those changes as carried into whatever replaced it"
+        ),
+    };
+    match commits {
+        Ok(commits) if commits.is_empty() => out.push_str(
+            ". No commit in that range changes it under this name, so the change arrived under \
+             another one",
+        ),
+        Ok(commits) => {
+            out.push_str(", in:\n");
+            for commit in commits.iter().take(DELETION_COMMITS_LISTED) {
+                out.push_str(&format!("  - `{}` {}\n", commit.id, commit.subject));
+            }
+            if commits.len() > DELETION_COMMITS_LISTED {
+                out.push_str(&format!(
+                    "  - and {} more\n",
+                    commits.len() - DELETION_COMMITS_LISTED
+                ));
+            }
+            return out;
+        }
+        Err(error) => out.push_str(&format!(". The commits could not be listed ({error})")),
+    }
+    out.push('\n');
+    out
+}
+
+/// What clears an outpaced deletion, given the version it would land over.
+pub(crate) fn deletion_remedy(to: &str) -> String {
+    format!(
+        "Carry those changes into whatever replaced each file, or confirm they are moot, then \
+         request again with `drop_incoming_reason:\"…\"` saying where they went. The reason is \
+         recorded as that deletion's resolution against `{to}` and shown on `cairn:~/rebase`."
+    )
 }
 
 /// The session coordinates that define what counts as a resolution.
@@ -550,6 +766,8 @@ pub(crate) enum Unproven {
     Drops(DroppedWork),
     /// The merge could not judge this path at all.
     Unjudged(String),
+    /// The tip deletes a file the base edited, and no statement covers that.
+    DeletionOutpaced(OutpacedDeletion),
 }
 
 impl TipAssessment {
@@ -563,38 +781,61 @@ impl TipAssessment {
     /// treating it as though it were is how a guard against silent loss comes to
     /// permit silent loss. The escape hatch is what keeps this from being a dead
     /// end: an agent who knows the drop is fine says so and proceeds.
+    ///
+    /// A deletion is judged by its [`DeletionStanding`] rather than its
+    /// verdict, which can only ever say a deletion was not assessed.
     pub(crate) fn unproven(&self) -> Vec<(&str, Unproven)> {
         self.paths
             .iter()
             .filter_map(|assessment| {
-                let reason = match &assessment.verdict {
-                    RestoreVerdict::Lossless => return None,
-                    RestoreVerdict::Lossy(dropped) => Unproven::Drops(dropped.clone()),
-                    RestoreVerdict::NotAssessed(reason) => Unproven::Unjudged(reason.clone()),
+                let reason = match (self.deletions.get(&assessment.path), &assessment.verdict) {
+                    (Some(DeletionStanding::Attested), _) => return None,
+                    (Some(DeletionStanding::Outpaced(deletion)), _) => {
+                        Unproven::DeletionOutpaced(deletion.clone())
+                    }
+                    (None, RestoreVerdict::Lossless) => return None,
+                    (None, RestoreVerdict::Lossy(dropped)) => Unproven::Drops(dropped.clone()),
+                    (None, RestoreVerdict::NotAssessed(reason)) => {
+                        Unproven::Unjudged(reason.clone())
+                    }
                 };
                 Some((assessment.path.as_str(), reason))
             })
             .collect()
     }
 
-    /// Whether every path assessed came back lossless. Deliberately false when
-    /// the detail was truncated: an answer about 25 of 200 paths is not an
-    /// answer about the session.
+    /// Every deletion no statement covers against this session's sides.
+    pub(crate) fn outpaced_deletions(&self) -> Vec<(&str, &OutpacedDeletion)> {
+        self.deletions
+            .iter()
+            .filter_map(|(path, standing)| match standing {
+                DeletionStanding::Outpaced(deletion) => Some((path.as_str(), deletion)),
+                DeletionStanding::Attested => None,
+            })
+            .collect()
+    }
+
+    /// Whether every path assessed came back lossless, or is a deletion a
+    /// statement covers. Deliberately false when the detail was truncated: an
+    /// answer about 25 of 200 paths is not an answer about the session.
     pub(crate) fn every_path_is_resolved(&self) -> bool {
         self.truncated == 0
             && self.unresolved.is_empty()
             && !self.paths.is_empty()
-            && self
-                .paths
-                .iter()
-                .all(|assessment| assessment.verdict == RestoreVerdict::Lossless)
+            && self.unproven().is_empty()
     }
 
     /// Whether the tip resolves none of this session's conflicting files, so a
     /// take-committed-tip replay has nothing to take. No stated reason changes
     /// this: it cannot supply a resolution that does not exist.
+    ///
+    /// A conflicting deletion nothing covers is not a resolution, but it is
+    /// not unresolved either: a statement is what covers it. So a tip whose
+    /// only uncovered paths are deletions is judged by [`Self::unproven`],
+    /// which names what the base did to each file.
     pub(crate) fn resolves_nothing(&self) -> bool {
-        self.unresolved.len() == self.conflicting
+        !self.unresolved.is_empty()
+            && self.unresolved.len() + self.uncovered_deletions == self.conflicting
     }
 
     /// What would count as resolving each unresolved file, and where to get
@@ -674,10 +915,17 @@ pub(crate) enum RestoreProof {
 /// explicit request against an operation that is already asynchronous and
 /// durable, so paying a subprocess per path is the cheapest thing in the
 /// transaction — far cheaper than discovering the loss from a compiler later.
+///
+/// `attestation` is the requester's `drop_incoming_reason`. With one, every
+/// replay path the tip deletes is entered into the basis against this
+/// session's sides before the assessment runs — see
+/// [`ConflictSession::attest_deletions`] — and the assessment reports which,
+/// for the request to persist once it is accepted.
 pub(crate) fn assess_session_tip_exhaustively(
     jj: &JjEnv,
     store: &Path,
     session: &ConflictSession,
+    attestation: Option<&str>,
 ) -> RestoreProof {
     if session.is_base_drift() {
         return RestoreProof::NothingToProve;
@@ -705,9 +953,22 @@ pub(crate) fn assess_session_tip_exhaustively(
             ))
         }
     };
-    RestoreProof::Assessed(assess_against_basis(
-        jj, store, session, base, &basis, tip, None,
-    ))
+    let deleted = match session.deleted_at(jj, store, &tip, &session.replay_paths(&basis)) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return RestoreProof::Unavailable(format!(
+                "which files your branch deletes could not be read ({error})"
+            ))
+        }
+    };
+    let (basis, newly_attested) = match attestation {
+        Some(reason) => session.attest_deletions(basis, &deleted, reason),
+        None => (basis, Vec::new()),
+    };
+    let mut assessment =
+        assess_against_basis(jj, store, session, base, &basis, &deleted, tip, None);
+    assessment.newly_attested = newly_attested;
+    RestoreProof::Assessed(assessment)
 }
 
 fn assess_session_tip_within(
@@ -727,52 +988,80 @@ fn assess_session_tip_within(
     let basis = session
         .resolution_basis_at(jj, store, &tip)
         .unwrap_or_else(|_| session.resolution_basis.clone());
+    // A store that cannot say which files are deleted leaves each such path
+    // with its own verdict, which reports it as not assessed.
+    let deleted = session
+        .deleted_at(jj, store, &tip, &session.replay_paths(&basis))
+        .unwrap_or_default();
     Some(assess_against_basis(
-        jj, store, session, base, &basis, tip, limit,
+        jj, store, session, base, &basis, &deleted, tip, limit,
     ))
 }
 
 /// Assess every path the replay has to place against what it was resolved
 /// against: a path the basis covers against its own recorded sides, any other
 /// against the session's. Order is path order.
+///
+/// `deleted` is [`ConflictSession::deleted_at`] for the replay paths. Each
+/// such path is resolved only when a statement covers it against this
+/// session's sides; otherwise the commits that edited it since whatever it was
+/// last measured from are named.
+#[allow(clippy::too_many_arguments)]
 fn assess_against_basis(
     jj: &JjEnv,
     store: &Path,
     session: &ConflictSession,
     session_base: &str,
     basis: &ResolutionBasis,
+    deleted: &BTreeSet<String>,
     tip: String,
     limit: Option<usize>,
 ) -> TipAssessment {
     let all = session.replay_paths(basis);
     let limit = limit.unwrap_or(all.len());
     let truncated = all.len().saturating_sub(limit);
-    let assessed: Vec<String> = all.into_iter().take(limit).collect();
-    let session_side = ResolvedSide {
-        base: session_base.to_string(),
-        theirs: session.theirs.clone().unwrap_or_default(),
-    };
-    let mut groups: BTreeMap<&ResolvedSide, Vec<String>> = BTreeMap::new();
-    for path in &assessed {
-        groups
-            .entry(basis.get(path).unwrap_or(&session_side))
-            .or_default()
-            .push(path.clone());
+    let session_theirs = session.theirs.clone().unwrap_or_default();
+    // Grouped by the sides alone: an attestation must not split a jj batch.
+    let mut groups: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
+    for path in all.iter().take(limit) {
+        let sides = basis
+            .get(path)
+            .map_or((session_base, session_theirs.as_str()), |side| {
+                (side.base.as_str(), side.theirs.as_str())
+            });
+        groups.entry(sides).or_default().push(path.clone());
     }
     let mut verdicts: std::collections::HashMap<String, PathAssessment> = groups
         .into_iter()
-        .flat_map(|(side, paths)| assess_paths(jj, store, &side.base, &tip, &side.theirs, &paths))
+        .flat_map(|((base, theirs), paths)| assess_paths(jj, store, base, &tip, theirs, &paths))
         .map(|assessment| (assessment.path.clone(), assessment))
         .collect();
 
+    // Standing, and its history lookup, only for the assessed prefix: the
+    // capped read renders nothing past it, and each lookup is a subprocess.
+    let assessed: Vec<String> = all.iter().take(limit).cloned().collect();
+    let deletions = deletion_standings(
+        &assessed,
+        basis,
+        deleted,
+        session_base,
+        &session_theirs,
+        |from, path| crate::jj::commits_changing_path(jj, store, from, &session_theirs, path),
+    );
+
     let unresolved: Vec<String> = session
         .conflicting()
-        .filter(|file| !basis.contains_key(&file.path))
+        .filter(|file| !basis.contains_key(&file.path) && !deleted.contains(&file.path))
         .map(|file| file.path.clone())
         .collect();
+    let uncovered_deletions = session
+        .conflicting()
+        .filter(|file| !basis.contains_key(&file.path) && deleted.contains(&file.path))
+        .count();
     TipAssessment {
-        paths: assessed
+        paths: all
             .iter()
+            .take(limit)
             .filter_map(|path| verdicts.remove(path))
             .collect(),
         truncated,
@@ -781,10 +1070,59 @@ fn assess_against_basis(
         conflicting: session.conflicting().count(),
         recorded: RecordedConflict {
             ours: session.ours.clone(),
-            theirs: session_side.theirs.clone(),
+            theirs: session_theirs,
             at: session.updated_at,
         },
+        deletions,
+        uncovered_deletions,
+        attested: basis
+            .iter()
+            .filter(|(_, side)| side.attested.is_some())
+            .map(|(path, side)| (path.clone(), side.clone()))
+            .collect(),
+        newly_attested: Vec::new(),
     }
+}
+
+/// The [`DeletionStanding`] of each of `paths` the tip deletes. `commits_since`
+/// lists the base's commits changing a path since a commit, and is asked only
+/// about these paths and only when no statement covers one against this
+/// session's sides.
+fn deletion_standings(
+    paths: &[String],
+    basis: &ResolutionBasis,
+    deleted: &BTreeSet<String>,
+    session_base: &str,
+    session_theirs: &str,
+    mut commits_since: impl FnMut(&str, &str) -> Result<Vec<IncomingCommit>, String>,
+) -> BTreeMap<String, DeletionStanding> {
+    paths
+        .iter()
+        .filter(|path| deleted.contains(*path))
+        .map(|path| {
+            let attested = basis
+                .get(path)
+                .and_then(|side| side.attested.as_ref().map(|reason| (side, reason)));
+            let standing = match attested {
+                Some((side, _)) if side.is_against(session_base, session_theirs) => {
+                    DeletionStanding::Attested
+                }
+                _ => {
+                    let from = attested
+                        .map_or(session_base, |(side, _)| side.theirs.as_str())
+                        .to_string();
+                    let commits = commits_since(&from, path);
+                    DeletionStanding::Outpaced(OutpacedDeletion {
+                        from,
+                        attested: attested.map(|(_, reason)| reason.clone()),
+                        to: session_theirs.to_string(),
+                        commits,
+                    })
+                }
+            };
+            (path.clone(), standing)
+        })
+        .collect()
 }
 
 /// What the replay guard decided about a proof attempt.
@@ -813,7 +1151,7 @@ pub(crate) fn decide_replay(proof: &RestoreProof, stated_reason: Option<&str>) -
     let blocker = match proof {
         RestoreProof::NothingToProve => return ReplayDecision::Proceed,
         RestoreProof::Assessed(assessment) if assessment.resolves_nothing() => {
-            return ReplayDecision::Refuse(format!(
+            let mut refusal = format!(
                 "Refusing this replay: your committed tip `{tip}` resolves none of this \
                  conflict's files against `{theirs}`, so there is no resolution to take. \
                  `resolution:\"take-committed-tip\"` would land each conflicting file as simply \
@@ -823,7 +1161,16 @@ pub(crate) fn decide_replay(proof: &RestoreProof, stated_reason: Option<&str>) -
                 tip = assessment.tip,
                 theirs = assessment.recorded.theirs,
                 what = assessment.what_resolves("cairn:~/rebase"),
-            ))
+            );
+            let deletions = assessment.outpaced_deletions();
+            if !deletions.is_empty() {
+                refusal.push_str("\n\n");
+                refusal.push_str(&outpaced_deletions_section(
+                    &deletions,
+                    &assessment.recorded.theirs,
+                ));
+            }
+            return ReplayDecision::Refuse(refusal);
         }
         RestoreProof::Unavailable(why) => format!(
             "Refusing this replay: `resolution:\"take-committed-tip\"` restores each conflicting \
@@ -874,7 +1221,7 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
         .iter()
         .filter_map(|(path, reason)| match reason {
             Unproven::Drops(dropped) => Some((*path, dropped)),
-            Unproven::Unjudged(_) => None,
+            Unproven::Unjudged(_) | Unproven::DeletionOutpaced(_) => None,
         })
         .collect();
     if !drops.is_empty() {
@@ -897,11 +1244,23 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
         );
     }
 
+    let deletions: Vec<(&str, &OutpacedDeletion)> = unproven
+        .iter()
+        .filter_map(|(path, reason)| match reason {
+            Unproven::DeletionOutpaced(deletion) => Some((*path, deletion)),
+            Unproven::Drops(_) | Unproven::Unjudged(_) => None,
+        })
+        .collect();
+    if let Some((_, first)) = deletions.first() {
+        out.push_str(&outpaced_deletions_section(&deletions, &first.to));
+        out.push_str("\n\n");
+    }
+
     let unjudged: Vec<(&str, &str)> = unproven
         .iter()
         .filter_map(|(path, reason)| match reason {
             Unproven::Unjudged(reason) => Some((*path, reason.as_str())),
-            Unproven::Drops(_) => None,
+            Unproven::Drops(_) | Unproven::DeletionOutpaced(_) => None,
         })
         .collect();
     if !unjudged.is_empty() {
@@ -919,6 +1278,21 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
         "If proceeding is deliberate, say why and the request goes through: add \
          `drop_incoming_reason:\"…\"` to this payload. The reason is recorded.",
     );
+    out
+}
+
+/// The refusal's section for deletions no statement covers. `to` is the side
+/// a statement made now would be recorded against.
+fn outpaced_deletions_section(deletions: &[(&str, &OutpacedDeletion)], to: &str) -> String {
+    let mut out = String::from("Files your branch deletes that the base has edited since:\n\n");
+    for (path, deletion) in deletions {
+        out.push_str(&format!(
+            "- `{path}` — {}",
+            describe_outpaced_deletion(deletion)
+        ));
+    }
+    out.push('\n');
+    out.push_str(&deletion_remedy(to));
     out
 }
 
@@ -1060,6 +1434,29 @@ pub(crate) fn inherited_basis(
             );
             previous.resolution_basis.clone()
         })
+}
+
+/// Persist a session's resolution basis after a request attested deletions.
+///
+/// `basis` should be what the session inherited plus the attested entries:
+/// the content-evidence entries are recomputed from the store on every read,
+/// so storing a live one would only freeze it. Written BEFORE the request is
+/// queued, because the worker reloads the session from here.
+pub(crate) async fn record_attested_basis(
+    db: &LocalDb,
+    intent_id: &str,
+    bookmark: &str,
+    basis: &ResolutionBasis,
+) -> Result<(), String> {
+    let basis_json = encode_basis(basis)?;
+    db.execute(
+        "UPDATE jj_reconcile_items SET resolution_basis_json = ?3
+         WHERE intent_id = ?1 AND bookmark = ?2",
+        params![intent_id, bookmark, basis_json.as_deref()],
+    )
+    .await
+    .map_err(|error| format!("record attested deletions: {error}"))?;
+    Ok(())
 }
 
 /// Record that an agent asked for a take-committed-tip or plain replay: when,
@@ -1392,6 +1789,10 @@ mod tests {
                     verdict,
                 })
                 .collect(),
+            deletions: BTreeMap::new(),
+            uncovered_deletions: 0,
+            attested: BTreeMap::new(),
+            newly_attested: Vec::new(),
         }
     }
 
@@ -1676,7 +2077,256 @@ mod tests {
         ResolvedSide {
             base: "fork".to_string(),
             theirs: theirs.to_string(),
+            attested: None,
         }
+    }
+
+    fn attested(theirs: &str, reason: &str) -> ResolvedSide {
+        ResolvedSide {
+            attested: Some(reason.to_string()),
+            ..side(theirs)
+        }
+    }
+
+    /// A statement covers each deleted replay path the session's sides do not
+    /// already have one for: an uncovered deletion, one covered against an
+    /// older side, and one content placed against these sides. It keeps the
+    /// statement an earlier request made against these same sides, and never
+    /// reaches a path the tip still has or one outside the replay.
+    #[test]
+    fn a_statement_attests_only_the_replays_deleted_paths_not_yet_covered_against_its_sides() {
+        let mut open = session("c1", "d1", &["fence.rs", "list.txt", "moved.rs"]);
+        open.resolution_basis
+            .insert("auth.rs".to_string(), attested("d0", "split into auth/"));
+        open.resolution_basis
+            .insert("kept.rs".to_string(), attested("d1", "first statement"));
+        open.resolution_basis
+            .insert("moved.rs".to_string(), side("d1"));
+        let deleted = changed(&["fence.rs", "auth.rs", "kept.rs", "moved.rs", "elsewhere.rs"]);
+
+        let (basis, newly) =
+            open.attest_deletions(open.resolution_basis.clone(), &deleted, "ported #4372");
+        assert_eq!(newly, vec!["auth.rs", "fence.rs", "moved.rs"]);
+        for path in ["auth.rs", "fence.rs", "moved.rs"] {
+            assert_eq!(
+                basis.get(path),
+                Some(&attested("d1", "ported #4372")),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            basis.get("kept.rs"),
+            Some(&attested("d1", "first statement")),
+            "an attestation against these sides keeps its own statement"
+        );
+        assert_eq!(basis.get("list.txt"), None, "the tip still has it");
+        assert_eq!(basis.get("elsewhere.rs"), None, "not a replay path");
+
+        let mut drift = open.clone();
+        drift.condition = ConflictCondition::BaseDrift.as_str().to_string();
+        let (unchanged, none) =
+            drift.attest_deletions(drift.resolution_basis.clone(), &deleted, "ported #4372");
+        assert!(none.is_empty());
+        assert_eq!(unchanged, drift.resolution_basis);
+    }
+
+    /// Content evidence outranks a statement: a file attested as deleted that
+    /// comes back and changes is resolved by that content, unattested.
+    #[test]
+    fn a_content_change_to_an_attested_path_replaces_the_statement() {
+        let mut open = session("c1", "d2", &["fence.rs"]);
+        open.resolution_basis
+            .insert("fence.rs".to_string(), attested("d1", "ported"));
+        let basis = open.basis_after(&changed(&["fence.rs"]), &changed(&["fence.rs"]));
+        assert_eq!(
+            basis.get("fence.rs"),
+            Some(&side("d2")),
+            "a statement against an older side is not this session's to keep"
+        );
+    }
+
+    /// Review finding on cairn/5473: a file deleted WHILE the session is open
+    /// differs from `ours` on every read. Read as a content change, it erased
+    /// the statement the moment it was recorded — on the worker's reread, the
+    /// page's, and the rollback's inheritance. The same deletion keeps its
+    /// statement; the file coming back replaces it.
+    #[test]
+    fn a_deletion_attested_during_the_session_keeps_its_statement_until_the_file_returns() {
+        let mut open = session("c1", "d1", &["fence.rs"]);
+        open.resolution_basis
+            .insert("fence.rs".to_string(), attested("d1", "ported #4372"));
+        let still_deleted = open.basis_after(&changed(&["fence.rs"]), &changed(&["fence.rs"]));
+        assert_eq!(
+            still_deleted.get("fence.rs"),
+            Some(&attested("d1", "ported #4372"))
+        );
+        let returned = open.basis_after(&changed(&["fence.rs"]), &changed(&[]));
+        assert_eq!(returned.get("fence.rs"), Some(&side("d1")));
+    }
+
+    /// Review finding on cairn/5473: the capped page read looks up history
+    /// only for the deletions it assesses, never for the paths past its cap.
+    #[test]
+    fn deletion_history_is_looked_up_only_for_the_paths_assessed() {
+        let mut basis = ResolutionBasis::new();
+        basis.insert("covered.rs".to_string(), attested("d1", "moot"));
+        basis.insert("older.rs".to_string(), attested("d0", "ported"));
+        let deleted = changed(&["covered.rs", "older.rs", "plain.rs", "hidden.rs"]);
+        let assessed: Vec<String> = ["covered.rs", "kept.rs", "older.rs", "plain.rs"]
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+        let mut asked = Vec::new();
+        let standings =
+            deletion_standings(&assessed, &basis, &deleted, "fork", "d1", |from, path| {
+                asked.push((from.to_string(), path.to_string()));
+                Ok(Vec::new())
+            });
+        assert_eq!(
+            asked,
+            vec![
+                ("d0".to_string(), "older.rs".to_string()),
+                ("fork".to_string(), "plain.rs".to_string()),
+            ],
+            "not the covered deletion, not a path the tip has, not one past the cap"
+        );
+        assert_eq!(
+            standings.get("covered.rs"),
+            Some(&DeletionStanding::Attested)
+        );
+        assert!(!standings.contains_key("hidden.rs"));
+        assert!(!standings.contains_key("kept.rs"));
+    }
+
+    #[test]
+    fn a_stored_attestation_round_trips_and_a_row_without_one_decodes_unattested() {
+        let mut basis = ResolutionBasis::new();
+        basis.insert("fence.rs".to_string(), attested("d1", "ported #4372"));
+        basis.insert("list.txt".to_string(), side("d1"));
+        let json = encode_basis(&basis).unwrap().unwrap();
+        assert_eq!(decode_basis(Some(&json)), basis);
+        assert_eq!(
+            json.matches("attested").count(),
+            1,
+            "an unattested side writes no field: {json}"
+        );
+        let legacy = r#"[{"path":"list.txt","base":"fork","theirs":"d1"}]"#;
+        assert_eq!(
+            decode_basis(Some(legacy)).get("list.txt"),
+            Some(&side("d1"))
+        );
+    }
+
+    fn deleted_assessment(standing: DeletionStanding) -> TipAssessment {
+        let mut tip = assessment(
+            vec![(
+                "fence.rs",
+                RestoreVerdict::NotAssessed("your branch deletes this path".to_string()),
+            )],
+            0,
+        );
+        tip.deletions.insert("fence.rs".to_string(), standing);
+        tip
+    }
+
+    fn outpaced(attested: Option<&str>) -> DeletionStanding {
+        DeletionStanding::Outpaced(OutpacedDeletion {
+            from: if attested.is_some() { "d1" } else { "fork" }.to_string(),
+            attested: attested.map(str::to_string),
+            to: "d2".to_string(),
+            commits: Ok(vec![IncomingCommit {
+                id: "f98e1e1d".to_string(),
+                subject: "fence: refuse a stale grant (#4372)".to_string(),
+            }]),
+        })
+    }
+
+    /// cairn/5473's endgame: the tip's only conflicting files are deletions a
+    /// statement covers against these sides. That is a resolution to take, not
+    /// "resolves none", and nothing about it is unproven.
+    #[test]
+    fn a_tip_whose_only_conflicts_are_attested_deletions_proceeds() {
+        let covered = deleted_assessment(DeletionStanding::Attested);
+        assert!(covered.unproven().is_empty());
+        assert!(!covered.resolves_nothing());
+        assert!(covered.every_path_is_resolved());
+        assert_eq!(
+            decide_replay(&RestoreProof::Assessed(covered), None),
+            ReplayDecision::Proceed
+        );
+    }
+
+    /// An uncovered deletion is refused by the commits that edited the file,
+    /// never as "resolves none" (no commit to an absent file can resolve it)
+    /// and never as a stale resolution (there is none).
+    #[test]
+    fn an_uncovered_deletion_is_refused_naming_the_base_commits_that_edited_it() {
+        let mut uncovered = deleted_assessment(outpaced(None));
+        uncovered.uncovered_deletions = 1;
+        assert!(!uncovered.resolves_nothing());
+        assert!(!uncovered.every_path_is_resolved());
+        assert!(matches!(
+            uncovered.unproven()[..],
+            [("fence.rs", Unproven::DeletionOutpaced(_))]
+        ));
+        let named = refusal(&RestoreProof::Assessed(uncovered));
+        assert!(
+            named.contains("`f98e1e1d` fence: refuse a stale grant (#4372)"),
+            "{named}"
+        );
+        assert!(named.contains("between `fork` and `d2`"), "{named}");
+        assert!(named.contains("drop_incoming_reason"), "{named}");
+        assert!(!named.contains("resolves none"), "{named}");
+        assert!(!named.contains("since that resolution was made"), "{named}");
+
+        let older = refusal(&RestoreProof::Assessed(deleted_assessment(outpaced(Some(
+            "ported into auth/",
+        )))));
+        assert!(
+            older.contains(
+                "Your statement (\"ported into auth/\") covered the base's version of it at `d1`"
+            ),
+            "{older}"
+        );
+        assert!(older.contains("`f98e1e1d`"), "{older}");
+    }
+
+    /// A tip resolving nothing still says what the base did to the files it
+    /// deletes, so the agent learns both requirements from one refusal.
+    #[test]
+    fn a_tip_resolving_nothing_also_names_its_uncovered_deletions() {
+        let mut nothing = deleted_assessment(outpaced(None));
+        nothing.paths.push(PathAssessment {
+            path: "list.txt".to_string(),
+            verdict: RestoreVerdict::Lossless,
+        });
+        nothing.conflicting = 2;
+        nothing.unresolved = vec!["list.txt".to_string()];
+        nothing.uncovered_deletions = 1;
+        assert!(nothing.resolves_nothing());
+        let both = refusal(&RestoreProof::Assessed(nothing));
+        assert!(both.contains("resolves none"), "{both}");
+        assert!(both.contains("- `list.txt`"), "{both}");
+        assert!(both.contains("`f98e1e1d`"), "{both}");
+    }
+
+    #[test]
+    fn a_long_list_of_incoming_commits_is_capped_and_counted() {
+        let deletion = OutpacedDeletion {
+            from: "fork".to_string(),
+            attested: None,
+            to: "d2".to_string(),
+            commits: Ok((0..13)
+                .map(|n| IncomingCommit {
+                    id: format!("c{n:07}"),
+                    subject: format!("edit {n}"),
+                })
+                .collect()),
+        };
+        let described = describe_outpaced_deletion(&deletion);
+        assert!(described.contains("`c0000009` edit 9"), "{described}");
+        assert!(!described.contains("`c0000010`"), "{described}");
+        assert!(described.contains("and 3 more"), "{described}");
     }
 
     fn changed(paths: &[&str]) -> BTreeSet<String> {
@@ -1688,7 +2338,7 @@ mod tests {
     #[test]
     fn only_a_path_whose_own_content_changed_takes_the_sessions_sides() {
         let open = session("c1", "d1", &["f.txt", "g.txt"]);
-        let basis = open.basis_after(&changed(&["f.txt", "unrelated.txt"]));
+        let basis = open.basis_after(&changed(&["f.txt", "unrelated.txt"]), &changed(&[]));
         assert_eq!(basis.get("f.txt"), Some(&side("d1")));
         assert_eq!(basis.get("g.txt"), None, "g was not touched");
         assert_eq!(basis.get("unrelated.txt"), None, "not a conflicting path");
@@ -1705,9 +2355,9 @@ mod tests {
         over_resolution
             .resolution_basis
             .insert("list.txt".to_string(), side("d1"));
-        let after_unrelated = over_resolution.basis_after(&changed(&["other.txt"]));
+        let after_unrelated = over_resolution.basis_after(&changed(&["other.txt"]), &changed(&[]));
         assert_eq!(after_unrelated.get("list.txt"), Some(&side("d1")));
-        let after_reresolving = over_resolution.basis_after(&changed(&["list.txt"]));
+        let after_reresolving = over_resolution.basis_after(&changed(&["list.txt"]), &changed(&[]));
         assert_eq!(after_reresolving.get("list.txt"), Some(&side("d2")));
     }
 

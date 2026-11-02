@@ -37,4 +37,4 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.13.6"
+version = "0.13.7"

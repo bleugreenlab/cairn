@@ -96,8 +96,11 @@ struct SpeakArgs {
     format: Option<String>,
     #[serde(default)]
     speed: Option<f32>,
-    #[serde(default)]
-    instructions: Option<String>,
+    /// The provider's `instructions` speech parameter, a prompt for how the
+    /// voice should sound. Named apart from the wire key so it is never read
+    /// as an MCP server's `initialize` instructions.
+    #[serde(default, rename = "instructions")]
+    voice_style: Option<String>,
 }
 
 /// One stored image, as the image door's reply lists it.
@@ -453,7 +456,7 @@ async fn speak(
     let request = SpeechRequest {
         formats,
         speed: args.speed,
-        instructions: args.instructions,
+        instructions: args.voice_style,
         ..SpeechRequest::new(args.voice)
     };
     let bound = super::response_item_bound(timeout);
@@ -694,5 +697,25 @@ mod tests {
             "{}",
             outcome.body
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_voice_style_under_the_wire_key_instructions_reaches_the_speech_request() {
+        let voicebox = crate::orchestrator::speak::tests::Voicebox::new(&[b"ID3"], Duration::ZERO);
+        let (orch, voicebox, _) =
+            crate::orchestrator::speak::tests::offering(voicebox, &["gpt-4o-mini-tts"]).await;
+        seed_run(&orch).await;
+        let outcome = item(
+            &orch,
+            true,
+            "cairn://models/speak",
+            json!({"model": "gpt-4o-mini-tts", "text": "Hi.", "voice": "alloy", "format": "mp3",
+                   "instructions": "Speak softly."}),
+        )
+        .await;
+        assert!(outcome.succeeded, "{}", outcome.body);
+        let asked = voicebox.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].3.as_deref(), Some("Speak softly."));
     }
 }

@@ -53,7 +53,7 @@ pub(crate) const REBASE_FAST_FORWARD_BRANCH: KeySpec = KeySpec::new(
 pub(crate) const REBASE_DROP_INCOMING_REASON: KeySpec = KeySpec::new(
     "drop_incoming_reason",
     KeyType::Str,
-    "why discarding the incoming hunks a take-committed-tip would drop is correct; only needed when the replay is refused for dropping them",
+    "why discarding the incoming hunks a take-committed-tip would drop is correct; only needed when the replay is refused for dropping them; for a file your branch deletes that the base edited, states where the base's change went (or why it is moot) and is recorded as that deletion's resolution",
 );
 pub(crate) const OLD_STRING: KeySpec = KeySpec::new(
     "old_string",

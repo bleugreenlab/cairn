@@ -142,18 +142,22 @@ impl ReplayBaseline {
     /// automatic advance gets it checked here, per path, because measuring an
     /// unresolved file from the newer side would read the newer side's lines as
     /// deletions the branch made.
+    ///
+    /// An attested deletion never survives this: a deleted path is never
+    /// assessed lossless. That is right, because an automatic advance carries
+    /// no content, so a deletion lands only through an explicit replay.
     pub(crate) fn verified(self, jj: &crate::jj::JjEnv, store: &Path, tip: &str) -> Self {
-        let mut by_side: BTreeMap<
-            &crate::orchestrator::conflict_session::ResolvedSide,
-            Vec<String>,
-        > = BTreeMap::new();
+        let mut by_side: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
         for (path, side) in &self.basis {
-            by_side.entry(side).or_default().push(path.clone());
+            by_side
+                .entry((side.base.as_str(), side.theirs.as_str()))
+                .or_default()
+                .push(path.clone());
         }
         let held: BTreeSet<String> = by_side
             .into_iter()
-            .flat_map(|(side, paths)| {
-                crate::jj::assess_paths(jj, store, &side.base, tip, &side.theirs, &paths)
+            .flat_map(|((base, theirs), paths)| {
+                crate::jj::assess_paths(jj, store, base, tip, theirs, &paths)
             })
             .filter(|assessment| assessment.verdict == crate::jj::RestoreVerdict::Lossless)
             .map(|assessment| assessment.path)
@@ -482,6 +486,32 @@ fn plan_resolution_carry(
                         None => "your branch has not resolved this file against any base yet"
                             .to_string(),
                     };
+                    refused.push((path, why));
+                }
+                Ok(Carried::DeletionOutpaced) => {
+                    let attested = baseline
+                        .basis
+                        .get(&path)
+                        .and_then(|side| side.attested.clone());
+                    let deletion = crate::orchestrator::conflict_session::OutpacedDeletion {
+                        commits: crate::jj::commits_changing_path(
+                            jj,
+                            store,
+                            &resolved_against,
+                            destination,
+                            &path,
+                        ),
+                        from: resolved_against.clone(),
+                        attested,
+                        to: destination.to_string(),
+                    };
+                    let why = format!(
+                        "{}{}",
+                        crate::orchestrator::conflict_session::describe_outpaced_deletion(
+                            &deletion
+                        ),
+                        crate::orchestrator::conflict_session::deletion_remedy(destination)
+                    );
                     refused.push((path, why));
                 }
                 Ok(Carried::Unjudged(why)) | Err(why) => refused.push((path, why)),
@@ -2956,8 +2986,15 @@ pub(crate) async fn request_branch_replay(
         // `if let`. Every way of NOT having a proof — base drift aside — has to
         // reach a refusal, and an `Option` here is what let "could not check"
         // fall through as "nothing to report" twice over.
+        //
+        // A stated reason is also the resolution of every file the tip deletes:
+        // no content can show an absent file holding the incoming side, so the
+        // statement is entered into the basis before the assessment runs.
         let proof = crate::orchestrator::conflict_session::assess_session_tip_exhaustively(
-            &jj, store, session,
+            &jj,
+            store,
+            session,
+            drop_incoming_reason,
         );
         request_tip = match &proof {
             crate::orchestrator::conflict_session::RestoreProof::Assessed(assessment) => {
@@ -2974,6 +3011,35 @@ pub(crate) async fn request_branch_replay(
                      take-committed-tip restore on the requester's stated reason. {caveat}"
                 );
                 caveats.push(caveat);
+            }
+        }
+        // Only an accepted request records its statement, and before the
+        // worker is queued: the worker reloads the session from the database.
+        if let crate::orchestrator::conflict_session::RestoreProof::Assessed(assessment) = &proof {
+            if !assessment.newly_attested.is_empty() {
+                let mut stored = session.resolution_basis.clone();
+                stored.extend(assessment.attested.clone());
+                crate::orchestrator::conflict_session::record_attested_basis(
+                    db,
+                    &session.intent_id,
+                    branch,
+                    &stored,
+                )
+                .await?;
+                let paths: Vec<String> = assessment
+                    .newly_attested
+                    .iter()
+                    .map(|path| format!("`{path}`"))
+                    .collect();
+                caveats.push(format!(
+                    "Recorded your statement (\"{}\") as the resolution of {} deleted file(s) \
+                     against `{}`: {}. A replay carries each deletion as long as the base has \
+                     not changed the file since; cairn:~/rebase lists them.",
+                    drop_incoming_reason.unwrap_or_default(),
+                    paths.len(),
+                    assessment.recorded.theirs,
+                    paths.join(", ")
+                ));
             }
         }
     }
@@ -6805,7 +6871,10 @@ mod tests {
             .unwrap();
         let basis = previous
             .map(|previous| {
-                previous.basis_after(&changed.iter().map(|path| path.to_string()).collect())
+                previous.basis_after(
+                    &changed.iter().map(|path| path.to_string()).collect(),
+                    &std::collections::BTreeSet::new(),
+                )
             })
             .unwrap_or_default();
         persist_reconcile_item(
@@ -9478,6 +9547,15 @@ mod real_store_collision_tests {
         crate::jj::bookmark_commit(&fx.jj, &fx.store, bookmark).unwrap()
     }
 
+    /// Delete `path` in a workspace, seal, and return the bookmark's new
+    /// commit.
+    fn delete(fx: &Fixture, workspace: &Path, bookmark: &str, path: &str, message: &str) -> String {
+        let _ = crate::jj::update_stale(&fx.jj, workspace);
+        std::fs::remove_file(workspace.join(path)).unwrap();
+        crate::jj::seal(&fx.jj, workspace, message, None).unwrap();
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, bookmark).unwrap()
+    }
+
     fn branch_tip(r: &Replay) -> String {
         crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, BRANCH).unwrap()
     }
@@ -10051,6 +10129,310 @@ mod real_store_collision_tests {
             open_session(&r).await.map(|session| session.fingerprint())
         );
         assert_eq!(text_at(&r.fx, BRANCH, MODS), both);
+        assert!(open_session(&r).await.is_none());
+    }
+
+    // ── cairn/5473: a branch's deletion of a file the base edited ──────────────
+
+    const FENCE: &str = "src/fence.rs";
+    const FENCE_BASE: &str = "fn fence() {}\n";
+
+    /// The shared start: the branch retires `FENCE` before any session exists,
+    /// D1 edits it (and `LIST`, which the branch never touches), and the
+    /// automatic advance records a session conflicting on the deletion alone,
+    /// with nothing in the basis for it. Returns the harness, D1, and the tip.
+    async fn deletion_before_the_session(bin: &str, name: &str) -> (Replay, String, String) {
+        let r = replay_harness(bin, name, &[(FENCE, FENCE_BASE), (LIST, "head\n")]).await;
+        let deleted = delete(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            FENCE,
+            "branch retires fence.rs",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[
+                (FENCE, "fn fence() {}\nfn grant() {}\n"),
+                (LIST, "head\nA\n"),
+            ],
+            "D1 tightens the fence",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("the deletion conflicts with D1's edit");
+        assert_eq!(
+            session
+                .conflicting()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![FENCE]
+        );
+        assert_eq!(resolved_against(&session, FENCE), None);
+        (r, d1, deleted)
+    }
+
+    fn fence_is_absent_at(r: &Replay, revision: &str) -> bool {
+        crate::jj::paths_present_at(&r.fx.jj, &r.fx.store, revision, &[FENCE.to_string()])
+            .unwrap()
+            .is_empty()
+    }
+
+    /// Requirement (i): a deletion made before any session opened, with no
+    /// later base edit, is refused by the commit that edited the file until
+    /// the requester states where that edit went, and then it carries.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_deletion_made_before_the_session_carries_once_attested() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, d1, deleted) = deletion_before_the_session(&bin, "replay-deletion-1.db").await;
+
+        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .expect_err("nothing covers what D1 did to the deleted file");
+        assert!(
+            refusal.contains(&d1[..8]) && refusal.contains("D1 tightens the fence"),
+            "the refusal names the incoming commit: {refusal}"
+        );
+        assert!(!refusal.contains("resolves none"), "{refusal}");
+        assert!(
+            !refusal.contains("since that resolution was made"),
+            "{refusal}"
+        );
+        assert_eq!(branch_tip(&r), deleted, "a refused request moves nothing");
+
+        let reason = "fence.rs's grant check moved into the policy module";
+        let answer = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some(reason))
+            .await
+            .unwrap_or_else(|refusal| panic!("the attested request was refused: {refusal}"));
+        assert!(answer.contains("Recorded your statement"), "{answer}");
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d1),
+            "the replay landed: {:?}",
+            open_session(&r).await.map(|session| session.fingerprint())
+        );
+        assert!(fence_is_absent_at(&r, BRANCH), "the deletion carried");
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\n");
+        assert!(open_session(&r).await.is_none());
+    }
+
+    /// Requirements (ii) and (iii): a base edit after the attested side is
+    /// refused by name — by the carry, and then by the guard of the fresh
+    /// session — never as a stale resolution, the statement survives the
+    /// rollback on the side it covered, and a new statement lands it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_base_edit_after_the_attestation_is_refused_by_name() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, d1, deleted) = deletion_before_the_session(&bin, "replay-deletion-2.db").await;
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(FENCE, "fn fence() {}\nfn grant() {}\nfn audit() {}\n")],
+            "D2 audits the fence",
+        );
+        set_main(&r.fx, &d2);
+
+        let first = "grant moved into policy::grant";
+        let answer = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some(first))
+            .await
+            .unwrap_or_else(|refusal| panic!("the statement covers D1: {refusal}"));
+        assert!(answer.contains(first), "{answer}");
+        wait_for_worker(&r).await;
+        assert_eq!(
+            branch_tip(&r),
+            deleted,
+            "the carry refused, so nothing moved"
+        );
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d2
+        ));
+
+        let fresh = open_session(&r).await.expect("a fresh session against D2");
+        assert_eq!(fresh.theirs.as_deref(), Some(d2.as_str()));
+        let kept = fresh
+            .resolution_basis
+            .get(FENCE)
+            .expect("the statement survives");
+        assert_eq!(kept.theirs, d1, "on the side it covered");
+        assert_eq!(kept.attested.as_deref(), Some(first));
+
+        // The carry's own refusal, as the worker wrote it.
+        let plan = plan_resolution_carry(&r.fx.jj, &r.fx.store, &fresh, &d2, &deleted).unwrap();
+        let (path, why) = plan
+            .refused
+            .first()
+            .expect("the carry refuses the deletion");
+        assert_eq!(path, FENCE);
+        assert!(
+            why.contains(&d2[..8]) && why.contains("D2 audits the fence"),
+            "{why}"
+        );
+        assert!(
+            why.contains(first),
+            "it quotes the statement it outran: {why}"
+        );
+        assert!(!why.contains("since that resolution was made"), "{why}");
+
+        // The page reads the same assessment: the statement, and what outran it.
+        let page = crate::orchestrator::conflict_session::assess_session_tip(
+            &r.fx.jj,
+            &r.fx.store,
+            &fresh,
+        )
+        .expect("the page assesses the tip");
+        assert_eq!(
+            page.attested
+                .get(FENCE)
+                .and_then(|side| side.attested.as_deref()),
+            Some(first)
+        );
+        assert!(matches!(
+            page.deletions.get(FENCE),
+            Some(crate::orchestrator::conflict_session::DeletionStanding::Outpaced(_))
+        ));
+
+        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .expect_err("the statement covered D1, not D2");
+        assert!(
+            refusal.contains(&d2[..8]) && refusal.contains("D2 audits the fence"),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("D1 tightens the fence"),
+            "only what came after the statement: {refusal}"
+        );
+
+        let second = "audit moved into policy::audit too";
+        let answer = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some(second))
+            .await
+            .unwrap_or_else(|refusal| panic!("the new statement covers D2: {refusal}"));
+        assert!(answer.contains(second), "{answer}");
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the replay landed: {:?}",
+            open_session(&r).await.map(|session| session.fingerprint())
+        );
+        assert!(fence_is_absent_at(&r, BRANCH));
+        assert!(open_session(&r).await.is_none());
+    }
+
+    /// Review regression: the deletion is made WHILE the session is open, so
+    /// it reads as a content change since `ours` on every recomputation of the
+    /// basis. The statement must survive those rereads — the page's, the
+    /// worker's, and the rollback's inheritance onto a D2 session — so the next
+    /// refusal names only what D2 did, and quotes the statement it outran.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_deletion_attested_during_the_session_survives_a_rollback_onto_d2() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(
+            &bin,
+            "replay-deletion-in-session.db",
+            &[(FENCE, FENCE_BASE)],
+        )
+        .await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(FENCE, "fn fence() {}\nfn branch() {}\n")],
+            "branch extends the fence",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(FENCE, "fn fence() {}\nfn grant() {}\n")],
+            "D1 tightens the fence",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        assert!(open_session(&r)
+            .await
+            .expect("both sides extend the fence")
+            .conflicting()
+            .any(|file| file.path == FENCE));
+        let deleted = delete(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            FENCE,
+            "retire fence.rs while the conflict is open",
+        );
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(FENCE, "fn fence() {}\nfn grant() {}\nfn audit() {}\n")],
+            "D2 audits the fence",
+        );
+        set_main(&r.fx, &d2);
+
+        let first = "grant moved into policy::grant";
+        request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some(first))
+            .await
+            .unwrap_or_else(|refusal| panic!("the statement covers D1: {refusal}"));
+        wait_for_worker(&r).await;
+        assert_eq!(branch_tip(&r), deleted, "D2 outran the statement");
+
+        let fresh = open_session(&r).await.expect("a fresh session against D2");
+        assert_eq!(fresh.theirs.as_deref(), Some(d2.as_str()));
+        let kept = fresh
+            .resolution_basis
+            .get(FENCE)
+            .expect("the rollback's inheritance kept the statement");
+        assert_eq!(kept.theirs, d1);
+        assert_eq!(kept.attested.as_deref(), Some(first));
+        let reread = fresh
+            .resolution_basis_at(&r.fx.jj, &r.fx.store, &deleted)
+            .unwrap();
+        assert_eq!(
+            reread.get(FENCE).and_then(|side| side.attested.as_deref()),
+            Some(first),
+            "and a reread keeps it"
+        );
+
+        let refusal = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .expect_err("the statement covered D1, not D2");
+        assert!(
+            refusal.contains(&d2[..8]) && refusal.contains("D2 audits the fence"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(first) && !refusal.contains("D1 tightens the fence"),
+            "measured from the statement, not the fork: {refusal}"
+        );
+
+        let second = "audit moved into policy::audit too";
+        request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, Some(second))
+            .await
+            .unwrap_or_else(|refusal| panic!("the new statement covers D2: {refusal}"));
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the replay landed: {:?}",
+            open_session(&r).await.map(|session| session.fingerprint())
+        );
+        assert!(fence_is_absent_at(&r, BRANCH));
         assert!(open_session(&r).await.is_none());
     }
 

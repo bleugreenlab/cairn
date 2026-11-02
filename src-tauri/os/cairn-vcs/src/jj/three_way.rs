@@ -878,6 +878,12 @@ pub enum Carried {
     /// The destination changed the region the resolution covers. Nobody has
     /// resolved this pair of sides yet.
     Conflicted { text: String, regions: usize },
+    /// The committed side deletes this path, and the destination holds a
+    /// version of it the resolution was not made against. A deletion has no
+    /// lines to merge another change into, so whatever the destination added
+    /// since has nowhere to go. Data-free: naming the commits that made that
+    /// change needs the store, which the caller has.
+    DeletionOutpaced,
     /// Not judgeable line-wise. Carries the reason, written for the agent.
     Unjudged(String),
 }
@@ -904,11 +910,7 @@ pub fn carry_resolution(
         );
     }
     if let FileContent::Absent = committed {
-        return Carried::Unjudged(
-            "your resolution deletes this path, and the base has changed it since that \
-             resolution was made"
-                .to_string(),
-        );
+        return Carried::DeletionOutpaced;
     }
     let (Some(base), Some(ours), Some(theirs)) = (
         resolved_against.mergeable(),
@@ -1011,6 +1013,59 @@ pub fn paths_changed_between(
         .collect())
 }
 
+/// One commit, as a refusal names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingCommit {
+    /// The short commit id.
+    pub id: String,
+    /// The first line of its description.
+    pub subject: String,
+}
+
+/// The commits in `from..to` that change exactly `path`, newest first.
+///
+/// What a refusal names when the base edited a file the branch deletes: the
+/// commits whose change has to be carried into whatever replaced the file.
+/// `root-file:` matches the one path and nothing below or beside it, so a
+/// sibling sharing its prefix is never listed.
+pub fn commits_changing_path(
+    jj: &JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+    path: &str,
+) -> Result<Vec<IncomingCommit>, String> {
+    // `\x1f` is a jj string escape emitting the literal unit separator split
+    // on below, as in `conflicted_commits`.
+    const TEMPLATE: &str = "commit_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"";
+    let quoted = path.replace('\\', "\\\\").replace('"', "\\\"");
+    let revset = format!("{from}..{to} & files(root-file:\"{quoted}\")");
+    let listed = jj.run(
+        store,
+        &[
+            "log",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-r",
+            &revset,
+            "-T",
+            TEMPLATE,
+        ],
+        "jj log (commits changing a path)",
+    )?;
+    Ok(listed
+        .lines()
+        .filter_map(|line| {
+            let (id, subject) = line.split_once('\u{1f}')?;
+            let id = id.trim();
+            (!id.is_empty()).then(|| IncomingCommit {
+                id: id.to_string(),
+                subject: subject.trim().to_string(),
+            })
+        })
+        .collect())
+}
+
 /// Which of `paths` a `from`..`to` summary diff mentions, by substring, so a
 /// rename's rendering still counts as a mention of both its ends.
 fn paths_mentioned_in_diff(
@@ -1097,10 +1152,16 @@ mod tests {
             carry_resolution(&text("a\n"), &text("a\nb\n"), &FileContent::Absent),
             Carried::Unjudged(_)
         ));
-        assert!(matches!(
+        assert_eq!(
             carry_resolution(&text("a\n"), &FileContent::Absent, &text("a\nc\n")),
-            Carried::Unjudged(_)
-        ));
+            Carried::DeletionOutpaced,
+            "a deletion the destination edited past is named as such, not as unjudgeable"
+        );
+        assert_eq!(
+            carry_resolution(&text("a\n"), &FileContent::Absent, &text("a\n")),
+            Carried::Unchanged,
+            "a deletion made against the destination's own version lands"
+        );
         // Binary content carries no bytes to compare, so the pure function can
         // never call it unchanged; `carry_paths` asks the store instead.
         assert!(matches!(

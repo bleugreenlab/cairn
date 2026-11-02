@@ -218,12 +218,12 @@ pub(crate) mod tests {
     use crate::orchestrator::models::ModelRuntime;
 
     /// An `audio/speech` server that answers every clip with the same chunks,
-    /// each after `hold`, and records the model, text and format it was asked
-    /// for.
+    /// each after `hold`, and records the model, text, format and voice-style
+    /// instructions it was asked for.
     pub(crate) struct Voicebox {
         chunks: Vec<Vec<u8>>,
         hold: Duration,
-        asked: Mutex<Vec<(String, String, String)>>,
+        pub(crate) asked: Mutex<Vec<(String, String, String, Option<String>)>>,
         cancelled: Arc<AtomicBool>,
     }
 
@@ -289,6 +289,7 @@ pub(crate) mod tests {
                 clip.model.clone(),
                 clip.input.clone(),
                 clip.format.to_string(),
+                clip.instructions.clone(),
             ));
             Ok(Box::new(Clip {
                 chunks: self.chunks.clone().into(),
@@ -302,6 +303,14 @@ pub(crate) mod tests {
     /// A workspace whose one speech provider is a custom OpenAI speech server
     /// offering `tts-1`, answered by `voicebox`.
     pub(crate) async fn workspace(voicebox: Voicebox) -> (Orchestrator, Arc<Voicebox>, String) {
+        offering(voicebox, &["tts-1"]).await
+    }
+
+    /// [`workspace`], its speech server offering the models `ids` instead.
+    pub(crate) async fn offering(
+        voicebox: Voicebox,
+        ids: &[&str],
+    ) -> (Orchestrator, Arc<Voicebox>, String) {
         let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let voicebox = Arc::new(voicebox);
         orch.models_runtime = ModelRuntime {
@@ -317,7 +326,7 @@ pub(crate) mod tests {
                     None,
                     &[],
                     CustomModelPolicy::Explicit {
-                        ids: vec!["tts-1".into()],
+                        ids: ids.iter().map(|id| id.to_string()).collect(),
                     },
                     CustomSampling::default(),
                     1,

@@ -12953,3 +12953,60 @@ async fn concurrent_publications_from_one_parent_all_stay_on_the_branch() {
         );
     }
 }
+
+/// What a refusal names when the base edited a file a branch deletes: only the
+/// commits in `from..to` that change that exact path, newest first. A sibling
+/// whose name merely extends it is not the file.
+#[test]
+#[serial_test::serial(jj)]
+fn commits_changing_path_lists_only_the_range_commits_that_touch_that_exact_file() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/cairn-1-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    let base = bookmark_commit(&jj, &ws, "main").unwrap();
+    write_base_marker(&ws, "main", &base).unwrap();
+    std::fs::create_dir_all(ws.join("dir")).unwrap();
+    let commit = |path: &str, content: &str, message: &str| {
+        std::fs::write(ws.join(path), content).unwrap();
+        seal(&jj, &ws, message, None).unwrap();
+        bookmark_commit(&jj, &store, branch).unwrap()
+    };
+    let added = commit("dir/f.txt", "a\n", "add f");
+    commit("dir/f.txt.bak", "x\n", "touch a sibling");
+    commit("dir/f.txt", "b\n", "edit \"f\"");
+    let tip = commit("dir/other.txt", "o\n", "unrelated");
+
+    let listed = commits_changing_path(&jj, &store, &base, &tip, "dir/f.txt").unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["edit \"f\"", "add f"],
+        "{listed:?}"
+    );
+    assert!(
+        added.starts_with(&listed[1].id),
+        "a short id of the commit itself: {listed:?} vs {added}"
+    );
+    let since_added = commits_changing_path(&jj, &store, &added, &tip, "dir/f.txt").unwrap();
+    assert_eq!(
+        since_added
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["edit \"f\""],
+        "the range excludes `from` itself"
+    );
+    assert!(commits_changing_path(&jj, &store, &tip, &tip, "dir/f.txt")
+        .unwrap()
+        .is_empty());
+}

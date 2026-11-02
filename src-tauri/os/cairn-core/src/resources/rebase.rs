@@ -802,6 +802,9 @@ struct LiveStanding {
     /// Each distinct incoming side the tip's resolved files were resolved
     /// against, with the files resolved against it.
     resolved_against: BTreeMap<String, Vec<String>>,
+    /// Deletions resolved by the requester's statement rather than by
+    /// content: path, the side it covered, and the statement.
+    attested: Vec<(String, String, String)>,
 }
 
 async fn load_live_standing(
@@ -830,8 +833,12 @@ async fn load_live_standing(
         .and_then(|tip| session.resolution_basis_at(&jj, &store, tip).ok())
         .unwrap_or_else(|| session.resolution_basis.clone());
     let mut resolved_against: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut attested = Vec::new();
     for (path, side) in basis {
-        resolved_against.entry(side.theirs).or_default().push(path);
+        match side.attested {
+            Some(reason) => attested.push((path, side.theirs, reason)),
+            None => resolved_against.entry(side.theirs).or_default().push(path),
+        }
     }
     Ok(LiveStanding {
         base_branch: base.base_branch,
@@ -839,6 +846,7 @@ async fn load_live_standing(
         fork_point,
         ours_in_ancestry,
         resolved_against,
+        attested,
     })
 }
 
@@ -881,7 +889,7 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
              longer carries.\n",
         );
     }
-    if !standing.resolved_against.is_empty() {
+    if !standing.resolved_against.is_empty() || !standing.attested.is_empty() {
         out.push_str("\nYour committed tip's resolutions:\n\n");
         for (theirs, paths) in &standing.resolved_against {
             let paths: Vec<String> = paths.iter().map(|path| format!("`{path}`")).collect();
@@ -889,6 +897,12 @@ fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, S
                 "- resolved against `{theirs}`: {}\n",
                 paths.join(", ")
             ));
+        }
+        if !standing.attested.is_empty() {
+            out.push_str("\nDeletions you attested with `drop_incoming_reason`:\n\n");
+            for (path, theirs, reason) in &standing.attested {
+                out.push_str(&format!("- `{path}` against `{theirs}` — \"{reason}\"\n"));
+            }
         }
         out.push_str(&format!(
             "\nA take-committed-tip replay carries each forward onto `{head}`: a file the base has \
@@ -1895,11 +1909,12 @@ fn resolution_section(assessment: Option<&TipAssessment>, base: &str) -> String 
              a structural merge that settles it.\n\n",
         );
     }
+    // The guard's own predicate, so a deletion a statement covers is not
+    // listed as missing work.
     let lossy: Vec<&str> = assessment
-        .paths
-        .iter()
-        .filter(|path| path.verdict != crate::jj::RestoreVerdict::Lossless)
-        .map(|path| path.path.as_str())
+        .unproven()
+        .into_iter()
+        .map(|(path, _)| path)
         .filter(|path| !assessment.unresolved.iter().any(|open| open == path))
         .collect();
     if !lossy.is_empty() {
@@ -1950,6 +1965,11 @@ fn dropped_work_section(assessment: Option<&TipAssessment>, base: &str) -> Strin
             Unproven::Unjudged(why) => out.push_str(&format!(
                 "`{path}` cannot be checked this way — {why}. The replay would restore your \
                  committed version of it whole, so decide that deliberately.\n\n"
+            )),
+            Unproven::DeletionOutpaced(deletion) => out.push_str(&format!(
+                "`{path}`: {}{}\n\n",
+                crate::orchestrator::conflict_session::describe_outpaced_deletion(deletion),
+                crate::orchestrator::conflict_session::deletion_remedy(&deletion.to)
             )),
         }
     }
@@ -2124,6 +2144,10 @@ mod tests {
                 theirs: "a337fa4d".to_string(),
                 at: 0,
             },
+            deletions: Default::default(),
+            uncovered_deletions: 0,
+            attested: Default::default(),
+            newly_attested: Vec::new(),
         }
     }
 
@@ -2176,6 +2200,7 @@ mod tests {
             resolved_against: [("a337fa4d".to_string(), vec!["migrations.rs".to_string()])]
                 .into_iter()
                 .collect(),
+            attested: Vec::new(),
         })
     }
 
@@ -2241,6 +2266,34 @@ mod tests {
         assert!(
             current.contains("rewritten since this session was recorded"),
             "{current}"
+        );
+    }
+
+    /// cairn/5473: a deletion resolved by the requester's statement is named
+    /// on the page with the side it covered and the statement itself, apart
+    /// from the resolutions content earned.
+    #[test]
+    fn an_attested_deletion_is_named_with_its_reason() {
+        let mut standing = live("a337fa4d", true);
+        standing.as_mut().unwrap().attested = vec![(
+            "src/fence.rs".to_string(),
+            "a337fa4d".to_string(),
+            "ported #4372 into src/fence/mod.rs".to_string(),
+        )];
+        let section = standing_section(&recorded_session(), &standing);
+        assert!(
+            section.contains(
+                "- `src/fence.rs` against `a337fa4d` — \"ported #4372 into src/fence/mod.rs\""
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains("resolved against `a337fa4d`: `migrations.rs`"),
+            "content-earned resolutions are still listed: {section}"
+        );
+        assert!(
+            !section.contains("`migrations.rs`, `src/fence.rs`"),
+            "and the attested deletion is not folded into them: {section}"
         );
     }
 
