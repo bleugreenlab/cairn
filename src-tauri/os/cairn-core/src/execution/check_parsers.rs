@@ -1465,6 +1465,88 @@ pub(crate) fn report_excerpt(report: &str, stored_tail: &str, max: usize) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// Test report rows, one line at a time
+// ---------------------------------------------------------------------------
+
+/// What a test runner said about the test it named on one line of its report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportedTest {
+    Failed,
+    /// Passed, skipped, retried, or still running.
+    NotFailed,
+}
+
+static NAMED_GLYPH_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    // Vitest's verbose row and bun's colored row: a status glyph before an id
+    // that carries ` > `. The glyph alone identifies nothing, since Cairn's own
+    // check scripts open their verdict lines with `✓` and `✗`.
+    Regex::new(r"^\s*([✓×✗↓»✎])\s+\S.*? > \S").unwrap()
+});
+
+/// Vitest's failure-block header (` FAIL  scripts  a.test.ts > suite > name`),
+/// which `scripts/test-frontend.ts` repeats at the end of a sharded run.
+static VITEST_FAIL_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*FAIL\s+\S.*? > \S").unwrap());
+
+static BUN_PAREN_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\((pass|fail|skip|todo)\)\s+\S").unwrap());
+
+/// Every nextest status line that names a test; [`NEXTEST_FAIL`] picks out the
+/// failing ones.
+static NEXTEST_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^\s*(?:(?:TRY \d+ )?(?:PASS|FAIL|FLAKY|SLOW|LEAK|LEAK-FAIL|TIMEOUT|ABORT|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|START|SKIP|CANCEL|SETUP)|RETRY \d+/\d+)\s+\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?\S+\s+\S",
+    )
+    .unwrap()
+});
+
+static LIBTEST_ROW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^test \S+ .*?\.\.\. (ok|FAILED|ignored)\b").unwrap());
+
+/// Whether `line` is a test runner reporting one test by name, and if so
+/// whether that test failed. `None` for every other line.
+///
+/// A test's name is free text, so a report row is never evidence about the
+/// process that printed it: a suite that pins an output classifier names its
+/// cases after the very phrases the classifier matches. Only shapes that carry
+/// a test's identity count (`file > suite > name`, bun's `(fail)`, nextest's
+/// `FAIL [time] crate path`, libtest's `test path ... FAILED`).
+pub(crate) fn reported_test(line: &str) -> Option<ReportedTest> {
+    let clean = if line.contains('\x1b') {
+        Cow::Owned(strip_ansi(line))
+    } else {
+        Cow::Borrowed(line)
+    };
+    let line = clean.trim_end();
+    let report = |failed: bool| {
+        Some(if failed {
+            ReportedTest::Failed
+        } else {
+            ReportedTest::NotFailed
+        })
+    };
+    if let Some(cap) = NAMED_GLYPH_ROW.captures(line) {
+        return report(matches!(&cap[1], "×" | "✗"));
+    }
+    if VITEST_FAIL_HEADER.is_match(line) {
+        return report(true);
+    }
+    if let Some(cap) = BUN_PAREN_ROW.captures(line) {
+        return report(&cap[1] == "fail");
+    }
+    if NEXTEST_FAIL.is_match(line) {
+        return report(true);
+    }
+    if NEXTEST_ROW.is_match(line) {
+        return report(false);
+    }
+    if let Some(cap) = LIBTEST_ROW.captures(line) {
+        return report(&cap[1] == "FAILED");
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Small string utilities.
 // ---------------------------------------------------------------------------
 
@@ -2732,6 +2814,46 @@ Exit code: 1";
         assert_eq!(parsed.passed, 11);
         assert!(!parsed.complete, "a per-file line is not a test row");
         assert!(parsed.tests.is_empty());
+    }
+
+    #[test]
+    fn a_report_row_is_recognized_by_the_test_identity_it_carries() {
+        use ReportedTest::{Failed, NotFailed};
+        for (line, expected) in [
+            // Vitest verbose, colored and with a project label, as a check captures it.
+            (
+                " \x1b[32m✓\x1b[39m \x1b[30m\x1b[46m scripts \x1b[49m\x1b[39m scripts/lib/a.test.ts\x1b[2m > \x1b[22mscan\x1b[2m > \x1b[22mfailed to fill whole buffer\x1b[32m 0\x1b[2mms\x1b[22m\x1b[39m",
+                Some(NotFailed),
+            ),
+            (" × src/a.test.ts > scan > breaks 2ms", Some(Failed)),
+            (" ↓ src/a.test.ts > scan > later", Some(NotFailed)),
+            (
+                " FAIL   scripts  scripts/field-guide.test.ts > field guide > keeps generated outputs current",
+                Some(Failed),
+            ),
+            ("   FAIL  src/a.test.tsx > suite > name", Some(Failed)),
+            // bun
+            ("(pass) api > accepts a token [0.48ms]", Some(NotFailed)),
+            ("(fail) api > rejects a stale token [0.20ms]", Some(Failed)),
+            ("✗ api > rejects a stale token [0.20ms]", Some(Failed)),
+            // nextest
+            ("        PASS [   0.010s] cairn-core execution::tests::ok", Some(NotFailed)),
+            ("  TRY 1 FAIL [   0.010s] cairn-core execution::tests::flaky", Some(NotFailed)),
+            ("        FAIL [   0.088s] (3/4) cairn-core execution::tests::breaks", Some(Failed)),
+            ("     TIMEOUT [ 120.000s] cairn-core execution::tests::hangs", Some(Failed)),
+            // libtest
+            ("test execution::tests::ok ... ok", Some(NotFailed)),
+            ("test execution::tests::breaks ... FAILED", Some(Failed)),
+            // Not rows: a script's verdict glyph, diagnostics, summaries.
+            ("✗ 3 call(s) take the host's default branch:", None),
+            ("✓ typecheck: 9 workspace(s) clean", None),
+            ("Failed to send data to or receive data from server", None),
+            ("        Summary [   2.104s] 17 tests run: 17 passed, 0 skipped", None),
+            ("test result: FAILED. 1 passed; 1 failed; 0 ignored", None),
+            (" ✓ src/b.test.ts (11 tests) 5ms", None),
+        ] {
+            assert_eq!(reported_test(line), expected, "{line}");
+        }
     }
 
     #[test]

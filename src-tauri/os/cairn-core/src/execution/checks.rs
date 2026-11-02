@@ -5279,8 +5279,8 @@ impl From<String> for CheckExecutionFailure {
 }
 use crate::execution::check_parsers::{
     anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    parse_check_output, ParsedCheckResult, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER,
-    RUST_LINT_PARSER,
+    parse_check_output, reported_test, ParsedCheckResult, ReportedTest, MAX_FAILURE_NAMES,
+    RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
 };
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
 use crate::jj::{
@@ -5618,7 +5618,27 @@ fn classify_check_failure(
         return None;
     }
 
-    let lines: Vec<&str> = output.lines().collect();
+    // A runner's report rows name tests, and a test's name is free text: the
+    // suite that pins these very signatures names its cases after them, so a
+    // passing row of it would read as an sccache transport failure. Rows are
+    // blanked rather than dropped so evidence indices still address `output`.
+    // A row naming a FAILING test is the same positive evidence a parsed
+    // failure is, for a run whose structured result never reached Cairn.
+    let mut names_a_failing_test = false;
+    let lines: Vec<&str> = output
+        .lines()
+        .map(|line| match reported_test(line) {
+            Some(ReportedTest::Failed) => {
+                names_a_failing_test = true;
+                ""
+            }
+            Some(ReportedTest::NotFailed) => "",
+            None => line,
+        })
+        .collect();
+    if names_a_failing_test && !parsed.is_some_and(|result| result.parser == RUST_LINT_PARSER) {
+        return None;
+    }
     let cache_corruption = lines.iter().position(|line| {
         line.to_ascii_lowercase()
             .contains("memory map must have a non-zero length")
@@ -21946,6 +21966,98 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     }
 
     const VITEST_COMMAND: &str = "bunx vitest related --reporter=default --reporter=json src/a.ts";
+
+    /// Passing rows of `scripts/lib/rust-process-outcome.test.ts` as a sharded
+    /// frontend run prints them: each test is named after a transport signature
+    /// the classifier matches.
+    const ROWS_NAMED_AFTER_SIGNATURES: &str = concat!(
+        " \x1b[32m✓\x1b[39m \x1b[30m\x1b[46m scripts \x1b[49m\x1b[39m scripts/lib/rust-process-outcome.test.ts\x1b[2m > \x1b[22mRust process outcomes\x1b[2m > \x1b[22mdoes not let Cargo's compile summary hide cache infrastructure failure: Failed to send data to or receive data from server: Connection reset by peer (os error 54)\x1b[32m 0\x1b[2mms\x1b[22m\x1b[39m\n",
+        " ✓ scripts/lib/rust-process-outcome.test.ts > Rust process outcomes > does not let Cargo's compile summary hide cache infrastructure failure: failed client/server communication 0ms\n",
+        " ✓ scripts/lib/rust-process-outcome.test.ts > Rust process outcomes > does not let Cargo's compile summary hide cache infrastructure failure: failed to fill whole buffer 0ms\n",
+    );
+
+    const FRONTEND_COMMAND: &str = "bun run test:frontend:scoped";
+
+    #[test]
+    fn a_passing_test_named_after_an_infrastructure_signature_is_not_evidence() {
+        // Vitest failed the run over an error that escaped a test file; no
+        // assertion failed. That is a runner error, never the build host's.
+        let output = format!(
+            "{ROWS_NAMED_AFTER_SIGNATURES}\n Unhandled Errors \n\
+             Vitest caught 1 unhandled error during the test run.\n\
+             ReferenceError: window is not defined\n\
+             error: script \"test:frontend:scoped\" exited with code 1\n\nExit code: 1"
+        );
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed("vitest", 4210, 0)),
+            &output,
+        )
+        .expect("an abnormal Vitest exit");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert!(
+            classification.reason.contains("unhandled")
+                || classification.reason.contains("escaped"),
+            "{}",
+            classification.reason
+        );
+        // A command no runner arm claims stays an ordinary failure.
+        assert_eq!(
+            classify_check_failure(
+                "bun run check:web",
+                Some(1),
+                false,
+                false,
+                None,
+                ROWS_NAMED_AFTER_SIGNATURES
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_named_failing_test_is_an_ordinary_failure_without_a_structured_result() {
+        // The cairn/4209 specimen's shape: genuine assertion failures, named in
+        // the run's closing report, beside passing rows that read as transport
+        // failure, and no parsed result to say so.
+        let output = format!(
+            "{ROWS_NAMED_AFTER_SIGNATURES}\n\
+             \x20  FAIL  scripts/field-guide.test.ts > field guide > keeps generated outputs current and deterministic\n\
+             \x20  FAIL  scripts/field-guide.test.ts > field guide > builds publish-clean pages while preserving source metadata\n\n\
+             error: script \"test:frontend:scoped\" exited with code 1\n\nExit code: 1"
+        );
+        assert_eq!(
+            classify_check_failure(FRONTEND_COMMAND, Some(1), false, false, None, &output),
+            None
+        );
+
+        // Every runner's failing row outranks infrastructure text, as a parsed
+        // failure does.
+        for row in [
+            "(fail) api > rejects a stale token [0.20ms]",
+            "        FAIL [   0.088s] (3/4) cairn-core execution::tests::breaks",
+            "test execution::tests::breaks ... FAILED",
+        ] {
+            let output = format!("Failed to send data to or receive data from server\n{row}\n");
+            assert_eq!(
+                classify_check_failure("bun run check:web", Some(1), false, false, None, &output),
+                None,
+                "{row}"
+            );
+        }
+
+        // A script's own verdict glyph names no test, so the infrastructure
+        // evidence beside it still stands.
+        let output = "✗ clippy: 2 findings\nsccache: encountered fatal error: failed to create output file\n";
+        let classification =
+            classify_check_failure("bun run check:web", Some(1), false, false, None, output)
+                .expect("positive infrastructure evidence");
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert_eq!(classification.evidence_line, Some(1));
+    }
 
     /// A parse shaped like Vitest's when a test FILE failed to collect: no
     /// assertion failed, so `failed` stays zero while the file itself is a named
