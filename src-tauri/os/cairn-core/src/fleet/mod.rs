@@ -231,11 +231,35 @@ fn load_context(
         io_pressure_full_millis: host
             .io_pressure
             .value()
-            .map(|pressure| pressure.full_avg10_millis),
+            .map(cairn_common::executor_protocol::IoPressure::priced_full_millis),
         memory_pressure_full_millis: host
             .memory_pressure
             .value()
             .map(cairn_common::executor_protocol::MemoryPressure::priced_full_millis),
+        // How old the readings are is a question about an instant, which the
+        // prediction's stall prices answer; see [`forecast_start`].
+        host_stall_stale: false,
+    }
+}
+
+/// What a candidate would begin the work under, in the shape the learner
+/// reads: the co-resident work its contention counted and the host stall its
+/// prediction priced, including a reading too old to price.
+fn forecast_start(prediction: &PlacementPrediction) -> ExecutionLoadContext {
+    use cairn_common::executor_protocol::HostStallPrice;
+    let share = |price: &Option<HostStallPrice>| match price {
+        Some(HostStallPrice::Priced { full_millis, .. }) => Some(*full_millis),
+        _ => None,
+    };
+    let stale =
+        |price: &Option<HostStallPrice>| matches!(price, Some(HostStallPrice::Stale { .. }));
+    ExecutionLoadContext {
+        co_resident_compile_jobs: prediction.contention.co_resident_compile_jobs,
+        co_resident_light_jobs: prediction.contention.co_resident_light_jobs,
+        cpu_utilization_millis: None,
+        io_pressure_full_millis: share(&prediction.io_pressure),
+        memory_pressure_full_millis: share(&prediction.memory_pressure),
+        host_stall_stale: stale(&prediction.io_pressure) || stale(&prediction.memory_pressure),
     }
 }
 
@@ -15560,6 +15584,16 @@ fn rank_candidates<'a, 'b>(
     // which gives every fresh machine a bounded turn instead of retrying the first
     // executor forever. Failed object transfer never reaches `observe_completed`,
     // so those attempts consume budget but never become duration samples.
+    //
+    // Otherwise-idle is the learner's rule, asked of the forecast
+    // ([`resource_profiles::teaches_baseline`]): a run beside other work, or one
+    // whose stall reading is stale, never becomes a baseline sample, so
+    // exploring there spends the lane, at whatever its stall and contention
+    // cost, for nothing. A busy machine stays thin and stays eligible, and it
+    // took one lane in four of a work class forever (cairn/4999: bbs at 47%
+    // full I/O stall beside fifteen cargo lanes, chosen over a 1.6 s forecast,
+    // each run dying at vitest's 60 s start bound). It still competes on its
+    // forecast, where its stall is priced.
     let exploration_due = exploration.decisions_since_exploration >= EXPLORATION_INTERVAL - 1;
     let last_explored = |candidate: &&ScoredCandidate<'a>| {
         exploration
@@ -15575,6 +15609,7 @@ fn rank_candidates<'a, 'b>(
             && candidate.over_ceiling.is_none()
             && candidate.admission_accepts
             && candidate.prediction.queue.predicted_ms() == Some(0)
+            && resource_profiles::teaches_baseline(&forecast_start(&candidate.prediction))
             && candidate.prediction.run.profile_key.is_some()
             && matches!(
                 candidate.prediction.run.fallback,
@@ -16201,11 +16236,6 @@ fn placement_prediction_with_contention(
     }
 }
 
-/// The largest stall share priced. The multiplier `1/(1-f)` has no bound as
-/// the stall nears total, and a ranking needs a finite price; past nine-tenths
-/// stalled a machine is already priced at ten times its run.
-const HOST_STALL_PRICED_CEILING_MILLIS: u32 = 900;
-
 /// The stall share one reading prices, or the record of why it prices
 /// nothing: unmeasured is never zero, and a stale stall is not this machine
 /// now.
@@ -16224,22 +16254,18 @@ fn priced_stall_share<T>(
                 age_ms: reading.age_ms(now_unix_ms),
             })
         }
-        Some(value) => Ok(share(value).min(HOST_STALL_PRICED_CEILING_MILLIS)),
+        Some(value) => Ok(share(value).min(resource_profiles::HOST_STALL_PRICED_CEILING_MILLIS)),
     }
-}
-
-/// `t * f/(1-f)`: what a stall share `f` adds to a run that takes `t`.
-fn stall_penalty_ms(run_ms: u64, full_millis: u32) -> u64 {
-    u64::try_from(u128::from(run_ms) * u128::from(full_millis) / u128::from(1_000 - full_millis))
-        .unwrap_or(u64::MAX)
 }
 
 /// Add a machine's memory and storage stalls to its time to a verdict: a run
 /// that would take `t` on a machine fully stalled a fraction `f` of the time
 /// takes `t/(1-f)`, so the price is `t * f/(1-f)` on the contention-adjusted
-/// run. A summand like the queue and the run, never an exclusion and never an
-/// admission gate (tenet 1139): an unmeasured or stale reading adds nothing
-/// and the record says why.
+/// run ([`resource_profiles::stall_penalty_ms`]). The run and its contention
+/// were learned with the stall each sample began under divided out, so this
+/// is the only place a stall is charged. A summand like the queue and the run,
+/// never an exclusion and never an admission gate (tenet 1139): an unmeasured
+/// or stale reading adds nothing and the record says why.
 ///
 /// The two stalls overlap: a task swapping a page in is stalled on memory and
 /// waiting on I/O at once, and PSI counts it in both. So the machine is priced
@@ -16251,6 +16277,7 @@ fn price_host_stall(
     now_unix_ms: u64,
 ) {
     use cairn_common::executor_protocol::{HostStallPrice, IoPressure, MemoryPressure};
+    use resource_profiles::stall_penalty_ms;
     let run_ms = prediction.adjusted_run_ms;
     let memory = priced_stall_share(
         &host.memory_pressure,
@@ -26046,6 +26073,269 @@ mod tests {
             Some(0)
         );
         assert_eq!(thrashing.predicted_verdict_ms, 600_000 + 1_400_000);
+    }
+
+    /// A host whose storage is stalled for a fraction of the time, with its
+    /// slowest device's writes, in the shape bbs advertised on 11-01.
+    fn stalled_host(
+        entry: &mut ExecutorConnectionState,
+        io_full_millis: u32,
+        memory_full_millis: u32,
+        measured_at_unix_ms: u64,
+    ) {
+        use cairn_common::executor_protocol::{DeviceWriteLatency, IoPressure, MemoryPressure};
+        measured(entry, 0.1, 40_000_000_000, 2_000_000_000_000);
+        let host = &mut Arc::make_mut(&mut entry.health).host;
+        host.io_pressure = Measurement::measured(
+            measured_at_unix_ms,
+            IoPressure {
+                full_avg10_millis: io_full_millis,
+                full_avg60_millis: io_full_millis,
+                slowest_device: Some(DeviceWriteLatency {
+                    device: "sda".into(),
+                    mean_write_ms: Some(190),
+                    writes: 120,
+                    in_flight: 16,
+                    window_ms: 5_000,
+                }),
+            },
+        );
+        host.memory_pressure = Measurement::measured(
+            measured_at_unix_ms,
+            MemoryPressure {
+                full_avg10_millis: memory_full_millis,
+                full_avg60_millis: memory_full_millis,
+            },
+        );
+    }
+
+    fn stall_priced_prediction(
+        entry: &ExecutorConnectionState,
+        run: DurationEstimate,
+        contention: ContentionEstimate,
+    ) -> PlacementPrediction {
+        let mut prediction = placement_prediction_with_contention(
+            entry,
+            CacheWarmthEvidence::Observed {
+                warmth: ExecutionWarmth::PreparedWarmSlot,
+                observed_at_unix_ms: NOW,
+            },
+            QueueForecast::Forecast {
+                predicted_ms: 0,
+                requests_ahead: 0,
+                running_ahead: 0,
+                fully_measured: true,
+                observed_at_unix_ms: NOW,
+                stalled_head_ms: None,
+            },
+            run,
+            contention,
+            SyncCost::Known(0),
+        );
+        price_host_stall(&mut prediction, &entry.health.host, NOW);
+        prediction
+    }
+
+    fn learned_run(predicted_ms: u64, sample_count: u64) -> DurationEstimate {
+        let mut run = test_prior_duration();
+        run.predicted_ms = predicted_ms;
+        run.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        run.sample_count = sample_count;
+        run.profile_key = Some("skip-census".into());
+        run.fallback = None;
+        run
+    }
+
+    fn machine_curve(compile: u32, light: u32, multiplier_millis: u32) -> ContentionEstimate {
+        ContentionEstimate {
+            co_resident_compile_jobs: compile,
+            co_resident_light_jobs: light,
+            multiplier_millis,
+            source: cairn_common::executor_protocol::ContentionEvidence::Machine,
+            sample_count: 100,
+            fallback: None,
+        }
+    }
+
+    fn ranked_winner(
+        candidates: Vec<(&ExecutorConnectionState, PlacementPrediction)>,
+    ) -> (String, bool) {
+        let scored = candidates
+            .into_iter()
+            .map(|(entry, prediction)| {
+                ScoredCandidate::new(
+                    entry,
+                    SyncCost::Known(0),
+                    None,
+                    &ResourceReservation::default(),
+                    prediction,
+                    None,
+                    None,
+                    NOW,
+                )
+            })
+            .collect::<Vec<_>>();
+        let (winner, _, _, exploring, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &spillable_request(),
+            &ActivePlacementPolicy::default_profile(),
+            &ExplorationState::default(),
+        );
+        (
+            winner.unwrap().entry.identity.executor_id.clone(),
+            exploring,
+        )
+    }
+
+    /// cairn/4999's specimen, replayed from what the orchestrator recorded for
+    /// request 6dc74b43 (01:22:33Z 11-02, a main-cadence `skip-census` lane).
+    /// The three losers' predictions are their placement-rejection rows, digit
+    /// for digit. bbs won: fifteen cargo lanes and one light job beside it,
+    /// 47.4% of the time fully stalled on I/O, and one sample of the lane, so
+    /// it was a bootstrap candidate and the due exploration chose it over
+    /// bginf-sp2's 1.6 s. The run died at vitest's 60 s worker-start bound,
+    /// taught nothing, and left bbs as thin for the next due decision. A run
+    /// beside other work never becomes a baseline sample, so the lane now goes
+    /// to the earliest verdict. Idle, the same machine is still explored at the
+    /// same stall, because its sample is de-stalled; on a stale reading it is
+    /// not, because its sample could not be.
+    #[test]
+    fn exploration_never_spends_a_lane_where_the_run_cannot_teach() {
+        use cairn_common::executor_protocol::{ContentionEvidence, ContentionFallback};
+        let (_, mut sp2) = fleet_entry("bginf-sp2", "linux", 0, &[]);
+        let (_, mut fedora) = fleet_entry("fedora", "linux", 0, &[]);
+        let (_, mut ub) = fleet_entry("bgsrv-ub", "linux", 0, &[]);
+        let (_, mut bbs) = fleet_entry("bbs", "linux", 0, &[]);
+        stalled_host(&mut sp2, 111, 0, NOW);
+        stalled_host(&mut fedora, 43, 0, NOW);
+        stalled_host(&mut ub, 193, 1, NOW);
+        stalled_host(&mut bbs, 474, 9, NOW);
+        let sp2_prediction =
+            stall_priced_prediction(&sp2, learned_run(1_403, 4), machine_curve(1, 0, 1_000));
+        let fedora_prediction =
+            stall_priced_prediction(&fedora, learned_run(1_304, 15), machine_curve(4, 1, 2_295));
+        let ub_prediction =
+            stall_priced_prediction(&ub, learned_run(3_205, 43), machine_curve(1, 0, 1_384));
+        assert_eq!(
+            [
+                sp2_prediction.predicted_verdict_ms,
+                fedora_prediction.predicted_verdict_ms,
+                ub_prediction.predicted_verdict_ms,
+            ],
+            [1_578, 3_127, 5_496],
+            "the replay reproduces the recorded predictions"
+        );
+        let mut thin = test_prior_duration();
+        thin.predicted_ms = 30_000;
+        thin.profile_key = Some("skip-census".into());
+        thin.fallback = Some(DurationFallback::BelowConfidenceFloor);
+        let prior = |compile, light| ContentionEstimate {
+            multiplier_millis: 1_000 + compile * 600 + light * 100,
+            source: ContentionEvidence::Prior,
+            sample_count: 0,
+            fallback: Some(ContentionFallback::NoGlobalCurve),
+            ..machine_curve(compile, light, 1_000)
+        };
+        let rivals = || {
+            vec![
+                (&sp2, sp2_prediction.clone()),
+                (&fedora, fedora_prediction.clone()),
+                (&ub, ub_prediction.clone()),
+            ]
+        };
+
+        let busy = stall_priced_prediction(&bbs, thin.clone(), prior(15, 1));
+        assert!(
+            busy.describe().contains("I/O stalled 47.4% of the time"),
+            "the price is on the page: {}",
+            busy.describe()
+        );
+        let mut fleet = rivals();
+        fleet.push((&bbs, busy));
+        assert_eq!(
+            ranked_winner(fleet),
+            ("bginf-sp2".to_string(), false),
+            "a run beside fifteen cargo lanes teaches no baseline, so it buys none"
+        );
+
+        let mut fleet = rivals();
+        fleet.push((
+            &bbs,
+            stall_priced_prediction(&bbs, thin.clone(), prior(0, 0)),
+        ));
+        assert_eq!(
+            ranked_winner(fleet),
+            ("bbs".to_string(), true),
+            "alone, its run is a sample even at 47% stall: the stall is divided out"
+        );
+
+        stalled_host(
+            &mut bbs,
+            474,
+            9,
+            NOW - EXECUTOR_TELEMETRY_STALE_AFTER_MS - 1,
+        );
+        let mut fleet = rivals();
+        fleet.push((&bbs, stall_priced_prediction(&bbs, thin, prior(0, 0))));
+        assert_eq!(
+            ranked_winner(fleet),
+            ("bginf-sp2".to_string(), false),
+            "on a stale reading the stall could not be divided out"
+        );
+    }
+
+    /// cairn/4999's short lane: a three-second lane both machines have learned,
+    /// one host at bbs's 11-01 reading (44% of the time fully stalled, its
+    /// slowest device writing in 190 ms) and one idle. The stalled machine is
+    /// predicted at `3 s / 0.56` and ranks second, and wins when it is the only
+    /// candidate: a price, never a refusal. A machine with no stall reading is
+    /// predicted at its count-only run and says why.
+    #[test]
+    fn a_short_lane_ranks_a_disk_stalled_machine_below_an_idle_one() {
+        use cairn_common::executor_protocol::{HostStallPrice, MeasurementGap};
+        let (_, mut stalled) = fleet_entry("bbs", "linux", 0, &[]);
+        let (_, mut idle) = fleet_entry("bginf-sp2", "linux", 0, &[]);
+        let (_, mut unmeasured) = fleet_entry("bgsrv-mac", "macos", 0, &[]);
+        stalled_host(&mut stalled, 440, 0, NOW);
+        stalled_host(&mut idle, 0, 0, NOW);
+        measured(&mut unmeasured, 0.1, 40_000_000_000, 2_000_000_000_000);
+        let predict = |entry| {
+            stall_priced_prediction(entry, learned_run(3_000, 16), machine_curve(0, 0, 1_000))
+        };
+
+        let stalled_prediction = predict(&stalled);
+        assert_eq!(
+            stalled_prediction.io_pressure,
+            Some(HostStallPrice::Priced {
+                full_millis: 440,
+                penalty_ms: 2_357,
+            })
+        );
+        assert_eq!(stalled_prediction.predicted_verdict_ms, 5_357);
+        let idle_prediction = predict(&idle);
+        assert_eq!(idle_prediction.predicted_verdict_ms, 3_000);
+        let unmeasured_prediction = predict(&unmeasured);
+        assert_eq!(unmeasured_prediction.predicted_verdict_ms, 3_000);
+        assert!(matches!(
+            unmeasured_prediction.io_pressure,
+            Some(HostStallPrice::Unmeasured {
+                gap: MeasurementGap::NotSampled
+            })
+        ));
+
+        assert_eq!(
+            ranked_winner(vec![
+                (&stalled, stalled_prediction.clone()),
+                (&idle, idle_prediction),
+            ]),
+            ("bginf-sp2".to_string(), false)
+        );
+        assert_eq!(
+            ranked_winner(vec![(&stalled, stalled_prediction)]),
+            ("bbs".to_string(), false)
+        );
     }
 
     fn local_first() -> ActivePlacementPolicy {

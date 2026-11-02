@@ -3681,14 +3681,21 @@ pub struct ExecutionLoadContext {
     /// CPU utilization in thousandths, preserving an integer wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_utilization_millis: Option<u32>,
-    /// [`IoPressure::full_avg10_millis`], or `None` where it was not measured,
-    /// which is never the same as zero.
+    /// [`IoPressure::priced_full_millis`], the share placement prices, or
+    /// `None` where it was not measured, which is never the same as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub io_pressure_full_millis: Option<u32>,
     /// [`MemoryPressure::priced_full_millis`], or `None` where it was not
     /// measured, which is never the same as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure_full_millis: Option<u32>,
+    /// The machine measures host stall, but its readings were past
+    /// [`MACHINE_READING_STALE_AFTER_MS`] when the execution began, so the two
+    /// pressure fields above are absent for want of a current reading rather
+    /// than for want of a sampler. How much of such a run went to the stall is
+    /// unknown, so it teaches no speed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_stall_stale: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6393,6 +6400,20 @@ pub struct LearnedResourceEstimate {
 /// machine. A held execution has no jobs, so nothing about it ever reaches an
 /// executor, and no frame, variant, field or serialized form changes; a runner
 /// talking to an older executor gets nothing wrong.
+///
+/// cairn/4999 does not move the number. [`ExecutionLoadContext`] gains a
+/// defaulted `hostStallStale` flag, and the executor now records
+/// `ioPressureFullMillis` as [`IoPressure::priced_full_millis`] (the worse of
+/// the two windows, as memory's already was) and leaves both pressure fields
+/// out when its cached reading is past [`MACHINE_READING_STALE_AFTER_MS`],
+/// setting the flag instead. The struct refuses no unknown fields. The runner
+/// reads the context only after a run, to decide what the run teaches its
+/// duration and contention profiles; no admission, grant or placement outcome
+/// on either side reads it. What a runner gets wrong talking to an older
+/// executor: nothing it decodes differently; that executor's runs carry a
+/// ten-second reading and never the flag, so a run that began on a stale
+/// reading still teaches its speed, de-stalled by that reading, until the
+/// machine runs a build carrying this. An older runner ignores the flag.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 161;
 
 /// The version `build.rs` derived from the paragraphs above

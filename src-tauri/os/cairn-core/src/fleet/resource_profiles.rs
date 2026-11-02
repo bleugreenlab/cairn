@@ -185,6 +185,79 @@ struct ContentionProfile {
     recent_multiplier_millis: Vec<u64>,
 }
 
+/// The largest stall share priced or divided out. The multiplier `1/(1-f)` has
+/// no bound as the stall nears total, and a ranking needs a finite price; past
+/// nine-tenths stalled a machine is already priced at ten times its run.
+pub(super) const HOST_STALL_PRICED_CEILING_MILLIS: u32 = 900;
+
+/// `t * f/(1-f)`: what a stall share `f` adds to a run that takes `t` on the
+/// same machine unstalled. The one curve for host stall: placement adds it to
+/// a prediction and [`destalled_ms`] takes it back out of an observation, so a
+/// stall is charged once, from the reading current when the work is placed.
+pub(super) fn stall_penalty_ms(run_ms: u64, full_millis: u32) -> u64 {
+    let full_millis = full_millis.min(HOST_STALL_PRICED_CEILING_MILLIS);
+    u64::try_from(u128::from(run_ms) * u128::from(full_millis) / u128::from(1_000 - full_millis))
+        .unwrap_or(u64::MAX)
+}
+
+/// `d * (1-f)`: the unstalled duration of a run observed to take `d` under a
+/// stall share `f`, the inverse of [`stall_penalty_ms`].
+fn destalled_ms(observed_ms: u64, full_millis: u32) -> u64 {
+    let full_millis = full_millis.min(HOST_STALL_PRICED_CEILING_MILLIS);
+    observed_ms.saturating_mul(u64::from(1_000 - full_millis)) / 1_000
+}
+
+/// The host stall a run began under, as the learner reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartingStall {
+    /// The machine has no stall reading: macOS, a kernel without PSI, an
+    /// executor too old to record one. The count-only model takes the run as
+    /// it came, as it always has; unmeasured is never priced as unstalled.
+    Unmeasured,
+    /// The machine measures stall but its reading was too old to be the
+    /// machine at the start, so the run's own speed cannot be separated out.
+    Stale,
+    /// Thousandths of wall time fully stalled, the worse of memory and
+    /// storage, as placement prices it.
+    Measured(u32),
+}
+
+impl StartingStall {
+    fn of(load: &ExecutionLoadContext) -> Self {
+        if load.host_stall_stale {
+            return Self::Stale;
+        }
+        match (
+            load.io_pressure_full_millis,
+            load.memory_pressure_full_millis,
+        ) {
+            (None, None) => Self::Unmeasured,
+            (io, memory) => Self::Measured(io.unwrap_or(0).max(memory.unwrap_or(0))),
+        }
+    }
+
+    /// The observation with the stall taken out, or `None` when it cannot be.
+    fn destall(self, observed_ms: u64) -> Option<u64> {
+        match self {
+            Self::Unmeasured => Some(observed_ms),
+            Self::Stale => None,
+            Self::Measured(full_millis) => Some(destalled_ms(observed_ms, full_millis)),
+        }
+    }
+}
+
+/// Whether a successful run that begins under `load` becomes a sample of this
+/// machine's own speed for a command it has no confident duration for. The
+/// rule [`observe_completed`] applies, and the one placement asks before it
+/// spends a lane exploring a machine: a run beside other work measures the
+/// baseline times a slowdown nothing has separated yet, and a run whose stall
+/// reading was stale cannot have the stall divided out.
+pub(super) fn teaches_baseline(load: &ExecutionLoadContext) -> bool {
+    load.co_resident_compile_jobs == 0
+        && load.co_resident_light_jobs == 0
+        && StartingStall::of(load) != StartingStall::Stale
+}
+
 pub(super) fn contention_prior(load: &ExecutionLoadContext) -> ContentionEstimate {
     ContentionEstimate {
         co_resident_compile_jobs: load.co_resident_compile_jobs,
@@ -904,45 +977,24 @@ pub(super) async fn observe_completed(
     // not depend on knowing why — but it teaches the predictor nothing, because
     // filing it under a guessed warmth is how warm and cold runs contaminate each
     // other.
+    //
+    // Speed is learned with the host's stall divided out, by the reading the
+    // run began under: a baseline and a contention curve describe the machine
+    // and its co-resident work, and the stall is priced separately from the
+    // reading current when work is placed. Learned raw, a stalled run would be
+    // charged twice, once inside the curve and again by the price.
     if let (Some(duration), Some(warmth), Some(load)) =
         (duration, metadata.warmth, metadata.load_context.as_ref())
     {
-        let idle = load.co_resident_compile_jobs == 0 && load.co_resident_light_jobs == 0;
-        let baseline = resolve_duration(
-            db.clone(),
-            Some(identity),
-            context,
-            warmth,
-            CellCommandClass::Other,
-            metadata.finished_at_unix_ms,
-        )
-        .await;
-        if idle {
-            let _ = record_duration(
+        if let Some(duration) = StartingStall::of(load).destall(duration) {
+            learn_speed(
                 db.clone(),
                 identity,
                 context,
                 warmth,
-                metadata.finished_at_unix_ms,
+                metadata,
+                load,
                 duration,
-            )
-            .await;
-            let _ = record_contention(
-                db.clone(),
-                context,
-                load,
-                metadata.finished_at_unix_ms,
-                1_000,
-            )
-            .await;
-        } else if baseline.is_learned() && baseline.predicted_ms > 0 {
-            let multiplier = duration.saturating_mul(1_000) / baseline.predicted_ms;
-            let _ = record_contention(
-                db.clone(),
-                context,
-                load,
-                metadata.finished_at_unix_ms,
-                multiplier.max(1_000),
             )
             .await;
         }
@@ -960,6 +1012,8 @@ pub(super) async fn observe_completed(
         metadata.finished_at_unix_ms,
         memory,
         disk,
+        // The reservation's duration high-water mark stays the run as it
+        // came: it covers the worst case seen, stall included.
         duration,
         // A success here is the machine holding the command, which is the
         // one thing that disproves "it cannot run here at all".
@@ -970,6 +1024,39 @@ pub(super) async fn observe_completed(
         },
     )
     .await;
+}
+
+/// Fold one de-stalled duration into the machine's baseline, when it ran
+/// alone, or into its contention curve, when it ran beside work and the
+/// baseline is already known.
+async fn learn_speed(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    warmth: ExecutionWarmth,
+    metadata: &CellExecutionMeta,
+    load: &ExecutionLoadContext,
+    duration: u64,
+) {
+    let finished = metadata.finished_at_unix_ms;
+    if teaches_baseline(load) {
+        let _ = record_duration(db.clone(), identity, context, warmth, finished, duration).await;
+        let _ = record_contention(db, context, load, finished, 1_000).await;
+        return;
+    }
+    let baseline = resolve_duration(
+        db.clone(),
+        Some(identity),
+        context,
+        warmth,
+        CellCommandClass::Other,
+        finished,
+    )
+    .await;
+    if baseline.is_learned() && baseline.predicted_ms > 0 {
+        let multiplier = duration.saturating_mul(1_000) / baseline.predicted_ms;
+        let _ = record_contention(db, context, load, finished, multiplier.max(1_000)).await;
+    }
 }
 
 /// Record an out-of-memory kill of `identity` on this machine context.
@@ -3254,6 +3341,7 @@ mod tests {
             cpu_utilization_millis: Some(700),
             io_pressure_full_millis: None,
             memory_pressure_full_millis: None,
+            host_stall_stale: false,
         };
         let target = duration_context();
         assert_eq!(
@@ -3315,6 +3403,7 @@ mod tests {
                 cpu_utilization_millis: None,
                 io_pressure_full_millis: None,
                 memory_pressure_full_millis: None,
+                host_stall_stale: false,
             }),
             ..meta
         }
@@ -3586,5 +3675,172 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(machine.recent_multiplier_millis, vec![2_000]);
+    }
+
+    fn under_stall(
+        mut meta: CellExecutionMeta,
+        co_resident_compile_jobs: u32,
+        io_pressure_full_millis: Option<u32>,
+    ) -> CellExecutionMeta {
+        meta.load_context = Some(ExecutionLoadContext {
+            co_resident_compile_jobs,
+            io_pressure_full_millis,
+            ..ExecutionLoadContext::default()
+        });
+        meta
+    }
+
+    /// The stall a run began under is divided out of what it teaches, by the
+    /// curve placement prices stall with, so a machine is charged for it once:
+    /// from the reading current when work is placed. At bbs's 10-15 reading
+    /// (23% of the time fully stalled on I/O), three idle 10 s runs teach a
+    /// 7.7 s baseline, which a placement at the same stall prices back to
+    /// 10 s. The same runs on a machine with no stall reading teach 10 s: the
+    /// count-only model, unchanged, and unmeasured never read as unstalled.
+    #[tokio::test]
+    async fn a_stalled_run_teaches_the_speed_the_machine_has_unstalled() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-destalled.db").await);
+        let identity = duration_identity();
+        let warmth = ExecutionWarmth::PreparedWarmSlot;
+        let measuring = duration_context();
+        let unmeasuring = ProfileContext {
+            executor_class: "mac-device:mac".into(),
+            os: "macos".into(),
+            ..duration_context()
+        };
+        for finished in 1..=3 {
+            for (context, stall) in [(&measuring, Some(230)), (&unmeasuring, None)] {
+                observe_completed(
+                    db.clone(),
+                    Some(&identity),
+                    context,
+                    &under_stall(completion(Some(warmth), finished, 10_000), 0, stall),
+                    CompletionKind::Succeeded,
+                )
+                .await;
+            }
+        }
+        let stalled = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &measuring,
+            warmth,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        let unmeasured = resolve_duration(
+            db.clone(),
+            Some(&identity),
+            &unmeasuring,
+            warmth,
+            CellCommandClass::CargoTest,
+            10,
+        )
+        .await;
+        assert!(stalled.is_learned() && unmeasured.is_learned());
+        assert_eq!(stalled.predicted_ms, 7_700);
+        assert_eq!(unmeasured.predicted_ms, 10_000);
+        assert_eq!(
+            stalled.predicted_ms + stall_penalty_ms(stalled.predicted_ms, 230),
+            10_000,
+            "priced at the stall it was learned under, it is the run it was"
+        );
+        let profile = load_profile(db.clone(), &identity, &measuring)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.upper_duration_ms,
+            Some(10_000),
+            "the reservation covers the run as it came, stall included"
+        );
+
+        // Beside two cargo lanes at the same stall, a 20 s run: 15.4 s of it
+        // was the lanes, a 2x slowdown, and the rest was the disk.
+        observe_completed(
+            db.clone(),
+            Some(&identity),
+            &measuring,
+            &under_stall(completion(Some(warmth), 4, 20_000), 2, Some(230)),
+            CompletionKind::Succeeded,
+        )
+        .await;
+        let load = ExecutionLoadContext {
+            co_resident_compile_jobs: 2,
+            ..ExecutionLoadContext::default()
+        };
+        let machine = load_contention_profile(db, &measuring.executor_class, &load)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(machine.recent_multiplier_millis, vec![2_000]);
+    }
+
+    /// A run that began on a stale stall reading cannot have the stall divided
+    /// out, so it teaches no speed: neither a baseline nor a slowdown. Its
+    /// memory was real demand, and the reservation keeps it.
+    #[tokio::test]
+    async fn a_run_begun_on_a_stale_stall_reading_teaches_no_speed() {
+        let db = Arc::new(crate::storage::migrated_test_db("duration-stale-stall.db").await);
+        let identity = duration_identity();
+        let context = duration_context();
+        let warmth = ExecutionWarmth::PreparedWarmSlot;
+        for finished in 1..=3 {
+            let mut meta = completion(Some(warmth), finished, 10_000);
+            meta.load_context = Some(ExecutionLoadContext {
+                host_stall_stale: true,
+                ..ExecutionLoadContext::default()
+            });
+            observe_completed(
+                db.clone(),
+                Some(&identity),
+                &context,
+                &meta,
+                CompletionKind::Succeeded,
+            )
+            .await;
+        }
+        assert!(
+            load_duration_profile(db.clone(), &identity, &context, warmth)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(load_contention_profile(
+            db.clone(),
+            &context.executor_class,
+            &ExecutionLoadContext::default()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let profile = load_profile(db, &identity, &context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(profile.sample_count, 3);
+    }
+
+    /// The rule exploration asks before spending a lane: only a run alone on
+    /// the machine, on a current stall reading, becomes a baseline sample. A
+    /// stall is divided out, so it does not disqualify the run.
+    #[test]
+    fn only_a_run_alone_on_a_current_reading_teaches_a_baseline() {
+        assert!(teaches_baseline(&ExecutionLoadContext::default()));
+        assert!(teaches_baseline(&ExecutionLoadContext {
+            io_pressure_full_millis: Some(474),
+            ..ExecutionLoadContext::default()
+        }));
+        assert!(!teaches_baseline(&ExecutionLoadContext {
+            co_resident_compile_jobs: 15,
+            co_resident_light_jobs: 1,
+            io_pressure_full_millis: Some(474),
+            ..ExecutionLoadContext::default()
+        }));
+        assert!(!teaches_baseline(&ExecutionLoadContext {
+            host_stall_stale: true,
+            ..ExecutionLoadContext::default()
+        }));
     }
 }
