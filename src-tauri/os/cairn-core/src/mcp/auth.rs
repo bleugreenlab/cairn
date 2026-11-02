@@ -570,9 +570,21 @@ mod tests {
             // forwards its arguments and returns the runner's payload, like
             // `permission.rs`.
             "src-tauri/src/commands/fleet.rs",
-            // The operator's merge-gate override proxy: main-webview only,
-            // local runner only, forwards its arguments and returns the
-            // runner's payload, like `fleet.rs`.
+            // The operator's starts and releases of held work
+            // (`start_recipe_execution`, `start_held_execution_now`,
+            // `override_operator_hold`): routed through `operator_target`
+            // like tenet verdicts, so only the main webview reaches the local
+            // runner or a configured peer. The module names only
+            // `invoke_as_operator`, forwards the runner's arguments unchanged,
+            // and returns only the runner's payload.
+            "src-tauri/src/commands/executions.rs",
+            // The Inference page's actions and the endpoint secret copy:
+            // main-webview only, local runner only, each forwarding its
+            // arguments unchanged and returning only the runner's payload.
+            // The copied secret goes to the clipboard runner-side and never
+            // into a response.
+            "src-tauri/src/commands/inference.rs",
+            "src-tauri/src/commands/event_endpoints.rs",
             // The channel agent-text grant: main-webview only, local runner
             // only — channel bindings belong to this desktop's own runner, so
             // it never routes to a peer. Forwards one runner command with its
