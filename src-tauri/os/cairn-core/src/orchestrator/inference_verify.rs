@@ -39,14 +39,15 @@ use cairn_db::turso::params;
 use cairn_inference::control::{Phase, START_REPORT_BOUND_SECS, STOP_REPORT_BOUND_SECS};
 use cairn_inference::verify::{self, ChatSample, EmbedSample, Speeds, Stage};
 use cairn_inference::{
-    AcceleratorFamily, Deployment, DeploymentId, Engine, InferenceProfile, InferenceProfileId,
-    Inventory, MachineName, ProfileOrigin, RecordSource, Server,
+    unknown_address, AcceleratorFamily, Address, Addresses, Deployment, DeploymentId, Engine,
+    InferenceProfile, InferenceProfileId, Inventory, MachineName, Network, ProfileOrigin,
+    RecordSource, Server,
 };
 use cairn_models::types::catalog::VerbKind;
 use sha2::{Digest, Sha256};
 
 use super::inference::{load_inventory, write_inventory, Authoring, Removals};
-use super::inference_control::{link_addresses, load_history, load_states, SETTLE_MS};
+use super::inference_control::{load_history, load_states, rendered_head, SETTLE_MS};
 use crate::fleet::models::{self, store::load_pins, PinTarget};
 use crate::fleet::pools::{Pool, PoolKey};
 use crate::storage::{LocalDb, RowExt};
@@ -77,6 +78,8 @@ pub trait Act: Send + Sync {
     fn embed(&self, api_base: String, model: String) -> Pending<'_, Result<EmbedSample, String>>;
     fn sleep(&self, ms: u64) -> Pending<'_, ()>;
     fn now_ms(&self) -> i64;
+    /// How the attached machines are reached now.
+    fn network(&self) -> Network;
 }
 
 const KEPT: i64 = 20;
@@ -253,6 +256,8 @@ pub struct Planned {
     pub profile: InferenceProfileId,
     pub pool: PoolKey,
     pub deployment: DeploymentId,
+    /// Where its head is reached, as the plan was rendered.
+    pub head: Address,
     /// Who the deployment stays loaded for once it passes, when a load of its
     /// model started it; `None` unloads it after measuring.
     pub then_keep: Option<String>,
@@ -266,11 +271,13 @@ fn port_for(profile: &InferenceProfile) -> u16 {
 }
 
 /// Refuse a verification that cannot start, write its deployment and its row,
-/// and return what to run.
+/// and return what to run. A machine it would use whose address is unknown is
+/// refused before anything is written.
 pub async fn begin(
     db: &LocalDb,
     profile_id: &str,
     pool: &Pool,
+    network: &Network,
     requested_by: &str,
     now: i64,
 ) -> Result<Planned, String> {
@@ -317,6 +324,12 @@ pub async fn begin(
         ));
     }
     let machines: Vec<MachineName> = pool.machines().take(k).map(MachineName::from).collect();
+    if let Some(problem) = Addresses::new(&inventory, network).unreachable(&machines[0], &machines)
+    {
+        return Err(format!(
+            "profile {profile_id} cannot be verified on pool {pool_id}: {problem}"
+        ));
+    }
     let deployment = Deployment {
         id: deployment_id(&profile.id, pool_id),
         source: RecordSource::Cairn,
@@ -409,21 +422,23 @@ pub async fn begin(
             "pool {pool_id} is already being verified (verification {running}); wait for it to finish"
         ));
     }
-    let links = link_addresses(&pool.members);
-    if let Some(problem) = super::inference_control::render_problem(&inventory, &deployment, &links)
-    {
-        let reason = format!("it cannot be rendered into scripts for its head: {problem}");
-        finish(db, &id, false, Some(reason.clone()), now).await?;
-        return Err(format!(
-            "verification {id} failed at render, before anything was stopped: {reason}"
-        ));
-    }
+    let head = match rendered_head(&inventory, &deployment, network) {
+        Ok(head) => head,
+        Err(problem) => {
+            let reason = format!("it cannot be rendered into scripts for its head: {problem}");
+            finish(db, &id, false, Some(reason.clone()), now).await?;
+            return Err(format!(
+                "verification {id} failed at render, before anything was stopped: {reason}"
+            ));
+        }
+    };
     Ok(Planned {
         id,
         started_at: now,
         profile: profile.id,
         pool: pool_id.clone(),
         deployment: deployment.id,
+        head,
         then_keep: None,
     })
 }
@@ -656,10 +671,10 @@ async fn measure(db: &LocalDb, act: &dyn Act, plan: &Planned) -> Result<Measured
         .get(&plan.deployment)
         .ok_or("the deployment is gone")?
         .clone();
-    let address = inventory
-        .address_of(&deployment.head)
-        .ok_or_else(|| format!("the head {}'s address is unknown", deployment.head))?
-        .to_string();
+    let address = Addresses::new(&inventory, &act.network())
+        .from_orch(&deployment.head)
+        .ok_or_else(|| format!("the head {}", unknown_address(&deployment.head)))?
+        .address;
     let mut measured = Measured {
         context: verify::context_of(&profile),
         ..Measured::default()
@@ -823,7 +838,16 @@ pub async fn verify_in_order(
         loop {
             let mut plan = match first.take() {
                 Some(plan) if plan.profile == profile => plan,
-                _ => match begin(db, profile.as_str(), pool, requested_by, act.now_ms()).await {
+                _ => match begin(
+                    db,
+                    profile.as_str(),
+                    pool,
+                    &act.network(),
+                    requested_by,
+                    act.now_ms(),
+                )
+                .await
+                {
                     Ok(plan) => plan,
                     Err(why) => {
                         results.push((String::new(), Outcome::Failed(why)));
@@ -1038,6 +1062,10 @@ impl Act for Live {
     fn now_ms(&self) -> i64 {
         crate::fleet::unix_time_ms() as i64
     }
+
+    fn network(&self) -> Network {
+        self.orch.fleet.network()
+    }
 }
 
 /// Fail what a previous orch left running, once at boot.
@@ -1058,8 +1086,8 @@ pub fn spawn_recovery(orch: super::Orchestrator) {
 }
 
 /// Start verifying `profiles` on `pool` in the background, the first planned
-/// now so a refusal is answered at once; return the first verification's id.
-/// With `then_keep`, the first that passes stays loaded for them.
+/// now so a refusal is answered at once; return the first verification's
+/// plan. With `then_keep`, the first that passes stays loaded for them.
 pub async fn spawn(
     orch: &super::Orchestrator,
     profiles: Vec<InferenceProfileId>,
@@ -1067,7 +1095,7 @@ pub async fn spawn(
     requested_by: &str,
     all: bool,
     then_keep: Option<String>,
-) -> Result<String, String> {
+) -> Result<Planned, String> {
     let first = profiles
         .first()
         .ok_or_else(|| format!("no profile to verify on pool {}", pool.key))?
@@ -1076,11 +1104,12 @@ pub async fn spawn(
         &orch.db.local,
         first.as_str(),
         &pool,
+        &orch.fleet.network(),
         requested_by,
         crate::fleet::unix_time_ms() as i64,
     )
     .await?;
-    let id = plan.id.clone();
+    let planned = plan.clone();
     let live = Live::new(orch.clone())?;
     let requested_by = requested_by.to_string();
     let db = orch.db.local.clone();
@@ -1103,7 +1132,7 @@ pub async fn spawn(
             );
         }
     });
-    Ok(id)
+    Ok(planned)
 }
 
 #[cfg(test)]
@@ -1363,6 +1392,10 @@ machines:
         fn now_ms(&self) -> i64 {
             *self.now.lock().unwrap()
         }
+
+        fn network(&self) -> Network {
+            Network::default()
+        }
     }
 
     async fn seeded(name: &str) -> LocalDb {
@@ -1377,7 +1410,9 @@ machines:
     async fn a_pass_pins_records_its_measurements_and_unloads() {
         let db = seeded("inference-verify-pass").await;
         let fake = Fake::new(&db);
-        let plan = begin(&db, "embed", &solo(), "operator", 1).await.unwrap();
+        let plan = begin(&db, "embed", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap();
         assert_eq!(plan.deployment.as_str(), "verify-embed-box");
         assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
         let holder = format!("verify:{}", plan.id);
@@ -1403,7 +1438,9 @@ machines:
     async fn load_plan(db: &LocalDb, profile: &str) -> Planned {
         Planned {
             then_keep: Some("operator".into()),
-            ..begin(db, profile, &solo(), "operator", 1).await.unwrap()
+            ..begin(db, profile, &solo(), &Network::default(), "operator", 1)
+                .await
+                .unwrap()
         }
     }
 
@@ -1510,9 +1547,16 @@ machines:
             },
         )
         .await;
-        let plan = begin(&db, "chat", &solo(), "operator", fake.now_ms())
-            .await
-            .unwrap();
+        let plan = begin(
+            &db,
+            "chat",
+            &solo(),
+            &Network::default(),
+            "operator",
+            fake.now_ms(),
+        )
+        .await
+        .unwrap();
         assert_eq!(run(&db, &fake, &plan).await.unwrap(), Outcome::Passed);
     }
 
@@ -1574,7 +1618,9 @@ machines:
             .lock()
             .unwrap()
             .push("CUDA driver version is insufficient for CUDA runtime version".into());
-        let plan = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
+        let plan = begin(&db, "chat", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap();
         let outcome = run(&db, &fake, &plan).await.unwrap();
         assert!(matches!(&outcome, Outcome::Failed(why) if why.contains("driver")));
         assert_eq!(
@@ -1594,7 +1640,9 @@ machines:
         let fake = Fake::new(&db);
         *fake.refuse_pin.lock().unwrap() =
             Some("verify-embed-box cannot run: box is in no detected pool".into());
-        let plan = begin(&db, "embed", &solo(), "operator", 1).await.unwrap();
+        let plan = begin(&db, "embed", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap();
         let outcome = run(&db, &fake, &plan).await.unwrap();
         assert_eq!(
             outcome,
@@ -1624,7 +1672,7 @@ machines:
         )
         .await
         .unwrap();
-        let refusal = begin(&db, "chat", &solo(), "operator", 1)
+        let refusal = begin(&db, "chat", &solo(), &Network::default(), "operator", 1)
             .await
             .unwrap_err();
         assert!(
@@ -1633,7 +1681,9 @@ machines:
         );
 
         delete_pin(&db, &old).await.unwrap();
-        let plan = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
+        let plan = begin(&db, "chat", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap();
         let fake = Fake::new(&db);
         assert_eq!(
             recover(fake.db, &fake).await.unwrap(),
@@ -1659,7 +1709,7 @@ machines:
         write_inventory(&db, &Authoring::Replace(inventory.to_yaml()))
             .await
             .unwrap();
-        let refusal = begin(&db, "chat", &solo(), "operator", 1)
+        let refusal = begin(&db, "chat", &solo(), &Network::default(), "operator", 1)
             .await
             .unwrap_err();
         assert!(
@@ -1674,11 +1724,47 @@ machines:
         );
     }
 
+    /// An enrolled executor needs no machine record: its verification is
+    /// planned at the address its connection came from. A machine neither
+    /// recorded nor attached is refused before anything is written.
+    #[tokio::test]
+    async fn an_enrolled_executor_is_verified_where_it_connected_from() {
+        let db = seeded("inference-verify-observed").await;
+        let mut inventory = load_inventory(&db).await.unwrap();
+        inventory.machines.clear();
+        write_inventory(&db, &Authoring::Replace(inventory.to_yaml()))
+            .await
+            .unwrap();
+
+        let refusal = begin(&db, "embed", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            "profile embed cannot be verified on pool box: box's address is unknown: no executor named box is attached and it has no machine record; enrol it as an executor or add a machine record"
+        );
+        assert!(load_verifications(&db).await.unwrap().is_empty());
+
+        let observed = Network {
+            connections: BTreeMap::from([("box".to_string(), "10.0.0.7".parse().unwrap())]),
+            ..Network::default()
+        };
+        let plan = begin(&db, "embed", &solo(), &observed, "operator", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.head.to_string(),
+            "10.0.0.7 (observed from its connection)"
+        );
+    }
+
     #[tokio::test]
     async fn one_verification_holds_a_pool_at_a_time() {
         let db = seeded("inference-verify-one").await;
-        let first = begin(&db, "chat", &solo(), "operator", 1).await.unwrap();
-        let refusal = begin(&db, "embed", &solo(), "operator", 2)
+        let first = begin(&db, "chat", &solo(), &Network::default(), "operator", 1)
+            .await
+            .unwrap();
+        let refusal = begin(&db, "embed", &solo(), &Network::default(), "operator", 2)
             .await
             .unwrap_err();
         assert_eq!(

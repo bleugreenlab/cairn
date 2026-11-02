@@ -755,12 +755,17 @@ const CATCHUP_SCAN_TURNS: i64 = 8;
 /// decodes empty, so a handful is plenty.
 const CATCHUP_TURN_CANDIDATES: i64 = 4;
 
-/// A job's newest `?2` turns that ran, newest first. `idx_turns_job_id` holds a
-/// job's turns in insertion order, so this walks the index backwards with no
-/// sort over the job's history.
-pub(crate) const WINDOW_TURNS_SQL: &str = "SELECT id, run_id, created_at FROM turns
-     WHERE job_id = ?1 AND run_id IS NOT NULL
-     ORDER BY rowid DESC LIMIT ?2";
+/// A job's newest `?2` turns the chat renders, newest first: the same turns
+/// [`count_job_chat_turns`] counts, so the window walked is the window counted.
+/// `idx_turns_job_id` holds a job's turns in insertion order, so this walks the
+/// index backwards with no sort over the job's history.
+///
+/// [`count_job_chat_turns`]: super::push::count_job_chat_turns
+pub(crate) const WINDOW_TURNS_SQL: &str = concat!(
+    "SELECT id, run_id, created_at FROM turns WHERE ",
+    super::push::job_chat_turns_where!(),
+    " ORDER BY rowid DESC LIMIT ?2"
+);
 
 /// One turn's newest top-level-assistant prose candidates as keys: run `?1`,
 /// from the turn's start `?2`, turn `?3`, at most `?4`. Through the prose index
@@ -861,13 +866,18 @@ async fn newest_assistant_prose(
     let mut turns = Vec::new();
     let mut rows = conn.query(WINDOW_TURNS_SQL, params![job_id, scan]).await?;
     while let Some(row) = rows.next().await? {
-        turns.push((row.text(0)?, row.text(1)?, row.i64(2)?));
+        turns.push((row.text(0)?, row.opt_text(1)?, row.i64(2)?));
     }
     drop(rows);
     let candidates_sql = prose_candidates_sql(prose_walk_index(conn).await?);
     let row_sql = format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1");
     let mut found = Vec::new();
     for (turn_id, run_id, started) in turns {
+        // A run-less turn holds only a session boundary: one of the window's
+        // turns, but never assistant prose.
+        let Some(run_id) = run_id else {
+            continue;
+        };
         let mut keys = Vec::new();
         let mut rows = conn
             .query(

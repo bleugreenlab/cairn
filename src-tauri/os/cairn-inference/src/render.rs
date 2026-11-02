@@ -165,7 +165,7 @@ impl<'a> Ranks<'a> {
         for peer in &ordered[1..] {
             if peer.address.is_none() {
                 return Err(Refusal(format!(
-                    "machine {}'s address is unknown, so the head cannot reach it over ssh; give it a machine record with its address",
+                    "machine {}'s address is unknown, so the head cannot reach it over ssh: it has no address on the pool's link, no attached executor of that name and no machine record",
                     peer.name
                 )));
             }

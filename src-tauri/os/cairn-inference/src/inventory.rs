@@ -529,13 +529,6 @@ impl Inventory {
         }
     }
 
-    /// The network address of `machine`, as its record states it.
-    pub fn address_of(&self, machine: &MachineName) -> Option<&str> {
-        self.machines
-            .get(machine)
-            .map(|record| record.address.as_str())
-    }
-
     /// Cairn's own record format, as YAML.
     pub fn to_yaml(&self) -> String {
         let file = InventoryFile {
@@ -646,10 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_s_address_is_where_its_deployments_answer() {
-        let inventory = test_inventory();
-        assert_eq!(inventory.address_of(&"sp1".into()), Some("10.20.20.40"));
-        assert_eq!(inventory.address_of(&"sp2".into()), None);
+    fn a_machine_record_s_address_may_not_be_blank() {
         let mut blank = test_inventory();
         blank.insert_machine(machine("sp2", " "));
         assert_eq!(

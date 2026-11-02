@@ -290,7 +290,7 @@ async fn delivery_stamp_and_read_cursor_roll_back_together_on_private_and_team_s
         };
         db.execute_script("INSERT INTO jobs(id,project_id,status,created_at,updated_at) VALUES('recipient','p','idle',1,1),('child','p','running',1,1);
             INSERT INTO runs(id,project_id,job_id,created_at,updated_at) VALUES('run','p','child',1,1);
-            INSERT INTO turns(id,session_id,run_id,sequence,state,created_at,updated_at) VALUES('turn-1','session','run',1,'completed',1,1);
+            INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,created_at,updated_at) VALUES('turn-1','session','run','child',1,'completed',1,1);
             INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,turn_id,created_at) VALUES('turn','run',1,1,'text','{}','turn-1',1);
             INSERT INTO attention_pushes(id,recipient,content_ref,wake,boundary,key,created_at) VALUES('push','recipient','cairn://p/proj/1','wake','event','catchup:child',1);").await.unwrap();
         let result: DbResult<()> = db

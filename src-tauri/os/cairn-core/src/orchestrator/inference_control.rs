@@ -31,14 +31,15 @@ use cairn_inference::control::{
     self, Allocation, AllocationWatch, LoadOutcome, Observation, Phase, Report, Request,
     START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
-use cairn_inference::render::{render, MachineAt};
-use cairn_inference::{Deployment, DeploymentId, Inventory, MachineName};
+use cairn_inference::render::render;
+use cairn_inference::{
+    unknown_address, Address, Addresses, Deployment, DeploymentId, Inventory, MachineName, Network,
+};
 
 use super::inference::load_inventory;
 use super::Orchestrator;
 use crate::fleet::inference::Preemption;
 use crate::fleet::models::room::{gpu_allocated_bytes, RunningBatch};
-use crate::fleet::pools::PoolMember;
 use crate::fleet::{DeploymentReportReceived, Fleet};
 use crate::storage::{LocalDb, RowExt};
 
@@ -123,9 +124,10 @@ pub(crate) trait Heads: Send + Sync {
     fn running(&self, machines: &BTreeSet<String>) -> BTreeMap<String, Vec<RunningBatch>>;
     /// Stop one running batch to make room; false when it has already ended.
     fn preempt(&self, request_id: &str, attempt_id: &str, preemption: Preemption) -> bool;
-    /// Each pooled machine's address on the fast link joining its pool, by
-    /// public name, as placement detects the pools now.
-    fn links(&self) -> BTreeMap<String, String>;
+    /// How the attached machines are reached now: where each one's connection
+    /// came from, and each pooled machine's address on the fast link joining
+    /// its pool as placement detects the pools now.
+    fn network(&self) -> Network;
 }
 
 impl Heads for Fleet {
@@ -158,37 +160,9 @@ impl Heads for Fleet {
         )
     }
 
-    fn links(&self) -> BTreeMap<String, String> {
-        link_addresses(self.detected_pools().iter().flat_map(|pool| &pool.members))
+    fn network(&self) -> Network {
+        Fleet::network(self)
     }
-}
-
-/// Each of `members`' addresses on the link joining its pool, by machine.
-pub(crate) fn link_addresses<'a>(
-    members: impl IntoIterator<Item = &'a PoolMember>,
-) -> BTreeMap<String, String> {
-    members
-        .into_iter()
-        .filter_map(|member| Some((member.machine.clone(), member.link_address?.to_string())))
-        .collect()
-}
-
-/// `deployment`'s machines as the renderer reaches them: each one's address
-/// from its machine record, and its fast-link address from `links`.
-pub(crate) fn machines_at(
-    inventory: &Inventory,
-    deployment: &Deployment,
-    links: &BTreeMap<String, String>,
-) -> Vec<MachineAt> {
-    deployment
-        .machines
-        .iter()
-        .map(|name| MachineAt {
-            name: name.clone(),
-            address: inventory.address_of(name).map(str::to_string),
-            link: links.get(name.as_str()).cloned(),
-        })
-        .collect()
 }
 
 /// One deployment's stored row.
@@ -461,31 +435,35 @@ struct Plan {
     stop: Option<String>,
     cleanup: Option<String>,
     health_url: String,
+    /// Where the head is reached, which the health URL is formed from.
+    head: Address,
 }
 
 impl Plan {
     fn of(
         inventory: &Inventory,
         deployment: &Deployment,
-        links: &BTreeMap<String, String>,
+        network: &Network,
     ) -> Result<Self, String> {
         let profile = inventory
             .profiles
             .get(&deployment.profile)
             .ok_or_else(|| format!("its profile {} is missing", deployment.profile))?;
-        let machines = machines_at(inventory, deployment, links);
+        let addresses = Addresses::new(inventory, network);
+        let machines = addresses.machines_at(deployment);
         let rendered = render(profile, deployment, &machines).map_err(|refusal| refusal.0)?;
-        let address = inventory.address_of(&deployment.head).ok_or_else(|| {
+        let head = addresses.from_orch(&deployment.head).ok_or_else(|| {
             format!(
-                "the head {}'s address is unknown, so its health URL cannot be formed",
-                deployment.head
+                "its health URL cannot be formed because the head {}",
+                unknown_address(&deployment.head)
             )
         })?;
         Ok(Self {
             start: rendered.start,
             stop: rendered.stop,
             cleanup: rendered.cleanup,
-            health_url: deployment.health_url(address),
+            health_url: deployment.health_url(&head.address),
+            head,
         })
     }
 
@@ -511,15 +489,15 @@ impl Plan {
     }
 }
 
-/// Why Cairn could not render `deployment`'s start and stop for its head, or
-/// `None` when it can: what a start would refuse, asked before anything is
+/// Where Cairn reaches `deployment`'s head once its start and stop render, or
+/// why they cannot: what a start would refuse, asked before anything is
 /// stopped to make room for it.
-pub(crate) fn render_problem(
+pub(crate) fn rendered_head(
     inventory: &Inventory,
     deployment: &Deployment,
-    links: &BTreeMap<String, String>,
-) -> Option<String> {
-    Plan::of(inventory, deployment, links).err()
+    network: &Network,
+) -> Result<Address, String> {
+    Plan::of(inventory, deployment, network).map(|plan| plan.head)
 }
 
 /// Which stored command an observation must belong to.
@@ -636,7 +614,7 @@ pub(crate) async fn request(
             format!("there is no deployment {id}; cairn://inference/deployments lists them")
         })?
         .clone();
-    let plan = Plan::of(&inventory, &deployment, &heads.links())
+    let plan = Plan::of(&inventory, &deployment, &heads.network())
         .map_err(|why| format!("Cairn cannot {} {id}: {why}", request.as_str()))?;
     if request == Request::Stop && plan.stop.is_none() {
         return Err(format!(
@@ -906,7 +884,7 @@ pub(crate) async fn tick(
             .await?;
             continue;
         }
-        let plan = match Plan::of(&inventory, deployment, &heads.links()) {
+        let plan = match Plan::of(&inventory, deployment, &heads.network()) {
             Ok(plan) => plan,
             Err(why) => {
                 if matches!(row.phase, Phase::Reserving { .. }) {
@@ -1020,7 +998,7 @@ pub(crate) async fn probe_unknown(
         if probes.unknown_probed.contains(id) {
             continue;
         }
-        if let Ok(plan) = Plan::of(&inventory, deployment, &heads.links()) {
+        if let Ok(plan) = Plan::of(&inventory, deployment, &heads.network()) {
             if probe(heads, probes, deployment, &plan, &readings, now_ms) {
                 probes.unknown_probed.insert(id.clone());
             }
@@ -1062,7 +1040,7 @@ pub(crate) async fn launch(
     let Some(deployment) = inventory.deployments.get(id) else {
         return Err(format!("there is no deployment {id}"));
     };
-    let plan = match Plan::of(&inventory, deployment, &heads.links()) {
+    let plan = match Plan::of(&inventory, deployment, &heads.network()) {
         Ok(plan) => plan,
         Err(why) => {
             apply(
@@ -1180,7 +1158,7 @@ pub(crate) mod tests {
         pub(crate) refuse: Mutex<Option<String>>,
         pub(crate) running: Mutex<BTreeMap<String, Vec<RunningBatch>>>,
         pub(crate) preempted: Mutex<Vec<(String, Preemption)>>,
-        pub(crate) links: Mutex<BTreeMap<String, String>>,
+        pub(crate) network: Mutex<Network>,
     }
 
     impl Heads for FakeHeads {
@@ -1226,8 +1204,8 @@ pub(crate) mod tests {
                 .push((request_id.to_string(), preemption));
             true
         }
-        fn links(&self) -> BTreeMap<String, String> {
-            self.links.lock().unwrap().clone()
+        fn network(&self) -> Network {
+            self.network.lock().unwrap().clone()
         }
     }
 

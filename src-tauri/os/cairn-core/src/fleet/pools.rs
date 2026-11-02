@@ -287,6 +287,35 @@ impl super::Fleet {
             .collect();
         derive_pools(named.iter().map(|(name, host)| (name.as_str(), *host)))
     }
+
+    /// How the attached machines are reached now, by public name: where each
+    /// one's connection to the runner came from, and each pooled machine's
+    /// address on the link joining its pool. The colocated executor shares the
+    /// orch's machine, so it is loopback. A remote executor whose connection
+    /// arrived on loopback came through a forwarded port, which says nothing
+    /// of where its machine is, so it has no connection address here.
+    pub fn network(&self) -> cairn_inference::Network {
+        let connections = self
+            .lock_connections()
+            .values()
+            .filter_map(|entry| {
+                let address = if entry.colocated {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    Some(entry.link_path?.executor.ip().to_canonical())
+                        .filter(|ip| !ip.is_loopback())?
+                };
+                Some((super::executor_public_name(entry), address))
+            })
+            .collect();
+        let links = self
+            .detected_pools()
+            .into_iter()
+            .flat_map(|pool| pool.members)
+            .filter_map(|member| Some((member.machine, member.link_address?)))
+            .collect();
+        cairn_inference::Network { connections, links }
+    }
 }
 
 #[cfg(test)]

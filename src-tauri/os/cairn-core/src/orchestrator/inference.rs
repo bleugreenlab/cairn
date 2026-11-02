@@ -383,6 +383,9 @@ pub struct InferenceView {
     pub retired_link_setting: bool,
     /// Enrolled executors by name: `true` when attached now.
     pub executors: BTreeMap<String, bool>,
+    /// How the attached executors are reached now, which a machine record
+    /// overrides.
+    pub network: cairn_inference::Network,
     /// What Cairn has done to the deployments it acts on.
     pub deployment_control: super::inference_control::ControlView,
     /// What placement holds and decides: the detected pools with their
@@ -410,6 +413,7 @@ pub async fn load_view(orch: &Orchestrator) -> Result<InferenceView, String> {
         retired_link_setting: crate::config::settings::load_inference(&orch.config_dir)
             .retired_bginf_link,
         executors,
+        network: orch.fleet.network(),
         deployment_control: super::inference_control::load_control_view(orch).await?,
         models: crate::fleet::models::view(orch).await?,
         verifications: super::inference_verify::load_verifications(&orch.db.local).await?,
@@ -637,7 +641,7 @@ machines:
             assert!(said.contains(line), "{line}: {said}");
         }
         let stored = load_inventory(&db).await.unwrap();
-        assert_eq!(stored.address_of(&"bginf-sp2".into()), Some("10.20.20.41"));
+        assert_eq!(stored.machines[&"bginf-sp2".into()].address, "10.20.20.41");
 
         let removal = Removals {
             profiles: vec!["qwen36-fast".into()],

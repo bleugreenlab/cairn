@@ -1,9 +1,12 @@
 //! The cairn-inference facet: how each model is run and where.
 //!
 //! The records ([`profile`], [`deployment`], [`machine`]) describe how a model
-//! is run, which machines a deployment of it occupies, and where each machine
-//! answers; the [`inventory`] holds them together and validates them as a
-//! whole. Which model runs when is not decided here: execution's placement
+//! is run, which machines a deployment of it occupies, and, for a machine that
+//! is not an enrolled executor, where it answers; the [`inventory`] holds them
+//! together and validates them as a whole. [`Addresses`] is the one answer to
+//! where a machine is reached: its record, else what the fleet observes of the
+//! enrolled executor's connection and pool link.
+//! Which model runs when is not decided here: execution's placement
 //! holds a running model as a resident on a pool of machines it detects, and
 //! acquires, evicts and warms it like any other work (tenets 1336, 1337).
 //! [`served`] is what Cairn offers from its deployments: every deployed
@@ -46,7 +49,9 @@ pub use deployment::{Deployment, DeploymentId};
 pub use inventory::{
     ChangeReport, Inventory, KindReport, UpdatedRecord, ValidationError, YamlError,
 };
-pub use machine::{MachineName, MachineRecord};
+pub use machine::{
+    unknown_address, Address, AddressSource, Addresses, MachineName, MachineRecord, Network,
+};
 pub use model::{Model, ModelFacts};
 pub use profile::{
     Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,

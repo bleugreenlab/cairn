@@ -1104,7 +1104,7 @@ pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String
             .map(ToString::to_string)
             .unwrap_or_default();
         let others = profiles.len().saturating_sub(1);
-        let id = super::inference_verify::spawn(
+        let plan = super::inference_verify::spawn(
             orch,
             profiles,
             detected,
@@ -1113,8 +1113,9 @@ pub async fn load(orch: &Orchestrator, pool: &str, model: &str) -> Result<String
             Some(OPERATOR.to_string()),
         )
         .await?;
+        let (id, head) = (plan.id, plan.head);
         return Ok(format!(
-            "{model} has no deployment on {pool} yet, so loading verifies profile {first} there first (verification {id}){}; the first that passes stays loaded",
+            "{model} has no deployment on {pool} yet, so loading verifies profile {first} there first (verification {id}, reaching its head at {head}){}; the first that passes stays loaded",
             match others {
                 0 => String::new(),
                 1 => ", then 1 more profile if it fails".to_string(),
@@ -1286,6 +1287,7 @@ pub async fn generate_profiles(
         model,
         &pool,
         &executor_snapshots(orch),
+        &orch.fleet.network(),
         &BTreeMap::new(),
     )
     .await
@@ -1299,7 +1301,7 @@ pub async fn verify_profile(
     pool: &str,
 ) -> Result<String, String> {
     let detected = super::inference_generate::detected_pool(orch, pool)?;
-    let id = super::inference_verify::spawn(
+    let plan = super::inference_verify::spawn(
         orch,
         vec![InferenceProfileId::from(profile)],
         detected,
@@ -1308,7 +1310,10 @@ pub async fn verify_profile(
         None,
     )
     .await?;
-    Ok(format!("Verifying {profile} on {pool} (verification {id})"))
+    Ok(format!(
+        "Verifying {profile} on {pool} (verification {}), reaching its head at {}",
+        plan.id, plan.head
+    ))
 }
 
 #[cfg(test)]

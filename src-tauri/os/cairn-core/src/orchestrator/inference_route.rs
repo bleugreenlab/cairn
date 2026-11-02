@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use cairn_config::inference::InferenceProfileDeclaration;
 use cairn_inference::control::Phase;
 use cairn_inference::served::{self, deployments_serving, EngineMeasure, ServedModel};
-use cairn_inference::{Deployment, DeploymentId, InferenceProfileId, Inventory};
+use cairn_inference::{
+    unknown_address, Addresses, Deployment, DeploymentId, InferenceProfileId, Inventory, Network,
+};
 use cairn_models::types::catalog::Modalities;
 
 use super::inference::load_inventory;
@@ -127,19 +129,21 @@ async fn healthy_now(orch: &Orchestrator) -> Result<BTreeSet<DeploymentId>, Stri
 pub(crate) async fn served_now(orch: &Orchestrator) -> Result<Vec<ServedModel>, String> {
     let inventory = served_inventory(orch).await?;
     let healthy = healthy_now(orch).await?;
+    let network = orch.fleet.network();
+    let addresses = Addresses::new(&inventory, &network);
     for deployment in inventory.deployments.values() {
         if !healthy.contains(&deployment.id) {
             forget(&deployment.id);
             continue;
         }
-        let (Some(profile), Some(address)) = (
+        let (Some(profile), Some(head)) = (
             inventory.profiles.get(&deployment.profile),
-            inventory.address_of(&deployment.head),
+            addresses.from_orch(&deployment.head),
         ) else {
             continue;
         };
         let load = models::healthy_since(orch, &deployment.id).await;
-        measure(deployment, address, &profile.served_name, load).await;
+        measure(deployment, &head.address, &profile.served_name, load).await;
     }
     Ok(served::served_models(&inventory, &measures()))
 }
@@ -219,7 +223,14 @@ async fn answer(
         RequestState::Ready { .. } => {
             let load = models::healthy_since(orch, &handle.deployment).await;
             Ok(Asked::Ready(
-                route(inventory, &handle.deployment, &handle.pool, load).await?,
+                route(
+                    inventory,
+                    &orch.fleet.network(),
+                    &handle.deployment,
+                    &handle.pool,
+                    load,
+                )
+                .await?,
             ))
         }
         RequestState::Waiting => {
@@ -239,6 +250,7 @@ async fn answer(
 
 async fn route(
     inventory: &Inventory,
+    network: &Network,
     deployment: &DeploymentId,
     pool: &PoolKey,
     load: Option<Ms>,
@@ -253,17 +265,19 @@ async fn route(
             record.profile
         )
     })?;
-    let address = inventory.address_of(&record.head).ok_or_else(|| {
-        format!(
-            "{deployment}'s head {} has no address among the inventory's machines, so its API cannot be reached; write one under machines in cairn://inference",
-            record.head
-        )
-    })?;
-    let measure = measure(record, address, &profile.served_name, load).await;
+    let head = Addresses::new(inventory, network)
+        .from_orch(&record.head)
+        .ok_or_else(|| {
+            format!(
+                "{deployment}'s API cannot be reached because its head {}",
+                unknown_address(&record.head)
+            )
+        })?;
+    let measure = measure(record, &head.address, &profile.served_name, load).await;
     Ok(Route {
         deployment: deployment.clone(),
         pool: pool.clone(),
-        api_base: record.api_base(address),
+        api_base: record.api_base(&head.address),
         served_name: profile.served_name.clone(),
         context_length: measure.context_length(),
     })

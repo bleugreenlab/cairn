@@ -14,7 +14,7 @@ use cairn_common::executor_protocol::{
     ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
 };
 use cairn_inference::generate::{self, Arch, HwMemory, MachineHw, PoolHw};
-use cairn_inference::{AcceleratorFamily, Inventory, MachineName};
+use cairn_inference::{AcceleratorFamily, Addresses, Inventory, MachineName, Network};
 use serde::{Deserialize, Serialize};
 
 use super::inference::{load_inventory, write_inventory, Authoring, Removals};
@@ -190,13 +190,17 @@ pub struct Generation {
     pub said: String,
 }
 
-/// Generate profiles for `model` on `pool` and write them.
+/// Generate profiles for `model` on `pool` and write them. A pool with a
+/// machine Cairn cannot reach is refused before anything is generated, since
+/// no candidate for it could be verified: its first machine heads a
+/// verification, as [`super::inference_verify::begin`] places it.
 pub async fn generate(
     db: &LocalDb,
     hub: &dyn Hub,
     model: &str,
     pool: &Pool,
     snapshots: &BTreeMap<String, ExecutorHealthSnapshot>,
+    network: &Network,
     stated: &BTreeMap<String, StatedHardware>,
 ) -> Result<Generation, String> {
     let inventory = load_inventory(db).await?;
@@ -204,6 +208,16 @@ pub async fn generate(
         format!("model {model} is not registered; append it to cairn://inference/models first")
     })?;
     let hardware = pool_hardware(pool, snapshots, stated)?;
+    let machines: Vec<MachineName> = pool.machines().map(MachineName::from).collect();
+    if let Some(problem) = machines
+        .first()
+        .and_then(|head| Addresses::new(&inventory, network).unreachable(head, &machines))
+    {
+        return Err(format!(
+            "no profile generated for pool {} could be verified: {problem}",
+            pool.key
+        ));
+    }
     let pool = &pool.key;
     let (repos, skipped) = weight_sources(hub, &model).await?;
     let generated = generate::generate(&model, &repos, &hardware);
@@ -329,12 +343,32 @@ mod tests {
                 "NVIDIA GeForce RTX 4090",
             ),
         )]);
+        let refusal = generate(
+            &db,
+            &hub,
+            "Qwen/Qwen3-Embedding-4B",
+            &Pool::of_one("bbs"),
+            &BTreeMap::new(),
+            &Network::default(),
+            &hardware,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            "no profile generated for pool bbs could be verified: bbs's address is unknown: no executor named bbs is attached and it has no machine record; enrol it as an executor or add a machine record"
+        );
+        let attached = Network {
+            connections: BTreeMap::from([("bbs".to_string(), "10.10.10.10".parse().unwrap())]),
+            ..Network::default()
+        };
         let said = generate(
             &db,
             &hub,
             "Qwen/Qwen3-Embedding-4B",
             &Pool::of_one("bbs"),
             &BTreeMap::new(),
+            &attached,
             &hardware,
         )
         .await
@@ -375,6 +409,7 @@ mod tests {
             "Qwen/Qwen3-Embedding-4B",
             &fedora,
             &BTreeMap::new(),
+            &Network::default(),
             &BTreeMap::new(),
         )
         .await
@@ -389,6 +424,7 @@ mod tests {
             "Qwen/Qwen3-Embedding-4B",
             &fedora,
             &BTreeMap::new(),
+            &Network::default(),
             &BTreeMap::new(),
         )
         .await

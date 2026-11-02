@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::{self, EngineSample, EngineSummary};
-use cairn_inference::DeploymentId;
+use cairn_inference::{Addresses, DeploymentId};
 
 use super::inference::load_inventory;
 use super::inference_control::deployment_phases;
@@ -89,14 +89,16 @@ async fn scrape_once(orch: &Orchestrator, client: &reqwest::Client) -> Result<()
         .map(|(id, _)| id)
         .collect();
     retain(&healthy);
+    let network = orch.fleet.network();
+    let addresses = Addresses::new(&inventory, &network);
     for id in &healthy {
         let Some(deployment) = inventory.deployments.get(id) else {
             continue;
         };
-        let Some(address) = inventory.address_of(&deployment.head) else {
+        let Some(head) = addresses.from_orch(&deployment.head) else {
             continue;
         };
-        let url = deployment.metrics_url(address);
+        let url = deployment.metrics_url(&head.address);
         let body = match client.get(&url).send().await {
             Ok(response) if response.status().is_success() => response.text().await.ok(),
             _ => None,

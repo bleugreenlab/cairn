@@ -587,12 +587,14 @@ pub(super) async fn dispatch(
             }
             let requester = actor(orch, request, None).await;
             let count = profiles.len();
-            let id = inference_verify::spawn(orch, profiles, detected, &requester, all, None)
+            let plan = inference_verify::spawn(orch, profiles, detected, &requester, all, None)
                 .await
                 .map_err(fail)?;
             Ok(Some(format!(
-                "Verifying {name}'s profiles on pool {pool} ({count} to try, {}), starting with verification {id}. Read cairn://inference/models/{name} for each one's outcome.",
-                if all { "every one" } else { "until one passes" }
+                "Verifying {name}'s profiles on pool {pool} ({count} to try, {}), starting with verification {}, which reaches its head at {}. Read cairn://inference/models/{name} for each one's outcome.",
+                if all { "every one" } else { "until one passes" },
+                plan.id,
+                plan.head
             )))
         }
         (CairnResource::InferenceModel { name }, ChangeMode::Delete) => {
@@ -667,10 +669,19 @@ pub(super) async fn dispatch(
             let detected = detected_pool(orch, pool).map_err(fail)?;
             let hub = Web::new().map_err(fail)?;
             let snapshots = snapshots(orch);
+            let network = orch.fleet.network();
             authorized(orch, request, async {
-                generate(&orch.db.local, &hub, model, &detected, &snapshots, &stated)
-                    .await
-                    .map(|generation| generation.said)
+                generate(
+                    &orch.db.local,
+                    &hub,
+                    model,
+                    &detected,
+                    &snapshots,
+                    &network,
+                    &stated,
+                )
+                .await
+                .map(|generation| generation.said)
             })
             .await
             .map(Some)
@@ -687,7 +698,7 @@ pub(super) async fn dispatch(
             }
             let detected = detected_pool(orch, &pool).map_err(fail)?;
             let requester = actor(orch, request, None).await;
-            let verification = inference_verify::spawn(
+            let plan = inference_verify::spawn(
                 orch,
                 vec![cairn_inference::InferenceProfileId::from(id.as_str())],
                 detected,
@@ -697,8 +708,9 @@ pub(super) async fn dispatch(
             )
             .await
             .map_err(fail)?;
+            let (verification, head) = (plan.id, plan.head);
             Ok(Some(format!(
-                "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, pinned for the verification so placement displaces any unpinned model on its machines, then its health is checked and it is benchmarked; afterwards it is unloaded and placement's rules bring the pool's models back. Read cairn://inference/verifications/{verification} for its stage."
+                "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, its head reached at {head}, pinned for the verification so placement displaces any unpinned model on its machines, then its health is checked and it is benchmarked; afterwards it is unloaded and placement's rules bring the pool's models back. Read cairn://inference/verifications/{verification} for its stage."
             )))
         }
         _ => Ok(None),

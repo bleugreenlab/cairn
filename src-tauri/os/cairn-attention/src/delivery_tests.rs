@@ -5,7 +5,7 @@ use crate::delivery::{
     one_line_excerpt, prose_candidates_sql, render_push_resolved, CATCHUP_DIGEST_CHARS,
     REVIEW_ARTIFACT_SQL, WINDOW_TURNS_SQL,
 };
-use crate::push::{Boundary, Push, Wake};
+use crate::push::{Boundary, Push, Wake, JOB_CHAT_TURNS_SQL};
 use crate::runtime::*;
 use crate::storage::*;
 use crate::wakes::conditions::{ConditionOutcome, WakeCondition};
@@ -279,6 +279,44 @@ async fn catchup_without_assistant_text_still_counts_its_turns() {
     );
 }
 
+/// The window walked is the window counted. A run-less session-boundary turn is
+/// one of the new turns, so the walk takes it rather than reaching back past the
+/// cursor, and the read turn's prose is not quoted as news.
+#[tokio::test]
+async fn catchup_walk_stays_inside_the_counted_window() {
+    let (runtime, db) = fixture("delivery-catchup-boundary.db").await;
+    said(&db, "a", 1, 100, "old").await;
+    turn(
+        &db,
+        "b",
+        2,
+        200,
+        &[(
+            "b-call",
+            201,
+            "assistant",
+            assistant_read("call-1", &["file:x"]),
+            None,
+        )],
+    )
+    .await;
+    db.execute_script(
+        "INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,created_at,updated_at)
+           VALUES('c','sess-2',NULL,'child-job',1,'completed',300,300);
+         INSERT INTO events(id,run_id,sequence,timestamp,event_type,data,turn_id,created_at)
+           VALUES('c-boundary','run-1',300,300,'system:session_boundary','{}','c',300);",
+    )
+    .await
+    .unwrap();
+
+    let (uri, rendered) = catchup(&runtime, 1).await;
+
+    assert_eq!(
+        rendered,
+        format!("{}\n\nbuilder · 2 new turns. Read {uri}", header(&uri))
+    );
+}
+
 #[tokio::test]
 async fn catchup_with_operator_messages_keeps_digest_and_adds_line() {
     let (runtime, db) = fixture("delivery-catchup-digest.db").await;
@@ -471,13 +509,17 @@ async fn failed_lookup_keeps_the_pointer() {
     assert_eq!(rendered, pointer(&uri, "New chat to catch up on"));
 }
 
-/// Each new statement is bounded by what it shows: no scan, no sort over a
-/// job's history, and each on the index that bounds it. The count of the job's
-/// turns is the existing cursor arithmetic and is not held here.
+/// Each statement is bounded by what it shows: no scan, no sort over a job's
+/// history, and each on the index that bounds it.
 #[tokio::test]
 async fn catchup_and_review_statements_stay_on_their_indexes() {
     let (_, db) = fixture("delivery-plans.db").await;
     let statements = [
+        (
+            "job chat turns",
+            JOB_CHAT_TURNS_SQL.to_string(),
+            "idx_turns_job_id",
+        ),
         (
             "window turns",
             WINDOW_TURNS_SQL.to_string(),
@@ -507,8 +549,10 @@ async fn catchup_and_review_statements_stay_on_their_indexes() {
                 Box::pin(async move {
                     let mut rows = if explain.contains("?4") {
                         conn.query(&explain, params!["a", 1i64, "b", 4i64]).await?
-                    } else {
+                    } else if explain.contains("?2") {
                         conn.query(&explain, params!["a", "b"]).await?
+                    } else {
+                        conn.query(&explain, params!["a"]).await?
                     };
                     let mut steps = Vec::new();
                     while let Some(row) = rows.next().await? {
@@ -524,6 +568,16 @@ async fn catchup_and_review_statements_stay_on_their_indexes() {
         assert!(!plan.contains("SCAN"), "{label} scans:\n{plan}");
         if label != "turn fallback" {
             assert!(!plan.contains("SORTER"), "{label} sorts:\n{plan}");
+        }
+        if label == "job chat turns" || label == "window turns" {
+            assert!(
+                plan.contains("COVERING INDEX idx_events_turn_id"),
+                "{label} must probe events by key alone:\n{plan}"
+            );
+            assert!(
+                !plan.contains("idx_events_run_id"),
+                "{label} must not walk a run's events:\n{plan}"
+            );
         }
     }
 }

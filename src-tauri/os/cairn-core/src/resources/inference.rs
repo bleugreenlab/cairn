@@ -16,10 +16,10 @@ use crate::fleet::models::requests::RequestState;
 use crate::fleet::models::store::ANSWERED_KEPT_MS;
 use crate::fleet::models::{ModelsView, PoolView, ResidentView};
 use crate::orchestrator::inference::InferenceView;
-use crate::orchestrator::inference_control::{link_addresses, machines_at, LoadRow};
+use crate::orchestrator::inference_control::LoadRow;
 use crate::orchestrator::inference_verify::VerificationRow;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
-use cairn_inference::{Deployment, DeploymentId};
+use cairn_inference::{unknown_address, Addresses, Deployment, DeploymentId};
 
 const INDEX: &[(&str, &str)] = &[
     (
@@ -61,6 +61,28 @@ fn age(seconds: i64) -> String {
 
 fn age_since(view: &InferenceView, ms: i64) -> String {
     age((view.now_ms - ms) / 1_000)
+}
+
+/// Where Cairn reaches `deployment`'s head and where it learned that, with
+/// the URLs derived from it; or why it cannot reach the head.
+fn head_lines(out: &mut String, view: &InferenceView, deployment: &Deployment) {
+    match Addresses::new(&view.inventory, &view.network).from_orch(&deployment.head) {
+        Some(head) => {
+            let _ = writeln!(out, "- head address: {head}");
+            let _ = writeln!(out, "- API base: {}", deployment.api_base(&head.address));
+            let _ = writeln!(out, "- health: {}", deployment.health_url(&head.address));
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "- API base and health: unknown, so Cairn cannot start or probe it (port {}, API path {}, health path {}): the head {}",
+                deployment.api_port,
+                deployment.api_path,
+                deployment.health_path,
+                unknown_address(&deployment.head)
+            );
+        }
+    }
 }
 
 fn enrolment(view: &InferenceView, machine: &MachineName) -> &'static str {
@@ -375,19 +397,7 @@ pub(crate) fn render_deployments(view: &InferenceView, params: &[QueryParam]) ->
             };
             let _ = writeln!(out, "  - `{machine}` ({head}{})", enrolment(view, machine));
         }
-        match inventory.address_of(&deployment.head) {
-            Some(address) => {
-                let _ = writeln!(out, "- API base: {}", deployment.api_base(address));
-                let _ = writeln!(out, "- health: {}", deployment.health_url(address));
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "- API base and health: head address unknown (port {}, API path {}, health path {})",
-                    deployment.api_port, deployment.api_path, deployment.health_path
-                );
-            }
-        }
+        head_lines(&mut out, view, deployment);
         let _ = writeln!(out, "- phase: {}", phase_summary(view, &deployment.id));
         let _ = writeln!(
             out,
@@ -579,15 +589,7 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     for machine in &deployment.machines {
         let _ = writeln!(out, "{}", machine_line(view, deployment, machine));
     }
-    match view.inventory.address_of(&deployment.head) {
-        Some(address) => {
-            let _ = writeln!(out, "- API base: {}", deployment.api_base(address));
-            let _ = writeln!(out, "- health: {}", deployment.health_url(address));
-        }
-        None => out.push_str(
-            "- health: the head's address is unknown, so Cairn cannot start or probe it\n",
-        ),
-    }
+    head_lines(&mut out, view, deployment);
     let loads = view.deployment_control.loads.get(&id);
     match loads.and_then(|loads| {
         loads
@@ -683,10 +685,9 @@ fn pool_section(out: &mut String, view: &InferenceView, pool: &PoolView) {
     out.push_str("- machines:\n");
     for member in &pool.members {
         let name = MachineName::from(member.machine.as_str());
-        let address = view
-            .inventory
-            .address_of(&name)
-            .map_or("address unknown".to_string(), str::to_string);
+        let address = Addresses::new(&view.inventory, &view.network)
+            .from_orch(&name)
+            .map_or("address unknown".to_string(), |at| at.to_string());
         let link = member
             .link_address
             .map(|ip| format!("; link address {ip}"))
@@ -1030,14 +1031,14 @@ pub(crate) fn render_profile(view: &InferenceView, id: &str, params: &[QueryPara
     };
     let mut out = String::new();
     profile_section(&mut out, profile);
-    let links = link_addresses(view.models.pools.iter().flat_map(|pool| &pool.members));
+    let addresses = Addresses::new(&view.inventory, &view.network);
     for deployment in view
         .inventory
         .deployments
         .values()
         .filter(|d| d.profile == profile.id)
     {
-        let machines = machines_at(&view.inventory, deployment, &links);
+        let machines = addresses.machines_at(deployment);
         let _ = writeln!(out, "## As deployment {}\n", deployment.id);
         match cairn_inference::render::render(profile, deployment, &machines) {
             Ok(rendered) => {
@@ -1125,7 +1126,7 @@ mod tests {
     use crate::fleet::models::settings::EffectiveSettings;
     use crate::fleet::models::{DeploymentPlacement, RequestView};
     use crate::fleet::pools::PoolMember;
-    use cairn_inference::{Inventory, RecordSource};
+    use cairn_inference::{Inventory, Network, RecordSource};
     use std::collections::BTreeMap;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1153,6 +1154,7 @@ machines:
             inventory: Inventory::from_yaml(INVENTORY).unwrap(),
             retired_link_setting: false,
             executors: BTreeMap::from([("fedora".to_string(), true)]),
+            network: Network::default(),
             models: ModelsView {
                 now: NOW,
                 ..ModelsView::default()
@@ -1330,7 +1332,7 @@ machines:
         for line in [
             "## sp1+sp2\n",
             "- link: 200 Gb/s between its machines",
-            "  - `sp1`: not enrolled; 192.0.2.40\n",
+            "  - `sp1`: not enrolled; 192.0.2.40 (record)\n",
             "  - `sp2`: not enrolled; address unknown\n",
             "  - deepseek-ai/DeepSeek-V4-Flash (`dsv4f-tp2`): healthy; reserving sp1 100.0 GiB, sp2 98.0 GiB; adopted as it was running when placement started, 30m ago; stays: deepseek-ai/DeepSeek-V4-Flash was requested within its idle window and keeps its machines, until in 9m",
             "- warm model: deepseek-ai/DeepSeek-V4-Flash",
@@ -1410,7 +1412,9 @@ machines:
         );
         let deployments = render_deployments(&view, &[]);
         assert!(
-            deployments.contains("- API base: http://192.0.2.43:8090/v1"),
+            deployments.contains(
+                "- head address: 192.0.2.43 (record)\n- API base: http://192.0.2.43:8090/v1"
+            ),
             "{deployments}"
         );
         assert!(
@@ -1420,6 +1424,30 @@ machines:
         assert!(
             deployments.contains("  - `sp2` (not enrolled)"),
             "{deployments}"
+        );
+    }
+
+    /// An attached executor with no machine record is reached where its
+    /// connection came from, and the page says so; one neither recorded nor
+    /// attached says what would give it an address.
+    #[test]
+    fn a_head_s_address_names_where_it_came_from() {
+        let mut view = view();
+        view.inventory.machines.clear();
+        view.network
+            .connections
+            .insert("fedora".into(), "10.10.10.10".parse().unwrap());
+        let deployments = render_deployments(&view, &[]);
+        assert!(
+            deployments.contains(
+                "- head address: 10.10.10.10 (observed from its connection)\n- API base: http://10.10.10.10:8090/v1\n- health: http://10.10.10.10:8090/health\n"
+            ),
+            "{deployments}"
+        );
+        let page = render_deployment(&view, "qwen36-fast", &[]);
+        assert!(
+            page.contains("- API base and health: unknown, so Cairn cannot start or probe it (port 8001, API path /v1, health path /v1/models): the head sp1's address is unknown: no executor named sp1 is attached and it has no machine record; enrol it as an executor or add a machine record\n"),
+            "{page}"
         );
     }
 

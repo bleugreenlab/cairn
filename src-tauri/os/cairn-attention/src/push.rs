@@ -1204,23 +1204,38 @@ pub async fn read_cursor_updated_at(
     .await
 }
 
-/// Distinct chat turns currently recorded across one job's runs — the job-scoped
-/// chat tail, matching exactly what `{node}/chat` renders (the node chat loads
-/// events for that one job's runs). Runs on a caller-supplied connection so the
-/// catch-up cursor advance can compute the delivery-time tail inside the stamp
-/// transaction.
+/// The `turns` predicate selecting job `?1`'s turns that the chat renders: those
+/// with at least one event. A literal so the count and the catch-up window walk
+/// can each `concat!` it into a `const` statement and share one spelling.
+macro_rules! job_chat_turns_where {
+    () => {
+        "job_id = ?1 AND EXISTS (SELECT 1 FROM events e WHERE e.turn_id = turns.id)"
+    };
+}
+pub(crate) use job_chat_turns_where;
+
+/// The job chat tail: how many of job `?1`'s turns have at least one event.
+pub(crate) const JOB_CHAT_TURNS_SQL: &str =
+    concat!("SELECT COUNT(*) FROM turns WHERE ", job_chat_turns_where!());
+
+/// The job-scoped chat tail: the number of the job's turns that have at least
+/// one event, which is exactly the blocks `{node}/chat` pages with `?offset=`
+/// (blocks are built from events). A crashed turn that recorded no event renders
+/// nothing and is not counted; a run-less turn holding only a session boundary
+/// renders a block and is counted.
+///
+/// This equals counting the distinct `turn_id`s of the events on the job's runs
+/// because an event's turn belongs to the job that owns the event's run. Keyed on
+/// `turns.job_id`, it costs one `idx_turns_job_id` entry plus one covering
+/// `idx_events_turn_id` probe per turn and never opens an event row.
+///
+/// Runs on a caller-supplied connection so the catch-up cursor advance can
+/// compute the delivery-time tail inside the stamp transaction.
 pub(crate) async fn count_job_chat_turns(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<i64> {
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(DISTINCT e.turn_id) FROM events e
-             JOIN runs r ON e.run_id = r.id
-             WHERE r.job_id = ?1 AND e.turn_id IS NOT NULL",
-            params![job_id],
-        )
-        .await?;
+    let mut rows = conn.query(JOB_CHAT_TURNS_SQL, params![job_id]).await?;
     match rows.next().await? {
         Some(row) => Ok(row.i64(0)?),
         None => Ok(0),
@@ -4370,16 +4385,16 @@ mod tests {
 
     // ---- Catch-up read cursors (CAIRN-1894) ----------------------------------
 
-    /// Insert a chat event carrying `turn_id` on the child issue's run so
-    /// `count_issue_chat_turns` sees a distinct turn.
+    /// Insert a `child-job` turn on its run with one chat event, so
+    /// `count_job_chat_turns` sees one more turn.
     async fn add_chat_turn(db: &LocalDb, turn_id: &str, seq: i64) {
         let turn_id = turn_id.to_string();
         db.write(move |conn| {
             let turn_id = turn_id.clone();
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-                     VALUES(?1,'sess2','run-1',?2,'completed',1,1)",
+                    "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+                     VALUES(?1,'sess2','run-1','child-job',?2,'completed',1,1)",
                     params![turn_id.as_str(), seq],
                 )
                 .await?;
@@ -4515,6 +4530,51 @@ mod tests {
             Some(10),
             "a non-catchup push must not touch the read cursor"
         );
+    }
+
+    /// The tail counts the turns the chat renders: a crashed turn with no event
+    /// is left out, a run-less session-boundary turn is counted, and a sub-agent
+    /// event sharing a turn adds nothing. It agrees with the distinct event turns
+    /// on the job's runs, the definition it replaced.
+    #[tokio::test]
+    async fn job_chat_tail_counts_turns_that_have_events() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        add_chat_turn(&db, "t1", 1).await;
+        add_chat_turn(&db, "t2", 2).await;
+        db.execute_script(
+            "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('crashed','sess2','run-1','child-job',3,'failed',1,1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('boundary','sess3',NULL,'child-job',4,'completed',1,1);
+             INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
+               VALUES('ev-boundary','run-1','boundary',4,1,'system:session_boundary','{}',1);
+             INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+               VALUES('ev-sub','run-1','t2',5,1,'assistant','{}','call-1',1);",
+        )
+        .await
+        .unwrap();
+
+        let (tail, distinct_event_turns) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let tail = count_job_chat_turns(conn, "child-job").await?;
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(DISTINCT e.turn_id) FROM events e
+                             JOIN runs r ON e.run_id = r.id
+                             WHERE r.job_id = ?1 AND e.turn_id IS NOT NULL",
+                            params!["child-job"],
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("a count row");
+                    Ok::<_, DbError>((tail, row.i64(0)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(tail, 3);
+        assert_eq!(tail, distinct_event_turns);
     }
 
     #[tokio::test]
