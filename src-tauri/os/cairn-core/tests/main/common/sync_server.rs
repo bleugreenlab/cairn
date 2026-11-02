@@ -268,6 +268,26 @@ fn cached_tursodb_roots() -> Vec<PathBuf> {
     roots.into_iter().map(|root| root.join("tursodb")).collect()
 }
 
+/// Name the provisioned `tursodb` in `CAIRN_TURSODB_BIN` while the ambient homes
+/// are still visible, the handoff `hermeticRustTestEnv` makes for a runner-sealed
+/// process. Runs before the in-process seal, which moves those homes and drops
+/// `CAIRN_TOOL_CACHE`; under the runner the variable is already set, or nothing
+/// is found, and this changes nothing. Only an existing file is named: [`runs`]
+/// still proves it works when it is resolved.
+pub fn hand_tursodb_across_the_seal() {
+    if std::env::var_os("CAIRN_TURSODB_BIN").is_some() {
+        return;
+    }
+    let pinned = parse_pinned_rev(DATABASE_MANIFEST);
+    let provisioned = cached_tursodb_roots()
+        .into_iter()
+        .filter_map(|root| pinned_bin_in(&root, pinned))
+        .find(|bin| bin.is_file());
+    if let Some(bin) = provisioned {
+        std::env::set_var("CAIRN_TURSODB_BIN", bin);
+    }
+}
+
 fn tursodb_exe() -> &'static str {
     if cfg!(windows) {
         "tursodb.exe"

@@ -3568,7 +3568,15 @@ mod tests {
         assert!(baseline.contains("Locally authored project instructions."));
         assert_eq!(baseline.matches("<agent_role>").count(), 1);
         assert_eq!(baseline.matches("</agent_role>").count(), 1);
-        crate::system_prompt::assert_no_substrate_vocabulary("assembled prompt", baseline);
+        // The fixture's paths live wherever this process keeps temp files (an
+        // executor's cell scratch, say), and that directory's name is not prose
+        // the prompt chose; the vocabulary guard is about the prose.
+        let temp = std::env::temp_dir();
+        let mut prose = baseline.clone();
+        for root in [temp.canonicalize().unwrap_or_else(|_| temp.clone()), temp] {
+            prose = prose.replace(&*root.to_string_lossy(), "<temp>");
+        }
+        crate::system_prompt::assert_no_substrate_vocabulary("assembled prompt", &prose);
         for prompt in prompts.iter() {
             assert_eq!(prompt, baseline);
             for forbidden in [

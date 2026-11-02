@@ -51,7 +51,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [features]
-# Test helpers other crates' tests share (`token_meter::assert_meter_contract`).
+# Test helpers other crates' tests share (`token_meter::assert_meter_contract`,
+# and `test_seal`, which every test binary runs before `main`).
 test-utils = []
 
 [dev-dependencies]

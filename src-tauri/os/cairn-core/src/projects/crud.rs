@@ -1737,6 +1737,31 @@ mod tests {
         assert_eq!(resolved.as_deref(), Some("/member/repo"));
     }
 
+    /// Production seeds the workspace project from the resolved Cairn home, so
+    /// any test that seeds it the same way must get a repository inside the
+    /// test seal, never the operator's live home.
+    #[tokio::test]
+    async fn the_workspace_project_seeded_from_the_resolved_home_lies_inside_the_seal() {
+        let db = migrated_db().await;
+        let home = crate::config::get_config_dir().unwrap();
+        seed_workspace_project_db(&db, &FixedClock, &home)
+            .await
+            .unwrap();
+        let workspace = get_db(&db, "workspace")
+            .await
+            .unwrap()
+            .expect("workspace row");
+        let seal = std::env::var_os(cairn_common::test_seal::SEALED_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("the test process is sealed before main");
+        assert!(
+            cairn_common::test_seal::is_within(&seal, Path::new(&workspace.repo_path)),
+            "the workspace repo_path {} escapes the seal {}",
+            workspace.repo_path,
+            seal.display()
+        );
+    }
+
     #[tokio::test]
     async fn seed_workspace_project_is_visible_and_idempotent() {
         let db = migrated_db().await;

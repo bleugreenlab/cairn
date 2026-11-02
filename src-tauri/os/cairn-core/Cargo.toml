@@ -159,6 +159,8 @@ cairn-config = { path = "../cairn-config", features = ["test-utils"] }
 cairn-vcs = { path = "../cairn-vcs", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
 async-trait = "0.1"
+# Runs `cairn_common::test_seal` before `main` in each test binary.
+ctor = { version = "1", default-features = false }
 filetime = "0.2"
 mockall = "0.13"
 serde_json = "1.0"

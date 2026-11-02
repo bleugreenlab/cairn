@@ -1,5 +1,66 @@
 use crate::storage::{LocalDb, RowExt};
 
+// Seal the cairn-core test binary away from every live Cairn home before any
+// test runs; see `cairn_common::test_seal`.
+ctor::declarative::ctor! {
+    #[ctor(unsafe)]
+    fn seal_test_process() {
+        cairn_common::test_seal::seal_process();
+    }
+}
+
+/// The seal this process runs inside, whether its constructor applied it or the
+/// Rust test runner did.
+fn seal_root() -> std::path::PathBuf {
+    std::env::var_os(cairn_common::test_seal::SEALED_ENV)
+        .map(std::path::PathBuf::from)
+        .expect("the test process is sealed before main")
+}
+
+#[test]
+fn the_test_process_runs_inside_its_seal() {
+    use cairn_common::test_seal::is_within;
+    let root = seal_root();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    for (name, path) in [
+        ("cairn home", cairn_common::paths::cairn_home()),
+        ("HOME", home),
+        ("temp dir", std::env::temp_dir()),
+    ] {
+        assert!(
+            is_within(&root, &path),
+            "{name} {} escapes the seal {}",
+            path.display(),
+            root.display()
+        );
+    }
+    let ceilings = std::env::var_os("GIT_CEILING_DIRECTORIES").expect("git ceilings");
+    assert!(
+        std::env::split_paths(&ceilings).any(|ceiling| ceiling == root),
+        "the seal root {} is not a git ceiling",
+        root.display()
+    );
+}
+
+/// A temp directory that is not a repository must not resolve to one above it.
+/// Unsealed, with the temp directory a build slot's scratch under the live
+/// home, this resolved the home's own `.git`, and a remote or commit made "in a
+/// temp repo" landed in the operator's workspace repository.
+#[test]
+fn git_cannot_discover_a_repository_above_the_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = crate::env::git()
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "a bare temp directory resolved to the repository at {}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+}
+
 /// Log targets some test has asked to record, and the lines recorded for them.
 static CAPTURED_TARGETS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 static CAPTURED_LINES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());

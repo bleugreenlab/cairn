@@ -8,6 +8,17 @@
 
 mod common;
 
+// Seal this binary away from every live Cairn home before any test runs (see
+// `cairn_common::test_seal`), handing the provisioned `tursodb` across first,
+// because the seal moves the homes its cache is found under.
+ctor::declarative::ctor! {
+    #[ctor(unsafe)]
+    fn seal_test_process() {
+        common::sync_server::hand_tursodb_across_the_seal();
+        cairn_common::test_seal::seal_process();
+    }
+}
+
 mod account;
 mod accumulator;
 mod action_runs;

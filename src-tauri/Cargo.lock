@@ -1062,6 +1062,7 @@ dependencies = [
  "chrono-tz",
  "crossbeam-channel",
  "crypto_box",
+ "ctor",
  "diffy",
  "dirs 5.0.1",
  "filetime",
@@ -1873,6 +1874,12 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "ctor"
+version = "1.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 
 [[package]]
 name = "ctr"
