@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use cairn_common::query::QueryParam;
-use cairn_inference::fit::{templates, Template};
+use cairn_inference::fit::{templates, templates_for, Template};
 use cairn_inference::hf::{AuxiliaryFile, RepoFiles};
+use cairn_inference::AcceleratorFamily;
 use cairn_inference::{control::gib, Model};
 use serde::Serialize;
 
@@ -199,7 +200,7 @@ pub(crate) async fn render_pool_hardware(
         return data(&facts);
     }
     let mut out = format!(
-        "# Pool {}: hardware\n\n- link: {}\n- driver and CUDA versions: not reported by executors\n\n",
+        "# Pool {}: hardware\n\n- link: {}\n- driver, CUDA and ROCm versions: not reported by executors\n\n",
         facts.pool,
         match (facts.linked, facts.link_gbps) {
             (true, Some(gbps)) => format!("{gbps} Gb/s between its machines, so a model may split across them"),
@@ -323,39 +324,85 @@ fn fit_line(out: &mut String, fit: &FitAnswer) {
 fn template_lines(out: &mut String, template: &Template) {
     let _ = writeln!(
         out,
-        "## {}\n\n- server: {}\n- hardware: {} on {:?}{}\n- weights: {:?}\n- image: `{}`\n- command: `{}`\n",
+        "## {}\n\n- server: {}\n- hardware: {} on {}{}\n- weights: {:?}\n- image: `{}`\n- command: `{}`{}\n",
         template.id,
         template.server.as_str(),
         template.family.as_str(),
-        template.runtime,
+        template.runtime.as_str(),
         template
             .arch
-            .map(|arch| format!(", {arch:?} only"))
+            .map(|arch| format!(", {} only", arch.as_str()))
             .unwrap_or_default(),
         template.formats,
         template.image,
-        template.command.join(" ")
+        template.command.join(" "),
+        template
+            .notes
+            .as_deref()
+            .map(|notes| format!("\n- notes: {notes}"))
+            .unwrap_or_default()
     );
 }
 
-/// `cairn://inference/templates`.
-pub(crate) fn render_templates(params: &[QueryParam]) -> String {
-    const URI: &str = "cairn://inference/templates";
-    if let Some(error) = reject(URI, params, &["format"]) {
-        return error;
+/// The pool a templates read is scoped to: its key and its accelerator.
+struct TemplatesScope {
+    pool: String,
+    accelerator: AcceleratorFamily,
+}
+
+fn templates_page(scope: Option<&TemplatesScope>, listed: &[&Template], as_data: bool) -> String {
+    if as_data {
+        return data(&listed);
     }
-    match json(URI, params) {
-        Err(error) => return error,
-        Ok(true) => return data(&templates()),
-        Ok(false) => {}
+    let mut out = match scope {
+        None => String::from(
+            "# Inference templates\n\nEngines Cairn ships as known-good starting points. Add `?pool=<pool>` for those that serve a pool. Read `cairn://inference/templates/<id>?model=&pool=&source=` for one made into a whole profile.\n\n",
+        ),
+        Some(scope) => format!(
+            "# Inference templates for pool {}\n\nIts accelerator is {}: these are the engines Cairn ships as known-good starting points for it, on its machines' CPU. Read `cairn://inference/templates/<id>?model=&pool={}&source=` for one made into a whole profile.\n\n",
+            scope.pool,
+            scope.accelerator.as_str(),
+            scope.pool
+        ),
+    };
+    if listed.is_empty() {
+        out.push_str("No shipped template serves it: research an engine for it and write the profile from that.\n");
     }
-    let mut out = String::from(
-        "# Inference templates\n\nEngines Cairn ships as known-good starting points. Read `cairn://inference/templates/<id>?model=&pool=&source=` for one made into a whole profile.\n\n",
-    );
-    for template in templates() {
+    for template in listed {
         template_lines(&mut out, template);
     }
     out
+}
+
+/// `cairn://inference/templates`, every template or, with `?pool=`, those
+/// that serve the pool's accelerator and CPU.
+pub(crate) async fn render_templates(orch: &Orchestrator, params: &[QueryParam]) -> String {
+    const URI: &str = "cairn://inference/templates";
+    if let Some(error) = reject(URI, params, &["format", "pool", "generation"]) {
+        return error;
+    }
+    let as_data = match json(URI, params) {
+        Ok(as_data) => as_data,
+        Err(error) => return error,
+    };
+    let Some(pool) = find_query_value(params, "pool") else {
+        let all: Vec<&Template> = templates().iter().collect();
+        return templates_page(None, &all, as_data);
+    };
+    let scoped = async {
+        let stated = stated(orch, params).await?;
+        let (detected, hardware) = generate::hardware_of(orch, pool, &stated)?;
+        let scope = TemplatesScope {
+            pool: detected.key.0,
+            accelerator: hardware.accelerator()?,
+        };
+        Ok::<_, String>((scope, templates_for(&hardware)?))
+    }
+    .await;
+    match scoped {
+        Ok((scope, listed)) => templates_page(Some(&scope), &listed, as_data),
+        Err(error) => error,
+    }
 }
 
 /// `cairn://inference/templates/<id>`, and with model, pool and source a
@@ -528,20 +575,37 @@ mod tests {
 
     #[test]
     fn the_templates_list_and_their_data_agree() {
-        let listed = render_templates(&[]);
+        let all: Vec<&Template> = templates().iter().collect();
+        let listed = templates_page(None, &all, false);
         for template in templates() {
             assert!(listed.contains(&format!("## {}", template.id)), "{listed}");
         }
-        let as_data = render_templates(&[QueryParam {
-            key: "format".into(),
-            value: "json".into(),
-        }]);
+        assert!(listed.contains("- hardware: amd on rocm, x86_64 only"));
+        assert!(
+            listed.contains("- notes: "),
+            "a template's research is read"
+        );
+        let as_data = templates_page(None, &all, true);
         let parsed: serde_json::Value = serde_json::from_str(&as_data).unwrap();
         assert_eq!(parsed.as_array().unwrap().len(), templates().len());
-        assert!(render_templates(&[QueryParam {
-            key: "format".into(),
-            value: "xml".into(),
-        }])
-        .starts_with("Unknown format"));
+    }
+
+    #[test]
+    fn a_pool_s_templates_name_its_accelerator() {
+        let rocm: Vec<&Template> = templates()
+            .iter()
+            .filter(|t| t.family == AcceleratorFamily::Amd)
+            .collect();
+        let scope = TemplatesScope {
+            pool: "fedora".into(),
+            accelerator: AcceleratorFamily::Amd,
+        };
+        let page = templates_page(Some(&scope), &rocm, false);
+        assert!(
+            page.starts_with("# Inference templates for pool fedora\n\nIts accelerator is amd:")
+        );
+        assert!(page.contains("## llamacpp-rocm") && !page.contains("## llamacpp-cuda"));
+        let none = templates_page(Some(&scope), &[], false);
+        assert!(none.contains("No shipped template serves it"));
     }
 }

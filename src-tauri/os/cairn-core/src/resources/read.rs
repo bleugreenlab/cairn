@@ -2099,7 +2099,7 @@ async fn render_resource_body(
             crate::resources::inference_generate::render_fit(orch, &params).await
         }
         CairnResource::InferenceTemplates => {
-            crate::resources::inference_generate::render_templates(&params)
+            crate::resources::inference_generate::render_templates(orch, &params).await
         }
         CairnResource::InferenceTemplate { id } => {
             crate::resources::inference_generate::render_template(orch, &id, &params).await

@@ -354,7 +354,23 @@ fn rank_script(
             AcceleratorFamily::Amd => {
                 flags.extend(["--device".into(), "/dev/dri".into()]);
                 if accelerator.runtime == AcceleratorRuntime::Rocm {
-                    flags.extend(["--device".into(), "/dev/kfd".into()]);
+                    // ROCm's documented container surface: the compute
+                    // interface beside the render nodes, the video group, and
+                    // no seccomp filter, since the default profiles refuse the
+                    // NUMA memory-policy calls (mbind, set_mempolicy) the HSA
+                    // runtime makes. Podman refuses any group beside
+                    // keep-groups, which already carries the account's own
+                    // video and render membership into a rootless container.
+                    flags.extend([
+                        "--device".into(),
+                        "/dev/kfd".into(),
+                        "--security-opt".into(),
+                        "seccomp=unconfined".into(),
+                    ]);
+                    runtime_flags.push_str(
+                        "if [ \"$rt\" = docker ]; then gpu=(--group-add video); else gpu=(); fi\n",
+                    );
+                    flags.push("\"${gpu[@]}\"".into());
                 }
             }
             AcceleratorFamily::Apple => {

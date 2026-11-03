@@ -22,7 +22,9 @@
 //!   pinned by digest with the server it runs, the hardware it serves and the
 //!   weight formats it reads, and [`starting_profile`], one of them made into
 //!   a whole profile for a weight source on a pool, which the agent may take
-//!   as it is or change.
+//!   as it is or change. A template serves a pool only on the pool's
+//!   accelerator ([`PoolHw::accelerator`], read from its machines' hardware
+//!   and never assumed) and its machines' CPU ([`Template::serves`]).
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -62,6 +64,40 @@ pub struct Template {
     pub image: String,
     pub formats: Vec<Format>,
     pub command: Vec<String>,
+    /// What the research behind the template found worth knowing when running
+    /// it: the GPUs its image is built for, known issues and their workarounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+impl Template {
+    /// Whether this template's image runs on every machine of `pool`, or why
+    /// not: the pool's accelerator must be the template's family, and every
+    /// machine's CPU the template's architecture when it names one.
+    pub fn serves(&self, pool: &PoolHw) -> Result<(), String> {
+        let family = pool.accelerator()?;
+        if self.family != family {
+            return Err(format!(
+                "template {} runs on {} ({}), and the pool's accelerator is {}",
+                self.id,
+                self.family.as_str(),
+                self.runtime.as_str(),
+                family.as_str()
+            ));
+        }
+        if let Some(arch) = self.arch {
+            if let Some(machine) = pool.machines.iter().find(|m| m.arch != arch) {
+                return Err(format!(
+                    "template {}'s image is built for {} only, and {} is {}",
+                    self.id,
+                    arch.as_str(),
+                    machine.name,
+                    machine.arch.as_str()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +123,13 @@ impl Arch {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "aarch64",
+            Self::X86_64 => "x86_64",
+        }
+    }
 }
 
 /// The templates shipped with Cairn.
@@ -95,6 +138,16 @@ pub fn templates() -> &'static [Template] {
     TEMPLATES.get_or_init(|| {
         serde_yaml::from_str(include_str!("templates.yaml")).expect("templates.yaml parses")
     })
+}
+
+/// The shipped templates that serve `pool`, or why the pool's accelerator
+/// cannot choose any.
+pub fn templates_for(pool: &PoolHw) -> Result<Vec<&'static Template>, String> {
+    pool.accelerator()?;
+    Ok(templates()
+        .iter()
+        .filter(|template| template.serves(pool).is_ok())
+        .collect())
 }
 
 /// One machine's hardware.
@@ -166,6 +219,30 @@ pub struct PoolHw {
     /// Whether its machines are joined by a link fast enough to split a model
     /// across them.
     pub linked: bool,
+}
+
+impl PoolHw {
+    /// The accelerator family every machine of the pool has, which decides the
+    /// engine images that can serve it. Each machine's family comes from its
+    /// hardware read or the operator's statement of it; a machine whose
+    /// accelerator is unknown never becomes a [`MachineHw`]. Refused, naming
+    /// each machine's, when they differ.
+    pub fn accelerator(&self) -> Result<AcceleratorFamily, String> {
+        let Some(first) = self.machines.first() else {
+            return Err("the pool has no machines, so its accelerator is unknown".into());
+        };
+        if self.machines.iter().all(|m| m.family == first.family) {
+            return Ok(first.family);
+        }
+        Err(format!(
+            "the pool's machines have different accelerators ({}), and one engine image serves one",
+            self.machines
+                .iter()
+                .map(|m| format!("{}: {}", m.name, m.family.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
 }
 
 /// What [`fit`] predicts.
@@ -263,6 +340,7 @@ fn gib(bytes: u64) -> f64 {
 /// The machine count, per-machine share and context for `weight_bytes` of
 /// `model`'s weights on `pool`, or why they do not fit.
 pub fn fit(model: &Model, weight_bytes: u64, pool: &PoolHw) -> Result<Predicted, String> {
+    pool.accelerator()?;
     let usable = pool
         .machines
         .iter()
@@ -490,7 +568,7 @@ pub fn starting_profile(
             interconnect: (k > 1).then_some(Interconnect::Rdma),
             memory: Some(memory),
         },
-        notes: None,
+        notes: template.notes.clone(),
     }
 }
 
@@ -878,10 +956,134 @@ mod tests {
 
     #[test]
     fn the_templates_parse_and_pin_their_images() {
-        assert_eq!(templates().len(), 4);
+        assert_eq!(templates().len(), 6);
         assert!(templates()
             .iter()
             .all(|t| crate::profile::is_pinned_image(&t.image)));
+    }
+
+    fn ids(pool: &PoolHw) -> Vec<&'static str> {
+        templates_for(pool)
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_pool_is_served_only_by_templates_for_its_accelerator_and_cpu() {
+        assert_eq!(
+            ids(&halo()),
+            vec!["llamacpp-vulkan", "llamacpp-rocm", "vllm-rocm"]
+        );
+        assert_eq!(ids(&bbs()), vec!["vllm-openai", "llamacpp-cuda"]);
+        assert_eq!(
+            ids(&sparks()),
+            vec!["vllm-ngc", "llamacpp-cuda"],
+            "the x86_64 images are not offered to aarch64 machines"
+        );
+
+        let why = template("llamacpp-cuda").serves(&halo()).unwrap_err();
+        assert_eq!(
+            why,
+            "template llamacpp-cuda runs on nvidia (cuda), and the pool's accelerator is amd"
+        );
+        let why = template("vllm-openai").serves(&sparks()).unwrap_err();
+        assert_eq!(
+            why,
+            "template vllm-openai's image is built for x86_64 only, and bginf-sp1 is aarch64"
+        );
+    }
+
+    #[test]
+    fn a_pool_without_one_known_accelerator_is_refused_naming_why() {
+        let mixed = PoolHw {
+            machines: vec![spark("bginf-sp1"), halo().machines[0].clone()],
+            linked: true,
+        };
+        let why = mixed.accelerator().unwrap_err();
+        assert_eq!(
+            why,
+            "the pool's machines have different accelerators (bginf-sp1: nvidia, fedora: amd), and one engine image serves one"
+        );
+        assert_eq!(templates_for(&mixed).unwrap_err(), why);
+        assert_eq!(template("llamacpp-rocm").serves(&mixed).unwrap_err(), why);
+        assert_eq!(fit(&Model::named("m"), GIB, &mixed).unwrap_err(), why);
+
+        let empty = PoolHw {
+            machines: vec![],
+            linked: false,
+        };
+        assert!(empty
+            .accelerator()
+            .unwrap_err()
+            .contains("its accelerator is unknown"));
+    }
+
+    /// The live case: the embedder bginf-halo serves today by hand, generated
+    /// from the ROCm template and rendered as its head would run it.
+    #[test]
+    fn the_embedder_on_halo_starts_with_rocm_s_devices_and_no_nvidia_flags() {
+        let own = repo!("Qwen--Qwen3-Embedding-4B");
+        let gguf = repo!("Qwen--Qwen3-Embedding-4B-GGUF", no_config);
+        let model = model_of(&own);
+        let files = files(&model, &[own, gguf]);
+        let q8 = files.source("Qwen/Qwen3-Embedding-4B-GGUF@q8_0").unwrap();
+        let predicted = fit(&model, q8.bytes(), &halo()).unwrap();
+        let rocm = template("llamacpp-rocm");
+        rocm.serves(&halo()).unwrap();
+        let profile = starting_profile(rocm, q8, &model, &halo(), &predicted, None);
+        assert_eq!(profile.problems(), vec![]);
+        assert_eq!(
+            profile.requirements.accelerator,
+            Some(Accelerator {
+                family: AcceleratorFamily::Amd,
+                runtime: AcceleratorRuntime::Rocm,
+            })
+        );
+        assert!(
+            matches!(
+                profile.requirements.memory,
+                Some(MemoryPerMachine::Unified { system }) if system.0 > predicted.weight_bytes
+            ),
+            "the same arithmetic as CUDA, typed unified: {:?}",
+            profile.requirements.memory
+        );
+        assert!(profile
+            .notes
+            .as_deref()
+            .is_some_and(|notes| notes.contains("gfx1151")));
+
+        let deployment = crate::deployment::Deployment {
+            id: "embed".into(),
+            source: Default::default(),
+            profile: profile.id.clone(),
+            machines: vec!["fedora".into()],
+            head: "fedora".into(),
+            api_port: 8090,
+            api_path: "/v1".into(),
+            health_path: "/health".into(),
+        };
+        let start = crate::render::render(
+            &profile,
+            &deployment,
+            &[crate::render::MachineAt {
+                name: "fedora".into(),
+                address: None,
+                link: None,
+            }],
+        )
+        .unwrap()
+        .start;
+        assert!(
+            start.contains("--device /dev/dri --device /dev/kfd --security-opt seccomp=unconfined"),
+            "{start}"
+        );
+        assert!(start
+            .contains("if [ \"$rt\" = docker ]; then gpu=(--group-add video); else gpu=(); fi"));
+        assert!(start.contains("--group-add keep-groups"), "podman's own");
+        assert!(!start.contains("--gpus") && !start.contains("nvidia.com"));
+        assert!(start.contains(&format!("'{}'", rocm.image)));
     }
 
     #[test]

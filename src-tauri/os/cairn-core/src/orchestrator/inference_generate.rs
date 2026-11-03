@@ -19,15 +19,17 @@
 //! `inference_generations`, which is what lets the operator come back to one.
 //!
 //! A machine's hardware comes from its executor's latest health: the GPU's
-//! vendor, name and memory, the machine's memory and CPU architecture, read
-//! from the GPUs a model runs on (its discrete cards when it has any). A
-//! machine that reports no GPU is refused by name unless the generation
-//! states its hardware.
+//! vendor (its accelerator family), name and memory, the machine's memory and
+//! CPU architecture, read from the GPUs a model runs on (its discrete cards
+//! when it has any). A machine that reports no GPU has no known accelerator
+//! and is refused by name unless the generation states its hardware; nothing
+//! assumes one. The accelerator chooses the templates that serve the pool.
 
 use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
-    model_gpus, ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
+    model_gpus, ExecutorHealthSnapshot, GpuDevice, GpuMemory, GpuVendor, MachineMemory,
+    MeasurementReading,
 };
 use cairn_common::identity::AppearanceTransport;
 use cairn_inference::fit::{self, Arch, HwMemory, MachineHw, PoolHw, Predicted};
@@ -133,20 +135,43 @@ pub fn reported_hardware(
     name: &MachineName,
     snapshot: &ExecutorHealthSnapshot,
 ) -> Result<MachineHw, String> {
-    let arch = Arch::parse(&snapshot.advertisement.capabilities.arch).ok_or_else(|| {
-        format!(
-            "{name} reports architecture {}, which is not aarch64 or x86_64",
-            snapshot.advertisement.capabilities.arch
-        )
+    hardware_from(
+        name,
+        &snapshot.advertisement.capabilities.arch,
+        &snapshot.host.gpus.reading,
+        &snapshot.machine.memory.reading,
+    )
+}
+
+/// A machine's hardware from its readings: the accelerator family is the
+/// vendor of the GPUs a model runs on, so a machine with no such GPU read has
+/// none, and is refused naming it rather than given one.
+fn hardware_from(
+    name: &MachineName,
+    arch: &str,
+    gpus: &MeasurementReading<Vec<GpuDevice>>,
+    memory: &MeasurementReading<MachineMemory>,
+) -> Result<MachineHw, String> {
+    let arch = Arch::parse(arch).ok_or_else(|| {
+        format!("{name} reports architecture {arch}, which is not aarch64 or x86_64")
     })?;
-    let MeasurementReading::Measured { value: devices } = &snapshot.host.gpus.reading else {
-        return Err(format!("{name} has not reported its GPUs"));
+    let state = |why: String| {
+        format!(
+            "{name}'s accelerator is unknown: {why}; state its hardware: hardware: {{\"{name}\": {{family: nvidia|amd, memoryGib, unified, arch}}}}"
+        )
+    };
+    let devices = match gpus {
+        MeasurementReading::Measured { value } => value,
+        MeasurementReading::Unavailable { detail, .. } => {
+            return Err(state(match detail {
+                Some(detail) => format!("it has not reported its GPUs ({detail})"),
+                None => "it has not reported its GPUs".into(),
+            }))
+        }
     };
     let gpus = model_gpus(devices);
     let Some(device) = gpus.first() else {
-        return Err(format!(
-            "{name} reports no GPU it can read; state its hardware: hardware: {{\"{name}\": {{family, memoryGib, unified, arch}}}}"
-        ));
+        return Err(state("it reports no GPU it can read".into()));
     };
     let family = match device.vendor {
         GpuVendor::Nvidia => AcceleratorFamily::Nvidia,
@@ -169,7 +194,7 @@ pub fn reported_hardware(
         },
         MeasurementReading::Measured {
             value: GpuMemory::Unified { .. },
-        } => match &snapshot.machine.memory.reading {
+        } => match memory {
             MeasurementReading::Measured { value } => HwMemory::Unified {
                 total: value.total_bytes,
             },
@@ -409,9 +434,21 @@ pub fn starting_profile(
                 .join(", ")
         )
     })?;
-    if hardware.machines.is_empty() {
-        return Err("the pool has no machines".into());
-    }
+    template.serves(hardware).map_err(|why| {
+        match fit::templates_for(hardware).map(|serving| {
+            serving
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }) {
+            Ok(serving) if !serving.is_empty() => {
+                format!("{why}; the templates that serve this pool are {serving}")
+            }
+            Ok(_) => format!("{why}; no shipped template serves this pool"),
+            Err(_) => why,
+        }
+    })?;
     let source = files
         .source(source)
         .ok_or_else(|| unknown_source(files, source))?;
@@ -1633,6 +1670,111 @@ requirements:
             "answers": [{"question": "Quantization", "answer": "q8_0"}],
             "startingTemplate": "llamacpp-cuda",
         })
+    }
+
+    /// bginf-halo's Radeon 8060S as the amdgpu reader reports it: a unified
+    /// device, its pool the machine's memory.
+    fn radeon_8060s() -> GpuDevice {
+        use cairn_common::executor_protocol::{UnifiedAllocationSource, UnifiedPool};
+        GpuDevice {
+            index: 0,
+            vendor: GpuVendor::Amd,
+            model: "AMD Radeon 8060S Graphics".into(),
+            uuid: None,
+            cores: None,
+            memory: MeasurementReading::Measured {
+                value: GpuMemory::Unified {
+                    gpu_allocated_bytes: MeasurementReading::Measured { value: 4 * GIB },
+                    source: UnifiedAllocationSource::AmdgpuGtt,
+                    pool: MeasurementReading::Measured {
+                        value: UnifiedPool::HostMemory,
+                    },
+                    apertures: None,
+                },
+            },
+            utilization_millis: MeasurementReading::Measured { value: 0 },
+        }
+    }
+
+    #[test]
+    fn a_machine_s_accelerator_is_its_reported_gpu_s_and_unknown_is_refused_by_name() {
+        use cairn_common::executor_protocol::MeasurementGap;
+        let fedora = MachineName::from("fedora");
+        let memory = MeasurementReading::Measured {
+            value: MachineMemory {
+                total_bytes: 125 * GIB,
+                available_bytes: 88 * GIB,
+            },
+        };
+
+        let unread = MeasurementReading::Unavailable {
+            reason: MeasurementGap::UnsupportedPlatform,
+            detail: Some("NVML not loadable".into()),
+        };
+        let why = hardware_from(&fedora, "x86_64", &unread, &memory).unwrap_err();
+        assert_eq!(
+            why,
+            "fedora's accelerator is unknown: it has not reported its GPUs (NVML not loadable); state its hardware: hardware: {\"fedora\": {family: nvidia|amd, memoryGib, unified, arch}}"
+        );
+        let none = MeasurementReading::Measured { value: vec![] };
+        let why = hardware_from(&fedora, "x86_64", &none, &memory).unwrap_err();
+        assert!(
+            why.starts_with("fedora's accelerator is unknown: it reports no GPU it can read;"),
+            "{why}"
+        );
+
+        let read = MeasurementReading::Measured {
+            value: vec![radeon_8060s()],
+        };
+        let halo = hardware_from(&fedora, "x86_64", &read, &memory).unwrap();
+        assert_eq!(halo.family, AcceleratorFamily::Amd);
+        assert_eq!(halo.memory, HwMemory::Unified { total: 125 * GIB });
+        assert_eq!(
+            fit::templates_for(&PoolHw {
+                machines: vec![halo],
+                linked: false,
+            })
+            .unwrap()
+            .iter()
+            .map(|t| t.id.as_str())
+            .collect::<Vec<_>>(),
+            vec!["llamacpp-vulkan", "llamacpp-rocm", "vllm-rocm"]
+        );
+    }
+
+    #[test]
+    fn a_starting_profile_from_another_accelerator_s_template_is_refused_naming_the_right_ones() {
+        let stated = StatedHardware {
+            family: AcceleratorFamily::Amd,
+            gpu: Some("AMD Radeon 8060S".into()),
+            memory_gib: 125.0,
+            unified: true,
+            arch: "x86_64".into(),
+        };
+        let halo = PoolHw {
+            machines: vec![stated.machine(&"fedora".into()).unwrap()],
+            linked: false,
+        };
+        let model = Model::named("Qwen/Qwen3-Embedding-4B");
+        let files = RepoFiles::default();
+        let why =
+            starting_profile("llamacpp-cuda", &model, &files, "x@q8_0", None, &halo).unwrap_err();
+        assert_eq!(
+            why,
+            "template llamacpp-cuda runs on nvidia (cuda), and the pool's accelerator is amd; the templates that serve this pool are llamacpp-vulkan, llamacpp-rocm, vllm-rocm"
+        );
+        let why =
+            starting_profile("llamacpp-rocm", &model, &files, "x@q8_0", None, &halo).unwrap_err();
+        assert!(
+            why.starts_with("the model has no weight source x@q8_0"),
+            "a serving template passes on to the source: {why}"
+        );
+        let why = starting_profile("llamacpp-rocm", &model, &files, "x@q8_0", None, &bbs_hw())
+            .unwrap_err();
+        assert_eq!(
+            why,
+            "template llamacpp-rocm runs on amd (rocm), and the pool's accelerator is nvidia; the templates that serve this pool are vllm-openai, llamacpp-cuda"
+        );
     }
 
     #[test]

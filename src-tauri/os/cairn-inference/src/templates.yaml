@@ -6,6 +6,13 @@
 # `command` is the full serving command with the container's entrypoint
 # cleared; generation appends the flags it computes (context, memory share,
 # tensor parallelism, and the rendezvous flags of a profile spanning machines).
+# `notes` is what the research behind a template found worth knowing when
+# running it; the generating agent reads it, and a starting profile carries it.
+#
+# A template serves a pool whose machines all have its accelerator `family`
+# and, when it names one, its CPU `arch`. The container's GPU options follow
+# from family and runtime when the profile is rendered (`render.rs`): NVIDIA
+# through the container runtime's GPU support, AMD through its device nodes.
 
 # vLLM on DGX Spark (GB10, aarch64): NVIDIA's NGC build, the one bginf's
 # Qwen3.6 ran. nvcr.io/nvidia/vllm:26.05.post1-py3.
@@ -48,3 +55,43 @@
   image: ghcr.io/ggml-org/llama.cpp@sha256:afdc5265d1cfc729ad3ebaac59fd60e5d15c3b7aef455d7dc16bc1dccbc4dc64
   formats: [gguf]
   command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
+
+# llama.cpp's server on AMD through ROCm (HIP), for GGUF weights:
+# ghcr.io/ggml-org/llama.cpp:server-rocm, b12063 (2cbca389f), built on ROCm
+# 7.2.1 by upstream's .devops/rocm.Dockerfile. amd64 only.
+- id: llamacpp-rocm
+  server: llamaCpp
+  family: amd
+  runtime: rocm
+  arch: x86_64
+  image: ghcr.io/ggml-org/llama.cpp@sha256:cac35f0d13f73fb3bd533f7287ff59701cc5d3742c3af0a0a829d05b96d4b38e
+  formats: [gguf]
+  command: [/app/llama-server, -m, "{weights}", --alias, "{servedName}", --host, 0.0.0.0, --port, "{port}", -ngl, "999"]
+  notes: >-
+    Upstream's ROCm 7.2.1 build compiles gfx908, gfx90a, gfx942, gfx1030,
+    gfx1100-gfx1102, gfx1150, gfx1151 (Strix Halo, Radeon 8060S), gfx1200 and
+    gfx1201 natively, so no HSA_OVERRIDE_GFX_VERSION is needed for them; a GPU
+    outside that list is not served by this image. The host needs only the
+    amdgpu kernel driver exposing /dev/kfd and /dev/dri: the ROCm userspace is
+    in the image. On Strix Halo, ROCm generally prefills faster than Vulkan and
+    Vulkan sometimes decodes faster (strixhalo.wiki/AI/llamacpp-with-ROCm).
+
+# vLLM on AMD through ROCm: vLLM's own ROCm release image,
+# vllm/vllm-openai-rocm:v0.33.0 (the same as its v0.33.0-rocm100 tag, ROCm
+# 10.0). amd64 only.
+- id: vllm-rocm
+  server: vllm
+  family: amd
+  runtime: rocm
+  arch: x86_64
+  image: docker.io/vllm/vllm-openai-rocm@sha256:4fcd39b758b660c4e9c345c021e2ea8f0ccdb31e3c32507d676cc3005ae83fba
+  formats: [safetensors]
+  command: [vllm, serve, "{model}", --revision, "{revision}", --served-model-name, "{servedName}", --host, 0.0.0.0, --port, "{port}"]
+  notes: >-
+    The image's PyTorch is built for gfx90a, gfx942, gfx950, gfx1100, gfx1101,
+    gfx1150, gfx1151 (Strix Halo), gfx1200 and gfx1201; its AITER kernels for
+    gfx942 and gfx950 only, so other GPUs take the Triton paths. On gfx1151 a
+    vLLM maintainer confirmed the upstream ROCm image serving on a Radeon 8060S,
+    and older releases hung in graph capture (vllm-project/vllm#32180): if a
+    load stalls there, add --enforce-eager. On Strix Halo llama.cpp is usually
+    the faster engine for one stream.

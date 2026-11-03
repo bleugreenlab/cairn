@@ -419,6 +419,17 @@ pub enum AcceleratorRuntime {
     Metal,
 }
 
+impl AcceleratorRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Rocm => "rocm",
+            Self::Vulkan => "vulkan",
+            Self::Metal => "metal",
+        }
+    }
+}
+
 /// How a multi-machine deployment's machines talk to each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
