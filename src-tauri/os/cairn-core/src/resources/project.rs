@@ -806,6 +806,23 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
             .await
             .map_err(|error| error.to_string());
 
+            // Active only, the same set the threads collection offers: a closed
+            // thread is not somewhere to address.
+            let mut threads: Vec<String> = Vec::new();
+            if let Ok(mut rows) = conn
+                .query(
+                    "SELECT name FROM threads WHERE project_id = ?1 AND status = 'active' ORDER BY name",
+                    (project_id.as_str(),),
+                )
+                .await
+            {
+                while let Ok(Some(row)) = rows.next().await {
+                    if let Ok(name) = row.text(0) {
+                        threads.push(name);
+                    }
+                }
+            }
+
             Ok((
                 (
                     project_id,
@@ -814,13 +831,13 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
                     canonical_key,
                     repo_path,
                 ),
-                (issue_stats, recent_issues, labels, terminals, held),
+                (issue_stats, recent_issues, labels, terminals, held, threads),
             ))
         })
     });
     let (
         (project_id, project_name, project_context, canonical_key, repo_path),
-        (issue_stats, recent_issues, labels, terminals, held),
+        (issue_stats, recent_issues, labels, terminals, held, threads),
     ) = match read.await {
         Ok(rows) => rows,
         Err(error) => return error,
@@ -856,6 +873,8 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
             super::tenets::awaiting(pending)
         ));
     }
+
+    output.push_str(&render_project_threads(&canonical_key, &threads));
 
     output.push_str(&render_held_executions(held, &canonical_key));
 
@@ -954,6 +973,35 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     output.push('\n');
 
     output
+}
+
+/// The `## Threads` section: every active thread by name, linked, with the
+/// collection that carries their jurisdictions. Thread names are chosen, not
+/// numbered, so without this listing a caller can only guess them.
+fn render_project_threads(project_key: &str, threads: &[String]) -> String {
+    let collection = cairn_common::uri::build_project_threads_uri(project_key);
+    let mut out = String::from("## Threads\n\n");
+    if threads.is_empty() {
+        out.push_str(&format!(
+            "No threads yet. Start one by appending `{{name}}` to [{collection}]({collection}).\n\n"
+        ));
+        return out;
+    }
+    out.push_str(&format!(
+        "A thread holds one ongoing topic with its own agent session; append `{{content}}` to a \
+         thread's URI to message that session. Jurisdictions and activity: \
+         [{collection}]({collection}).\n\n"
+    ));
+    let links: Vec<String> = threads
+        .iter()
+        .map(|name| {
+            let uri = cairn_common::uri::build_thread_uri(project_key, name);
+            format!("[{name}]({uri})")
+        })
+        .collect();
+    out.push_str(&links.join(", "));
+    out.push_str("\n\n");
+    out
 }
 
 /// The `## Repository ref store` section: how big the project's shared ref
@@ -2225,6 +2273,73 @@ mod project_issues_query_tests {
             "{overview}"
         );
         assert!(!overview.contains("Finished work —"), "{overview}");
+    }
+
+    /// Thread names are chosen rather than numbered, so the project page is
+    /// where a caller with no prior knowledge learns them: every active thread
+    /// linked by name, and the collection that describes them.
+    #[tokio::test]
+    async fn the_project_page_lists_active_threads_and_links_the_collection() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                conn.execute("UPDATE projects SET key = 'lbl'", ()).await?;
+                conn.execute(
+                    "INSERT INTO threads (id, project_id, name, jurisdiction, status, created_at, updated_at)
+                     VALUES ('t-general', 'p-labels', 'general', 'Everything else', 'active', 1, 1),
+                            ('t-design', 'p-labels', 'design', 'Architecture', 'active', 1, 1),
+                            ('t-old', 'p-labels', 'retired', 'Old ground', 'closed', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let root = tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(db), search_index)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build();
+        let overview = read_project(&orch, "lbl").await;
+        assert!(overview.contains("## Threads\n\n"), "{overview}");
+        assert!(
+            overview.contains("[design](cairn://p/lbl/design), [general](cairn://p/lbl/general)"),
+            "{overview}"
+        );
+        assert!(
+            overview.contains("[cairn://p/lbl/threads](cairn://p/lbl/threads)"),
+            "{overview}"
+        );
+        assert!(
+            !overview.contains("retired"),
+            "a closed thread is not offered as somewhere to address: {overview}"
+        );
+    }
+
+    #[test]
+    fn a_project_without_threads_says_how_to_start_one() {
+        let section = render_project_threads("lbl", &[]);
+        assert!(
+            section.starts_with("## Threads\n\nNo threads yet."),
+            "{section}"
+        );
+        assert!(section.contains("`{name}`"), "{section}");
+        assert!(section.contains("cairn://p/lbl/threads"), "{section}");
     }
 
     #[tokio::test]

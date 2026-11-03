@@ -85,7 +85,7 @@ pub(super) async fn resolve(
         return HomeTargets::default();
     }
 
-    let home = crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request).await;
+    let home = crate::mcp::handlers::run_context::deictic_home_uri(&orch.db, request).await;
     let mut home_uri = home.clone().unwrap_or_default();
     let mut rename: Option<HomeRename> = None;
     let mut origins = Vec::with_capacity(changes.len());
@@ -278,7 +278,7 @@ impl HomeTargets {
     pub(super) fn blocked(&self, index: usize, applied: &[AppliedChange]) -> Option<String> {
         match self.origins.get(index)?.as_ref()? {
             Origin::Unresolved { shorthand, error } => Some(format!(
-                "`{shorthand}` names this run's home, which could not be resolved: {error}"
+                "`{shorthand}` names the calling run's home, which could not be resolved: {error}"
             )),
             Origin::Resolved {
                 shorthand,

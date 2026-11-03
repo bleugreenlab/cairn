@@ -195,12 +195,13 @@ async fn an_unresolvable_home_fails_the_item_naming_the_shorthand() {
         common::change_resource_as_run(&orch, json!([create_arc("Placing work.")]), None).await;
 
     assert!(
-        result.contains("`cairn:~/arc` names this run's home, which could not be resolved"),
+        result.contains("`cairn:~/arc` names the calling run's home, which could not be resolved"),
         "the refusal must name the shorthand and say what failed: {result}"
     );
     assert!(
-        result.contains("run ID"),
-        "the refusal must carry the underlying resolution error: {result}"
+        result.contains("resolve only for an agent node inside a Cairn run")
+            && result.contains("`cairn://p/PROJECT/...`"),
+        "an outside caller is told where `~` resolves and what to address instead: {result}"
     );
     assert_eq!(arc_owner(&db).await, None, "nothing was written");
 }

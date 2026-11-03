@@ -134,7 +134,7 @@ pub(crate) async fn resolve_home_relative_resource_uri(
 
     // Route the run lookup across every open database so deictic targets resolve
     // from the live job row in whichever DB the run lives (CAIRN-2132).
-    let home_uri = crate::mcp::handlers::run_context::lookup_home_uri_routed(dbs, request).await?;
+    let home_uri = crate::mcp::handlers::run_context::deictic_home_uri(dbs, request).await?;
     Ok(resolve_home_relative_against(&home_uri, uri)
         .expect("a deictic URI resolves from a canonical home URI"))
 }

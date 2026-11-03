@@ -106,12 +106,25 @@ pub(super) async fn read_project_messages(
     ) {
         Ok(messages) => {
             let mut out = format!("# Messages — {}\n\n", project_ctx.project_key);
+            out.push_str(&project_board_purpose(&project_ctx.project_key));
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
             out.push_str(&format_messages(&messages));
             out
         }
         Err(e) => format!("Failed to query messages: {}", e),
     }
+}
+
+/// What the project board is for, said on the board itself. Nothing routes a
+/// project-channel message to a session, so a caller choosing between this
+/// page and a live thread needs to know that before posting.
+fn project_board_purpose(project_key: &str) -> String {
+    let threads = cairn_common::uri::build_project_threads_uri(project_key);
+    format!(
+        "A project-wide board: a message appended here is stored for whoever reads this page, \
+         and it wakes no agent. To reach a live session, append to a thread (listed at \
+         [{threads}]({threads})) or to a node's `/messages`.\n\n"
+    )
 }
 
 /// A direct message's line carries its delivery urgency: whether it woke its
@@ -226,7 +239,29 @@ pub(super) async fn read_issue_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::read_node_messages;
+    use super::{read_node_messages, read_project_messages};
+
+    /// The board says it wakes no one and where a message would, so a caller
+    /// does not post to it expecting a session to answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_project_board_says_it_wakes_no_agent_and_points_at_threads() {
+        let db = crate::storage::migrated_test_db("project-board.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);",
+        )
+        .await
+        .unwrap();
+
+        let read = read_project_messages(&db, "p", &[]).await;
+        assert!(
+            read.starts_with("# Messages — p\n\nA project-wide board"),
+            "{read}"
+        );
+        assert!(read.contains("wakes no agent"), "{read}");
+        assert!(read.contains("(cairn://p/p/threads)"), "{read}");
+        assert!(read.contains("0 message(s)"), "{read}");
+    }
 
     /// A thread's `/messages` is its session's direct stream across every run
     /// the session has had, newest window first, each line with its urgency,

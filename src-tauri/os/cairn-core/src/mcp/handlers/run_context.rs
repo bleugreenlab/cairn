@@ -13,6 +13,28 @@ fn required_run_id(request: &CallbackRequest) -> Result<&str, String> {
         .ok_or_else(|| "Authenticated agent request is missing its run ID".to_string())
 }
 
+/// Why a deictic target cannot resolve for a request that carries no run.
+/// `cairn:~/` names the caller's own node and `cairn:@/` its project; a caller
+/// outside a run (the CLI in an ordinary shell, an external MCP client) has
+/// neither, and "missing its run ID" told it nothing about what to write instead.
+pub(crate) const DEICTIC_OUTSIDE_RUN: &str = "Home paths (`cairn:~/...`) and project paths \
+     (`cairn:@/...`) resolve only for an agent node inside a Cairn run, and this request comes \
+     from outside one. Address the resource by its canonical URI instead: \
+     `cairn://p/PROJECT/...` (projects are listed at `cairn://projects`; the URI grammar is at \
+     `cairn://help`).";
+
+/// The home a `cairn:~/` or `cairn:@/` target resolves against, refusing a
+/// request with no run as [`DEICTIC_OUTSIDE_RUN`] before any lookup.
+pub(crate) async fn deictic_home_uri(
+    dbs: &crate::db::DbState,
+    request: &CallbackRequest,
+) -> Result<String, String> {
+    if required_run_id(request).is_err() {
+        return Err(DEICTIC_OUTSIDE_RUN.to_string());
+    }
+    lookup_home_uri_routed(dbs, request).await
+}
+
 pub(crate) async fn lookup_run(
     db: &LocalDb,
     request: &CallbackRequest,
@@ -477,6 +499,34 @@ mod tests {
                 .expect("missing identity must be refused");
             assert!(err.contains("missing its run ID"), "{err}");
         }
+    }
+
+    /// A caller outside any run who writes `cairn:~/` is told where `~`
+    /// resolves and what to address instead, not that a run ID is missing.
+    #[tokio::test]
+    async fn a_deictic_target_outside_a_run_names_the_canonical_form() {
+        let dbs = local_dbs().await;
+        for run_id in [None, Some(String::new())] {
+            let request = CallbackRequest {
+                run_id,
+                ..Default::default()
+            };
+            let err = deictic_home_uri(&dbs, &request)
+                .await
+                .expect_err("no run, no home");
+            assert!(
+                err.contains("`cairn:~/...`") && err.contains("inside a Cairn run"),
+                "{err}"
+            );
+            assert!(err.contains("`cairn://p/PROJECT/...`"), "{err}");
+            assert!(err.contains("`cairn://help`"), "{err}");
+        }
+
+        seed_run(&dbs.local).await;
+        let home = deictic_home_uri(&dbs, &request_for_run("r"))
+            .await
+            .expect("a live run resolves its home");
+        assert_eq!(home, "cairn://p/prj/7/1/builder");
     }
 
     #[tokio::test]

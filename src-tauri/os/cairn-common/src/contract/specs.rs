@@ -751,6 +751,11 @@ pub(crate) const PROJECT_RELATED: &[RelatedSpec] = &[
         actions: true,
     },
     RelatedSpec {
+        label: "threads",
+        kind: ResourceKind::ProjectThreads,
+        actions: false,
+    },
+    RelatedSpec {
         label: "messages",
         kind: ResourceKind::ProjectMessages,
         actions: false,

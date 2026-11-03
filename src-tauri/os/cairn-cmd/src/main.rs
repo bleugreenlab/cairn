@@ -24,14 +24,32 @@ use cli::{default_callback_url, run_cli_change, run_cli_check, run_cli_read, run
 
 cairn_common::sidecar_version_stamp!();
 
-/// Cairn MCP Server - tools for Claude to interact with Cairn
+/// Cairn's command line: read, write, and watch Cairn resources, run project
+/// checks, and manage executors and provider sign-in.
 #[derive(Parser)]
-#[command(name = "cairn-cmd", version)]
+#[command(name = "cairn-cmd", version, after_help = RESOURCE_MODEL_HELP)]
 struct Args {
     /// Subcommand. When omitted, opens the interactive Cairn shell.
     #[command(subcommand)]
     command: Option<Command>,
 }
+
+/// The resource model, shown under `cairn --help`. A caller arriving with only
+/// the CLI has no other way to learn that URIs are the whole surface or where
+/// their reference lives.
+const RESOURCE_MODEL_HELP: &str = "\
+Everything in Cairn is a resource addressed by a URI, reached with `cairn read` and `cairn write`:
+  cairn://p/PROJECT/...   a project's issues, threads, messages, terminals, and nodes
+  file:PATH               a file in the worktree
+
+Start here:
+  cairn read cairn://help        the URI grammar and every resource, with filters and write payloads
+  cairn read cairn://projects    every project with its canonical URI
+  cairn read cairn://p/PROJECT   a project's overview, linking its issues, threads, and messages
+
+Every resource read ends with an affordance block listing its filters, its links, and the exact
+`cairn write` payloads it accepts. Home paths (`cairn:~/...`) name your own node and resolve only
+inside a Cairn run; from outside one, address `cairn://p/PROJECT/...`.";
 
 const BARE_NON_TTY_ERROR: &str = "cairn: the MCP server has moved to `cairn mcp`.\n\
 Update your MCP client's command to add the `mcp` argument, or re-run Cairn's\n\
@@ -96,6 +114,42 @@ mod cli_parse_tests {
             BARE_NON_TTY_ERROR,
             "cairn: the MCP server has moved to `cairn mcp`.\nUpdate your MCP client's command to add the `mcp` argument, or re-run Cairn's\nexternal MCP setup to rewrite the registration."
         );
+    }
+
+    fn rendered_help(path: &[&str]) -> String {
+        use clap::CommandFactory;
+        let mut command = Args::command();
+        for name in path {
+            command = command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no `{name}` subcommand"))
+                .clone();
+        }
+        command.render_long_help().to_string()
+    }
+
+    /// `cairn --help` is the whole entry point for a caller with only the CLI:
+    /// it must name the resource model and where its reference lives.
+    #[test]
+    fn top_level_help_names_the_resource_model_and_its_reference() {
+        let help = rendered_help(&[]);
+        assert!(help.contains("cairn read cairn://help"), "{help}");
+        assert!(help.contains("cairn read cairn://projects"), "{help}");
+        assert!(help.contains("cairn://p/PROJECT/..."), "{help}");
+        assert!(help.contains("affordance block"), "{help}");
+        assert!(help.contains("inside a Cairn run"), "{help}");
+        assert!(!help.contains("MCP Server - tools for Claude"), "{help}");
+    }
+
+    /// `cairn write --help` gives the payload shape and says where each
+    /// target's keys are listed, rather than naming a type the reader cannot see.
+    #[test]
+    fn write_help_gives_the_payload_shape_and_where_keys_are_listed() {
+        let help = rendered_help(&["write"]);
+        assert!(help.contains(r#"{"changes":[{"target":"#), "{help}");
+        assert!(help.contains("`actions` block"), "{help}");
+        assert!(help.contains("cairn read cairn://help"), "{help}");
+        assert!(!help.contains("ChangeInput"), "{help}");
     }
 
     #[test]
@@ -257,7 +311,8 @@ enum Command {
     Mcp,
     /// Read one or more files or Cairn resources and print them to stdout (pipeable).
     Read {
-        /// One or more targets: `file:path` (worktree-relative), `file:/abs/path`, `cairn://p/PROJECT/...`, or `cairn:~/...`.
+        /// One or more targets: `file:path` (worktree-relative), `file:/abs/path`, `cairn://p/PROJECT/...`,
+        /// or `cairn:~/...` (inside a Cairn run only). `cairn read cairn://help` lists every resource.
         /// Node workspace changes are available at `cairn:~/diff` with summary,
         /// commits, patch, and check views. Append `?key=value` for scoping.
         #[arg(required = true, num_args = 1..)]
@@ -286,11 +341,11 @@ enum Command {
         #[command(subcommand)]
         command: auth::AuthCommand,
     },
-    /// Apply ordered file/resource mutations (ChangeInput JSON via --json or stdin).
-    #[command(alias = "change")]
+    /// Apply ordered file/resource mutations (JSON via --json or stdin).
+    #[command(alias = "change", after_help = cli::WRITE_PAYLOAD_HELP)]
     Write {
-        /// ChangeInput JSON (an object with `changes`, or a bare `changes` array).
-        /// If omitted, JSON is read from stdin.
+        /// The write as JSON: an object with `changes`, or a bare `changes` array
+        /// (shape below). If omitted, JSON is read from stdin.
         #[arg(long)]
         json: Option<String>,
         /// Commit message for file-target changes (`^` to amend).

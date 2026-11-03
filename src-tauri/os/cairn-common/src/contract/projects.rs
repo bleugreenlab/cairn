@@ -395,7 +395,7 @@ pub(crate) const PROJECT_MESSAGES_CONTRACT: ResourceContract =
         kind: ResourceKind::ProjectMessages,
         uri_template: "cairn://p/{project}/messages",
         name: "Project messages",
-        description: "Project-wide messages between agents",
+        description: "Project-wide message board: an append is stored for whoever reads this page and wakes no agent. To reach a live session, append to a thread (listed at cairn://p/{project}/threads) or to a node's /messages",
         read_projections: &[
             ProjectionSpec {
                 key: "before",

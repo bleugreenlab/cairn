@@ -207,6 +207,26 @@ fn stop_explanation_for(
     stop.map(|stop| stop.refusal(now_unix_ms))
 }
 
+/// The write payload's shape and where each target's keys are listed, shown
+/// under `cairn write --help` and after a payload that does not parse.
+pub(crate) const WRITE_PAYLOAD_HELP: &str = "\
+Payload shape:
+  {\"changes\":[{\"target\":URI,\"mode\":\"create|append|patch|replace|delete\",\"payload\":{...}}]}
+  (or the bare changes array). File edits also need --commit-msg.
+
+The payload keys a target accepts are listed in the `actions` block at the end of
+`cairn read <target>`, each with a copy-ready example. `cairn read cairn://help` documents
+write mechanics and every resource.
+
+Example (message an issue's channel):
+  cairn write --json '{\"changes\":[{\"target\":\"cairn://p/PROJECT/NUMBER/messages\",\"mode\":\"append\",\"payload\":{\"content\":\"hello\"}}]}'";
+
+/// What `cairn write` prints for a payload that does not parse: the parser's
+/// complaint, then the shape it expected.
+fn invalid_write_json(error: &str) -> String {
+    format!("cairn write: invalid JSON: {error}\n\n{WRITE_PAYLOAD_HELP}")
+}
+
 /// Parse a `ChangeInput` from a JSON object (with `changes`) or a bare array.
 fn parse_change_input(raw: &str) -> Result<ChangeInput, String> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
@@ -1003,7 +1023,7 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
     let mut input = match parse_change_input(&raw) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("cairn write: invalid JSON: {e}");
+            eprintln!("{}", invalid_write_json(&e));
             return false;
         }
     };
@@ -1079,6 +1099,26 @@ mod tests {
             select_mcp_secret(None, || Some("local-runner-secret".into())),
             Some("local-runner-secret".into())
         );
+    }
+
+    #[test]
+    fn an_unparseable_write_says_the_shape_it_expected() {
+        let error = parse_change_input("{not json").unwrap_err();
+        let message = invalid_write_json(&error);
+        assert!(
+            message.starts_with("cairn write: invalid JSON: "),
+            "{message}"
+        );
+        assert!(message.contains("Payload shape:"), "{message}");
+        assert!(message.contains("`actions` block"), "{message}");
+        // The example the hint offers is itself a write that parses.
+        let example = WRITE_PAYLOAD_HELP
+            .split("--json '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("the hint carries a --json example");
+        let input = parse_change_input(example).expect("the example parses");
+        assert_eq!(input.changes.map(|changes| changes.len()), Some(1));
     }
 
     #[test]

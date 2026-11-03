@@ -683,6 +683,18 @@ pub(super) async fn read_project_threads(db: &LocalDb, project_key: &str) -> Str
     .unwrap_or_else(|error| error)
 }
 
+/// What appending to a thread does to its session, said where a caller decides
+/// to append. Thread messages are delivered as `DeliveryUrgency::Steer`: an
+/// idle (or not yet started) session is woken and the message starts its turn;
+/// a running turn receives it at its next tool or turn boundary.
+fn thread_delivery_semantics(status: &str) -> &'static str {
+    if status == "closed" {
+        "Messaging: this thread is closed, so an append is refused until it is patched back to `status:\"active\"`."
+    } else {
+        "Messaging: append `{content}` to this URI to message the thread's session. An idle session starts a turn on the message at once (a session not yet started is started); a running turn receives it at its next tool call or turn boundary, without being interrupted."
+    }
+}
+
 /// Render a thread's overview.
 ///
 /// Only the overview: every addressable descendant is normalized onto its
@@ -781,6 +793,7 @@ pub(super) async fn read_thread(
                 )),
                 None => out.push_str("- Live session: not started\n"),
             }
+            out.push_str(&format!("\n{}\n", thread_delivery_semantics(&status)));
             let mut children = match conn
                 .query(
                     concat!(
@@ -1258,6 +1271,15 @@ mod tests {
         assert!(overview.contains("[arc](cairn://p/thr/design-review/arc)"));
         assert!(overview.contains("[12 — Child issue](cairn://p/thr/12)"));
         assert!(overview.contains("Live session: not started"));
+        // The page a caller appends to says what an append does to the session.
+        assert!(
+            overview.contains("An idle session starts a turn on the message at once"),
+            "{overview}"
+        );
+        assert!(
+            overview.contains("at its next tool call or turn boundary, without being interrupted"),
+            "{overview}"
+        );
     }
 
     /// The collection is an ACTIVE listing and the canonical URI is not. That
@@ -1286,6 +1308,10 @@ mod tests {
         let overview = read_thread(&db, "thr", "retired-topic", &[], 4).await;
         assert!(overview.contains("# retired-topic"));
         assert!(overview.contains("Status: closed"));
+        assert!(
+            overview.contains("this thread is closed, so an append is refused"),
+            "{overview}"
+        );
         assert!(
             overview.contains("[44 — Still open child](cairn://p/thr/44)"),
             "closing routes attention, it does not disown children: {overview}"

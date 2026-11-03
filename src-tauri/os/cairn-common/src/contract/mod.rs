@@ -632,6 +632,18 @@ mod tests {
         assert!(mutation_spec(ResourceKind::ProjectSettings, ChangeMode::Create).is_none());
     }
 
+    /// Thread names are chosen, not numbered, so the project overview is where
+    /// a caller with no prior knowledge finds the collection that lists them.
+    #[test]
+    fn the_project_overview_links_its_threads_collection() {
+        let project = contract_for(ResourceKind::Project).expect("registered");
+        assert!(project
+            .related
+            .iter()
+            .any(|related| related.label == "threads"
+                && related.kind == ResourceKind::ProjectThreads));
+    }
+
     #[test]
     fn key_spec_satisfied_by_alias() {
         assert!(SUBAGENT_TYPE.satisfied_by(["subagent_type"].into_iter()));
