@@ -676,6 +676,10 @@ async fn hybrid_read_degrades_unresolvable_file_sections_verbatim() {
         .await
         .unwrap();
     assert_eq!(summary.hybrid_read, 1);
+    assert!(
+        summary.unresolvable_coordinate >= 1,
+        "ghost.txt's miss is counted in the summary, not warned: {summary}"
+    );
 
     let events = load_events(&db).await;
     let row = events.iter().find(|e| e.id == "e1").unwrap();
@@ -745,6 +749,7 @@ async fn pure_resource_batch_falls_to_zstd() {
         .unwrap();
     assert_eq!(summary.hybrid_read, 0);
     assert_eq!(summary.gitcoord_read, 0);
+    assert_eq!(summary.ineligible_read, 1, "classified before any render");
 
     let events = load_events(&db).await;
     let row = events.iter().find(|e| e.id == "e1").unwrap();
@@ -753,6 +758,119 @@ async fn pure_resource_batch_falls_to_zstd() {
         Some("zstd"),
         "the pure-resource result falls to plain zstd"
     );
+
+    let reconstructed = reconstruct_events(&db, events).await;
+    let read = reconstructed.iter().find(|e| e.id == "e1").unwrap();
+    assert_eq!(tool_result_of(read), stored);
+}
+
+/// A `?branch` read is resolved live from jj, so no coordinate can reproduce
+/// it. Archival classifies it before verifying: straight to zstd, no coordinate
+/// resolved, no render attempted, counted as `ineligible_read` (and not as a
+/// mismatch), and the stored bytes round-trip.
+#[tokio::test]
+async fn branch_read_goes_straight_to_zstd() {
+    use crate::storage::event_fixture::{mixed_render_targets, MixedSection};
+    let fx = build_fixture();
+    let db = migrated_test_db("archival-branch-read.db").await;
+    seed_chain(&db, fx.repo.to_str().unwrap(), false).await;
+
+    // The live read rendered the branch's bytes; the fixture stores them as an
+    // opaque section, since the archived renderer refuses the shape.
+    let target = "file:a.txt?grep=beta&branch=agent/other-builder-0&-C=2&head_limit=12";
+    let stored = mixed_render_targets(&[MixedSection::Resource(target, "3:beta")]);
+    insert_event(
+        &db,
+        "a1",
+        "run",
+        1,
+        1,
+        "assistant",
+        &assistant_read("r1", &[target]),
+    )
+    .await;
+    insert_event(
+        &db,
+        "e1",
+        "run",
+        2,
+        2,
+        "tool_result",
+        &read_result("r1", &stored),
+    )
+    .await;
+
+    let summary = archive(&db, Some(fx.range())).await.unwrap();
+    assert_eq!(summary.ineligible_read, 1);
+    assert_eq!(summary.mismatch_fallback, 0);
+    assert_eq!(summary.hybrid_read + summary.gitcoord_read, 0);
+    assert_eq!(
+        (summary.unresolvable_coordinate, summary.render_failed),
+        (0, 0),
+        "nothing was resolved or rendered: {summary}"
+    );
+    assert_eq!(storage_mode(&db, "e1").await.as_deref(), Some("zstd"));
+
+    let reconstructed = reconstruct_events(&db, load_events(&db).await).await;
+    let read = reconstructed.iter().find(|e| e.id == "e1").unwrap();
+    assert_eq!(tool_result_of(read), stored);
+}
+
+/// In a mixed batch, a `?branch` target stays verbatim in the hybrid skeleton
+/// beside the coordinatized plain file section, and is never rendered: the
+/// verification meets no render failure.
+#[tokio::test]
+async fn branch_section_of_a_mixed_read_stays_verbatim() {
+    use crate::storage::event_fixture::{mixed_render_targets, MixedSection};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_repo(repo);
+    write_file(repo, "a.txt", b"alpha\nbeta\ngamma\n");
+    commit_all(repo, "base");
+
+    let db = migrated_test_db("archival-branch-mixed.db").await;
+    seed_chain(&db, repo.to_str().unwrap(), false).await;
+
+    let branch_target = "file:a.txt?branch=agent/other-builder-0";
+    let stored = mixed_render_targets(&[
+        MixedSection::File("file:a.txt", b"alpha\nbeta\ngamma\n"),
+        MixedSection::Resource(branch_target, "ALPHA\nbeta\ngamma\n"),
+    ]);
+    insert_event(
+        &db,
+        "a1",
+        "run",
+        1,
+        1,
+        "assistant",
+        &assistant_read("r1", &["file:a.txt", branch_target]),
+    )
+    .await;
+    insert_event(
+        &db,
+        "e1",
+        "run",
+        2,
+        2,
+        "tool_result",
+        &read_result("r1", &stored),
+    )
+    .await;
+
+    let summary = archive(&db, Some(branch_range(repo, "main")))
+        .await
+        .unwrap();
+    assert_eq!(summary.hybrid_read, 1, "{summary}");
+    assert_eq!(summary.ineligible_read, 0);
+    assert_eq!(
+        summary.render_failed, 0,
+        "the ?branch section is never rendered"
+    );
+
+    let events = load_events(&db).await;
+    let row = events.iter().find(|e| e.id == "e1").unwrap();
+    let data: Value = serde_json::from_str(&row.data).unwrap();
+    assert_eq!(data["sections"], json!([0]));
 
     let reconstructed = reconstruct_events(&db, events).await;
     let read = reconstructed.iter().find(|e| e.id == "e1").unwrap();

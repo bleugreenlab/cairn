@@ -56,6 +56,13 @@ pub trait ArchivedFileRenderer: Send + Sync {
         target: &str,
         bytes: &[u8],
     ) -> Result<ReadSegment, String>;
+
+    /// Whether any blob could ever reproduce `target`, decided from the target
+    /// alone: no bytes, no object store. `Err` names the refusing shape (a
+    /// `?branch` read, an `issue_history` request, a multi-file walk), and
+    /// [`Self::produce_archived_file_segment`] refuses exactly these targets,
+    /// so a caller that asks first never resolves a coordinate it cannot use.
+    fn archived_target_support(&self, target: &str) -> Result<(), String>;
 }
 
 static ARCHIVED_FILE_RENDERER: OnceLock<&'static dyn ArchivedFileRenderer> = OnceLock::new();

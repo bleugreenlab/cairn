@@ -209,6 +209,10 @@ pub struct ArchiveTarget {
 /// resolved bytes at a durable commit but failed the render-and-compare at every
 /// candidate: the signature of replay drift, an uncommitted edit, or a
 /// divergence between the live and archived read composition.
+///
+/// The summary is the per-execution record of verification, so the misses it
+/// counts (`unresolvable_coordinate`, `render_failed`) are logged only at debug
+/// while the writer runs.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ArchiveSummary {
     pub gitcoord_read: usize,
@@ -223,10 +227,20 @@ pub struct ArchiveSummary {
     /// skeleton plus a deduped tool-set and the inlined varying fields.
     pub system_init: usize,
     pub mismatch_fallback: usize,
+    /// Reads with no target a git coordinate could reproduce (every target a
+    /// `?branch` read, a glob or multi-file search, an out-of-repo path, or a
+    /// resource or web read), sent straight to zstd with no coordinate resolved
+    /// and no render attempted. Counted within `zstd`, like `mismatch_fallback`.
+    pub ineligible_read: usize,
     /// Committed writes whose recorded commit the repository no longer knows
     /// (collected before archival, or sealed somewhere never exported), and so
     /// fell to zstd.
     pub unresolved_write: usize,
+    /// Candidate `(commit, path)` coordinates verification could not resolve: a
+    /// file absent at a fork point, an out-of-repo path. Expected in quantity.
+    pub unresolvable_coordinate: usize,
+    /// Resolved blobs the renderer failed to render during verification.
+    pub render_failed: usize,
     pub bytes_before: usize,
     pub bytes_after: usize,
 }
@@ -251,7 +265,10 @@ impl ArchiveSummary {
         self.system_prompt += other.system_prompt;
         self.system_init += other.system_init;
         self.mismatch_fallback += other.mismatch_fallback;
+        self.ineligible_read += other.ineligible_read;
         self.unresolved_write += other.unresolved_write;
+        self.unresolvable_coordinate += other.unresolvable_coordinate;
+        self.render_failed += other.render_failed;
         self.bytes_before += other.bytes_before;
         self.bytes_after += other.bytes_after;
     }
@@ -269,7 +286,8 @@ impl fmt::Display for ArchiveSummary {
         write!(
             f,
             "{} gitcoord-read, {} hybrid-read, {} gitcoord-write, {} system-prompt, \
-             {} system-init, {} zstd, {} mismatch-fallback, {} unresolved-write, \
+             {} system-init, {} zstd ({} ineligible-read, {} mismatch-fallback), \
+             {} unresolved-write, {} unresolvable-coordinate, {} render-failed, \
              {} -> {} bytes",
             self.gitcoord_read,
             self.hybrid_read,
@@ -277,24 +295,44 @@ impl fmt::Display for ArchiveSummary {
             self.system_prompt,
             self.system_init,
             self.zstd,
+            self.ineligible_read,
             self.mismatch_fallback,
             self.unresolved_write,
+            self.unresolvable_coordinate,
+            self.render_failed,
             self.bytes_before,
             self.bytes_after,
         )
     }
 }
 
+/// One execution archives at a time, process-wide, across teardown and the
+/// sweep alike.
+///
+/// Archival is maintenance over transcripts nobody appends to any more: only
+/// the teardown that queued it waits for it, and those run detached. Closing a
+/// coordinator issue resolves its whole subtree within seconds, each resolution
+/// spawning its own teardown, so an uncapped writer classified a dozen large
+/// transcripts on a dozen cores at once and interleaved their UPDATE chunks on
+/// the runtime. Serialized, a storm of closes costs one blocking core and one
+/// stream of writes, for longer.
+static ARCHIVAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Archive one execution's still-`full` events.
 ///
 /// With a range, the writer packs the branch's objects, writes
 /// `execution_history`, and attempts git coordinates; without one it writes only
 /// zstd and blobbed shapes. On error nothing past the last committed chunk is
-/// written and the remaining rows stay `full` for a later pass to retry.
+/// written and the remaining rows stay `full` for a later pass to retry. Waits
+/// for [`ARCHIVAL_GATE`] first.
 pub async fn archive_execution(
     db: &LocalDb,
     target: ArchiveTarget,
 ) -> Result<ArchiveSummary, String> {
+    let _permit = ARCHIVAL_GATE
+        .acquire()
+        .await
+        .map_err(|error| format!("archival gate closed: {error}"))?;
     let Some(loaded) = load(db, &target.execution_id)
         .await
         .map_err(|e| format!("loading execution events for archival: {e}"))?
@@ -374,6 +412,9 @@ struct Loaded {
     events: Vec<Event>,
 }
 
+/// Event rows loaded between yields to the runtime.
+const LOAD_YIELD_ROWS: usize = 256;
+
 async fn load(db: &LocalDb, execution_id: &str) -> DbResult<Option<Loaded>> {
     let execution_id = execution_id.to_string();
     db.read(move |conn| {
@@ -430,6 +471,12 @@ async fn load(db: &LocalDb, execution_id: &str) -> DbResult<Option<Loaded>> {
             let mut events = Vec::new();
             while let Some(row) = rows.next().await? {
                 events.push(event_from_row(&row)?);
+                // A coordinator's transcript runs to tens of thousands of rows,
+                // and a row step rarely awaits anything real: hand the worker
+                // back periodically so the load never holds it for seconds.
+                if events.len() % LOAD_YIELD_ROWS == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
 
             Ok(Some(Loaded {

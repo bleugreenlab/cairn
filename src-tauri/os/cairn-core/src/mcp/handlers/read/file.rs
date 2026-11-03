@@ -800,25 +800,26 @@ fn render_text_from_bytes(
     })
 }
 
-/// Produce the same [`ReadSegment`] the live read producer would have built from
-/// `bytes` for a single `file:` target.
+/// A single `file:` target one archived blob can faithfully address, as parsed by
+/// [`parse_archived_file_target`].
+struct ArchivedFileTarget {
+    rel_path: String,
+    projection: ReadProjection,
+    offset: Option<i64>,
+    limit: Option<usize>,
+    char_offset: Option<usize>,
+}
+
+/// Parse `target` as an archived file read, or name the shape that keeps a
+/// single blob from reproducing it: a `?branch` read (resolved live from jj), an
+/// `issue_history` request (sourced from the DB), a glob projection, or a
+/// multi-file grep, ast, or outline walk.
 ///
-/// Reconstruction calls this per target in an archived `gitcoord` read and then
-/// runs the resulting segments through the very same `assemble` the live
-/// `read_batch` ran, so a reconstructed batch reproduces the live envelope
-/// byte-for-byte: enriched headers, continue footers, fair-share budgets, and the
-/// empty-body header collapse. The query parsing ([`parse_file_projection`]) and
-/// the byte renderers (`render_text_from_bytes`, `render_single_file_grep`) are
-/// the same ones [`produce_file_segment`] uses, so there is no frozen second copy
-/// of the windowing/grep logic — only the disk read is swapped for the resolved
-/// git blob. Returns `Err` for any target a single blob cannot faithfully address
-/// (a glob projection, a multi-file grep, or an `issue_history` request, whose
-/// history is sourced from the DB rather than the blob); the caller then falls to
-/// zstd.
-pub(crate) fn produce_archived_file_segment(
-    target: &str,
-    bytes: &[u8],
-) -> Result<ReadSegment, String> {
+/// Every eligibility decision lives here and none needs the bytes, so the
+/// archival writer can ask ([`archived_file_target_support`]) before resolving
+/// any coordinate, and [`produce_archived_file_segment`] refuses exactly the
+/// targets this refuses.
+fn parse_archived_file_target(target: &str) -> Result<ArchivedFileTarget, String> {
     let split = split_target_query(target)?;
     if !split.identity.starts_with("file:") {
         return Err(format!(
@@ -847,35 +848,81 @@ pub(crate) fn produce_archived_file_segment(
                 .to_string(),
         );
     }
+    // A single blob addresses exactly one file. A glob projection, or a
+    // `glob`/`type` push-down on a grep, ast, or outline read, means the live
+    // read walked the tree, which no blob reproduces. ast-grep and outline are
+    // in-process and stateless, so their single-file forms are eligible.
+    let multi_file = match &projection {
+        ReadProjection::Glob { .. } => Some("a glob projection"),
+        ReadProjection::Ast { glob: Some(_), .. } => Some("a multi-file ast search (glob)"),
+        ReadProjection::Outline { glob: Some(_) } => Some("a multi-file outline (glob)"),
+        ReadProjection::Grep(grep) if grep.glob.is_some() || grep.file_type.is_some() => {
+            Some("a multi-file grep (glob/type)")
+        }
+        _ => None,
+    };
+    if let Some(shape) = multi_file {
+        return Err(format!(
+            "archival read target uses {shape}, which is never gitcoord-addressed"
+        ));
+    }
     let char_offset = parse_optional_usize(
         find_query_value(&split.params, "char_offset"),
         "char_offset",
     )?;
-
-    let uri = target.to_string();
     let rel_path = split
         .identity
         .strip_prefix("file:")
-        .unwrap_or(&split.identity);
+        .unwrap_or(&split.identity)
+        .to_string();
+    Ok(ArchivedFileTarget {
+        rel_path,
+        projection,
+        offset,
+        limit,
+        char_offset,
+    })
+}
+
+/// Whether one archived blob can ever reproduce `target`, decided from the
+/// target alone. `Err` names the refusing shape.
+pub(crate) fn archived_file_target_support(target: &str) -> Result<(), String> {
+    parse_archived_file_target(target).map(|_| ())
+}
+
+/// Produce the same [`ReadSegment`] the live read producer would have built from
+/// `bytes` for a single `file:` target.
+///
+/// Reconstruction calls this per target in an archived `gitcoord` read and then
+/// runs the resulting segments through the very same `assemble` the live
+/// `read_batch` ran, so a reconstructed batch reproduces the live envelope
+/// byte-for-byte: enriched headers, continue footers, fair-share budgets, and the
+/// empty-body header collapse. The query parsing ([`parse_file_projection`]) and
+/// the byte renderers (`render_text_from_bytes`, `render_single_file_grep`) are
+/// the same ones [`produce_file_segment`] uses, so there is no frozen second copy
+/// of the windowing/grep logic — only the disk read is swapped for the resolved
+/// git blob. Returns `Err` for any target [`parse_archived_file_target`] refuses;
+/// the caller then falls to zstd.
+pub(crate) fn produce_archived_file_segment(
+    target: &str,
+    bytes: &[u8],
+) -> Result<ReadSegment, String> {
+    let ArchivedFileTarget {
+        rel_path,
+        projection,
+        offset,
+        limit,
+        char_offset,
+    } = parse_archived_file_target(target)?;
+    let uri = target.to_string();
+    let rel_path = rel_path.as_str();
     let path = std::path::Path::new(rel_path);
 
     match projection {
-        ReadProjection::Glob { .. } => Err(
-            "archival read target uses a glob projection, which is never gitcoord-addressed"
-                .to_string(),
-        ),
-        ReadProjection::Ast { pattern, glob } => {
-            // ast-grep is in-process and stateless: it parses source text with no
-            // live-server or whole-tree dependency, so a single-file structural
-            // search reconstructs identically from the blob bytes. Only the
-            // multi-file `glob` walk is unreproducible from one blob — mirror the
-            // grep arm and reject just that case.
-            if glob.is_some() {
-                return Err(
-                    "archival read target uses a multi-file ast search (glob), which is never gitcoord-addressed"
-                        .to_string(),
-                );
-            }
+        ReadProjection::Glob { .. } => {
+            unreachable!("parse_archived_file_target refuses glob projections")
+        }
+        ReadProjection::Ast { pattern, .. } => {
             let src = String::from_utf8_lossy(bytes);
             let lang = crate::symbols::engine::lang_for_path(path);
             let rendered = crate::symbols::search::search_text(rel_path, &src, lang, &pattern);
@@ -884,15 +931,7 @@ pub(crate) fn produce_archived_file_segment(
             meta.file_count = None;
             Ok(ReadSegment::text(rendered.body, meta))
         }
-        ReadProjection::Outline { glob } => {
-            // Single-file outline reconstructs from blob bytes for the same
-            // reason ast search does; only the multi-file glob walk cannot.
-            if glob.is_some() {
-                return Err(
-                    "archival read target uses a multi-file outline (glob), which is never gitcoord-addressed"
-                        .to_string(),
-                );
-            }
+        ReadProjection::Outline { .. } => {
             let src = String::from_utf8_lossy(bytes);
             let lang = crate::symbols::engine::lang_for_path(path);
             let rendered = crate::symbols::outline::outline_text_rendered(&src, lang);
@@ -902,15 +941,6 @@ pub(crate) fn produce_archived_file_segment(
             Ok(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::Grep(mut grep_payload) => {
-            // A single blob addresses exactly one file. A `glob`/`type` push-down
-            // means the live read ran multi-file ripgrep over the tree, which a
-            // blob cannot reproduce — ineligible.
-            if grep_payload.glob.is_some() || grep_payload.file_type.is_some() {
-                return Err(
-                    "archival read target uses a multi-file grep (glob/type), which is never gitcoord-addressed"
-                        .to_string(),
-                );
-            }
             // Resolve the effective output mode through the very function the
             // live producer uses, with the classification a blob makes certain:
             // one file. It touches no disk, so the path need not exist during
@@ -3017,5 +3047,38 @@ mod tests {
         assert_eq!(segment.images[0].mime_type, "image/png");
         let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
         assert_eq!(segment.images[0].data, expected);
+    }
+
+    /// The bytes-free support check and the renderer refuse the same targets,
+    /// so the archival writer can classify a read without resolving anything.
+    #[test]
+    fn archived_target_support_matches_what_the_renderer_refuses() {
+        let refused = [
+            "file:a.ts?branch=agent/x-builder-0",
+            "file:a.ts?grep=beta&branch=agent/x-builder-0&-C=2&head_limit=12",
+            "file:a.ts?issue_history=true",
+            "file:src?glob=**/*.ts",
+            "file:src?grep=beta&glob=**/*.ts",
+            "file:src?ast=foo($A)&glob=**/*.ts",
+            "file:src?outline&glob=**/*.ts",
+        ];
+        for target in refused {
+            let reason = archived_file_target_support(target).unwrap_err();
+            assert_eq!(
+                produce_archived_file_segment(target, b"alpha\nbeta\n").unwrap_err(),
+                reason,
+                "{target}"
+            );
+        }
+        for target in [
+            "file:a.ts",
+            "file:a.ts?offset=2&limit=1",
+            "file:a.ts?grep=beta&-C=2",
+            "file:a.ts?ast=foo($A)",
+            "file:a.ts?outline",
+        ] {
+            archived_file_target_support(target).unwrap();
+            produce_archived_file_segment(target, b"alpha\nbeta\n").unwrap();
+        }
     }
 }

@@ -78,6 +78,10 @@ impl crate::storage::render::ArchivedFileRenderer for McpArchivedFileRenderer {
     ) -> Result<ReadSegment, String> {
         file::produce_archived_file_segment(target, bytes)
     }
+
+    fn archived_target_support(&self, target: &str) -> Result<(), String> {
+        file::archived_file_target_support(target)
+    }
 }
 
 /// Register the mcp archived-file renderer with `storage::render`. Idempotent

@@ -3,8 +3,10 @@ use super::*;
 use crate::storage::pack_catalog::{PackCatalogPublication, PackKind};
 
 /// Event UPDATEs per transaction. Bounds a single transaction's size no matter
-/// how long the transcript is.
-const UPDATE_CHUNK: usize = 500;
+/// how long the transcript is, and how long one chunk holds the write lock and
+/// the runtime worker stepping it: the embedded engine rarely suspends inside a
+/// statement, so a chunk runs as one long poll.
+const UPDATE_CHUNK: usize = 100;
 
 /// Apply a local (private database) archival: the content-addressed blobs and
 /// the `execution_history` row commit first, then the event rewrites in chunks.
@@ -199,6 +201,9 @@ async fn write_event_updates(db: &LocalDb, updates: Vec<EventUpdate>) -> Result<
         })
         .await
         .map_err(|e| format!("archival event transaction failed: {e}"))?;
+        // Let the writers and readers queued behind this chunk run before the
+        // next one takes the lock again.
+        tokio::task::yield_now().await;
     }
     Ok(())
 }

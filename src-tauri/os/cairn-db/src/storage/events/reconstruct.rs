@@ -952,7 +952,7 @@ fn reconstruct_gitcoord_read(
         });
 
     let (rendered, resolved) = match paths {
-        Some(paths) => reconstruct_read_resolving(commit_hex, &paths, store),
+        Some(paths) => reconstruct_read_resolving(commit_hex, &paths, store, &mut StubReport::Log),
         None => {
             log::warn!("gitcoord read {} has no tool_input.paths", event.id);
             (stub(commit_hex, "<read>"), false)
@@ -1064,8 +1064,14 @@ fn reconstruct_hybrid_read(
         })
         .unwrap_or_default();
 
-    let (rendered, resolved) =
-        splice_hybrid_skeleton_resolving(&skeleton, commit_hex, &paths, &sections, store);
+    let (rendered, resolved) = splice_hybrid_skeleton_resolving(
+        &skeleton,
+        commit_hex,
+        &paths,
+        &sections,
+        store,
+        &mut StubReport::Log,
+    );
 
     // Same drift tripwire as the pure-file read: a mismatch means the live and
     // archival read composition diverged since archival. A degraded (stub) section
@@ -1283,8 +1289,13 @@ fn split_diff_by_path(diff: &str) -> HashMap<String, String> {
 /// errors out of the batch. This degraded output is not byte-exact history: the
 /// `STUB_PREFIX` guard in [`reconstruct_gitcoord_read`] explicitly exempts it from
 /// the recorded-render SHA comparison (as does the equivalent hybrid-read guard).
-pub fn reconstruct_read(commit_hex: &str, paths: &[String], store: Option<&ObjectStore>) -> String {
-    reconstruct_read_resolving(commit_hex, paths, store).0
+pub fn reconstruct_read(
+    commit_hex: &str,
+    paths: &[String],
+    store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
+) -> String {
+    reconstruct_read_resolving(commit_hex, paths, store, report).0
 }
 
 /// [`reconstruct_read`], also reporting whether every target resolved.
@@ -1292,13 +1303,14 @@ fn reconstruct_read_resolving(
     commit_hex: &str,
     paths: &[String],
     store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
 ) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
     let mut resolved = true;
     let segments: Vec<ReadSegment> = paths
         .iter()
         .map(
-            |target| match build_archived_segment(commit_hex, target, store, renderer) {
+            |target| match build_archived_segment(commit_hex, target, store, renderer, report) {
                 Ok(segment) => segment,
                 Err(stub) => {
                     resolved = false;
@@ -1320,8 +1332,9 @@ pub fn render_archived_file_section(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
 ) -> String {
-    render_archived_file_section_resolving(commit_hex, target, store).0
+    render_archived_file_section_resolving(commit_hex, target, store, report).0
 }
 
 /// [`render_archived_file_section`], also reporting whether the target resolved.
@@ -1329,9 +1342,11 @@ fn render_archived_file_section_resolving(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
 ) -> (String, bool) {
     let renderer = crate::storage::render::archived_file_renderer();
-    let (seg, resolved) = match build_archived_segment(commit_hex, target, store, renderer) {
+    let (seg, resolved) = match build_archived_segment(commit_hex, target, store, renderer, report)
+    {
         Ok(segment) => (segment, true),
         Err(stub) => (*stub, false),
     };
@@ -1360,8 +1375,9 @@ pub fn splice_hybrid_skeleton(
     paths: &[String],
     sections: &[usize],
     store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
 ) -> String {
-    splice_hybrid_skeleton_resolving(skeleton, commit_hex, paths, sections, store).0
+    splice_hybrid_skeleton_resolving(skeleton, commit_hex, paths, sections, store, report).0
 }
 
 /// [`splice_hybrid_skeleton`], also reporting whether every excised section
@@ -1373,6 +1389,7 @@ fn splice_hybrid_skeleton_resolving(
     paths: &[String],
     sections: &[usize],
     store: Option<&ObjectStore>,
+    report: &mut StubReport<'_>,
 ) -> (String, bool) {
     let mut out = skeleton.to_string();
     let mut resolved = true;
@@ -1382,7 +1399,7 @@ fn splice_hybrid_skeleton_resolving(
             continue;
         };
         let (section, section_resolved) =
-            render_archived_file_section_resolving(commit_hex, target, store);
+            render_archived_file_section_resolving(commit_hex, target, store, report);
         resolved &= section_resolved;
         out = out.replace(&section_placeholder(index), &section);
     }
@@ -1396,6 +1413,10 @@ fn splice_hybrid_skeleton_resolving(
 /// live read built from the same bytes; when no renderer is registered the
 /// target degrades to the same coordinate stub as an unresolvable one.
 ///
+/// A target whose shape the renderer refuses outright (a `?branch` read, say)
+/// stubs before its coordinate is resolved: no blob could ever render it, so
+/// walking the tree for one would be wasted work.
+///
 /// `Err` carries that stub segment, so a caller that only renders treats both
 /// arms alike and one that reports can tell them apart.
 fn build_archived_segment(
@@ -1403,6 +1424,7 @@ fn build_archived_segment(
     target: &str,
     store: Option<&ObjectStore>,
     renderer: Option<&dyn ArchivedFileRenderer>,
+    report: &mut StubReport<'_>,
 ) -> Result<ReadSegment, Box<ReadSegment>> {
     let stub_segment = |label: &str| {
         Box::new(crate::storage::render::error_segment(
@@ -1416,10 +1438,16 @@ fn build_archived_segment(
     let Some(path) = repo_relative_path(target) else {
         return Err(stub_segment(target));
     };
+    if let Some(Err(reason)) = renderer.map(|renderer| renderer.archived_target_support(target)) {
+        report.ineligible(target, &reason);
+        return Err(stub_segment(&path));
+    }
     match store.resolve_path_at_commit(commit_hex, &path) {
-        Ok(bytes) => render_archived_bytes(renderer, target, &bytes, || *stub_segment(&path)),
+        Ok(bytes) => {
+            render_archived_bytes(renderer, target, &bytes, report, || *stub_segment(&path))
+        }
         Err(error) => {
-            warn_unresolvable_once(commit_hex, &path, &error);
+            report.unresolvable(commit_hex, &path, &error);
             Err(stub_segment(&path))
         }
     }
@@ -1434,18 +1462,30 @@ fn render_archived_bytes(
     renderer: Option<&dyn ArchivedFileRenderer>,
     target: &str,
     bytes: &[u8],
+    report: &mut StubReport<'_>,
     stub: impl Fn() -> ReadSegment,
 ) -> Result<ReadSegment, Box<ReadSegment>> {
     match renderer {
         Some(renderer) => match renderer.produce_archived_file_segment(target, bytes) {
             Ok(segment) => Ok(segment),
             Err(error) => {
-                log::warn!("archived read render failed for {target}: {error}");
+                report.render_failed(target, &error);
                 Err(Box::new(stub()))
             }
         },
         None => Err(Box::new(stub())),
     }
+}
+
+/// Whether a recorded read `target` could ever be reproduced from a git
+/// coordinate: an in-repo `file:` target whose shape the registered renderer
+/// accepts. Decided from the target alone, so the archival writer can send a
+/// read with no eligible target straight to zstd without resolving a
+/// coordinate or attempting a render.
+pub fn read_target_is_coordinate_eligible(target: &str) -> bool {
+    repo_relative_path(target).is_some()
+        && crate::storage::render::archived_file_renderer()
+            .is_some_and(|renderer| renderer.archived_target_support(target).is_ok())
 }
 
 pub fn repo_relative_path(target: &str) -> Option<String> {
@@ -1458,27 +1498,89 @@ fn stub(commit_hex: &str, label: &str) -> String {
     format!("{STUB_PREFIX}: {commit_hex}:{label}")
 }
 
-/// An unresolvable archived-read coordinate is a permanent, expected condition
-/// for legacy rows written before the render-and-compare verify shipped: their
-/// original rendered bytes were discarded at teardown and can never be
-/// reconstructed. The same handful of coordinates would otherwise warn on every
-/// transcript view (CAIRN-1675 observed ~1,854 lines for ~6 coordinates), so
-/// warn once per coordinate per process and drop the repeats to debug.
-fn warn_unresolvable_once(commit_hex: &str, path: &str, error: &impl std::fmt::Display) {
-    use std::collections::HashSet;
+/// How an archived-segment build reports a target that degrades to a stub.
+///
+/// Reconstruction ([`StubReport::Log`]) shows a transcript to a reader, so a
+/// stub is logged, once per distinct cause per process. The archival writer's
+/// verification ([`StubReport::Tally`]) tries every candidate commit for every
+/// read in a transcript and expects most attempts to miss, so it counts them
+/// for the execution's summary line and logs each only at debug.
+pub enum StubReport<'a> {
+    Log,
+    Tally(&'a mut StubTally),
+}
+
+/// Stubbed targets one archival verification pass counted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StubTally {
+    /// Targets whose shape the renderer refuses, stubbed before any
+    /// coordinate was resolved.
+    pub ineligible: usize,
+    /// `(commit, path)` coordinates that did not resolve.
+    pub unresolvable: usize,
+    /// Resolved blobs the renderer failed to render.
+    pub render_failed: usize,
+}
+
+impl StubReport<'_> {
+    /// A refused shape is by design, not a fault, so reconstruction names it
+    /// once per shape at info.
+    fn ineligible(&mut self, target: &str, reason: &str) {
+        match self {
+            StubReport::Log if first_occurrence(format!("ineligible:{reason}")) => log::info!(
+                "archived read target shape is never reconstructed from a blob ({reason}); \
+                 first seen: {target}"
+            ),
+            StubReport::Log => log::debug!("archived read target ineligible {target}: {reason}"),
+            StubReport::Tally(tally) => {
+                tally.ineligible += 1;
+                log::debug!("archived read target ineligible {target}: {reason}");
+            }
+        }
+    }
+
+    /// An unresolvable coordinate is a permanent, expected condition for legacy
+    /// rows written before the render-and-compare verify shipped: their original
+    /// rendered bytes were discarded at teardown and can never be reconstructed.
+    /// The same handful of coordinates would otherwise warn on every transcript
+    /// view (CAIRN-1675 observed ~1,854 lines for ~6 coordinates), so
+    /// reconstruction warns once per coordinate per process.
+    fn unresolvable(&mut self, commit_hex: &str, path: &str, error: &dyn std::fmt::Display) {
+        let key = format!("{commit_hex}:{path}");
+        match self {
+            StubReport::Log if first_occurrence(format!("unresolvable:{key}")) => {
+                log::warn!("archived read coordinate unresolvable {key}: {error}")
+            }
+            StubReport::Log => log::debug!("archived read coordinate unresolvable {key}: {error}"),
+            StubReport::Tally(tally) => {
+                tally.unresolvable += 1;
+                log::debug!("archived read coordinate unresolvable {key}: {error}");
+            }
+        }
+    }
+
+    fn render_failed(&mut self, target: &str, error: &str) {
+        match self {
+            StubReport::Log if first_occurrence(format!("render:{error}")) => {
+                log::warn!("archived read render failed for {target}: {error}")
+            }
+            StubReport::Log => log::debug!("archived read render failed for {target}: {error}"),
+            StubReport::Tally(tally) => {
+                tally.render_failed += 1;
+                log::debug!("archived read render failed for {target}: {error}");
+            }
+        }
+    }
+}
+
+/// Whether this process has not yet seen `key`.
+fn first_occurrence(key: String) -> bool {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let key = format!("{commit_hex}:{path}");
-    let first = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .map(|mut seen| seen.insert(key.clone()))
-        .unwrap_or(true);
-    if first {
-        log::warn!("archived read coordinate unresolvable {key}: {error}");
-    } else {
-        log::debug!("archived read coordinate unresolvable {key}: {error}");
-    }
+        .map(|mut seen| seen.insert(key))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -1734,13 +1836,77 @@ mod tests {
         assert!(!reported[0].0.data.contains("sk-secret"));
     }
 
+    /// A renderer that refuses every `?branch` target, and fails the test if it
+    /// is ever asked to render one.
+    struct RefusesBranch;
+
+    impl ArchivedFileRenderer for RefusesBranch {
+        fn produce_archived_file_segment(
+            &self,
+            target: &str,
+            _bytes: &[u8],
+        ) -> Result<ReadSegment, String> {
+            assert!(
+                !target.contains("branch="),
+                "a refused shape reached the renderer: {target}"
+            );
+            Ok(crate::storage::render::error_segment(
+                target,
+                "rendered".to_string(),
+            ))
+        }
+
+        fn archived_target_support(&self, target: &str) -> Result<(), String> {
+            if target.contains("branch=") {
+                Err("branch reads are resolved live".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A refused shape stubs before its coordinate is resolved: the `?branch`
+    /// read of an absent path counts as ineligible, not unresolvable, and never
+    /// reaches the renderer. Archival verification tallies every miss.
+    #[test]
+    fn refused_shapes_stub_before_resolving_and_misses_are_tallied() {
+        let fx = build_fixture();
+        let store = ObjectStore::new(&fx.origin, None).unwrap();
+        let mut tally = StubTally::default();
+        let mut report = StubReport::Tally(&mut tally);
+        let mut build = |target: &str| {
+            build_archived_segment(
+                &fx.anchor,
+                target,
+                Some(&store),
+                Some(&RefusesBranch),
+                &mut report,
+            )
+        };
+        let refused = build("file:ghost.txt?branch=feature").unwrap_err();
+        assert!(refused.body.contains(STUB_PREFIX));
+        let missing = build("file:ghost.txt").unwrap_err();
+        assert!(missing.body.contains(STUB_PREFIX));
+        assert!(build("file:a.txt").is_ok());
+        assert_eq!(
+            tally,
+            StubTally {
+                ineligible: 1,
+                unresolvable: 1,
+                render_failed: 0,
+            }
+        );
+    }
+
     /// The trait-fallback branch: with no renderer registered, archived file bytes
     /// degrade to the injected stub. Pure — no DB, no global, no mcp dependency.
     #[test]
     fn render_archived_bytes_without_renderer_degrades_to_stub() {
         let stub =
             || crate::storage::render::error_segment("file:a.txt", stub("deadbeef", "file:a.txt"));
-        let segment = render_archived_bytes(None, "file:a.txt", b"ignored", stub).unwrap_err();
+        let segment =
+            render_archived_bytes(None, "file:a.txt", b"ignored", &mut StubReport::Log, stub)
+                .unwrap_err();
         assert!(segment.body.contains(STUB_PREFIX));
     }
 }
