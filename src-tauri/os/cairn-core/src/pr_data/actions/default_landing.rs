@@ -286,7 +286,14 @@ fn replay_and_bind(
             &merge_context.target_branch,
         )?;
     }
-    bind::bind_onto(&store.jj, &store.path, source, target_tip, rules)
+    bind::bind_onto(
+        &store.jj,
+        &store.path,
+        source,
+        target_tip,
+        &merge_context.target_branch,
+        rules,
+    )
 }
 
 /// The merge result as it would land now, built in the store and undone. The

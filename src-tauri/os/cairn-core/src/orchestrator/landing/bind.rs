@@ -19,6 +19,11 @@
 //! `version-heading`); `.cairn/config.yaml`'s `landing.identifiers`, read at
 //! the destination, instantiates them.
 //!
+//! One spelling is refused rather than bound: a provisional stem quoted alone
+//! in code (`"NEXT_x"`). While the file is provisional that literal is both
+//! its number and its stem, and binding splits them (`0284` and `0284_x`), so
+//! no rewrite of it is right for every use.
+//!
 //! Nothing here renumbers at replay. A base advance carries `NEXT` through
 //! unchanged, and a child merged into an integration branch carries it to the
 //! integration branch's own landing.
@@ -253,6 +258,13 @@ pub(crate) fn replace_tokens(text: &str, substitutions: &BTreeMap<String, String
 /// or TypeScript file still spells as a bare quoted literal is reported in the
 /// commit body, never rewritten: only its author knows which migration it
 /// meant.
+///
+/// A provisional stem that such a file quotes alone is refused. A provisional
+/// migration's `version` is its whole stem, so on the branch `"NEXT_x"` may
+/// be the version (bound, `0284`) or the file stem (bound, `0284_x`), and
+/// either rewrite breaks the other use on the default branch. The name, `x`,
+/// is the same on both sides of the binding, and is what code should select
+/// by.
 pub(crate) fn plan_numbered_file(
     kind: &str,
     directory: &str,
@@ -290,6 +302,7 @@ pub(crate) fn plan_numbered_file(
     let mut substitutions: BTreeMap<String, String> = BTreeMap::new();
     let mut renamed: BTreeMap<String, String> = BTreeMap::new();
     let mut rebound_numbers: Vec<(u64, String)> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
     let mut next = taken;
     for (number, stem, rest, name) in &added {
         next += 1;
@@ -313,7 +326,20 @@ pub(crate) fn plan_numbered_file(
             continue;
         }
         match number {
-            Numbered::Provisional => {}
+            Numbered::Provisional => {
+                let sites = quoted_sites(changed, stem);
+                if !sites.is_empty() {
+                    let name_part = rest.rsplit_once('.').map_or(*rest, |(name, _)| name);
+                    ambiguous.push(format!(
+                        "`\"{stem}\"` is quoted alone at {}. While the file is provisional that \
+                         literal is both its number and its stem, and the landing binds them \
+                         apart (`{next:0width$}` and `{bound_stem}`), so it cannot tell which \
+                         the code means. Select it by its name, `{name_part}`, which binding \
+                         leaves unchanged, or name the file whole (`{name}`)",
+                        sites.join(", ")
+                    ));
+                }
+            }
             Numbered::Bound(old) => {
                 rebound_numbers.push((*old, bound_stem.clone()));
             }
@@ -325,6 +351,9 @@ pub(crate) fn plan_numbered_file(
             format!("{directory}/{name}"),
             format!("{directory}/{bound_name}"),
         );
+    }
+    if !ambiguous.is_empty() {
+        return Err(format!("[{kind}] {}", ambiguous.join("; ")));
     }
     for (from, to) in &renamed {
         plan.edits.push(FileEdit::Rename {
@@ -348,17 +377,7 @@ pub(crate) fn plan_numbered_file(
 
     for (old, bound_stem) in rebound_numbers {
         let digits = format!("{old:0width$}");
-        let quoted = [format!("\"{digits}\""), format!("'{digits}'")];
-        let sites: Vec<String> = changed
-            .iter()
-            .filter(|(path, _)| path.ends_with(".rs") || path.ends_with(".ts"))
-            .flat_map(|(path, text)| {
-                text.lines()
-                    .enumerate()
-                    .filter(|(_, line)| quoted.iter().any(|needle| line.contains(needle.as_str())))
-                    .map(move |(index, _)| format!("{path}:{}", index + 1))
-            })
-            .collect();
+        let sites = quoted_sites(changed, &digits);
         if !sites.is_empty() {
             plan.notes.push(format!(
                 "  `{digits}` still appears as a bare literal at {}; a number reference does not \
@@ -368,6 +387,32 @@ pub(crate) fn plan_numbered_file(
         }
     }
     Ok(())
+}
+
+/// The `path:line` of every line of a Rust or TypeScript file in `changed` that
+/// quotes `literal` alone, in double or single quotes. Quoted alone, a literal
+/// is a value the code compares; a file reference carries a suffix or a path.
+fn quoted_sites(changed: &[(String, String)], literal: &str) -> Vec<String> {
+    let quoted = [format!("\"{literal}\""), format!("'{literal}'")];
+    changed
+        .iter()
+        .filter(|(path, _)| [".rs", ".ts", ".tsx"].iter().any(|ext| path.ends_with(ext)))
+        .flat_map(|(path, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| quoted.iter().any(|needle| line.contains(needle.as_str())))
+                .map(move |(index, _)| format!("{path}:{}", index + 1))
+        })
+        .collect()
+}
+
+/// A landing refused for a reason the branch's author fixes, in the wording
+/// every landing refusal shares.
+fn landing_refusal(source_branch: &str, target_branch: &str, error: &str) -> String {
+    format!(
+        "Refusing to merge `{source_branch}` into `{target_branch}`: {error}. \
+         `{target_branch}` was not advanced."
+    )
 }
 
 /// Bind the one version heading the branch authored above `anchor` in `file`.
@@ -551,18 +596,21 @@ pub(crate) fn touches_identifiers(
         }))
 }
 
-/// Bind `branch`, which must already descend from `target`, against `target`,
-/// and seal the bind commit onto it when there is anything to bind. The caller
-/// holds the store lock.
+/// Bind `branch`, which must already descend from `target` (the tip of
+/// `target_branch`), against `target`, and seal the bind commit onto it when
+/// there is anything to bind. A rule that refuses the branch is reported as a
+/// landing refusal. The caller holds the store lock.
 pub(crate) fn bind_onto(
     jj: &crate::jj::JjEnv,
     store: &Path,
     branch: &str,
     target: &str,
+    target_branch: &str,
     rules: &[(String, IdentifierRule)],
 ) -> Result<BoundLanding, String> {
     let tip = crate::jj::bookmark_commit(jj, store, branch)
         .ok_or_else(|| format!("bookmark `{branch}` did not resolve to one commit"))?;
+    let refuse = |error: String| landing_refusal(branch, target_branch, &error);
     let mut plan = BindPlan::default();
     let mut changed: Option<Vec<(String, String)>> = None;
     for (kind, rule) in rules {
@@ -584,7 +632,8 @@ pub(crate) fn bind_onto(
                     &target_names,
                     changed.as_deref().unwrap_or_default(),
                     &mut plan,
-                )?;
+                )
+                .map_err(refuse)?;
             }
             IdentifierRule::VersionHeading { file, anchor } => {
                 let (Some(target_text), Some(tip_text)) = (
@@ -593,7 +642,8 @@ pub(crate) fn bind_onto(
                 ) else {
                     continue;
                 };
-                plan_version_heading(kind, file, anchor, &tip_text, &target_text, &mut plan)?;
+                plan_version_heading(kind, file, anchor, &tip_text, &target_text, &mut plan)
+                    .map_err(refuse)?;
             }
         }
     }
@@ -673,12 +723,7 @@ pub(crate) fn validate_landing(
                 _ => Ok(()),
             },
         };
-        violation.map_err(|error| {
-            format!(
-                "Refusing to merge `{source_branch}` into `{target_branch}`: {error}. \
-                 `{target_branch}` was not advanced."
-            )
-        })?;
+        violation.map_err(|error| landing_refusal(source_branch, target_branch, &error))?;
     }
     Ok(())
 }
@@ -836,6 +881,82 @@ mod tests {
         assert!(plan.edits.contains(&FileEdit::Rewrite {
             path: "src/lib.rs".into(),
             content: "include_str!(\"../0284_mine.sql\");\n".into(),
+        }));
+    }
+
+    /// cairn/4882's branch: a test found its provisional migration with
+    /// `version != "NEXT_channel_ambient"`, the stem rewrite turned that into
+    /// `"0328_channel_ambient"`, and the bound version is `"0328"`.
+    #[test]
+    fn a_provisional_stem_quoted_alone_is_refused_with_every_site() {
+        let error = bind(
+            &["0327_prev.sql", "NEXT_channel_ambient.sql"],
+            &["0327_prev.sql"],
+            &[
+                (
+                    "src-tauri/os/cairn-db/src/storage/migrations.rs",
+                    "let head = TURSO_MIGRATIONS\n    .iter()\n    .take_while(|migration| migration.version != \"NEXT_channel_ambient\")\n",
+                ),
+                (
+                    "scripts/lib/migration-check.test.ts",
+                    "expect(version).toBe('NEXT_channel_ambient');\n",
+                ),
+                ("docs/notes.md", "\"NEXT_channel_ambient\" in prose is a reference\n"),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.starts_with("[migration] "), "{error}");
+        assert!(
+            error.contains("src-tauri/os/cairn-db/src/storage/migrations.rs:3"),
+            "{error}"
+        );
+        assert!(
+            error.contains("scripts/lib/migration-check.test.ts:1"),
+            "{error}"
+        );
+        assert!(!error.contains("docs/notes.md"), "{error}");
+        assert!(
+            error.contains("(`0328` and `0328_channel_ambient`)"),
+            "{error}"
+        );
+        assert!(error.contains("by its name, `channel_ambient`"), "{error}");
+        assert!(error.contains("(`NEXT_channel_ambient.sql`)"), "{error}");
+    }
+
+    #[test]
+    fn file_references_and_names_still_bind_beside_number_literals() {
+        let migrations = "// NEXT_channel_ambient rebuilds two tables\n\
+                          include_str!(\"../turso_migrations/NEXT_channel_ambient.sql\");\n\
+                          .take_while(|m| m.version != \"0130\")\n\
+                          .take_while(|m| m.name != \"channel_ambient\")\n";
+        let plan = bind(
+            &["0327_prev.sql", "NEXT_channel_ambient.sql"],
+            &["0327_prev.sql"],
+            &[(
+                "src-tauri/os/cairn-db/src/storage/migrations.rs",
+                migrations,
+            )],
+        )
+        .unwrap();
+        assert!(plan.edits.contains(&FileEdit::Rewrite {
+            path: "src-tauri/os/cairn-db/src/storage/migrations.rs".into(),
+            content: migrations.replace("NEXT_channel_ambient", "0328_channel_ambient"),
+        }));
+    }
+
+    /// A hand-numbered stem's version is only its number, so the stem quoted
+    /// alone is a stem and rebinds like any other reference to it.
+    #[test]
+    fn a_hand_numbered_stem_quoted_alone_is_rewritten() {
+        let plan = bind(
+            &["0283_old.sql", "0284_theirs.sql", "0284_mine.sql"],
+            &["0283_old.sql", "0284_theirs.sql"],
+            &[("src/x.rs", "let stem = \"0284_mine\";\n")],
+        )
+        .unwrap();
+        assert!(plan.edits.contains(&FileEdit::Rewrite {
+            path: "src/x.rs".into(),
+            content: "let stem = \"0285_mine\";\n".into(),
         }));
     }
 

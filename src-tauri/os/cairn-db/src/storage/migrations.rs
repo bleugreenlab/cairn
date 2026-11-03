@@ -6458,7 +6458,7 @@ mod tests {
             .unwrap();
         let head = TURSO_MIGRATIONS
             .iter()
-            .take_while(|migration| migration.version != "0328_channel_ambient")
+            .take_while(|migration| migration.name() != "channel_ambient")
             .cloned()
             .collect::<Vec<_>>();
         assert!(

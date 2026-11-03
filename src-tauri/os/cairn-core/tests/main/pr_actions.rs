@@ -1841,6 +1841,63 @@ async fn a_branch_heading_two_protocol_versions_is_refused_before_it_lands() {
     );
 }
 
+/// cairn/5926: a branch whose test selects its provisional migration by
+/// version, `"NEXT_gamma"`, is refused when it would land, naming the site,
+/// rather than rewritten to the stem `0002_gamma` while the bound version is
+/// `0002`. Neither `main` nor the branch moves.
+#[tokio::test]
+async fn a_branch_quoting_a_provisional_version_is_refused_before_it_lands() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping a_branch_quoting_a_provisional_version_is_refused_before_it_lands: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = binding_project();
+    let project = create_project(&db, "bind3", repo.path().to_str().unwrap()).await;
+    let (issue, job, mr) = branch_merge_request(&db, &project, 1, "agent/gamma").await;
+    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
+    let config_dir = cfg.path().join("config");
+    seal_branch(
+        &config_dir,
+        repo.path(),
+        "agent/gamma",
+        &[
+            (
+                "migrations/NEXT_gamma.sql",
+                "-- lineage: shared\nCREATE TABLE gamma (id INTEGER);\n",
+            ),
+            (
+                "gamma_test.rs",
+                "fn head() {\n    MIGRATIONS.iter().take_while(|m| m.version != \"NEXT_gamma\");\n}\n",
+            ),
+        ],
+    );
+    let main_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "main");
+    let branch_before = jj_bookmark_commit(&bin, &config_dir, repo.path(), "agent/gamma");
+
+    let err = actions::merge_pr_for_job(&orch, &job, None, None, None)
+        .await
+        .expect_err("a provisional version literal must not land");
+    assert!(
+        err.starts_with("Refusing to merge `agent/gamma` into `main`: [migration] "),
+        "{err}"
+    );
+    assert!(err.contains("gamma_test.rs:2"), "{err}");
+    assert!(err.contains("(`0002` and `0002_gamma`)"), "{err}");
+    assert!(err.ends_with("`main` was not advanced."), "{err}");
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "main"),
+        main_before
+    );
+    assert_eq!(
+        jj_bookmark_commit(&bin, &config_dir, repo.path(), "agent/gamma"),
+        branch_before,
+        "the prospective bind is undone"
+    );
+}
+
 /// A jj-conflicted source must be refused BEFORE the fold, and the refusal must
 /// name the offending file and the resolve-at-base recovery path — not a bare
 /// "has a recorded conflict". The PR stays open (the gate fired pre-fold).
