@@ -6848,6 +6848,13 @@ pub struct LearnedResourceEstimate {
 /// it: the number gates attach for every machine, while this refusal is
 /// already per edge. On an executor the launch fence compares its own evidence
 /// with its own table, where the two revisions always agree.
+///
+/// cairn/5515 does not move the number. The fleet's refusal to dispatch a
+/// second answer to one question names its owed phrase through a constant the
+/// main cadence reads to recognise a hold; the text is byte-for-byte what it
+/// was, and it is the runner's own log and cadence message, never a frame. No
+/// frame, variant or field changes, and a runner talking to an older executor
+/// gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above

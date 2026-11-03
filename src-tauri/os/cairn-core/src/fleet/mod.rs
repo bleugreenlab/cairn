@@ -1412,6 +1412,10 @@ pub enum DrainApplication {
 /// to prevent.
 const RETIREMENT_CONFIRMATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// What a refusal to dispatch a second answer to one question says that
+/// question still owes. The main cadence recognises a hold by it.
+pub(crate) const PURPOSE_OWES_DEATH: &str = "still owes a confirmed death";
+
 #[derive(Debug)]
 struct ExecutorListenerPublication {
     current: Mutex<Option<ExecutorListenerAdvertisement>>,
@@ -8745,7 +8749,9 @@ impl Fleet {
         )
     }
 
-    /// One outstanding debt, whole, as a refusal names it.
+    /// One outstanding debt, whole, as a refusal names it. It opens with
+    /// `request {id} attempt {id},`: the main cadence keys an unchanged hold
+    /// on those two ids (`checks_main::hold_debts`).
     pub(crate) fn describe_purpose_debt(
         &self,
         debt: &purpose::PurposeDebtView,
@@ -8776,7 +8782,7 @@ impl Fleet {
             .collect::<Vec<_>>()
             .join(" | ");
         format!(
-            "purpose {key} still owes a confirmed death after {}s; refusing to dispatch a second answer to one question. Outstanding: {owed}",
+            "purpose {key} {PURPOSE_OWES_DEATH} after {}s; refusing to dispatch a second answer to one question. Outstanding: {owed}",
             RETIREMENT_CONFIRMATION_BUDGET.as_secs()
         )
     }

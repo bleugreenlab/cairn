@@ -1769,6 +1769,9 @@ pub struct ManualCheckNoVerdict {
     pub cause: String,
 }
 
+/// [`ManualCheckNoVerdict::kind`] when Cairn declined to run the check.
+pub(crate) const NO_VERDICT_SUPPRESSED: &str = "suppressed";
+
 /// Build the manual reply from the outcome the run returned.
 ///
 /// Everything here comes from the evaluation itself — its verdict, and the
@@ -1868,7 +1871,7 @@ fn manual_check_no_verdict(outcome: &CheckOutcome) -> Option<ManualCheckNoVerdic
     );
     let kind = match existence {
         LaneExistence::Complete => return None,
-        LaneExistence::Breaker { .. } => "suppressed".to_string(),
+        LaneExistence::Breaker { .. } => NO_VERDICT_SUPPRESSED.to_string(),
         LaneExistence::Died { kind } => match CheckFailureKind::from_stored(&kind) {
             Some(failure) if failure.is_infrastructure() => "infrastructure".to_string(),
             _ => kind,

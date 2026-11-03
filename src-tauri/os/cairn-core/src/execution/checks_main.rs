@@ -14,7 +14,7 @@
 //! other command (a typecheck, a build) has its exit as its verdict, and its
 //! message names the move between the two rows' verdicts and quotes a red
 //! one's output. Such a lane runs in a minute or two after nearly every merge,
-//! so a green that follows a green is recorded but not posted.
+//! so a green that follows a green is recorded but wakes no one.
 //!
 //! Scheduling is coalesced per lane and never preemptive. A whole-suite run
 //! takes most of an hour while merges land every few minutes, so a newer tip
@@ -38,6 +38,17 @@
 //! incomplete enumeration, a run that selected nothing). Under a post-merge
 //! detection regime, a silent detector is the dangerous case.
 //!
+//! Every attempt is recorded (its row, its overview line); only news wakes the
+//! `notify` thread ([`observe`], [`CadenceSlots::wake`]). A complete row wakes
+//! when it differs from its own host's previous row, is the first on its host,
+//! or ends a silence: [`SILENCE_BOUND_MS`] since that row, or the first row
+//! after a non-verdict. A non-verdict wakes when it is not the one the lane last
+//! announced. An unchanged one (a hold waiting on the same debt, a suppression
+//! of the same inputs, a retried refusal whose only change is how stale its
+//! evidence is) wakes no one, and a standing hold re-announces once per bound as
+//! still held. Each wake costs the thread a turn, and a channel that repeats
+//! itself trains its reader to skim the notice that differs.
+//!
 //! Store identity: cadence observations record `cadence = 'main'` and
 //! `job_id = 'main:{project_id}'`. A row is measured against the newest such
 //! observation for the same check and `verdict_platform` that classifies as
@@ -48,10 +59,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use cairn_common::executor_protocol::{CheckSelectorSource, ExecutorSelector};
+use regex::Regex;
 
 use crate::config::project_settings::CheckCommand;
 use crate::execution::check_parsers::is_test_runner_command;
@@ -59,8 +71,9 @@ use crate::execution::check_placement::CheckPlacementOverride;
 use crate::execution::checks::{
     execute_check_contract, host_ended_compile, load_checks_contract_at_commit_detailed,
     resolve_check_contract_at_commit, CheckRunProducer, CheckRunTarget, CommitChecksContract,
-    CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX,
+    CommitChecksContractError, HostEnding, MAIN_CADENCE_STREAM_PREFIX, NO_VERDICT_SUPPRESSED,
 };
+use crate::fleet::PURPOSE_OWES_DEATH;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
@@ -74,6 +87,10 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(10);
 const BOOT_SETTLE_WINDOW: Duration = Duration::from_secs(60);
 /// How often every project is re-armed without a merge.
 pub(crate) const HEARTBEAT: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long after its predecessor a row ends a silence, waking its thread even
+/// when it says nothing new; and how often a standing hold re-announces itself
+/// as still held.
+const SILENCE_BOUND_MS: i64 = 60 * 60 * 1000;
 /// The name cadence messages are sent under.
 const SENDER: &str = "main cadence";
 /// How far back a bracket walk reads before it calls itself truncated.
@@ -258,6 +275,53 @@ pub(crate) struct LaneOutcome {
     pub(crate) at_unix_ms: i64,
 }
 
+/// A lane's announced non-verdict, held so that an unchanged repeat (a retry of
+/// the same refusal, a re-resolution of the same suppression) is recorded
+/// without waking the lane's thread again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Standing {
+    /// See [`observe`].
+    identity: String,
+    /// Whether it re-announces once per [`SILENCE_BOUND_MS`] while it stands. A
+    /// suppression does not: it re-reports only when it lifts or its inputs
+    /// change.
+    reminds: bool,
+    /// When it was first announced.
+    since_ms: i64,
+    /// When it last woke the thread.
+    woke_ms: i64,
+}
+
+/// What an attempt was attempting, beyond its verdict: the inputs it would
+/// have answered, once the contract resolved, and whether Cairn declined to
+/// run them because the lane is suppressed.
+#[derive(Clone, Debug, Default)]
+struct Attempted {
+    inputs: Option<String>,
+    suppressed: bool,
+}
+
+/// An attempt as the announce step weighs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Observed {
+    /// A complete row, and whether it is news: see [`row_is_news`].
+    Row { news: bool },
+    /// An attempt without a verdict, by identity: see [`observe`].
+    Unobserved { identity: String, reminds: bool },
+}
+
+/// What the announce step does with an attempt's report. The row and the
+/// overview line are recorded whichever it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wake {
+    /// Post the report: it carries a change or ends a silence.
+    Announce,
+    /// Post that the non-verdict first announced at `since_ms` still stands.
+    StillHeld { since_ms: i64 },
+    /// Post nothing: the attempt is identical to the one before it.
+    Quiet,
+}
+
 /// One line of the project overview's Main cadence section.
 pub(crate) fn render_outcome_line(outcome: &LaneOutcome, now_ms: i64) -> String {
     let tip = outcome.tip.as_deref().map_or_else(
@@ -301,6 +365,10 @@ pub(crate) struct CadenceSlots {
     interrupted: HashMap<String, Vec<Interruption>>,
     /// Each lane's last report, for the project overview.
     outcomes: HashMap<(String, LaneKey), LaneOutcome>,
+    /// Each lane's standing non-verdict: the last it announced, until a
+    /// complete row ends it. In memory like `outcomes`, so after a restart a
+    /// lane's first non-verdict announces again.
+    standing: HashMap<(String, LaneKey), Standing>,
     /// Whether the startup default-advance catch-up has observed origin. Until
     /// it has, a pass must not fetch; see [`run_pass`].
     origin_observed: bool,
@@ -382,12 +450,63 @@ impl CadenceSlots {
     /// Drop the last reports of lanes the tip no longer declares, so the
     /// overview never lists a lane that will not report again.
     fn forget_undeclared_outcomes(&mut self, project_id: &str, declared: &[CadenceLane]) {
-        self.outcomes.retain(|(project, (check, platform)), _| {
+        let kept = |(project, (check, platform)): &(String, LaneKey)| {
             project != project_id
                 || declared
                     .iter()
                     .any(|lane| &lane.check == check && &lane.platform == platform)
-        });
+        };
+        self.outcomes.retain(|key, _| kept(key));
+        self.standing.retain(|key, _| kept(key));
+    }
+
+    /// What the announce step does with `observed` on `lane`. A complete row
+    /// wakes when it is news, and when it is the first row after a standing
+    /// non-verdict, which it ends. A non-verdict wakes when it is not the one
+    /// standing, and becomes the one standing; while it stands unchanged it
+    /// wakes again only once per [`SILENCE_BOUND_MS`], and only if it reminds.
+    fn wake(&mut self, project_id: &str, lane: &CadenceLane, observed: Observed, now: i64) -> Wake {
+        let key = (project_id.to_string(), lane.key());
+        match observed {
+            Observed::Row { news } => {
+                let ended = self.standing.remove(&key).is_some();
+                if news || ended {
+                    Wake::Announce
+                } else {
+                    Wake::Quiet
+                }
+            }
+            Observed::Unobserved { identity, reminds } => match self.standing.get_mut(&key) {
+                Some(standing) if standing.identity == identity => {
+                    if standing.reminds && now - standing.woke_ms >= SILENCE_BOUND_MS {
+                        standing.woke_ms = now;
+                        Wake::StillHeld {
+                            since_ms: standing.since_ms,
+                        }
+                    } else {
+                        Wake::Quiet
+                    }
+                }
+                _ => {
+                    self.standing.insert(
+                        key,
+                        Standing {
+                            identity,
+                            reminds,
+                            since_ms: now,
+                            woke_ms: now,
+                        },
+                    );
+                    Wake::Announce
+                }
+            },
+        }
+    }
+
+    /// A complete row already answers `lane`'s inputs, so whatever non-verdict
+    /// stood on it no longer does.
+    fn answered(&mut self, project_id: &str, lane: &CadenceLane) {
+        self.standing.remove(&(project_id.to_string(), lane.key()));
     }
 
     fn outcomes(&self, project_id: &str) -> Vec<LaneOutcome> {
@@ -1027,7 +1146,7 @@ async fn project_key(db: &LocalDb, project_id: &str) -> Result<String, String> {
 enum LaneAttempt {
     /// A complete cadence row already answers this lane for these inputs.
     Covered(CadenceRow),
-    Verdict(CadenceVerdict),
+    Verdict(CadenceVerdict, Attempted),
 }
 
 async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: Trigger) {
@@ -1060,6 +1179,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                         at_unix_ms: now_ms(),
                     },
                 );
+                slots.answered(context.project_id, lane);
                 slots.take_interruption(context.project_id, lane)
             };
             if let Some(interruption) = rearmed {
@@ -1074,7 +1194,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                 announce_quiet_lane(orch, &db, context, lane, &row).await;
             }
         }
-        LaneAttempt::Verdict(verdict) => {
+        LaneAttempt::Verdict(verdict, attempted) => {
             let verdict = cancelled_by_restart(verdict, orch.fleet.runner_stopping_since());
             if matches!(verdict, CadenceVerdict::Death { .. }) {
                 rearm_on_debt_settlement(orch, context, lane);
@@ -1088,6 +1208,7 @@ async fn run_lane(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane, trigger: T
                 lane,
                 Some(context.commit),
                 verdict,
+                &attempted,
             )
             .await;
         }
@@ -1138,7 +1259,12 @@ async fn attempt_lane(
     context: &PassContext<'_>,
     lane: &CadenceLane,
 ) -> LaneAttempt {
-    let death = |cause: String| LaneAttempt::Verdict(CadenceVerdict::Death { row: None, cause });
+    let death = |cause: String| {
+        LaneAttempt::Verdict(
+            CadenceVerdict::Death { row: None, cause },
+            Attempted::default(),
+        )
+    };
     let placement = match CheckPlacementOverride::new(
         ExecutorSelector {
             os: Some(lane.platform.clone()),
@@ -1174,6 +1300,19 @@ async fn attempt_lane(
     {
         Ok(contract) => contract,
         Err(error) => return death(error),
+    };
+    let attempted = Attempted {
+        inputs: Some(contract.context.input_hash.clone()),
+        suppressed: false,
+    };
+    let attempt = |verdict: CadenceVerdict, suppressed: bool| {
+        LaneAttempt::Verdict(
+            verdict,
+            Attempted {
+                suppressed,
+                ..attempted.clone()
+            },
+        )
     };
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
     // A complete row on any executor of the platform covers these inputs: the
@@ -1224,32 +1363,52 @@ async fn attempt_lane(
     .await
     {
         Ok(result) => result,
-        Err(error) => return death(error),
+        Err(error) => {
+            return attempt(
+                CadenceVerdict::Death {
+                    row: None,
+                    cause: error,
+                },
+                false,
+            )
+        }
     };
     if let Some(no_verdict) = result.no_verdict.as_ref() {
-        return death(format!("{}: {}", no_verdict.kind, no_verdict.cause));
+        return attempt(
+            CadenceVerdict::Death {
+                row: None,
+                cause: format!("{}: {}", no_verdict.kind, no_verdict.cause),
+            },
+            no_verdict.kind == NO_VERDICT_SUPPRESSED,
+        );
     }
     let Some(observation_id) = result.observation_id.as_deref() else {
-        return LaneAttempt::Verdict(CadenceVerdict::NoVerdict {
-            row: None,
-            cause: format!(
-                "the run exited {} but recorded no observation: {}",
-                result
-                    .exit_code
-                    .map_or_else(|| "without a code".to_string(), |code| code.to_string()),
-                result
-                    .not_recorded
-                    .as_deref()
-                    .unwrap_or("no cause reported")
-            ),
-        });
+        return attempt(
+            CadenceVerdict::NoVerdict {
+                row: None,
+                cause: format!(
+                    "the run exited {} but recorded no observation: {}",
+                    result
+                        .exit_code
+                        .map_or_else(|| "without a code".to_string(), |code| code.to_string()),
+                    result
+                        .not_recorded
+                        .as_deref()
+                        .unwrap_or("no cause reported")
+                ),
+            },
+            false,
+        );
     };
     match load_row(&db, context.project_key, observation_id, &names).await {
-        Ok(row) => LaneAttempt::Verdict(lane.verdict.classify(row)),
-        Err(error) => LaneAttempt::Verdict(CadenceVerdict::NoVerdict {
-            row: None,
-            cause: format!("observation {observation_id} could not be read back: {error}"),
-        }),
+        Ok(row) => attempt(lane.verdict.classify(row), false),
+        Err(error) => attempt(
+            CadenceVerdict::NoVerdict {
+                row: None,
+                cause: format!("observation {observation_id} could not be read back: {error}"),
+            },
+            false,
+        ),
     }
 }
 
@@ -1263,6 +1422,7 @@ async fn report_lane(
     lane: &CadenceLane,
     commit: Option<&str>,
     verdict: CadenceVerdict,
+    attempted: &Attempted,
 ) {
     let names = |executor: &str| orch.fleet.executor_name_for_text(executor);
     // Without the chain (a pass that failed before resolving the tip, or an
@@ -1332,7 +1492,8 @@ async fn report_lane(
             );
         }
     }
-    let content = render_report(&CadenceReport {
+    let now = now_ms();
+    let report = CadenceReport {
         check: &lane.check,
         platform: &lane.platform,
         kind: lane.verdict,
@@ -1340,9 +1501,10 @@ async fn report_lane(
         verdict: &verdict,
         comparison: &comparison,
         bracket: &bracket,
-        now_ms: now_ms(),
+        now_ms: now,
         rearmed: rearmed.as_ref(),
-    });
+    };
+    let content = render_report(&report);
     orch.main_cadence.lock().unwrap().settled(
         project_id,
         LaneOutcome {
@@ -1355,7 +1517,7 @@ async fn report_lane(
             row: verdict
                 .row()
                 .map(|row| (row.reference.clone(), row.commit.clone())),
-            at_unix_ms: now_ms(),
+            at_unix_ms: now,
         },
     );
     match &verdict {
@@ -1369,32 +1531,154 @@ async fn report_lane(
             log::error!("{content}")
         }
     }
-    if posts(lane.verdict, &verdict, &comparison) || rearmed.is_some() {
-        deliver(orch, db, project_id, &lane.notify, &content).await;
+    let observed = observe(lane.verdict, &verdict, &comparison, commit, attempted);
+    let wake = orch
+        .main_cadence
+        .lock()
+        .unwrap()
+        .wake(project_id, lane, observed, now);
+    // A boot re-arm cites the pass the restart cancelled, which only its own
+    // report names.
+    let wake = if rearmed.is_some() {
+        Wake::Announce
     } else {
-        log::info!(
-            "main cadence {} on {}: still green, so the row is recorded and not posted",
+        wake
+    };
+    match wake {
+        Wake::Announce => deliver(orch, db, project_id, &lane.notify, &content).await,
+        Wake::StillHeld { since_ms } => {
+            let still = render_still_held(&report, since_ms);
+            deliver(orch, db, project_id, &lane.notify, &still).await;
+        }
+        Wake::Quiet => log::info!(
+            "main cadence {} on {}: identical to its predecessor, so recorded and not posted",
             lane.check,
             lane.platform
-        );
+        ),
     }
 }
 
-/// Whether an attempt's report is posted to the lane's thread. An exit lane
-/// runs in a minute or two after nearly every merge, so a green that follows a
-/// green would wake the thread once per merge to say what the row already
-/// records; it is logged instead. Every other outcome posts: a per-test row's
-/// diff, any red, any move, a baseline, and every attempt that did not
-/// complete.
-fn posts(kind: LaneVerdict, verdict: &CadenceVerdict, comparison: &Comparison) -> bool {
-    match (kind, verdict) {
-        (LaneVerdict::Exit, CadenceVerdict::Complete(row)) => {
-            !(row.verdict_passed
-                && comparison
-                    .previous()
-                    .is_some_and(|previous| previous.verdict_passed))
+/// An elapsed duration as the fleet prints one (`808815ms`, `3m34s`, `2h 5m`).
+static ELAPSED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:\d+(?:\.\d+)?(?:ms|[smhd]))+\b").unwrap());
+/// One outstanding debt's ids, as `Fleet::describe_purpose_debt` opens it.
+static DEBT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"request (\S+) attempt (\S+?),").unwrap());
+
+/// The announce step's one predicate, before the lane's standing non-verdict
+/// is consulted ([`CadenceSlots::wake`]): a complete row and whether it is news
+/// ([`row_is_news`]), or a non-verdict and what makes it the same as another.
+///
+/// A **hold** (the fleet refused to dispatch because the lane's question still
+/// owes a displaced answer's confirmed death) is the debt it waits on: its
+/// reason and each outstanding request and attempt, whatever the tip, since
+/// only settling the debt ends it. A **suppression** is its inputs and its
+/// reason: it lifts when they change. Any other non-verdict is its inputs (the
+/// tip, when it died before resolving them) and its cause with every elapsed
+/// duration elided, since a retry of an unchanged refusal differs only in how
+/// long ago its evidence was measured. A restart cancellation is its restart.
+fn observe(
+    kind: LaneVerdict,
+    verdict: &CadenceVerdict,
+    comparison: &Comparison,
+    commit: Option<&str>,
+    attempted: &Attempted,
+) -> Observed {
+    let (class, cause) = match verdict {
+        CadenceVerdict::Complete(row) => {
+            return Observed::Row {
+                news: row_is_news(kind, row, comparison),
+            }
         }
-        _ => true,
+        CadenceVerdict::NoVerdict { cause, .. } => ("no-verdict", cause),
+        CadenceVerdict::Death { cause, .. } => ("death", cause),
+        CadenceVerdict::Cancelled {
+            stopped_at_unix_ms, ..
+        } => {
+            return Observed::Unobserved {
+                identity: format!("cancelled\n{stopped_at_unix_ms}"),
+                reminds: false,
+            }
+        }
+    };
+    let identity = match hold_debts(cause) {
+        Some((reason, debts)) => format!("hold\n{class}\n{reason}\n{debts}"),
+        None => {
+            let anchor = attempted
+                .inputs
+                .as_deref()
+                .or(verdict.row().map(|row| row.commit.as_str()))
+                .or(commit)
+                .unwrap_or_default();
+            let class = if attempted.suppressed {
+                NO_VERDICT_SUPPRESSED
+            } else {
+                class
+            };
+            format!("{class}\n{anchor}\n{}", ELAPSED.replace_all(cause, "…"))
+        }
+    };
+    Observed::Unobserved {
+        identity,
+        reminds: !attempted.suppressed,
+    }
+}
+
+/// The debt a hold waits on, when `cause` is the fleet's refusal to dispatch a
+/// second answer to a question that still owes a confirmed death: the reason
+/// it was refused under, and each outstanding request and attempt. Nothing else
+/// in the refusal identifies the hold; the rest says how long ago each piece of
+/// its evidence was measured.
+fn hold_debts(cause: &str) -> Option<(&str, String)> {
+    let at = cause.find(PURPOSE_OWES_DEATH)?;
+    let head = &cause[..at];
+    let reason = head
+        .rsplit_once("purpose ")
+        .map_or(head, |(reason, _)| reason)
+        .trim();
+    let mut debts: Vec<String> = DEBT
+        .captures_iter(&cause[at..])
+        .map(|ids| format!("{} {}", &ids[1], &ids[2]))
+        .collect();
+    debts.sort();
+    debts.dedup();
+    Some((reason, debts.join(" | ")))
+}
+
+/// Whether a complete row is news: whether it differs from its predecessor on
+/// its own host, or ends a silence there. A baseline is news, and so is a row
+/// [`SILENCE_BOUND_MS`] or more after its predecessor. An exit lane's row is
+/// news unless it is a green after a green: its verdict is its exit, so two
+/// greens say the same thing whichever hosts ran them. A per-test row is news
+/// unless it was measured against its own host's previous row and turned
+/// nothing red or green, observed no red test for the first time, lost no test,
+/// skipped no test that was red, and found no new failure the host explains:
+/// then its still-red set is exactly the previous row's. A row measured against
+/// another host's is the first on its host, which is news.
+fn row_is_news(kind: LaneVerdict, row: &CadenceRow, comparison: &Comparison) -> bool {
+    let Some(previous) = comparison.previous() else {
+        return true;
+    };
+    if row.ran_at_ms - previous.ran_at_ms >= SILENCE_BOUND_MS {
+        return true;
+    }
+    match kind {
+        LaneVerdict::Exit => !(row.verdict_passed && previous.verdict_passed),
+        LaneVerdict::PerTest => {
+            if !matches!(comparison, Comparison::SameExecutor { .. }) {
+                return true;
+            }
+            let diff = row_diff(row, comparison);
+            !(diff
+                .host_conditions
+                .iter()
+                .all(|group| group.tests.is_empty())
+                && diff.newly_red.is_empty()
+                && diff.newly_green.is_empty()
+                && diff.first_red.is_empty()
+                && diff.removed.is_empty()
+                && diff.red_now_skipped == 0)
+        }
     }
 }
 
@@ -1455,6 +1739,7 @@ async fn announce_lane_death(orch: &Orchestrator, tip: &Tip, lane: &CadenceLane,
             CadenceVerdict::Death { row: None, cause },
             orch.fleet.runner_stopping_since(),
         ),
+        &Attempted::default(),
     )
     .await;
 }
@@ -1502,6 +1787,7 @@ async fn announce_pass_failure(
                 },
                 orch.fleet.runner_stopping_since(),
             ),
+            &Attempted::default(),
         )
         .await;
     }
@@ -4022,6 +4308,33 @@ pub(crate) fn render_report(report: &CadenceReport<'_>) -> String {
         ));
     }
     out
+}
+
+/// What an unchanged non-verdict posts once per [`SILENCE_BOUND_MS`] while it
+/// stands: how long, since when, and its cause as it reads now. The first
+/// notice carried everything else, and the eventual complete row's bracket
+/// lists every merge that landed meanwhile.
+fn render_still_held(report: &CadenceReport<'_>, since_ms: i64) -> String {
+    let (class, cause) = match report.verdict {
+        CadenceVerdict::NoVerdict { cause, .. } => ("no-verdict", cause),
+        CadenceVerdict::Death { cause, .. } => ("death", cause),
+        CadenceVerdict::Complete(_) | CadenceVerdict::Cancelled { .. } => {
+            return render_report(report)
+        }
+    };
+    let tip = report
+        .commit
+        .map(|commit| format!(" · `{}`", short_commit(commit)))
+        .unwrap_or_default();
+    format!(
+        "🚨 **MAIN CADENCE STILL HELD · {check} · {platform}{tip}** — still held for {held}: the {class} first announced at {since} has not changed, and main is unobserved for {check} on {platform} until a cadence row completes.\n\n- Cause: {cause}\n- Repeats: every attempt since {since} is on the project overview and was not posted. The next notice is a changed cause, the first complete row, or this line again in {bound}.\n",
+        check = report.check,
+        platform = report.platform,
+        held = age(report.now_ms, since_ms),
+        since = stamp(since_ms),
+        cause = truncate(cause, MAX_CAUSE_CHARS),
+        bound = age(SILENCE_BOUND_MS, 0),
+    )
 }
 
 /// The heartbeat's note for a lane whose current inputs a complete row already
@@ -6547,7 +6860,16 @@ mod tests {
         };
         let comparison = same(&previous);
         let verdict = LaneVerdict::Exit.classify(red);
-        assert!(posts(LaneVerdict::Exit, &verdict, &comparison));
+        assert_eq!(
+            observe(
+                LaneVerdict::Exit,
+                &verdict,
+                &comparison,
+                None,
+                &Attempted::default()
+            ),
+            Observed::Row { news: true }
+        );
         let text = exit_report(&verdict, &comparison, &bracket);
         assert!(
             text.starts_with(
@@ -6730,31 +7052,27 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_lane_posts_everything_but_a_green_after_a_green() {
+    fn an_exit_lane_row_is_news_unless_a_green_follows_a_green() {
         let green = || tsc_row("g", "c", HOUR, 0);
         let red = || tsc_row("r", "c", HOUR, 2);
         let complete = |row| CadenceVerdict::Complete(row);
-        let exit = |verdict: &CadenceVerdict, comparison: &Comparison| {
-            posts(LaneVerdict::Exit, verdict, comparison)
+        let exit = |row: &CadenceRow, comparison: &Comparison| {
+            row_is_news(LaneVerdict::Exit, row, comparison)
         };
-        assert!(!exit(&complete(green()), &same(&green())), "still green");
+        assert!(!exit(&green(), &same(&green())), "still green");
         assert!(
-            !exit(
-                &complete(green()),
-                &Comparison::OtherExecutor { previous: green() }
-            ),
+            !exit(&green(), &Comparison::OtherExecutor { previous: green() }),
             "still green across hosts"
         );
-        assert!(exit(&complete(green()), &same(&red())), "newly green");
-        assert!(exit(&complete(red()), &same(&red())), "still red");
-        assert!(exit(&complete(green()), &Comparison::Baseline), "baseline");
-        assert!(exit(
-            &CadenceVerdict::Death {
-                row: None,
-                cause: "no machine".into()
-            },
-            &same(&green())
-        ));
+        assert!(exit(&green(), &same(&red())), "newly green");
+        assert!(exit(&red(), &same(&red())), "still red");
+        assert!(exit(&green(), &Comparison::Baseline), "baseline");
+        let mut later = green();
+        later.ran_at_ms += SILENCE_BOUND_MS;
+        assert!(
+            exit(&later, &same(&green())),
+            "the first green after a silence"
+        );
 
         let still_green = exit_report(&complete(green()), &same(&green()), &Bracket::default());
         assert!(
@@ -6762,14 +7080,270 @@ mod tests {
             "{still_green}"
         );
         assert!(!still_green.contains("Output tail"), "{still_green}");
+    }
 
-        // A per-test lane's row posts whatever it says.
-        let tests = row("t", "c", HOUR, &[("a", TestOutcome::Passed)]);
-        assert!(posts(
-            LaneVerdict::PerTest,
-            &complete(tests.clone()),
-            &same(&tests)
+    fn hold(attempt: &str, retired: &str) -> CadenceVerdict {
+        CadenceVerdict::Death {
+            row: None,
+            cause: format!(
+                "infrastructure: ExecutorUnavailable: purpose main-cadence:00ace0d0:rust-tests:linux {PURPOSE_OWES_DEATH} after 120s; refusing to dispatch a second answer to one question. Outstanding: request 7ceec5e8 attempt {attempt}, retired {retired} ago while running, on fedora (connection generation 4); displaced by newer; awaiting its terminal outcome; settles when fedora reports it ended"
+            ),
+        }
+    }
+
+    fn inputs(hash: &str, suppressed: bool) -> Attempted {
+        Attempted {
+            inputs: Some(hash.into()),
+            suppressed,
+        }
+    }
+
+    const MINUTE: i64 = 60 * 1000;
+
+    /// cairn/5515: four wakes for one standing hold whose only change was the
+    /// `retired Nm ago` counter and, once, the tip.
+    #[test]
+    fn an_unchanged_hold_wakes_once_and_a_changed_one_or_a_row_wakes_again() {
+        let lane = linux_lane();
+        let mut slots = CadenceSlots::default();
+        let mut wake = |verdict: &CadenceVerdict, tip: &str, attempted: &Attempted, at: i64| {
+            let observed = observe(
+                LaneVerdict::PerTest,
+                verdict,
+                &Comparison::Baseline,
+                Some(tip),
+                attempted,
+            );
+            slots.wake("p", &lane, observed, at)
+        };
+        assert_eq!(
+            wake(&hold("20e7c41c", "3m"), "t1", &inputs("i1", false), 0),
+            Wake::Announce,
+            "the first notice of a hold is unchanged"
+        );
+        assert_eq!(
+            wake(
+                &hold("20e7c41c", "12m"),
+                "t1",
+                &inputs("i1", false),
+                12 * MINUTE
+            ),
+            Wake::Quiet
+        );
+        assert_eq!(
+            wake(
+                &hold("20e7c41c", "28m"),
+                "t2",
+                &inputs("i2", false),
+                28 * MINUTE
+            ),
+            Wake::Quiet,
+            "a new tip under the same hold folds into the eventual row's bracket"
+        );
+        assert_eq!(
+            wake(
+                &hold("20e7c41c", "1h 5m"),
+                "t2",
+                &inputs("i2", false),
+                65 * MINUTE
+            ),
+            Wake::StillHeld { since_ms: 0 },
+            "a standing hold re-announces once per bound"
+        );
+        assert_eq!(
+            wake(
+                &hold("20e7c41c", "1h 10m"),
+                "t2",
+                &inputs("i2", false),
+                70 * MINUTE
+            ),
+            Wake::Quiet
+        );
+        assert_eq!(
+            wake(
+                &hold("750f243f", "1m"),
+                "t2",
+                &inputs("i2", false),
+                71 * MINUTE
+            ),
+            Wake::Announce,
+            "another attempt is another hold"
+        );
+
+        let green = row("g", "t3", 80 * MINUTE, &[("a", TestOutcome::Passed)]);
+        let mut then = green.clone();
+        then.ran_at_ms -= MINUTE;
+        let row_wake = |slots: &mut CadenceSlots, comparison: &Comparison| {
+            let observed = observe(
+                LaneVerdict::PerTest,
+                &CadenceVerdict::Complete(green.clone()),
+                comparison,
+                Some("t3"),
+                &inputs("i3", false),
+            );
+            slots.wake("p", &lane, observed, 80 * MINUTE)
+        };
+        assert_eq!(
+            row_wake(&mut slots, &same(&then)),
+            Wake::Announce,
+            "the first row after a hold ends it, however quiet"
+        );
+        assert_eq!(row_wake(&mut slots, &same(&then)), Wake::Quiet);
+
+        let still = render_still_held(
+            &CadenceReport {
+                check: "rust-tests",
+                platform: "linux",
+                kind: LaneVerdict::PerTest,
+                commit: Some("bbbbbbbbbbbbbbbbbbbb"),
+                verdict: &hold("20e7c41c", "2h"),
+                comparison: &Comparison::Baseline,
+                bracket: &Bracket::default(),
+                now_ms: 2 * HOUR + 5 * MINUTE,
+                rearmed: None,
+            },
+            0,
+        );
+        assert!(
+            still.starts_with(
+                "🚨 **MAIN CADENCE STILL HELD · rust-tests · linux · `bbbbbbbbbbbb`** — still held for 2h 5m: the death first announced at "
+            ),
+            "{still}"
+        );
+        assert!(
+            still.contains("request 7ceec5e8 attempt 20e7c41c"),
+            "{still}"
+        );
+        assert!(still.contains("this line again in 1h."), "{still}");
+    }
+
+    /// cairn/5515: four suppressions re-announced verbatim when main's lanes
+    /// were re-resolved, and a refusal re-delivered with only its staleness
+    /// counters advanced.
+    #[test]
+    fn an_unchanged_suppression_or_refusal_wakes_no_one() {
+        let lane = linux_lane();
+        let mut slots = CadenceSlots::default();
+        let mut wake = |cause: &str, attempted: &Attempted, at: i64| {
+            let verdict = CadenceVerdict::Death {
+                row: None,
+                cause: cause.into(),
+            };
+            let observed = observe(
+                LaneVerdict::PerTest,
+                &verdict,
+                &Comparison::Baseline,
+                Some("8befeb6d"),
+                attempted,
+            );
+            slots.wake("p", &lane, observed, at)
+        };
+        let suppressed = "suppressed: stopped after 3 infrastructure failures: bgsrv-ub (cpu was measured 573485ms ago), fedora (cpu was measured 143851ms ago)";
+        assert_eq!(wake(suppressed, &inputs("i1", true), 0), Wake::Announce);
+        assert_eq!(
+            wake(suppressed, &inputs("i1", true), 3 * HOUR + 19 * MINUTE),
+            Wake::Quiet,
+            "a suppression re-reports only when it lifts or its inputs change"
+        );
+        assert_eq!(
+            wake(suppressed, &inputs("i2", true), 3 * HOUR + 20 * MINUTE),
+            Wake::Announce,
+            "new inputs"
+        );
+
+        let refused = |ms: &str| {
+            format!("NoMatchingExecutor: no linux executor can run it: fedora (cpu was measured {ms} ago)")
+        };
+        assert_eq!(
+            wake(&refused("808815ms"), &inputs("i3", false), 4 * HOUR),
+            Wake::Announce
+        );
+        assert_eq!(
+            wake(&refused("809445ms"), &inputs("i3", false), 4 * HOUR + 1),
+            Wake::Quiet,
+            "only the staleness counter moved"
+        );
+        assert_eq!(
+            wake(&refused("809445ms"), &inputs("i4", false), 4 * HOUR + 2),
+            Wake::Announce,
+            "the same refusal of other inputs is another question"
+        );
+    }
+
+    /// cairn/5515: eight skip-census rows in fifty minutes, each `0 newly red,
+    /// 0 newly green · still red: 0`.
+    #[test]
+    fn a_row_identical_to_its_predecessor_wakes_no_one_and_a_change_wakes() {
+        let lane = linux_lane();
+        let mut slots = CadenceSlots::default();
+        let mut wake = |current: &CadenceRow, comparison: &Comparison| {
+            let observed = observe(
+                LaneVerdict::PerTest,
+                &CadenceVerdict::Complete(current.clone()),
+                comparison,
+                Some(&current.commit),
+                &inputs("i", false),
+            );
+            slots.wake("p", &lane, observed, current.ran_at_ms)
+        };
+        let green = [("a", TestOutcome::Passed), ("b", TestOutcome::Passed)];
+        let b_red = [("a", TestOutcome::Passed), ("b", failed("boom"))];
+        let b_skipped = [("a", TestOutcome::Passed), ("b", TestOutcome::Skipped)];
+        let r1 = row("r1", "c1", 0, &green);
+        let r2 = row("r2", "c2", 5 * MINUTE, &green);
+        let r3 = row("r3", "c3", 10 * MINUTE, &b_red);
+        let r4 = row("r4", "c4", 15 * MINUTE, &b_red);
+        let r5 = row("r5", "c5", 20 * MINUTE, &b_skipped);
+        assert_eq!(wake(&r1, &Comparison::Baseline), Wake::Announce, "baseline");
+        assert_eq!(wake(&r2, &same(&r1)), Wake::Quiet, "identical green");
+        assert_eq!(wake(&r3, &same(&r2)), Wake::Announce, "one newly red");
+        assert_eq!(
+            wake(&r4, &same(&r3)),
+            Wake::Quiet,
+            "an unchanged still-red set"
+        );
+        assert_eq!(
+            wake(&r5, &same(&r4)),
+            Wake::Announce,
+            "a red test now skipped changes the still-red set"
+        );
+        let mut renamed = row("r6", "c6", 25 * MINUTE, &[("a", TestOutcome::Passed)]);
+        assert_eq!(wake(&renamed, &same(&r2)), Wake::Announce, "a removed test");
+        renamed.tests.insert("c".into(), failed("new"));
+        assert_eq!(
+            wake(
+                &renamed,
+                &same(&row("r0", "c0", 24 * MINUTE, &[("a", TestOutcome::Passed)]))
+            ),
+            Wake::Announce,
+            "a first-observed red"
+        );
+    }
+
+    #[test]
+    fn the_first_row_on_a_host_or_after_the_silence_bound_wakes_even_when_identical() {
+        let green = [("a", TestOutcome::Passed)];
+        let before = row("r1", "c1", 0, &green);
+        let news = |current: &CadenceRow, comparison: &Comparison| {
+            row_is_news(LaneVerdict::PerTest, current, comparison)
+        };
+        assert!(!news(
+            &row("r2", "c2", SILENCE_BOUND_MS - 1, &green),
+            &same(&before)
         ));
+        assert!(
+            news(&row("r2", "c2", SILENCE_BOUND_MS, &green), &same(&before)),
+            "a silence ended"
+        );
+        assert!(
+            news(
+                &on("fedora", row("r2", "c2", MINUTE, &green)),
+                &Comparison::OtherExecutor {
+                    previous: before.clone()
+                }
+            ),
+            "the first row on a host"
+        );
     }
 
     /// An exit lane's comparison rows are its own check's whole-command rows:
