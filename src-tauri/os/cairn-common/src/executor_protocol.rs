@@ -3282,7 +3282,10 @@ impl ContainmentObservations {
     /// for a stronger one. Scope must match the seam requested, so a batch
     /// measurement never certifies a terminal. It must match the live build,
     /// boot, and platform, so evidence that survived an upgrade or a reboot is
-    /// not replayed as current. Its fingerprint must equal the machine's
+    /// not replayed as current. It must be measured against the claim revision
+    /// this binary holds for the edge, so a probe written for an earlier or
+    /// later claim never answers for this one, even when no fingerprint input
+    /// moved. Its fingerprint must equal the machine's
     /// current one, so a changed profile, mount, helper, or policy invalidates
     /// the result rather than inheriting its verdict. The positive control must
     /// have passed, so a broken harness cannot masquerade as a strong boundary.
@@ -3330,6 +3333,12 @@ impl ContainmentObservations {
                 || scope.policy_mode != definition.key.policy_mode
             {
                 return Err(ContainmentDeficiency::NotObserved);
+            }
+            if scope.claim_revision != definition.claim_revision {
+                return Err(ContainmentDeficiency::StaleClaim {
+                    measured: scope.claim_revision,
+                    current: definition.claim_revision,
+                });
             }
             if scope.executor_build_id != self.executor_build_id {
                 return Err(ContainmentDeficiency::StaleBuild);
@@ -3467,6 +3476,9 @@ pub enum ContainmentDeficiency {
     PriorBoot,
     /// The probe ran on a different platform than this machine reports.
     PlatformMismatch,
+    /// The probe tested a different revision of this edge's claim than the one
+    /// being placed on, so it is evidence about a claim nobody is asking for.
+    StaleClaim { measured: u32, current: u32 },
     /// The machine can no longer compute this edge's invalidation fingerprint,
     /// naming the inputs it could not read.
     FingerprintUncomputable,
@@ -3492,6 +3504,9 @@ impl ContainmentDeficiency {
             }
             Self::PriorBoot => "measured during an earlier boot of this executor".into(),
             Self::PlatformMismatch => "measured on a different platform than this machine".into(),
+            Self::StaleClaim { measured, current } => format!(
+                "measured against claim revision {measured} of this edge, but the claim now required is revision {current}, so the probe never tested it"
+            ),
             Self::FingerprintUncomputable => {
                 "this machine cannot currently read every input that could widen this edge".into()
             }
@@ -6811,6 +6826,28 @@ pub struct LearnedResourceEstimate {
 /// to the executor's process and its log. No frame, variant or field changes,
 /// Hello is sent exactly as before, and a runner talking to an older executor
 /// gets nothing wrong.
+///
+/// cairn/6015 does not move the number. No frame, variant, field or serialized
+/// name changes: `PositiveScope.claimRevision` has crossed since version 90,
+/// and [`ContainmentDeficiency`] never crosses. What changes is a judgement.
+/// [`ContainmentObservations::satisfies`] now refuses positive evidence whose
+/// claim revision differs from the edge definition held by the binary deciding
+/// (`StaleClaim`), where only the never-called `validate` compared them. Until
+/// now a fingerprint move was what fenced a claim bump, and both the
+/// fingerprint and its current value are computed by the executor, so an
+/// executor that had not updated still offered its old evidence as current.
+/// What a runner gets wrong talking to an older executor: nothing. After a
+/// claim bump it refuses that executor's evidence for the bumped edge, and only
+/// for envelopes that name that edge, until the executor runs a build that
+/// re-probes. The other direction refuses too: an executor whose build carries
+/// a newer claim than the runner's has its evidence for that edge refused
+/// until the runner updates, so a page-call claim bump that reaches remote
+/// executors before the runner refuses page calls there meanwhile. That
+/// fail-closed refusal is the rule's intent. An older runner
+/// keeps accepting mismatched evidence as before, and a bump would not reach
+/// it: the number gates attach for every machine, while this refusal is
+/// already per edge. On an executor the launch fence compares its own evidence
+/// with its own table, where the two revisions always agree.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -24165,6 +24202,69 @@ mod tests {
                 }
             }),
             ContainmentDeficiency::PositiveControlFailed
+        );
+        let current = edge.definition().claim_revision;
+        assert_eq!(
+            deficiency(&|observations| {
+                if let EdgeDisposition::Refused { scope, .. } =
+                    &mut observations.observations[0].disposition
+                {
+                    scope.claim_revision = current + 1;
+                }
+            }),
+            ContainmentDeficiency::StaleClaim {
+                measured: current + 1,
+                current,
+            }
+        );
+    }
+
+    /// A claim bump has to fence the evidence measured under the old claim on
+    /// its own. The fingerprint and its current value are both computed by the
+    /// executor, so an executor that has not updated still reports its old
+    /// measurement as current; only the deciding binary's definition can tell
+    /// that the probe tested a claim it no longer makes.
+    #[test]
+    fn evidence_for_an_earlier_claim_revision_does_not_satisfy_the_revised_claim() {
+        let edge = CONTAINMENT_EDGE_IDS
+            .into_iter()
+            .find(|edge| edge.definition().claim_revision >= 2)
+            .expect("some edge has had its claim revised");
+        let definition = edge.definition();
+        let wanted = requires(edge, MaximumDisposition::Refused);
+
+        let mut stale = refused(edge);
+        let EdgeDisposition::Refused { scope, .. } = &mut stale.disposition else {
+            unreachable!("refused() builds a Refused disposition");
+        };
+        scope.claim_revision = 1;
+        let stale_scope = scope.clone();
+
+        // Nothing but the claim revision distinguishes the stale evidence.
+        assert_eq!(
+            PositiveScope {
+                claim_revision: definition.claim_revision,
+                ..stale_scope.clone()
+            },
+            positive_scope(edge)
+        );
+        assert!(matrix(vec![refused(edge)]).satisfies(&wanted).is_ok());
+
+        let refusal = matrix(vec![stale]).satisfies(&wanted).unwrap_err();
+        assert_eq!(refusal.edge, edge);
+        assert_eq!(
+            refusal.deficiency,
+            ContainmentDeficiency::StaleClaim {
+                measured: 1,
+                current: definition.claim_revision,
+            }
+        );
+        let described = refusal.describe();
+        assert!(described.contains(&format!("{edge:?}")), "{described}");
+        assert!(described.contains("claim revision 1"), "{described}");
+        assert!(
+            described.contains(&format!("revision {}", definition.claim_revision)),
+            "{described}"
         );
     }
 
