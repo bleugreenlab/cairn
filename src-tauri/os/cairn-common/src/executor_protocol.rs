@@ -6607,6 +6607,16 @@ pub struct LearnedResourceEstimate {
 /// process output events, to any batch that names a context, as it does for a
 /// write-check batch. No frame, variant or field changes, and a runner talking
 /// to an older executor gets nothing wrong.
+///
+/// cairn/5890 does not move the number. A colocated executor now runs the
+/// tool-refresh loop, installing nothing, so that each pass re-probes its host
+/// toolchain identity and its `bun` and `node` probe lines name their source;
+/// the runner re-probes its own identity on the same cadence. Those probes
+/// travel in the `ToolchainProbe` the advertisement already carries, as free
+/// text in `detail`, and the identity in the fields it already fills. No frame,
+/// variant or field changes. A runner talking to an older colocated executor
+/// gets nothing wrong: that executor reports the identity it started with, as
+/// it always did.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above

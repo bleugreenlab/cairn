@@ -394,6 +394,14 @@ pub fn refresh_toolchain_identity() -> Option<&'static str> {
     hold_identity(probe_host_identity())
 }
 
+/// How often a long-lived process calls [`refresh_toolchain_identity`]: every
+/// executor's tool-refresh pass, and the runner's own re-probe beside it. Both
+/// processes on one machine resolve the same PATH, so they follow a host tool
+/// change on one cadence, and a colocated verdict's fingerprint and the
+/// runner's lookup for it are apart for at most one interval.
+pub const HOST_IDENTITY_REFRESH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
 fn hold_identity(probed: String) -> Option<&'static str> {
     let mut held = IDENTITY
         .write()

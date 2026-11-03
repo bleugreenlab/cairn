@@ -2996,6 +2996,35 @@ impl Orchestrator {
         });
     }
 
+    /// Spawn the runner's host toolchain re-probe on its own task, one every
+    /// [`cairn_checkenv::HOST_IDENTITY_REFRESH_INTERVAL`], the cadence every
+    /// executor's tool-refresh pass re-probes on. The runner holds the identity
+    /// its local fingerprint is keyed by and the expectations every reuse
+    /// lookup and merge gate compares a stored verdict against, and nothing
+    /// else in this process ever re-reads them: a `rustup` or Bun change on
+    /// this machine moves what its colocated executor's lanes run under, and
+    /// without this the runner would keep expecting the old tools until it
+    /// restarted. The first probe waits a full interval, because startup has
+    /// just probed.
+    pub fn spawn_toolchain_identity_refresh(&self) {
+        tokio::spawn(async move {
+            let every = cairn_checkenv::HOST_IDENTITY_REFRESH_INTERVAL;
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                match tokio::task::spawn_blocking(cairn_checkenv::refresh_toolchain_identity).await
+                {
+                    Ok(Some(identity)) => log::info!(
+                        "the host toolchain identity changed to {identity}; expectations and keys from here use it"
+                    ),
+                    Ok(None) => {}
+                    Err(error) => log::warn!("host toolchain re-probe failed: {error}"),
+                }
+            }
+        });
+    }
+
     /// Spawn the archival sweep on its own task: one pass now, then one every
     /// [`crate::archival::sweep::SWEEP_INTERVAL`]. Detached because the first
     /// pass on an install with a backlog is a long catch-up that no other
