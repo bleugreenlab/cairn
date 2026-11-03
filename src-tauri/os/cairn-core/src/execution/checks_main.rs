@@ -2059,6 +2059,10 @@ struct RowFilter<'a> {
     executor_id: Option<&'a str>,
     /// Never this row.
     excluding: Option<&'a str>,
+    /// Only rows that observed this commit.
+    commit: Option<&'a str>,
+    /// Only rows on a named executor other than this one.
+    other_than_executor: Option<&'a str>,
     /// Main's first-parent chain. A row of any cadence on it qualifies, and
     /// the nearest tree wins. Without it only the cadence's own rows qualify,
     /// newest finish first.
@@ -2110,6 +2114,8 @@ async fn latest_complete_row(
                     AND (?5 = '' OR input_hash = ?5)
                     AND (?6 = '' OR executor_id = ?6)
                     AND (?7 = 1 OR cadence = 'main')
+                    AND (?9 = '' OR commit_sha = ?9)
+                    AND (?10 = '' OR (executor_id IS NOT NULL AND executor_id != ?10))
                   ORDER BY ran_at DESC LIMIT ?8"
             ),
             (
@@ -2121,6 +2127,8 @@ async fn latest_complete_row(
                 filter.executor_id.unwrap_or("").to_string(),
                 i64::from(filter.main_chain.is_some()),
                 CANDIDATE_SCAN,
+                filter.commit.unwrap_or("").to_string(),
+                filter.other_than_executor.unwrap_or("").to_string(),
             ),
             |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
         )
@@ -2159,11 +2167,15 @@ pub(crate) enum Comparison {
     Baseline,
     /// The previous complete row on the attempt's own executor: the diff is
     /// tree movement. `neighbour` is another executor's complete row that ran
-    /// after `previous`, when one did: the other host's view of the same
-    /// window, which separates the host census from movement.
+    /// after `previous`, when one did: the other host's view of the window,
+    /// on whatever tree it ran. `peer` is another executor's complete row on
+    /// the attempt's own commit, the only row a test is said to differ by
+    /// host against: across trees, a merge in between explains a difference
+    /// as well as the host does (tenet 772).
     SameExecutor {
         previous: CadenceRow,
         neighbour: Option<Box<CadenceRow>>,
+        peer: Option<Box<CadenceRow>>,
     },
     /// The attempt's executor has no earlier complete row, so the platform's
     /// newest (another executor's) stands in, and host differences cannot be
@@ -2194,6 +2206,7 @@ impl Comparison {
             Comparison::SameExecutor {
                 previous,
                 neighbour,
+                ..
             } => Some(neighbour.as_deref().unwrap_or(previous)),
             Comparison::OtherExecutor { previous } | Comparison::AnyExecutor { previous } => {
                 Some(previous)
@@ -2217,12 +2230,14 @@ fn bracket_base<'a>(
 }
 
 /// Choose the comparison for an attempt on `executor_id` from that executor's
-/// newest complete row and the platform's newest complete row on any executor,
-/// "newest" in [`tree_order`].
+/// newest complete row, the platform's newest complete row on any executor,
+/// "newest" in [`tree_order`], and another executor's row on the attempt's
+/// own commit.
 fn select_comparison(
     executor_id: Option<&str>,
     same_executor: Option<CadenceRow>,
     newest: Option<CadenceRow>,
+    peer: Option<CadenceRow>,
     chain: Option<&MainChain>,
 ) -> Comparison {
     let Some(executor_id) = executor_id else {
@@ -2239,6 +2254,7 @@ fn select_comparison(
             Comparison::SameExecutor {
                 previous,
                 neighbour: neighbour.map(Box::new),
+                peer: peer.map(Box::new),
             }
         }
         None => newest.map_or(Comparison::Baseline, |previous| Comparison::OtherExecutor {
@@ -2292,7 +2308,33 @@ async fn comparison_for(
         names,
     )
     .await?;
-    Ok(select_comparison(executor_id, same_executor, newest, chain))
+    let peer = match (executor_id, current) {
+        (Some(executor_id), Some(current)) => {
+            latest_complete_row(
+                db,
+                project_id,
+                project_key,
+                lane,
+                RowFilter {
+                    excluding,
+                    commit: Some(&current.commit),
+                    other_than_executor: Some(executor_id),
+                    main_chain: chain,
+                    ..RowFilter::default()
+                },
+                names,
+            )
+            .await?
+        }
+        _ => None,
+    };
+    Ok(select_comparison(
+        executor_id,
+        same_executor,
+        newest,
+        peer,
+        chain,
+    ))
 }
 
 /// The line of a failure excerpt that says what went wrong. A Rust panic opens
@@ -3187,12 +3229,13 @@ fn failed_on(row: &CadenceRow, test: &str, condition: &HostCondition) -> bool {
 /// the compared row is never held under a host label: it is still red.
 fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<'a> {
     let previous = comparison.previous();
-    let (same_host, neighbour) = match comparison {
+    let (same_host, neighbour, peer) = match comparison {
         Comparison::SameExecutor {
             previous,
             neighbour,
-        } => (Some(previous), neighbour.as_deref()),
-        _ => (None, None),
+            peer,
+        } => (Some(previous), neighbour.as_deref(), peer.as_deref()),
+        _ => (None, None, None),
     };
     let red_before =
         |test: &str| previous.is_some_and(|previous| passed_in(previous, test) == Some(false));
@@ -3220,8 +3263,10 @@ fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<
             .copied()
             .filter(|test| same_host.is_some_and(|row| passed_in(row, test) == Some(true)))
             .collect();
-        let elsewhere =
-            neighbour.filter(|row| tests.iter().any(|test| failed_on(row, test, condition)));
+        let elsewhere = [peer, neighbour]
+            .into_iter()
+            .flatten()
+            .find(|row| tests.iter().any(|test| failed_on(row, test, condition)));
         if elsewhere.is_none() && condition.breadth(&passed_here_before) >= HOST_CONDITION_MIN {
             diff.host_conditions.push(HostConditionGroup {
                 cause: HostCause::Error(condition),
@@ -3317,8 +3362,9 @@ fn passed_in(row: &CadenceRow, test: &str) -> Option<bool> {
     }
 }
 
-/// Tests that differ from another host's row while agreeing with this host's
-/// previous row: a difference between the hosts, not movement in the tree.
+/// Tests that differ from another host's row on the same tree while agreeing
+/// with this host's previous row: a difference between the hosts, not
+/// movement in the tree.
 #[derive(Debug, Default)]
 struct HostCensus<'a> {
     /// Red here, passed on the other host.
@@ -3330,14 +3376,14 @@ struct HostCensus<'a> {
 fn host_census<'a>(
     current: &'a CadenceRow,
     previous: &CadenceRow,
-    neighbour: &CadenceRow,
+    peer: &CadenceRow,
 ) -> HostCensus<'a> {
     let mut census = HostCensus::default();
     for test in current.tests.keys() {
         let Some(here) = passed_in(current, test) else {
             continue;
         };
-        if passed_in(neighbour, test).is_none_or(|there| there == here)
+        if passed_in(peer, test).is_none_or(|there| there == here)
             || passed_in(previous, test) != Some(here)
         {
             continue;
@@ -3351,25 +3397,25 @@ fn host_census<'a>(
     census
 }
 
-/// The one-host tag on a newly-red group: how many of its tests passed on the
-/// other host's row in the same window.
-fn one_host(tests: &[&str], neighbour: Option<&CadenceRow>) -> String {
-    let Some(neighbour) = neighbour else {
+/// The one-host tag on a red group: how many of its tests passed on another
+/// host's row on the same tree.
+fn one_host(tests: &[&str], peer: Option<&CadenceRow>) -> String {
+    let Some(peer) = peer else {
         return String::new();
     };
     let passed = tests
         .iter()
-        .filter(|test| passed_in(neighbour, test) == Some(true))
+        .filter(|test| passed_in(peer, test) == Some(true))
         .count();
     if passed == 0 {
         String::new()
     } else if passed == tests.len() {
-        format!(" · **one host**: passed on `{}`", host(neighbour))
+        format!(" · **one host**: passed on `{}`", host(peer))
     } else {
         format!(
             " · **one host** for {passed} of {}: passed on `{}`",
             tests.len(),
-            host(neighbour)
+            host(peer)
         )
     }
 }
@@ -3386,13 +3432,13 @@ fn render_tests(out: &mut String, indent: &str, tests: &[&str]) {
     }
 }
 
-fn render_groups(out: &mut String, groups: &[(&str, Vec<&str>)], neighbour: Option<&CadenceRow>) {
+fn render_groups(out: &mut String, groups: &[(&str, Vec<&str>)], peer: Option<&CadenceRow>) {
     for (signature, tests) in groups.iter().take(MAX_GROUPS) {
         out.push_str(&format!(
             "- **{} test{}**{} — `{}`\n",
             tests.len(),
             plural(tests.len()),
-            one_host(tests, neighbour),
+            one_host(tests, peer),
             signature.replace('`', "'")
         ));
         for test in tests.iter().take(MAX_IDS_PER_GROUP) {
@@ -3558,23 +3604,81 @@ fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) 
     out.push_str(&format!("- Compared with: {line}\n"));
 }
 
+/// The "Same tree on another host" line: the row host claims compare with,
+/// or, when no other host has run this commit, that none can be made, with
+/// the nearest other host's row placed by its commit and the merges between.
+fn render_peer(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow, reds: usize) {
+    let Comparison::SameExecutor {
+        previous,
+        neighbour,
+        peer,
+    } = report.comparison
+    else {
+        return;
+    };
+    if let Some(peer) = peer {
+        out.push_str(&format!(
+            "- Same tree on another host: {}, the {} (ran {} earlier). Host differences below are measured against it.\n",
+            peer.reference,
+            armed(peer),
+            age(row.ran_at_ms, peer.ran_at_ms)
+        ));
+        return;
+    }
+    if reds == 0 {
+        return;
+    }
+    let mut line = format!(
+        "- Same tree on another host: none. No other host has run commit `{}` on {}, so no red below is attributed to a host.",
+        short_commit(&row.commit),
+        report.platform
+    );
+    if let Some(neighbour) = neighbour {
+        let gap = if neighbour.commit == previous.commit {
+            Some(report.bracket.merges.len())
+        } else {
+            report
+                .bracket
+                .merges
+                .iter()
+                .position(|merge| merge.commit == neighbour.commit)
+                .map(|at| report.bracket.merges.len() - 1 - at)
+        };
+        let gap = match gap {
+            Some(count) => format!(
+                "{count} merge{} earlier (listed under **Merges since the compared row**)",
+                plural(count)
+            ),
+            None => "a different tree".to_string(),
+        };
+        line.push_str(&format!(
+            " The nearest other host's row, {} on `{}`, ran commit `{}`, {gap}; a test it passed may have been broken by a merge in between, not by this host.",
+            neighbour.reference,
+            host(neighbour),
+            short_commit(&neighbour.commit)
+        ));
+    }
+    out.push_str(&line);
+    out.push('\n');
+}
+
 fn render_host_census(
     out: &mut String,
     row: &CadenceRow,
     previous: &CadenceRow,
-    neighbour: &CadenceRow,
+    peer: &CadenceRow,
 ) {
-    let census = host_census(row, previous, neighbour);
+    let census = host_census(row, previous, peer);
     let total = census.red_here.len() + census.green_here.len();
     if total == 0 {
         return;
     }
-    let (here, there) = (host(row), host(neighbour));
+    let (here, there) = (host(row), host(peer));
     out.push_str(&format!(
-        "\n**HOST CENSUS against `{there}`: {total}** — these differ from {} (`{there}`, commit `{}`, ran {} earlier) but match this host's previous row, so they are a difference between the hosts, not movement in the tree.\n",
-        neighbour.reference,
-        short_commit(&neighbour.commit),
-        age(row.ran_at_ms, neighbour.ran_at_ms)
+        "\n**HOST CENSUS against `{there}`: {total}** — these differ from {} (`{there}`, the same commit `{}`, ran {} earlier) but match this host's previous row, so they are a difference between the hosts, not movement in the tree.\n",
+        peer.reference,
+        short_commit(&peer.commit),
+        age(row.ran_at_ms, peer.ran_at_ms)
     ));
     if !census.red_here.is_empty() {
         out.push_str(&format!(
@@ -3636,10 +3740,12 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         return render_exit_complete(out, report, row);
     }
     let previous = report.comparison.previous();
-    let (neighbour, cross_host) = match report.comparison {
-        Comparison::SameExecutor { neighbour, .. } => (neighbour.as_deref(), None),
-        Comparison::OtherExecutor { previous } => (None, Some(host(previous))),
-        Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None),
+    let (neighbour, peer, cross_host) = match report.comparison {
+        Comparison::SameExecutor {
+            neighbour, peer, ..
+        } => (neighbour.as_deref(), peer.as_deref(), None),
+        Comparison::OtherExecutor { previous } => (None, None, Some(host(previous))),
+        Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None, None),
     };
     let diff = row_diff(row, report.comparison);
     let newly_red = group_size(&diff.newly_red);
@@ -3681,6 +3787,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     ));
     row_identity(out, row, LaneVerdict::PerTest);
     render_basis(out, report, row);
+    render_peer(out, report, row, newly_red + first_red);
     render_host_conditions(out, row, &diff.host_conditions, previous, neighbour);
     if newly_red > 0 {
         let title = match cross_host {
@@ -3693,7 +3800,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
             diff.newly_red.len(),
             plural(diff.newly_red.len())
         ));
-        render_groups(out, &diff.newly_red, neighbour);
+        render_groups(out, &diff.newly_red, peer);
     }
     if first_red > 0 {
         out.push_str(&format!(
@@ -3703,7 +3810,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
             plural(diff.first_red.len()),
             if first_red == 1 { "it" } else { "them" }
         ));
-        render_groups(out, &diff.first_red, neighbour);
+        render_groups(out, &diff.first_red, peer);
     }
     if !diff.newly_green.is_empty() {
         let title = match cross_host {
@@ -3757,10 +3864,11 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
     }
     if let Comparison::SameExecutor {
         previous,
-        neighbour: Some(neighbour),
+        peer: Some(peer),
+        ..
     } = report.comparison
     {
-        render_host_census(out, row, previous, neighbour);
+        render_host_census(out, row, previous, peer);
     }
     if previous.is_some() {
         render_bracket(out, "Merges since the compared row", report.bracket);
@@ -3998,6 +4106,7 @@ mod tests {
         Comparison::SameExecutor {
             previous: previous.clone(),
             neighbour: None,
+            peer: None,
         }
     }
 
@@ -4863,6 +4972,7 @@ mod tests {
                             row("mac", "cccccccccccccccc", 4 * HOUR, tests),
                         ))
                     }),
+                    peer: None,
                 },
                 &Bracket::default(),
             )
@@ -5535,7 +5645,7 @@ mod tests {
     }
 
     #[test]
-    fn another_hosts_row_in_the_window_splits_the_host_census_from_movement() {
+    fn another_hosts_row_on_the_same_tree_splits_the_host_census_from_movement() {
         let previous = on(
             "fedora",
             row(
@@ -5552,9 +5662,9 @@ mod tests {
                 ],
             ),
         );
-        let neighbour = row(
+        let peer = row(
             "other",
-            "cccccccccccccccc",
+            "bbbbbbbbbbbbbbbb",
             2 * HOUR,
             &[
                 ("core::lock_a", failed("Blocking waiting for file lock")),
@@ -5583,12 +5693,17 @@ mod tests {
         );
         let comparison = Comparison::SameExecutor {
             previous,
-            neighbour: Some(Box::new(neighbour)),
+            neighbour: Some(Box::new(peer.clone())),
+            peer: Some(Box::new(peer)),
         };
         let text = report(
             &CadenceVerdict::Complete(current),
             &comparison,
             &Bracket::default(),
+        );
+        assert!(
+            text.contains("- Same tree on another host: cairn://p/cairn/check-observations/other, the cadence row on `bbs`"),
+            "{text}"
         );
         // Movement is measured on fedora's own history only.
         assert!(text.contains("2 newly red, 1 newly green"), "{text}");
@@ -5598,7 +5713,7 @@ mod tests {
         );
         assert!(
             text.contains("**1 test** · **one host**: passed on `bbs` — `left == right`"),
-            "a red the other host's newer row passed is flagged: {text}"
+            "a red the other host passed on the same tree is flagged: {text}"
         );
         assert!(
             text.contains("**1 test** — `index out of bounds`"),
@@ -5606,7 +5721,7 @@ mod tests {
         );
         assert!(
             text.contains("**HOST CENSUS against `bbs`: 3**")
-                && text.contains("check-observations/other"),
+                && text.contains("(`bbs`, the same commit `bbbbbbbbbbbb`"),
             "{text}"
         );
         assert!(
@@ -5626,6 +5741,155 @@ mod tests {
             "the host census is not reported as newly green: {text}"
         );
         assert!(text[green..census].contains("`core::fixed`"), "{text}");
+    }
+
+    /// Specimen ac84ce84 (cairn/5975): fedora's rust-tests at 8a3cd116 tagged
+    /// its new reds `one host: passed on bginf-sp2` against sp2's row at
+    /// 2702605c, a tree from before the merges (#4717, #4721) that broke them;
+    /// they were red on bgsrv-mac at 8a3cd116 too. A host is named only
+    /// against another host's row on the same tree.
+    #[test]
+    fn another_hosts_row_on_an_older_tree_names_no_host() {
+        const TIP: &str = "8a3cd1160000000000000000";
+        const SP2_TREE: &str = "2702605c0000000000000000";
+        let colocated = "cairn-exec::link_tests::a_colocated_ready_reprobes_the_managed_tools";
+        let arc = "cairn-core::resources::common::tests::arc_affordance_points_collection_operations_to_the_thread_database";
+        let born = "cairn-core::resources::common::tests::a_test_born_in_the_bracket";
+        let stuck = "cairn-core::stuck";
+        let previous = on(
+            "fedora",
+            row(
+                "prev",
+                "aaaaaaaaaaaaaaaa",
+                HOUR,
+                &[
+                    (colocated, TestOutcome::Passed),
+                    (arc, TestOutcome::Passed),
+                    (stuck, failed("refresh computed twice")),
+                ],
+            ),
+        );
+        let sp2 = on(
+            "bginf-sp2",
+            row(
+                "sp2",
+                SP2_TREE,
+                2 * HOUR,
+                &[
+                    (colocated, TestOutcome::Passed),
+                    (arc, TestOutcome::Passed),
+                    (born, TestOutcome::Passed),
+                    (stuck, TestOutcome::Passed),
+                ],
+            ),
+        );
+        let current = on(
+            "fedora",
+            row(
+                "cur",
+                TIP,
+                3 * HOUR,
+                &[
+                    (colocated, failed("managed tools were not reprobed")),
+                    (arc, failed("assertion `left == right` failed")),
+                    (born, failed("assertion failed: born red")),
+                    (stuck, failed("refresh computed twice")),
+                ],
+            ),
+        );
+        let merge = |commit: &str, pr: i64| BracketMerge {
+            commit: commit.to_string(),
+            subject: format!("land (#{pr})"),
+            pr: Some(pr),
+            issue: None,
+        };
+        let bracket = Bracket {
+            merges: vec![
+                merge(SP2_TREE, 4715),
+                merge("dde08b700000000000000000", 4717),
+                merge("c1c1c1c10000000000000000", 4719),
+                merge("c2c2c2c20000000000000000", 4720),
+                merge(TIP, 4721),
+            ],
+            ..Bracket::default()
+        };
+        let render = |peer: Option<CadenceRow>| {
+            report(
+                &CadenceVerdict::Complete(current.clone()),
+                &Comparison::SameExecutor {
+                    previous: previous.clone(),
+                    neighbour: Some(Box::new(sp2.clone())),
+                    peer: peer.map(Box::new),
+                },
+                &bracket,
+            )
+        };
+
+        let text = render(None);
+        assert!(
+            text.contains("2 newly red, 0 newly green · first observed here: 1 red"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("one host") && !text.contains("HOST CENSUS"),
+            "an older tree's pass is not a host difference: {text}"
+        );
+        assert!(
+            text.contains("- Same tree on another host: none. No other host has run commit `8a3cd1160000` on linux, so no red below is attributed to a host. The nearest other host's row, cairn://p/cairn/check-observations/sp2 on `bginf-sp2`, ran commit `2702605c0000`, 4 merges earlier (listed under **Merges since the compared row**)"),
+            "the gap to the nearest other host's tree is named: {text}"
+        );
+        assert!(
+            text.contains("#4717") && text.contains("#4721"),
+            "the merges between are listed: {text}"
+        );
+
+        // A reference tree outside the bracket is still never a host claim.
+        let mut elsewhere = sp2.clone();
+        elsewhere.commit = "ffffffffffffffff".into();
+        let text = report(
+            &CadenceVerdict::Complete(current.clone()),
+            &Comparison::SameExecutor {
+                previous: previous.clone(),
+                neighbour: Some(Box::new(elsewhere)),
+                peer: None,
+            },
+            &bracket,
+        );
+        assert!(!text.contains("one host"), "{text}");
+        assert!(
+            text.contains("ran commit `ffffffffffff`, a different tree;"),
+            "{text}"
+        );
+
+        // bgsrv-mac on the same tree, red the same way: the tree, no host.
+        let mut mac = current.clone();
+        mac.id = "mac".into();
+        mac.reference = "cairn://p/cairn/check-observations/mac".into();
+        let mac = on("bgsrv-mac", mac);
+        let text = render(Some(mac.clone()));
+        assert!(
+            text.contains("- Same tree on another host: cairn://p/cairn/check-observations/mac, the cadence row on `bgsrv-mac`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("one host") && !text.contains("No other host"),
+            "{text}"
+        );
+
+        // A same-tree host that passed them is the host difference, as before.
+        let mut passing = mac;
+        for outcome in passing.tests.values_mut() {
+            *outcome = TestOutcome::Passed;
+        }
+        let text = render(Some(passing));
+        assert!(
+            text.contains("**1 test** · **one host**: passed on `bgsrv-mac`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- Red on `fedora`, passed on `bgsrv-mac`: 1\n  - `cairn-core::stuck`"),
+            "{text}"
+        );
     }
 
     /// Specimen 03d65964: bbs's no-verdict wake listed five merges as
@@ -5659,6 +5923,7 @@ mod tests {
         let comparison = Comparison::SameExecutor {
             previous: previous.clone(),
             neighbour: Some(Box::new(fedora)),
+            peer: None,
         };
         assert_eq!(
             bracket_base(&no_verdict, &comparison).map(|row| row.id.as_str()),
@@ -5880,6 +6145,7 @@ mod tests {
             Comparison::SameExecutor {
                 previous,
                 neighbour,
+                ..
             } => {
                 assert_eq!(previous.id, "b1");
                 assert_eq!(id_of(neighbour.as_deref()).as_deref(), Some("f1"));
@@ -5894,6 +6160,7 @@ mod tests {
             Comparison::SameExecutor {
                 previous,
                 neighbour,
+                ..
             } => {
                 assert_eq!(previous.id, "f1");
                 assert_eq!(id_of(neighbour.as_deref()).as_deref(), Some("b2"));
@@ -5907,9 +6174,11 @@ mod tests {
             Comparison::SameExecutor {
                 previous,
                 neighbour,
+                peer,
             } => {
                 assert_eq!(previous.id, "f2");
                 assert!(neighbour.is_none(), "{neighbour:?}");
+                assert!(peer.is_none(), "no other host ran c-f3: {peer:?}");
             }
             other => panic!("expected a same-executor comparison, got {other:?}"),
         }
@@ -5925,6 +6194,33 @@ mod tests {
         match comparison(None).await {
             Comparison::AnyExecutor { previous } => assert_eq!(previous.id, "n1"),
             other => panic!("expected the platform's newest, got {other:?}"),
+        }
+
+        // Another host's row on f3's own commit is its peer; a second row on
+        // that commit from f3's own host is not.
+        let passed: &[(&str, &str)] = &[("a", "passed")];
+        for (id, executor, ran_at) in [("b3", "bbs", 9), ("f3r", "fedora", 10)] {
+            store(
+                &db,
+                Stored {
+                    id,
+                    executor,
+                    ran_at,
+                    cadence: "main",
+                    commit: "c-f3",
+                    selection: "full",
+                    failure_kind: None,
+                    tests: passed,
+                },
+            )
+            .await;
+        }
+        match comparison(Some(load("f3").await)).await {
+            Comparison::SameExecutor { previous, peer, .. } => {
+                assert_eq!(previous.id, "f3r");
+                assert_eq!(id_of(peer.as_deref()).as_deref(), Some("b3"));
+            }
+            other => panic!("expected a same-executor comparison, got {other:?}"),
         }
     }
 
@@ -6038,6 +6334,7 @@ mod tests {
             Comparison::SameExecutor {
                 previous,
                 neighbour,
+                ..
             } => {
                 assert_eq!(previous.id, "man-f", "q is nearer the tip than A");
                 assert_eq!(
