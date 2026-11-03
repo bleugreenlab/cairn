@@ -77,7 +77,10 @@ pub(crate) const PENDING_DELIVERIES_FLOOR: Duration = Duration::from_secs(1);
 /// and what decides whether a push is still live
 /// (`cairn_attention::push::resolve_verdicts`): issues, merge requests,
 /// artifacts, prompts and permission requests. A direct push's card reads its
-/// message too, which `messages` already covers.
+/// message too, which `messages` already covers. Whether the job can be
+/// delivered to at all (`messages::delivery::delivery_refusal`) reads the job
+/// and its session, which those entries cover, and its thread and execution,
+/// so closing or reopening a thread and superseding an execution move it too.
 ///
 /// None of these frames can be placed against one job: a frame's `jobId` names
 /// the job that owns the row, which for a message is its sender and for a merge
@@ -95,6 +98,8 @@ const PENDING_DELIVERY_INPUT_TABLES: &[&str] = &[
     "messages",
     "sessions",
     "jobs",
+    "threads",
+    "executions",
     "runs",
     "turns",
     "issues",

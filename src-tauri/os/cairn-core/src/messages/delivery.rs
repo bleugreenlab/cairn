@@ -157,6 +157,74 @@ fn session_refuses_turns_sync(db: &LocalDb, job_id: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Why nothing queued for a job can reach it right now.
+///
+/// The one answer to "is this recipient deliverable": the idle flush consults
+/// it before deciding to resume, and the pending list consults it before
+/// showing anything as pending, so the composer can never promise a delivery
+/// the flush would decline. Every refusal is reversible (reopening the issue or
+/// the thread, or lifting a cancel), which is why callers filter on it rather
+/// than retiring the rows it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryRefusal {
+    /// The job is a closed thread's session.
+    DormantThread,
+    /// The job's execution was superseded by another attempt on its issue.
+    Superseded,
+    /// The job is cancelled. Cancelled to Running is not a transition; a lifted
+    /// cancel passes through Pending first, so a job still reading Cancelled
+    /// cannot take a turn now.
+    Cancelled,
+    /// The job's current session was closed by a resolution or a node removal,
+    /// or failed.
+    SessionRefusesTurns,
+}
+
+impl DeliveryRefusal {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::DormantThread => "its thread is closed",
+            Self::Superseded => "its execution was superseded",
+            Self::Cancelled => "it is cancelled",
+            Self::SessionRefusesTurns => "its session is closed",
+        }
+    }
+}
+
+/// Whether anything queued for `job_id` can be delivered, or why not.
+///
+/// A failed or complete job is deliberately NOT refused here: both resume on a
+/// reply or a retry with the same job id, so what they hold is still pending.
+/// An unreadable lineage is an `Err`, left to the caller to fail closed on.
+pub(crate) async fn delivery_refusal(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<DeliveryRefusal>, String> {
+    if crate::threads::is_dormant_thread_session(db, job_id).await {
+        return Ok(Some(DeliveryRefusal::DormantThread));
+    }
+    let fence = crate::execution::canonical::fence_for_job(db, job_id)
+        .await
+        .map_err(|error| format!("failed to read canonical lineage for job {job_id}: {error}"))?;
+    if fence.is_superseded() {
+        return Ok(Some(DeliveryRefusal::Superseded));
+    }
+    let status = db
+        .query_opt_text(
+            "SELECT status FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .map_err(|error| format!("failed to read status of job {job_id}: {error}"))?;
+    if status.as_deref() == Some("cancelled") {
+        return Ok(Some(DeliveryRefusal::Cancelled));
+    }
+    if crate::execution::jobs::current_session_refuses_turns(db, job_id).await {
+        return Ok(Some(DeliveryRefusal::SessionRefusesTurns));
+    }
+    Ok(None)
+}
+
 /// Sync wrapper for [`head_turn_active`] for use from non-async callers
 /// (e.g. PR conflict resolution).
 pub(crate) fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
@@ -658,35 +726,33 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
     .ok()
     .flatten()?;
 
-    // A closed thread's session is not resumable by anything queued for it —
+    // A recipient no turn can reach is not resumed by anything queued for it —
     // pushes, queued user messages, or notices. Taken here, at the one gate the
     // idle flush consults, so every queued reason to resume is covered by one
-    // check rather than each mechanism carrying its own.
-    if crate::threads::is_dormant_thread_session_sync(db, &job_id) {
-        return None;
-    }
-
-    // CAIRN-4665: a superseded execution's node does not even decide to resume.
-    // Redundant with the fence at turn admission by design — this is the one gate
-    // the idle flush consults, and the symmetry with the dormancy check above is
-    // worth keeping: every queued reason to resume is covered here rather than
-    // relying on the launch funnel to refuse after the decision was made.
-    if crate::execution::canonical::job_refusal(db, &job_id).is_some() {
-        log::debug!(
-            "flush-on-idle: job {} declined resume (its execution was superseded)",
-            &job_id[..job_id.len().min(8)]
-        );
-        return None;
-    }
-
-    // A session closed by a resolution (or failed) takes no turn. Deciding to
-    // resume it anyway reached the launch funnel only to be refused there.
-    if session_refuses_turns_sync(db, &job_id) {
-        log::debug!(
-            "flush-on-idle: job {} declined resume (its session is closed)",
-            &job_id[..job_id.len().min(8)]
-        );
-        return None;
+    // check rather than each mechanism carrying its own, and rather than relying
+    // on the launch funnel to refuse after the decision was made. An unreadable
+    // lineage declines too: a missed refusal could put two agents on one issue.
+    let refusal = {
+        let job_id = job_id.clone();
+        run_db_blocking(move || async move { delivery_refusal(db, &job_id).await })
+    };
+    match refusal {
+        Ok(None) => {}
+        Ok(Some(refusal)) => {
+            log::debug!(
+                "flush-on-idle: job {} declined resume ({})",
+                &job_id[..job_id.len().min(8)],
+                refusal.describe()
+            );
+            return None;
+        }
+        Err(error) => {
+            log::debug!(
+                "flush-on-idle: job {} declined resume (deliverability unknown): {error}",
+                &job_id[..job_id.len().min(8)]
+            );
+            return None;
+        }
     }
 
     // Passive side-channel notices no longer wake an idle job; they ride along
@@ -1310,6 +1376,34 @@ mod tests {
             "an idle coordinator whose review is backed by a confirmed create-pr must resume",
         );
         assert_eq!(pending.job_id, "job-1");
+    }
+
+    /// A cancelled job is not resumed even while a stray session of its stays
+    /// open: Cancelled to Running is not a transition, so the flush declines
+    /// rather than leaving the launch funnel to refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flush_declines_a_cancelled_job_with_an_open_session() {
+        let db = migrated_db().await;
+        seed_run(&db, "run-1", "job-1").await;
+        seed_waking_push(&db, "job-1").await;
+        set_head_turn(&db, "job-1", "complete", None).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('sess-1','job-1','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-1' WHERE id='job-1';",
+        )
+        .await
+        .unwrap();
+        assert!(
+            collect_pending_for_flush(&db, "run-1").is_some(),
+            "the fixture resumes before the cancel"
+        );
+
+        db.execute("UPDATE jobs SET status='cancelled' WHERE id='job-1'", ())
+            .await
+            .unwrap();
+
+        assert!(collect_pending_for_flush(&db, "run-1").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
