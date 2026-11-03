@@ -385,18 +385,19 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
+        description: "Executions for an issue. Append {recipe?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. A named recipe is run exactly; with none named Cairn chooses (the workspace setting defaultRecipe until a measured chooser exists; refused, naming the setting, when it is unset). The reply always carries the resolution: `recipe: <id> · <what decided it>`, one line per agent step with what it would pick `now:` (each step selects at its own launch; a single-model allotment is `(exact)`), and the patch and re-append that change it. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
-            required: &[KeySpec::new(
-                "recipe",
-                KeyType::Str,
-                "recipe id to run; discover ids via cairn://recipes",
-            )],
+            required: &[],
             optional: &[
+                KeySpec::new(
+                    "recipe",
+                    KeyType::Str,
+                    "recipe id to run exactly; omit and Cairn chooses (defaultRecipe). Discover ids via cairn://recipes",
+                ),
                 KeySpec::new(
                     "branch",
                     KeyType::Str,
@@ -426,7 +427,7 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecution,
         uri_template: "cairn://p/{project}/{number}/executions/{exec_seq}",
         name: "Execution snapshot",
-        description: "A single execution's frozen snapshot: the recipe (nodes/edges/trigger), every agent snapshot (prompt, tools, model selection, fence, skills), and skills. Read renders it. Patch {agent, snapshot} merges the given snapshot fields over one agent snapshot (send only what changes; a full snapshot replaces every field), mirroring the UI snapshot editor (fence reaches a live session immediately, model on the next turn, prompt on the next session). An agent cannot edit its own snapshot, nor change the fence of any agent in its own execution. Read also lists every condition evaluation; Patch {reevaluate} re-runs a condition that blocked and routed nowhere, recording a new routed or blocked row beside the old one.",
+        description: "A single execution's frozen snapshot: the recipe (nodes/edges/trigger), every agent snapshot (prompt, tools, model selection, fence, skills), and skills. Read renders it, with how its recipe was resolved and every agent edit since. Patch {agent, snapshot} merges the given snapshot fields over one agent snapshot (send only what changes; a full snapshot replaces every field), mirroring the UI snapshot editor (fence reaches a live session immediately, model on the next turn, prompt on the next session). It is how a step's allotment is changed live: snapshot {models:[...]} is what a step that has not launched yet selects within, and every edit that changes something is recorded. An agent cannot edit its own snapshot, nor change the fence of any agent in its own execution. Read also lists every condition evaluation; Patch {reevaluate} re-runs a condition that blocked and routed nowhere, recording a new routed or blocked row beside the old one.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,

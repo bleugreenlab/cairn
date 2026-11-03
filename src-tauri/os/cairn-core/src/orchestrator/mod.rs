@@ -796,6 +796,7 @@ impl OrchestratorBuilder {
             subscriptions: self.subscriptions,
             models_runtime,
             decision_observations: Arc::default(),
+            recipe_chooser: Arc::default(),
             mcp_binary_path: self.mcp_binary_path,
             jj_binary_path: self.jj_binary_path,
             config_dir: self.config_dir,
@@ -1586,6 +1587,10 @@ pub struct Orchestrator {
     /// Which logprobs offers were seen to answer decisions, and which could
     /// not. See [`decide::DecisionObservations`].
     decision_observations: Arc<decide::DecisionObservations>,
+    /// The recipe chooser an unnamed execution create asks. Empty: none is
+    /// installed until judgment has measured one on the resolution records
+    /// (tenets 1222, 1243), so `defaultRecipe` answers.
+    recipe_chooser: Arc<std::sync::OnceLock<crate::execution::recipe_resolution::InstalledChooser>>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
     /// Path to the cairn-cmd binary
@@ -2267,6 +2272,23 @@ impl Orchestrator {
         executor: Arc<dyn EffectExecutor>,
     ) -> Result<(), Arc<dyn EffectExecutor>> {
         self.executor.set(executor)
+    }
+
+    /// The recipe chooser installed in the resolution seam, if any.
+    pub(crate) fn recipe_chooser(
+        &self,
+    ) -> Option<crate::execution::recipe_resolution::InstalledChooser> {
+        self.recipe_chooser.get().cloned()
+    }
+
+    /// Install a recipe chooser. Test-only: production installs none until
+    /// one has been measured.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn install_recipe_chooser_for_test(
+        &self,
+        chooser: crate::execution::recipe_resolution::InstalledChooser,
+    ) {
+        let _ = self.recipe_chooser.set(chooser);
     }
 
     /// Register the OS process id of the desktop UI now attached over the

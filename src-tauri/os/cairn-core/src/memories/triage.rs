@@ -384,21 +384,36 @@ async fn spawn_triage_for_scope_inner(
             break;
         }
 
-        if let Err(error) = crate::mcp::handlers::executions::start_execution_from_collection(
+        let started = match crate::mcp::handlers::executions::resolve_filing(
             orch,
             &target.project_key,
             outcome.number,
             Some(MEMORY_TRIAGE_RECIPE),
+            crate::execution::recipe_resolution::ResolutionCreator::system(),
             None,
-            None,
-            None,
-            // The triage issue was just created here; it has no prior attempt.
-            crate::execution::recipe::LaunchIntent::NewAttempt,
-            Vec::new(),
-            crate::execution::recipe::QueuePlace::Tail,
         )
         .await
         {
+            Ok(filing) => {
+                crate::mcp::handlers::executions::start_execution_from_collection(
+                    orch,
+                    &target.project_key,
+                    outcome.number,
+                    filing,
+                    None,
+                    None,
+                    None,
+                    // The triage issue was just created here; it has no prior
+                    // attempt.
+                    crate::execution::recipe::LaunchIntent::NewAttempt,
+                    Vec::new(),
+                    crate::execution::recipe::QueuePlace::Tail,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = started {
             // Nothing will ever triage this batch, so release the claim and remove
             // the issue instead of leaving memories owned by a batch that will never
             // run.

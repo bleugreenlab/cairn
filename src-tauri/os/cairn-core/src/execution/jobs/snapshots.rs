@@ -1325,6 +1325,7 @@ mod host_snapshot_tests {
             &execution_id,
             "thread",
             edited,
+            None,
         )
         .await
         .unwrap();

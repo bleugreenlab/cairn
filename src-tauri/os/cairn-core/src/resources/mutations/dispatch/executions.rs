@@ -133,24 +133,40 @@ pub(super) async fn dispatch(
             } else {
                 crate::execution::recipe::QueuePlace::Tail
             };
+            // With no recipe named, Cairn chooses; either way the recipe is
+            // resolved before anything is written, so a refusal files nothing.
+            let creator =
+                crate::execution::recipe_resolution::ResolutionCreator::of_request(orch, request)
+                    .await;
+            let filing = executions::resolve_filing(
+                orch,
+                project,
+                *number,
+                recipe,
+                creator,
+                item.payload
+                    .as_ref()
+                    .and_then(|p| p.get("overrides"))
+                    .cloned(),
+            )
+            .await
+            .map_err(|error| build_failure(index, item, error))?;
             if dry_run {
                 format!(
-                    "Would {} an execution for {project}/{number}{}",
+                    "Would {} an execution for {project}/{number}\n{}",
                     if after.is_empty() {
                         "start"
                     } else {
                         "file a held"
                     },
-                    recipe
-                        .map(|r| format!(" (recipe '{r}')"))
-                        .unwrap_or_default()
+                    filing.resolution.line()
                 )
             } else {
                 executions::start_execution_from_collection(
                     orch,
                     project,
                     *number,
-                    recipe,
+                    filing,
                     branch_target,
                     continuity,
                     overrides,

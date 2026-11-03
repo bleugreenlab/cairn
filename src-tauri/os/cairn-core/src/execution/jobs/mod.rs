@@ -37,6 +37,7 @@ mod goal_intent;
 mod inputs;
 mod lifecycle;
 mod node_selection;
+pub(crate) use node_selection::pinned;
 mod ordinary_admission;
 mod persistence;
 mod private_lane;

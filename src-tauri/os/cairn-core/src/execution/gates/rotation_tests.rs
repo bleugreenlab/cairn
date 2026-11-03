@@ -196,11 +196,21 @@ async fn a_threads_own_order_holds_inside_its_lane() {
     );
 
     add_issue(&env, ALPHA + 6, Some("ta")).await;
-    crate::mcp::handlers::executions::start_execution_from_collection(
+    let filing = crate::mcp::handlers::executions::resolve_filing(
         &env.orch,
         "prj",
         ALPHA + 6,
         Some("memory-triage"),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    crate::mcp::handlers::executions::start_execution_from_collection(
+        &env.orch,
+        "prj",
+        ALPHA + 6,
+        filing,
         None,
         None,
         None,
@@ -306,11 +316,21 @@ async fn mixed(name: &str) -> (Env, Arc<LocalDb>) {
         file(&env, number, json!([])).await.unwrap();
     }
     for number in [11, 12] {
-        crate::mcp::handlers::executions::start_execution_from_collection(
+        let filing = crate::mcp::handlers::executions::resolve_filing(
             &env.orch,
             "tq",
             number,
             Some("memory-triage"),
+            Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        crate::mcp::handlers::executions::start_execution_from_collection(
+            &env.orch,
+            "tq",
+            number,
+            filing,
             None,
             None,
             None,

@@ -1598,11 +1598,20 @@ pub(crate) mod tests {
 
     pub(crate) async fn file(env: &Env, number: i32, after: Value) -> Result<String, String> {
         let clauses = super::super::authoring::parse_after(Some(&after), "after")?;
-        start_execution_from_collection(
+        let filing = crate::mcp::handlers::executions::resolve_filing(
             &env.orch,
             "prj",
             number,
             Some(RECIPE),
+            Default::default(),
+            None,
+        )
+        .await?;
+        start_execution_from_collection(
+            &env.orch,
+            "prj",
+            number,
+            filing,
             None,
             None,
             None,

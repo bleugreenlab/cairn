@@ -301,6 +301,12 @@ pub struct Settings {
     /// history.
     #[serde(default)]
     pub embedding_model: Option<String>,
+    /// The recipe an execution that names none starts, until a measured
+    /// chooser decides instead. `None` refuses such a start, naming this
+    /// setting. Checked for id syntax when written and for existence when
+    /// used, since a project recipe is invisible at workspace scope.
+    #[serde(default)]
+    pub default_recipe: Option<String>,
 
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
@@ -400,6 +406,10 @@ pub struct UpdateSettings {
     /// Cairn gateway's Cohere Embed v4.
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub embedding_model: Option<Option<String>>,
+    /// Set the recipe an unnamed start uses; `null` or blank clears it, and
+    /// such a start is then refused.
+    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
+    pub default_recipe: Option<Option<String>>,
 
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]

@@ -92,15 +92,32 @@ pub(super) async fn dispatch(
                 spec.place = crate::execution::recipe::QueuePlace::Head { placed_by };
             }
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
+            if let Some(spec) = execution.as_mut() {
+                spec.creator = crate::execution::recipe_resolution::ResolutionCreator::of_request(
+                    orch, request,
+                )
+                .await;
+            }
             if dry_run {
                 match &execution {
-                    Some(spec) => format!(
-                        "Would create issue in project {project}: {title} and start an execution{}",
-                        spec.recipe
-                            .as_deref()
-                            .map(|r| format!(" (recipe '{r}')"))
-                            .unwrap_or_default()
-                    ),
+                    Some(spec) => {
+                        let resolution = issues::preview_create_recipe(
+                            orch,
+                            project,
+                            title,
+                            payload_str(payload, "description", &[]),
+                            labels.as_deref(),
+                            parent.as_deref(),
+                            spec.recipe.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                        format!(
+                            "Would create issue in project {project}: {title} and start an \
+                             execution\n{}",
+                            resolution.line()
+                        )
+                    }
                     None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
@@ -433,9 +450,10 @@ async fn resolve_issue_comment_id(
         })
 }
 
-/// Parse the optional `execution` object on an issue-create payload into a
-/// create+start spec. Absent or null -> None (create only). When present it must
-/// be an object whose `recipe`/`backend`, if set, are strings.
+/// Parse the optional `execution` key on an issue-create payload into a
+/// create+start spec. Absent or null -> None (create only). `true` is an
+/// empty spec: start, with Cairn choosing the recipe. Otherwise it must be an
+/// object whose `recipe`, if set, is a string.
 fn parse_create_execution_spec(
     index: usize,
     item: &ChangeItem,
@@ -443,13 +461,18 @@ fn parse_create_execution_spec(
 ) -> ResourceMutationResult<Option<issues::CreateExecutionSpec>> {
     let value = match payload.get("execution") {
         None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Bool(true)) => {
+            return Ok(Some(issues::CreateExecutionSpec::default()))
+        }
         Some(value) => value,
     };
     let obj = value.as_object().ok_or_else(|| {
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe, backend?, overrides?, after?, place?}",
+            "payload.execution must be true (start, Cairn chooses the recipe) or an object \
+             {recipe?, overrides?, after?, place?}; omit it to create the issue without starting \
+             one",
         )
     })?;
     if let Some(refusal) =
@@ -478,6 +501,8 @@ fn parse_create_execution_spec(
     }
     Ok(Some(issues::CreateExecutionSpec {
         recipe: str_field("recipe")?,
+        creator: Default::default(),
+        overrides_filed: obj.get("overrides").cloned(),
         overrides: super::executions::parse_launch_overrides(index, item, Some(value)).map_err(
             |mut failure| {
                 // The key is `execution.overrides` here, not the top-level

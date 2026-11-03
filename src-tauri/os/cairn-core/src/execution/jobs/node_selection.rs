@@ -78,7 +78,10 @@ pub(super) fn select_job_model(
 /// else its snapshot agent's selection (the composer's or the snapshot
 /// editor's pin). The agent's selection supplies the provider when it names
 /// the same model.
-fn pinned(job_model: Option<&str>, agent: Option<&ModelSelection>) -> Option<ModelSelection> {
+pub(crate) fn pinned(
+    job_model: Option<&str>,
+    agent: Option<&ModelSelection>,
+) -> Option<ModelSelection> {
     match (job_model, agent) {
         (Some(model), Some(selection)) if selection.model.as_str() == model => {
             Some(selection.clone())
@@ -471,7 +474,16 @@ pub(super) mod tests {
                     let agent = if upstream.is_some() { "review" } else { "build" };
                     agent_node(id, agent, *models, *upstream)
                 }).collect::<Vec<_>>(),
-                "edges": []
+                // A constraint names an upstream node, so each constrained
+                // node follows the one it names.
+                "edges": nodes.iter().filter_map(|(id, _, upstream)| {
+                    let upstream = (*upstream)?;
+                    Some(serde_json::json!({
+                        "id": format!("{upstream}-{id}"), "edgeType": "control",
+                        "sourceNodeId": upstream, "sourceHandle": "control-out",
+                        "targetNodeId": id, "targetHandle": "control-in"
+                    }))
+                }).collect::<Vec<_>>()
             },
             "agents": { "build": agent("build"), "review": agent("review") },
             "skills": {},
@@ -521,6 +533,93 @@ pub(super) mod tests {
         Ok(orch
             .job_selection(id)?
             .expect("a launched node stores its selection"))
+    }
+
+    /// A record as the preview and the launch both see it, apart from the
+    /// work it was stored for.
+    fn unsubjected(mut record: SelectionRecord) -> SelectionRecord {
+        record.subject = Default::default();
+        record
+    }
+
+    /// The create reply's "would pick now" is each step's launch: a step
+    /// previews exactly what its own launch then stores, a constrained step
+    /// previews against its upstream's predicted pick and then its stored one,
+    /// a single-model step is exact, and a pin is reported as pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preview_predicts_what_each_steps_launch_stores() {
+        let exact: &[&str] = &["claude/sonnet"];
+        let (orch, db, _repo) = execution(
+            two_makers(),
+            &[
+                ("builder-1", Some(&["md"]), None),
+                ("exact", Some(exact), None),
+                ("pinned", None, None),
+                ("review", None, Some("builder-1")),
+            ],
+        )
+        .await;
+        db.execute("UPDATE jobs SET model = 'opus' WHERE id = 'pinned'", ())
+            .await
+            .unwrap();
+        let preview = || async {
+            crate::execution::launch_preview::preview_execution(&orch, &db, "x", "p")
+                .await
+                .unwrap()
+        };
+        let step = |steps: &[crate::execution::launch_preview::StepPreview], id: &str| {
+            steps
+                .iter()
+                .find(|step| step.node_id == id)
+                .cloned()
+                .unwrap()
+        };
+
+        let before = preview().await;
+        assert_eq!(
+            step(&before, "exact").line(),
+            "exact = claude/sonnet (exact)"
+        );
+        assert_eq!(step(&before, "pinned").line(), "pinned pinned: claude/opus");
+        let builder = step(&before, "builder-1");
+        assert!(
+            builder.line().starts_with("builder-1 now: "),
+            "{}",
+            builder.line()
+        );
+        let review = step(&before, "review");
+        assert!(
+            review.line().starts_with("review now, after builder-1: "),
+            "{}",
+            review.line()
+        );
+        let predicted_review = review.record().cloned().unwrap();
+
+        // The builder launches on exactly what it previewed.
+        let launched = launch(&orch, &db, "builder-1").unwrap();
+        assert_eq!(
+            unsubjected(builder.record().cloned().unwrap()),
+            unsubjected(launched.clone())
+        );
+        assert_eq!(
+            unsubjected(step(&before, "exact").record().cloned().unwrap()),
+            unsubjected(launch(&orch, &db, "exact").unwrap())
+        );
+
+        // Launched, the builder reports its stored choice, and the reviewer
+        // now reads that rather than a prediction.
+        let after = preview().await;
+        assert_eq!(
+            step(&after, "builder-1").line(),
+            format!("builder-1 chose: {}", launched.provenance)
+        );
+        let review = step(&after, "review").record().cloned().unwrap();
+        assert_eq!(review, predicted_review);
+        assert_eq!(model_ref(&review.chosen), "claude/sonnet");
+        assert_eq!(
+            unsubjected(review),
+            unsubjected(launch(&orch, &db, "review").unwrap())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -946,6 +946,19 @@ pub(super) async fn read_issue_execution(
     };
 
     let mut output = render_execution_snapshot(project_key, number, exec_seq, &snapshot);
+    let resolution = db
+        .read(|conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                Ok::<_, crate::storage::DbError>(
+                    crate::execution::recipe_resolution::resolution_block(conn, &execution_id)
+                        .await,
+                )
+            })
+        })
+        .await
+        .unwrap_or_default();
+    output.push_str(&resolution);
     output.push_str(&render_condition_evaluations(
         project_key,
         number,

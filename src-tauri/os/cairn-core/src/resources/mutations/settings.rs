@@ -47,6 +47,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "imageModel",
     "speechModel",
     "embeddingModel",
+    "defaultRecipe",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     "privateDedicatedProcessCapacity",

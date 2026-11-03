@@ -386,6 +386,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // packets are what its delegated children's lineage reads.
     owned("delegated_packets", "executions"),
     owned("execution_gates", "executions"),
+    // The judgment thread's labels: kept as long as the execution they
+    // describe, and deleted with it.
+    owned("recipe_resolutions", "executions"),
+    owned("execution_agent_edits", "executions"),
+    // One row per distinct recipe set a project's resolutions chose among.
+    owned("recipe_option_sets", "projects"),
     keep(
         "queue_lane_turns",
         "one row per queue lane that has started work: bounded by the threads and parent issues there are",

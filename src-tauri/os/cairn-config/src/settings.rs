@@ -274,6 +274,10 @@ pub struct SettingsFile {
     /// Cairn gateway's Cohere Embed v4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding_model: Option<String>,
+    /// The recipe an execution naming none starts. Absent: such a start is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_recipe: Option<String>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
@@ -699,6 +703,7 @@ impl SettingsFile {
             image_model: non_blank(&self.image_model),
             speech_model: non_blank(&self.speech_model),
             embedding_model: non_blank(&self.embedding_model),
+            default_recipe: non_blank(&self.default_recipe),
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
@@ -772,6 +777,7 @@ impl SettingsFile {
             image_model: settings.image_model.clone(),
             speech_model: settings.speech_model.clone(),
             embedding_model: settings.embedding_model.clone(),
+            default_recipe: settings.default_recipe.clone(),
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
@@ -1266,6 +1272,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "imageModel",
     "speechModel",
     "embeddingModel",
+    "defaultRecipe",
     // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
@@ -1347,10 +1354,14 @@ pub fn update_settings(
         let mut current = file.to_settings();
         let enablement_changed = input.enabled_providers.is_some();
         let models_changed = input.models.is_some();
+        let default_recipe_changed = input.default_recipe.is_some();
         let enabled_before = current.enabled_providers.clone();
         apply_settings_update(&mut current, input);
         drop_removed_providers(&mut current, &enabled_before);
         validate_enabled_providers(&current, enablement_changed, provider_names)?;
+        if default_recipe_changed {
+            validate_default_recipe(&current)?;
+        }
         if let (true, Some(models)) = (models_changed, &current.models) {
             models.validate()?;
         }
@@ -1725,6 +1736,18 @@ fn trimmed_model(value: Option<String>) -> Option<String> {
         .filter(|model| !model.is_empty())
 }
 
+/// `defaultRecipe` must be a recipe id. Whether it names a recipe that loads
+/// is asked where it is used: a project's own recipes are invisible here.
+fn validate_default_recipe(settings: &Settings) -> Result<(), String> {
+    match settings.default_recipe.as_deref() {
+        Some(id) if !cairn_domain::is_recipe_id(id) => Err(format!(
+            "defaultRecipe '{id}' is not a recipe id: a recipe id is a plain name of letters, \
+             digits, `-` and `_` (the recipe file's name without its extension)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.models {
         current.models = Some(value);
@@ -1743,6 +1766,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.embedding_model {
         current.embedding_model = trimmed_model(value);
+    }
+    if let Some(value) = input.default_recipe {
+        current.default_recipe = trimmed_model(value);
     }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
@@ -2372,6 +2398,49 @@ externalReplies: disabled
             serde_json::from_value(serde_json::json!({ "decisionModel": "  " })).unwrap(),
         );
         assert_eq!(current.decision_model, None);
+    }
+
+    #[test]
+    fn default_recipe_is_set_cleared_and_omitted_when_unset() {
+        assert_eq!(test_settings().default_recipe, None);
+        let empty = SettingsFile::from_settings(&test_settings());
+        assert!(!serde_yaml::to_string(&empty)
+            .unwrap()
+            .contains("defaultRecipe"));
+
+        let mut current = test_settings();
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "defaultRecipe": " build " })).unwrap(),
+        );
+        assert_eq!(current.default_recipe.as_deref(), Some("build"));
+        assert!(validate_default_recipe(&current).is_ok());
+        let yaml = serde_yaml::to_string(&SettingsFile::from_settings(&current)).unwrap();
+        assert!(yaml.contains("defaultRecipe: build"), "{yaml}");
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            parsed.to_settings().default_recipe.as_deref(),
+            Some("build")
+        );
+
+        apply_settings_update(&mut current, UpdateSettings::default());
+        assert_eq!(current.default_recipe.as_deref(), Some("build"));
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "defaultRecipe": null })).unwrap(),
+        );
+        assert_eq!(current.default_recipe, None);
+        current.default_recipe = Some("build".into());
+        apply_settings_update(
+            &mut current,
+            serde_json::from_value(serde_json::json!({ "defaultRecipe": "  " })).unwrap(),
+        );
+        assert_eq!(current.default_recipe, None);
+
+        // A path or file name is refused when written, naming the setting.
+        current.default_recipe = Some("recipes/build.yaml".into());
+        let refused = validate_default_recipe(&current).unwrap_err();
+        assert!(refused.contains("defaultRecipe"), "{refused}");
     }
 
     #[test]

@@ -1236,8 +1236,9 @@ async fn issue_create_with_execution_creates_issue_then_surfaces_start_failure()
 async fn issue_create_rejects_malformed_execution_before_creating() {
     let fixture = issue_project_fixture("mcp").await;
 
-    // A non-object execution is rejected at parse time, before the issue row is
-    // written — a malformed spec must not leave a half-created issue behind.
+    // Anything but `true` or an object is rejected at parse time, before the
+    // issue row is written — a malformed spec must not leave a half-created
+    // issue behind.
     let bad_shape = apply_change(
         &fixture.orch,
         &fixture.project_issues_uri(),
@@ -1246,8 +1247,22 @@ async fn issue_create_rejects_malformed_execution_before_creating() {
     )
     .await;
     assert!(
-        bad_shape.contains("must be an object"),
+        bad_shape.contains("must be true (start, Cairn chooses the recipe) or an object"),
         "unexpected: {bad_shape}"
+    );
+
+    // `execution: true` with no defaultRecipe is refused naming the setting,
+    // also before the issue exists.
+    let no_default = apply_change(
+        &fixture.orch,
+        &fixture.project_issues_uri(),
+        "append",
+        json!({ "title": "Unnamed", "execution": true }),
+    )
+    .await;
+    assert!(
+        no_default.contains("set the workspace setting defaultRecipe"),
+        "unexpected: {no_default}"
     );
 
     // A non-string field inside execution is likewise rejected.

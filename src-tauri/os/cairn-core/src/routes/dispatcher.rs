@@ -403,21 +403,35 @@ async fn fire_issue_sink(
     )
     .await?;
     if let Some(recipe) = recipe {
-        crate::mcp::handlers::executions::start_execution_from_collection(
+        let filing = crate::mcp::handlers::executions::resolve_filing(
             orch,
             project,
             outcome.number,
             Some(recipe),
+            crate::execution::recipe_resolution::ResolutionCreator::route_dispatcher(),
             None,
-            None,
-            None,
-            // A freshly dispatched issue has no prior attempt to supersede.
-            crate::execution::recipe::LaunchIntent::NewAttempt,
-            Vec::new(),
-            crate::execution::recipe::QueuePlace::Tail,
-        )
-        .await
-        .map_err(|error| {
+        );
+        let started = match filing.await {
+            Ok(filing) => {
+                crate::mcp::handlers::executions::start_execution_from_collection(
+                    orch,
+                    project,
+                    outcome.number,
+                    filing,
+                    None,
+                    None,
+                    None,
+                    // A freshly dispatched issue has no prior attempt to
+                    // supersede.
+                    crate::execution::recipe::LaunchIntent::NewAttempt,
+                    Vec::new(),
+                    crate::execution::recipe::QueuePlace::Tail,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        started.map_err(|error| {
             format!(
                 "{} was created, but execution start failed: {error}",
                 outcome.uri

@@ -25,11 +25,17 @@ use crate::storage::{LocalDb, RowExt};
 /// Apply an edited agent snapshot to a stored execution snapshot and propagate
 /// the change. The single source of truth shared by the Tauri command and the
 /// execution-snapshot resource patch.
+///
+/// An edit that changes anything is recorded in `execution_agent_edits`, in
+/// the same write as the snapshot, so a live override of a step's allotment is
+/// a fact the recipe-resolution records can be joined to. `actor` is the
+/// editing node or thread, `operator` for the app, `None` for the CLI.
 pub async fn update_execution_agent(
     orch: &Orchestrator,
     execution_id: &str,
     agent_id: &str,
     agent_snapshot: AgentSnapshot,
+    actor: Option<&str>,
 ) -> Result<(), String> {
     let owning = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
     let db: &LocalDb = owning.as_ref();
@@ -61,6 +67,13 @@ pub async fn update_execution_agent(
     // `merge_agent_patch` strips the field so a caller cannot assert it.
     normalized_snapshot.edited_at = Some(chrono::Utc::now().timestamp());
 
+    let edit = AgentEdit::between(
+        execution_id,
+        agent_id,
+        snapshot.agents.get(agent_id),
+        &normalized_snapshot,
+        actor,
+    );
     snapshot
         .agents
         .insert(agent_id.to_string(), normalized_snapshot.clone());
@@ -72,7 +85,7 @@ pub async fn update_execution_agent(
 
     let job_ids = load_agent_job_ids(db, execution_id, agent_id).await?;
 
-    update_agent_snapshot(db, execution_id, &updated_json).await?;
+    update_agent_snapshot(db, execution_id, &updated_json, edit).await?;
     drop(snapshot_guard);
 
     if let Some(selection) = normalized_snapshot.selection.as_ref() {
@@ -222,7 +235,68 @@ async fn load_execution_snapshot_json(
     .map_err(|e| format!("Failed to load execution: {e}"))
 }
 
-/// Persist the edited snapshot itself.
+/// One recorded edit: which snapshot keys changed, and the agent's allotment
+/// and pin before and after.
+#[derive(Clone)]
+struct AgentEdit {
+    id: String,
+    execution_id: String,
+    agent_id: String,
+    actor: Option<String>,
+    changed: String,
+    before: String,
+    after: String,
+}
+
+impl AgentEdit {
+    /// The edit from `before` to `after`, or `None` when nothing changed.
+    fn between(
+        execution_id: &str,
+        agent_id: &str,
+        before: Option<&AgentSnapshot>,
+        after: &AgentSnapshot,
+        actor: Option<&str>,
+    ) -> Option<Self> {
+        let changed = changed_keys(before, after);
+        if changed.is_empty() {
+            return None;
+        }
+        let models = |agent: Option<&AgentSnapshot>| {
+            serde_json::json!({
+                "models": agent.map(|agent| &agent.models),
+                "selection": agent.and_then(|agent| agent.selection.as_ref()),
+            })
+            .to_string()
+        };
+        Some(Self {
+            id: cairn_common::ids::mint_child(execution_id),
+            execution_id: execution_id.to_string(),
+            agent_id: agent_id.to_string(),
+            actor: actor.map(str::to_string),
+            changed: serde_json::to_string(&changed).unwrap_or_else(|_| "[]".to_string()),
+            before: models(before),
+            after: models(Some(after)),
+        })
+    }
+}
+
+/// The snapshot keys whose values differ, the server's edit stamp aside.
+fn changed_keys(before: Option<&AgentSnapshot>, after: &AgentSnapshot) -> Vec<String> {
+    let object = |agent: Option<&AgentSnapshot>| {
+        agent
+            .and_then(|agent| serde_json::to_value(agent).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    };
+    let (before, after) = (object(before), object(Some(after)));
+    let keys: std::collections::BTreeSet<&String> = before.keys().chain(after.keys()).collect();
+    keys.into_iter()
+        .filter(|key| key.as_str() != "editedAt" && before.get(*key) != after.get(*key))
+        .cloned()
+        .collect()
+}
+
+/// Persist the edited snapshot itself, and the record of the edit.
 ///
 /// The per-job model deliberately does NOT travel with this write. Updating
 /// every job's model up front and rotating afterwards is what let a snapshot
@@ -234,18 +308,38 @@ async fn update_agent_snapshot(
     db: &LocalDb,
     execution_id: &str,
     snapshot_json: &str,
+    edit: Option<AgentEdit>,
 ) -> Result<(), String> {
     let execution_id = execution_id.to_string();
     let snapshot_json = snapshot_json.to_string();
     db.write(|conn| {
         let execution_id = execution_id.clone();
         let snapshot_json = snapshot_json.clone();
+        let edit = edit.clone();
         Box::pin(async move {
             conn.execute(
                 "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
                 params![snapshot_json.as_str(), execution_id.as_str()],
             )
             .await?;
+            if let Some(edit) = edit {
+                conn.execute(
+                    "INSERT INTO execution_agent_edits
+                       (id, execution_id, agent_id, created_at, actor, changed, before, after)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        edit.id.as_str(),
+                        edit.execution_id.as_str(),
+                        edit.agent_id.as_str(),
+                        chrono::Utc::now().timestamp(),
+                        edit.actor.as_deref(),
+                        edit.changed.as_str(),
+                        edit.before.as_str(),
+                        edit.after.as_str()
+                    ],
+                )
+                .await?;
+            }
 
             Ok(())
         })
@@ -399,9 +493,41 @@ mod tests {
         .await
         .unwrap();
 
-        update_execution_agent(&orch, "exec-1", "builder", builder(Model::SONNET))
+        update_execution_agent(
+            &orch,
+            "exec-1",
+            "builder",
+            builder(Model::SONNET),
+            Some("operator"),
+        )
+        .await
+        .expect("a model edit to a session-less job succeeds");
+        let edit = db
+            .query_opt_text(
+                "SELECT changed || ' ' || actor || ' ' || after FROM execution_agent_edits
+                  WHERE execution_id = 'exec-1' AND agent_id = 'builder'",
+                (),
+            )
             .await
-            .expect("a model edit to a session-less job succeeds");
+            .unwrap()
+            .expect("a changing edit is recorded");
+        assert!(edit.starts_with("[\"selection\"] operator "), "{edit}");
+        assert!(edit.contains(Model::SONNET), "{edit}");
+
+        // An edit that changes nothing is not recorded.
+        update_execution_agent(&orch, "exec-1", "builder", builder(Model::SONNET), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT COUNT(*) || '' FROM execution_agent_edits WHERE execution_id = 'exec-1'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("1")
+        );
 
         let stored = db
             .query_opt_text("SELECT snapshot FROM executions WHERE id = 'exec-1'", ())

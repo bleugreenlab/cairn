@@ -2395,6 +2395,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // release it records, in the database that owns the released execution.
     ("queue_lane_turns", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
+    // cairn/5814: how each execution create resolved its recipe, the option
+    // sets those resolutions chose among, and live edits to a step's
+    // allotment. Read wherever the execution is, so they share its scope.
+    ("recipe_resolutions", TableScope::ProjectScoped),
+    ("recipe_option_sets", TableScope::ProjectScoped),
+    ("execution_agent_edits", TableScope::ProjectScoped),
     // cairn/5935: conditions on a pending ask (a deferred gated artifact). Read
     // and written wherever the artifact they defer is, so they share its scope.
     ("ask_conditions", TableScope::ProjectScoped),
@@ -3128,6 +3134,24 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "executions",
         id_columns: &["id", "issue_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "recipe_resolutions",
+        id_columns: &[
+            "id",
+            "project_id",
+            "issue_id",
+            "execution_id",
+            "supersedes_execution_id",
+        ],
+    },
+    RekeyTableManifest {
+        table: "recipe_option_sets",
+        id_columns: &["project_id"],
+    },
+    RekeyTableManifest {
+        table: "execution_agent_edits",
+        id_columns: &["id", "execution_id"],
     },
     RekeyTableManifest {
         table: "delegated_packets",

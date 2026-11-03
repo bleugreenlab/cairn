@@ -2124,7 +2124,14 @@ pub(crate) mod tests {
             "the filing names the cap, not yet its place: {filed}"
         );
         assert!(
-            filed.ends_with("Only the operator's Start now skips the queue."),
+            filed.lines().next().is_some_and(
+                |line| line.ends_with("Only the operator's Start now skips the queue.")
+            ),
+            "{filed}"
+        );
+        // The resolution follows, as on every filing.
+        assert!(
+            filed.contains("\nrecipe: memory-triage · named\n"),
             "{filed}"
         );
         assert!(is_held(&env, 1).await, "held: no jobs, no slot");

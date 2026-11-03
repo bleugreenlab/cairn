@@ -1,8 +1,10 @@
 //! Programmatic execution start via an issue's executions collection.
 //!
-//! Appending `{recipe?, backend?, branch?, continuity?, lifecycle?, overrides?,
-//! after?, place?}` to `cairn://p/PROJECT/NUMBER/executions` starts a new
-//! execution. This is the external-driver entry point: it shares
+//! Appending `{recipe?, branch?, continuity?, lifecycle?, overrides?, after?,
+//! place?}` to `cairn://p/PROJECT/NUMBER/executions` starts a new execution,
+//! on the named recipe or, with none named, on the one Cairn resolves
+//! (`execution::recipe_resolution`). This is the external-driver entry point:
+//! it shares
 //! the same start sequence as the user-facing Tauri command
 //! (`start_recipe_execution_and_advance`) and stamps `initiated_via="external"`
 //! attribution on the snapshot. Local-secret auth (which already gates every
@@ -49,14 +51,130 @@ async fn resolve_project_and_issue(
     resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))
 }
 
+/// What an execution create files besides its launch options: the recipe it
+/// resolved and why, and who filed it with what, for the reply and the
+/// resolution record.
+pub(crate) struct ExecutionFiling {
+    pub(crate) resolution: crate::execution::recipe_resolution::RecipeResolution,
+    pub(crate) creator: crate::execution::recipe_resolution::ResolutionCreator,
+    /// The `overrides` exactly as the creator wrote them.
+    pub(crate) overrides_filed: Option<serde_json::Value>,
+}
+
+/// Resolve the recipe an execution create on issue `number` starts: `named`
+/// exactly, or Cairn's choice when it is `None`.
+pub(crate) async fn resolve_filing(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+    named: Option<&str>,
+    creator: crate::execution::recipe_resolution::ResolutionCreator,
+    overrides_filed: Option<serde_json::Value>,
+) -> Result<ExecutionFiling, String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let (project_id, issue_id, _) =
+        resolve_project_and_issue(&owning_db, project_key, number).await?;
+    let facts = crate::execution::recipe_resolution::issue_facts(&owning_db, &issue_id).await?;
+    let resolution = crate::execution::recipe_resolution::resolve_execution_recipe(
+        orch,
+        &owning_db,
+        &project_id,
+        &facts,
+        named,
+    )
+    .await?;
+    Ok(ExecutionFiling {
+        resolution,
+        creator,
+        overrides_filed,
+    })
+}
+
+/// The reply's resolution block: the recipe and why, one line per agent step,
+/// and the ways to change it.
+///
+/// The fix hint is keyed to each step's state, so following it changes what
+/// runs. A step that has not launched and is not pinned selects within its
+/// snapshot's `models` at its own launch, so a `models` patch steers it. A
+/// step that has launched never selects again, and a pin wins over `models`,
+/// so either one moves only by a `selection` patch, which reaches it from its
+/// next turn.
+pub(crate) fn resolution_lines(
+    filing: &ExecutionFiling,
+    steps: &Result<Vec<crate::execution::launch_preview::StepPreview>, String>,
+    issue_uri: &str,
+    seq: i32,
+) -> String {
+    use crate::execution::launch_preview::StepPick;
+    let mut lines = vec![filing.resolution.line()];
+    match steps {
+        Ok(steps) => lines.extend(steps.iter().map(|step| step.line())),
+        Err(error) => lines.push(format!("preview unavailable: {error}")),
+    }
+    let execution_uri = format!("{issue_uri}/executions/{seq}");
+    let mut fixes = Vec::new();
+    match steps {
+        Ok(steps) => {
+            let selects = |step: &&crate::execution::launch_preview::StepPreview| {
+                step.pin.is_none() && !matches!(step.pick, Ok(StepPick::Chosen(_)))
+            };
+            if let Some(agent) = steps
+                .iter()
+                .filter(selects)
+                .find_map(|step| step.agent_id.as_deref())
+            {
+                fixes.push(format!(
+                    "change a step: patch {execution_uri} \
+                     {{agent:\"{agent}\",snapshot:{{models:[...]}}}}"
+                ));
+            }
+            if let Some(agent) = steps
+                .iter()
+                .filter(|step| !selects(step))
+                .find_map(|step| step.agent_id.as_deref())
+            {
+                fixes.push(format!(
+                    "move a launched or pinned step: patch {execution_uri} \
+                     {{agent:\"{agent}\",snapshot:{{selection:{{backend:\"<provider>\",model:\"<model>\"}}}}}} \
+                     (from its next turn)"
+                ));
+            }
+        }
+        // Without a preview the steps' state is unknown; `models` is what a
+        // step that has not launched reads.
+        Err(_) => fixes.push(format!(
+            "change a step: patch {execution_uri} {{agent:\"<agent>\",snapshot:{{models:[...]}}}}"
+        )),
+    }
+    let agent = steps
+        .as_ref()
+        .ok()
+        .and_then(|steps| steps.iter().find_map(|step| step.agent_id.clone()))
+        .unwrap_or_else(|| "<agent>".to_string());
+    // The re-run names its recipe, so a re-append cannot drift to whatever
+    // the default has become.
+    fixes.push(format!(
+        "re-run: append {{recipe:\"{recipe}\",overrides:{{agents:{{{agent}:{{models:[...]}}}}}}}} \
+         to {issue_uri}/executions (supersedes execution {seq})",
+        recipe = filing.resolution.recipe
+    ));
+    lines.push(fixes.join(" · "));
+    lines.join("\n")
+}
+
 /// Start a new execution for an issue from an append to its executions
 /// collection, returning the caller-facing account of what the launch did.
+///
+/// Every account carries the resolution: the recipe and why, what each step
+/// would run now, and how to change either. The execution is durable before
+/// any of that is computed, so a preview that fails says so on one line
+/// rather than refusing the write.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_execution_from_collection(
     orch: &Orchestrator,
     project_key: &str,
     number: i32,
-    recipe: Option<&str>,
+    filing: ExecutionFiling,
     branch_target: Option<crate::models::BranchTarget>,
     continuity: Option<crate::models::Continuity>,
     overrides: Option<crate::models::LaunchDeltas>,
@@ -73,17 +191,7 @@ pub(crate) async fn start_execution_from_collection(
     let (project_id, issue_id, title) =
         resolve_project_and_issue(&owning_db, project_key, number).await?;
     let key = cairn_common::uri::canonical_project(project_key);
-
-    // Resolve the recipe once, refusing a path or file name, so the launch is
-    // handed the canonical id of the file it loads.
-    let recipe = crate::execution::recipe::resolve_filed_recipe_id(
-        &orch.config_dir,
-        &owning_db,
-        &project_id,
-        recipe,
-    )
-    .await?;
-    let recipe = recipe.as_deref();
+    let recipe = Some(filing.resolution.recipe.as_str());
 
     // Read BEFORE the launch: after it, the prior canonical execution is
     // superseded and this would resolve to the new one. Only a launch that will
@@ -91,7 +199,7 @@ pub(crate) async fn start_execution_from_collection(
     // alternative supersedes nothing by declaration, an automatic trigger
     // nothing by authority.
     let superseded = if matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt) {
-        canonical_execution_seq(&owning_db, &issue_id).await
+        canonical_execution(&owning_db, &issue_id).await
     } else {
         None
     };
@@ -149,6 +257,41 @@ pub(crate) async fn start_execution_from_collection(
 
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
+
+    let steps = crate::execution::launch_preview::preview_execution(
+        orch,
+        &owning_db,
+        &execution.id,
+        &project_id,
+    )
+    .await;
+    let preview = match &steps {
+        Ok(steps) => serde_json::Value::Array(steps.iter().map(|step| step.to_json()).collect()),
+        Err(error) => serde_json::json!([{ "error": error }]),
+    };
+    if let Err(error) = crate::execution::recipe_resolution::record_resolution(
+        &owning_db,
+        crate::execution::recipe_resolution::ResolutionRecord {
+            resolution: &filing.resolution,
+            project_id: &project_id,
+            issue_id: &issue_id,
+            execution_id: &execution.id,
+            creator: &filing.creator,
+            overrides: filing.overrides_filed.as_ref(),
+            preview: &preview,
+            supersedes_execution_id: superseded.as_ref().map(|(id, _)| id.as_str()),
+        },
+    )
+    .await
+    {
+        log::warn!(
+            "execution {} started without its resolution record: {error}",
+            execution.id
+        );
+    }
+    let resolved = resolution_lines(&filing, &steps, &issue_uri, seq);
+    let superseded = superseded.map(|(_, seq)| seq);
+
     if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
         // Held by the queue alone. A tail filing's line carries no place in
         // line: places are numbered at the end of a sweep pass, never on the
@@ -171,7 +314,7 @@ pub(crate) async fn start_execution_from_collection(
         } else {
             None
         };
-        return Ok(held_filing_summary(
+        let held = held_filing_summary(
             &format!("{key}/{number} \"{title}\""),
             seq,
             &execution.recipe_id,
@@ -180,7 +323,8 @@ pub(crate) async fn start_execution_from_collection(
             queued.as_deref(),
             matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
                 .then_some(superseded),
-        ));
+        );
+        return Ok(format!("{held}\n{resolved}"));
     }
     // Say what starting this did to the issue's lineage. Starting an ordinary
     // execution IS the supersede decision, so the result has to report it — the
@@ -207,8 +351,8 @@ pub(crate) async fn start_execution_from_collection(
         crate::execution::recipe::QueuePlace::Tail => "",
     };
     Ok(format!(
-        "Started execution {} for {}/{} \"{}\" (recipe '{}').{}{} Watch {} for attention.",
-        seq, key, number, title, execution.recipe_id, standing, placed, issue_uri
+        "Started execution {} for {}/{} \"{}\" (recipe '{}').{}{} Watch {} for attention.\n{}",
+        seq, key, number, title, execution.recipe_id, standing, placed, issue_uri, resolved
     ))
 }
 
@@ -399,9 +543,13 @@ async fn acting_principal(orch: &Orchestrator, request: &CallbackRequest) -> ser
     serde_json::to_value(&principal).unwrap_or(serde_json::Value::Null)
 }
 
-/// The `seq` of the execution that owns this issue's attempt right now, for the
-/// one line the launch result uses to say what it superseded.
-async fn canonical_execution_seq(db: &crate::storage::LocalDb, issue_id: &str) -> Option<i64> {
+/// The id and `seq` of the execution that owns this issue's attempt right now:
+/// what the launch result says it superseded, and what its resolution record
+/// links the re-run to.
+async fn canonical_execution(
+    db: &crate::storage::LocalDb,
+    issue_id: &str,
+) -> Option<(String, i64)> {
     use crate::storage::RowExt;
     let issue_id = issue_id.to_string();
     db.read(|conn| {
@@ -409,13 +557,16 @@ async fn canonical_execution_seq(db: &crate::storage::LocalDb, issue_id: &str) -
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT seq FROM executions
+                    "SELECT id, seq FROM executions
                       WHERE issue_id = ?1 AND lifecycle = 'canonical' LIMIT 1",
                     cairn_db::turso::params![issue_id.as_str()],
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => row.opt_i64(0),
+                Some(row) => match row.opt_i64(1)? {
+                    Some(seq) => Ok(Some((row.text(0)?, seq))),
+                    None => Ok(None),
+                },
                 None => Ok(None),
             }
         })
@@ -459,11 +610,15 @@ pub(crate) async fn edit_execution_agent(
         ));
     }
 
+    let actor = crate::execution::recipe_resolution::ResolutionCreator::of_request(orch, request)
+        .await
+        .uri;
     crate::execution::snapshot_edit::update_execution_agent(
         orch,
         &execution_id,
         agent_id,
         agent_snapshot,
+        actor.as_deref(),
     )
     .await?;
 

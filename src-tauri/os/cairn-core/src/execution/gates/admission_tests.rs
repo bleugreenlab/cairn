@@ -126,11 +126,20 @@ async fn saturated(name: &str, numbers: impl IntoIterator<Item = i32>) -> Env {
 
 /// A capped filing on issue `number`, as an executions append makes it.
 async fn file_on(orch: &Orchestrator, number: i32) -> Result<String, String> {
-    crate::mcp::handlers::executions::start_execution_from_collection(
+    let filing = crate::mcp::handlers::executions::resolve_filing(
         orch,
         "prj",
         number,
         Some("memory-triage"),
+        Default::default(),
+        None,
+    )
+    .await?;
+    crate::mcp::handlers::executions::start_execution_from_collection(
+        orch,
+        "prj",
+        number,
+        filing,
         None,
         None,
         None,

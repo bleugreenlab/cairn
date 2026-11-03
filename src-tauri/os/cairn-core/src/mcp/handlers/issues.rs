@@ -15,11 +15,16 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 // ============================================================================
 
 /// Optional create+start request parsed from the issue-create payload's
-/// `execution` key, taking the same keys an executions-collection append does.
-/// `recipe` is required by the launch (there is no default recipe).
+/// `execution` key (`true`, or the keys an executions-collection append
+/// takes). With no `recipe`, Cairn chooses one
+/// (`execution::recipe_resolution`).
 #[derive(Debug, Default, Clone)]
 pub struct CreateExecutionSpec {
     pub(crate) recipe: Option<String>,
+    /// Who files it, for the resolution record.
+    pub(crate) creator: crate::execution::recipe_resolution::ResolutionCreator,
+    /// `overrides` exactly as written, for the resolution record.
+    pub(crate) overrides_filed: Option<serde_json::Value>,
     /// Ad-hoc adjustments to the recipe this launch freezes — the same grammar
     /// the executions-collection append takes, so "create a child and skip its
     /// review" is one call rather than a create, a start, and a patch that
@@ -174,17 +179,24 @@ pub async fn create_issue_in_project(
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
-    // A filing that names its recipe by anything but a recipe id is refused
-    // before the issue exists, so the refusal leaves no orphan issue behind it.
-    if let Some(spec) = &execution {
-        crate::execution::recipe::resolve_filed_recipe_id(
-            &orch.config_dir,
-            &owning_db,
-            &ctx.project_id,
-            spec.recipe.as_deref(),
-        )
-        .await?;
-    }
+    // The recipe is resolved before the issue exists, so a refusal (a path for
+    // a recipe id, no default to choose with) leaves no orphan issue behind.
+    let resolution = match &execution {
+        Some(spec) => Some(
+            resolve_create_recipe(
+                orch,
+                &owning_db,
+                &ctx.project_id,
+                &title,
+                description.as_deref(),
+                labels.as_deref(),
+                parent_uri.as_deref(),
+                spec.recipe.as_deref(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     let issue = insert_issue_with_context(
         orch,
         &owning_db,
@@ -205,7 +217,7 @@ pub async fn create_issue_in_project(
     let executions_uri =
         cairn_common::uri::build_issue_executions_uri(&ctx.project_key, issue.number);
 
-    let summary = match execution {
+    let summary = match execution.zip(resolution) {
         // Filing without work is legitimate, but the result has to say so: a
         // bare "Created issue" reads the same as a started child to a caller who
         // believes it sent `execution`, and the child then sits idle unnoticed.
@@ -215,15 +227,19 @@ pub async fn create_issue_in_project(
         ),
         // Create+start is "create then start", not one transaction: the issue is
         // already durable here. Reuse the executions-collection start path so the
-        // recipe resolution, `initiated_via="external"` stamp, and watcher
-        // wake are identical. If the start fails (bad recipe id, no default recipe),
-        // surface an error that names the created issue so the caller can retry the
-        // start instead of silently dropping it.
-        Some(spec) => match super::executions::start_execution_from_collection(
+        // reply, the resolution record, the `initiated_via="external"` stamp,
+        // and the watcher wake are identical. If the start fails (a recipe
+        // that does not load), surface an error that names the created issue
+        // so the caller can retry the start instead of silently dropping it.
+        Some((spec, resolution)) => match super::executions::start_execution_from_collection(
             orch,
             &ctx.project_key,
             issue.number,
-            spec.recipe.as_deref(),
+            super::executions::ExecutionFiling {
+                resolution,
+                creator: spec.creator,
+                overrides_filed: spec.overrides_filed,
+            },
             None,
             None,
             spec.overrides,
@@ -252,6 +268,56 @@ pub async fn create_issue_in_project(
         number,
         uri,
     })
+}
+
+/// The recipe an issue create's `execution` starts, from the facts the create
+/// payload carries: the issue does not exist yet.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_create_recipe(
+    orch: &Orchestrator,
+    owning_db: &LocalDb,
+    project_id: &str,
+    title: &str,
+    description: Option<&str>,
+    labels: Option<&[String]>,
+    parent_uri: Option<&str>,
+    recipe: Option<&str>,
+) -> Result<crate::execution::recipe_resolution::RecipeResolution, String> {
+    let facts = crate::execution::recipe_resolution::IssueFacts {
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        labels: labels.map(<[String]>::to_vec).unwrap_or_default(),
+        parent: parent_uri.map(str::to_string),
+    };
+    crate::execution::recipe_resolution::resolve_execution_recipe(
+        orch, owning_db, project_id, &facts, recipe,
+    )
+    .await
+}
+
+/// What an issue create's `execution` would resolve to, for a dry run.
+pub(crate) async fn preview_create_recipe(
+    orch: &Orchestrator,
+    project_key: &str,
+    title: &str,
+    description: Option<&str>,
+    labels: Option<&[String]>,
+    parent_uri: Option<&str>,
+    recipe: Option<&str>,
+) -> Result<crate::execution::recipe_resolution::RecipeResolution, String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let ctx = lookup_project_by_key(&owning_db, project_key).await?;
+    resolve_create_recipe(
+        orch,
+        &owning_db,
+        &ctx.project_id,
+        title,
+        description,
+        labels,
+        parent_uri,
+        recipe,
+    )
+    .await
 }
 
 async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext, String> {

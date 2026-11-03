@@ -239,7 +239,7 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe, backend?, overrides?, after?, place?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `place` takes the same value the executions collection does",
+    "true | {recipe?, overrides?, after?, place?} to also start an execution once the issue is created; omit to create only. With no recipe Cairn chooses: the workspace setting defaultRecipe until a measured chooser exists, refused (and no issue created) when it is unset; a named recipe is run exactly. The reply carries the resolution: the recipe and what decided it, one line per agent step with its allotment and what it would pick `now:` (each step selects at its own launch, so this is a prediction, not a lock; a single-model allotment is exact), and the URIs to change a step live or re-run on another recipe. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `place` takes the same value the executions collection does",
 );
 /// `place` on a filing, shared verbatim by the executions-collection append and
 /// the issue-create `execution` block.
@@ -855,6 +855,11 @@ pub(crate) const SETTINGS_DECISION_MODEL: KeySpec = KeySpec::new(
     "decisionModel",
     KeyType::Str,
     "the pool or provider/model a decision node naming no models is answered within; null returns it to the catalog's choice",
+);
+pub(crate) const SETTINGS_DEFAULT_RECIPE: KeySpec = KeySpec::new(
+    "defaultRecipe",
+    KeyType::Str,
+    "the recipe id an execution naming no recipe starts (execution:true on issue create, an executions append without recipe); null clears it, and such a start is then refused",
 );
 pub(crate) const SETTINGS_IMAGE_MODEL: KeySpec = KeySpec::new(
     "imageModel",

@@ -335,6 +335,9 @@ pub(super) const COPY_ORDER: &[TableCopySpec] = &[
     spec("delegated_packets", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("condition_evaluations", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("execution_history", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
+    spec("recipe_option_sets", "project_id = ?1"),
+    spec("recipe_resolutions", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
+    spec("execution_agent_edits", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("jobs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     // Runner-local rebuild notices, addressed through their recipient jobs.
     // Their private cross-scope foreign key is why the private half must run
@@ -1565,6 +1568,12 @@ pub(super) mod tests {
             INSERT INTO feed_cursors(home_kind, home_id) VALUES ('thread', 'thread-delete');
             INSERT INTO landing_allocations(id, project_id, kind, value, name, provisional, branch, allocated_at)
               VALUES ('allocation-delete', 'project-delete', 'migration', 2, '0002_x', 'NEXT_x', 'agent/delete', 1);
+            INSERT INTO recipe_option_sets(project_id, candidates_hash, candidates, created_at)
+              VALUES ('project-delete', 'hash-delete', '[]', 1);
+            INSERT INTO recipe_resolutions(id, project_id, issue_id, execution_id, created_at, created_by_kind, source, resolved_recipe, measured_by, reason, candidates_hash, preview)
+              VALUES ('resolution-delete', 'project-delete', 'issue-delete', 'execution-delete', 1, 'agent', 'named', 'recipe', 'named by creator', 'named', 'hash-delete', '[]');
+            INSERT INTO execution_agent_edits(id, execution_id, agent_id, created_at, changed, before, after)
+              VALUES ('edit-delete', 'execution-delete', 'builder', 1, '[]', '{}', '{}');
             INSERT INTO service_log(project_id, service, kind, text, created_at)
               VALUES ('project-delete', 'echo', 'lifecycle', 'started', 1);
             INSERT INTO thread_services(id, project_id, thread_id, name, version, data, source_hash, created_at)

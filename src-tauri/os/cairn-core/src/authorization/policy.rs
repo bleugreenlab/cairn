@@ -39,6 +39,9 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "embeddingModel",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
+    // The recipe every unnamed start runs decides which agents, tools and
+    // fences other agents' work gets, so an agent setting it would steer them.
+    "defaultRecipe",
     // Commands this workspace will execute on the host.
     "buildServices",
     // Which verbs each inference profile's model is offered for, and so which

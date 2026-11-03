@@ -63,18 +63,7 @@ pub fn list_recipes(
 /// What a recipe id is, for refusals that name the rule.
 const RECIPE_ID_SHAPE: &str = "a recipe id is a plain name of letters, digits, `-` and `_` (the recipe file's name without its extension), never a path or a file name";
 
-/// Whether `id` is a recipe id: a plain name of letters, digits, `-` and `_`.
-///
-/// A recipe's identity is the stem of its file, and policy that names a
-/// recipe (contextual-package selection) compares ids, so an id must not be
-/// able to reach a file by another spelling: no path
-/// separators, no `.` (so no `..`, no extension, no hidden name).
-pub fn is_recipe_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-}
+pub use crate::models::is_recipe_id;
 
 /// The refusal for a string that is not a recipe id, naming the recipe it
 /// most plausibly meant when one resolves (`./planbuild` and

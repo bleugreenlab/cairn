@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::config::get_recipe_from_files;
 use crate::models::Continuity;
 
-fn get_selected_recipe(
+pub(crate) fn get_selected_recipe(
     config_dir: &std::path::Path,
     project_path: &std::path::Path,
     project_id: &str,
@@ -359,7 +359,9 @@ async fn launch_recipe_execution(
     // Get project path for file-based recipe loading
     let project_path = project_path_for_recipe(&db, project_id).await?;
 
-    // Get the recipe (use provided or find default)
+    // Every caller resolves its recipe before it gets here: an unnamed
+    // execution create through `recipe_resolution`, the composer and the
+    // scheduler by naming one.
     let recipe = match recipe_id {
         Some(id) => get_selected_recipe(&orch.config_dir, &project_path, project_id, id)?,
         None => return Err("No recipe specified for execution".to_string()),
@@ -768,7 +770,7 @@ pub fn check_node_constraints(recipe: &RecipeSnapshot) -> Result<(), String> {
     }
 }
 
-fn constraint_problem(recipe: &RecipeSnapshot, node: &RecipeNode) -> Option<String> {
+pub(crate) fn constraint_problem(recipe: &RecipeSnapshot, node: &RecipeNode) -> Option<String> {
     let constraints = &node.agent_config.as_ref()?.constraints;
     if constraints.is_empty() {
         return None;
@@ -929,24 +931,7 @@ pub async fn resolve_recipe_launch(
     });
 
     let config_dir = orch.config_dir.clone();
-    // One provider record per backend, asked whether a selection can hold a
-    // session: the same answer the session door gives at launch.
-    let providers = std::cell::RefCell::new(HashMap::new());
-    let serves_session = |selection: &ModelSelection| -> Result<(), String> {
-        let mut providers = providers.borrow_mut();
-        let provider = providers
-            .entry(selection.backend.clone())
-            .or_insert_with(|| orch.catalog_provider(&selection.backend, Some(project_id)));
-        provider
-            .admit(selection.model.as_str(), VerbKind::Session)
-            .map(|_| ())
-            .map_err(|refusal| {
-                refusal
-                    .detail
-                    .clone()
-                    .unwrap_or_else(|| refusal.to_string())
-            })
-    };
+    let serves_session = crate::execution::launch_preview::session_admitter(orch, project_id);
     let ladder = orch.models_ladder(Some(project_id))?;
     let mut offered: Vec<ModelSelection> = Vec::new();
     for raw in ladder
@@ -989,22 +974,11 @@ pub async fn resolve_recipe_launch(
     })
 }
 
-/// The node's own preview before constraints are applied.
-struct NodePreview {
-    agent: config_agents::FileAgent,
-    allotment: Vec<AllotmentEntry>,
-    pin: Option<ModelSelection>,
-    record: Result<SelectionRecord, String>,
-}
-
 /// Pure per-node previewer: maps recipe agent nodes to preview rows using a
 /// supplied agent loader and selection. Every node carries `available` so even
 /// an unplaceable row can be pinned. Loud, per-node errors; never fails the
-/// whole plan.
-///
-/// Nodes are previewed in two passes: each node on its own, then each
-/// constrained node again against the first-pass pick of the nodes it names,
-/// which is the best prediction of what those nodes will store at launch.
+/// whole plan. The previewing itself is the engine an execution create's
+/// reply uses too ([`crate::execution::launch_preview::preview_steps`]).
 fn resolve_launch_nodes(
     recipe: &RecipeSnapshot,
     overrides: &LaunchOverrides,
@@ -1033,10 +1007,11 @@ fn resolve_launch_nodes(
         })
         .collect();
 
-    // First pass: every node on its own.
-    let mut first: HashMap<String, Result<NodePreview, String>> = HashMap::new();
+    let mut agents: HashMap<String, config_agents::FileAgent> = HashMap::new();
+    let mut failed: HashMap<String, String> = HashMap::new();
+    let mut steps = Vec::new();
     for (node, agent_id) in &agent_nodes {
-        let preview = match load_agent(agent_id) {
+        match load_agent(agent_id) {
             Ok(Some(agent)) => {
                 let node_models = node.agent_config.as_ref().and_then(|c| c.models.clone());
                 let (allotment, pin) = match overrides.nodes.get(&node.id) {
@@ -1053,115 +1028,65 @@ fn resolve_launch_nodes(
                         None,
                     ),
                 };
-                let record = match &pin {
-                    Some(pin) => serves_session(pin)
-                        .map_err(|why| format!("{}: {why}", model_ref(pin)))
-                        .and_then(|()| {
-                            select(
-                                &[AllotmentEntry::Model(pin.clone())],
-                                &ResolvedConstraints::default(),
-                            )
-                        }),
-                    None => select(&allotment, &ResolvedConstraints::default()),
-                };
-                Ok(NodePreview {
-                    agent,
+                steps.push(crate::execution::launch_preview::StepInput {
+                    node_id: node.id.clone(),
+                    agent_id: Some(agent_id.clone()),
                     allotment,
                     pin,
-                    record,
-                })
+                    stored: None,
+                });
+                agents.insert(node.id.clone(), agent);
             }
-            Ok(None) => Err(format!("Agent config not found: {agent_id}")),
-            Err(e) => Err(format!("Failed to load agent '{agent_id}': {e}")),
-        };
-        first.insert(node.id.clone(), preview);
+            Ok(None) => {
+                failed.insert(
+                    node.id.clone(),
+                    format!("Agent config not found: {agent_id}"),
+                );
+            }
+            Err(e) => {
+                failed.insert(
+                    node.id.clone(),
+                    format!("Failed to load agent '{agent_id}': {e}"),
+                );
+            }
+        }
     }
-
-    let name_of = |id: &str| {
-        recipe
-            .nodes
-            .iter()
-            .find(|node| node.id == id)
-            .map_or_else(|| id.to_string(), |node| node.name.clone())
-    };
-    let picks: HashMap<String, SelectionRecord> = first
-        .iter()
-        .filter_map(|(id, preview)| {
-            let record = preview.as_ref().ok()?.record.as_ref().ok()?;
-            Some((id.clone(), record.clone()))
-        })
-        .collect();
-    let picked = |id: &str| picks.get(id).cloned();
+    let mut previews: HashMap<String, crate::execution::launch_preview::StepPreview> =
+        crate::execution::launch_preview::preview_steps(recipe, &steps, select, serves_session)
+            .into_iter()
+            .map(|preview| (preview.node_id.clone(), preview))
+            .collect();
 
     let mut nodes = Vec::new();
     for (node, agent_id) in &agent_nodes {
-        let preview = match first.remove(&node.id) {
-            Some(Ok(preview)) => preview,
-            failed => {
-                let error = match failed {
-                    Some(Err(error)) => error,
-                    _ => format!("Agent config not found: {agent_id}"),
-                };
-                nodes.push(ResolvedLaunchNode {
-                    node_id: node.id.clone(),
-                    agent_id: agent_id.clone(),
-                    agent_name: agent_id.clone(),
-                    prompt_present: false,
-                    resolved: None,
-                    error: Some(error),
-                    available: union(None),
-                });
-                continue;
-            }
+        let (Some(preview), Some(agent)) = (previews.remove(&node.id), agents.remove(&node.id))
+        else {
+            let error = failed
+                .remove(&node.id)
+                .unwrap_or_else(|| format!("Agent config not found: {agent_id}"));
+            nodes.push(ResolvedLaunchNode {
+                node_id: node.id.clone(),
+                agent_id: agent_id.clone(),
+                agent_name: agent_id.clone(),
+                prompt_present: false,
+                resolved: None,
+                error: Some(error),
+                available: union(None),
+            });
+            continue;
         };
-        let NodePreview {
-            agent,
+        let crate::execution::launch_preview::StepPreview {
             allotment,
             pin,
-            record,
+            depends_on,
+            pick,
+            ..
         } = preview;
-
-        // Second pass: a constrained node reads its upstream's predicted pick.
-        let constraints = node
-            .agent_config
-            .as_ref()
-            .map(|config| config.constraints.clone())
-            .unwrap_or_default();
-        let mut depends_on = Vec::new();
-        let constraint_error = if pin.is_none() && !constraints.is_empty() {
-            constraint_problem(recipe, node)
-        } else {
-            None
-        };
-        let record = if pin.is_some() || constraints.is_empty() || constraint_error.is_some() {
-            record
-        } else {
-            let mut resolved = ResolvedConstraints::default();
-            for (slot, reference) in [
-                (&mut resolved.same_band_as, &constraints.same_band_as),
-                (
-                    &mut resolved.different_maker_from,
-                    &constraints.different_maker_from,
-                ),
-            ] {
-                if let Some(reference) = reference {
-                    let name = name_of(reference);
-                    if !depends_on.contains(&name) {
-                        depends_on.push(name.clone());
-                    }
-                    // The provenance names the upstream node as the recipe
-                    // shows it, not by its id.
-                    *slot = picked(reference).map(|record| (name, record));
-                }
-            }
-            select(&allotment, &resolved)
-        };
-
-        let row = match (constraint_error, record, &pin) {
-            (Some(error), _, _) => Err(error),
-            (None, Ok(record), _) => Ok(record),
-            (None, Err(_), Some(pin)) if serves_session(pin).is_ok() => Err(String::new()),
-            (None, Err(error), _) => Err(error),
+        use crate::execution::launch_preview::StepPick;
+        let row = match pick {
+            Ok(StepPick::Predicted(record) | StepPick::Chosen(record)) => Ok(record),
+            Ok(StepPick::PinnedUnplaced) => Err(String::new()),
+            Err(error) => Err(error),
         };
         let (resolved, error) = match (row, pin) {
             (Ok(record), pin) => {
@@ -1661,7 +1586,10 @@ pub(crate) async fn resolve_filed_recipe_id(
     )))
 }
 
-async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
+pub(crate) async fn project_repo_path(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Option<String>, String> {
     let project_id = project_id.to_string();
     db.query_text(
         "SELECT repo_path FROM projects WHERE id = ?1",

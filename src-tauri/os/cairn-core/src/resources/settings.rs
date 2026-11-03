@@ -45,6 +45,11 @@ fn model_defaults(settings: &crate::models::Settings) -> String {
                 crate::orchestrator::embed::default_embedding_selection()
             ),
         ),
+        line(
+            "defaultRecipe",
+            settings.default_recipe.as_deref(),
+            "an execution naming no recipe is refused".into(),
+        ),
     ]
     .concat()
 }
