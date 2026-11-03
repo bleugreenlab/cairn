@@ -267,6 +267,29 @@ async fn list_pending_for_job_async(
     .map_err(|error| format!("Failed to list queued messages: {error}"))
 }
 
+/// One of a job's operator messages by id, pending or delivered; `None` only
+/// when the job holds no row with that id.
+///
+/// This is how a client whose enqueue response was lost learns whether the
+/// write happened. The composer's request id is the row id, and a claim stamps
+/// `delivered_at` rather than removing the row, so presence here is the durable
+/// truth of that send for its whole life. Scoped to the job so an id cannot
+/// read another job's message.
+pub async fn find_for_job_async(
+    db: &LocalDb,
+    job_id: &str,
+    id: &str,
+) -> Result<Option<QueuedMessage>, String> {
+    db.query_all(
+        format!("SELECT {SELECT_COLUMNS} FROM queued_messages WHERE id = ?1 AND job_id = ?2"),
+        params![id.to_string(), job_id.to_string()],
+        message_from_row,
+    )
+    .await
+    .map(|rows| rows.into_iter().next())
+    .map_err(|error| format!("Failed to read queued message: {error}"))
+}
+
 /// Edit a pending queued message in place. Delivered rows are left untouched.
 pub fn update_content(db: &LocalDb, id: &str, content: &str) -> Result<bool, String> {
     let id = id.to_string();
@@ -616,6 +639,37 @@ mod tests {
         assert_eq!(retry.id, first.id);
         let pending = list_pending_for_job_async(&db, "job-a").await.unwrap();
         assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_reports_a_request_row_pending_or_delivered_and_only_for_its_job() {
+        let db = migrated_db().await;
+        assert!(find_for_job_async(&db, "job-a", "request-1")
+            .await
+            .unwrap()
+            .is_none());
+
+        enqueue_idempotent(&db, "job-a", "hello", Delivery::Queue, "request-1").unwrap();
+        let pending = find_for_job_async(&db, "job-a", "request-1")
+            .await
+            .unwrap()
+            .expect("the enqueued row is found by its request id");
+        assert_eq!(pending.delivered_at, None);
+
+        claim_all_for_job_async(&db, "job-a").await.unwrap();
+        let delivered = find_for_job_async(&db, "job-a", "request-1")
+            .await
+            .unwrap()
+            .expect("a delivered row is still the record of the send");
+        assert!(delivered.delivered_at.is_some());
+
+        assert!(
+            find_for_job_async(&db, "job-b", "request-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a request id does not read another job's message"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
