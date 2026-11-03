@@ -1232,16 +1232,17 @@ mod tests {
 
     // ---- Catch-up push creator (CAIRN-1894) ----------------------------------
 
-    /// Insert a chat event carrying `turn_id` on the child issue's run so
-    /// `child_chat_turn_count` sees a distinct turn.
+    /// Insert a `child-job` turn on its run with one chat event, so
+    /// `count_job_chat_turns` sees one more turn. The turn carries its job id as
+    /// every production turn writer stamps it; the count keys on `turns.job_id`.
     async fn add_chat_turn(db: &LocalDb, turn_id: &str, seq: i64) {
         let turn_id = turn_id.to_string();
         db.write(move |conn| {
             let turn_id = turn_id.clone();
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-                     VALUES(?1,'sess2','run-1',?2,'completed',1,1)",
+                    "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+                     VALUES(?1,'sess2','run-1','child-job',?2,'completed',1,1)",
                     params![turn_id.as_str(), seq],
                 )
                 .await?;
@@ -1516,10 +1517,10 @@ mod tests {
                VALUES('task-job','p','issue-1','child-job','explore','running','sess3',1,1);
              INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
                VALUES('run-task','p','task-job','issue-1',1,1);
-             INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-               VALUES('tk1','sess3','run-task',1,'completed',1,1);
-             INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-               VALUES('tk2','sess3','run-task',2,'completed',1,1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('tk1','sess3','run-task','task-job',1,'completed',1,1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('tk2','sess3','run-task','task-job',2,'completed',1,1);
              INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
                VALUES('etk1','run-task','tk1',1,1,'assistant','{}',1);
              INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
@@ -2100,8 +2101,8 @@ mod tests {
               VALUES('{CHILD_JOB}','p','issue-4602','exec-4602','builder','running','sess-child',1,1);
             INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
               VALUES('run-4602','p','{CHILD_JOB}','issue-4602',1,1);
-            INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-              VALUES('turn-4602','sess-child','run-4602',1,'completed',1,1);
+            INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+              VALUES('turn-4602','sess-child','run-4602','{CHILD_JOB}',1,'completed',1,1);
             INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
               VALUES('ev-4602','run-4602','turn-4602',1,1,'assistant','{{}}',1);
             "
@@ -2207,8 +2208,8 @@ mod tests {
             let data = data.clone();
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-                     VALUES(?1,'sess2','run-1',?2,'completed',1,1)",
+                    "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+                     VALUES(?1,'sess2','run-1','child-job',?2,'completed',1,1)",
                     params![turn_id.as_str(), seq],
                 )
                 .await?;
@@ -2289,10 +2290,10 @@ mod tests {
                VALUES('task-job','p','issue-1','child-job','explore','running','sess3',1,1);
              INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
                VALUES('run-task','p','task-job','issue-1',1,1);
-             INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-               VALUES('tk1','sess3','run-task',1,'completed',1,1);
-             INSERT INTO turns(id, session_id, run_id, sequence, state, created_at, updated_at)
-               VALUES('tk2','sess3','run-task',2,'completed',1,1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('tk1','sess3','run-task','task-job',1,'completed',1,1);
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+               VALUES('tk2','sess3','run-task','task-job',2,'completed',1,1);
              INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
                VALUES('etk1','run-task','tk1',1,1,'assistant','{}',1);
              INSERT INTO events(id, run_id, turn_id, sequence, timestamp, event_type, data, created_at)
