@@ -146,11 +146,16 @@ pub(crate) fn lint_baseline(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &contract.contract.extra_inputs, &snapshot);
+    // The base's row was recorded by whichever cadence ran it, against a change
+    // this lookup does not know. A base-subtracting check is not base-relative
+    // (its base enters through this transport, not its key), so its key never
+    // reads the change and the lookup can name it.
     transport.input_hash = check_input_hash(
         check,
         inputs.for_check(check_name),
         entries.as_deref(),
         &transport.tree,
+        crate::execution::checks::CheckChange::unknown(check_name),
     );
     match crate::execution::cache::latest_lint_tree_findings(
         db,

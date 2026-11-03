@@ -6804,6 +6804,13 @@ pub struct LearnedResourceEstimate {
 /// reads as one from cache, and the runner derives from the latest load, so
 /// a pull still stops governing once one later load has run. An older runner
 /// ignores the field. The build-hash rollout delivers it.
+///
+/// cairn/5993 does not move the number. A starting executor names the step it
+/// is waiting on and, past a bound without a runner, writes it to its own log;
+/// a resident daemon whose log cannot be opened exits non-zero. Both are local
+/// to the executor's process and its log. No frame, variant or field changes,
+/// Hello is sent exactly as before, and a runner talking to an older executor
+/// gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above

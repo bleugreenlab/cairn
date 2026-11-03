@@ -157,6 +157,7 @@ fn manual_check_plan(
     tree_hash: &str,
     check_name: &str,
     repo_root: &Path,
+    basis: ChangeBasis<'_>,
 ) -> Result<(CheckPlan, String), String> {
     let check = checks
         .get(check_name)
@@ -178,6 +179,10 @@ fn manual_check_plan(
         tree_hash,
         &check_platform_identity(),
         check_toolchain_identity(),
+        CheckChange {
+            name: check_name,
+            basis,
+        },
     );
     Ok((plan, key))
 }
@@ -280,9 +285,8 @@ pub(crate) fn check_transport_env(
     changed: &[GraphFileChange],
     base_content: Option<String>,
 ) -> Vec<(String, String)> {
-    let changed_body = changed
-        .iter()
-        .map(|change| change.path.as_str())
+    let changed_body = transport_paths(changed)
+        .into_iter()
         .collect::<Vec<_>>()
         .join("\n");
     let mut env = vec![(CHANGED_FILES_CONTENT_ENV.to_string(), changed_body)];
@@ -290,6 +294,23 @@ pub(crate) fn check_transport_env(
         env.push((BASE_CONTENT_CONTENT_ENV.to_string(), base_content));
     }
     env
+}
+
+/// Every path a change set names, sorted and unique: what the changed-file
+/// transport carries, and what a base-relative key folds ([`change_identity`]).
+///
+/// A rename names its destination AND its source. A check judging what the
+/// change added needs the new path, and one judging what it removed needs the
+/// old: the diff from a fork point reports a rename only when the source
+/// existed at the base, so that source is a file the change deleted.
+pub(crate) fn transport_paths(changed: &[GraphFileChange]) -> BTreeSet<&str> {
+    changed
+        .iter()
+        .flat_map(|change| {
+            std::iter::once(change.path.as_str()).chain(change.previous_path.as_deref())
+        })
+        .filter(|path| !path.is_empty())
+        .collect()
 }
 
 /// Every `*_CONTENT` transport a check batch may carry, paired with the
@@ -1042,9 +1063,10 @@ pub(crate) struct CheckContractSnapshot {
     pub(crate) context: ManualCheckCacheContext,
     sealed_coordinate: crate::execution::cache::SealedCheckCoordinate,
     repository_path: String,
-    /// The branch whose fork point with the sealed head is this run's base. See
-    /// [`manual_attribution_target`].
-    attribution_target: String,
+    /// What the sealed head changed since its fork point with the run's
+    /// attribution target ([`manual_attribution_target`]). The key above names
+    /// it for a base-relative check, and the transport is built from it.
+    change: BaseRelativeChange,
     /// The commit whose `.cairn/config.yaml` declared the requested check. An
     /// explicitly requested branch supplies both the definition and the content,
     /// so a manual check on one branch can never run another branch's definition.
@@ -1352,6 +1374,21 @@ pub(crate) async fn resolve_check_contract_at_commit(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+    let change = resolve_base_relative_change(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        &repository,
+        &commit,
+        &attribution_target,
+        check_name,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Manual-check planning infrastructure failure: could not compute the base-relative \
+             inputs {check_name} runs against: {error}"
+        )
+    })?;
     let (mut plan, input_hash) = manual_check_plan(
         &checks,
         &inputs,
@@ -1359,6 +1396,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         &tree_hash,
         check_name,
         &repository,
+        change.basis(),
     )?;
     // Reuse answers only what this request may count: the narrowed platforms,
     // and for a named machine, that machine's own observations.
@@ -1391,7 +1429,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
         },
         sealed_coordinate,
         repository_path,
-        attribution_target,
+        change,
         defined_by_commit,
         configured_check,
         placement,
@@ -1414,6 +1452,7 @@ pub(crate) async fn resolve_check_contract_at_commit(
 /// With `baseline_store` (the store and project the run records into), a check
 /// judged against its base's findings also carries that base's recorded set
 /// ([`crate::execution::lint_baseline`]).
+#[cfg(test)]
 async fn base_relative_transport(
     jj_binary_path: &str,
     config_dir: &Path,
@@ -1423,6 +1462,72 @@ async fn base_relative_transport(
     check_name: &str,
     baseline_store: Option<(Arc<LocalDb>, String)>,
 ) -> Result<Vec<(String, String)>, String> {
+    let change = resolve_base_relative_change(
+        jj_binary_path,
+        config_dir,
+        project_repository,
+        head,
+        target,
+        check_name,
+    )
+    .await?;
+    let check_name = check_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        base_relative_transport_for(&change, &check_name, baseline_store)
+    })
+    .await
+    .map_err(|error| format!("manual check transport task failed: {error}"))?
+}
+
+/// The change a run of `head` is measured against: everything it changed since
+/// its fork point with an integration target. Resolved once, before the run is
+/// keyed, so the key a base-relative check is looked up under and the transport
+/// its command reads come from the same diff.
+#[derive(Clone)]
+pub(crate) struct BaseRelativeChange {
+    jj: JjEnv,
+    /// The logical repository `base` and `head` resolve in.
+    repository: PathBuf,
+    /// The object database the base's checks contract is read from.
+    object_repository: PathBuf,
+    base: String,
+    head: String,
+    target: String,
+    changed: Vec<GraphFileChange>,
+    /// The base tree's listing, read only for a check Cairn ships base content
+    /// to, whose key names the base blobs that content came from.
+    base_entries: Option<Vec<(String, String)>>,
+}
+
+impl std::fmt::Debug for BaseRelativeChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseRelativeChange")
+            .field("repository", &self.repository)
+            .field("base", &self.base)
+            .field("head", &self.head)
+            .field("target", &self.target)
+            .field("changed", &self.changed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BaseRelativeChange {
+    fn basis(&self) -> ChangeBasis<'_> {
+        ChangeBasis::Against {
+            changed: &self.changed,
+            base_entries: self.base_entries.as_deref(),
+        }
+    }
+}
+
+async fn resolve_base_relative_change(
+    jj_binary_path: &str,
+    config_dir: &Path,
+    project_repository: &Path,
+    head: &str,
+    target: &str,
+    check_name: &str,
+) -> Result<BaseRelativeChange, String> {
     let jj = crate::jj::environment(jj_binary_path, config_dir);
     let repository = {
         let jj = jj.clone();
@@ -1441,39 +1546,74 @@ async fn base_relative_transport(
         })?
         .base;
     let head = head.to_string();
-    let carries_protocol_base = needs_executor_base_content(check_name);
-    let check_name = check_name.to_string();
+    let names_base_blobs = needs_executor_base_content(check_name);
     let target = target.to_string();
     let object_repository = project_repository.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let changed = logical_changed_files(&jj, &repository, &base, &head).map_err(|error| {
             format!("the changed files of {base}..{head} could not be read: {error}")
         })?;
-        let base_content = carries_protocol_base
-            .then(|| executor_base_content_bundle(&jj, &repository, &base, &changed))
+        let base_entries = names_base_blobs
+            .then(|| tree_entries(&jj, &repository, &base))
             .transpose()
-            .map_err(|error| format!("executor protocol base content from {base}: {error}"))?;
-        let mut env = check_transport_env(&changed, base_content);
-        if let Some((db, project_id)) = baseline_store {
-            let source = crate::execution::lint_baseline::LintBaselineSource {
-                jj: &jj,
-                object_repository: &object_repository,
-                repository: &repository,
-                base: &base,
-                head: &head,
-                base_label: Some(&target),
-            };
-            env.extend(crate::execution::lint_baseline::lint_baseline_env(
-                &source,
-                db,
-                &project_id,
-                [check_name.as_str()],
-            ));
-        }
-        Ok(env)
+            .map_err(|error| format!("the tree of base {base} could not be read: {error}"))?;
+        Ok(BaseRelativeChange {
+            jj,
+            repository,
+            object_repository,
+            base,
+            head,
+            target,
+            changed,
+            base_entries,
+        })
     })
     .await
-    .map_err(|error| format!("manual check transport task failed: {error}"))?
+    .map_err(|error| format!("manual check change task failed: {error}"))?
+}
+
+/// The transport a run of one check ships for `change`: its changed files, and
+/// the executor-protocol base bundle or the lint baseline when the check is
+/// one that receives it.
+///
+/// Synchronous: it reads the object database and the store.
+fn base_relative_transport_for(
+    change: &BaseRelativeChange,
+    check_name: &str,
+    baseline_store: Option<(Arc<LocalDb>, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let BaseRelativeChange {
+        jj,
+        repository,
+        object_repository,
+        base,
+        head,
+        target,
+        changed,
+        ..
+    } = change;
+    let base_content = needs_executor_base_content(check_name)
+        .then(|| executor_base_content_bundle(jj, repository, base, changed))
+        .transpose()
+        .map_err(|error| format!("executor protocol base content from {base}: {error}"))?;
+    let mut env = check_transport_env(changed, base_content);
+    if let Some((db, project_id)) = baseline_store {
+        let source = crate::execution::lint_baseline::LintBaselineSource {
+            jj,
+            object_repository,
+            repository,
+            base,
+            head,
+            base_label: Some(target),
+        };
+        env.extend(crate::execution::lint_baseline::lint_baseline_env(
+            &source,
+            db,
+            &project_id,
+            [check_name],
+        ));
+    }
+    Ok(env)
 }
 
 /// The one item a manual run submits, less the per-attempt command and stream.
@@ -1881,16 +2021,15 @@ pub(crate) async fn execute_check_contract(
     let repository_path = contract.repository_path;
     let repository = PathBuf::from(&repository_path);
     let plan = contract.plan;
-    let transport_env = base_relative_transport(
-        &orch.jj_binary_path,
-        &orch.config_dir,
-        &repository,
-        &context.commit_sha,
-        &contract.attribution_target,
-        check_name,
-        Some((db.clone(), context.project_id.clone())),
-    )
-    .await
+    let transport_env = {
+        let change = contract.change;
+        let name = check_name.to_string();
+        let store = Some((db.clone(), context.project_id.clone()));
+        tokio::task::spawn_blocking(move || base_relative_transport_for(&change, &name, store))
+            .await
+            .map_err(|error| format!("manual check transport task failed: {error}"))
+            .and_then(|transport| transport)
+    }
     .map_err(|error| {
         format!(
             "Manual-check planning infrastructure failure: could not compute the base-relative \
@@ -2297,6 +2436,11 @@ fn fix_is_attributed_to_declared_fixers(paths: &[String], fixers: &[&InputSelect
 /// `fix_landed_on_tested_base` is false when the branch advanced while the wave
 /// ran and the fix was merged onto the newer head. The fixed commit then carries
 /// code no check in the wave executed, so only an unchanged input key carries.
+///
+/// The ordering proof covers the TREE only. A base-relative check ran after the
+/// fixers but was handed the change of the commit the wave was planned at, so
+/// it carries across a fold only when its key, which names that change, did
+/// not move.
 fn verdict_survives_fix(
     fix_landed_on_tested_base: bool,
     executed: bool,
@@ -2304,9 +2448,14 @@ fn verdict_survives_fix(
     superseded_by_later_fixer: bool,
     key_before: &str,
     key_after: &str,
+    base_relative: bool,
 ) -> bool {
     key_before == key_after
-        || (fix_landed_on_tested_base && fix_attributed && executed && !superseded_by_later_fixer)
+        || (!base_relative
+            && fix_landed_on_tested_base
+            && fix_attributed
+            && executed
+            && !superseded_by_later_fixer)
 }
 
 /// The submitted plan indices whose declared fix a LATER declared fixer could
@@ -4600,31 +4749,24 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
         return None;
     }
     let tree_hash = logical_tree_hash(&jj, &repository, &head).ok()?;
-    let base_content = if plans
-        .iter()
-        .any(|plan| needs_executor_base_content(&plan.name))
-    {
-        match executor_base_content_bundle(&jj, &repository, &base, &changed) {
-            Ok(content) => Some(content),
-            Err(error) => return Some(Err(error)),
-        }
-    } else {
-        None
+    let wave_change = WaveChange {
+        jj: &jj,
+        repository: &repository,
+        object_repository: &object_repository,
+        base: &base,
+        head: &head,
+        changed: &changed,
     };
-    let mut transport = check_transport_env(&changed, base_content);
-    transport.extend(crate::execution::lint_baseline::lint_baseline_env(
-        &crate::execution::lint_baseline::LintBaselineSource {
-            jj: &jj,
-            object_repository: &object_repository,
-            repository: &repository,
-            base: &base,
-            head: &head,
-            base_label: None,
-        },
-        db.clone(),
-        &project_id,
-        plans.iter().map(|plan| plan.name.as_str()),
-    ));
+    let planned: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
+    let transport = match write_wave_transport(&wave_change, &planned, db.clone(), &project_id) {
+        Ok(transport) => transport,
+        Err(error) => return Some(Err(error)),
+    };
+    let base_entries = key_base_entries(&checks, &jj, &repository, &base);
+    let basis = ChangeBasis::Against {
+        changed: &changed,
+        base_entries: base_entries.as_deref(),
+    };
     // The narrowing baseline is this JOB's last green run of each check, not the
     // project's most recent row of any status. Both qualifiers carry weight: a
     // sibling branch's tree is not an anchor on this branch's lineage, and a red
@@ -4642,7 +4784,16 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
                 .get(&plan.name)
                 .expect("planned check must retain its configured definition");
             let selector = inputs.for_check(&plan.name);
-            let input_hash = check_input_hash(check, selector, entries.as_deref(), &tree_hash);
+            let input_hash = check_input_hash(
+                check,
+                selector,
+                entries.as_deref(),
+                &tree_hash,
+                CheckChange {
+                    name: &plan.name,
+                    basis,
+                },
+            );
             let should_reselect =
                 get_check_result(db.clone(), &project_id, &plan.name, &input_hash)
                     .ok()
@@ -4672,6 +4823,60 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
         sealed_commit: head,
         transport,
     }))
+}
+
+/// Where a write wave's change is read: `changed` is everything `head` changed
+/// since `base`, both resolved in the logical `repository`.
+struct WaveChange<'a> {
+    jj: &'a JjEnv,
+    repository: &'a Path,
+    /// The object database the base's checks contract is read from.
+    object_repository: &'a Path,
+    base: &'a str,
+    head: &'a str,
+    changed: &'a [GraphFileChange],
+}
+
+/// The transport the write-cadence checks of `change.head` receive: its
+/// changed files, the executor-protocol base bundle when a planned check is
+/// shipped one, and the lint baseline when one subtracts its base.
+///
+/// It describes the commit the checks run at and no other. A wave whose fix
+/// lands on a head that moved while it ran verifies at that newer head, so it
+/// builds this again there: the change of the commit it was planned at omits
+/// whatever the newer head added, and a check judging additions would read
+/// those as files the change never touched.
+fn write_wave_transport(
+    change: &WaveChange<'_>,
+    planned: &[&str],
+    db: Arc<LocalDb>,
+    project_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let base_content = if planned.iter().any(|name| needs_executor_base_content(name)) {
+        Some(executor_base_content_bundle(
+            change.jj,
+            change.repository,
+            change.base,
+            change.changed,
+        )?)
+    } else {
+        None
+    };
+    let mut transport = check_transport_env(change.changed, base_content);
+    transport.extend(crate::execution::lint_baseline::lint_baseline_env(
+        &crate::execution::lint_baseline::LintBaselineSource {
+            jj: change.jj,
+            object_repository: change.object_repository,
+            repository: change.repository,
+            base: change.base,
+            head: change.head,
+            base_label: None,
+        },
+        db,
+        project_id,
+        planned.iter().copied(),
+    ));
+    Ok(transport)
 }
 
 /// Give every substrate failure in a settled batch the time its request was
@@ -7298,7 +7503,7 @@ async fn run_write_checks_after_seal_inner(
         })
         .collect();
     let cell_env = slot_check_env(jj.shell_env());
-    let process_env = write_check_transport_env(&cell_env, transport);
+    let mut process_env = write_check_transport_env(&cell_env, transport);
     // Reuse follows the suite's declared trust set, not the environment of the
     // executor that a miss may eventually select. Filter hits before placement so
     // a stored verdict consumes no build-slot capacity.
@@ -7549,6 +7754,9 @@ async fn run_write_checks_after_seal_inner(
         }
         keyed = rekeyed.keyed;
         tree_hash = rekeyed.tree_hash;
+        // Every lane from here on (the spilled ones, an uncached retry) runs at
+        // the fixed commit, so it carries that commit's change.
+        process_env = rekeyed.process_env;
         batched_results.extend(rekeyed.results);
         fixed = Some(published);
     }
@@ -7975,12 +8183,149 @@ struct FixedWave {
     results: HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>,
     /// Set when re-verification dirtied the tree AGAIN. Never folded.
     non_convergent: Option<crate::fleet::MutationDelta>,
+    /// Each check process's environment at the fixed commit: the slot's, plus
+    /// the transport of the fixed commit's own change.
+    process_env: Vec<(String, String)>,
 }
 
 /// What re-planning a wave against the fixed commit yields: every plan paired
 /// with its re-derived result key, the indices whose verdict the fix invalidated,
-/// and the fixed commit's tree hash.
-type Replan = (Vec<(CheckPlan, String)>, Vec<usize>, String);
+/// the fixed commit's tree hash, and its transport.
+type Replan = (
+    Vec<(CheckPlan, String)>,
+    Vec<usize>,
+    String,
+    Vec<(String, String)>,
+);
+
+/// Everything re-planning a wave onto the commit its fix landed reads.
+struct FixReplanning {
+    jj: JjEnv,
+    repository: PathBuf,
+    object_repository: PathBuf,
+    base: String,
+    /// The commit the fix was published as.
+    head: String,
+    checks: HashMap<String, CheckCommand>,
+    extra_inputs: HashMap<String, Vec<String>>,
+    plans: Vec<CheckPlan>,
+    keys_before: Vec<String>,
+    executed: BTreeSet<usize>,
+    superseded: BTreeSet<usize>,
+    fixer_names: Vec<String>,
+    fixed_paths: Vec<String>,
+    fix_landed_on_tested_base: bool,
+    db: Arc<LocalDb>,
+    project_id: String,
+}
+
+/// Re-key every plan of a wave onto its fixed commit, name the ones the fix
+/// invalidated, and build the transport that commit's lanes carry.
+///
+/// Synchronous: VCS inspection and the store wait on subprocesses and joined
+/// threads, so the caller runs it on the blocking pool.
+fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String> {
+    let FixReplanning {
+        jj,
+        repository,
+        object_repository,
+        base,
+        head,
+        checks,
+        extra_inputs,
+        plans,
+        keys_before,
+        executed,
+        superseded,
+        fixer_names,
+        fixed_paths,
+        fix_landed_on_tested_base,
+        db,
+        project_id,
+    } = planning;
+    let tree_hash = logical_tree_hash(&jj, &repository, &head)?;
+    let entries = if any_check_declares_inputs(checks.values()) {
+        tree_entries(&jj, &repository, &head).ok()
+    } else {
+        None
+    };
+    let blobs = TreeBlobs {
+        jj: &jj,
+        repository: &repository,
+    };
+    let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+    let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+    // Attribution is a property of the whole wave: the fix is the slot's
+    // combined delta, so the question is whether the declared fixers that ran
+    // can account for every path in it. It is asked against the FIXED tree's
+    // inputs, which is the tree the verdicts are being keyed to.
+    let fixers: Vec<&InputSelector> = fixer_names
+        .iter()
+        .map(|name| inputs.for_check(name))
+        .collect();
+    let attributed = fix_is_attributed_to_declared_fixers(&fixed_paths, &fixers);
+    // The fixed commit's own change. When the fix landed on a head that moved
+    // while the wave ran, it differs from the change the wave was planned with,
+    // and every key and lane from here on is about it.
+    let changed = logical_changed_files(&jj, &repository, &base, &head)
+        .map_err(|error| format!("the changed files of {base}..{head} are unreadable: {error}"))?;
+    let base_entries = key_base_entries(&checks, &jj, &repository, &base);
+    let basis = ChangeBasis::Against {
+        changed: &changed,
+        base_entries: base_entries.as_deref(),
+    };
+    let planned: Vec<&str> = plans.iter().map(|plan| plan.name.as_str()).collect();
+    let transport = write_wave_transport(
+        &WaveChange {
+            jj: &jj,
+            repository: &repository,
+            object_repository: &object_repository,
+            base: &base,
+            head: &head,
+            changed: &changed,
+        },
+        &planned,
+        db,
+        &project_id,
+    )?;
+    let mut rekeyed = Vec::with_capacity(plans.len());
+    let mut invalidated = Vec::new();
+    for (index, plan) in plans.into_iter().enumerate() {
+        let check = checks
+            .get(&plan.name)
+            .expect("planned check must retain its configured definition");
+        let key_after = check_input_hash(
+            check,
+            inputs.for_check(&plan.name),
+            entries.as_deref(),
+            &tree_hash,
+            CheckChange {
+                name: &plan.name,
+                basis,
+            },
+        );
+        if verdict_survives_fix(
+            fix_landed_on_tested_base,
+            executed.contains(&index),
+            attributed,
+            superseded.contains(&index),
+            &keys_before[index],
+            &key_after,
+            is_base_relative(&plan.name, check),
+        ) {
+            rekeyed.push((plan, key_after));
+            continue;
+        }
+        // The fix changed this check's inputs and nothing proves it saw them.
+        // Re-plan against the fixed commit so a `{changedFiles}` selector
+        // covers the fixed paths too, then run it once.
+        let replanned = replan_one_check(&plan.name, check, &inputs, &changed, &repository)
+            .unwrap_or_else(|| plan.clone());
+        invalidated.push(index);
+        rekeyed.push((replanned, key_after));
+    }
+    Ok((rekeyed, invalidated, tree_hash, transport))
+}
 
 /// Re-key a wave onto the commit its fix landed, re-verifying exactly the checks
 /// whose verdict the fix invalidated.
@@ -8031,81 +8376,30 @@ async fn rekey_wave_onto_fix(
         .map(|index| wave.keyed[*index].0.name.clone())
         .filter(|name| wave.checks.get(name).is_some_and(|check| check.fixes))
         .collect();
-    let fixed_paths = fixed_paths.to_vec();
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let repository = logical.repository_path.clone();
     let head = fixed_commit.to_string();
-    let base = live_base.unwrap_or(logical.default_commit_id);
-    let planning_head = head.clone();
-    let planning_repository = repository.clone();
-
-    let (rekeyed, invalidated, tree_hash) =
-        tokio::task::spawn_blocking(move || -> Result<Replan, String> {
-            let tree_hash = logical_tree_hash(&jj, &planning_repository, &planning_head)?;
-            let entries = if any_check_declares_inputs(checks.values()) {
-                tree_entries(&jj, &planning_repository, &planning_head).ok()
-            } else {
-                None
-            };
-            let blobs = TreeBlobs {
-                jj: &jj,
-                repository: &planning_repository,
-            };
-            let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
-            let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-            // Attribution is a property of the whole wave: the fix is the slot's
-            // combined delta, so the question is whether the declared fixers that
-            // ran can account for every path in it. It is asked against the FIXED
-            // tree's inputs, which is the tree the verdicts are being keyed to.
-            let fixers: Vec<&InputSelector> = fixer_names
-                .iter()
-                .map(|name| inputs.for_check(name))
-                .collect();
-            let attributed = fix_is_attributed_to_declared_fixers(&fixed_paths, &fixers);
-            let changed = logical_changed_files(&jj, &planning_repository, &base, &planning_head)
-                .inspect_err(|error| {
-                    log::warn!(
-                        "fixer rekey: changed files of {base}..{planning_head} unreadable; \
-                         rekeying against an empty change set: {error}"
-                    );
-                })
-                .unwrap_or_default();
-            let mut rekeyed = Vec::with_capacity(plans.len());
-            let mut invalidated = Vec::new();
-            for (index, plan) in plans.into_iter().enumerate() {
-                let check = checks
-                    .get(&plan.name)
-                    .expect("planned check must retain its configured definition");
-                let key_after = check_input_hash(
-                    check,
-                    inputs.for_check(&plan.name),
-                    entries.as_deref(),
-                    &tree_hash,
-                );
-                if verdict_survives_fix(
-                    fix_landed_on_tested_base,
-                    executed.contains(&index),
-                    attributed,
-                    superseded.contains(&index),
-                    &keys_before[index],
-                    &key_after,
-                ) {
-                    rekeyed.push((plan, key_after));
-                    continue;
-                }
-                // The fix changed this check's inputs and nothing proves it saw
-                // them. Re-plan against the fixed commit so a `{changedFiles}`
-                // selector covers the fixed paths too, then run it once.
-                let replanned =
-                    replan_one_check(&plan.name, check, &inputs, &changed, &planning_repository)
-                        .unwrap_or_else(|| plan.clone());
-                invalidated.push(index);
-                rekeyed.push((replanned, key_after));
-            }
-            Ok((rekeyed, invalidated, tree_hash))
-        })
-        .await
-        .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
+    let planning = FixReplanning {
+        jj: crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        repository: logical.repository_path.clone(),
+        object_repository: logical.object_repository_path.clone(),
+        base: live_base.unwrap_or(logical.default_commit_id),
+        head: head.clone(),
+        checks,
+        extra_inputs,
+        plans,
+        keys_before,
+        executed,
+        superseded,
+        fixer_names,
+        fixed_paths: fixed_paths.to_vec(),
+        fix_landed_on_tested_base,
+        db: orch.db.local.clone(),
+        project_id: wave.run_context.project_id.clone(),
+    };
+    let (rekeyed, invalidated, tree_hash, transport) =
+        tokio::task::spawn_blocking(move || replan_onto_fix(planning))
+            .await
+            .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
+    let process_env = write_check_transport_env(wave.cell_env, transport);
 
     // An invalidated verdict may still be answerable from the cache on the FIXED
     // tree; only a genuine miss needs the slot. A deferred lane is never
@@ -8120,7 +8414,7 @@ async fn rekey_wave_onto_fix(
                 &wave.run_context.project_id,
                 &rekeyed[*index].0,
                 &rekeyed[*index].1,
-                wave.process_env,
+                &process_env,
             )
         })
         .collect();
@@ -8130,6 +8424,7 @@ async fn rekey_wave_onto_fix(
             tree_hash,
             results: HashMap::new(),
             non_convergent: None,
+            process_env,
         });
     }
     log::info!(
@@ -8146,6 +8441,7 @@ async fn rekey_wave_onto_fix(
             keyed: &rekeyed,
             order: &fixer_first_submission_order(&rekeyed, wave.checks, &misses),
             sealed_commit: &head,
+            process_env: &process_env,
             ..wave
         },
         MutationPolicy::AllowDelta,
@@ -8156,6 +8452,7 @@ async fn rekey_wave_onto_fix(
         tree_hash,
         results: outcome.results,
         non_convergent: outcome.delta,
+        process_env,
     })
 }
 
@@ -8431,6 +8728,10 @@ fn selected_changed_files_for_miss(
 /// incidental one such as a toolchain bump, discards the baseline and falls back to
 /// the cumulative branch diff. That costs selectivity, never coverage. A false
 /// accept is not reachable, because every contract field is hashed into the key.
+///
+/// A base-relative check's row also keyed the change it was measured against,
+/// which the row does not record, so its key is recomputed against an unknown
+/// change and never matches: such a check always takes the cumulative diff.
 fn baseline_matches_current_contract(
     baseline: &CheckResultCacheEntry,
     baseline_entries: &[(String, String)],
@@ -8446,6 +8747,7 @@ fn baseline_matches_current_contract(
         &baseline.tree_hash,
         platform,
         toolchain,
+        CheckChange::unknown(&baseline.check_name),
     ) == baseline.input_hash
 }
 
@@ -9145,6 +9447,126 @@ fn observation_cadence(tool_use_id: &str) -> &'static str {
     }
 }
 
+/// The change a check's verdict is measured against, as its result key sees it.
+///
+/// Only a base-relative check's key reads it ([`change_identity`]); every other
+/// key ignores it and stays byte for byte what it was.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChangeBasis<'a> {
+    /// Measured against a resolved base.
+    Against {
+        /// Everything that changed since the base: what the transport ships.
+        changed: &'a [GraphFileChange],
+        /// The base tree's listing. Read only for a check Cairn ships base
+        /// content to, whose key names the base blobs that content came from;
+        /// `None` leaves such a check's key unformable.
+        base_entries: Option<&'a [(String, String)]>,
+    },
+    /// No base was resolved, so there is no change to name.
+    Unknown,
+}
+
+/// A configured check, by name, and the change its key is measured against.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckChange<'a> {
+    /// Which transports Cairn ships a check, and so what its key has to name,
+    /// is decided by its configured name ([`needs_executor_base_content`]).
+    pub(crate) name: &'a str,
+    pub(crate) basis: ChangeBasis<'a>,
+}
+
+impl<'a> CheckChange<'a> {
+    pub(crate) fn unknown(name: &'a str) -> Self {
+        Self {
+            name,
+            basis: ChangeBasis::Unknown,
+        }
+    }
+}
+
+/// Whether a check's verdict is a function of the change it is measured
+/// against as well as of its tree: it declares `baseRelative`, or Cairn ships
+/// it base content, which only a base-relative check could want.
+pub(crate) fn is_base_relative(name: &str, check: &CheckCommand) -> bool {
+    check.base_relative || needs_executor_base_content(name)
+}
+
+/// The change component of a base-relative check's result key, or `None` for a
+/// check whose verdict is read off its tree alone.
+///
+/// It names the changed paths the check's own inputs select, as the transport
+/// ships them, and, for a check Cairn ships base content to, the base blob each
+/// bundled path came from. The inputs bound the change for the same reason they
+/// bound the tree: a check depends on what it declares, so an edit elsewhere on
+/// the branch neither moves its key nor costs it a re-run.
+///
+/// A base-relative check whose change cannot be named gets a key no other
+/// evaluation produces. It neither reuses a verdict nor leaves one for another
+/// evaluation to reuse: a verdict measured against an unknown change answers no
+/// question anyone else asks.
+fn change_identity(
+    check: &CheckCommand,
+    selector: &InputSelector,
+    change: CheckChange<'_>,
+) -> Option<String> {
+    if !is_base_relative(change.name, check) {
+        return None;
+    }
+    let unformable = || format!("unformable:{}", uuid::Uuid::new_v4().simple());
+    let ChangeBasis::Against {
+        changed,
+        base_entries,
+    } = change.basis
+    else {
+        return Some(unformable());
+    };
+    let paths: Vec<&str> = transport_paths(changed)
+        .into_iter()
+        .filter(|path| selector.matches(path))
+        .collect();
+    let base_content = if needs_executor_base_content(change.name) {
+        let Some(base_entries) = base_entries else {
+            return Some(unformable());
+        };
+        let blobs: HashMap<&str, &str> = base_entries
+            .iter()
+            .map(|(path, blob)| (path.as_str(), blob.as_str()))
+            .collect();
+        Some(
+            executor_base_content_paths(changed)
+                .into_iter()
+                .map(|path| {
+                    let blob = blobs.get(path.as_str()).map(|blob| blob.to_string());
+                    (path, blob)
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    Some(crate::execution::check_identity::change_fingerprint(
+        &paths,
+        base_content.as_deref(),
+    ))
+}
+
+/// The base tree's listing, when some configured check's key names base blobs
+/// ([`change_identity`]). `None` otherwise, and when the base cannot be listed,
+/// which leaves that check's key unformable rather than wrong.
+pub(crate) fn key_base_entries(
+    checks: &HashMap<String, CheckCommand>,
+    jj: &JjEnv,
+    repository: &Path,
+    base: &str,
+) -> Option<Vec<(String, String)>> {
+    checks
+        .iter()
+        .any(|(name, check)| is_base_relative(name, check) && needs_executor_base_content(name))
+        .then(|| tree_entries(jj, repository, base).ok())
+        .flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn check_command_identity(
     check: &CheckCommand,
     selector: &InputSelector,
@@ -9152,10 +9574,17 @@ fn check_command_identity(
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
+    change: CheckChange<'_>,
 ) -> String {
     let (os, arch) = platform.split_once('-').unwrap_or((platform, "unknown"));
-    let content =
-        crate::execution::check_identity::content_identity(check, selector, entries, tree_hash);
+    let change = change_identity(check, selector, change);
+    let content = crate::execution::check_identity::content_identity(
+        check,
+        selector,
+        entries,
+        tree_hash,
+        change.as_deref(),
+    );
     let environment = crate::execution::check_identity::environment_identity(
         crate::execution::check_identity::CheckEnvironmentInput {
             os: os.to_string(),
@@ -9180,8 +9609,11 @@ pub(crate) fn check_result_key(
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
+    change: CheckChange<'_>,
 ) -> String {
-    check_command_identity(check, selector, entries, tree_hash, platform, toolchain)
+    check_command_identity(
+        check, selector, entries, tree_hash, platform, toolchain, change,
+    )
 }
 
 /// The input hash one configured check is evaluated, reused, and READ under at a
@@ -9200,12 +9632,15 @@ pub(crate) fn check_result_key(
 ///
 /// `entries` must be the sealed tree's listing whenever any configured check
 /// declares inputs (see [`any_check_declares_inputs`]) and may be `None`
-/// otherwise; every caller derives it the same way.
+/// otherwise; every caller derives it the same way. `change` is the change the
+/// evaluation is measured against, which a base-relative check's key names; a
+/// caller that cannot resolve a base says so with [`ChangeBasis::Unknown`].
 pub(crate) fn check_input_hash(
     check: &CheckCommand,
     selector: &InputSelector,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
+    change: CheckChange<'_>,
 ) -> String {
     check_result_key(
         check,
@@ -9214,6 +9649,7 @@ pub(crate) fn check_input_hash(
         tree_hash,
         &check_platform_identity(),
         check_toolchain_identity(),
+        change,
     )
 }
 
@@ -9223,18 +9659,26 @@ pub(crate) fn check_input_hashes(
     inputs: &ResolvedInputs,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
+    basis: ChangeBasis<'_>,
 ) -> HashMap<String, String> {
     checks
         .iter()
         .map(|(name, check)| {
             (
                 name.clone(),
-                check_input_hash(check, inputs.for_check(name), entries, tree_hash),
+                check_input_hash(
+                    check,
+                    inputs.for_check(name),
+                    entries,
+                    tree_hash,
+                    CheckChange { name, basis },
+                ),
             )
         })
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_result_key_for_executed_command(
     check: &CheckCommand,
     command: &str,
@@ -9243,10 +9687,13 @@ fn check_result_key_for_executed_command(
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
+    change: CheckChange<'_>,
 ) -> String {
     let mut executed = check.clone();
     executed.command = command.to_string();
-    check_result_key(&executed, selector, entries, tree_hash, platform, toolchain)
+    check_result_key(
+        &executed, selector, entries, tree_hash, platform, toolchain, change,
+    )
 }
 
 /// A verdict a planned lane may report instead of executing, with the
@@ -11337,6 +11784,7 @@ fn key_review_tree_plans(
     tree_hash: &str,
     platform: &str,
     toolchain: &str,
+    basis: ChangeBasis<'_>,
 ) -> Vec<(CheckPlan, String)> {
     plans
         .into_iter()
@@ -11352,6 +11800,10 @@ fn key_review_tree_plans(
                 tree_hash,
                 platform,
                 toolchain,
+                CheckChange {
+                    name: &plan.name,
+                    basis,
+                },
             );
             (plan, key)
         })
@@ -11460,6 +11912,7 @@ async fn run_prospective_tree_checks(
 
     let platform = check_platform_identity();
     let toolchain = check_toolchain_identity();
+    let base_entries = key_base_entries(&checks, &gate_jj, &gate_repository, base_commit_id);
     let keyed = key_review_tree_plans(
         plans,
         &checks,
@@ -11468,6 +11921,10 @@ async fn run_prospective_tree_checks(
         tree_hash,
         &platform,
         toolchain,
+        ChangeBasis::Against {
+            changed,
+            base_entries: base_entries.as_deref(),
+        },
     );
 
     let attributed_changed = changed;
@@ -13322,6 +13779,7 @@ mod tests {
                 &tree_hash,
                 "sealed",
                 repo,
+                ChangeBasis::Unknown,
             )
             .expect("sealed check is planned from the sealed contract");
             (defined_by_commit, tree_hash, input_hash, plan)
@@ -13492,6 +13950,7 @@ fi
             &tree_hash,
             "selected",
             &repo,
+            ChangeBasis::Unknown,
         )
         .expect("a selector check is runnable manually");
 
@@ -13591,6 +14050,7 @@ fi
             "tree",
             "rust-tests",
             temp.path(),
+            ChangeBasis::Unknown,
         )
         .expect("rust-tests is runnable manually");
         assert_eq!(plan.command, "bun run test:rust:full");
@@ -13605,6 +14065,7 @@ fi
             "tree",
             &check_platform_identity(),
             check_toolchain_identity(),
+            ChangeBasis::Unknown,
         )
         .pop()
         .unwrap();
@@ -13616,6 +14077,7 @@ fi
                 resolved.for_check("rust-tests"),
                 Some(&entries),
                 "tree",
+                CheckChange::unknown("test"),
             ),
             "execution breadth is evidence identity"
         );
@@ -13639,6 +14101,7 @@ fi
             "tree",
             "mixed",
             temp.path(),
+            ChangeBasis::Unknown,
         )
         .expect_err("two selectors have no whole-suite form");
         assert!(error.contains("is unrunnable"), "{error}");
@@ -13663,6 +14126,7 @@ fi
                 "tree",
                 TEST_PLATFORM,
                 TEST_TOOLCHAIN,
+                CheckChange::unknown("test"),
             )
         };
         assert_ne!(key(Some("tool full-a")), key(Some("tool full-b")));
@@ -13691,6 +14155,7 @@ fi
                 "tree",
                 "rust",
                 temp.path(),
+                ChangeBasis::Unknown,
             )
             .expect("a placeholder-free check is runnable manually");
             assert_eq!(plan.command, "cargo test");
@@ -13700,7 +14165,8 @@ fi
                     &configured,
                     resolved.for_check("rust"),
                     Some(&entries),
-                    "tree"
+                    "tree",
+                    CheckChange::unknown("test")
                 ),
                 "impact {impact:?}"
             );
@@ -14104,6 +14570,7 @@ fi
             "whole-tree-a",
             "macos-aarch64",
             "rustc=1;bun=1",
+            CheckChange::unknown("test"),
         );
 
         let mut changed_definition = definition.clone();
@@ -14116,7 +14583,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         changed_definition = definition.clone();
@@ -14129,7 +14597,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         changed_definition = definition.clone();
@@ -14142,7 +14611,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         changed_definition = definition.clone();
@@ -14155,7 +14625,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         changed_definition = definition.clone();
@@ -14175,7 +14646,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         assert_ne!(
@@ -14186,7 +14658,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "linux-x86_64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         assert_ne!(
@@ -14197,7 +14670,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=2;bun=1"
+                "rustc=2;bun=1",
+                CheckChange::unknown("test")
             )
         );
 
@@ -14213,7 +14687,8 @@ fi
                 Some(&inside_changed),
                 "whole-tree-b",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
         let outside_changed = vec![
@@ -14228,7 +14703,8 @@ fi
                 Some(&outside_changed),
                 "whole-tree-b",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
 
@@ -14241,7 +14717,8 @@ fi
                 Some(&base),
                 "whole-tree-a",
                 "macos-aarch64",
-                "rustc=1;bun=1"
+                "rustc=1;bun=1",
+                CheckChange::unknown("test")
             )
         );
     }
@@ -14326,6 +14803,7 @@ cairn-common = { path = "../cairn-common" }
             "whole-tree",
             TEST_PLATFORM,
             TEST_TOOLCHAIN,
+            CheckChange::unknown("test"),
         )
     }
 
@@ -14498,7 +14976,8 @@ cairn-common = { path = "../cairn-common" }
                 None,
                 "tree-one",
                 "platform",
-                "toolchain"
+                "toolchain",
+                CheckChange::unknown("test")
             ),
             check_result_key(
                 &definition,
@@ -14506,7 +14985,8 @@ cairn-common = { path = "../cairn-common" }
                 None,
                 "tree-two",
                 "platform",
-                "toolchain"
+                "toolchain",
+                CheckChange::unknown("test")
             ),
         );
         assert_eq!(
@@ -14543,6 +15023,7 @@ cairn-common = { path = "../cairn-common" }
             "tree",
             TEST_PLATFORM,
             TEST_TOOLCHAIN,
+            CheckChange::unknown("test"),
         );
         let full_plan = plan("rust-tests", full_command);
         let checks = HashMap::from([("rust-tests".to_string(), configured.clone())]);
@@ -14555,6 +15036,7 @@ cairn-common = { path = "../cairn-common" }
             "tree",
             TEST_PLATFORM,
             TEST_TOOLCHAIN,
+            ChangeBasis::Unknown,
         )
         .pop()
         .unwrap();
@@ -14964,6 +15446,7 @@ cairn-common = { path = "../cairn-common" }
                 &tree,
                 "test-platform",
                 "test-toolchain",
+                CheckChange::unknown("test"),
             ),
             check_result_key(
                 &definition,
@@ -14972,6 +15455,7 @@ cairn-common = { path = "../cairn-common" }
                 &tree,
                 "test-platform",
                 "test-toolchain",
+                CheckChange::unknown("test"),
             ),
             "identical impact-filtered trees must hit despite different commit history"
         );
@@ -15002,6 +15486,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_platforms: None,
             runtime: None,
             fixes: false,
+            base_relative: false,
             main_cadence: None,
             tree: Default::default(),
         }
@@ -15440,6 +15925,7 @@ cairn-common = { path = "../cairn-common" }
             tree_hash,
             TEST_PLATFORM,
             TEST_TOOLCHAIN,
+            CheckChange::unknown("test"),
         );
         entry
     }
@@ -16317,7 +16803,7 @@ cairn-common = { path = "../cairn-common" }
         for (plan, key_before) in &keyed {
             let key_after = format!("key-after-{}", plan.name);
             assert!(
-                verdict_survives_fix(true, true, true, false, key_before, &key_after),
+                verdict_survives_fix(true, true, true, false, key_before, &key_after, false),
                 "{} must not run again against a fix it already saw",
                 plan.name
             );
@@ -16330,25 +16816,27 @@ cairn-common = { path = "../cairn-common" }
         // its verdict cannot be keyed onto it. Re-verifying is the only honest
         // answer; re-keying it would be exactly the false green this forbids.
         assert!(!verdict_survives_fix(
-            true, false, true, false, "before", "after"
+            true, false, true, false, "before", "after", false
         ));
         // Unless the fix left its inputs alone — the same argument the result
         // cache itself rests on.
         assert!(verdict_survives_fix(
-            true, false, true, false, "same", "same"
+            true, false, true, false, "same", "same", false
         ));
         // An unattributed fix invalidates even a check that ran: something else
         // rewrote the tree mid-wave and nothing proves this check saw it.
         assert!(!verdict_survives_fix(
-            true, true, false, false, "before", "after"
+            true, true, false, false, "before", "after", false
         ));
         // A fixer another fixer ran after cannot carry: it never saw the output
         // that landed, however well the fold is attributed.
         assert!(!verdict_survives_fix(
-            true, true, true, true, "before", "after"
+            true, true, true, true, "before", "after", false
         ));
         // Unless the later fixer left its inputs alone.
-        assert!(verdict_survives_fix(true, true, true, true, "same", "same"));
+        assert!(verdict_survives_fix(
+            true, true, true, true, "same", "same", false
+        ));
     }
 
     /// Wave A answered pending, the agent committed B, and A's formatter fix
@@ -16363,10 +16851,11 @@ cairn-common = { path = "../cairn-common" }
             true,
             false,
             "a-tree",
-            "b-plus-fix"
+            "b-plus-fix",
+            false
         ));
         assert!(verdict_survives_fix(
-            false, true, true, false, "same", "same"
+            false, true, true, false, "same", "same", false
         ));
         // The same pass carries when the fix landed on the tree it ran against.
         assert!(verdict_survives_fix(
@@ -16375,7 +16864,8 @@ cairn-common = { path = "../cairn-common" }
             true,
             false,
             "a-tree",
-            "a-plus-fix"
+            "a-plus-fix",
+            false
         ));
     }
 
@@ -16464,7 +16954,15 @@ cairn-common = { path = "../cairn-common" }
         let fixers: Vec<&InputSelector> = resolved.iter().collect();
         assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
         assert!(
-            !verdict_survives_fix(true, true, true, superseded.contains(&0), "p", "p-after"),
+            !verdict_survives_fix(
+                true,
+                true,
+                true,
+                superseded.contains(&0),
+                "p",
+                "p-after",
+                false
+            ),
             "a green prettier verdict must not be keyed to a tree eslint rewrote"
         );
         // The other two are proven by ordering and carry as before.
@@ -16474,7 +16972,8 @@ cairn-common = { path = "../cairn-common" }
             true,
             superseded.contains(&1),
             "e",
-            "e-after"
+            "e-after",
+            false
         ));
         assert!(verdict_survives_fix(
             true,
@@ -16482,7 +16981,8 @@ cairn-common = { path = "../cairn-common" }
             true,
             superseded.contains(&2),
             "t",
-            "t-after"
+            "t-after",
+            false
         ));
     }
 
@@ -16517,7 +17017,7 @@ cairn-common = { path = "../cairn-common" }
             &[&selector(&checks["fmt"])]
         ));
         assert!(
-            verdict_survives_fix(true, true, true, false, "key-before", "key-after"),
+            verdict_survives_fix(true, true, true, false, "key-before", "key-after", false),
             "re-checking a fixer against its own output is the loop this removes"
         );
     }
@@ -19237,7 +19737,15 @@ cairn-common = { path = "../cairn-common" }
         let check: CheckCommand = serde_yaml::from_str("command: bun run test:frontend\n").unwrap();
         let selector = InputSelector::from_globs(&["**".to_string()]);
         let key = |toolchain: &str| {
-            check_result_key(&check, &selector, None, "tree", "macos-aarch64", toolchain)
+            check_result_key(
+                &check,
+                &selector,
+                None,
+                "tree",
+                "macos-aarch64",
+                toolchain,
+                CheckChange::unknown("test"),
+            )
         };
         let before_node = "rustc=rustc 1.97.1 (8bab26f4f 2026-07-14);bun=1.4.4";
         assert_eq!(
@@ -20909,7 +21417,13 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             ("src/lib.rs".to_string(), "blob-a".to_string()),
             ("docs/readme.md".to_string(), "docs-b".to_string()),
         ];
-        let keyed = check_input_hashes(&checks, &inputs, Some(&before), "tree-a");
+        let keyed = check_input_hashes(
+            &checks,
+            &inputs,
+            Some(&before),
+            "tree-a",
+            ChangeBasis::Unknown,
+        );
         for (name, definition) in &checks {
             assert_eq!(
                 keyed[name],
@@ -20920,11 +21434,18 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
                     "tree-a",
                     &check_platform_identity(),
                     check_toolchain_identity(),
+                    CheckChange::unknown("test"),
                 ),
                 "{name}: the shared key is the engine's key on this host"
             );
         }
-        let moved = check_input_hashes(&checks, &inputs, Some(&after), "tree-b");
+        let moved = check_input_hashes(
+            &checks,
+            &inputs,
+            Some(&after),
+            "tree-b",
+            ChangeBasis::Unknown,
+        );
         assert_eq!(
             keyed["rust"], moved["rust"],
             "untouched inputs keep their key"
@@ -24426,6 +24947,475 @@ mod write_wave_target_tests {
         assert!(
             !git_stdout(&repo, &["show", &format!("{parent}:src/lib.rs")])
                 .contains("#[allow(dead_code)]")
+        );
+    }
+
+    const MIGRATIONS_CONFIG: &str = "checks:\n  migrations:\n    command: bun run check:migrations\n    baseRelative: true\n    impact:\n      - src-tauri/turso_migrations/**\n  fmt:\n    command: cargo fmt --check\n    fixes: true\n    impact:\n      - src/**\n";
+    const MIGRATIONS: &str = "src-tauri/turso_migrations";
+
+    fn migration(name: &str) -> String {
+        format!("{MIGRATIONS}/{name}")
+    }
+
+    fn rename(repo: &Path, from: &str, to: &str, message: &str) -> String {
+        git(repo, &["mv", from, to]);
+        commit(repo, &[], message)
+    }
+
+    fn coordinate(jj: &JjEnv, home: &Path, repo: &Path) -> PathBuf {
+        crate::jj::coordinate_repository(jj, home, repo).unwrap()
+    }
+
+    fn wave_planning(
+        jj: &JjEnv,
+        coordinates: &Path,
+        repo: &Path,
+        db: &Arc<LocalDb>,
+        base: &str,
+        head: &str,
+    ) -> WriteWavePlanning {
+        WriteWavePlanning {
+            jj: jj.clone(),
+            repository: coordinates.to_path_buf(),
+            object_repository: repo.to_path_buf(),
+            head: head.to_string(),
+            base: base.to_string(),
+            contract: checks_contract_at_commit(repo, head)
+                .expect("the head declares its checks")
+                .contract,
+            db: db.clone(),
+            project_id: "project".into(),
+            job_id: "job".into(),
+        }
+    }
+
+    fn shipped(transport: &[(String, String)]) -> BTreeSet<String> {
+        transport
+            .iter()
+            .find(|(name, _)| name == CHANGED_FILES_CONTENT_ENV)
+            .map(|(_, value)| value.lines().map(str::to_string).collect())
+            .expect("every wave ships its changed files")
+    }
+
+    fn key_of<'a>(wave: &'a [(CheckPlan, String)], name: &str) -> &'a str {
+        wave.iter()
+            .find(|(plan, _)| plan.name == name)
+            .map(|(_, key)| key.as_str())
+            .unwrap_or_else(|| panic!("{name} is planned"))
+    }
+
+    /// A pure rename (R100) ships its destination. When the source existed at
+    /// the base, the rename is also a deletion the change made, so the source
+    /// ships too.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_pure_rename_ships_its_destination_and_any_source_the_base_had() {
+        let Some(bin) = jj_bin() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path().to_path_buf();
+        init_project(&repo);
+        let base = commit(
+            &repo,
+            &[
+                (".cairn/config.yaml", MIGRATIONS_CONFIG),
+                (
+                    &migration("0001_a.sql"),
+                    "-- lineage: shared\nCREATE TABLE a(id);\n",
+                ),
+            ],
+            "main",
+        );
+        git(&repo, &["checkout", "-q", "-b", "agent/feature"]);
+        commit(
+            &repo,
+            &[(
+                &migration("0002_x.sql"),
+                "-- lineage: shared\nCREATE TABLE x(id);\n",
+            )],
+            "add a migration",
+        );
+        let renamed_own = rename(
+            &repo,
+            &migration("0002_x.sql"),
+            &migration("NEXT_x.sql"),
+            "the number is the landing's",
+        );
+        let renamed_base = rename(
+            &repo,
+            &migration("0001_a.sql"),
+            &migration("NEXT_a.sql"),
+            "and rename one the base had",
+        );
+
+        let jj = crate::jj::environment(&bin, home.path());
+        let coordinates = {
+            let (jj, home, repo) = (jj.clone(), home.path().to_path_buf(), repo.clone());
+            tokio::task::spawn_blocking(move || coordinate(&jj, &home, &repo))
+                .await
+                .unwrap()
+        };
+        let db = Arc::new(crate::storage::migrated_test_db("rename-transport.db").await);
+        for (head, expected) in [
+            (renamed_own, vec![migration("NEXT_x.sql")]),
+            (
+                renamed_base,
+                vec![
+                    migration("0001_a.sql"),
+                    migration("NEXT_a.sql"),
+                    migration("NEXT_x.sql"),
+                ],
+            ),
+        ] {
+            let planning = wave_planning(&jj, &coordinates, &repo, &db, &base, &head);
+            let wave = tokio::task::spawn_blocking(move || plan_write_wave(planning))
+                .await
+                .unwrap()
+                .expect("migrations applies to a migration change")
+                .unwrap();
+            assert_eq!(
+                shipped(&wave.transport),
+                expected.into_iter().collect::<BTreeSet<_>>(),
+                "at {head}"
+            );
+        }
+    }
+
+    /// The cairn/5942 specimen. A wave planned at a head that added
+    /// `0002_x.sql` folds its formatter fix after the branch moved on to a head
+    /// that renamed it to `NEXT_x.sql`, so the fix lands on that newer head and
+    /// the wave re-verifies there. It must re-verify with the newer head's
+    /// change: the change it was planned with names `0002_x.sql`, and
+    /// check:migrations reads a `NEXT_` file missing from it as one this change
+    /// did not add. And the re-verified verdict must be keyed exactly as the
+    /// newer head's own wave keys it, so neither answers for the other wrongly.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_fix_landing_on_a_moved_head_re_verifies_with_that_heads_change() {
+        let Some(bin) = jj_bin() else {
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path().to_path_buf();
+        init_project(&repo);
+        let base = commit(
+            &repo,
+            &[
+                (".cairn/config.yaml", MIGRATIONS_CONFIG),
+                ("src/lib.rs", "fn a() {}\n"),
+            ],
+            "main",
+        );
+        git(&repo, &["checkout", "-q", "-b", "agent/feature"]);
+        let planned_at = commit(
+            &repo,
+            &[
+                ("src/lib.rs", "fn a()  {}\n"),
+                (
+                    &migration("0002_x.sql"),
+                    "-- lineage: shared\nCREATE TABLE x(id);\n",
+                ),
+            ],
+            "the write the wave was planned at",
+        );
+        let moved_to = rename(
+            &repo,
+            &migration("0002_x.sql"),
+            &migration("NEXT_x.sql"),
+            "the next write, committed while that wave ran",
+        );
+        let fixed = commit(
+            &repo,
+            &[("src/lib.rs", "fn a() {}\nfn b() {}\n")],
+            "fix: apply write-check changes",
+        );
+
+        let jj = crate::jj::environment(&bin, home.path());
+        let coordinates = {
+            let (jj, home, repo) = (jj.clone(), home.path().to_path_buf(), repo.clone());
+            tokio::task::spawn_blocking(move || coordinate(&jj, &home, &repo))
+                .await
+                .unwrap()
+        };
+        let db = Arc::new(crate::storage::migrated_test_db("moved-head-fold.db").await);
+        let plan = |head: &str| {
+            let planning = wave_planning(&jj, &coordinates, &repo, &db, &base, head);
+            async move {
+                tokio::task::spawn_blocking(move || plan_write_wave(planning))
+                    .await
+                    .unwrap()
+                    .expect("both checks apply")
+                    .unwrap()
+            }
+        };
+        let wave = plan(&planned_at).await;
+        assert!(
+            !shipped(&wave.transport).contains(&migration("NEXT_x.sql")),
+            "the planned head never had the NEXT_ file"
+        );
+
+        let checks = checks_contract_at_commit(&repo, &fixed)
+            .unwrap()
+            .contract
+            .checks;
+        let order: Vec<usize> = (0..wave.keyed.len()).collect();
+        let replanning = FixReplanning {
+            jj: jj.clone(),
+            repository: coordinates.clone(),
+            object_repository: repo.clone(),
+            base: base.clone(),
+            head: fixed.clone(),
+            superseded: fixers_superseded_by_a_later_fixer(&wave.keyed, &checks, &order),
+            checks,
+            extra_inputs: HashMap::new(),
+            plans: wave.keyed.iter().map(|(plan, _)| plan.clone()).collect(),
+            keys_before: wave.keyed.iter().map(|(_, key)| key.clone()).collect(),
+            executed: order.iter().copied().collect(),
+            fixer_names: vec!["fmt".to_string()],
+            fixed_paths: vec!["src/lib.rs".to_string()],
+            fix_landed_on_tested_base: false,
+            db: db.clone(),
+            project_id: "project".into(),
+        };
+        let (rekeyed, invalidated, _, transport) =
+            tokio::task::spawn_blocking(move || replan_onto_fix(replanning))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            shipped(&transport),
+            BTreeSet::from([migration("NEXT_x.sql"), "src/lib.rs".to_string()]),
+            "the fixed commit's lanes carry the fixed commit's change"
+        );
+        let migrations = wave
+            .keyed
+            .iter()
+            .position(|(plan, _)| plan.name == "migrations")
+            .unwrap();
+        assert!(
+            invalidated.contains(&migrations),
+            "the newer head's migration change invalidated the planned verdict"
+        );
+        let own_wave = plan(&fixed).await;
+        assert_eq!(
+            key_of(&rekeyed, "migrations"),
+            key_of(&own_wave.keyed, "migrations"),
+            "the re-verified verdict is keyed as the fixed commit's own wave keys it"
+        );
+        assert_eq!(shipped(&transport), shipped(&own_wave.transport));
+        let _ = moved_to;
+    }
+}
+
+/// A base-relative check's verdict is a function of its tree AND the change it
+/// was measured against, so its key names both.
+#[cfg(test)]
+mod base_relative_key_tests {
+    use super::*;
+
+    const MIGRATION: &str = "src-tauri/turso_migrations/NEXT_x.sql";
+
+    fn check(yaml: &str) -> CheckCommand {
+        serde_yaml::from_str(yaml).unwrap()
+    }
+
+    fn change(path: &str) -> GraphFileChange {
+        GraphFileChange {
+            path: path.to_string(),
+            previous_path: None,
+            status: "added".to_string(),
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    fn key(name: &str, check: &CheckCommand, basis: ChangeBasis<'_>) -> String {
+        let selector = InputSelector::from_globs(check.impact.as_deref().unwrap_or(&[]));
+        let entries = vec![(MIGRATION.to_string(), "blob".to_string())];
+        check_result_key(
+            check,
+            &selector,
+            Some(&entries),
+            "tree",
+            "macos-aarch64",
+            "rustc=1;bun=1",
+            CheckChange { name, basis },
+        )
+    }
+
+    fn against(changed: &[GraphFileChange]) -> ChangeBasis<'_> {
+        ChangeBasis::Against {
+            changed,
+            base_entries: None,
+        }
+    }
+
+    /// The cairn/5942 reuse: a red computed against a change that omitted the
+    /// `NEXT_` file was replayed for the same tree measured against the change
+    /// that does carry it. Same tree, different change: no shared key, so the
+    /// second evaluation cannot reuse the first one's verdict.
+    #[test]
+    fn the_same_tree_against_a_different_change_does_not_share_a_key() {
+        let migrations = check(
+            "command: bun run check:migrations\nbaseRelative: true\nimpact: [src-tauri/turso_migrations/**]\n",
+        );
+        let with_next = [change(MIGRATION)];
+        let without = [change("src-tauri/turso_migrations/0337_x.sql")];
+        assert_ne!(
+            key("migrations", &migrations, against(&with_next)),
+            key("migrations", &migrations, against(&without)),
+        );
+        assert_ne!(
+            key("migrations", &migrations, against(&with_next)),
+            key("migrations", &migrations, against(&[])),
+            "an empty change is a change too"
+        );
+        assert_eq!(
+            key("migrations", &migrations, against(&with_next)),
+            key("migrations", &migrations, against(&with_next)),
+            "the same change reuses"
+        );
+        // What the change touched outside the check's inputs is not something
+        // the check depends on, so it neither moves the key nor costs a re-run.
+        let elsewhere = [change(MIGRATION), change("src/lib.rs")];
+        assert_eq!(
+            key("migrations", &migrations, against(&with_next)),
+            key("migrations", &migrations, against(&elsewhere)),
+        );
+    }
+
+    /// Both sides of a rename are part of the change a base-relative key names.
+    #[test]
+    fn a_renames_source_is_part_of_the_change() {
+        let migrations = check(
+            "command: bun run check:migrations\nbaseRelative: true\nimpact: [src-tauri/turso_migrations/**]\n",
+        );
+        let added = [change(MIGRATION)];
+        let mut moved = change(MIGRATION);
+        moved.status = "renamed".to_string();
+        moved.previous_path = Some("src-tauri/turso_migrations/0337_x.sql".to_string());
+        assert_ne!(
+            key("migrations", &migrations, against(&added)),
+            key(
+                "migrations",
+                &migrations,
+                against(std::slice::from_ref(&moved))
+            ),
+        );
+        assert_eq!(
+            check_transport_env(&[moved], None)[0].1,
+            format!("src-tauri/turso_migrations/0337_x.sql\n{MIGRATION}"),
+            "the transport names the destination and the source"
+        );
+    }
+
+    /// A check that does not declare `baseRelative` keeps the key it had, byte
+    /// for byte, whatever change it is handed.
+    #[test]
+    fn a_check_read_off_its_tree_ignores_the_change() {
+        let fmt = check("command: cargo fmt --check\nimpact: [src-tauri/turso_migrations/**]\n");
+        let with_next = [change(MIGRATION)];
+        assert_eq!(
+            key("fmt", &fmt, against(&with_next)),
+            key("fmt", &fmt, against(&[])),
+        );
+        assert_eq!(
+            key("fmt", &fmt, against(&with_next)),
+            key("fmt", &fmt, ChangeBasis::Unknown),
+        );
+    }
+
+    /// A base-relative check with no change to name gets a key nothing else
+    /// produces: it neither reuses a verdict nor leaves one behind.
+    #[test]
+    fn an_unknown_change_shares_no_key() {
+        let migrations = check(
+            "command: bun run check:migrations\nbaseRelative: true\nimpact: [src-tauri/turso_migrations/**]\n",
+        );
+        assert_ne!(
+            key("migrations", &migrations, ChangeBasis::Unknown),
+            key("migrations", &migrations, ChangeBasis::Unknown),
+        );
+    }
+
+    /// The executor-protocol guard is shipped its base's content, so its key
+    /// names the base blob each bundled path came from: the same tree and
+    /// change compared against a different base protocol source is a
+    /// different question. Without the base's listing it has no key to share.
+    #[test]
+    fn a_base_content_check_names_its_base_blobs() {
+        let protocol = check("command: bun run check:executor-protocol\nimpact: [src-tauri/**]\n");
+        let changed = [change(EXECUTOR_PROTOCOL_SOURCE)];
+        let base = |blob: &str| vec![(EXECUTOR_PROTOCOL_SOURCE.to_string(), blob.to_string())];
+        let (v40, v41) = (base("v40"), base("v41"));
+        let key_against = |entries: Option<&[(String, String)]>| {
+            key(
+                EXECUTOR_PROTOCOL_CHECK,
+                &protocol,
+                ChangeBasis::Against {
+                    changed: &changed,
+                    base_entries: entries,
+                },
+            )
+        };
+        assert!(is_base_relative(EXECUTOR_PROTOCOL_CHECK, &protocol));
+        assert_eq!(key_against(Some(&v40)), key_against(Some(&v40)));
+        assert_ne!(key_against(Some(&v40)), key_against(Some(&v41)));
+        assert_ne!(key_against(None), key_against(None));
+    }
+
+    /// Every project check that reads the changed-file set as a statement about
+    /// the change is base-relative: check:migrations judges what the change
+    /// added, and the scoped findings wrappers (check-rust.ts, check-dead.ts)
+    /// gate only on findings in changed files. executor-protocol is by the base
+    /// content it is shipped.
+    #[test]
+    fn the_projects_change_reading_checks_are_base_relative() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cairn/config.yaml");
+        let config: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let declared = |name: &str| -> CheckCommand {
+            serde_yaml::from_value(config["checks"][name].clone())
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+        };
+        for name in ["migrations", "rust-lint", "dead-code"] {
+            assert!(declared(name).base_relative, "{name} declares baseRelative");
+        }
+        assert!(is_base_relative(
+            EXECUTOR_PROTOCOL_CHECK,
+            &declared(EXECUTOR_PROTOCOL_CHECK)
+        ));
+        assert!(!is_base_relative("rust-fmt", &declared("rust-fmt")));
+    }
+
+    /// The narrowing baseline's delta is diffed by path, so a rename since the
+    /// baseline reads as its source deleted and its destination added.
+    #[test]
+    fn the_baseline_delta_reads_a_rename_as_both_paths() {
+        let selector = InputSelector::from_globs(&["src-tauri/turso_migrations/**".to_string()]);
+        let baseline = vec![(
+            "src-tauri/turso_migrations/0337_x.sql".to_string(),
+            "blob".to_string(),
+        )];
+        let current = vec![(MIGRATION.to_string(), "blob".to_string())];
+        let delta: Vec<(String, String)> =
+            diff_tree_entries_for_selector(&baseline, &current, &selector)
+                .into_iter()
+                .map(|change| (change.path, change.status))
+                .collect();
+        assert_eq!(
+            delta,
+            vec![
+                (
+                    "src-tauri/turso_migrations/0337_x.sql".to_string(),
+                    "deleted".to_string()
+                ),
+                (MIGRATION.to_string(), "added".to_string()),
+            ]
         );
     }
 }

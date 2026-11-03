@@ -1337,6 +1337,7 @@ mod tests {
             verdict_platforms: None,
             runtime: None,
             fixes: false,
+            base_relative: false,
             main_cadence: None,
             tree: Default::default(),
         }

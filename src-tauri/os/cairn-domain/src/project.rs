@@ -459,6 +459,18 @@ pub struct CheckCommand {
     #[serde(default, skip_serializing_if = "is_not_check_fixer")]
     pub fixes: bool,
 
+    /// Whether this check's verdict is measured against its integration base
+    /// rather than read off the tree alone: its command reads the changed-file
+    /// set every cadence ships (`CAIRN_CHECK_CHANGED_FILES`), and the base
+    /// content where one is shipped. Such a verdict answers "this tree, judged
+    /// against this change", so the changed paths the check's inputs select,
+    /// and the identity of any base content it receives, enter its result key.
+    /// The same tree measured against a different change is a different
+    /// question and does not reuse the verdict. See docs/checks.md,
+    /// "Base-relative checks".
+    #[serde(default, skip_serializing_if = "is_not_base_relative")]
+    pub base_relative: bool,
+
     /// Run this check's whole suite on the default branch after every merge,
     /// on each named platform, and post each result to a project thread. Absent
     /// means the check never runs on main by itself. Not part of the check's
@@ -600,6 +612,10 @@ fn is_default_check_resource_class(resource_class: &CheckResourceClass) -> bool 
 
 fn is_not_check_fixer(fixes: &bool) -> bool {
     !*fixes
+}
+
+fn is_not_base_relative(base_relative: &bool) -> bool {
+    !*base_relative
 }
 
 fn default_check_when() -> CheckWhen {
@@ -809,7 +825,7 @@ impl CheckVocabulary {
 /// One declared check entry, read under a vocabulary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeclaredCheck {
-    Supported(CheckCommand),
+    Supported(Box<CheckCommand>),
     Unsupported(UnsupportedCheck),
 }
 
@@ -830,7 +846,7 @@ pub fn read_declared_check(
     // string wherever the field wants one. `command: false` must keep meaning
     // the shell command it meant when the whole file was parsed from text.
     let text = serde_yaml::to_string(&declared)?;
-    serde_yaml::from_str(&text).map(DeclaredCheck::Supported)
+    serde_yaml::from_str(&text).map(|check| DeclaredCheck::Supported(Box::new(check)))
 }
 
 fn render_inline(value: &serde_yaml::Value) -> String {
@@ -934,6 +950,7 @@ mod check_vocabulary_tests {
                 "verdictPlatforms",
                 "runtime",
                 "fixes",
+                "baseRelative",
                 "mainCadence",
                 "tree",
             ]

@@ -1208,6 +1208,7 @@ async fn run_turn_end_checks_inner(
     // 4. Compute changed files between immutable logical coordinates.
     let wave_base = base.clone();
     let baseline_base = base.clone();
+    let key_base = base.clone();
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let changed_jj = jj.clone();
     let changed_repo = logical_repository.clone();
@@ -1324,8 +1325,22 @@ async fn run_turn_end_checks_inner(
             // the `/checks` projection reads lanes by while the wave runs.
             let tree_hash = logical_tree_hash(&planning_jj, &planning_repository, &planning_commit)
                 .map_err(|error| error.to_string())?;
-            let input_hashes =
-                check_input_hashes(&planning_checks, &inputs, entries.as_deref(), &tree_hash);
+            let base_entries = crate::execution::checks::key_base_entries(
+                &planning_checks,
+                &planning_jj,
+                &planning_repository,
+                &key_base,
+            );
+            let input_hashes = check_input_hashes(
+                &planning_checks,
+                &inputs,
+                entries.as_deref(),
+                &tree_hash,
+                crate::execution::checks::ChangeBasis::Against {
+                    changed: &planning_changed,
+                    base_entries: base_entries.as_deref(),
+                },
+            );
             Ok::<_, String>((plans, input_hashes, tree_hash, expected_toolchain))
         })
         .await

@@ -54,8 +54,8 @@ use crate::execution::check_identity::{
 };
 use crate::execution::check_parsers::ParsedCheckResult;
 use crate::execution::checks::{
-    check_platform_identity, check_result_key, check_toolchain_identity,
-    load_checks_contract_at_commit, CommitChecksContract,
+    check_platform_identity, check_result_key, check_toolchain_identity, is_base_relative,
+    load_checks_contract_at_commit, ChangeBasis, CheckChange, CommitChecksContract,
 };
 use crate::execution::inputs::{ResolvedInputs, TreeBlobs, TreeSnapshot};
 use crate::issues::relations::{canonicalize_issue_uri, resolve_issue_uri};
@@ -1318,7 +1318,8 @@ async fn check_verdict_coordinate(
     issue_uri: &str,
     check_name: &str,
 ) -> Option<CheckVerdictCoordinate> {
-    let (project_id, repository, branch) = gated_ref(ctx, issue_uri).await.ok().flatten()?;
+    let (project_id, repository, branch, integration_target) =
+        gated_ref(ctx, issue_uri).await.ok().flatten()?;
     let repository = PathBuf::from(repository);
     let jj_binary_path = ctx.orch().jj_binary_path.clone();
     let config_dir = ctx.orch().config_dir.clone();
@@ -1357,6 +1358,34 @@ async fn check_verdict_coordinate(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+    // A base-relative verdict answers for its tree measured against one change,
+    // so the coordinate names the change the branch's own cadences measure: its
+    // fork point with its integration target. One that cannot be resolved names
+    // none, and no verdict answers it.
+    let mut changed = None;
+    let mut base_entries = None;
+    if is_base_relative(check_name, check) {
+        if let Ok(fork) =
+            cairn_vcs::merge_base(&coordinate_repository, &commit, &integration_target).await
+        {
+            changed =
+                crate::jj::logical_changed_files(&jj, &coordinate_repository, &fork.base, &commit)
+                    .ok();
+            base_entries = crate::execution::checks::key_base_entries(
+                &checks,
+                &jj,
+                &coordinate_repository,
+                &fork.base,
+            );
+        }
+    }
+    let basis = match changed.as_deref() {
+        Some(changed) => ChangeBasis::Against {
+            changed,
+            base_entries: base_entries.as_deref(),
+        },
+        None => ChangeBasis::Unknown,
+    };
     let input_hash = check_result_key(
         check,
         inputs.for_check(check_name),
@@ -1364,6 +1393,10 @@ async fn check_verdict_coordinate(
         &tree_hash,
         &check_platform_identity(),
         check_toolchain_identity(),
+        CheckChange {
+            name: check_name,
+            basis,
+        },
     );
     let expected_toolchain = cairn_checkenv::expected_toolchain_identity_in(&repository);
     Some(CheckVerdictCoordinate {
@@ -1380,13 +1413,14 @@ async fn check_verdict_coordinate(
     })
 }
 
-/// The issue's project, repository, and working branch — the ref a check verdict
-/// on that issue would be about. The newest branched job wins, which is the same
-/// branch every other surface calls "the issue's branch".
+/// The issue's project, repository, working branch, and that branch's
+/// integration target — the ref a check verdict on that issue would be about,
+/// and what its change is measured against. The newest branched job wins, which
+/// is the same branch every other surface calls "the issue's branch".
 async fn gated_ref(
     ctx: &GateContext<'_>,
     issue_uri: &str,
-) -> DbResult<Option<(String, String, String)>> {
+) -> DbResult<Option<(String, String, String, String)>> {
     let uri = issue_uri.to_string();
     ctx.db_for_issue(issue_uri)
         .await
@@ -1398,7 +1432,8 @@ async fn gated_ref(
                 };
                 let mut rows = conn
                     .query(
-                        "SELECT i.project_id, p.repo_path, j.branch
+                        "SELECT i.project_id, p.repo_path, j.branch,
+                                COALESCE(j.base_branch, p.default_branch, 'main')
                            FROM issues i
                            JOIN projects p ON p.id = i.project_id
                            JOIN jobs j ON j.issue_id = i.id AND j.branch IS NOT NULL
@@ -1414,7 +1449,7 @@ async fn gated_ref(
                 let (Some(repository), Some(branch)) = (row.opt_text(1)?, row.opt_text(2)?) else {
                     return Ok(None);
                 };
-                Ok(Some((row.text(0)?, repository, branch)))
+                Ok(Some((row.text(0)?, repository, branch, row.text(3)?)))
             })
         })
         .await

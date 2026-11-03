@@ -613,7 +613,7 @@ fn parse_project_settings_under(
         for (name, entry) in declared {
             match read_declared_check(entry, vocabulary) {
                 Ok(DeclaredCheck::Supported(check)) => {
-                    supported.insert(name, check);
+                    supported.insert(name, *check);
                 }
                 Ok(DeclaredCheck::Unsupported(unsupported)) => {
                     unsupported_checks.insert(name, unsupported);

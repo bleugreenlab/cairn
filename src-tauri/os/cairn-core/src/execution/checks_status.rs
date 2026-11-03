@@ -12,7 +12,7 @@ use crate::execution::check_parsers::{
 };
 use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
-    CheckFailureKind,
+    ChangeBasis, CheckFailureKind,
 };
 use crate::execution::checks_turn_end::{
     read_turn_end_log_tail, resolve_job_coords, JobCoords, WavePlan,
@@ -1341,9 +1341,37 @@ async fn settled_statuses(
             let inputs = ResolvedInputs::resolve(checks, &status_contract.extra_inputs, &snapshot);
             let mut verdicts_elapsed = Duration::ZERO;
             let head_tree = logical_tree_hash(&status_jj, &logical_repository, &logical_head).ok();
+            let changed = live_range.as_ref().and_then(|range| {
+                logical_changed_files(&status_jj, &logical_repository, &range.base, &logical_head)
+                    .inspect_err(|error| {
+                        log::debug!(
+                            "check status: changed files of {}..{logical_head} unreadable: {error}",
+                            range.base
+                        );
+                    })
+                    .ok()
+            });
+            // A base-relative check is keyed by the change it was measured
+            // against, so the projection asks with the same change the runners
+            // planned with; without one it can name no such verdict.
+            let base_entries = live_range.as_ref().and_then(|range| {
+                crate::execution::checks::key_base_entries(
+                    checks,
+                    &status_jj,
+                    &logical_repository,
+                    &range.base,
+                )
+            });
+            let basis = match changed.as_deref() {
+                Some(changed) => ChangeBasis::Against {
+                    changed,
+                    base_entries: base_entries.as_deref(),
+                },
+                None => ChangeBasis::Unknown,
+            };
             let live_rows = head_tree.as_deref().and_then(|tree_hash| {
                 let input_hashes =
-                    check_input_hashes(checks, &inputs, entries.as_deref(), tree_hash);
+                    check_input_hashes(checks, &inputs, entries.as_deref(), tree_hash, basis);
                 // What a wave planned at this checkout would expect, so the
                 // projection borrows exactly the verdicts the wave would.
                 let expected_toolchain =
@@ -1367,16 +1395,6 @@ async fn settled_statuses(
             let mut rows = live_rows
                 .or_else(|| list_check_results_for_job(status_db.clone(), &status_job_id).ok())
                 .unwrap_or_default();
-            let changed = live_range.as_ref().and_then(|range| {
-                logical_changed_files(&status_jj, &logical_repository, &range.base, &logical_head)
-                    .inspect_err(|error| {
-                        log::debug!(
-                            "check status: changed files of {}..{logical_head} unreadable: {error}",
-                            range.base
-                        );
-                    })
-                    .ok()
-            });
             let applicable_names = changed.as_ref().map(|changed| {
                 plan_checks(checks, &inputs, changed, &project_root)
                     .into_iter()

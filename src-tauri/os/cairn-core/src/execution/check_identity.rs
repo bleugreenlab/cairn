@@ -170,6 +170,7 @@ pub(crate) fn content_identity(
     selector: &InputSelector,
     entries: Option<&[(String, String)]>,
     tree_hash: &str,
+    change: Option<&str>,
 ) -> CheckContentIdentity {
     let filtered_tree_hash = if selector.keys_on_whole_tree() {
         tree_hash.to_string()
@@ -219,6 +220,13 @@ pub(crate) fn content_identity(
         field(&mut hasher, "tree");
         field(&mut hasher, check.tree.as_str());
     }
+    // A base-relative verdict answers for its tree measured against one change
+    // ([`change_fingerprint`]), so that change is part of what it attests to.
+    // Trailing and only for such a check, so every other key is unchanged.
+    if let Some(change) = change {
+        field(&mut hasher, "change");
+        field(&mut hasher, change);
+    }
 
     CheckContentIdentity {
         fingerprint: digest(hasher),
@@ -227,6 +235,35 @@ pub(crate) fn content_identity(
         result_schema_version: CHECK_RESULT_SCHEMA_VERSION,
         parser_version: CHECK_PARSER_VERSION,
     }
+}
+
+/// The fingerprint of the change a base-relative check was measured against:
+/// the changed paths its inputs select, and, for a check shipped base content,
+/// each bundled path with the base blob it came from (`None` where the base has
+/// no such file). Two evaluations that fingerprint alike handed their command
+/// the same change, so one's verdict answers for the other's.
+pub(crate) fn change_fingerprint(
+    paths: &[&str],
+    base_content: Option<&[(String, Option<String>)]>,
+) -> String {
+    let mut hasher = Sha256::new();
+    field(&mut hasher, "check-change-v1");
+    field(&mut hasher, &paths.len().to_string());
+    for path in paths {
+        field(&mut hasher, path);
+    }
+    match base_content {
+        Some(bundle) => {
+            field(&mut hasher, "base-content");
+            field(&mut hasher, &bundle.len().to_string());
+            for (path, blob) in bundle {
+                field(&mut hasher, path);
+                option(&mut hasher, blob.as_deref());
+            }
+        }
+        None => field(&mut hasher, "no-base-content"),
+    }
+    digest(hasher)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,7 +416,7 @@ mod tests {
         let selector = crate::execution::inputs::InputSelector::from_globs(&["a/**".to_string()]);
         let entries = vec![("a/x".to_string(), "1".repeat(40))];
         let identity = |yaml: &str| {
-            content_identity(&command(yaml), &selector, Some(&entries), "tree").fingerprint
+            content_identity(&command(yaml), &selector, Some(&entries), "tree", None).fingerprint
         };
         let implicit = identity("command: bun run x\nimpact: [a/**]\n");
         let full = identity("command: bun run x\nimpact: [a/**]\ntree: full\n");
