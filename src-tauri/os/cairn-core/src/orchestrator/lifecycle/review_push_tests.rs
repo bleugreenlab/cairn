@@ -1,6 +1,7 @@
 use super::review_push::{
-    bounded_rearm_candidates, rearm_one_bounded_failed_review, spawn_turn_end_checks,
-    BOUNDED_REARM_CANDIDATES_SQL, DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+    bounded_rearm_candidates, rearm_candidate_jobs_sql, rearm_one_bounded_failed_review,
+    resolve_producing_job_for_issue, resolve_producing_job_sql, review_artifact_ref_sql,
+    spawn_turn_end_checks, BOUNDED_REARM_CANDIDATES_SQL, DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
 };
 use super::{
     create_review_push_for_pr_open, evaluate_review_readiness, record_bounded_rearm_lookup_failure,
@@ -12,6 +13,7 @@ use crate::orchestrator::attention_push::{
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_db::turso::Value;
 use std::sync::Arc;
 
 const ISSUE_URI: &str = "cairn://p/prj/7";
@@ -930,7 +932,12 @@ async fn bounded_rearm_selects_retryable_review_work() {
 #[tokio::test]
 async fn bounded_rearm_candidates_never_walk_the_check_history() {
     let db = test_db().await;
-    let plan = query_plan(&db, BOUNDED_REARM_CANDIDATES_SQL).await;
+    let plan = query_plan(
+        &db,
+        BOUNDED_REARM_CANDIDATES_SQL,
+        vec![Value::Integer(DORMANT_INFRA_RETRY_COOLDOWN_SECONDS)],
+    )
+    .await;
 
     assert!(
         !plan.contains("SCAN check_result_cache"),
@@ -1054,14 +1061,13 @@ async fn bounded_rearm_candidate_arms_survive_the_live_job_drive() {
     );
 }
 
-async fn query_plan(db: &LocalDb, sql: &str) -> String {
+async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<Value>) -> String {
     let sql = format!("EXPLAIN QUERY PLAN {sql}");
     db.read(move |conn| {
         let sql = sql.clone();
+        let binds = binds.clone();
         Box::pin(async move {
-            let mut rows = conn
-                .query(&sql, (DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,))
-                .await?;
+            let mut rows = conn.query(&sql, binds).await?;
             let mut plan = String::new();
             while let Some(row) = rows.next().await? {
                 plan.push_str(&row.text(3)?);
@@ -1072,6 +1078,164 @@ async fn query_plan(db: &LocalDb, sql: &str) -> String {
     })
     .await
     .unwrap()
+}
+
+/// Every reviewable-output statement must cost the JOB's artifacts, never the
+/// workspace's.
+///
+/// The plan is the only seam where that difference is visible: the regression
+/// returned the right job from one statement, while the planner, keeping no
+/// statistics, drove each job's probe from `idx_artifacts_type` and fetched
+/// every create-pr and plan row ever written, overflow pages included. That was
+/// 90 s p50 for one evaluation of a 119-job issue on the 11-02 production clone
+/// (cairn/5643), the same trap cairn/4207 pinned in the attention-push resolver.
+#[tokio::test]
+async fn review_readiness_statements_seek_by_job() {
+    let db = test_db().await;
+    let statements = [
+        (
+            "resolve_producing_job_for_issue",
+            resolve_producing_job_sql(),
+            vec![Value::Text("i-rev".to_string())],
+            "SEARCH a USING COVERING INDEX idx_artifacts_job_review",
+        ),
+        (
+            "rearm_candidate_jobs",
+            rearm_candidate_jobs_sql(),
+            Vec::new(),
+            "SEARCH a USING COVERING INDEX idx_artifacts_job_review",
+        ),
+        // `updated_at` is selected and not covered, so the chain heads that
+        // pass the predicate fetch their row; the walk itself stays on the index.
+        (
+            "review_artifact_ref",
+            review_artifact_ref_sql(),
+            vec![Value::Text("j-prod".to_string())],
+            "SEARCH a USING INDEX idx_artifacts_job_review",
+        ),
+    ];
+    for (name, sql, binds, outer) in statements {
+        let plan = query_plan(&db, &sql, binds).await;
+        assert!(
+            plan.contains(outer),
+            "{name}: a job's artifacts are reached by job, through the index \
+             that covers the reviewable predicate (migration 0333):\n{plan}"
+        );
+        assert!(
+            plan.contains("SEARCH newer USING COVERING INDEX idx_artifacts_output_job_version"),
+            "{name}: the chain-head test seeks 0306's index and reads no row \
+             bodies:\n{plan}"
+        );
+        assert!(
+            !plan.contains("idx_artifacts_type"),
+            "{name}: an artifact index keyed by TYPE is keyed by the workspace's \
+             history: every plan or create-pr ever written matches it, and \
+             intersecting that set per job is the 90-second evaluation coming \
+             back:\n{plan}"
+        );
+    }
+
+    let rearm = query_plan(&db, &rearm_candidate_jobs_sql(), Vec::new()).await;
+    assert!(
+        rearm.contains("SEARCH j USING INDEX idx_jobs_issue_id") && !rearm.contains("SCAN jobs"),
+        "the boot re-arm is driven by the unresolved ISSUES and reaches their \
+         jobs by index; driving it from `jobs` walks every job ever run:\n{rearm}"
+    );
+}
+
+/// The cost the plan pin above protects, held at a scale where losing it
+/// shows: ~10k create-pr and plan artifacts on unrelated jobs, each carrying
+/// 8 KB of data so every row overflows, and an issue of 50 jobs where only one
+/// owns a reviewable head (the other 49 own confirmed plans, which are not
+/// reviewable). Resolving the producing job must cost that issue's artifacts.
+///
+/// Measured on a debug build (Linux arm64, shared executor): 7.4 ms with the
+/// covering index, 1.17 s with the same statement over a bare `artifacts a`,
+/// which the planner drives from `idx_artifacts_type`. The bound sits between
+/// them, far from both.
+#[tokio::test]
+async fn resolving_the_producing_job_costs_the_issue_not_the_workspace() {
+    const NOISE_ARTIFACTS: usize = 10_000;
+    const NOISE_JOBS: usize = 200;
+    const ISSUE_JOBS: usize = 50;
+    const BOUND_MS: u64 = 250;
+
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_artifact(&db, "create-pr", 1).await;
+    db.write(|conn| {
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                 VALUES('i-noise','p-rev',8,'Noise','active','active','none',1,1)",
+                (),
+            )
+            .await?;
+            for n in 0..NOISE_JOBS {
+                conn.execute(
+                    "INSERT INTO jobs(id, project_id, issue_id, status, node_name, created_at, updated_at)
+                     VALUES(?1,'p-rev','i-noise','complete','noise',1,1)",
+                    (format!("j-noise-{n}"),),
+                )
+                .await?;
+            }
+            // `j-watch` is the seed's second job on the issue.
+            for n in 2..ISSUE_JOBS {
+                let job = format!("j-issue-{n}");
+                conn.execute(
+                    "INSERT INTO jobs(id, project_id, issue_id, status, node_name, created_at, updated_at)
+                     VALUES(?1,'p-rev','i-rev','complete','other',?2,?2)",
+                    (job.as_str(), n as i64 + 10),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO artifacts
+                       (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+                     VALUES(?1,?2,'plan',1,'{}',1,'plan',1,1,1)",
+                    (format!("a-issue-{n}"), job.as_str()),
+                )
+                .await?;
+            }
+            let body = format!("{{\"pad\":\"{}\"}}", "x".repeat(8 * 1024));
+            for n in 0..NOISE_ARTIFACTS {
+                let kind = if n % 4 == 0 { "plan" } else { "create-pr" };
+                conn.execute(
+                    "INSERT INTO artifacts
+                       (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+                     VALUES(?1,?2,?3,1,?4,?5,?3,0,1,1)",
+                    (
+                        format!("a-noise-{n}"),
+                        format!("j-noise-{}", n % NOISE_JOBS),
+                        kind,
+                        body.as_str(),
+                        (n / NOISE_JOBS) as i64 + 1,
+                    ),
+                )
+                .await?;
+            }
+            Ok::<_, crate::storage::DbError>(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let producing = resolve_producing_job_for_issue(&db, "i-rev").await.unwrap();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "resolve_producing_job_for_issue over {NOISE_ARTIFACTS} noise artifacts: {elapsed:?}"
+    );
+
+    assert_eq!(
+        producing.as_deref(),
+        Some("j-prod"),
+        "j-prod owns the issue's only reviewable head; the others' plans are confirmed"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(BOUND_MS),
+        "one evaluation took {elapsed:?}: it is reading the workspace's create-pr \
+         and plan artifacts, not the issue's"
+    );
 }
 
 #[tokio::test]

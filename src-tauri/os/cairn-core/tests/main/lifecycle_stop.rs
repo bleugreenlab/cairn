@@ -698,6 +698,198 @@ async fn host_shutdown_stops_the_agent_process_it_spawned() {
     );
 }
 
+/// A stand-in agent that ignores SIGTERM, so `graceful_stop` spends its whole
+/// grace period on it before falling back to SIGKILL. The ignored disposition
+/// survives `exec`. Returns only once the trap is installed: a TERM that raced
+/// ahead of it would kill the shell at once and leave no window to observe.
+#[cfg(unix)]
+fn spawn_term_ignoring_child() -> std::process::Child {
+    use std::io::BufRead;
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "trap '' TERM; echo ready; exec sleep 30"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn a TERM-ignoring stand-in agent");
+    let mut line = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line.trim(), "ready");
+    child
+}
+
+#[cfg(unix)]
+fn register_real_child(
+    orch: &cairn_core::internal::orchestrator::Orchestrator,
+    run_id: &str,
+    child: std::process::Child,
+) {
+    let handle = cairn_core::internal::agent_process::process::RunHandle::new(
+        std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(RealChild(child))))),
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+        Some("session-1".to_string()),
+        Some("job-1".to_string()),
+    );
+    orch.process_state
+        .register_process(run_id.to_string(), handle)
+        .unwrap();
+}
+
+/// Starts killing `run_id` on the blocking pool and returns once its handle has
+/// left the registry while the kill is still waiting on the child. Each lookup
+/// takes the registry lock, so reaching the handle's absence quickly is itself
+/// the proof that the kill is not holding that lock across the stop.
+#[cfg(unix)]
+async fn kill_until_inside_graceful_stop(
+    orch: &cairn_core::internal::orchestrator::Orchestrator,
+    run_id: &str,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let kill = {
+        let orch = orch.clone();
+        let run_id = run_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            lifecycle::kill_session_with_reason(&orch, &run_id, "warm_evict")
+        })
+    };
+    let started = std::time::Instant::now();
+    while orch.process_state.has_process(run_id) != Some(false) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the killed run never left the registry"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the registry was unreadable for {elapsed:?}: the kill held its lock while stopping the child"
+    );
+    assert!(
+        !kill.is_finished(),
+        "the kill should still be waiting out the child's ignored SIGTERM"
+    );
+    kill
+}
+
+/// Reaps `pid`, a child of this test process, and returns its wait status, or
+/// `None` if it is still running after `within`. Signal 0 cannot answer this:
+/// a SIGKILLed child nobody has reaped is a zombie that still accepts it.
+#[cfg(unix)]
+fn reap_within(pid: u32, within: std::time::Duration) -> Option<libc::c_int> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        let mut status = 0;
+        // SAFETY: `status` is a valid out-pointer for the duration of the call.
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if reaped == pid as libc::pid_t {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn assert_killed_by_sigkill(pid: u32) {
+    let status = reap_within(pid, std::time::Duration::from_secs(2))
+        .expect("the kill must not return while its child is still running");
+    assert!(
+        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+        "the TERM-ignoring child should have been stopped by the SIGKILL fallback, got wait status {status}"
+    );
+}
+
+/// cairn/5789: every session's reader takes the process registry lock per
+/// stdout line, so a kill that holds it across `graceful_stop` (up to 3 s for a
+/// child that ignores SIGTERM) stalls every session on the host. Another
+/// session's reader must get through while a run is being killed, and the kill
+/// must still return only once its child is dead.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_reader_can_take_the_registry_while_another_run_is_being_killed() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+
+    let child = spawn_term_ignoring_child();
+    let pid = child.id();
+    register_real_child(&orch, "run-1", child);
+    orch.process_state
+        .register_process(
+            "run-2".to_string(),
+            cairn_core::internal::agent_process::process::RunHandle::test_handle(
+                Some("session-2"),
+                Some("job-2"),
+            ),
+        )
+        .unwrap();
+    assert!(orch.process_state.begin_turn("run-2", "turn-2"));
+
+    let kill = kill_until_inside_graceful_stop(&orch, "run-1").await;
+
+    let started = std::time::Instant::now();
+    let turn = orch.process_state.get_current_turn_id("run-2");
+    let waited = started.elapsed();
+    assert_eq!(turn.as_deref(), Some("turn-2"));
+    assert!(
+        waited < std::time::Duration::from_millis(250),
+        "another session's reader waited {waited:?} on the registry during a kill"
+    );
+    assert!(
+        !kill.is_finished(),
+        "the reader's lookup must have overlapped the stop"
+    );
+
+    kill.await.unwrap().unwrap();
+    assert_killed_by_sigkill(pid);
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("exited")
+    );
+}
+
+/// A kill owns only the handle it removed. A process registered under the same
+/// run id after that removal, while the old child is still being stopped, is a
+/// successor the old kill must leave running and registered.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kill_never_stops_a_process_registered_after_its_removal() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+
+    let predecessor = spawn_term_ignoring_child();
+    let predecessor_pid = predecessor.id();
+    register_real_child(&orch, "run-1", predecessor);
+
+    let kill = kill_until_inside_graceful_stop(&orch, "run-1").await;
+
+    let successor = std::process::Command::new("sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn a successor agent process");
+    let successor_pid = successor.id();
+    register_real_child(&orch, "run-1", successor);
+
+    kill.await.unwrap().unwrap();
+    assert_killed_by_sigkill(predecessor_pid);
+    assert_eq!(orch.process_state.has_process("run-1"), Some(true));
+    assert!(
+        process_alive(successor_pid),
+        "the old kill must not stop the process registered after it removed its handle"
+    );
+
+    assert!(orch.process_state.stop_and_remove("run-1"));
+    assert!(!process_alive(successor_pid));
+}
+
 /// The common case — an idle runner restarting — must cost nothing and report
 /// nothing, so the shutdown log stays quiet unless agents were actually stopped.
 #[tokio::test]

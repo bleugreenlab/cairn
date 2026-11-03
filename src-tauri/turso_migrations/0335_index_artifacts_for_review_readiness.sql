@@ -1,0 +1,26 @@
+-- lineage: shared
+-- cairn/5643: review readiness asks, per job, "does this job own a reviewable
+-- head": a create-pr artifact, or an unconfirmed plan, that heads its
+-- (job_id, output_name) version chain. Turso keeps no table statistics, and
+-- given that predicate's `artifact_type` terms it drove every per-job probe from
+-- `idx_artifacts_type`: for each job it walked every create-pr (12,117) and plan
+-- (3,342) row in the workspace, fetching each full row through its overflow
+-- pages (`confirmed`, `version` and `output_name` sit after `data`) before it
+-- could test `job_id`. On the 11-02 production clone that was 90 s p50 for the
+-- 119-job worst issue and 144 s for the boot re-arm; cairn/4207 is the same trap
+-- in the attention-push resolver.
+--
+-- This index answers the whole predicate from index entries, seeking by job.
+-- `orchestrator::lifecycle::review_push` names it with `INDEXED BY` from the
+-- predicate's single home, because the planner still prefers the type index
+-- when left to choose; after it the worst issue reads in 5 ms p50 and the
+-- re-arm in well under a second. `idx_artifacts_job_id` stays: it is narrower
+-- for the many `job_id`-only seeks.
+--
+-- Shared: `artifacts` is ProjectScoped and both lineages carry it, and
+-- `INDEXED BY` refuses a statement whose index is missing. On the 11-02 clone
+-- (43,953 artifacts, 33 GB database) the build took 49.6 s on a loaded machine,
+-- which is this migration's one-time startup cost: it reads every artifact row
+-- once, overflow pages included.
+CREATE INDEX IF NOT EXISTS idx_artifacts_job_review
+    ON artifacts (job_id, artifact_type, confirmed, output_name, version);

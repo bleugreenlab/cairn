@@ -596,15 +596,30 @@ pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str) {
 ///
 /// The single home of the predicate: "which job owns reviewable output", "which
 /// jobs re-arm at startup", and "what is reviewable" all splice it in, so they
-/// cannot disagree.
-const REVIEWABLE_ARTIFACT_PREDICATE: &str = "(a.artifact_type = 'create-pr'
-          OR (a.artifact_type = 'plan' AND a.confirmed = 0))
+/// cannot disagree. They read it over [`REVIEW_ARTIFACTS`], never a bare
+/// `artifacts a`.
+const REVIEWABLE_ARTIFACT_PREDICATE: &str = "a.artifact_type IN ('create-pr', 'plan')
+     AND (a.artifact_type = 'create-pr' OR a.confirmed = 0)
      AND NOT EXISTS (
-       SELECT 1 FROM artifacts newer
+       SELECT 1 FROM artifacts newer INDEXED BY idx_artifacts_output_job_version
        WHERE newer.job_id = a.job_id
          AND newer.output_name IS a.output_name
          AND newer.version > a.version
      )";
+
+/// The row source [`REVIEWABLE_ARTIFACT_PREDICATE`] is read over: one job's
+/// artifacts, through an index that covers every column the predicate tests.
+///
+/// The index is named because the planner, which keeps no statistics, otherwise
+/// drives any probe carrying `artifact_type` terms from `idx_artifacts_type`.
+/// That index is keyed by workspace history: every create-pr and plan ever
+/// written matches it, and each row it yields is fetched whole, overflow pages
+/// included, before `job_id` can be tested. Per job of an issue, that was a
+/// 90-second evaluation on a production clone (cairn/5643; cairn/4207 is the
+/// same trap in the attention-push resolver). The chain-head arm names 0306's
+/// index for the same reason, now that two indexes lead with `job_id`.
+/// `review_readiness_statements_seek_by_job` pins both seeks.
+const REVIEW_ARTIFACTS: &str = "artifacts a INDEXED BY idx_artifacts_job_review";
 
 /// Resolve the job that owns an issue's reviewable output — a create-pr /
 /// unconfirmed-plan artifact, or an open PR on the job's own branch. Mirrors the
@@ -612,7 +627,7 @@ const REVIEWABLE_ARTIFACT_PREDICATE: &str = "(a.artifact_type = 'create-pr'
 /// issue-scoped (no branch given): the pr-action node writes no reviewable
 /// artifact, so the artifact/worktree ordering excludes it. `None` when the issue
 /// has no reviewable output at all.
-async fn resolve_producing_job_for_issue(
+pub(super) async fn resolve_producing_job_for_issue(
     db: &crate::storage::LocalDb,
     issue_id: &str,
 ) -> Result<Option<String>, String> {
@@ -621,34 +636,7 @@ async fn resolve_producing_job_for_issue(
         let issue_id = issue_id.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(
-                    &format!(
-                        "SELECT j.id FROM jobs j
-                     WHERE j.issue_id = ?1
-                       AND (
-                         EXISTS (
-                           SELECT 1 FROM artifacts a
-                           WHERE a.job_id = j.id
-                             AND {REVIEWABLE_ARTIFACT_PREDICATE}
-                         )
-                         OR EXISTS (
-                           SELECT 1 FROM merge_requests mr
-                           WHERE mr.issue_id = ?1
-                             AND mr.source_branch = j.branch
-                             AND mr.status = 'open'
-                         )
-                       )
-                     ORDER BY
-                       CASE WHEN EXISTS (
-                         SELECT 1 FROM artifacts a
-                         WHERE a.job_id = j.id
-                           AND a.artifact_type IN ('create-pr', 'plan')
-                       ) THEN 0 ELSE 1 END,
-                       j.created_at DESC
-                     LIMIT 1"
-                    ),
-                    (issue_id.as_str(),),
-                )
+                .query(&resolve_producing_job_sql(), (issue_id.as_str(),))
                 .await?;
             match rows.next().await? {
                 Some(row) => Ok::<_, DbError>(Some(row.text(0)?)),
@@ -658,6 +646,35 @@ async fn resolve_producing_job_for_issue(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// [`resolve_producing_job_for_issue`]'s statement; `?1` is the issue id.
+pub(super) fn resolve_producing_job_sql() -> String {
+    format!(
+        "SELECT j.id FROM jobs j
+          WHERE j.issue_id = ?1
+            AND (
+              EXISTS (
+                SELECT 1 FROM {REVIEW_ARTIFACTS}
+                 WHERE a.job_id = j.id
+                   AND {REVIEWABLE_ARTIFACT_PREDICATE}
+              )
+              OR EXISTS (
+                SELECT 1 FROM merge_requests mr
+                 WHERE mr.issue_id = ?1
+                   AND mr.source_branch = j.branch
+                   AND mr.status = 'open'
+              )
+            )
+          ORDER BY
+            CASE WHEN EXISTS (
+              SELECT 1 FROM {REVIEW_ARTIFACTS}
+               WHERE a.job_id = j.id
+                 AND a.artifact_type IN ('create-pr', 'plan')
+            ) THEN 0 ELSE 1 END,
+            j.created_at DESC
+          LIMIT 1"
+    )
 }
 
 /// How many startup re-arm evaluations run at once. Enough that a runner with
@@ -1343,30 +1360,7 @@ async fn rearm_candidate_jobs(
 ) -> Result<Vec<(String, String)>, String> {
     db.read(|conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    &format!(
-                        "SELECT DISTINCT j.id, j.issue_id FROM jobs j
-                     JOIN issues i ON i.id = j.issue_id
-                     WHERE i.status NOT IN ('merged', 'closed')
-                       AND j.status IN ('idle', 'complete', 'failed', 'blocked', 'cancelled')
-                       AND (
-                         EXISTS (
-                           SELECT 1 FROM artifacts a
-                           WHERE a.job_id = j.id
-                             AND {REVIEWABLE_ARTIFACT_PREDICATE}
-                         )
-                         OR EXISTS (
-                           SELECT 1 FROM merge_requests mr
-                           WHERE mr.issue_id = j.issue_id
-                             AND mr.source_branch = j.branch
-                             AND mr.status = 'open'
-                         )
-                       )"
-                    ),
-                    (),
-                )
-                .await?;
+            let mut rows = conn.query(&rearm_candidate_jobs_sql(), ()).await?;
             let mut ids = Vec::new();
             while let Some(row) = rows.next().await? {
                 ids.push((row.text(0)?, row.text(1)?));
@@ -1376,6 +1370,34 @@ async fn rearm_candidate_jobs(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// [`rearm_candidate_jobs`]'s statement. It is driven from the unresolved
+/// ISSUES, reaching their jobs by index, for the same reason
+/// [`BOUNDED_REARM_CANDIDATES_SQL`] is: driving it from `jobs` walks every job
+/// ever run (23k on the 11-02 production clone) to keep the few hundred under
+/// live issues. `CROSS JOIN` states that order to a planner with no statistics.
+/// A job joins exactly one issue, so the rows are distinct without `DISTINCT`.
+pub(super) fn rearm_candidate_jobs_sql() -> String {
+    format!(
+        "SELECT j.id, j.issue_id FROM issues i
+          CROSS JOIN jobs j INDEXED BY idx_jobs_issue_id ON j.issue_id = i.id
+          WHERE i.status NOT IN ('merged', 'closed')
+            AND j.status IN ('idle', 'complete', 'failed', 'blocked', 'cancelled')
+            AND (
+              EXISTS (
+                SELECT 1 FROM {REVIEW_ARTIFACTS}
+                 WHERE a.job_id = j.id
+                   AND {REVIEWABLE_ARTIFACT_PREDICATE}
+              )
+              OR EXISTS (
+                SELECT 1 FROM merge_requests mr
+                 WHERE mr.issue_id = j.issue_id
+                   AND mr.source_branch = j.branch
+                   AND mr.status = 'open'
+              )
+            )"
+    )
 }
 
 /// The PR-open edge of the review push (CAIRN-2483). A builder that writes a
@@ -1725,20 +1747,7 @@ pub(crate) async fn review_artifact_ref(
             let job_id = job_id.clone();
             Box::pin(async move {
                 let mut rows = conn
-                    .query(
-                        &format!(
-                            "SELECT e.seq, j.uri_segment, parent.uri_segment, a.output_name, a.version, a.updated_at
-                         FROM artifacts a
-                         JOIN jobs j ON a.job_id = j.id
-                         JOIN executions e ON j.execution_id = e.id
-                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
-                         WHERE a.job_id = ?1
-                           AND {REVIEWABLE_ARTIFACT_PREDICATE}
-                         ORDER BY a.version DESC
-                         LIMIT 1"
-                        ),
-                        (job_id.as_str(),),
-                    )
+                    .query(&review_artifact_ref_sql(), (job_id.as_str(),))
                     .await?;
                 match rows.next().await? {
                     Some(row) => Ok::<_, DbError>(Some((
@@ -1780,4 +1789,21 @@ pub(crate) async fn review_artifact_ref(
             (uri, format!("artifact:{version}:{updated_at}"))
         },
     ))
+}
+
+/// [`review_artifact_ref`]'s statement; `?1` is the job id. It selects
+/// `updated_at`, which the index does not cover, so only the rows that pass the
+/// predicate (a job's chain heads) fetch their row.
+pub(super) fn review_artifact_ref_sql() -> String {
+    format!(
+        "SELECT e.seq, j.uri_segment, parent.uri_segment, a.output_name, a.version, a.updated_at
+           FROM {REVIEW_ARTIFACTS}
+           JOIN jobs j ON a.job_id = j.id
+           JOIN executions e ON j.execution_id = e.id
+           LEFT JOIN jobs parent ON j.parent_job_id = parent.id
+          WHERE a.job_id = ?1
+            AND {REVIEWABLE_ARTIFACT_PREDICATE}
+          ORDER BY a.version DESC
+          LIMIT 1"
+    )
 }

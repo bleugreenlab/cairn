@@ -1351,24 +1351,37 @@ pub fn kill_session_with_reason(
     cleanup_inline_commands(orch, run_id);
     cleanup_job_terminals(orch, run_id);
 
-    // Kill the process
+    // Remove the handle under the registry lock, but stop its child only after
+    // releasing it: `graceful_stop` can wait seconds on a child that ignores
+    // SIGTERM, and every session's reader takes this lock per stdout line.
+    //
     // A panic while another thread holds the registry must not strand durable
     // run state. The child handle may still be safely removed from a poisoned
     // mutex; more importantly, exit-reason persistence and finalization below
     // must remain unconditional.
-    let mut processes = orch
-        .process_state
-        .processes
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            log::error!(
-                "Process registry lock was poisoned while killing run {}; recovering to finalize it",
-                &run_id[..run_id.len().min(8)]
-            );
-            poisoned.into_inner()
-        });
+    let handle = {
+        let mut processes = orch
+            .process_state
+            .processes
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                log::error!(
+                    "Process registry lock was poisoned while killing run {}; recovering to finalize it",
+                    &run_id[..run_id.len().min(8)]
+                );
+                poisoned.into_inner()
+            });
+        let handle = processes.remove(run_id);
+        // `into_inner` repairs access for this caller but does not clear the
+        // mutex's poison bit. Clear it while the repaired registry is still
+        // locked: releasing first would let a successor observe stale poison, or
+        // let a new panic's poison be cleared without this caller inspecting
+        // that state.
+        orch.process_state.processes.clear_poison();
+        handle
+    };
 
-    if let Some(handle) = processes.remove(run_id) {
+    if let Some(handle) = handle {
         if let Ok(mut child_guard) = handle.child.lock() {
             if let Some(mut child) = child_guard.take() {
                 crate::agent_process::process::graceful_stop(&mut *child);
@@ -1376,15 +1389,6 @@ pub fn kill_session_with_reason(
             }
         }
     }
-
-    // `into_inner` repairs access for this caller but does not clear the mutex's
-    // poison bit. Clear it while the repaired registry is still locked: releasing
-    // first would let a successor observe stale poison, or let a new panic's
-    // poison be cleared without this caller inspecting that state.
-    orch.process_state.processes.clear_poison();
-
-    // Drop the lock before calling finalize_run (which also locks)
-    drop(processes);
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
     let final_status = if matches!(
