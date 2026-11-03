@@ -43,6 +43,33 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// wedged main thread can never hang a read indefinitely.
 const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Budget for the reachability probe a read runs once a page has failed to
+/// become interactive within [`READINESS_TIMEOUT`]. A loopback connect answers
+/// in microseconds and a LAN one in milliseconds, so this only bounds a
+/// resolver or a silently-dropped SYN; reaching it reports reachability as
+/// unknown rather than delaying the read further.
+const REACHABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The time budgets of one readiness-gated read. A value rather than the consts
+/// directly so the soft/hard/unreachable classification is unit-testable with
+/// tiny budgets.
+#[derive(Debug, Clone, Copy)]
+struct ReadBudgets {
+    readiness: Duration,
+    bridge: Duration,
+    open_ack: Duration,
+    probe: Duration,
+}
+
+impl ReadBudgets {
+    const STANDARD: Self = Self {
+        readiness: READINESS_TIMEOUT,
+        bridge: BRIDGE_TIMEOUT,
+        open_ack: OPEN_ACK_TIMEOUT,
+        probe: REACHABILITY_PROBE_TIMEOUT,
+    };
+}
+
 /// Resolve a browser resource URI to its owning scope plus slug. Node/task
 /// browsers resolve to the backing job; project browsers to the project row.
 async fn resolve_browser_scope(
@@ -570,6 +597,193 @@ fn bridge_failed_message(header: &str, url: &str) -> String {
     )
 }
 
+/// What a TCP connect says about a page that never became interactive.
+///
+/// A failed navigation has no representation in the nav pipeline (a refused
+/// load emits `Started` and never `Finished`), and the content script that
+/// feeds the network archive never runs on a page that never loaded, so
+/// nothing else observes the failure. The connect is the right instrument
+/// because it runs on the browser's own machine: the orchestrator is
+/// loopback-bound, and only the desktop attached to it as its local runner
+/// hosts its inline browsers (`docs/cairn-orch.md`, `docs/data-flow.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reachability {
+    /// Something accepted the connection, so the page is genuinely slow.
+    Reachable,
+    /// No address accepted and at least one refused: nothing is listening, so
+    /// the page cannot load however long the read waits.
+    Refused { authority: String, loopback: bool },
+    /// The probe could not decide; `reason` says why, for the reader.
+    Unknown { reason: String },
+}
+
+/// The host and port a page's URL would connect to.
+#[derive(Debug, Clone)]
+struct ProbeTarget {
+    host: url::Host<String>,
+    port: u16,
+    /// `host:port` as the reader should see it (IPv6 bracketed).
+    authority: String,
+}
+
+fn probe_target(url: Option<&str>) -> Result<ProbeTarget, String> {
+    let raw = url.ok_or_else(|| "the browser has no URL".to_string())?;
+    let parsed = url::Url::parse(raw).map_err(|error| format!("{raw} is not a URL ({error})"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "a {}: URL names no server to connect to",
+            parsed.scheme()
+        ));
+    }
+    let host = parsed
+        .host()
+        .ok_or_else(|| format!("{raw} has no host"))?
+        .to_owned();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| format!("{raw} has no port"))?;
+    let authority = format!("{host}:{port}");
+    Ok(ProbeTarget {
+        host,
+        port,
+        authority,
+    })
+}
+
+fn is_loopback_host(host: &url::Host<String>) -> bool {
+    match host {
+        url::Host::Domain(name) => name == "localhost" || name.ends_with(".localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    }
+}
+
+/// Resolve the target and try each address in turn. Any accepted connection is
+/// `Reachable`. Otherwise one refusal decides `Refused`: the other addresses
+/// failed too (an address family this machine lacks, say), so the browser has
+/// no route to a listener either. Failures with no refusal among them are
+/// reported as `Unknown` with the error, never as unreachable.
+async fn connect_probe(target: ProbeTarget) -> Reachability {
+    let addrs: Vec<std::net::SocketAddr> = match &target.host {
+        url::Host::Ipv4(ip) => vec![(*ip, target.port).into()],
+        url::Host::Ipv6(ip) => vec![(*ip, target.port).into()],
+        url::Host::Domain(name) => {
+            match tokio::net::lookup_host((name.as_str(), target.port)).await {
+                Ok(addrs) => addrs.collect(),
+                Err(error) => {
+                    return Reachability::Unknown {
+                        reason: format!("{name} did not resolve ({error})"),
+                    }
+                }
+            }
+        }
+    };
+    let mut refused = false;
+    let mut last_error = None;
+    for addr in addrs {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(_) => return Reachability::Reachable,
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => refused = true,
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if refused {
+        return Reachability::Refused {
+            loopback: is_loopback_host(&target.host),
+            authority: target.authority,
+        };
+    }
+    Reachability::Unknown {
+        reason: match last_error {
+            Some(error) => format!("connecting to {} failed ({error})", target.authority),
+            None => format!("{} resolved to no addresses", target.authority),
+        },
+    }
+}
+
+/// Probe whether the page's server accepts connections from this machine.
+/// Infallible by construction: every failure of the probe itself, including a
+/// URL with no host/port, a timeout, or a panic, is `Unknown`, so the probe can
+/// only add information to a read and never becomes a way for it to fail.
+async fn probe_reachability(url: Option<&str>, budget: Duration) -> Reachability {
+    match probe_target(url) {
+        Ok(target) => {
+            let authority = target.authority.clone();
+            bounded_probe(&authority, connect_probe(target), budget).await
+        }
+        Err(reason) => Reachability::Unknown { reason },
+    }
+}
+
+/// Run `probe` under `budget`, mapping every way it can fail to `Unknown`.
+async fn bounded_probe(
+    authority: &str,
+    probe: impl std::future::Future<Output = Reachability> + Send + 'static,
+    budget: Duration,
+) -> Reachability {
+    // Spawned so a panic inside the probe arrives here as a JoinError instead
+    // of unwinding through the read; aborted on timeout so a hung connect does
+    // not outlive it.
+    let mut probe = tokio::spawn(probe);
+    match tokio::time::timeout(budget, &mut probe).await {
+        Ok(Ok(reachability)) => reachability,
+        Ok(Err(error)) => Reachability::Unknown {
+            reason: format!("the probe of {authority} failed ({error})"),
+        },
+        Err(_) => {
+            probe.abort();
+            Reachability::Unknown {
+                reason: format!(
+                    "probing {authority} did not finish within {}ms",
+                    budget.as_millis()
+                ),
+            }
+        }
+    }
+}
+
+/// The message for a page that did not become interactive within the readiness
+/// budget, chosen by what the reachability probe observed. Only a refusal
+/// replaces the still-loading message, because only a refusal makes its
+/// "read again" advice wrong; an undecided probe keeps that message and says
+/// reachability is unknown rather than asserting either way.
+fn not_ready_message(header: &str, url: &str, reachability: &Reachability) -> String {
+    match reachability {
+        Reachability::Reachable => still_loading_message(header, url),
+        Reachability::Refused {
+            authority,
+            loopback,
+        } => {
+            let placement = if *loopback {
+                format!(
+                    " {authority} is a loopback address, so it names the browser's own machine; a server started by a `run` batch or terminal may be listening on another executor's loopback instead."
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{header}\n\n(The page at {url} cannot load: the machine the browser runs on was refused a connection to {authority}, so nothing is listening there. It has not loaded after {}s and more time will not change that. Start the server where this machine can reach it, then reload the browser.{placement})",
+                READINESS_TIMEOUT.as_secs()
+            )
+        }
+        Reachability::Unknown { reason } => format!(
+            "{}\n(Whether the server is reachable from the machine the browser runs on is unknown: {reason}.)",
+            still_loading_message(header, url)
+        ),
+    }
+}
+
+/// Probe the page's server and compose the not-ready message for `browser`.
+async fn page_not_ready_message(
+    header: &str,
+    browser: &JobBrowser,
+    probe_budget: Duration,
+) -> String {
+    let url = browser.url.as_deref().unwrap_or("(blank)");
+    let reachability = probe_reachability(browser.url.as_deref(), probe_budget).await;
+    not_ready_message(header, url, &reachability)
+}
+
 /// Send a read-path `OpenForRead` and await the host's ack on the reqId
 /// broadcast, so the caller knows the rehydrated webview is registered and (for a
 /// fresh create) its loading flag is established before it samples readiness,
@@ -620,19 +834,16 @@ async fn open_for_read(orch: &Orchestrator, browser: &JobBrowser, ack_timeout: D
 /// priming), and on a transport failure RE-checks the loading flag to close the
 /// rehydrate/cold-start race — a reload may have begun loading AFTER the first
 /// check. Returns the bridge response on a reply (the caller inspects
-/// `response.ok`), or a classified user-facing message (soft still-loading vs
-/// hard loaded-but-broken) already prefixed with `header`.
-///
-/// `readiness_timeout`/`bridge_timeout` are parameters rather than the consts
-/// directly so the soft/hard classification is unit-testable with tiny budgets.
+/// `response.ok`), or a classified user-facing message (still-loading,
+/// unreachable, or loaded-but-broken) already prefixed with `header`. A page
+/// that never becomes interactive is probed for reachability before the
+/// message is composed (see [`Reachability`]).
 async fn read_bridge_with_readiness(
     orch: &Orchestrator,
     browser: &JobBrowser,
     header: &str,
     request: &BridgeRequest,
-    readiness_timeout: Duration,
-    bridge_timeout: Duration,
-    open_ack_timeout: Duration,
+    budgets: ReadBudgets,
 ) -> Result<BridgeResponse, String> {
     let url = browser.url.as_deref().unwrap_or("(blank)");
     // Subscribe BEFORE the rehydrate Open so a fast page-load Finished cannot
@@ -645,34 +856,35 @@ async fn read_bridge_with_readiness(
     // cold rehydrate that closure both registers the webview (so BeginRenderPriming
     // and the bridge find it) and flags a freshly created one loading (so the gate
     // waits for the load instead of bridging a not-yet-loaded page).
-    open_for_read(orch, browser, open_ack_timeout).await;
+    open_for_read(orch, browser, budgets.open_ack).await;
 
     // If the page is loading, wait (bounded) for it to become interactive before
-    // bridging. No Finished within the readiness budget → soft still-loading.
+    // bridging. No Finished within the readiness budget → not ready, classified
+    // by reachability.
     if orch.is_browser_loading(&browser.id)
-        && await_browser_nav(&mut nav_rx, &browser.id, readiness_timeout, true)
+        && await_browser_nav(&mut nav_rx, &browser.id, budgets.readiness, true)
             .await
             .is_none()
     {
-        return Err(still_loading_message(header, url));
+        return Err(page_not_ready_message(header, browser, budgets.probe).await);
     }
 
-    match browser_bridge_roundtrip(orch, &browser.id, request, bridge_timeout).await {
+    match browser_bridge_roundtrip(orch, &browser.id, request, budgets.bridge).await {
         Ok(response) => Ok(response),
         Err(_) => {
             // Transport failed. Re-check the loading flag to close the
             // rehydrate/cold-start race: the Open above may have kicked off a
             // reload that started loading AFTER the first check.
             if orch.is_browser_loading(&browser.id) {
-                if await_browser_nav(&mut nav_rx, &browser.id, readiness_timeout, true)
+                if await_browser_nav(&mut nav_rx, &browser.id, budgets.readiness, true)
                     .await
                     .is_none()
                 {
-                    return Err(still_loading_message(header, url));
+                    return Err(page_not_ready_message(header, browser, budgets.probe).await);
                 }
                 // Retry once after a confirmed Finished; a second failure on a
                 // now-loaded page is a genuine bridge failure.
-                return browser_bridge_roundtrip(orch, &browser.id, request, bridge_timeout)
+                return browser_bridge_roundtrip(orch, &browser.id, request, budgets.bridge)
                     .await
                     .map_err(|_| bridge_failed_message(header, url));
             }
@@ -735,9 +947,7 @@ pub(crate) async fn render_browser(
         &browser,
         &header,
         &BridgeRequest::Extract { format },
-        READINESS_TIMEOUT,
-        BRIDGE_TIMEOUT,
-        OPEN_ACK_TIMEOUT,
+        ReadBudgets::STANDARD,
     )
     .await
     {
@@ -912,9 +1122,7 @@ pub(crate) async fn render_browser_console(
         &browser,
         &header,
         &BridgeRequest::GetConsole { limit },
-        READINESS_TIMEOUT,
-        BRIDGE_TIMEOUT,
-        OPEN_ACK_TIMEOUT,
+        ReadBudgets::STANDARD,
     )
     .await
     {
@@ -1069,9 +1277,7 @@ pub(crate) async fn render_browser_interactive(
         &browser,
         &header,
         &BridgeRequest::ListInteractive { limit },
-        READINESS_TIMEOUT,
-        BRIDGE_TIMEOUT,
-        OPEN_ACK_TIMEOUT,
+        ReadBudgets::STANDARD,
     )
     .await
     {
@@ -2042,6 +2248,214 @@ mod tests {
         }
     }
 
+    fn test_budgets(readiness: Duration, bridge: Duration, open_ack: Duration) -> ReadBudgets {
+        ReadBudgets {
+            readiness,
+            bridge,
+            open_ack,
+            probe: Duration::from_secs(2),
+        }
+    }
+
+    /// A loopback URL on a port nothing listens on: bound to reserve a free
+    /// port, then released, so a connect to it is refused.
+    fn refused_loopback_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/app")
+    }
+
+    /// Drive a read against a page that is loading and never finishes, so the
+    /// readiness gate always gives up and the reachability probe decides the
+    /// message.
+    async fn read_never_finishing_page(url: &str) -> String {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        orch.set_browser_loading("bid", true);
+        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let browser = browser_with_id("bid", url);
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            test_budgets(
+                Duration::from_millis(60),
+                Duration::from_millis(60),
+                Duration::from_millis(20),
+            ),
+        )
+        .await;
+        drop(orch);
+        join_host_drain(task).await;
+        res.expect_err("a page that never finishes loading cannot yield a bridge response")
+    }
+
+    /// A refused connection reads as unreachable, never as "wait and re-read":
+    /// re-reading can never load a page whose server is not listening.
+    #[tokio::test]
+    async fn read_readiness_refused_server_reads_as_unreachable() {
+        let url = refused_loopback_url();
+        let err = read_never_finishing_page(&url).await;
+        assert!(err.starts_with("# Browser main"), "{err}");
+        assert!(err.contains(&url), "{err}");
+        assert!(err.contains("refused"), "{err}");
+        assert!(err.contains("cannot load"), "{err}");
+        assert!(
+            !err.contains("Read again"),
+            "must not advise waiting: {err}"
+        );
+        assert!(
+            !err.contains("still loading"),
+            "must not read as slow: {err}"
+        );
+        assert!(
+            err.contains("loopback"),
+            "a loopback target names co-placement: {err}"
+        );
+    }
+
+    /// A URL with no host/port to probe still yields today's still-loading
+    /// message, with reachability reported unknown. This fails if a probe that
+    /// cannot run turns into a read failure or an unreachable verdict.
+    #[tokio::test]
+    async fn read_readiness_unprobeable_url_keeps_still_loading_and_says_unknown() {
+        for url in ["about:blank", "file:///tmp/index.html", "not a url"] {
+            let err = read_never_finishing_page(url).await;
+            assert!(
+                err.starts_with(&still_loading_message("# Browser main", url)),
+                "{url}: {err}"
+            );
+            assert!(err.contains("unknown"), "{url}: {err}");
+            assert!(!err.contains("refused"), "{url}: {err}");
+        }
+    }
+
+    /// A probe that hangs or panics is bounded and reported as unknown; neither
+    /// escapes into the read.
+    #[tokio::test]
+    async fn bounded_probe_maps_hang_and_panic_to_unknown() {
+        let hung = bounded_probe(
+            "127.0.0.1:1",
+            std::future::pending::<Reachability>(),
+            Duration::from_millis(30),
+        )
+        .await;
+        match hung {
+            Reachability::Unknown { reason } => {
+                assert!(reason.contains("did not finish within 30ms"), "{reason}")
+            }
+            other => panic!("a hung probe must be unknown, got {other:?}"),
+        }
+        async fn exploding_probe() -> Reachability {
+            panic!("probe exploded")
+        }
+        let panicked =
+            bounded_probe("127.0.0.1:1", exploding_probe(), Duration::from_secs(2)).await;
+        assert!(
+            matches!(panicked, Reachability::Unknown { .. }),
+            "a panicking probe must be unknown, got {panicked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_distinguishes_listening_from_refused() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        assert_eq!(
+            probe_reachability(Some(&live), Duration::from_secs(2)).await,
+            Reachability::Reachable
+        );
+        drop(listener);
+
+        let refused = refused_loopback_url();
+        let port = refused
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches("/app");
+        assert_eq!(
+            probe_reachability(Some(&refused), Duration::from_secs(2)).await,
+            Reachability::Refused {
+                authority: format!("127.0.0.1:{port}"),
+                loopback: true,
+            }
+        );
+        // A name resolving to several loopback addresses (localhost → ::1 and
+        // 127.0.0.1) is refused only when no address accepts.
+        let by_name = format!("http://localhost:{port}/");
+        assert!(
+            matches!(
+                probe_reachability(Some(&by_name), Duration::from_secs(2)).await,
+                Reachability::Refused { loopback: true, .. }
+            ),
+            "{by_name}"
+        );
+        assert!(matches!(
+            probe_reachability(None, Duration::from_secs(2)).await,
+            Reachability::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn probe_target_reads_host_port_and_loopback() {
+        let target = probe_target(Some("https://example.com/a")).unwrap();
+        assert_eq!(target.authority, "example.com:443");
+        assert!(!is_loopback_host(&target.host));
+        let target = probe_target(Some("http://[::1]:5470/")).unwrap();
+        assert_eq!(target.authority, "[::1]:5470");
+        assert!(is_loopback_host(&target.host));
+        let target = probe_target(Some("http://app.localhost:3000")).unwrap();
+        assert!(is_loopback_host(&target.host));
+        let target = probe_target(Some("http://192.168.1.4:8080")).unwrap();
+        assert_eq!(target.authority, "192.168.1.4:8080");
+        assert!(!is_loopback_host(&target.host));
+        assert!(probe_target(Some("about:blank")).is_err());
+        assert!(probe_target(None).is_err());
+    }
+
+    #[test]
+    fn not_ready_message_routes_on_reachability() {
+        let url = "http://localhost:5470/";
+        assert_eq!(
+            not_ready_message("# Browser main", url, &Reachability::Reachable),
+            still_loading_message("# Browser main", url),
+            "a reachable server keeps today's message verbatim"
+        );
+        let remote = not_ready_message(
+            "# Browser main",
+            "http://10.0.0.5:80/",
+            &Reachability::Refused {
+                authority: "10.0.0.5:80".to_string(),
+                loopback: false,
+            },
+        );
+        assert!(remote.contains("refused"), "{remote}");
+        assert!(!remote.contains("Read again"), "{remote}");
+        assert!(
+            !remote.contains("loopback"),
+            "a non-loopback target has no co-placement note: {remote}"
+        );
+        let unknown = not_ready_message(
+            "# Browser main",
+            url,
+            &Reachability::Unknown {
+                reason: "localhost did not resolve".to_string(),
+            },
+        );
+        assert!(
+            unknown.starts_with(&still_loading_message("# Browser main", url)),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("unknown: localhost did not resolve"),
+            "{unknown}"
+        );
+    }
+
     /// Part 1: a content-script bridge round-trip brackets the dispatch with
     /// BeginRenderPriming → Bridge → EndRenderPriming, in that order, so a
     /// backgrounded webview is held realized off-screen for the round-trip.
@@ -2194,32 +2608,20 @@ mod tests {
     }
 
     /// Part 2: a loading page that never becomes interactive within the
-    /// readiness budget reads as a SOFT still-loading message naming the url —
-    /// not a hard bridge failure.
+    /// readiness budget, served by something that accepts connections, reads as
+    /// the SOFT still-loading message naming the url, verbatim — not a hard
+    /// bridge failure and not an unreachable verdict.
     #[tokio::test]
     async fn read_readiness_still_loading_is_soft() {
-        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
-        orch.set_browser_loading("bid", true);
-        // Drain commands; never reply, never publish Finished.
-        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let browser = browser_with_id("bid", "http://localhost:5173/app");
-        let res = read_bridge_with_readiness(
-            &orch,
-            &browser,
-            "# Browser main",
-            &BridgeRequest::Extract {
-                format: BridgeFormat::Text,
-            },
-            Duration::from_millis(60),
-            Duration::from_millis(60),
-            Duration::from_millis(20),
-        )
-        .await;
-        let err = res.unwrap_err();
-        assert!(err.contains("still loading"), "{err}");
-        assert!(err.contains("http://localhost:5173/app"), "{err}");
-        drop(orch);
-        join_host_drain(task).await;
+        // Listening but never answering: the genuinely slow server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/app",
+            listener.local_addr().unwrap().port()
+        );
+        let err = read_never_finishing_page(&url).await;
+        assert_eq!(err, still_loading_message("# Browser main", &url));
+        drop(listener);
     }
 
     /// Part 2: a loading page that finishes within the readiness budget proceeds
@@ -2257,9 +2659,11 @@ mod tests {
             &BridgeRequest::Extract {
                 format: BridgeFormat::Text,
             },
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_millis(20),
+            test_budgets(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_millis(20),
+            ),
         )
         .await;
         let resp = res.expect("a finished page should read successfully");
@@ -2284,9 +2688,11 @@ mod tests {
             &BridgeRequest::Extract {
                 format: BridgeFormat::Text,
             },
-            Duration::from_millis(60),
-            Duration::from_millis(60),
-            Duration::from_millis(20),
+            test_budgets(
+                Duration::from_millis(60),
+                Duration::from_millis(60),
+                Duration::from_millis(20),
+            ),
         )
         .await;
         let err = res.unwrap_err();
@@ -2345,9 +2751,11 @@ mod tests {
             &BridgeRequest::Extract {
                 format: BridgeFormat::Text,
             },
-            Duration::from_secs(2),
-            Duration::from_millis(60),
-            Duration::from_millis(20),
+            test_budgets(
+                Duration::from_secs(2),
+                Duration::from_millis(60),
+                Duration::from_millis(20),
+            ),
         )
         .await;
         let resp = res.expect("the retry after the race should succeed");
@@ -2414,9 +2822,11 @@ mod tests {
             &BridgeRequest::Extract {
                 format: BridgeFormat::Text,
             },
-            Duration::from_secs(2),
-            Duration::from_millis(200),
-            Duration::from_secs(1),
+            test_budgets(
+                Duration::from_secs(2),
+                Duration::from_millis(200),
+                Duration::from_secs(1),
+            ),
         )
         .await;
         let resp = res.expect("cold read should wait for the open ack + load, then bridge");
