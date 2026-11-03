@@ -304,30 +304,18 @@ async fn load_execution_history(
     db: &LocalDb,
     execution_id: &str,
 ) -> DbResult<Option<(String, String, Option<(Vec<u8>, Vec<u8>)>)>> {
-    let execution_id = execution_id.to_string();
-    db.read(move |conn| {
-        let execution_id = execution_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT base_sha, tip_sha, pack, pack_idx
-                     FROM execution_history WHERE execution_id = ?1 LIMIT 1",
-                    (execution_id.as_str(),),
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            let base_sha = row.text(0)?;
-            let tip_sha = row.text(1)?;
-            let pack = match (row.opt_blob(2)?, row.opt_blob(3)?) {
-                (Some(pack), Some(idx)) => Some((pack, idx)),
-                _ => None,
-            };
-            Ok(Some((base_sha, tip_sha, pack)))
-        })
-    })
-    .await
+    let Some((base_sha, tip_sha)) = db
+        .query_opt(
+            "SELECT base_sha, tip_sha FROM execution_history WHERE execution_id = ?1 LIMIT 1",
+            (execution_id.to_string(),),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let pack = crate::storage::events::load_execution_pack(db, execution_id).await?;
+    Ok(Some((base_sha, tip_sha, pack)))
 }
 
 /// Resolve and render a node's own work as a diff. Returns `Ok(None)` when

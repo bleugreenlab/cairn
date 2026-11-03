@@ -2050,7 +2050,7 @@ pub(crate) fn system_prompt_placement(
 /// Segment kinds in an assembled system prompt's recorded boundary map. Every
 /// kind except [`SEGMENT_KIND_DYNAMIC`] is static across runs (a backend or app
 /// constant, the workspace doctrine, or an agent's role body) and is
-/// content-addressed into `archival_blobs` at teardown; the dynamic tail (the
+/// content-addressed into the content store at archival; the dynamic tail (the
 /// per-run orientation block) stays inline on the event.
 const SEGMENT_KIND_CAIRN: &str = "cairn";
 const SEGMENT_KIND_WORKSPACE: &str = "workspace";

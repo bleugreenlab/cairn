@@ -2942,6 +2942,22 @@ impl Orchestrator {
         }
     }
 
+    /// Run one archive offload pass over the private database: move the git
+    /// range packs and segment blobs it still holds inline into its file
+    /// archive. Team replicas hold none.
+    pub async fn run_archive_offload(&self) {
+        let report = crate::archival::offload::run_offload_pass(
+            &self.db.local,
+            crate::archival::offload::OffloadBudget::PRODUCTION,
+        )
+        .await;
+        if report.error.is_some() {
+            log::warn!("archive offload: {report}");
+        } else {
+            log::info!("archive offload: {report}");
+        }
+    }
+
     /// Run one retention evictor pass over the private database: delete what
     /// the `Evict` rules in `cairn_db::storage::retention` name, a page at a
     /// time, folding the logical log when the pass has grown it. Team replicas
@@ -3060,6 +3076,12 @@ impl Orchestrator {
     /// pass on an install with a backlog is a long catch-up that no other
     /// startup work should wait behind.
     pub fn spawn_archival_maintenance(&self) {
+        // The archive offload runs after each sweep, moving bytes still inline in
+        // the private database into its file archive. The operator can stop it
+        // without a rebuild, and the boot log says which way it went.
+        use crate::archival::offload::{offload_enabled, OFFLOAD_ENV};
+        let offload_setting = std::env::var(OFFLOAD_ENV).ok();
+        let offload = offload_enabled(offload_setting.as_deref());
         let orch = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(crate::archival::sweep::SWEEP_INTERVAL);
@@ -3069,6 +3091,35 @@ impl Orchestrator {
                 orch.run_archival_maintenance().await;
             }
         });
+        // The offload on the sweep's cadence, but first run well after boot:
+        // the minutes after a boot are already the busiest the database sees,
+        // and a first pass over a backlog moves gigabytes. It and the sweep
+        // serialize on the archival permit, so neither waits on the other's
+        // schedule.
+        use crate::archival::offload::FIRST_PASS_DELAY;
+        if offload {
+            log::info!(
+                "archive offload: on ({OFFLOAD_ENV}={offload_setting:?}), first pass in {FIRST_PASS_DELAY:?}, then every {:?}",
+                crate::archival::sweep::SWEEP_INTERVAL
+            );
+            let orch = self.clone();
+            tokio::spawn(async move {
+                let period = crate::archival::sweep::SWEEP_INTERVAL;
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + FIRST_PASS_DELAY,
+                    period,
+                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+                    orch.run_archive_offload().await;
+                }
+            });
+        } else {
+            log::warn!(
+                "archive offload: off ({OFFLOAD_ENV}={offload_setting:?}); inline archival bytes stay in the database"
+            );
+        }
         // The retention evictor beside it, on its own shorter interval: its
         // passes are bounded, so a backlog clears over many short passes rather
         // than one long one. The first pass waits a full interval so it never

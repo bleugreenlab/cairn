@@ -197,8 +197,9 @@ pub enum SinkKind {
     /// `message_stream_chunks` — the accumulator a streamed message is built
     /// from. Redundant once its event exists.
     StreamChunk,
-    /// `archival_blobs` and the content-addressed segment store — compressed
-    /// segments of events that were rewritten at teardown.
+    /// Segments of events rewritten at archival, addressed by their own hash:
+    /// in the content store, or (until the archive offload drains it) compressed
+    /// in `archival_blobs`.
     ArchivalBlob,
     /// The Tantivy full-text index.
     SearchIndex,

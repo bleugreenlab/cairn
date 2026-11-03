@@ -207,5 +207,9 @@ name = "export_project"
 required-features = ["internal-api"]
 
 [[example]]
+name = "archive_offload_clone"
+required-features = ["internal-api"]
+
+[[example]]
 name = "db_lock_probe"
 required-features = ["internal-api"]

@@ -129,6 +129,71 @@ pub struct DbState {
     content_store_factory: RwLock<Option<Arc<dyn ContentStoreFactory>>>,
 }
 
+/// Install the private database's archive: the file store its archived packs
+/// and segment blobs live in, rooted at the configured `archive.path` (by
+/// default `archive` in the Cairn home). Call once, after the private
+/// database's migrations and before anything archives or reconstructs.
+///
+/// The store creates its root only for a database that has never had an
+/// archive. Once one has been opened, `archival_progress` records it, and a
+/// missing root from then on is offline rather than recreated empty: the
+/// archive holds the only copy of what the database points into, so an empty
+/// stand-in would turn a lost archive into a quiet field of stubs. An offline
+/// root is installed all the same: archival fails and leaves rows `full`, and
+/// archived content reads as offline, until the root returns.
+pub async fn install_private_archive(local: &LocalDb, config_dir: &std::path::Path) {
+    use crate::archival::progress;
+    let root = crate::config::settings::load_archive_settings(config_dir).root(config_dir);
+    let recorded = match progress::load(local, progress::ARCHIVE_ROOT).await {
+        Ok(saved) => saved.cursor,
+        Err(error) => {
+            // Unknown history: never create.
+            log::warn!("archive: reading the recorded archive root failed: {error}");
+            Some(String::new())
+        }
+    };
+    let store = match &recorded {
+        Some(_) => crate::storage::FileContentStore::open_existing(&root),
+        None => crate::storage::FileContentStore::open(&root),
+    };
+    match store.status() {
+        Ok(()) => {
+            log::info!("archive: {} online", root.display());
+            let root_text = root.display().to_string();
+            if recorded.as_deref() != Some(root_text.as_str()) {
+                let saved = progress::save(
+                    local,
+                    progress::ARCHIVE_ROOT,
+                    &progress::Progress {
+                        watermark: None,
+                        cursor: Some(root_text),
+                    },
+                )
+                .await;
+                if let Err(error) = saved {
+                    log::warn!("archive: recording the archive root failed: {error}");
+                }
+            }
+        }
+        Err(error) => match recorded.as_deref().filter(|previous| !previous.is_empty()) {
+            Some(previous) => log::warn!(
+                "archive: {error}; this database keeps archived bytes in an archive (last opened at \
+                 {previous}). Archival is paused and archived content reads as offline until that \
+                 archive is at {} again; to start an empty archive there instead, create the \
+                 directory with an empty `{}` file in it",
+                root.display(),
+                crate::storage::content_store::ARCHIVE_MARKER,
+            ),
+            None => log::warn!(
+                "archive: {error}; archival is paused and archived content reads as offline until it returns"
+            ),
+        },
+    }
+    if local.set_private_content_store(Arc::new(store)).is_err() {
+        log::warn!("archive: the private database already has a content store; keeping it");
+    }
+}
+
 impl DbState {
     pub fn new(local: Arc<LocalDb>, search_index: Arc<SearchIndex>) -> Self {
         Self {
@@ -1101,6 +1166,58 @@ mod tests {
         DbState::new(local, index)
     }
 
+    /// A storeless private database on a temp path, as `init_database` opens it.
+    async fn storeless_private_db(dir: &std::path::Path) -> LocalDb {
+        let db = LocalDb::open(dir.join("cairn.db")).await.unwrap();
+        MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// The first boot creates the archive and records it; a later boot that
+    /// finds it gone leaves it gone and reads offline, rather than standing an
+    /// empty archive in for the one the database points into.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_archive_is_never_recreated_once_one_was_used() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("archive");
+        {
+            let db = storeless_private_db(home.path()).await;
+            install_private_archive(&db, home.path()).await;
+            assert!(db.content_store().is_some());
+            assert!(root
+                .join(crate::storage::content_store::ARCHIVE_MARKER)
+                .is_file());
+        }
+        std::fs::rename(&root, home.path().join("moved-away")).unwrap();
+
+        let db = storeless_private_db(home.path()).await;
+        install_private_archive(&db, home.path()).await;
+        let store = db.content_store().unwrap();
+        let error = store
+            .get(&crate::storage::content_store::content_hash(b"x"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::storage::ContentStoreError::Offline { .. }),
+            "{error}"
+        );
+        assert!(!root.exists(), "no empty stand-in");
+
+        // Returned, it is online again at the next boot.
+        std::fs::rename(home.path().join("moved-away"), &root).unwrap();
+        let db = storeless_private_db(home.path()).await;
+        install_private_archive(&db, home.path()).await;
+        assert!(db
+            .content_store()
+            .unwrap()
+            .get(&crate::storage::content_store::content_hash(b"x"))
+            .await
+            .is_ok());
+    }
+
     async fn migrated_team_db(name: &str) -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
         let db = LocalDb::open(temp.keep().join(name)).await.unwrap();
@@ -1158,7 +1275,7 @@ mod tests {
         let repo_path = repo.path().to_string_lossy().to_string();
 
         team_db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "
                 INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamABC123', 'Team', 1, 1);
                 INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)

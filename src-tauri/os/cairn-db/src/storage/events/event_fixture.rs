@@ -203,7 +203,7 @@ pub fn system_init_codex(session_id: &str) -> String {
 /// A `system:prompt` event's `data` exactly as `persist_system_prompt_event`
 /// records it: the concatenated `content`, plus `raw.hash` and a `raw.segments`
 /// boundary map of `{kind, byteOffset, byteLen}`. Every kind but `dynamic` is
-/// static across runs and content-addresses once into `archival_blobs`; the
+/// static across runs and content-addresses once into the content store; the
 /// `dynamic` tail inlines. Returns `(data, full_content)`. Shared by the archival
 /// rewrite and backfill tests so both writers exercise the identical anatomy.
 pub fn system_prompt(segments: &[(&str, &str)]) -> (String, String) {

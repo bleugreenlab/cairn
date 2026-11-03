@@ -15,7 +15,7 @@ pub enum PackKind {
 /// Each invocation handles a bounded batch so team-open latency is capped; later
 /// opens continue where the prior pass stopped.
 pub async fn backfill_execution_pack_catalog(db: &LocalDb, limit: usize) -> DbResult<usize> {
-    let Some(store) = db.team_content_store().cloned() else {
+    let Some(store) = db.content_store().cloned() else {
         return Ok(0);
     };
     let rows = db
@@ -54,7 +54,11 @@ pub async fn backfill_execution_pack_catalog(db: &LocalDb, limit: usize) -> DbRe
         .await?;
     let mut published = 0;
     for (execution_id, base, tip, hash, project_id, repository_id) in rows {
-        let bytes = match store.get(&hash).await.map_err(super::DbError::internal)? {
+        let bytes = match store
+            .get(&hash)
+            .await
+            .map_err(|error| super::DbError::internal(error.to_string()))?
+        {
             Some(bytes) if content_hash(&bytes) == hash => bytes,
             Some(_) => {
                 record_backfill_attempt(db, &execution_id, &hash, "invalid").await?;

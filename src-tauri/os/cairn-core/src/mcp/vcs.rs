@@ -873,11 +873,20 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ContentStore for RefusingContentStore {
-            async fn put(&self, _hash: &str, _bytes: &[u8]) -> Result<(), String> {
-                Err("content store offline".into())
+            async fn put(
+                &self,
+                _hash: &str,
+                _bytes: &[u8],
+            ) -> Result<(), crate::storage::ContentStoreError> {
+                Err(crate::storage::ContentStoreError::Remote(
+                    "content store offline".into(),
+                ))
             }
 
-            async fn get(&self, _hash: &str) -> Result<Option<Vec<u8>>, String> {
+            async fn get(
+                &self,
+                _hash: &str,
+            ) -> Result<Option<Vec<u8>>, crate::storage::ContentStoreError> {
                 Ok(None)
             }
         }

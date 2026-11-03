@@ -371,7 +371,7 @@ async fn execution_spanning_two_branches_archives_each_against_its_own() {
     );
     let (base, tip, has_pack) = db
         .query_one(
-            "SELECT base_sha, tip_sha, pack IS NOT NULL FROM execution_history WHERE execution_id = 'exec'",
+            "SELECT base_sha, tip_sha, pack_hash IS NOT NULL FROM execution_history WHERE execution_id = 'exec'",
             (),
             |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)? == 1)),
         )

@@ -38,6 +38,7 @@
 //! cost to the inventory; rotation ends the ability to find what is left behind.
 //! The ordering is not a preference, it is forced.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -188,8 +189,9 @@ pub async fn take_inventory_in(
 ) -> DbResult<Inventory> {
     let mut records = Vec::new();
 
-    records.extend(scan_transcript_events(db, snapshot, secret).await?);
-    records.extend(scan_archival_blobs(db, snapshot, secret).await?);
+    let (transcripts, segments) = scan_transcript_events(db, snapshot, secret).await?;
+    records.extend(transcripts);
+    records.extend(scan_archival_segments(db, snapshot, secret, segments).await?);
     for spec in SCANNED_TABLES {
         records.extend(scan_text_column(db, snapshot, secret, *spec).await?);
     }
@@ -334,11 +336,17 @@ async fn scan_text_column(
 /// a `gitcoord` row points at is the repository's own history, which is an
 /// [`SinkKind::ExternalCopy`] concern and is reported as manual rather than
 /// silently half-scanned.
+///
+/// Also returns every segment-blob hash the archived `blobbed` rows reference
+/// (a system prompt's static segments, a system init's skeleton and tool set),
+/// so [`scan_archival_segments`] can scan the ones held in the content store.
+/// The rows are not reconstructed here: a blobbed row's `data` is the stub that
+/// names its hashes.
 async fn scan_transcript_events(
     db: &LocalDb,
     snapshot: &Arc<RegistrySnapshot>,
     secret: &SecretId,
-) -> DbResult<Vec<AffectedRecord>> {
+) -> DbResult<(Vec<AffectedRecord>, BTreeSet<String>)> {
     let snapshot = Arc::clone(snapshot);
     let secret = secret.clone();
     db.read(move |conn| {
@@ -346,12 +354,22 @@ async fn scan_transcript_events(
         let secret = secret.clone();
         Box::pin(async move {
             let mut out = Vec::new();
+            let mut segments = BTreeSet::new();
             let mut rows = conn
-                .query("SELECT id, data, data_blob, codec FROM events", ())
+                .query(
+                    "SELECT id, data, data_blob, codec, storage_mode, content_commit FROM events",
+                    (),
+                )
                 .await?;
             while let Some(row) = rows.next().await? {
                 let id = row.text(0)?;
-                let mut occurrences = count_occurrences(&snapshot, &secret, &row.text(1)?);
+                let data = row.text(1)?;
+                let blobbed =
+                    row.opt_text(4)?.as_deref() == Some("gitcoord") && row.opt_text(5)?.is_none();
+                if blobbed {
+                    segments.extend(cairn_db::storage::events::segment_hashes(&data));
+                }
+                let mut occurrences = count_occurrences(&snapshot, &secret, &data);
                 if let Some(blob) = row.opt_blob(2)? {
                     let codec = row
                         .opt_text(3)?
@@ -368,57 +386,96 @@ async fn scan_transcript_events(
                     });
                 }
             }
-            DbResult::Ok(out)
+            DbResult::Ok((out, segments))
         })
     })
     .await
 }
 
-/// Scan the content-addressed archival segment blobs.
+/// `archival_blobs` rows read per page while scanning them.
+const SEGMENT_PAGE_ROWS: i64 = 100;
+
+/// Scan the content-addressed archival segment blobs, wherever they live.
 ///
-/// These are the static segments of a system prompt, moved out of their events
-/// at teardown and deduplicated by hash. A credential interpolated into a system
-/// prompt lands here, shared by every run whose prompt hashed the same — which
-/// is why the blob is addressed and quarantined by its own hash rather than
-/// through any one event.
-async fn scan_archival_blobs(
+/// These are the static segments of a system prompt (and a system init's
+/// skeleton and tool set), moved out of their events at archival and
+/// deduplicated by hash. A credential interpolated into a system prompt lands
+/// here, shared by every run whose prompt hashed the same — which is why the
+/// blob is addressed and quarantined by its own hash rather than through any
+/// one event, and why the read gate withholds by that hash whichever store
+/// served it.
+///
+/// Two homes, each segment counted once: the rows still in `archival_blobs`
+/// (compressed, draining into the file archive), paged by hash; then every
+/// `referenced` hash not found there, fetched from the content store. A
+/// referenced segment the store cannot produce because it is offline or
+/// failing fails the inventory rather than reading as clean.
+async fn scan_archival_segments(
     db: &LocalDb,
     snapshot: &Arc<RegistrySnapshot>,
     secret: &SecretId,
+    referenced: BTreeSet<String>,
 ) -> DbResult<Vec<AffectedRecord>> {
-    let snapshot = Arc::clone(snapshot);
-    let secret = secret.clone();
-    db.read(move |conn| {
-        let snapshot = Arc::clone(&snapshot);
-        let secret = secret.clone();
-        Box::pin(async move {
-            let mut out = Vec::new();
-            let mut rows = conn
-                .query("SELECT hash, content FROM archival_blobs", ())
+    let mut out = Vec::new();
+    let segment = |hash: String, bytes: &[u8]| {
+        let occurrences = count_occurrences_bytes(snapshot, secret, bytes);
+        (occurrences > 0).then_some(AffectedRecord {
+            sink: SinkKind::ArchivalBlob,
+            locator: hash,
+            occurrences,
+        })
+    };
+
+    // A team replica has no `archival_blobs` table.
+    let mut in_table: HashSet<String> = HashSet::new();
+    if db.team_content_store().is_none() {
+        let mut after = String::new();
+        loop {
+            let page: Vec<(String, Option<Vec<u8>>)> = db
+                .query_all(
+                    "SELECT hash, content FROM archival_blobs WHERE hash > ?1
+                     ORDER BY hash LIMIT ?2",
+                    (after.clone(), SEGMENT_PAGE_ROWS),
+                    |row| Ok((row.text(0)?, row.opt_blob(1)?)),
+                )
                 .await?;
-            while let Some(row) = rows.next().await? {
-                let hash = row.text(0)?;
-                let Some(blob) = row.opt_blob(1)? else {
+            let Some(last) = page.last().map(|(hash, _)| hash.clone()) else {
+                break;
+            };
+            for (hash, blob) in page {
+                in_table.insert(hash.clone());
+                let Some(blob) = blob else {
                     continue;
                 };
-                let Ok(bytes) =
+                if let Ok(bytes) =
                     cairn_db::storage::decompress(cairn_db::storage::CODEC_ZSTD_V1, &blob)
-                else {
-                    continue;
-                };
-                let occurrences = count_occurrences_bytes(&snapshot, &secret, &bytes);
-                if occurrences > 0 {
-                    out.push(AffectedRecord {
-                        sink: SinkKind::ArchivalBlob,
-                        locator: hash,
-                        occurrences,
-                    });
+                {
+                    out.extend(segment(hash, &bytes));
                 }
             }
-            DbResult::Ok(out)
-        })
-    })
-    .await
+            after = last;
+        }
+    }
+
+    let Some(store) = db.content_store() else {
+        return Ok(out);
+    };
+    for hash in referenced {
+        if in_table.contains(&hash) {
+            continue;
+        }
+        match store.get(&hash).await {
+            Ok(Some(bytes)) => out.extend(segment(hash, &bytes)),
+            // Gone from every home: nothing left to serve or scan.
+            Ok(None) => {}
+            Err(error) => {
+                return Err(cairn_db::storage::DbError::internal(format!(
+                    "archival segment {hash} could not be scanned: {error}"
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Scan the rotated JSONL logs and the runner's stderr file.
@@ -658,6 +715,90 @@ mod tests {
         // The record names where, not what. There is no field to check for the
         // value because there is no such field.
         assert!(!record.locator.contains(VALUE));
+    }
+
+    /// A credential interpolated into a system prompt lands in a segment the
+    /// file archive holds. The inventory finds it there, reports it once by its
+    /// hash even while a not-yet-offloaded `archival_blobs` copy also exists,
+    /// and the read gate withholds it by that hash.
+    #[tokio::test]
+    async fn a_secret_in_a_store_held_segment_is_found_once_and_withheld() {
+        use crate::archival::rewrite::testsupport::{
+            archive, insert_event, load_events, migrated_test_db, seed_chain, system_prompt,
+        };
+        use cairn_db::storage::quarantine::{quarantine, QuarantineSet, ARCHIVAL_BLOB_SINK};
+
+        let (registry, secret) = registry_with("prompt-key", VALUE);
+        let snapshot = registry.snapshot();
+        let db = migrated_test_db("remediation-store-segment.db").await;
+        seed_chain(&db, "/nonexistent", false).await;
+        let leaked = format!("use key {VALUE} for the provider. ").repeat(20);
+        let (prompt, _) = system_prompt(&[
+            ("backend_base", &"BACKEND-BASE ".repeat(200)),
+            ("cairn", leaked.as_str()),
+            ("dynamic", "\n\ncwd=/work"),
+        ]);
+        insert_event(&db, "sp", "run", 1, 1, "system:prompt", &prompt).await;
+        archive(&db, None).await.unwrap();
+        let hash = cairn_db::storage::content_store::content_hash(leaked.as_bytes());
+        assert!(db
+            .content_store()
+            .unwrap()
+            .get(&hash)
+            .await
+            .unwrap()
+            .is_some());
+
+        let roots = InventoryRoots {
+            log_dir: tempfile::tempdir().unwrap().keep(),
+            scratch_root: tempfile::tempdir().unwrap().keep(),
+        };
+        let found = take_inventory_in(&db, &snapshot, &secret, &roots)
+            .await
+            .unwrap();
+        let segments: Vec<&AffectedRecord> = found
+            .records
+            .iter()
+            .filter(|record| record.sink == SinkKind::ArchivalBlob)
+            .collect();
+        assert_eq!(segments.len(), 1, "{:?}", found.records);
+        assert_eq!(segments[0].locator, hash);
+        assert_eq!(segments[0].occurrences, 20);
+
+        // The same segment also still in archival_blobs: still one record.
+        db.execute(
+            "INSERT INTO archival_blobs(hash, content, created_at) VALUES (?1, ?2, 1)",
+            (
+                hash.clone(),
+                cairn_db::turso::Value::Blob(
+                    cairn_db::storage::compress(leaked.as_bytes()).unwrap(),
+                ),
+            ),
+        )
+        .await
+        .unwrap();
+        let again = take_inventory_in(&db, &snapshot, &secret, &roots)
+            .await
+            .unwrap();
+        let count = again
+            .records
+            .iter()
+            .filter(|record| record.sink == SinkKind::ArchivalBlob)
+            .count();
+        assert_eq!(count, 1, "never double-counted");
+
+        quarantine().install_for(
+            db.path(),
+            QuarantineSet::from_entries([(
+                ARCHIVAL_BLOB_SINK.to_string(),
+                hash.clone(),
+                "incident-store-segment".to_string(),
+            )]),
+        );
+        let served = cairn_db::storage::reconstruct_events(&db, load_events(&db).await).await;
+        assert!(!served[0].data.contains(VALUE), "withheld on read");
+        assert!(served[0].data.contains("incident-store-segment"));
+        quarantine().install_for(db.path(), QuarantineSet::from_entries(Vec::new()));
     }
 
     #[test]

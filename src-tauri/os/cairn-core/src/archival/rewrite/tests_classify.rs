@@ -255,23 +255,23 @@ async fn empty_range_archives_with_null_pack() {
         .unwrap();
     assert_eq!(summary.gitcoord_read, 1);
 
-    // The execution_history row exists with a NULL pack.
+    // The execution_history row exists with no pack, inline or stored.
     let pack_is_null = db
         .read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT pack FROM execution_history WHERE execution_id = 'exec'",
+                        "SELECT pack, pack_hash FROM execution_history WHERE execution_id = 'exec'",
                         (),
                     )
                     .await?;
                 let row = rows.next().await?.unwrap();
-                DbResult::Ok(row.opt_blob(0)?.is_none())
+                DbResult::Ok(row.opt_blob(0)?.is_none() && row.opt_text(1)?.is_none())
             })
         })
         .await
         .unwrap();
-    assert!(pack_is_null, "empty range stores a NULL pack");
+    assert!(pack_is_null, "empty range stores no pack");
 
     let events = load_events(&db).await;
     let reconstructed = reconstruct_events(&db, events).await;
@@ -473,4 +473,68 @@ fn strip_change_payloads_drops_payload_keeps_skeleton() {
         "payload dropped"
     );
     assert_eq!(input["commit_msg"], "w", "call skeleton kept");
+}
+
+/// The paged load returns the execution's events in `(created_at, sequence)`
+/// order across all its runs, with exact ties broken by insertion (rowid), and
+/// pages past one batch without dropping or repeating a row.
+#[tokio::test]
+async fn paged_load_orders_across_runs_with_ties_broken_by_rowid() {
+    let db = migrated_test_db("archival-load-order.db").await;
+    seed_chain(&db, "/nonexistent", true).await;
+    // Interleaved runs, with tied (created_at, sequence) pairs across them
+    // (`(run_id, sequence)` is unique, so a tie is always across runs).
+    insert_event(&db, "t2", "taskrun", 1, 5, "user", &user_text("t2")).await;
+    insert_event(&db, "m1", "run", 1, 5, "user", &user_text("m1")).await;
+    insert_event(&db, "m0", "run", 0, 1, "user", &user_text("m0")).await;
+    insert_event(&db, "m2", "run", 2, 9, "user", &user_text("m2")).await;
+    insert_event(&db, "t1", "taskrun", 0, 9, "user", &user_text("t1")).await;
+    insert_event(&db, "t3", "taskrun", 2, 9, "user", &user_text("t3")).await;
+    let batch = crate::storage::RECONSTRUCT_BATCH_ROWS as i64;
+    for n in 0..batch + 10 {
+        let id = format!("bulk{n:04}");
+        insert_event(&db, &id, "run", 100 + n, 100, "user", &user_text(&id)).await;
+    }
+
+    let loaded = load(&db, "exec").await.unwrap().unwrap();
+    let ids: Vec<String> = loaded.events.iter().map(|e| e.id.clone()).collect();
+    let expected: Vec<String> = db
+        .query_all(
+            "SELECT id FROM events ORDER BY created_at ASC, sequence ASC, rowid ASC",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, expected);
+    assert_eq!(
+        &ids[..6],
+        ["m0", "t2", "m1", "t1", "m2", "t3"],
+        "chronological across runs; (5, 1) and (9, 2) ties in insertion order"
+    );
+    assert_eq!(ids.len() as i64, 6 + batch + 10);
+}
+
+/// A database with no content store archives nothing, and says why.
+#[tokio::test]
+async fn archive_without_a_store_archives_nothing_and_names_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LocalDb::open(dir.path().join("storeless.db"))
+        .await
+        .unwrap();
+    crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+        .run(&db)
+        .await
+        .unwrap();
+    assert!(db.content_store().is_none());
+    seed_chain(&db, "/nonexistent", false).await;
+    insert_event(&db, "u1", "run", 1, 1, "user", &user_text("hi")).await;
+
+    let error = archive(&db, None).await.unwrap_err();
+    assert!(error.contains("no content store"), "{error}");
+    assert_eq!(
+        storage_mode(&db, "u1").await.as_deref(),
+        Some("full"),
+        "the row stays full"
+    );
 }

@@ -1,22 +1,24 @@
-//! The shared per-team content store: the canonical archival home for heavy
-//! team-run content (the per-execution range pack and the content-addressed
-//! system-prompt/init blobs), fetched on demand by hash.
+//! Content stores: the archival home for heavy execution content (the
+//! per-execution range pack and the content-addressed system-prompt/init
+//! blobs), fetched on demand by hash.
 //!
-//! For a team run, `crate::archival::rewrite::archive_execution` offloads those
-//! bytes to the store keyed by their content hash instead of inlining them into
-//! the synced replica; the replica keeps only rows, git coordinates, and hash
-//! pointers. On read, [`crate::storage::events::reconstruct`] fetches the bytes
-//! back by hash. Local runs never
-//! touch a store — their bytes stay inline in the private DB exactly as before.
+//! Archival (`archival::rewrite::archive_execution` in cairn-core) puts those
+//! bytes to the database's store keyed by their content hash, and the database
+//! keeps only rows, git coordinates, and hash pointers. On read,
+//! [`crate::storage::events::reconstruct`] fetches the bytes back by hash.
+//! [`LocalDb::content_store`] names the store: a team replica's is the shared
+//! per-team store, and the private database's is a [`FileContentStore`] in a
+//! directory beside it.
 //!
 //! The single seam is the [`ContentStore`] trait: a content-addressed
-//! `put(hash, bytes)` / `get(hash)`. The production implementation (a
-//! broker-backed store living in the account layer) proxies bytes through the
-//! api/ broker on the SAME auth boundary as team sync (a per-request minted sync
-//! token), backed by S3 in prod and a filesystem dir in dev. Swapping the broker
-//! for presigned S3 URLs later changes only that trait's impl and one broker
-//! route, never the archival call sites. Tests inject [`InMemoryContentStore`].
+//! `put(hash, bytes)` / `get(hash)`. The team implementation (a broker-backed
+//! store living in the account layer) proxies bytes through the api/ broker on
+//! the SAME auth boundary as team sync (a per-request minted sync token), backed
+//! by S3 in prod and a filesystem dir in dev. Swapping the broker for presigned
+//! S3 URLs later changes only that trait's impl and one broker route, never the
+//! archival call sites. Tests inject [`InMemoryContentStore`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -48,19 +50,40 @@ pub fn content_hash(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+mod file;
+pub use file::{FileContentStore, ARCHIVE_MARKER};
+
+/// Why a content store could not answer.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ContentStoreError {
+    /// The store's home is not there: a file store whose root has no marker or
+    /// cannot be read (an unmounted volume, a moved directory). Readers render
+    /// this as their labeled stub, naming the path.
+    #[error("archive offline: {}", path.display())]
+    Offline { path: PathBuf },
+    /// A local read or write failed.
+    #[error("content store io: {0}")]
+    Io(String),
+    /// A remote store (the team broker) refused or could not be reached.
+    #[error("{0}")]
+    Remote(String),
+}
+
 /// A content-addressed byte store. Both methods key on a caller-computed hash;
 /// the store itself never interprets the bytes.
 #[async_trait]
 pub trait ContentStore: Send + Sync {
     /// Store `bytes` under `hash`. Idempotent: content-addressed, so re-putting an
     /// existing key is a no-op (this is what makes cross-member dedup free).
-    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String>;
+    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), ContentStoreError>;
     /// Fetch the bytes for `hash`. `Ok(None)` means not found.
-    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
+    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, ContentStoreError>;
 }
 
-/// The database's own content store: the brokered team store on a team
-/// replica, and the durable `cas_cache` table on the private database.
+/// The attachment byte store: the brokered team store on a team replica, and
+/// the durable `cas_cache` table on the private database, where it holds the
+/// authoritative bytes of local attachments. Archival does not use these; it
+/// goes through [`LocalDb::content_store`].
 impl LocalDb {
     /// Store `bytes` under `hash`. Idempotent, like [`ContentStore::put`].
     ///
@@ -73,7 +96,7 @@ impl LocalDb {
     /// concurrent commits that every other writer in the process produces.
     pub async fn put_content(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
         if let Some(store) = self.team_content_store() {
-            return store.put(hash, bytes).await;
+            return store.put(hash, bytes).await.map_err(|e| e.to_string());
         }
         self.execute(
             "INSERT OR IGNORE INTO cas_cache(hash, content, fetched_at) VALUES (?1, ?2, unixepoch())",
@@ -87,7 +110,7 @@ impl LocalDb {
     /// Fetch the bytes stored under `hash`. `Ok(None)` means not found.
     pub async fn get_content(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
         if let Some(store) = self.team_content_store() {
-            return store.get(hash).await;
+            return store.get(hash).await.map_err(|e| e.to_string());
         }
         self.query_opt(
             "SELECT content FROM cas_cache WHERE hash = ?1 LIMIT 1",
@@ -161,7 +184,7 @@ impl InMemoryContentStore {
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl ContentStore for InMemoryContentStore {
-    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
+    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), ContentStoreError> {
         self.inner
             .lock()
             .await
@@ -169,7 +192,7 @@ impl ContentStore for InMemoryContentStore {
         Ok(())
     }
 
-    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
         Ok(self.inner.lock().await.get(hash).cloned())
     }
 }

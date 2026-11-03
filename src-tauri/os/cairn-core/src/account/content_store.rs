@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use crate::account::team_token_minter::TeamTokenMinter;
 use crate::api::ApiConfig;
 use crate::db::TeamId;
-use crate::storage::content_store::{content_hash, ContentStore, ContentStoreFactory};
+use crate::storage::content_store::{
+    content_hash, ContentStore, ContentStoreError, ContentStoreFactory,
+};
 use crate::storage::LocalDb;
 
 /// Production [`ContentStore`]: proxies bytes through the api/ broker
@@ -71,8 +73,12 @@ impl BrokeredContentStore {
 
 #[async_trait]
 impl ContentStore for BrokeredContentStore {
-    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
-        let token = self.minter.mint(&self.team_id).await?;
+    async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), ContentStoreError> {
+        let token = self
+            .minter
+            .mint(&self.team_id)
+            .await
+            .map_err(ContentStoreError::Remote)?;
         let url = self.api.team_cas_url(&self.team_id, hash);
         let resp = Self::client()
             .await
@@ -81,21 +87,27 @@ impl ContentStore for BrokeredContentStore {
             .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|e| format!("content-store put request failed: {e}"))?;
+            .map_err(|e| {
+                ContentStoreError::Remote(format!("content-store put request failed: {e}"))
+            })?;
         if !resp.status().is_success() {
-            return Err(format!(
+            return Err(ContentStoreError::Remote(format!(
                 "content-store put for {hash} returned {}",
                 resp.status()
-            ));
+            )));
         }
         Ok(())
     }
 
-    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+    async fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
         if let Some(bytes) = self.cache_get(hash).await {
             return Ok(Some(bytes));
         }
-        let token = self.minter.mint(&self.team_id).await?;
+        let token = self
+            .minter
+            .mint(&self.team_id)
+            .await
+            .map_err(ContentStoreError::Remote)?;
         let url = self.api.team_cas_url(&self.team_id, hash);
         let resp = Self::client()
             .await
@@ -103,20 +115,24 @@ impl ContentStore for BrokeredContentStore {
             .bearer_auth(token)
             .send()
             .await
-            .map_err(|e| format!("content-store get request failed: {e}"))?;
+            .map_err(|e| {
+                ContentStoreError::Remote(format!("content-store get request failed: {e}"))
+            })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(format!(
+            return Err(ContentStoreError::Remote(format!(
                 "content-store get for {hash} returned {}",
                 resp.status()
-            ));
+            )));
         }
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| format!("content-store get body read failed: {e}"))?
+            .map_err(|e| {
+                ContentStoreError::Remote(format!("content-store get body read failed: {e}"))
+            })?
             .to_vec();
         // Content-addressed integrity: the object's bytes MUST hash to the key it
         // was fetched under. A mismatch (a tampered or corrupt object, a broker or

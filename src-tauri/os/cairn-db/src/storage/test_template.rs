@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use tokio::sync::OnceCell;
 
+use super::content_store::FileContentStore;
 use super::local_db::{db_set_paths, LocalDb};
 use super::migration::{chain_fingerprint, MigrationRunner};
 use super::migrations::TURSO_MIGRATIONS;
@@ -39,6 +40,11 @@ impl LocalDb {
     /// run's template rather than replayed. When a database is already there,
     /// this opens it and runs the chain over it exactly as that pair of calls
     /// would, since a copy would clobber what the caller put there.
+    ///
+    /// Either way the handle carries a [`FileContentStore`] at `<path>.archive`,
+    /// as every production private database does, so archival under test takes
+    /// the one offloaded path. A test that needs a storeless handle opens with
+    /// `LocalDb::open` and runs the chain itself.
     pub async fn open_migrated_for_test(path: impl AsRef<Path>) -> DbResult<Self> {
         let path = path.as_ref();
         if db_set_paths(path).iter().any(|member| member.exists()) {
@@ -46,6 +52,7 @@ impl LocalDb {
             MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
                 .run(&db)
                 .await?;
+            install_test_archive(&db, path);
             return Ok(db);
         }
         let template = TEMPLATE.get_or_try_init(published_template).await?;
@@ -60,8 +67,16 @@ impl LocalDb {
                 })?;
             }
         }
-        Self::open(path).await
+        let db = Self::open(path).await?;
+        install_test_archive(&db, path);
+        Ok(db)
     }
+}
+
+/// Install a file store beside a test database, at `<path>.archive`.
+fn install_test_archive(db: &LocalDb, path: &Path) {
+    let store = FileContentStore::open(path.with_extension("archive"));
+    let _ = db.set_private_content_store(std::sync::Arc::new(store));
 }
 
 /// Find this chain's template under the temp dir, or build and publish it.

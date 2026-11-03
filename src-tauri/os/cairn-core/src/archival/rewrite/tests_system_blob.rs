@@ -77,13 +77,18 @@ async fn system_prompt_segments_round_trip_and_dedup() {
 
     let summary = archive(&db, None).await.unwrap();
     assert_eq!(summary.system_prompt, 2);
-    // Four distinct static segments shared by both events — not eight rows.
+    // Four distinct static segments shared by both events — not eight objects.
     assert_eq!(blob_count(&db).await, 4, "identical static segments dedup");
+    assert_eq!(
+        blob_row_count(&db).await,
+        0,
+        "nothing lands in archival_blobs"
+    );
 
     let stored1 = event_data_of(&db, "sp1").await;
     assert!(
         !stored1.contains("CLAUDE-BASE"),
-        "static bytes moved to archival_blobs"
+        "static bytes moved to the content store"
     );
     assert!(
         stored1.contains("cwd=/work/run-1"),
@@ -182,20 +187,7 @@ async fn system_prompt_missing_blob_degrades_to_stub() {
     assert_eq!(blob_count(&db).await, 2);
 
     // Drop the cairn segment's blob.
-    let cairn_hash = sha256_hex(b"CAIRNDATA");
-    db.write(move |conn| {
-        let cairn_hash = cairn_hash.clone();
-        Box::pin(async move {
-            conn.execute(
-                "DELETE FROM archival_blobs WHERE hash = ?1",
-                (cairn_hash.as_str(),),
-            )
-            .await?;
-            DbResult::Ok(())
-        })
-    })
-    .await
-    .unwrap();
+    drop_store_object(&db, &sha256_hex(b"CAIRNDATA"));
 
     let events = load_events(&db).await;
     let recon = reconstruct_events(&db, events).await;
@@ -342,14 +334,7 @@ async fn system_init_missing_skeleton_degrades_to_stub() {
     assert_eq!(blob_count(&db).await, 2);
 
     // Drop every blob so the skeleton can't resolve.
-    db.write(|conn| {
-        Box::pin(async move {
-            conn.execute("DELETE FROM archival_blobs", ()).await?;
-            DbResult::Ok(())
-        })
-    })
-    .await
-    .unwrap();
+    drop_store_objects(&db);
 
     let recon = reconstruct_events(&db, load_events(&db).await).await;
     let sm = recon.iter().find(|e| e.id == "sm1").unwrap();

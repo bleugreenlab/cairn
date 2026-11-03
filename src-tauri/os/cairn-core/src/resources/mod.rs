@@ -77,3 +77,11 @@ pub(crate) use thread_seed::{
 pub(crate) use threads::read_thread_queue;
 pub(crate) use threads::{delegate_thread_descendant, retired_surface};
 pub(crate) use transcript::era_source_digest;
+
+/// One job's transcript exactly as `.../chat/raw?format=json` serves it: every
+/// event reconstructed and passed through the quarantine gate. For offline
+/// verification against a database file (the archive offload's clone
+/// rehearsal), where there is no running app to read the resource from.
+pub async fn render_job_chat_raw_json(db: &crate::storage::LocalDb, job_id: &str) -> String {
+    node::render_job_chat_raw(db, job_id, transcript::RawTranscriptFormat::Json).await
+}

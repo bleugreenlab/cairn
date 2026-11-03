@@ -2179,6 +2179,9 @@ pub enum PrivateReason {
     RunnerTransient,
     /// A rebuildable / refetchable cache (CI logs).
     RebuildableCache,
+    /// Bytes this install holds that nothing can rebuild or refetch (local
+    /// attachment bytes), kept private by the issue that owns their home.
+    AuthoritativeContent { owner: &'static str },
     /// This install's own configuration of the machines it runs (the
     /// inference inventory): written by its operator, durable, and rebuilt
     /// from nowhere, but about this install's hardware, so never synced.
@@ -2700,6 +2703,15 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "archival_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // Where each archival maintenance pass over this install's database
+    // resumes (the sweep watermark, the archive offload's cursors), and the
+    // archive root this database's stored bytes live in. That `archive` row is
+    // what stops boot from standing an empty archive in for a missing one, so
+    // the table is not clearable runner state.
+    (
+        "archival_progress",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "delegated_packet_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -2864,11 +2876,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "codex_watchdog_lifecycle",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
-    // ── Private: rebuildable / refetchable caches ────────────────────────────
+    // On the private database `cas_cache` is the authoritative home of local
+    // attachment bytes, not a cache: nothing refetches them. (A team store's
+    // read-through copies land here too, and those are refetchable.)
     (
         "cas_cache",
-        TableScope::Private(PrivateReason::RebuildableCache),
+        TableScope::Private(PrivateReason::AuthoritativeContent {
+            owner: "cairn/4648",
+        }),
     ),
+    // ── Private: rebuildable / refetchable caches ────────────────────────────
     // An applied compaction and its table of contents are a projection of the
     // job's append-only transcript, which stays in the shared tables. Losing
     // them costs entry stability across generations, never content: the next

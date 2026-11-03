@@ -1,6 +1,6 @@
 use super::testsupport::*;
 use super::*;
-use crate::storage::{InMemoryContentStore, TeamReplicaContext};
+use crate::storage::{ContentStoreError, InMemoryContentStore, TeamReplicaContext};
 use std::sync::Arc;
 
 fn attach_team_store(db: &mut LocalDb, store: Arc<dyn ContentStore>) {
@@ -45,7 +45,12 @@ async fn team_run_offloads_system_blobs_and_reconstructs_from_store() {
 
     let summary = archive(&db, None).await.unwrap();
     assert_eq!(summary.system_prompt, 1);
-    assert_eq!(blob_count(&db).await, 0, "no archival_blobs on the replica");
+    assert_eq!(blob_row_count(&db).await, 0, "no archival_blobs rows");
+    assert_eq!(
+        blob_count(&db).await,
+        0,
+        "nothing in the private file store"
+    );
     assert_eq!(
         store.len().await,
         4,
@@ -152,6 +157,13 @@ async fn team_run_offloads_pack_and_reconstructs_gitcoord_from_store() {
         stored_w1,
         "restored through the store-fetched pack"
     );
+    // The node diff reads the same stored pack: before the shared reader it
+    // read only the inline columns, which a team replica never fills.
+    let diff = crate::diff::node_base_tip_diff(&db, "job", "", Path::new("/nonexistent"))
+        .await
+        .unwrap()
+        .expect("the stored pack renders the node diff");
+    assert!(diff.files.iter().any(|file| file.path == "a.txt"));
 
     attach_team_store(&mut db, Arc::new(InMemoryContentStore::new()));
     let recon = reconstruct_events(&db, load_events(&db).await).await;
@@ -169,10 +181,10 @@ async fn team_run_store_put_failure_leaves_rows_full() {
     struct FailingStore;
     #[async_trait::async_trait]
     impl ContentStore for FailingStore {
-        async fn put(&self, _: &str, _: &[u8]) -> Result<(), String> {
-            Err("store unavailable".to_string())
+        async fn put(&self, _: &str, _: &[u8]) -> Result<(), ContentStoreError> {
+            Err(ContentStoreError::Remote("store unavailable".to_string()))
         }
-        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
+        async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
             Ok(None)
         }
     }
@@ -184,6 +196,7 @@ async fn team_run_store_put_failure_leaves_rows_full() {
     insert_event(&db, "sp1", "run", 1, 1, "system:prompt", &data).await;
 
     assert!(archive(&db, None).await.is_err());
+    assert_eq!(blob_row_count(&db).await, 0);
     assert_eq!(blob_count(&db).await, 0);
     assert_eq!(storage_mode(&db, "sp1").await.as_deref(), Some("full"));
 }

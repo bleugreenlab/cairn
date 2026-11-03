@@ -459,6 +459,50 @@ pub struct SettingsFile {
     /// DTO); preserved across saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_log: Option<EventLogSettings>,
+    /// Where the private database's archive (its filesystem content store)
+    /// lives. Config-only (YAML, not in the Settings DTO); preserved across
+    /// saves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archive: Option<ArchiveSettings>,
+}
+
+/// `archive` in `settings.yaml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSettings {
+    /// The archive root. Absent means `archive` beside the database, in the
+    /// Cairn home (so a dev instance's archive stays in its own home). A
+    /// leading `~/` is the user's home directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl ArchiveSettings {
+    /// The archive root these settings name, for a Cairn home at `home`.
+    pub fn root(&self, home: &std::path::Path) -> std::path::PathBuf {
+        match self
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(path) => match path.strip_prefix("~/") {
+                Some(rest) => dirs::home_dir()
+                    .map(|dir| dir.join(rest))
+                    .unwrap_or_else(|| std::path::PathBuf::from(path)),
+                None => std::path::PathBuf::from(path),
+            },
+            None => home.join("archive"),
+        }
+    }
+}
+
+/// The workspace's `archive` section, or the default when unset.
+pub fn load_archive_settings(config_dir: &std::path::Path) -> ArchiveSettings {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.archive)
+        .unwrap_or_default()
 }
 
 /// `eventLog` in `settings.yaml`. Every value is a compact duration (`30d`,
@@ -827,6 +871,7 @@ impl SettingsFile {
             served_api: None,
             accepted_fence_commands: None,
             event_log: None,
+            archive: None,
             web_fetch: None,
             active_web_fetch: None,
             web_search: None,
@@ -2868,6 +2913,31 @@ buildServices:
         // No settings file means no managed daemon is launched.
         let services = load_build_services(temp.path());
         assert!(services.is_empty());
+    }
+
+    #[test]
+    fn archive_settings_default_beside_the_database_and_survive_a_save() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let unset = load_archive_settings(dir);
+        assert_eq!(unset, ArchiveSettings::default());
+        assert_eq!(unset.root(dir), dir.join("archive"));
+
+        std::fs::write(
+            get_settings_path(dir),
+            "logLevel: standard\narchive:\n  path: /Volumes/Cold/cairn-archive\n",
+        )
+        .unwrap();
+        save_settings(dir, &load_settings(dir)).unwrap();
+        let loaded = load_archive_settings(dir);
+        assert_eq!(
+            loaded.root(dir),
+            std::path::PathBuf::from("/Volumes/Cold/cairn-archive")
+        );
+        let home = ArchiveSettings {
+            path: Some("~/cold".into()),
+        };
+        assert_eq!(home.root(dir), dirs::home_dir().unwrap().join("cold"));
     }
 
     #[test]

@@ -429,6 +429,28 @@ pub(crate) fn chain_fingerprint(migrations: &[Migration]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// A migration [`MigrationRunner::run_observed`] is about to apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationStep<'a> {
+    /// `version_name`, the label [`MigrationRunner::run`] reports once applied.
+    pub label: &'a str,
+    /// One-based position among the migrations this run applies.
+    pub position: usize,
+    /// How many migrations this run applies.
+    pub of: usize,
+}
+
+/// What one registered migration needs from this run.
+enum Planned<'a> {
+    /// Re-key a row recorded under a provisional stem; no SQL runs.
+    Adopt {
+        provisional_version: String,
+        migration: &'a Migration,
+    },
+    /// Run the migration's SQL and record it.
+    Apply(&'a Migration),
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationRunner {
     migrations: Vec<Migration>,
@@ -442,6 +464,21 @@ impl MigrationRunner {
     }
 
     pub async fn run(&self, db: &LocalDb) -> DbResult<Vec<String>> {
+        self.run_observed(db, |_| {}).await
+    }
+
+    /// [`run`](Self::run), telling `observe` about each migration just before it
+    /// applies.
+    ///
+    /// Only migrations whose SQL actually runs are reported, and `of` counts
+    /// exactly those: an already-recorded entry costs nothing and an adopted
+    /// provisional one is a single-row update. One migration can take minutes on
+    /// a large database, so this is what lets a booting host say which one it is
+    /// waiting on instead of going silent.
+    pub async fn run_observed<F>(&self, db: &LocalDb, mut observe: F) -> DbResult<Vec<String>>
+    where
+        F: FnMut(MigrationStep<'_>) + Send,
+    {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS cairn_schema_migrations (
                 version TEXT PRIMARY KEY NOT NULL,
@@ -454,9 +491,51 @@ impl MigrationRunner {
         // Read the ledger once, up front, rather than re-asking it per migration.
         // The chain is well over a hundred entries long and every one of those
         // lookups put the same single-row question to the same table.
-        let (mut recorded, mut provisional) = self.applied_versions(db).await?;
+        let (recorded, provisional) = self.applied_versions(db).await?;
+        let plan = self.plan(recorded, provisional);
+        let of = plan
+            .iter()
+            .filter(|step| matches!(step, Planned::Apply(_)))
+            .count();
 
         let mut applied = Vec::new();
+        for step in plan {
+            match step {
+                Planned::Adopt {
+                    provisional_version,
+                    migration,
+                } => self.adopt(db, &provisional_version, migration).await?,
+                Planned::Apply(migration) => {
+                    let label = format!("{}_{}", migration.version, migration.name);
+                    observe(MigrationStep {
+                        label: &label,
+                        position: applied.len() + 1,
+                        of,
+                    });
+                    if migration.fk_off {
+                        self.run_fk_off(db, migration).await?;
+                    } else {
+                        self.run_standard(db, migration).await?;
+                    }
+                    applied.push(label);
+                }
+            }
+        }
+
+        Ok(applied)
+    }
+
+    /// Decide, against the ledger as read, what each registered migration needs.
+    ///
+    /// The ledger copy is kept current as the plan is built, so a version listed
+    /// twice is still applied exactly once, and a provisional row adopted early
+    /// in the chain is no longer counted as recorded later in it.
+    fn plan(
+        &self,
+        mut recorded: HashSet<String>,
+        mut provisional: HashMap<String, String>,
+    ) -> Vec<Planned<'_>> {
+        let mut plan = Vec::new();
         for migration in &self.migrations {
             if recorded.contains(migration.version) {
                 continue;
@@ -467,26 +546,19 @@ impl MigrationRunner {
             // the migration a second time.
             if !is_provisional_version(migration.version) {
                 if let Some(provisional_version) = provisional.remove(migration.name) {
-                    self.adopt(db, &provisional_version, migration).await?;
                     recorded.remove(&provisional_version);
                     recorded.insert(migration.version.to_string());
+                    plan.push(Planned::Adopt {
+                        provisional_version,
+                        migration,
+                    });
                     continue;
                 }
             }
-
-            if migration.fk_off {
-                self.run_fk_off(db, migration).await?;
-            } else {
-                self.run_standard(db, migration).await?;
-            }
-            // Kept current as the chain applies, so a version listed twice is
-            // still applied exactly once — the behaviour the per-migration
-            // re-query gave for free.
             recorded.insert(migration.version.to_string());
-            applied.push(format!("{}_{}", migration.version, migration.name));
+            plan.push(Planned::Apply(migration));
         }
-
-        Ok(applied)
+        plan
     }
 
     /// Apply a migration inside the normal exclusive transaction.
@@ -800,6 +872,47 @@ mod tests {
                 "NEXT_other".to_string()
             ]
         );
+    }
+
+    /// The observer hears about exactly the migrations whose SQL runs, in order,
+    /// numbered against that count: recorded entries and adopted provisional
+    /// rows are neither reported nor counted.
+    #[tokio::test]
+    async fn run_observed_reports_each_applied_migration_against_the_pending_count() {
+        let db = test_db("observed.db").await;
+        let first = Migration::new("9001", "first", "CREATE TABLE first (id INTEGER);");
+        MigrationRunner::new(vec![first]).run(&db).await.unwrap();
+        MigrationRunner::new(vec![Migration::new(
+            "NEXT_adopted",
+            "adopted",
+            "CREATE TABLE adopted (id INTEGER);",
+        )])
+        .run(&db)
+        .await
+        .unwrap();
+
+        let chain = vec![
+            first,
+            Migration::new("9002", "adopted", "CREATE TABLE adopted (id INTEGER);"),
+            Migration::new("9003", "second", "CREATE TABLE second (id INTEGER);"),
+            Migration::new("9004", "third", "CREATE TABLE third (id INTEGER);"),
+        ];
+        let mut seen = Vec::new();
+        let applied = MigrationRunner::new(chain)
+            .run_observed(&db, |step| {
+                seen.push((step.label.to_string(), step.position, step.of));
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![
+                ("9003_second".to_string(), 1, 2),
+                ("9004_third".to_string(), 2, 2),
+            ]
+        );
+        assert_eq!(applied, vec!["9003_second", "9004_third"]);
     }
 
     #[test]

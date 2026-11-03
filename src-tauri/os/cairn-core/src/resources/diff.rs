@@ -496,38 +496,20 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
     })
 }
 
-/// An execution's archived range: its endpoints and, when non-empty, its pack.
-struct ArchivedRange {
-    base: String,
-    tip: String,
-    pack: Option<(Vec<u8>, Vec<u8>)>,
-}
-
+/// An execution's archived range endpoints.
 async fn load_archived_range(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
-) -> Option<ArchivedRange> {
+) -> Option<(String, String)> {
     let mut rows = conn
         .query(
-            "SELECT base_sha, tip_sha, pack, pack_idx
-             FROM execution_history WHERE execution_id = ?1 LIMIT 1",
+            "SELECT base_sha, tip_sha FROM execution_history WHERE execution_id = ?1 LIMIT 1",
             (execution_id,),
         )
         .await
         .ok()?;
     let row = rows.next().await.ok()??;
-    let pack = match (
-        row.opt_blob(2).ok().flatten(),
-        row.opt_blob(3).ok().flatten(),
-    ) {
-        (Some(pack), Some(index)) => Some((pack, index)),
-        _ => None,
-    };
-    Some(ArchivedRange {
-        base: row.text(0).ok()?,
-        tip: row.text(1).ok()?,
-        pack,
-    })
+    Some((row.text(0).ok()?, row.text(1).ok()?))
 }
 
 async fn load_archived_data(
@@ -536,11 +518,20 @@ async fn load_archived_data(
     retain_content_source: bool,
 ) -> Option<DiffData> {
     let execution_id = coords.execution_id.clone()?;
-    let ArchivedRange { base, tip, pack } = read_resource(db, move |conn| {
-        Box::pin(async move { Ok(load_archived_range(conn, &execution_id).await) })
-    })
-    .await
-    .ok()??;
+    let (base, tip) = {
+        let execution_id = execution_id.clone();
+        read_resource(db, move |conn| {
+            Box::pin(async move { Ok(load_archived_range(conn, &execution_id).await) })
+        })
+        .await
+        .ok()??
+    };
+    // Inline or in the content store; a pack the store cannot produce falls
+    // through to the project repository, as reconstruction does.
+    let pack = crate::storage::events::load_execution_pack(db, &execution_id)
+        .await
+        .ok()
+        .flatten();
     let content_source =
         archived_content_source(&coords.repo_path, &tip, &pack, retain_content_source);
     let store = ObjectStore::new(Path::new(&coords.repo_path), pack).ok()?;

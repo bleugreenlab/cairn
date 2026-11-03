@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, MutexGuard, Once,
+    Arc, Mutex, MutexGuard, Once, OnceLock,
 };
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -649,9 +649,13 @@ pub struct LocalDb {
     /// `team_content_store()` and the local-run inline path is byte-for-byte
     /// unchanged.
     team: Option<Arc<TeamReplicaContext>>,
-    /// Set with `team`. The private database's content lives in its own
-    /// `cas_cache` table, reached through the pool like any other row.
+    /// Set with `team`. The private database's attachment bytes live in its
+    /// own `cas_cache` table, reached through the pool like any other row.
     team_content_store: Option<Arc<dyn ContentStore>>,
+    /// The private database's archival store (a file store beside the
+    /// database), installed once at open through
+    /// [`Self::set_private_content_store`] after the handle is shared.
+    private_content_store: OnceLock<Arc<dyn ContentStore>>,
     /// Connections that hold no open transaction and are free to be reused.
     ///
     /// The first `BEGIN CONCURRENT` on a fresh turso connection pays a one-time
@@ -747,6 +751,7 @@ impl LocalDb {
             mutation_generation: AtomicU64::new(0),
             team: None,
             team_content_store: None,
+            private_content_store: OnceLock::new(),
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -808,6 +813,7 @@ impl LocalDb {
             mutation_generation: AtomicU64::new(0),
             team: None,
             team_content_store: None,
+            private_content_store: OnceLock::new(),
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -865,6 +871,7 @@ impl LocalDb {
             mutation_generation: AtomicU64::new(0),
             team: None,
             team_content_store: None,
+            private_content_store: OnceLock::new(),
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
@@ -894,12 +901,37 @@ impl LocalDb {
     }
 
     /// A team replica's brokered content store; `None` on the private database.
-    /// Reading and writing content goes through [`Self::put_content`] and
-    /// [`Self::get_content`], which choose the store; this is for the team-only
-    /// paths (archival offload, pack catalog, reconstruction) that hand the
-    /// store onward.
+    /// Attachment bytes go through [`Self::put_content`] and
+    /// [`Self::get_content`], which choose between this and `cas_cache`; the
+    /// team-only paths (sealed-commit cloud coverage) hand it onward. Archival
+    /// and reconstruction use [`Self::content_store`].
     pub fn team_content_store(&self) -> Option<&Arc<dyn ContentStore>> {
         self.team_content_store.as_ref()
+    }
+
+    /// The store this database's archived packs and segment blobs live in: the
+    /// team store on a replica, the installed file store on the private
+    /// database. `None` only on a private handle nothing installed a store on.
+    pub fn content_store(&self) -> Option<&Arc<dyn ContentStore>> {
+        self.team_content_store
+            .as_ref()
+            .or_else(|| self.private_content_store.get())
+    }
+
+    /// Install the private database's archival store. Set once: a second
+    /// install is refused and returns the store it would have replaced.
+    pub fn set_private_content_store(
+        &self,
+        store: Arc<dyn ContentStore>,
+    ) -> Result<(), Arc<dyn ContentStore>> {
+        self.private_content_store.set(store)
+    }
+
+    /// Whether a checkpoint attempt is still running inside the engine. A
+    /// maintenance pass that folds when due skips its fold while one is, rather
+    /// than waiting on it.
+    pub fn checkpoint_in_engine(&self) -> bool {
+        self.checkpoint_in_engine.load(Ordering::SeqCst)
     }
 
     /// The private database that owns machine-local route metadata for this team
@@ -2590,7 +2622,9 @@ impl std::fmt::Display for CheckpointReport {
 /// The three files comprising one MVCC database set: the main `.db` plus its
 /// `-wal` and `-log` sidecars. Committed data lives in the sidecars, so any
 /// move, copy, backup, or snapshot of the database must treat all three as one
-/// unit (see docs/database.md). Returned in the order `[main, -wal, -log]`.
+/// unit (see docs/database.md). A private database's archive directory is part
+/// of it too: after the archive offload, a copy of the set without the archive
+/// reads archived content as stubs. Returned in the order `[main, -wal, -log]`.
 ///
 /// Each sidecar is named the way the pinned Turso names it, so the set is
 /// the files the engine actually wrote even for a path [`LocalDb::open`] would
@@ -3708,6 +3742,7 @@ mod tests {
             mutation_generation: AtomicU64::new(0),
             team: None,
             team_content_store: None,
+            private_content_store: OnceLock::new(),
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),

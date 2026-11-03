@@ -1,7 +1,7 @@
 use cairn_common::ids::rekey_to_team;
 use cairn_db::turso::{Connection, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::db::DbState;
@@ -13,10 +13,24 @@ use crate::CairnError;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum MoveProjectGateFailure {
-    TeamNotOpen { team_id: String },
-    ProjectNotLocal { project_id: String },
-    KeyCollision { key: String, team_id: String },
-    NotQuiesced { blocking_jobs: Vec<BlockingJob> },
+    TeamNotOpen {
+        team_id: String,
+    },
+    ProjectNotLocal {
+        project_id: String,
+    },
+    KeyCollision {
+        key: String,
+        team_id: String,
+    },
+    NotQuiesced {
+        blocking_jobs: Vec<BlockingJob>,
+    },
+    /// The project's archived bytes could not be copied to the team store, so
+    /// moving its pointer rows would leave the team copy pointing at nothing.
+    ArchiveUnavailable {
+        detail: String,
+    },
 }
 
 #[cfg(all(test, feature = "test-utils"))]
@@ -148,6 +162,10 @@ impl std::fmt::Display for MoveProjectGateFailure {
                 let labels: Vec<String> = blocking_jobs.iter().map(BlockingJob::label).collect();
                 write!(f, "NotQuiesced: {}", labels.join(", "))
             }
+            Self::ArchiveUnavailable { detail } => write!(
+                f,
+                "ArchiveUnavailable: this project's archived history could not be copied to the team: {detail}"
+            ),
         }
     }
 }
@@ -621,7 +639,23 @@ pub async fn move_project_to_team(
         ));
     }
 
+    // The objects are copied before any pointer row reaches the replica, the
+    // same put-before-pointer order archival keeps. Both copies run under the
+    // archival permit: a teardown, sweep, or offload page writing to this
+    // project between them would hand the team a pointer to an object it was
+    // never given. Archival waits out the move.
+    let archival_paused = crate::archival::rewrite::ARCHIVAL_GATE
+        .acquire()
+        .await
+        .map_err(|error| MoveProjectError::Internal(format!("archival gate closed: {error}")))?;
+    let copied = copy_archived_objects(&dbs.local, &team_db, project_id).await?;
+    if copied > 0 {
+        log::info!(
+            "move: copied {copied} archived objects of project {project_id} to team {team_id}"
+        );
+    }
     copy_project_graph(&dbs.local, &team_db, project_id, team_id).await?;
+    drop(archival_paused);
     verify_team_prefixes(&team_db, team_id, &team_project_id).await?;
     insert_project_route(&dbs.local, clock, &local_project.key, Some(team_id)).await?;
     dbs.set_route(&local_project.key, Some(team_id.to_string()))
@@ -753,6 +787,106 @@ async fn advancing_executions(db: &LocalDb, project_id: &str) -> Result<Vec<Bloc
         },
     )
     .await
+}
+
+/// Copy the archived bytes the moving project's rows point at into the team
+/// replica's content store.
+///
+/// An archived row's pointer (`execution_history.pack_hash`, a blobbed event's
+/// segment hashes) means "in this database's store", and the move changes
+/// which store that is: the private file archive on this side, the team store
+/// on the other. So every object the moved rows name is put to the team store
+/// first. A segment not yet offloaded comes from its compressed
+/// `archival_blobs` row; a pack still inline travels with its row. An object
+/// the private archive no longer has reads as a stub on both sides and does
+/// not block the move; an archive that cannot answer (offline, or absent)
+/// does, rather than letting the team copy point at bytes no member has.
+async fn copy_archived_objects(
+    source: &LocalDb,
+    target: &LocalDb,
+    project_id: &str,
+) -> MoveProjectResult<usize> {
+    let packs: BTreeSet<String> = source
+        .query_all(
+            "SELECT pack_hash FROM execution_history
+             WHERE pack_hash IS NOT NULL AND execution_id IN (
+                 SELECT id FROM executions
+                 WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))",
+            (project_id.to_string(),),
+            |row| row.text(0),
+        )
+        .await?
+        .into_iter()
+        .collect();
+    let segments: BTreeSet<String> = source
+        .query_all(
+            "SELECT data FROM events
+             WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1)
+               AND storage_mode = 'gitcoord' AND content_commit IS NULL",
+            (project_id.to_string(),),
+            |row| row.text(0),
+        )
+        .await?
+        .iter()
+        .flat_map(|data| crate::storage::events::segment_hashes(data))
+        .collect();
+    if packs.is_empty() && segments.is_empty() {
+        return Ok(0);
+    }
+
+    let unavailable = |detail: String| {
+        MoveProjectError::Gate(MoveProjectGateFailure::ArchiveUnavailable { detail })
+    };
+    let Some(team_store) = target.content_store().cloned() else {
+        return Err(unavailable("the team replica has no content store".into()));
+    };
+    let Some(private_store) = source.content_store().cloned() else {
+        return Err(unavailable("this database has no archive".into()));
+    };
+    let mut copied = 0;
+    let objects = packs
+        .iter()
+        .map(|hash| (hash, "pack"))
+        .chain(segments.iter().map(|hash| (hash, "segment")));
+    for (hash, kind) in objects {
+        let stored = private_store
+            .get(hash)
+            .await
+            .map_err(|error| unavailable(format!("archived {kind} {hash}: {error}")))?;
+        let bytes = match stored {
+            Some(bytes) => Some(bytes),
+            None if kind == "segment" => legacy_segment(source, hash).await?,
+            None => None,
+        };
+        let Some(bytes) = bytes else {
+            log::warn!(
+                "move: archived {kind} {hash} is already missing from this database's archive; \
+                 the team copy reads it as a stub, as this database does"
+            );
+            continue;
+        };
+        team_store.put(hash, &bytes).await.map_err(|error| {
+            unavailable(format!("putting {kind} {hash} to the team store: {error}"))
+        })?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+/// A segment the archive offload has not moved yet: its `archival_blobs` row,
+/// decompressed, when it hashes to its key.
+async fn legacy_segment(db: &LocalDb, hash: &str) -> MoveProjectResult<Option<Vec<u8>>> {
+    let stored = db
+        .query_opt(
+            "SELECT content FROM archival_blobs WHERE hash = ?1",
+            (hash.to_string(),),
+            |row| row.opt_blob(0),
+        )
+        .await?
+        .flatten();
+    Ok(stored
+        .and_then(|blob| crate::storage::decompress(crate::storage::CODEC_ZSTD_V1, &blob).ok())
+        .filter(|bytes| crate::storage::content_store::content_hash(bytes) == hash))
 }
 
 async fn copy_project_graph(
@@ -2322,6 +2456,246 @@ pub(super) mod tests {
             team,
             project_id: team_project_id,
         }
+    }
+
+    const ARCHIVE_TEAM: &str = "teamarchive";
+    const ARCHIVE_PROJECT: &str = "aaaaaaaa-1111-4111-8111-111111111111";
+    const ARCHIVE_EXECUTION: &str = "aaaaaaaa-3333-4333-8333-333333333333";
+    const ARCHIVE_JOB: &str = "aaaaaaaa-4444-4444-8444-444444444444";
+    const ARCHIVE_RUN: &str = "aaaaaaaa-5555-4555-8555-555555555555";
+
+    /// A private project with one execution archived the way teardown archives
+    /// it (a range pack and a blobbed system prompt, both in the private file
+    /// archive), its branch then deleted and collected, and a team replica
+    /// whose store is `team_store`.
+    async fn archived_project_fixture(
+        name: &str,
+        team_store: Arc<dyn crate::storage::ContentStore>,
+    ) -> (
+        crate::archival::rewrite::testsupport::Fixture,
+        DbState,
+        Arc<LocalDb>,
+        Arc<LocalDb>,
+    ) {
+        use crate::archival::rewrite::testsupport::*;
+        let fx = build_fixture();
+        let local = Arc::new(crate::storage::migrated_test_db(&format!("{name}-local.db")).await);
+        let mut team = migrated_db(&format!("{name}-team.db"), TEAM_MIGRATIONS.to_vec()).await;
+        team.set_team_context(
+            crate::storage::TeamReplicaContext {
+                team_id: ARCHIVE_TEAM.into(),
+                private_db: Some(local.clone()),
+            },
+            team_store,
+        );
+        let team = Arc::new(team);
+        team.execute(
+            "INSERT INTO teams(id, name, created_at, updated_at) VALUES (?1, 'Archive', 1, 1)",
+            (ARCHIVE_TEAM,),
+        )
+        .await
+        .unwrap();
+        register_archived_file_renderer_for_test();
+        local
+            .execute_script(format!(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+                   VALUES ('{ARCHIVE_TEAM}', 'Archive', 'http://localhost', '/tmp/team.db', 1);
+                 INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws', 'W', 1, 1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                   VALUES ('{ARCHIVE_PROJECT}', 'ws', 'Archived', 'ARCHIVED', '{repo}', 'main', 1, 1);
+                 INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq)
+                   VALUES ('{ARCHIVE_EXECUTION}', 'r', '{ARCHIVE_PROJECT}', 'completed', 1, 1);
+                 INSERT INTO jobs(id, execution_id, project_id, status, branch, created_at, updated_at)
+                   VALUES ('{ARCHIVE_JOB}', '{ARCHIVE_EXECUTION}', '{ARCHIVE_PROJECT}', 'complete', 'work', 1, 1);
+                 INSERT INTO runs(id, job_id, project_id, status, created_at, updated_at)
+                   VALUES ('{ARCHIVE_RUN}', '{ARCHIVE_JOB}', '{ARCHIVE_PROJECT}', 'exited', 1, 1);",
+                repo = fx.repo.display()
+            ))
+            .await
+            .unwrap();
+        let (prompt, _) = system_prompt(&[
+            ("backend_base", &"BACKEND-BASE ".repeat(300)),
+            ("cairn", &"CAIRN-PROMPT ".repeat(200)),
+            ("dynamic", "\n\ncwd=/work"),
+        ]);
+        insert_event(&local, "sp", ARCHIVE_RUN, 0, 0, "system:prompt", &prompt).await;
+        insert_event(
+            &local,
+            "a-w1",
+            ARCHIVE_RUN,
+            1,
+            1,
+            "assistant",
+            &assistant_write("w1"),
+        )
+        .await;
+        let w1 = short(&fx.repo, &fx.w1);
+        insert_event(
+            &local,
+            "e-w1",
+            ARCHIVE_RUN,
+            2,
+            2,
+            "tool_result",
+            &write_result("w1", &w1),
+        )
+        .await;
+        let stored = rendered(&[("file:a.txt", b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n")]);
+        let read = assistant_read("r1", &["file:a.txt"]);
+        insert_event(&local, "a-r1", ARCHIVE_RUN, 3, 3, "assistant", &read).await;
+        insert_event(
+            &local,
+            "e-r1",
+            ARCHIVE_RUN,
+            4,
+            4,
+            "tool_result",
+            &read_result("r1", &stored),
+        )
+        .await;
+        let summary = crate::archival::archive_execution(
+            &local,
+            crate::archival::ArchiveTarget {
+                execution_id: ARCHIVE_EXECUTION.into(),
+                ranges: vec![branch_range(&fx.repo, "work")],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((summary.gitcoord_read, summary.system_prompt), (1, 1));
+        git(&fx.repo, &["checkout", "-q", "main"]);
+        git(&fx.repo, &["branch", "-D", "-q", "work"]);
+        git(&fx.repo, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&fx.repo, &["gc", "-q", "--prune=now"]);
+
+        let search_dir = tempdir().unwrap();
+        let dbs = DbState::new(
+            local.clone(),
+            Arc::new(SearchIndex::open_or_create(search_dir.keep()).unwrap()),
+        );
+        dbs.insert_team_db_for_test(ARCHIVE_TEAM, team.clone())
+            .await;
+        (fx, dbs, local, team)
+    }
+
+    fn register_archived_file_renderer_for_test() {
+        crate::mcp::handlers::read::register_archived_file_renderer();
+    }
+
+    async fn run_events(db: &LocalDb, run_id: &str) -> Vec<crate::models::Event> {
+        use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
+        db.query_all(
+            format!("SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 ORDER BY sequence"),
+            (run_id.to_string(),),
+            event_from_row,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// After the move, the team copy reads the archived execution exactly as
+    /// the private database did: its pointer rows name objects the move put
+    /// into the team store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_moved_project_reads_its_archived_history_from_the_team_store() {
+        let team_store = crate::storage::InMemoryContentStore::new();
+        let (fx, dbs, local, team) =
+            archived_project_fixture("move-archive", Arc::new(team_store.clone())).await;
+        let expected: Vec<String> =
+            crate::storage::reconstruct_events(&local, run_events(&local, ARCHIVE_RUN).await)
+                .await
+                .into_iter()
+                .map(|event| event.data)
+                .collect();
+        assert!(expected
+            .iter()
+            .all(|data| !data.contains(crate::storage::events::reconstruct::STUB_PREFIX)));
+        let expected_diff = crate::diff::node_base_tip_diff(
+            &local,
+            ARCHIVE_JOB,
+            "",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .unwrap()
+        .map(|diff| format!("{diff:?}"));
+        assert!(expected_diff.is_some());
+
+        move_project_to_team(
+            &dbs,
+            &FixedClock,
+            ARCHIVE_PROJECT,
+            ARCHIVE_TEAM,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!team_store.is_empty().await, "the pack and segments moved");
+        // What the team route reconcile records for this host's checkout.
+        local
+            .execute(
+                "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'archived'",
+                (fx.repo.display().to_string(),),
+            )
+            .await
+            .unwrap();
+
+        let team_run = rekey_to_team(ARCHIVE_RUN, ARCHIVE_TEAM).unwrap();
+        let team_job = rekey_to_team(ARCHIVE_JOB, ARCHIVE_TEAM).unwrap();
+        let moved: Vec<String> =
+            crate::storage::reconstruct_events(&team, run_events(&team, &team_run).await)
+                .await
+                .into_iter()
+                .map(|event| event.data)
+                .collect();
+        assert_eq!(moved, expected);
+        let moved_diff = crate::diff::node_base_tip_diff(
+            &team,
+            &team_job,
+            "",
+            std::path::Path::new("/nonexistent"),
+        )
+        .await
+        .unwrap()
+        .map(|diff| format!("{diff:?}"));
+        assert_eq!(moved_diff.is_some(), expected_diff.is_some());
+    }
+
+    /// An archive that cannot supply the project's bytes refuses the move, so
+    /// no pointer row reaches the team copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_offline_archive_refuses_the_move() {
+        let (_fx, dbs, local, team) = archived_project_fixture(
+            "move-archive-offline",
+            Arc::new(crate::storage::InMemoryContentStore::new()),
+        )
+        .await;
+        let root = local.path().with_extension("archive");
+        std::fs::rename(&root, root.with_extension("away")).unwrap();
+
+        let error = move_project_to_team(
+            &dbs,
+            &FixedClock,
+            ARCHIVE_PROJECT,
+            ARCHIVE_TEAM,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                MoveProjectError::Gate(MoveProjectGateFailure::ArchiveUnavailable { detail })
+                    if detail.contains("archive offline")
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("ArchiveUnavailable:"));
+        assert_eq!(count(&team, "SELECT COUNT(*) FROM projects").await, 0);
+        assert_eq!(
+            count(&local, "SELECT COUNT(*) FROM execution_history").await,
+            1
+        );
     }
 
     async fn count(db: &LocalDb, sql: &str) -> i64 {

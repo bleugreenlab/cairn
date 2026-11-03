@@ -39,6 +39,8 @@
 //! zstd or blobbed path. A `system:prompt` predating the `raw.segments` boundary
 //! map falls to zstd either way.
 
+pub mod offload;
+pub(crate) mod progress;
 pub(crate) mod rewrite;
 pub mod sweep;
 

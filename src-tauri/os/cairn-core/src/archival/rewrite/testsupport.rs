@@ -220,10 +220,49 @@ pub(crate) fn short(repo: &Path, sha: &str) -> String {
     git(repo, &["rev-parse", "--short", sha]).trim().to_string()
 }
 
+/// The file store a migrated test database carries (see
+/// `LocalDb::open_migrated_for_test`).
+pub(crate) fn archive_root(db: &LocalDb) -> PathBuf {
+    db.path().with_extension("archive")
+}
+
+fn archive_objects(db: &LocalDb) -> Vec<PathBuf> {
+    let Ok(fanouts) = std::fs::read_dir(archive_root(db).join("objects")) else {
+        return Vec::new();
+    };
+    fanouts
+        .flatten()
+        .filter_map(|fanout| std::fs::read_dir(fanout.path()).ok())
+        .flat_map(|objects| objects.flatten().map(|object| object.path()))
+        .collect()
+}
+
+/// Objects in this database's file store: segment blobs, plus a range pack for
+/// an archival that wrote one.
 pub(crate) async fn blob_count(db: &LocalDb) -> i64 {
+    archive_objects(db).len() as i64
+}
+
+/// Rows left in the private `archival_blobs` table, which archival no longer
+/// writes.
+pub(crate) async fn blob_row_count(db: &LocalDb) -> i64 {
     db.query_one("SELECT COUNT(*) FROM archival_blobs", (), |row| row.i64(0))
         .await
         .unwrap()
+}
+
+/// Remove one object from this database's file store, as a lost or collected
+/// object would be.
+pub(crate) fn drop_store_object(db: &LocalDb, hash: &str) {
+    let path = archive_root(db).join("objects").join(&hash[..2]).join(hash);
+    std::fs::remove_file(&path).unwrap_or_else(|e| panic!("removing {}: {e}", path.display()));
+}
+
+/// Remove every object from this database's file store.
+pub(crate) fn drop_store_objects(db: &LocalDb) {
+    for object in archive_objects(db) {
+        std::fs::remove_file(object).unwrap();
+    }
 }
 
 pub(crate) async fn storage_mode(db: &LocalDb, id: &str) -> Option<String> {

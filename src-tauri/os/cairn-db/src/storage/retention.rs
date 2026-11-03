@@ -211,8 +211,16 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     tiered("tool_invocation_runs"),
     tiered("turn_embeddings").budget(1_024),
     tiered("session_skyline_cache").budget(768),
-    tiered("execution_history").budget(1_100),
-    tiered("archival_blobs"),
+    keep(
+        "execution_history",
+        "pointers: an execution's base/tip and its range pack's hash; the pack lives in the archive",
+    )
+    .budget(16),
+    owned_by(
+        "archival_blobs",
+        "cairn-core archival::offload",
+        "drains into the file archive; dropped once production reports it empty",
+    ),
     owned("event_read_tokens", "events"),
     owned("event_vibes", "events"),
     // Evicted here.
@@ -535,6 +543,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("analytics_rollup_backfill_state", MARKER),
     keep("app_boot_state", MARKER),
     keep("archival_backfill_state", MARKER),
+    keep("archival_progress", "one row per maintenance pass"),
     keep("delegated_packet_backfill_state", MARKER),
     keep("attention_push_retirement_backfill", MARKER),
     keep("embedding_state", MARKER),

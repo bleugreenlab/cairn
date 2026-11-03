@@ -21,7 +21,7 @@
 //! A `gitcoord` row is content-addressed, in two coordinate systems: a git commit
 //! (`content_commit` present) for transcript reads/writes, or content-hashed blob
 //! references (`content_commit` NULL) for a `blobbed` row, whose constant parts
-//! live once in `archival_blobs`. So `content_commit` first splits the `gitcoord`
+//! live once in the content store. So `content_commit` first splits the `gitcoord`
 //! mode into git-addressed vs hash-addressed. Within git-addressed, a `data_blob`
 //! absent is a pure-file read; a `data_blob` present is either a committed write
 //! or a mixed-target hybrid read, split by `content_render_sha`: a hybrid read
@@ -49,8 +49,8 @@
 use super::{CODEC_NONE, CODEC_ZSTD_V1};
 
 /// `data.archived` markers that select a `blobbed` row's reassembly contract on
-/// the read path. Both consumers store their constant parts in `archival_blobs`
-/// and inline their per-run remainder; only the reassembly differs.
+/// the read path. Both consumers store their constant parts in the content
+/// store and inline their per-run remainder; only the reassembly differs.
 pub const ARCHIVED_SYSTEM_PROMPT: &str = "system_prompt";
 pub const ARCHIVED_SYSTEM_INIT: &str = "system_init";
 
@@ -108,7 +108,7 @@ pub enum ArchivedShape {
         data: String,
         blob: Vec<u8>,
     },
-    /// A hash-addressed row whose constant parts live once in `archival_blobs`
+    /// A hash-addressed row whose constant parts live once in the content store
     /// and whose per-run remainder is inlined in `data`. Two consumers share this
     /// shape, discriminated by the `archived` marker inside `data`:
     /// - `"system_prompt"`: an ordered segment map of content-hash references plus
@@ -258,7 +258,7 @@ pub(crate) fn decode(cols: &EventColumns) -> Result<ArchivedShape, DecodeError> 
         }
         MODE_GITCOORD => {
             // No commit means hash-addressed: a `blobbed` row whose constant parts
-            // live in `archival_blobs` and whose per-run remainder is inlined in
+            // live in the content store and whose per-run remainder is inlined in
             // `data` (the `archived` marker inside `data` selects the system-prompt
             // vs system-init reassembly). With a commit it is git-addressed: a
             // `data_blob` absent is a pure-file read; a `data_blob` present is a
@@ -357,7 +357,7 @@ mod tests {
     }
 
     /// A `gitcoord` row with no commit is no longer rejected: it is the
-    /// hash-addressed `blobbed` shape (constant parts in `archival_blobs`, per-run
+    /// hash-addressed `blobbed` shape (constant parts in the content store, per-run
     /// remainder inline in `data`).
     #[test]
     fn gitcoord_without_commit_is_blobbed() {

@@ -50,6 +50,6 @@ pub use cairn_codec::packfile::build_execution_pack;
 pub use cairn_codec::testutil;
 
 pub use reconstruct::{
-    reconstruct_events, reconstruct_events_reporting, Reconstruction, RECONSTRUCT_BATCH_BYTES,
-    RECONSTRUCT_BATCH_ROWS,
+    load_execution_pack, reconstruct_events, reconstruct_events_reporting, segment_hashes,
+    Reconstruction, RECONSTRUCT_BATCH_BYTES, RECONSTRUCT_BATCH_ROWS,
 };

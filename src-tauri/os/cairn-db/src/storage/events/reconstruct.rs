@@ -108,7 +108,8 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     reconstruct_with(
         db,
         events,
-        team_store(db),
+        content_store(db),
+        has_local_blobs(db),
         db.private_route_db().map(Arc::as_ref),
     )
     .await
@@ -124,26 +125,33 @@ pub async fn reconstruct_events_with_routes(
     store: Option<&dyn ContentStore>,
     private_route_db: Option<&LocalDb>,
 ) -> Vec<Event> {
-    reconstruct_with(db, events, store, private_route_db).await
+    reconstruct_with(db, events, store, store.is_none(), private_route_db).await
 }
 
 async fn reconstruct_with(
     db: &LocalDb,
     events: Vec<Event>,
     store: Option<&dyn ContentStore>,
+    local_blobs: bool,
     private_route_db: Option<&LocalDb>,
 ) -> Vec<Event> {
     if !events.iter().any(is_archived) {
         return withheld(events);
     }
-    let coords = load_coords(db, &events, store, private_route_db).await;
+    let coords = load_coords(db, &events, store, local_blobs, private_route_db).await;
     withheld(finish(coords, events))
 }
 
-/// The store a team replica's offloaded packs and blobs are fetched from. The
-/// private database returns `None`: its packs and blobs are inline.
-fn team_store(db: &LocalDb) -> Option<&dyn ContentStore> {
-    db.team_content_store().map(|store| store.as_ref())
+/// The store this database's archived packs and segment blobs are fetched
+/// from: the team store on a replica, the file store on the private database.
+fn content_store(db: &LocalDb) -> Option<&dyn ContentStore> {
+    db.content_store().map(|store| store.as_ref())
+}
+
+/// Whether this database has an `archival_blobs` table: the private database
+/// does, a team replica does not.
+fn has_local_blobs(db: &LocalDb) -> bool {
+    db.team_content_store().is_none()
 }
 
 /// What reconstruction made of one event: whether the `data` it now carries is
@@ -193,7 +201,8 @@ pub async fn reconstruct_events_reporting(
         let coords = load_coords(
             db,
             &events,
-            team_store(db),
+            content_store(db),
+            has_local_blobs(db),
             db.private_route_db().map(Arc::as_ref),
         )
         .await;
@@ -235,12 +244,11 @@ async fn load_coords(
     db: &LocalDb,
     events: &[Event],
     store: Option<&dyn ContentStore>,
+    local_blobs: bool,
     private_route_db: Option<&LocalDb>,
 ) -> Coords {
     let run_ids = gitcoord_run_ids(events);
     let hashes = blobbed_hashes(events);
-    // A team replica has no `archival_blobs` table: its blobs are in the store.
-    let local_blobs = store.is_none();
     let rows = db
         .read(move |conn| {
             Box::pin(async move {
@@ -323,29 +331,37 @@ fn is_blobbed(event: &Event) -> bool {
 }
 
 /// Distinct content-addressed blob hashes referenced by the archived `blobbed`
-/// rows in `events`, so they load once up front. Collects both a system prompt's
-/// `segments[].hash` and a system init's `skeleton`/`toolset` hashes — harmless
-/// to scan for all keys regardless of which marker a row carries.
+/// rows in `events`, so they load once up front.
 fn blobbed_hashes(events: &[Event]) -> Vec<String> {
     let mut set: HashSet<String> = HashSet::new();
     for event in events.iter().filter(|event| is_blobbed(event)) {
-        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
-            continue;
-        };
-        if let Some(segments) = value.get("segments").and_then(|s| s.as_array()) {
-            for seg in segments {
-                if let Some(hash) = seg.get("hash").and_then(|v| v.as_str()) {
-                    set.insert(hash.to_string());
-                }
-            }
-        }
-        for key in ["skeleton", "toolset"] {
-            if let Some(hash) = value.get(key).and_then(|v| v.as_str()) {
-                set.insert(hash.to_string());
+        set.extend(segment_hashes(&event.data));
+    }
+    set.into_iter().collect()
+}
+
+/// The segment-blob hashes one archived `blobbed` row's stored `data`
+/// references: a system prompt's `segments[].hash` and a system init's
+/// `skeleton`/`toolset`. Scanning for every key is harmless whichever marker
+/// the row carries. Empty for anything that is not such a row's JSON.
+pub fn segment_hashes(data: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return Vec::new();
+    };
+    let mut hashes = Vec::new();
+    if let Some(segments) = value.get("segments").and_then(|s| s.as_array()) {
+        for seg in segments {
+            if let Some(hash) = seg.get("hash").and_then(|v| v.as_str()) {
+                hashes.push(hash.to_string());
             }
         }
     }
-    set.into_iter().collect()
+    for key in ["skeleton", "toolset"] {
+        if let Some(hash) = value.get(key).and_then(|v| v.as_str()) {
+            hashes.push(hash.to_string());
+        }
+    }
+    hashes
 }
 
 /// Resolved coordinates for one batch's archived events, gathered entirely
@@ -397,7 +413,8 @@ struct CoordRows {
     /// execution_id -> its `execution_history` pack columns, when it has any.
     packs: HashMap<String, PackRow>,
     /// Each requested blob hash, with its compressed `archival_blobs` bytes
-    /// when this is the private database and the row exists.
+    /// when this is the private database and the row has not been offloaded
+    /// yet.
     blobs: Vec<(String, Option<Vec<u8>>)>,
 }
 
@@ -590,9 +607,11 @@ async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -
 /// An execution's range pack columns, `None` for an empty range (NULL pack
 /// columns and no `pack_hash`) or a missing `execution_history` row.
 ///
-/// Local run: `pack`/`pack_idx` are inline. Team run: those columns are NULL
-/// and `pack_hash` points at the framed pack object in the content store,
-/// which [`fetch_pack`] fetches once the read has released.
+/// Archival writes `pack`/`pack_idx` NULL and `pack_hash` pointing at the
+/// framed pack object in the content store, which [`fetch_pack`] fetches once
+/// the read has released. A private row archived before the file store existed
+/// still carries its pack inline until the offload pass moves it, and inline
+/// wins while both are set, so the row reads the same in either state.
 async fn load_pack_row(conn: &turso::Connection, execution_id: &str) -> Option<PackRow> {
     let mut rows = conn
         .query(
@@ -608,14 +627,44 @@ async fn load_pack_row(conn: &turso::Connection, execution_id: &str) -> Option<P
     row.opt_text(2).ok()?.map(PackRow::Stored)
 }
 
-/// Fetch a team run's framed pack object by hash and split it back into
-/// `(pack, idx)`. An absent store, fetch error, or malformed object yields
-/// `None` (degrade to stub).
+/// An execution's archived range pack as `(pack, idx)`, wherever it lives:
+/// inline in `execution_history`, or in the database's content store by
+/// `pack_hash`. `None` for an empty range, a missing row, or a stored pack the
+/// store cannot produce (absent, offline, or failing its integrity check), so
+/// the caller falls through to the project repository as reconstruction does.
+/// The row read is one short read; the store fetch runs after it releases.
+pub async fn load_execution_pack(
+    db: &LocalDb,
+    execution_id: &str,
+) -> DbResult<Option<(Vec<u8>, Vec<u8>)>> {
+    let execution_id = execution_id.to_string();
+    let row = db
+        .read(move |conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move { DbResult::Ok(load_pack_row(conn, &execution_id).await) })
+        })
+        .await?;
+    Ok(match row {
+        Some(PackRow::Inline(pack, idx)) => Some((pack, idx)),
+        Some(PackRow::Stored(pack_hash)) => fetch_pack(content_store(db), &pack_hash).await,
+        None => None,
+    })
+}
+
+/// Fetch an execution's framed pack object by hash and split it back into
+/// `(pack, idx)`. An absent or offline store, fetch error, or malformed object
+/// yields `None` (degrade to stub).
 async fn fetch_pack(
     store: Option<&dyn ContentStore>,
     pack_hash: &str,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    let bytes = store?.get(pack_hash).await.ok()??;
+    let bytes = match store?.get(pack_hash).await {
+        Ok(bytes) => bytes?,
+        Err(error) => {
+            log::debug!("execution pack {pack_hash} unavailable: {error}");
+            return None;
+        }
+    };
     // Content-addressed integrity: the fetched object MUST hash to the pointer
     // that named it. A mismatch (corrupt/stale object, broker or backend bug,
     // tampering) is treated as absent so reconstruction degrades to a stub rather
@@ -633,14 +682,13 @@ async fn fetch_pack(
 /// row/object, integrity/utf-8 failure) leaves the segment to degrade to a
 /// labeled stub.
 ///
-/// The two scopes store the blob DIFFERENTLY under the same hash. Team conn
-/// (`store` present): the `archival_blobs` table is private-only and absent here,
-/// so the bytes are fetched from the content store — where they are stored
-/// UNCOMPRESSED (their sha256 IS the key, so a fetch can verify integrity), hence
-/// used directly after the hash check, no decompress. Private conn (`store` is
-/// `None`): the bytes come from `archival_blobs`, which holds the
-/// zstd-COMPRESSED form, read by [`CoordRows::load`] and passed here as
-/// `local`, so the local path decompresses.
+/// The content store holds the segment UNCOMPRESSED under its own sha256, so a
+/// fetch verifies against its key and is used directly. When the store cannot
+/// produce it, the private database falls back to its `archival_blobs` row
+/// (`local`, read by [`CoordRows::load`]), which holds the zstd-COMPRESSED
+/// form. That fallback serves only rows the offload pass has not yet moved
+/// into the file store; it goes when `archival_blobs` is dropped. A team
+/// replica has no such table, so its `local` is always `None`.
 async fn resolve_blob(
     hash: &str,
     local: Option<Vec<u8>>,
@@ -657,27 +705,23 @@ async fn resolve_blob(
     {
         return Some(crate::storage::quarantine::withheld_notice(incident));
     }
-    match store {
-        // Team conn: the store object is the UNCOMPRESSED segment bytes, keyed by
-        // their sha256. Verify the fetched bytes hash to the requested key before
-        // trusting them (content-addressed integrity over an untrusted network); a
-        // mismatch is treated as absent and degrades to a stub.
-        Some(store) => {
-            let bytes = store.get(hash).await.ok()??;
-            if content_hash(&bytes) != hash {
-                log::warn!(
-                    "content-store blob object for {hash} failed integrity check; treating as absent"
-                );
-                return None;
+    if let Some(store) = store {
+        match store.get(hash).await {
+            // Verify the fetched bytes hash to the requested key before trusting
+            // them (a team store is reached over an untrusted network); a
+            // mismatch is treated as absent.
+            Ok(Some(bytes)) if content_hash(&bytes) == hash => {
+                return String::from_utf8(bytes).ok();
             }
-            String::from_utf8(bytes).ok()
-        }
-        // Private conn: `archival_blobs` holds the zstd-compressed bytes.
-        None => {
-            let bytes = decompress(CODEC_ZSTD_V1, &local?).ok()?;
-            String::from_utf8(bytes).ok()
+            Ok(Some(_)) => log::warn!(
+                "content-store blob object for {hash} failed integrity check; treating as absent"
+            ),
+            Ok(None) => {}
+            Err(error) => log::debug!("segment blob {hash} unavailable: {error}"),
         }
     }
+    let bytes = decompress(CODEC_ZSTD_V1, &local?).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Read one content-addressed blob's compressed bytes from the private

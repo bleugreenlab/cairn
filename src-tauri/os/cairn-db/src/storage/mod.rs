@@ -52,7 +52,7 @@ pub use local_db::{
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
-    MigrationRunner,
+    MigrationRunner, MigrationStep,
 };
 pub use migrations::{
     Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
@@ -97,7 +97,9 @@ pub use search_index::{SearchIndex, SearchIndexHit};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use content_store::InMemoryContentStore;
-pub use content_store::{ContentStore, ContentStoreFactory, TeamReplicaContext};
+pub use content_store::{
+    ContentStore, ContentStoreError, ContentStoreFactory, FileContentStore, TeamReplicaContext,
+};
 #[cfg(any(test, feature = "test-utils"))]
 pub use events::event_fixture;
 pub use events::{

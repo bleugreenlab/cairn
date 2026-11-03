@@ -31,11 +31,11 @@
 //!     byte-for-byte.
 //! - **blobbed**: assembled `system:prompt` and near-constant `system:init`
 //!   events, independent of git. Their constant parts are content-hashed into
-//!   `archival_blobs` once and shared across executions; the per-run remainder
-//!   is inlined; a byte-exact verify gates each one. Blob rows are deliberately
-//!   not foreign-keyed to executions, so deleting one execution never cascades
-//!   a blob another still references; collecting unreferenced blobs is not
-//!   implemented.
+//!   the content store once and shared across executions; the per-run
+//!   remainder is inlined; a byte-exact verify gates each one. Store objects
+//!   are deliberately not owned by executions, so deleting one execution never
+//!   removes a blob another still references; collecting unreferenced objects
+//!   is not implemented.
 //! - **zstd**: everything else (run output, directory/glob reads, web/PDF/cairn
 //!   resource reads, out-of-repo paths, model text, thinking, artifacts), any
 //!   read that fails the compare, and every git-shaped row when no range is
@@ -82,12 +82,13 @@
 //!
 //! # Applying
 //!
-//! Blobs and the `execution_history` row commit first, then the event UPDATEs
-//! in bounded chunks, so a gitcoord row can never reference an absent pack and
-//! no single transaction grows with the transcript. Every UPDATE only touches a
-//! row still `full`, so a teardown and a sweep racing on one execution can
-//! never archive a row twice. A team replica offloads its pack and blobs to the
-//! team content store (put before commit) and keeps only hash pointers.
+//! The pack and blobs are put to the database's content store first (the team
+//! store on a replica, the file store beside the private database), then the
+//! `execution_history` pointer row commits, then the event UPDATEs in bounded
+//! chunks, so a gitcoord row can never reference an absent pack and no single
+//! transaction grows with the transcript. Every UPDATE only touches a row still
+//! `full`, so a teardown and a sweep racing on one execution can never archive
+//! a row twice. A database with no content store archives nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -100,6 +101,7 @@ use sha2::{Digest, Sha256};
 use crate::models::Event;
 use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
 use crate::storage::content_store::ContentStore;
+use crate::storage::events::columns::EVENT_COLUMN_COUNT;
 use crate::storage::events::encoding::{
     init_placeholder, ArchivedShape, ARCHIVED_SYSTEM_INIT, ARCHIVED_SYSTEM_PROMPT, INIT_TOOLS_TAG,
 };
@@ -134,10 +136,10 @@ mod tests_roundtrip;
 #[cfg(test)]
 mod tests_system_blob;
 #[cfg(test)]
-mod testsupport;
+pub(crate) mod testsupport;
 
-/// One content-addressed blob to insert into `archival_blobs`: its content hash
-/// and the zstd-compressed bytes.
+/// One content-addressed segment blob: the sha256 of its uncompressed bytes,
+/// and the zstd-compressed bytes (decompressed before they are put).
 pub(crate) type SegmentBlob = (String, Vec<u8>);
 
 /// A hash-addressed [`ArchivedShape::Blobbed`] plus the blobs it references
@@ -316,7 +318,10 @@ impl fmt::Display for ArchiveSummary {
 /// transcripts on a dozen cores at once and interleaved their UPDATE chunks on
 /// the runtime. Serialized, a storm of closes costs one blocking core and one
 /// stream of writes, for longer.
-static ARCHIVAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+///
+/// The archive offload ([`super::offload`]) takes it per page, so a teardown
+/// waits behind at most one page of it.
+pub(crate) static ARCHIVAL_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 /// Archive one execution's still-`full` events.
 ///
@@ -329,6 +334,16 @@ pub async fn archive_execution(
     db: &LocalDb,
     target: ArchiveTarget,
 ) -> Result<ArchiveSummary, String> {
+    // The heavy bytes go to the content store, and the database keeps only
+    // pointers. Every production database has one (the team store on a replica,
+    // the file store on the private database), so a handle without one archives
+    // nothing rather than writing the bytes back inline.
+    let Some(store) = db.content_store().cloned() else {
+        return Err(format!(
+            "archival: execution {} not archived: this database has no content store",
+            target.execution_id
+        ));
+    };
     let _permit = ARCHIVAL_GATE
         .acquire()
         .await
@@ -379,14 +394,7 @@ pub async fn archive_execution(
     if updates.is_empty() && history.is_none() && blobs.is_empty() {
         return Ok(summary);
     }
-    // A team replica offloads its heavy pack and system blobs to the shared team
-    // store and writes only pointers into the synced replica. The private
-    // database keeps them inline.
-    if let Some(store) = db.team_content_store() {
-        apply_offloaded(db, store.as_ref(), updates, history, blobs).await?;
-    } else {
-        apply(db, updates, history, blobs).await?;
-    }
+    apply(db, store.as_ref(), updates, history, blobs).await?;
     Ok(summary)
 }
 
@@ -412,10 +420,97 @@ struct Loaded {
     events: Vec<Event>,
 }
 
-/// Event rows loaded between yields to the runtime.
-const LOAD_YIELD_ROWS: usize = 256;
-
+/// Read one execution's metadata and every event it recorded.
+///
+/// The metadata is one short read. The events are read run by run, in pages of
+/// at most [`reconstruct::RECONSTRUCT_BATCH_ROWS`] rows or
+/// [`reconstruct::RECONSTRUCT_BATCH_BYTES`] stored bytes, each page its own
+/// short read keyed on `(sequence, rowid)` along `idx_events_run_sequence`,
+/// with a yield between pages. A coordinator's transcript runs to tens of
+/// thousands of rows, and one read over all of them held a transaction open
+/// long enough to stop the logical-log checkpoint (tenet 1260); paging bounds
+/// the transaction, not the memory. The rows still accumulate here, because
+/// classification needs the whole set at once (the tool map, the commit
+/// pre-pass, and the pack tips).
+///
+/// The result is sorted by `(created_at, sequence, rowid)`: the chronological
+/// order the classifier replays, with `rowid` making ties deterministic.
 async fn load(db: &LocalDb, execution_id: &str) -> DbResult<Option<Loaded>> {
+    let Some((mut loaded, run_ids)) = load_metadata(db, execution_id).await? else {
+        return Ok(None);
+    };
+    let mut keyed: Vec<(i64, Event)> = Vec::new();
+    for run_id in run_ids {
+        let mut after: (i64, i64) = (i64::MIN, i64::MIN);
+        loop {
+            let page = load_event_page(db, &run_id, after).await?;
+            let Some(last) = page
+                .last()
+                .map(|(rowid, event)| (i64::from(event.sequence), *rowid))
+            else {
+                break;
+            };
+            after = last;
+            keyed.extend(page);
+            tokio::task::yield_now().await;
+        }
+    }
+    keyed.sort_by_key(|(rowid, event)| (event.created_at, event.sequence, *rowid));
+    loaded.events = keyed.into_iter().map(|(_, event)| event).collect();
+    Ok(Some(loaded))
+}
+
+/// The next page of `run_id`'s events after `(sequence, rowid)`, each with its
+/// rowid.
+async fn load_event_page(
+    db: &LocalDb,
+    run_id: &str,
+    after: (i64, i64),
+) -> DbResult<Vec<(i64, Event)>> {
+    let run_id = run_id.to_string();
+    db.read(move |conn| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            let sql = format!(
+                "SELECT {EVENT_COLUMNS}, rowid FROM events
+                 WHERE run_id = ?1 AND (sequence > ?2 OR (sequence = ?2 AND rowid > ?3))
+                 ORDER BY sequence ASC, rowid ASC
+                 LIMIT ?4"
+            );
+            let mut rows = conn
+                .query(
+                    &sql,
+                    (
+                        run_id.as_str(),
+                        after.0,
+                        after.1,
+                        reconstruct::RECONSTRUCT_BATCH_ROWS as i64,
+                    ),
+                )
+                .await?;
+            let mut page = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = rows.next().await? {
+                let event = event_from_row(&row)?;
+                let rowid = row.i64(EVENT_COLUMN_COUNT)?;
+                bytes += event.data.len() + event.data_blob.as_ref().map_or(0, Vec::len);
+                page.push((rowid, event));
+                if bytes >= reconstruct::RECONSTRUCT_BATCH_BYTES {
+                    break;
+                }
+            }
+            Ok(page)
+        })
+    })
+    .await
+}
+
+/// The execution's metadata and its run ids, in one short read. `None` when no
+/// job names the execution.
+async fn load_metadata(
+    db: &LocalDb,
+    execution_id: &str,
+) -> DbResult<Option<(Loaded, Vec<String>)>> {
     let execution_id = execution_id.to_string();
     db.read(move |conn| {
         let execution_id = execution_id.clone();
@@ -457,36 +552,29 @@ async fn load(db: &LocalDb, execution_id: &str) -> DbResult<Option<Loaded>> {
                 run_branches.insert(row.text(0)?, row.text(1)?);
             }
 
-            // Filter by a run subquery rather than joining, so the unqualified
-            // EVENT_COLUMNS `id` stays unambiguous against runs.id/jobs.id.
-            let sql = format!(
-                "SELECT {EVENT_COLUMNS} FROM events
-                 WHERE run_id IN (
-                     SELECT r.id FROM runs r JOIN jobs j ON r.job_id = j.id
-                     WHERE j.execution_id = ?1
-                 )
-                 ORDER BY created_at ASC, sequence ASC"
-            );
-            let mut rows = conn.query(&sql, (execution_id.as_str(),)).await?;
-            let mut events = Vec::new();
+            let mut run_ids = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT r.id FROM runs r JOIN jobs j ON r.job_id = j.id
+                     WHERE j.execution_id = ?1 ORDER BY r.id",
+                    (execution_id.as_str(),),
+                )
+                .await?;
             while let Some(row) = rows.next().await? {
-                events.push(event_from_row(&row)?);
-                // A coordinator's transcript runs to tens of thousands of rows,
-                // and a row step rarely awaits anything real: hand the worker
-                // back periodically so the load never holds it for seconds.
-                if events.len() % LOAD_YIELD_ROWS == 0 {
-                    tokio::task::yield_now().await;
-                }
+                run_ids.push(row.text(0)?);
             }
 
-            Ok(Some(Loaded {
-                execution_id,
-                project_id,
-                repository_id,
-                has_history,
-                run_branches,
-                events,
-            }))
+            Ok(Some((
+                Loaded {
+                    execution_id,
+                    project_id,
+                    repository_id,
+                    has_history,
+                    run_branches,
+                    events: Vec::new(),
+                },
+                run_ids,
+            )))
         })
     })
     .await
@@ -519,8 +607,8 @@ struct Classified {
     updates: Vec<EventUpdate>,
     summary: ArchiveSummary,
     history: Option<ExecHistory>,
-    /// Content-addressed segment blobs to insert (hash, zstd bytes). Shared across
-    /// executions via `INSERT OR IGNORE`; duplicates are harmless.
+    /// Content-addressed segment blobs to put (hash, zstd bytes). Shared across
+    /// executions; a re-put of an existing hash is a no-op.
     blobs: Vec<SegmentBlob>,
 }
 

@@ -16,12 +16,13 @@
 //! `events` has no index on `storage_mode`, and most of its bytes belong to
 //! terminal issues. Candidates are therefore found through `issues`, `jobs`,
 //! `runs`, and `idx_events_run_id`, never by scanning `events`, and a pass only
-//! considers issues resolved since the last fully successful pass in this
-//! process (the watermark). The first pass after startup scans every resolved
-//! issue once; later passes see only new resolutions. A reopened issue clears
-//! `completed_at` and stamps a new one when it resolves again, so it re-enters
-//! the window. A pass with any failure leaves the watermark in place so the
-//! next pass retries. Within a pass, candidates are paged by
+//! considers issues resolved since the last fully successful pass (the
+//! watermark, persisted in `archival_progress` so a restart does not rescan).
+//! The first pass on a database scans every resolved issue once; later passes,
+//! in this process or the next, see only new resolutions. A reopened issue
+//! clears `completed_at` and stamps a new one when it resolves again, so it
+//! re-enters the window. A pass with any failure leaves the watermark in place
+//! so the next pass retries. Within a pass, candidates are paged by
 //! `(completed_at, execution_id)` so no page rescans an earlier one.
 //!
 //! The sweep only visits the private database. Team replicas are archived by
@@ -55,8 +56,9 @@
 //! longer read: the sweep needs no completion marker.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
+use super::progress;
 use super::rewrite::{archive_execution, ArchiveSummary, ArchiveTarget};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
@@ -70,11 +72,19 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 /// Candidate executions fetched per page.
 const PAGE_SIZE: i64 = 50;
 
-/// Per-database watermarks (keyed by [`LocalDb::instance`]): the resolution
-/// time below which every candidate has already been archived. The mutex also
-/// serializes passes on one database.
-static WATERMARKS: LazyLock<tokio::sync::Mutex<HashMap<u64, i64>>> =
+/// One lock per database (keyed by [`LocalDb::instance`]) serializing its
+/// passes, so two never read and advance the same persisted watermark at once.
+static PASS_LOCKS: LazyLock<std::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(Default::default);
+
+fn pass_lock(db: &LocalDb) -> Arc<tokio::sync::Mutex<()>> {
+    PASS_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(db.instance())
+        .or_default()
+        .clone()
+}
 
 /// Aggregate outcome of one sweep pass.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -98,12 +108,25 @@ pub(crate) async fn run_archival_sweep_at(
     now: i64,
     grace_secs: i64,
 ) -> Result<SweepSummary, String> {
-    let mut watermarks = WATERMARKS.lock().await;
-    let since = watermarks.get(&db.instance()).copied().unwrap_or(i64::MIN);
+    let lock = pass_lock(db);
+    let _serialized = lock.lock().await;
+    let saved = progress::load(db, progress::SWEEP)
+        .await
+        .map_err(|e| format!("loading the archival sweep watermark: {e}"))?;
+    let since = saved.watermark.unwrap_or(i64::MIN);
     let cutoff = now - grace_secs;
     let summary = sweep(db, since, cutoff).await?;
-    if summary.failed == 0 {
-        watermarks.insert(db.instance(), cutoff);
+    if summary.failed == 0 && cutoff > since {
+        progress::save(
+            db,
+            progress::SWEEP,
+            &progress::Progress {
+                watermark: Some(cutoff),
+                cursor: None,
+            },
+        )
+        .await
+        .map_err(|e| format!("saving the archival sweep watermark: {e}"))?;
     }
     Ok(summary)
 }
@@ -305,6 +328,52 @@ mod tests {
             .unwrap();
         assert_eq!(later.executions, 1);
         assert_eq!(mode(&db, "u2").await, "zstd");
+    }
+
+    async fn saved_watermark(db: &LocalDb) -> Option<i64> {
+        progress::load(db, progress::SWEEP).await.unwrap().watermark
+    }
+
+    /// The watermark is persisted: a fresh handle on the same file (a
+    /// restart) does not rescan what the last process already swept.
+    #[tokio::test]
+    async fn the_watermark_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archival-sweep-reopen.db");
+        {
+            let db = LocalDb::open_migrated_for_test(&path).await.unwrap();
+            seed_project(&db).await;
+            seed_issue(&db, 1, "merged", Some(1_000)).await;
+            let first = run_archival_sweep_at(&db, NOW, GRACE).await.unwrap();
+            assert_eq!(first.executions, 1);
+            assert_eq!(saved_watermark(&db).await, Some(NOW - GRACE));
+            // Put a full row back on the swept execution: a rescan would find it.
+            insert_event(&db, "late1", "r1", 3, &user_text("late")).await;
+        }
+        let db = LocalDb::open_migrated_for_test(&path).await.unwrap();
+        let again = run_archival_sweep_at(&db, NOW, GRACE).await.unwrap();
+        assert_eq!(again, SweepSummary::default(), "no rescan after reopen");
+        assert_eq!(mode(&db, "late1").await, "full");
+    }
+
+    /// A pass with a failed candidate leaves the watermark where it was, so
+    /// the next pass retries the window.
+    #[tokio::test]
+    async fn a_failed_candidate_does_not_advance_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archival-sweep-failed.db");
+        // A storeless handle: archival refuses every candidate.
+        let db = LocalDb::open(&path).await.unwrap();
+        crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        seed_project(&db).await;
+        seed_issue(&db, 1, "merged", Some(1_000)).await;
+        let failed = run_archival_sweep_at(&db, NOW, GRACE).await.unwrap();
+        assert_eq!(failed.failed, 1);
+        assert_eq!(saved_watermark(&db).await, None);
+        assert_eq!(mode(&db, "u1").await, "full");
     }
 
     #[tokio::test]
