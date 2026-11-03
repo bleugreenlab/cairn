@@ -288,14 +288,24 @@ impl Crossing {
     ///
     /// The command text is read first, because it can name the exact git
     /// subcommand. A git call made from an inline interpreter or a script is
-    /// not in that text, so the output's reported denial line is read next.
-    /// That line is unverified, which is why it may only choose a refusal: a
-    /// refusal gives the agent less than the escape prompt it replaces, so a
-    /// forged line can cost its author an answer but never widen access.
+    /// not in that text, so the denied path is read next. When the sandbox
+    /// recovered it, a `run` crossing's descriptor is that path, and a
+    /// git-internal one must be refused rather than prompted for, because an
+    /// allow would open git's index or refs to direct writes. When it did not,
+    /// the output's reported denial line stands in for it. That line is
+    /// unverified, which is why it may only choose a refusal: a refusal gives
+    /// the agent less than the escape prompt it replaces, so a forged line can
+    /// cost its author an answer but never widen access.
     fn route_refusal(&self) -> Option<String> {
         self.command
             .as_deref()
             .and_then(command_refusal::denied_command_refusal)
+            .or_else(|| {
+                matches!(self.kind, CrossingKind::ShellPathCrossing)
+                    .then(|| self.host_path())
+                    .flatten()
+                    .and_then(command_refusal::recovered_git_write_refusal)
+            })
             .or_else(|| {
                 self.reported
                     .as_deref()
@@ -368,8 +378,8 @@ pub(crate) async fn raise_fence_with_handoff(
     }
 
     // A blocked command whose blocked step has an ordinary route inside the
-    // sandbox (a git index or ref write, named by the command or by the
-    // output's denial line; see `command_refusal`) is answered with that
+    // sandbox (a git index or ref write, named by the command, the recovered
+    // path, or the output's denial line; see `command_refusal`) is answered with that
     // route instead of a prompt, so no operator is asked a question
     // whose only answers are harmful or futile. Unlike the protected-path
     // refusal above it leaves an `allow` fence alone: an agent trusted to
@@ -720,6 +730,59 @@ mod tests {
             }
         }
         assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// An inline interpreter's git call is not in its command text, but on
+    /// macOS the sandbox recovers the path it was denied. A path-scoped allow
+    /// would hand the item git's index, so the recovered path selects the
+    /// git-writer refusal instead, stated as the sandbox's own record.
+    #[tokio::test]
+    async fn a_recovered_git_internal_path_from_a_non_git_command_is_refused_with_its_route() {
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        let path =
+            "/Users/dev/.cairn-exec/managed-objects/m/repository.git/worktrees/slot-6/index.lock";
+        for command in ["uv run -", "./scripts/rename.sh"] {
+            let crossing = Crossing::shell_path(Path::new(path), command);
+            assert_eq!(crossing.kind, CrossingKind::ShellPathCrossing);
+
+            for fence in [Fence::Ask, Fence::Deny] {
+                match raise_fence(&orch, "run-1", fence, &run_request(), crossing.clone()).await {
+                    FenceDecision::Deny(refusal) => {
+                        assert!(
+                            refusal.contains("git's staging records or refs"),
+                            "{refusal}"
+                        );
+                        assert!(refusal.contains("The sandbox recorded"), "{refusal}");
+                        assert!(!refusal.contains("unverified"), "{refusal}");
+                        assert!(refusal.contains("plain `mv`"), "{refusal}");
+                        assert!(
+                            refusal.contains("`commit_msg` on the `run` or `write`"),
+                            "{refusal}"
+                        );
+                        assert!(!refusal.contains("slot-6"), "{refusal}");
+                    }
+                    other => panic!(
+                        "{fence:?} {command}: expected the git-writer refusal, got {other:?}"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            permission_rows(&orch).await,
+            0,
+            "no path-scoped crossing may reach anyone's desk"
+        );
+    }
+
+    /// A recovered path outside a git directory's own records, including a
+    /// file merely named `index.lock`, keeps the path-scoped prompt.
+    #[test]
+    fn a_recovered_path_elsewhere_keeps_the_path_prompt() {
+        for path in ["/outside/x", "/home/dev/project/build/index.lock"] {
+            let c = Crossing::shell_path(Path::new(path), "uv run -");
+            assert_eq!(c.kind, CrossingKind::ShellPathCrossing);
+            assert_eq!(c.route_refusal(), None, "{path}");
+        }
     }
 
     /// A path denial whose command has no in-sandbox route still raises the

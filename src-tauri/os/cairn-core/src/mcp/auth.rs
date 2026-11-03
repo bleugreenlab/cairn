@@ -572,7 +572,8 @@ mod tests {
             "src-tauri/src/commands/fleet.rs",
             // The operator's starts and releases of held work
             // (`start_recipe_execution`, `start_held_execution_now`,
-            // `override_operator_hold`): routed through `operator_target`
+            // `move_held_execution`, `override_operator_hold`): routed through
+            // `operator_target`
             // like tenet verdicts, so only the main webview reaches the local
             // runner or a configured peer. The module names only
             // `invoke_as_operator`, forwards the runner's arguments unchanged,

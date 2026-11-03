@@ -34,10 +34,11 @@
 //! else the command does.
 //!
 //! A git call an inline interpreter (`uv run -`, `bun -e`) or a script makes is
-//! not in the command text at all. For those, [`reported_git_write_refusal`]
-//! reads the denial line the item's own output carries and answers with one
-//! generic refusal when that line names a write to git's staging records or
-//! refs ([`is_git_internal_write`]).
+//! not in the command text at all. For those, the denied path itself is read:
+//! [`recovered_git_write_refusal`] takes the path the sandbox recorded, and
+//! [`reported_git_write_refusal`] the denial line the item's own output carries
+//! when no path was recovered. Either answers with one generic refusal when the
+//! path is a write to git's staging records or refs ([`is_git_internal_write`]).
 
 /// The refusal for a blocked command whose blocked step has an ordinary route
 /// inside the sandbox, or `None` to leave the crossing to the fence policy.
@@ -79,7 +80,21 @@ pub(crate) fn denied_command_refusal(command: &str) -> Option<String> {
 pub(crate) fn reported_git_write_refusal(reported: &str) -> Option<String> {
     reported_paths(reported)
         .any(is_git_internal_write)
-        .then(reported_git_write_text)
+        .then(|| git_internal_write_text(REPORTED_OPENING))
+}
+
+/// The refusal for a denial the sandbox recorded on `path`, when that path is
+/// a write to git's staging records or refs, or `None`.
+///
+/// The path comes from the sandbox's own violation record, so unlike a
+/// reported line it is not the agent's text. It matters here because the
+/// crossing it would otherwise raise is path-scoped: an allow would add `path`
+/// to the sandbox's writable set and let the item write git's index or refs
+/// directly.
+pub(crate) fn recovered_git_write_refusal(path: &std::path::Path) -> Option<String> {
+    path.to_str()
+        .is_some_and(is_git_internal_write)
+        .then(|| git_internal_write_text(RECORDED_OPENING))
 }
 
 /// Whether `path` is a file git writes to change its staging records or refs:
@@ -139,9 +154,16 @@ fn reported_paths(line: &str) -> impl Iterator<Item = &str> {
     quoted.chain(bare)
 }
 
-fn reported_git_write_text() -> String {
+/// How a refusal read from the item's output says where its path came from.
+const REPORTED_OPENING: &str = "This item's own output reports that the sandbox denied a write to git's staging records or refs. That report is unverified, since the item wrote it; the usual cause is a git call made from an inline interpreter or a script, where the command text does not show it.";
+
+/// How a refusal read from the sandbox's own record says where its path came
+/// from.
+const RECORDED_OPENING: &str = "The sandbox recorded that it denied this item a write to git's staging records or refs. The command text does not show a git call, so the usual cause is one made from an inline interpreter or a script.";
+
+fn git_internal_write_text(opening: &str) -> String {
     format!(
-        "This item's own output reports that the sandbox denied a write to git's staging records or refs. That report is unverified, since the item wrote it; the usual cause is a git call made from an inline interpreter or a script, where the command text does not show it. Those records live outside your working directory, so the sandbox blocks every write to them, and {COMMIT_IS_DERIVED} {CAIRN_OWNS_THE_BRANCH} The route is `commit_msg` on the `run` or `write` that makes the change: it stages and commits your working tree for you. {MV_ROUTE} {RM_ROUTE} Then run the item again without its git writes; anything before them may already have run."
+        "{opening} Those records live outside your working directory, so the sandbox blocks every write to them, and {COMMIT_IS_DERIVED} {CAIRN_OWNS_THE_BRANCH} The route is `commit_msg` on the `run` or `write` that makes the change: it stages and commits your working tree for you. {MV_ROUTE} {RM_ROUTE} Then run the item again without its git writes; anything before them may already have run."
     )
 }
 
@@ -920,6 +942,32 @@ mod tests {
             assert!(!refusal.contains("/r/"), "{refusal}");
             assert!(!refusal.contains("managed-objects"), "{refusal}");
             crate::system_prompt::assert_no_substrate_vocabulary("reported git write refusal", &refusal);
+        }
+    }
+
+    #[test]
+    fn a_recorded_git_internal_write_is_refused_as_verified() {
+        let path = std::path::Path::new(
+            "/Users/dev/.cairn-exec/managed-objects/m/repository.git/worktrees/slot-6/index.lock",
+        );
+        let refusal = recovered_git_write_refusal(path).expect("a git-internal path");
+        for shared in [COMMIT_IS_DERIVED, CAIRN_OWNS_THE_BRANCH, MV_ROUTE, RM_ROUTE] {
+            assert!(refusal.contains(shared), "{refusal}");
+        }
+        assert!(refusal.contains("The sandbox recorded"), "{refusal}");
+        assert!(!refusal.contains("unverified"), "{refusal}");
+        assert!(!refusal.contains("slot-6"), "{refusal}");
+        crate::system_prompt::assert_no_substrate_vocabulary(
+            "recorded git write refusal",
+            &refusal,
+        );
+
+        for elsewhere in ["/home/dev/project/build/index.lock", "/outside/x"] {
+            assert_eq!(
+                recovered_git_write_refusal(std::path::Path::new(elsewhere)),
+                None,
+                "{elsewhere}"
+            );
         }
     }
 

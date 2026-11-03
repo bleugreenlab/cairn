@@ -114,9 +114,11 @@ pub enum GateEvidenceState {
 /// the capacity gate row's `execution_gates.detail`, and carried on the census,
 /// so the one renderer (`execution::gates::census`) turns the same facts into
 /// words on every surface. `place` is the execution's place in line on this
-/// cap, `None` until the queue has numbered it. `placed_by` names the thread
-/// whose own reorder moved this hold ahead of where it was filed (cairn/5848),
-/// `None` for a hold in the place it was filed into.
+/// cap, `None` until the queue has numbered it. `placed_by` names who moved
+/// this hold ahead of where it was filed: a thread's own reorder (cairn/5848)
+/// or `the operator`'s fleet move (cairn/5895), `None` for a hold in the place
+/// it was filed into. `pinned` says the operator gave this hold its place, so
+/// a thread's own order no longer moves it; it ends when the hold latches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cap", rename_all = "camelCase")]
 pub enum CapacityHold {
@@ -131,6 +133,8 @@ pub enum CapacityHold {
         place: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placed_by: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pinned: bool,
     },
     /// The thread focus cap: the thread's open children, by issue number,
     /// against its limit.
@@ -143,6 +147,8 @@ pub enum CapacityHold {
         place: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placed_by: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pinned: bool,
     },
 }
 
@@ -168,6 +174,18 @@ impl CapacityHold {
     pub fn set_placed_by(&mut self, to: Option<String>) {
         match self {
             Self::Fleet { placed_by, .. } | Self::Thread { placed_by, .. } => *placed_by = to,
+        }
+    }
+
+    pub fn pinned(&self) -> bool {
+        match self {
+            Self::Fleet { pinned, .. } | Self::Thread { pinned, .. } => *pinned,
+        }
+    }
+
+    pub fn set_pinned(&mut self, to: bool) {
+        match self {
+            Self::Fleet { pinned, .. } | Self::Thread { pinned, .. } => *pinned = to,
         }
     }
 }

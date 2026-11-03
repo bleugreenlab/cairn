@@ -357,9 +357,9 @@ pub async fn hold_capacity_gate_conn(
     Ok(true)
 }
 
-/// Move a capacity gate to another place in its queue, as a thread's own
-/// reorder does. Only ever a permutation of keys its thread's set already
-/// holds, so keys stay unique.
+/// Move a capacity gate to another place in its queue: a thread's own reorder
+/// permutes keys its set already holds, and the operator's fleet move writes
+/// one it chose free in this database, so keys stay unique either way.
 pub async fn set_gate_queue_key_conn(
     conn: &Connection,
     gate_id: &str,
@@ -372,6 +372,25 @@ pub async fn set_gate_queue_key_conn(
     .await?;
     Ok(())
 }
+
+/// Shift every gate whose key is at most `at_most` by `by`, in one statement:
+/// the operator's fleet move opening a gap where consecutive keys left none.
+/// A uniform shift of a prefix of the key order keeps every relative order
+/// (fleet, thread, release), and every key in this database stays distinct
+/// because rows above `at_most` are untouched and a downward shift cannot
+/// reach them. Latched rows shift with the rest, so uniqueness holds over the
+/// whole column; a fresh mint still lands past the newest key. Touches only
+/// `execution_gates`, through `idx_execution_gates_queue_key`. Returns how
+/// many rows moved.
+pub async fn shift_queue_keys_conn(conn: &Connection, at_most: i64, by: i64) -> DbResult<u64> {
+    Ok(conn
+        .execute(SHIFT_QUEUE_KEYS_SQL, params![at_most, by])
+        .await?)
+}
+
+/// The statement [`shift_queue_keys_conn`] runs.
+pub const SHIFT_QUEUE_KEYS_SQL: &str =
+    "UPDATE execution_gates SET queue_key = queue_key + ?2 WHERE queue_key <= ?1";
 
 /// Record that a capacity cap no longer blocks this execution, WITHOUT
 /// latching it: a free slot can be taken again before the release, so the row
@@ -504,6 +523,26 @@ macro_rules! queue_key_sql {
             "), (SELECT MIN(g.queue_key) FROM execution_gates g WHERE g.execution_id = e.id AND ",
             cairn_db::capacity_gate_sql!(),
             "), (SELECT MIN(first_gate.created_at) * 1000000 FROM execution_gates first_gate WHERE first_gate.execution_id = e.id))"
+        )
+    };
+}
+
+/// Execution `e`'s place on the queue PAGE, which lists the fleet's order:
+/// the key of its unlatched `fleet_slot` row, blocking or dormant, else
+/// [`queue_key_sql!`]. It differs from [`queue_key_sql!`] (the earliest
+/// blocking key on EITHER cap) when an execution's thread key is older than
+/// its fleet key: a thread-held child that got its thread key at t=100 and its
+/// fleet row at t=500 is released on the fleet after a fleet-only hold from
+/// t=300, so a page numbered by the earliest key would show it ahead of that
+/// hold and the number would be false. The page and the operator's move
+/// resolve positions against this one key.
+#[macro_export]
+macro_rules! fleet_order_key_sql {
+    () => {
+        concat!(
+            "COALESCE((SELECT MIN(fleet_row.queue_key) FROM execution_gates fleet_row WHERE fleet_row.execution_id = e.id AND fleet_row.satisfied_at IS NULL AND json_extract(fleet_row.predicate_json, '$.fact') = 'fleet_slot'), ",
+            $crate::queue_key_sql!(),
+            ")"
         )
     };
 }

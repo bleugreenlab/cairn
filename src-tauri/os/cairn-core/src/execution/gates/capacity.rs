@@ -186,14 +186,19 @@ pub enum AdmissionSite {
     Release,
     /// A gate patch removing the last authored gate, which releases.
     GatePatch,
+    /// The operator moving one held execution to a new place in the fleet
+    /// order (`reorder::move_held_execution`), which may renumber keys in
+    /// several databases: no decision may read a half-renumbered line.
+    OperatorMove,
 }
 
 impl AdmissionSite {
-    const ALL: [AdmissionSite; 4] = [
+    const ALL: [AdmissionSite; 5] = [
         AdmissionSite::Filing,
         AdmissionSite::SweepPass,
         AdmissionSite::Release,
         AdmissionSite::GatePatch,
+        AdmissionSite::OperatorMove,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -202,6 +207,7 @@ impl AdmissionSite {
             AdmissionSite::SweepPass => "sweep_pass",
             AdmissionSite::Release => "release",
             AdmissionSite::GatePatch => "gate_patch",
+            AdmissionSite::OperatorMove => "operator_move",
         }
     }
 
@@ -213,7 +219,7 @@ impl AdmissionSite {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL_FOR_TESTS: [AdmissionSite; 4] = Self::ALL;
+    pub(crate) const ALL_FOR_TESTS: [AdmissionSite; 5] = Self::ALL;
 }
 
 impl std::fmt::Display for AdmissionSite {
@@ -303,7 +309,7 @@ pub struct AdmissionLock {
     mutex: Arc<tokio::sync::Mutex<()>>,
     holder: HolderSlot,
     wait_bound_ms: AtomicU64,
-    acquisitions: [AtomicU64; 4],
+    acquisitions: [AtomicU64; 5],
 }
 
 impl Default for AdmissionLock {
@@ -448,12 +454,14 @@ impl Drop for AdmissionGuard {
 }
 
 /// A fresh decision stored over a row that already has a place, carrying that
-/// place and who placed it there, so re-deciding a hold neither churns its row
-/// between sweeps nor forgets a thread's reorder.
+/// place, who placed it there, and whether the operator pinned it, so
+/// re-deciding a hold neither churns its row between sweeps nor forgets a
+/// reorder.
 pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &CapacityHold) -> String {
     let mut hold = hold.clone();
     let prior = prior.and_then(|detail| decode_hold(fact, detail));
     hold.set_place(prior.as_ref().and_then(CapacityHold::place));
+    hold.set_pinned(prior.as_ref().is_some_and(CapacityHold::pinned));
     hold.set_placed_by(
         prior
             .as_ref()
@@ -1014,6 +1022,7 @@ impl QueueSnapshot {
                 unplaced: self.load.waiting_for_machine,
                 place: None,
                 placed_by: None,
+                pinned: false,
             });
         }
         let thread = start.issue_id.and_then(|issue_id| {
@@ -1038,6 +1047,7 @@ impl QueueSnapshot {
                     limit: self.thread_limit,
                     place: None,
                     placed_by: None,
+                    pinned: false,
                 });
             }
         }
@@ -1398,13 +1408,14 @@ macro_rules! cap_held_sql {
 }
 pub(crate) use cap_held_sql;
 
-/// Every execution a cap holds right now, with its age and its place.
-const QUEUE_ROWS_SQL: &str = concat!(
+/// Every execution a cap holds right now, with its age, its place in the
+/// fleet's order (`fleet_order_key_sql!`) and its thread.
+pub(crate) const QUEUE_ROWS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, e.seq, i.number, i.title, p.id, p.key, t.name, ",
     cairn_workflow::held_since_sql!(),
     ", ",
-    cairn_workflow::queue_key_sql!(),
-    "
+    cairn_workflow::fleet_order_key_sql!(),
+    ", i.parent_thread_id
        FROM executions e
        LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN projects p ON p.id = i.project_id
@@ -1413,12 +1424,23 @@ const QUEUE_ROWS_SQL: &str = concat!(
     cap_held_sql!()
 );
 
-/// Every cap-held execution across every database, in release order (the
-/// queue's one order: `queue_key`, then database, then execution), with the
-/// fleet's load.
-pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
-    let settings = orch.get_settings();
-    let fleet = fleet_load(orch).await?;
+/// One cap-held execution in the fleet's order, with where it lives.
+pub(crate) struct FleetOrdered {
+    /// Its `fleet_order_key_sql!`.
+    pub key: i64,
+    pub db_index: usize,
+    pub db: Arc<LocalDb>,
+    /// Its issue's thread, when it has one.
+    pub thread_id: Option<String>,
+    /// As the page lists it, its census not yet read.
+    pub queued: QueuedExecution,
+}
+
+/// Every cap-held execution across every database in the fleet's order: its
+/// fleet row's key (`fleet_order_key_sql!`), then database, then execution.
+/// The ONE order the queue page numbers and the operator's move resolves a
+/// position against, so the two cannot drift apart.
+pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>, String> {
     let mut held = Vec::new();
     for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
         let rows = db
@@ -1427,9 +1449,9 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
                     let mut rows = conn.query(QUEUE_ROWS_SQL, ()).await?;
                     let mut out = Vec::new();
                     while let Some(row) = rows.next().await? {
-                        let queue_key = row.opt_i64(9)?.unwrap_or(0);
                         out.push((
-                            queue_key,
+                            row.opt_i64(9)?.unwrap_or(0),
+                            row.opt_text(10)?,
                             QueuedExecution {
                                 execution_id: row.text(0)?,
                                 issue_id: row.opt_text(1)?,
@@ -1444,14 +1466,6 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
                             },
                         ));
                     }
-                    drop(rows);
-                    let ids: Vec<String> =
-                        out.iter().map(|(_, q)| q.execution_id.clone()).collect();
-                    let mut censuses =
-                        super::census::census_for_executions_conn(conn, &ids).await?;
-                    for (_, queued) in &mut out {
-                        queued.census = censuses.remove(&queued.execution_id);
-                    }
                     Ok(out)
                 })
             })
@@ -1459,14 +1473,57 @@ pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
             .map_err(|error| format!("failed to list the execution queue: {error}"))?;
         held.extend(
             rows.into_iter()
-                .map(|(queue_key, queued)| (queue_key, db_index, queued)),
+                .map(|(key, thread_id, queued)| FleetOrdered {
+                    key,
+                    db_index,
+                    db: db.clone(),
+                    thread_id,
+                    queued,
+                }),
         );
     }
-    held.sort_by(|(a_key, a_db, a), (b_key, b_db, b)| {
-        (a_key, a_db, &a.execution_id).cmp(&(b_key, b_db, &b.execution_id))
+    held.sort_by(|a, b| {
+        (a.key, a.db_index, &a.queued.execution_id).cmp(&(
+            b.key,
+            b.db_index,
+            &b.queued.execution_id,
+        ))
     });
-    let mut held: Vec<QueuedExecution> = held.into_iter().map(|(_, _, queued)| queued).collect();
+    Ok(held)
+}
+
+/// Every cap-held execution across every database, in the fleet's order
+/// ([`fleet_order`]), with the fleet's load.
+pub async fn queue_view(orch: &Orchestrator) -> Result<QueueView, String> {
+    let settings = orch.get_settings();
+    let fleet = fleet_load(orch).await?;
+    let ordered = fleet_order(orch).await?;
+    // Each database's censuses in one read.
+    let mut groups: Vec<(usize, Arc<LocalDb>, Vec<String>)> = Vec::new();
+    for entry in &ordered {
+        let id = entry.queued.execution_id.clone();
+        match groups
+            .iter_mut()
+            .find(|(index, ..)| *index == entry.db_index)
+        {
+            Some((_, _, ids)) => ids.push(id),
+            None => groups.push((entry.db_index, entry.db.clone(), vec![id])),
+        }
+    }
+    let mut censuses = HashMap::new();
+    for (_, db, ids) in groups {
+        let found = db
+            .read(move |conn| {
+                let ids = ids.clone();
+                Box::pin(async move { super::census::census_for_executions_conn(conn, &ids).await })
+            })
+            .await
+            .map_err(|error| format!("failed to list the execution queue: {error}"))?;
+        censuses.extend(found);
+    }
+    let mut held: Vec<QueuedExecution> = ordered.into_iter().map(|entry| entry.queued).collect();
     for queued in &mut held {
+        queued.census = censuses.remove(&queued.execution_id);
         if let Some(census) = queued.census.as_mut() {
             orch.sweep_pulse.stamp(&queued.execution_id, census);
         }
@@ -2932,8 +2989,60 @@ pub(crate) mod tests {
         }
     }
 
+    /// The page lists the fleet's order, not each execution's earliest key.
+    /// A thread-held child took its thread key at t=100 and its fleet row at
+    /// t=500; a fleet-only hold has been waiting since t=300. The fleet
+    /// releases the t=300 hold first, so the page lists it first.
+    #[tokio::test]
+    async fn the_queue_page_lists_in_fleet_order() {
+        let env = env("cap-page-fleet-order.db").await;
+        caps(&env, 6, 1);
+        full_fleet(&env).await;
+        add_thread(&env, "ta", "alpha").await;
+        add_started(&env, 150, Some("ta"), "running").await;
+        add_issue(&env, 201, Some("ta")).await;
+        file(&env, 201, json!([])).await.unwrap();
+        file(&env, 1, json!([])).await.unwrap();
+        let (child, ..) = execution(&env, 201).await;
+        let (fleet_only, ..) = execution(&env, 1).await;
+        sweep_at(&env.orch, now()).await.unwrap();
+        let scale = cairn_workflow::gates::store::QUEUE_KEY_SCALE;
+        for (execution_id, fact, at) in [
+            (&child, THREAD_FOCUS_FACT, 100),
+            (&child, FLEET_SLOT_FACT, 500),
+            (&fleet_only, FLEET_SLOT_FACT, 300),
+        ] {
+            env.db
+                .execute(
+                    "UPDATE execution_gates SET queue_key = ?1
+                      WHERE execution_id = ?2 AND json_extract(predicate_json, '$.fact') = ?3",
+                    (at * scale, execution_id.clone(), fact.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+        let listed: Vec<String> = queue_view(&env.orch)
+            .await
+            .unwrap()
+            .held
+            .into_iter()
+            .map(|held| held.execution_id)
+            .collect();
+        assert_eq!(listed, vec![fleet_only.clone(), child.clone()]);
+
+        // Both caps free one place: the fleet's goes to the t=300 hold.
+        env.db
+            .execute_script("UPDATE jobs SET status = 'complete' WHERE id IN ('sj100', 'sj150');")
+            .await
+            .unwrap();
+        resolve_issue(&env, 150, "merged").await;
+        let report = sweep_at(&env.orch, now()).await.unwrap();
+        assert_eq!(report.released, vec![fleet_only]);
+        assert!(is_held(&env, 201).await);
+    }
+
     /// A hold's stored form round-trips, and a re-decided hold keeps the place
-    /// its row already had, and who placed it there.
+    /// its row already had, who placed it there, and the operator's pin.
     #[test]
     fn a_stored_hold_keeps_its_place_across_decisions() {
         let decided = CapacityHold::Fleet {
@@ -2942,6 +3051,7 @@ pub(crate) mod tests {
             unplaced: 2,
             place: None,
             placed_by: None,
+            pinned: false,
         };
         let stored = encode_hold(&CapacityHold::Fleet {
             running: 7,
@@ -2949,6 +3059,7 @@ pub(crate) mod tests {
             unplaced: 0,
             place: Some(3),
             placed_by: None,
+            pinned: false,
         });
         assert_eq!(
             stored,
@@ -2963,6 +3074,7 @@ pub(crate) mod tests {
                 unplaced: 2,
                 place: Some(3),
                 placed_by: None,
+                pinned: false,
             })
         );
         let placed = encode_hold(&CapacityHold::Fleet {
@@ -2971,6 +3083,7 @@ pub(crate) mod tests {
             unplaced: 0,
             place: Some(1),
             placed_by: Some("harness".to_string()),
+            pinned: false,
         });
         assert_eq!(
             placed,
@@ -2984,6 +3097,18 @@ pub(crate) mod tests {
             .and_then(|hold| hold.placed_by().map(str::to_string)),
             Some("harness".to_string()),
             "a re-decision keeps the thread's reorder"
+        );
+        let mut pinned = decode_hold(FLEET_SLOT_FACT, &placed).unwrap();
+        pinned.set_pinned(true);
+        let pinned = encode_hold(&pinned);
+        assert!(pinned.ends_with(r#","pinned":true}"#), "{pinned}");
+        assert!(
+            decode_hold(
+                FLEET_SLOT_FACT,
+                &carry_queue_facts(FLEET_SLOT_FACT, Some(&pinned), &decided)
+            )
+            .is_some_and(|hold| hold.pinned()),
+            "a re-decision keeps the operator's pin"
         );
         assert_eq!(
             decode_hold(
@@ -3012,6 +3137,7 @@ pub(crate) mod tests {
             limit: 2,
             place: Some(1),
             placed_by: None,
+            pinned: false,
         };
         assert_eq!(
             decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),

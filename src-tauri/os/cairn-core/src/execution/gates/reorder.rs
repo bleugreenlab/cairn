@@ -22,6 +22,12 @@
 //! held on one cap and one held only on the other compare by whichever key
 //! each has; their caps decide them separately, so no release depends on it.
 //!
+//! A row the operator PINNED (its execution was moved by
+//! [`move_held_execution`]) sits out of every rotation: the thread's order
+//! applies within the places its other children hold, and the operator's
+//! place survives. An `order` that lists a pinned child is refused by name. A
+//! pin ends when its execution is released and its rows latch.
+//!
 //! ## No admission lock
 //!
 //! A reorder does not take `Orchestrator::admission_lock`. Caps are counts the
@@ -33,15 +39,54 @@
 //! having happened just before it. A filing that asks for the head of the line
 //! rotates inside its own insert transaction, which already holds the lock;
 //! the rotation adds statements to that transaction, not an acquisition.
+//!
+//! ## The operator's fleet move
+//!
+//! The queue page lists every cap-held execution in the fleet's order
+//! (`capacity::fleet_order`), and the operator may move one of them to any
+//! position, across threads ([`move_held_execution`]). The move gives each of
+//! that execution's capacity rows a key FREE in its database. Its fleet row
+//! takes a key strictly between its new neighbours' on the page, ties across
+//! databases broken by database as every reader breaks them. Its thread row
+//! takes a key ahead of every sibling now below it and behind the nearest
+//! sibling above it. Nobody else's key changes, unless no free key is left
+//! between the neighbours (keys are dense inside a burst). Then every key at
+//! or before the lower neighbour, in every database, shifts down by one
+//! second's scale, which keeps every relative order and opens a gap of a
+//! million. The moved execution's rows are pinned (above) and record
+//! `placed_by: the operator` where its key went down.
+//!
+//! Two edges the move does not cover. A pin covers the rows that exist when
+//! the move runs: an execution moved while only its thread cap holds it gets
+//! a fresh, unpinned fleet key at the back if the fleet fills later. And a move
+//! to the back takes a key about a second past its neighbour, so a filing in
+//! ANOTHER database within that second mints an earlier key and sorts ahead of
+//! it; a filing in its own database still lands after it.
+//!
+//! Unlike a rotation, a move takes the admission lock
+//! (`AdmissionSite::OperatorMove`): a renumber spans databases, and no
+//! admission decision may read a line half shifted. The lock is taken before
+//! any write and let go before the places are renumbered. A database failing
+//! between two shifts can leave the cross-database order skewed by one shift;
+//! database writes fail here only when the database itself is failing, and
+//! the error reaches the operator. Caps are counts the keys cannot change, so
+//! a move, like a rotation, never lets a start exceed a cap.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use cairn_db::turso::{params, Connection};
-use cairn_workflow::gates::store::{set_gate_detail_conn, set_gate_queue_key_conn};
+use cairn_workflow::gates::store::{
+    set_gate_detail_conn, set_gate_queue_key_conn, shift_queue_keys_conn, QUEUE_KEY_SCALE,
+};
 
-use super::capacity::{capacity_fact, decode_hold, encode_hold, CAPACITY_FACTS};
+use super::capacity::{
+    capacity_fact, decode_hold, encode_hold, fleet_order, AdmissionSite, FleetOrdered,
+    CAPACITY_FACTS, FLEET_SLOT_FACT, THREAD_FOCUS_FACT,
+};
 use crate::models::CapacityHold;
-use crate::storage::{DbResult, RowExt};
+use crate::orchestrator::Orchestrator;
+use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// One unlatched capacity row of a queued execution: a place it occupies
 /// (blocking) or one it will wake on (dormant).
@@ -86,6 +131,21 @@ impl ThreadQueued {
         self.holds
             .iter()
             .find_map(|row| row.hold.as_ref().and_then(CapacityHold::placed_by))
+    }
+
+    /// Whether the operator gave it its place, so its thread's order does not
+    /// move it.
+    pub fn pinned(&self) -> bool {
+        self.holds
+            .iter()
+            .chain(&self.dormant)
+            .any(QueuedHold::pinned)
+    }
+}
+
+impl QueuedHold {
+    fn pinned(&self) -> bool {
+        self.hold.as_ref().is_some_and(CapacityHold::pinned)
     }
 }
 
@@ -180,8 +240,9 @@ pub(crate) struct Rotation {
 /// them in their current order. On each cap separately, and within each class
 /// (blocking, dormant) separately, the i-th execution of that order takes the
 /// i-th smallest key the set's rows of that class hold; a blocking row also
-/// takes, while numbered places remain, the i-th smallest place. A row whose
-/// key went down records `placed_by`; one whose key went up forgets it. A
+/// takes, while numbered places remain, the i-th smallest place. A row the
+/// operator pinned is left out, keeping its key and place. A row whose key
+/// went down records `placed_by`; one whose key went up forgets it. A
 /// blocking row left without a place is numbered by the next sweep. Runs
 /// inside the caller's write transaction.
 pub(crate) async fn rotate_to_front_conn(
@@ -215,7 +276,7 @@ pub(crate) async fn rotate_to_front_conn(
                 };
                 class
                     .iter()
-                    .find(|row| row.fact == fact)
+                    .find(|row| row.fact == fact && !row.pinned())
                     .map(|row| (queued.execution_id.as_str(), row))
             })
             .collect();
@@ -343,6 +404,10 @@ pub(crate) async fn resolve_order_conn(
             refusals.push(format!("{number} has no cap-held execution ({why})"));
             continue;
         }
+        if queued.iter().any(|queued| queued.pinned()) {
+            refusals.push(format!("{number}'s place is the operator's"));
+            continue;
+        }
         front.extend(queued.iter().map(|queued| queued.execution_id.clone()));
     }
     Ok(if refusals.is_empty() {
@@ -371,6 +436,408 @@ pub(crate) async fn order_thread_queue_conn(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// The operator's fleet move
+// ---------------------------------------------------------------------------
+
+/// Who an operator move records as having placed a hold ahead.
+const OPERATOR: &str = "the operator";
+
+const NOT_QUEUED: &str = "That execution is not queued: it started, or it waits on its own gates.";
+
+/// How many times a move re-reads the queue after renumbering to make room.
+/// One shift opens a gap of a million, so a second is already unexpected.
+const MOVE_ATTEMPTS: usize = 3;
+
+/// What the operator's move did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FleetMove {
+    /// Whether anything was written: false when it already stood there.
+    pub moved: bool,
+    /// Its 1-based place in the fleet's order afterwards.
+    pub position: usize,
+}
+
+/// Every unlatched capacity row in one database, blocking or dormant. Read
+/// from `execution_gates` alone: the move takes each execution's database and
+/// thread from the queue rows, so this never opens an `executions` row.
+pub(crate) const CAPACITY_HOLDS_SQL: &str = concat!(
+    "SELECT g.execution_id, g.id, g.predicate_json,
+            COALESCE(g.queue_key, g.created_at * 1000000), g.detail
+       FROM execution_gates g
+      WHERE g.satisfied_at IS NULL AND ",
+    cairn_db::capacity_gate_sql!(),
+    " ORDER BY g.seq, g.id"
+);
+
+/// Every key in use in one database within `[?1, ?2]`, latched rows included.
+pub(crate) const KEYS_IN_RANGE_SQL: &str =
+    "SELECT queue_key FROM execution_gates WHERE queue_key >= ?1 AND queue_key <= ?2";
+
+/// A place in the fleet's order: a key, and the database that breaks ties.
+type Spot = (i64, usize);
+
+/// Whether `key` in database `db` sorts strictly after `lo` and before `hi`
+/// (an open end bounds nothing).
+fn fits(key: i64, db: usize, lo: Option<Spot>, hi: Option<Spot>) -> bool {
+    lo.is_none_or(|lo| (key, db) > lo) && hi.is_none_or(|hi| (key, db) < hi)
+}
+
+/// The keys a row in database `db` may take between `lo` and `hi`, as an
+/// inclusive range: `(key, db)` sorts after `lo` and before `hi`. An open end
+/// reaches two seconds' scale past the other, so a move to either end lands
+/// one second's scale beyond its neighbour. `None` with both ends open.
+fn key_range(lo: Option<Spot>, hi: Option<Spot>, db: usize) -> Option<(i64, i64)> {
+    let first = lo.map(|(key, at)| if db > at { key } else { key.saturating_add(1) });
+    let last = hi.map(|(key, at)| if db < at { key } else { key.saturating_sub(1) });
+    let span = 2 * QUEUE_KEY_SCALE;
+    match (first, last) {
+        (Some(first), Some(last)) => Some((first, last)),
+        (Some(first), None) => Some((first, first.saturating_add(span))),
+        (None, Some(last)) => Some((last.saturating_sub(span), last)),
+        (None, None) => None,
+    }
+}
+
+/// The unused key in `[first, last]` nearest its middle, or `None` when every
+/// key there is taken.
+fn free_key(first: i64, last: i64, used: &BTreeSet<i64>) -> Option<i64> {
+    if first > last {
+        return None;
+    }
+    let middle = first + (last - first) / 2;
+    let mut distance = 0i64;
+    loop {
+        let (below, above) = (middle - distance, middle.saturating_add(distance));
+        if below < first && above > last {
+            return None;
+        }
+        if below >= first && !used.contains(&below) {
+            return Some(below);
+        }
+        if above <= last && !used.contains(&above) {
+            return Some(above);
+        }
+        distance += 1;
+    }
+}
+
+/// The later of two lower bounds, an open one being no bound.
+fn later(a: Option<Spot>, b: Option<Spot>) -> Option<Spot> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// The earlier of two upper bounds, an open one being no bound.
+fn earlier(a: Option<Spot>, b: Option<Spot>) -> Option<Spot> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+/// Every unlatched capacity row of the listed executions, by execution.
+async fn capacity_holds(
+    order: &[FleetOrdered],
+) -> Result<HashMap<String, Vec<QueuedHold>>, String> {
+    let listed: HashSet<&str> = order
+        .iter()
+        .map(|entry| entry.queued.execution_id.as_str())
+        .collect();
+    let mut read = HashSet::new();
+    let mut holds: HashMap<String, Vec<QueuedHold>> = HashMap::new();
+    for entry in order {
+        if !read.insert(entry.db_index) {
+            continue;
+        }
+        let rows = entry
+            .db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(CAPACITY_HOLDS_SQL, ()).await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push((
+                            row.text(0)?,
+                            row.text(1)?,
+                            row.text(2)?,
+                            row.i64(3)?,
+                            row.opt_text(4)?,
+                        ));
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+            .map_err(|error| format!("failed to read the queue: {error}"))?;
+        for (execution_id, gate_id, predicate, queue_key, detail) in rows {
+            let Some(fact) = capacity_fact(&predicate) else {
+                continue;
+            };
+            if !listed.contains(execution_id.as_str()) {
+                continue;
+            }
+            holds.entry(execution_id).or_default().push(QueuedHold {
+                fact,
+                gate_id,
+                queue_key,
+                hold: detail
+                    .as_deref()
+                    .and_then(|detail| decode_hold(fact, detail)),
+            });
+        }
+    }
+    Ok(holds)
+}
+
+async fn keys_in_range(db: &LocalDb, first: i64, last: i64) -> Result<BTreeSet<i64>, String> {
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn.query(KEYS_IN_RANGE_SQL, params![first, last]).await?;
+            let mut keys = BTreeSet::new();
+            while let Some(row) = rows.next().await? {
+                keys.insert(row.i64(0)?);
+            }
+            Ok(keys)
+        })
+    })
+    .await
+    .map_err(|error| format!("failed to read the queue: {error}"))
+}
+
+/// Move held execution `execution_id` to `position` (1-based) in the fleet's
+/// order, as the operator's drag on the queue page does: across threads, or
+/// within one. The position is resolved against the queue as it stands now,
+/// so a move to the front or the back is exact even from a stale page. A
+/// refusal changes nothing. The caller has proven the operator; see the
+/// module doc for what the move writes and why it takes the admission lock.
+pub async fn move_held_execution(
+    orch: &Orchestrator,
+    execution_id: &str,
+    position: usize,
+) -> Result<FleetMove, String> {
+    let guard = orch
+        .admission_lock
+        .acquire(AdmissionSite::OperatorMove, execution_id)
+        .await
+        .map_err(|busy| busy.to_string())?;
+    let moved = move_under_lock(orch, execution_id, position).await;
+    drop(guard);
+    let (outcome, touched) = moved?;
+    if outcome.moved {
+        super::capacity::refresh_places(orch, None).await?;
+    }
+    for (db, execution_id) in touched {
+        let change =
+            crate::notify::execution_gates_db_change_for_execution(&db, &execution_id, "update")
+                .await;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    Ok(outcome)
+}
+
+/// The move's reads and writes, holding the admission lock. Returns what it
+/// did and every execution whose rows it wrote or shifted.
+async fn move_under_lock(
+    orch: &Orchestrator,
+    execution_id: &str,
+    position: usize,
+) -> Result<(FleetMove, Vec<(Arc<LocalDb>, String)>), String> {
+    let mut touched: Vec<(Arc<LocalDb>, String)> = Vec::new();
+    for _ in 0..MOVE_ATTEMPTS {
+        let order = fleet_order(orch).await?;
+        let Some(from) = order
+            .iter()
+            .position(|entry| entry.queued.execution_id == execution_id)
+        else {
+            return Err(NOT_QUEUED.to_string());
+        };
+        if position == 0 || position > order.len() {
+            return Err(format!(
+                "Position {position} is outside the queue ({} queued).",
+                order.len()
+            ));
+        }
+        if position == from + 1 {
+            return Ok((
+                FleetMove {
+                    moved: false,
+                    position,
+                },
+                touched,
+            ));
+        }
+        let holds = capacity_holds(&order).await?;
+        let mut line: Vec<&FleetOrdered> = order.iter().collect();
+        let x = line.remove(from);
+        let at = position - 1;
+        line.insert(at, x);
+        let spot = |entry: &FleetOrdered| (entry.key, entry.db_index);
+        let page_lo = at.checked_sub(1).map(|index| spot(line[index]));
+        let page_hi = line.get(at + 1).map(|entry| spot(entry));
+
+        // Its thread's order: ahead of every sibling now below it, behind the
+        // nearest sibling above it that still sorts before those.
+        let thread_key = |entry: &&FleetOrdered| -> Option<i64> {
+            let same_thread = entry.db_index == x.db_index
+                && entry.thread_id.is_some()
+                && entry.thread_id == x.thread_id
+                && entry.queued.execution_id != execution_id;
+            if !same_thread {
+                return None;
+            }
+            holds
+                .get(&entry.queued.execution_id)?
+                .iter()
+                .find(|row| row.fact == THREAD_FOCUS_FACT)
+                .map(|row| row.queue_key)
+        };
+        let thread_hi = line[at + 1..].iter().filter_map(thread_key).min();
+        let thread_lo = line[..at]
+            .iter()
+            .filter_map(thread_key)
+            .filter(|key| thread_hi.is_none_or(|hi| *key < hi))
+            .max();
+        let thread_gap = (
+            thread_lo.map(|key| (key, x.db_index)),
+            thread_hi.map(|key| (key, x.db_index)),
+        );
+
+        let rows = holds.get(execution_id).cloned().unwrap_or_default();
+        let has_fleet_row = rows.iter().any(|row| row.fact == FLEET_SLOT_FACT);
+        let mut picked = BTreeSet::new();
+        let mut keys = Vec::new();
+        let mut renumber_at = None;
+        for row in &rows {
+            let (lo, hi) = if row.fact == FLEET_SLOT_FACT {
+                (page_lo, page_hi)
+            } else if has_fleet_row {
+                thread_gap
+            } else {
+                // With no fleet row its thread key is its place on the page
+                // too: inside both gaps when they meet, else its thread's.
+                let (lo, hi) = (later(thread_gap.0, page_lo), earlier(thread_gap.1, page_hi));
+                match key_range(lo, hi, x.db_index) {
+                    Some((first, last)) if first > last => thread_gap,
+                    _ => (lo, hi),
+                }
+            };
+            if fits(row.queue_key, x.db_index, lo, hi) {
+                keys.push(row.queue_key);
+                continue;
+            }
+            let Some((first, last)) = key_range(lo, hi, x.db_index) else {
+                keys.push(row.queue_key);
+                continue;
+            };
+            let mut used = keys_in_range(&x.db, first, last).await?;
+            used.extend(picked.iter().copied());
+            match free_key(first, last, &used) {
+                Some(key) => {
+                    picked.insert(key);
+                    keys.push(key);
+                }
+                None => {
+                    renumber_at = Some(lo);
+                    break;
+                }
+            }
+        }
+
+        if let Some(lo) = renumber_at {
+            let Some((key, db_at)) = lo else {
+                return Err("The queue has no room ahead of its first place.".to_string());
+            };
+            for (index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
+                // Keep cross-database ties: a later database's row at the same
+                // key sorts after the neighbour, so it stays.
+                let at_most = if index <= db_at { key } else { key - 1 };
+                db.write(move |conn| {
+                    Box::pin(
+                        async move { shift_queue_keys_conn(conn, at_most, -QUEUE_KEY_SCALE).await },
+                    )
+                })
+                .await
+                .map_err(|error| format!("failed to renumber the queue: {error}"))?;
+                for entry in order.iter().filter(|entry| entry.db_index == index) {
+                    let shifted = holds
+                        .get(&entry.queued.execution_id)
+                        .is_some_and(|rows| rows.iter().any(|row| row.queue_key <= at_most));
+                    if shifted {
+                        touched.push((entry.db.clone(), entry.queued.execution_id.clone()));
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut writes = Vec::new();
+        for (row, key) in rows.iter().zip(&keys) {
+            let detail = row.hold.as_ref().and_then(|hold| {
+                let mut next = hold.clone();
+                next.set_pinned(true);
+                match key.cmp(&row.queue_key) {
+                    std::cmp::Ordering::Less => next.set_placed_by(Some(OPERATOR.to_string())),
+                    std::cmp::Ordering::Greater => next.set_placed_by(None),
+                    std::cmp::Ordering::Equal => {}
+                }
+                (&next != hold).then(|| encode_hold(&next))
+            });
+            let key = (*key != row.queue_key).then_some(*key);
+            if key.is_some() || detail.is_some() {
+                writes.push((row.gate_id.clone(), key, detail));
+            }
+        }
+        let moved = !writes.is_empty();
+        if moved {
+            x.db.write(|conn| {
+                let writes = writes.clone();
+                Box::pin(async move {
+                    for (gate_id, key, detail) in &writes {
+                        if let Some(key) = key {
+                            set_gate_queue_key_conn(conn, gate_id, *key).await?;
+                        }
+                        if let Some(detail) = detail {
+                            set_gate_detail_conn(conn, gate_id, detail).await?;
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|error| format!("failed to move it: {error}"))?;
+            touched.push((x.db.clone(), execution_id.to_string()));
+        }
+
+        // Where it landed: its new place key among everyone else's.
+        let fleet_key = rows
+            .iter()
+            .zip(&keys)
+            .find(|(row, _)| row.fact == FLEET_SLOT_FACT)
+            .map(|(_, key)| *key);
+        let landed_key = fleet_key
+            .or_else(|| keys.iter().copied().min())
+            .unwrap_or(x.key);
+        let landed = 1 + order
+            .iter()
+            .filter(|entry| entry.queued.execution_id != execution_id)
+            .filter(|entry| spot(entry) < (landed_key, x.db_index))
+            .count();
+        return Ok((
+            FleetMove {
+                moved,
+                position: landed,
+            },
+            touched,
+        ));
+    }
+    Err("The queue could not make room to move it; its order is unchanged.".to_string())
+}
+
 /// `fleet 3rd · thread 1st`: an execution's place on each cap holding it.
 pub(crate) fn places_phrase(queued: &ThreadQueued, separator: &str) -> String {
     let mut parts = Vec::new();
@@ -396,10 +863,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::execution::gates::capacity::queue_view;
     use crate::execution::gates::capacity::tests::{
         add_issue, add_started, add_thread, caps, detail, full_fleet, is_held,
     };
-    use crate::execution::gates::capacity::{queue_view, FLEET_SLOT_FACT, THREAD_FOCUS_FACT};
     use crate::execution::gates::sweep::tests::{count, env, execution, file, now, Env};
     use crate::execution::gates::sweep::{evaluate_execution, sweep, sweep_at};
     use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
@@ -1261,6 +1728,404 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sweep_at(&env.orch, now()).await.unwrap().released, vec![e3]);
+    }
+
+    // -- the operator's fleet move ----------------------------------------------
+
+    /// The queue page's order: every cap-held execution, the fleet's order.
+    async fn view_ids(env: &Env) -> Vec<String> {
+        queue_view(&env.orch)
+            .await
+            .unwrap()
+            .held
+            .into_iter()
+            .map(|held| held.execution_id)
+            .collect()
+    }
+
+    fn ids(list: &[&String]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    async fn complete(env: &Env, job: &str) {
+        env.db
+            .execute(
+                format!("UPDATE jobs SET status = 'complete' WHERE id = '{job}'"),
+                (),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The acceptance case: five held across alpha and beta, the 5th moved to
+    /// 1st. Nobody else's key moves, and the next release is the moved one,
+    /// exactly once under racing sweeps and evaluations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_operator_moves_the_fifth_held_execution_to_first_across_threads() {
+        let w = world("move-fifth-first.db", false).await;
+        file(&w.env, 204, json!([])).await.unwrap();
+        let a4 = execution(&w.env, 204).await.0;
+        sweep_at(&w.env.orch, now()).await.unwrap();
+        assert_eq!(
+            view_ids(&w.env).await,
+            ids(&[&w.a1, &w.b1, &w.a2, &w.a3, &a4])
+        );
+        let before = rows(&w.env).await;
+
+        let moved = move_held_execution(&w.env.orch, &a4, 1).await.unwrap();
+        assert_eq!(
+            moved,
+            FleetMove {
+                moved: true,
+                position: 1
+            }
+        );
+        assert_eq!(
+            view_ids(&w.env).await,
+            ids(&[&a4, &w.a1, &w.b1, &w.a2, &w.a3])
+        );
+        let after = rows(&w.env).await;
+        assert!(key(&after, &a4, FLEET) < key(&before, &w.a1, FLEET));
+        assert_eq!(
+            placed_by(&after, &a4, FLEET).as_deref(),
+            Some("the operator")
+        );
+        assert!(hold(&after, &a4, FLEET).pinned());
+        assert_eq!(place(&after, &a4, FLEET), Some(1), "renumbered at once");
+        for (id, was) in [(&w.a1, 1), (&w.b1, 2), (&w.a2, 3), (&w.a3, 4)] {
+            assert_eq!(
+                key(&after, id, FLEET),
+                key(&before, id, FLEET),
+                "{id} kept its key"
+            );
+            assert_eq!(place(&after, id, FLEET), Some(was + 1));
+            assert!(!hold(&after, id, FLEET).pinned());
+        }
+        assert!(detail(&w.env, &a4)
+            .await
+            .ends_with("placed ahead by the operator"));
+        assert_eq!(
+            w.env
+                .orch
+                .admission_lock
+                .acquisitions(AdmissionSite::OperatorMove),
+            1,
+            "the move took the lock under its own site"
+        );
+
+        complete(&w.env, "sj100").await;
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let orch = w.env.orch.clone();
+            handles.push(tokio::spawn(
+                async move { sweep(&orch).await.unwrap().released },
+            ));
+        }
+        for _ in 0..2 {
+            let (orch, id) = (w.env.orch.clone(), a4.clone());
+            handles.push(tokio::spawn(async move {
+                if evaluate_execution(&orch, &id).await.unwrap().released {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }));
+        }
+        let mut released = Vec::new();
+        for handle in handles {
+            released.extend(handle.await.unwrap());
+        }
+        assert_eq!(
+            released,
+            vec![a4.clone()],
+            "exactly one release, of the moved"
+        );
+        assert_eq!(
+            count(
+                &w.env,
+                &format!(
+                    "SELECT COUNT(*) - COUNT(DISTINCT recipe_node_id) FROM jobs
+                      WHERE execution_id = '{a4}'"
+                )
+            )
+            .await,
+            0,
+            "one job set"
+        );
+        for number in [201, 202, 203, 301] {
+            assert!(is_held(&w.env, number).await, "{number} is still held");
+        }
+    }
+
+    /// The operator moved a3 to the front; alpha then orders its own queue.
+    /// a3 keeps its keys and its place, alpha's order permutes a1 and a2
+    /// among their own keys, and an order naming a3 is refused.
+    #[tokio::test]
+    async fn an_operator_placement_survives_a_later_thread_reorder() {
+        let w = world("move-survives-order.db", true).await;
+        move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
+        let placed = rows(&w.env).await;
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.b1, &w.a2]));
+
+        let rotation = order(&w.env, json!([202, 201]), "alpha").await.unwrap();
+        assert_eq!(
+            rotation
+                .queue
+                .iter()
+                .map(|queued| queued.issue_number)
+                .collect::<Vec<_>>(),
+            vec![203, 202, 201]
+        );
+        let after = rows(&w.env).await;
+        for fact in [FLEET, THREAD] {
+            assert_eq!(key(&after, &w.a3, fact), key(&placed, &w.a3, fact));
+            assert_eq!(key(&after, &w.a2, fact), key(&placed, &w.a1, fact));
+            assert_eq!(key(&after, &w.a1, fact), key(&placed, &w.a2, fact));
+            assert!(hold(&after, &w.a3, fact).pinned());
+            assert_eq!(
+                placed_by(&after, &w.a3, fact).as_deref(),
+                Some("the operator")
+            );
+        }
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a2, &w.b1, &w.a1]));
+
+        let refused = order(&w.env, json!([203]), "alpha").await.unwrap_err();
+        assert_eq!(refused, vec!["203's place is the operator's"]);
+        assert_eq!(rows(&w.env).await, after, "a refused order changes nothing");
+    }
+
+    /// Within one thread: a3 above a1 on both the fleet and the thread, and
+    /// the next release, once both caps free a place, is a3.
+    #[tokio::test]
+    async fn the_operator_moves_within_one_thread() {
+        use crate::execution::gates::sweep::tests::resolve_issue;
+        let w = world("move-within-thread.db", true).await;
+        let before = rows(&w.env).await;
+        move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
+        let after = rows(&w.env).await;
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.b1, &w.a2]));
+        assert_eq!(queue_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.a2]));
+        assert!(key(&after, &w.a3, THREAD) < key(&before, &w.a1, THREAD));
+        assert_eq!(
+            [&w.a3, &w.a1, &w.a2].map(|id| place(&after, id, THREAD)),
+            [Some(1), Some(2), Some(3)]
+        );
+        for id in [&w.a1, &w.a2, &w.b1] {
+            assert_eq!(row(&after, id, FLEET).1, row(&before, id, FLEET).1);
+        }
+
+        complete(&w.env, "sj100").await;
+        complete(&w.env, "sj150").await;
+        resolve_issue(&w.env, 150, "merged").await;
+        let report = sweep_at(&w.env.orch, now()).await.unwrap();
+        assert_eq!(report.released, vec![w.a3.clone()]);
+        assert!(is_held(&w.env, 201).await);
+    }
+
+    /// Consecutive keys leave no room between a1 and b1: the move shifts
+    /// everything up to a1 down a second's scale, lands exactly where asked,
+    /// moves no one else's order, and a fresh filing still lands last.
+    #[tokio::test]
+    async fn a_move_into_a_one_wide_gap_renumbers_without_reordering() {
+        let w = world("move-renumber.db", false).await;
+        file(&w.env, 204, json!([])).await.unwrap();
+        let a4 = execution(&w.env, 204).await.0;
+        sweep_at(&w.env.orch, now()).await.unwrap();
+        let base = key(&rows(&w.env).await, &w.a1, FLEET);
+        for (offset, id) in [&w.a1, &w.b1, &w.a2, &w.a3, &a4].into_iter().enumerate() {
+            w.env
+                .db
+                .execute(
+                    format!(
+                        "UPDATE execution_gates SET queue_key = {} WHERE execution_id = '{id}'
+                            AND json_extract(predicate_json, '$.fact') = 'fleet_slot'",
+                        base + offset as i64
+                    ),
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+        let before = rows(&w.env).await;
+
+        let moved = move_held_execution(&w.env.orch, &a4, 2).await.unwrap();
+        assert_eq!(moved.position, 2);
+        assert_eq!(
+            view_ids(&w.env).await,
+            ids(&[&w.a1, &a4, &w.b1, &w.a2, &w.a3])
+        );
+        let after = rows(&w.env).await;
+        assert_eq!(
+            key(&after, &w.a1, FLEET),
+            base - cairn_workflow::gates::store::QUEUE_KEY_SCALE,
+            "the shift ran"
+        );
+        for id in [&w.b1, &w.a2, &w.a3] {
+            assert_eq!(key(&after, id, FLEET), key(&before, id, FLEET));
+        }
+        let mut keys: Vec<i64> = after.values().map(|(_, key, ..)| *key).collect();
+        let all = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), all, "every key stays distinct");
+
+        file(&w.env, 1, json!([])).await.unwrap();
+        let fresh = execution(&w.env, 1).await.0;
+        assert_eq!(
+            view_ids(&w.env).await.last(),
+            Some(&fresh),
+            "a fresh filing lands last"
+        );
+    }
+
+    /// Not queued, out of range, already there: each refused or a no-op, and
+    /// no row changes.
+    #[tokio::test]
+    async fn a_move_that_cannot_apply_changes_nothing() {
+        let w = world("move-refusals.db", false).await;
+        let before = rows(&w.env).await;
+        let refused = move_held_execution(&w.env.orch, "se100", 1)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            "That execution is not queued: it started, or it waits on its own gates."
+        );
+        for position in [0, 5, 99] {
+            let refused = move_held_execution(&w.env.orch, &w.a2, position)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                refused,
+                format!("Position {position} is outside the queue (4 queued).")
+            );
+        }
+        assert_eq!(
+            move_held_execution(&w.env.orch, &w.a2, 3).await.unwrap(),
+            FleetMove {
+                moved: false,
+                position: 3
+            },
+            "a2 is already 3rd"
+        );
+        assert_eq!(rows(&w.env).await, before);
+    }
+
+    #[test]
+    fn a_free_key_sits_strictly_between_its_neighbours() {
+        let used = BTreeSet::from([10, 11, 12]);
+        assert_eq!(key_range(Some((10, 0)), Some((12, 0)), 0), Some((11, 11)));
+        assert_eq!(free_key(11, 11, &used), None, "a one-wide gap is full");
+        // A later database's row may share the lower neighbour's key; an
+        // earlier one's the upper's.
+        assert_eq!(key_range(Some((10, 0)), Some((12, 0)), 1), Some((10, 11)));
+        assert_eq!(key_range(Some((10, 1)), Some((12, 1)), 0), Some((11, 12)));
+        assert_eq!(free_key(10, 20, &used), Some(15));
+        assert_eq!(free_key(10, 13, &used), Some(13));
+        let scale = QUEUE_KEY_SCALE;
+        assert_eq!(
+            key_range(None, Some((100, 0)), 0),
+            Some((99 - 2 * scale, 99))
+        );
+        assert_eq!(
+            key_range(Some((100, 0)), None, 0),
+            Some((101, 101 + 2 * scale))
+        );
+        assert_eq!(key_range(None, None, 0), None);
+        assert!(fits(11, 0, Some((10, 0)), Some((12, 0))));
+        assert!(!fits(10, 0, Some((10, 0)), None));
+        assert!(fits(10, 1, Some((10, 0)), None));
+    }
+
+    async fn plan(env: &Env, sql: &str) -> String {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            sql.replace("?1", "0").replace("?2", "0")
+        );
+        env.db
+            .read(move |conn| {
+                let sql = sql.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, ()).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps.join("\n"))
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The move's own statements never open an `executions` row (whose
+    /// snapshot Turso would assemble, cairn/5894): they read and shift
+    /// `execution_gates` alone, the keys through their index. The queue rows
+    /// the move shares with the page are pinned by cairn/5894.
+    #[tokio::test]
+    async fn the_moves_statements_never_touch_executions() {
+        let env = env("move-plans.db").await;
+        for (name, sql, index) in [
+            ("capacity holds", CAPACITY_HOLDS_SQL, None),
+            (
+                "keys in range",
+                KEYS_IN_RANGE_SQL,
+                Some("idx_execution_gates_queue_key"),
+            ),
+            (
+                "the shift",
+                cairn_workflow::gates::store::SHIFT_QUEUE_KEYS_SQL,
+                Some("idx_execution_gates_queue_key"),
+            ),
+        ] {
+            let plan = plan(&env, sql).await;
+            assert!(
+                !plan.contains("executions"),
+                "{name} reads executions:\n{plan}"
+            );
+            if let Some(index) = index {
+                assert!(plan.contains(index), "{name} does not use {index}:\n{plan}");
+            }
+        }
+    }
+
+    /// cairn/5894's cost fixture: 2,000 executions with 150 KB snapshots, 20
+    /// of them cap-held. One move holds the admission lock for every read and
+    /// write it makes, and every filing and sweep waits on it, so it must stay
+    /// short. Run with `--ignored` for the number.
+    #[tokio::test]
+    #[ignore = "builds a 300 MB database; run with --ignored for the timing"]
+    async fn one_move_over_two_thousand_snapshots_is_bounded() {
+        let env = env("move-cost.db").await;
+        full_fleet(&env).await;
+        let snapshot = "x".repeat(150_000);
+        for batch in 0..40 {
+            let mut script = String::new();
+            for index in 0..50 {
+                let id = batch * 50 + index;
+                script.push_str(&format!(
+                    "INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq, snapshot)
+                       VALUES('history-{id}', 'r', 'p', 'complete', 1, 1, '{snapshot}');"
+                ));
+            }
+            env.db.execute_script(script).await.unwrap();
+        }
+        add_thread(&env, "ta", "alpha").await;
+        let mut held = Vec::new();
+        for number in 600..620 {
+            add_issue(&env, number, Some("ta")).await;
+            file(&env, number, json!([])).await.unwrap();
+            held.push(execution(&env, number).await.0);
+        }
+        sweep_at(&env.orch, now()).await.unwrap();
+        assert_eq!(view_ids(&env).await.len(), 20);
+
+        let started = std::time::Instant::now();
+        move_held_execution(&env.orch, &held[19], 1).await.unwrap();
+        let took = started.elapsed();
+        println!("one move over 2,000 snapshots took {took:?}");
+        assert_eq!(view_ids(&env).await[0], held[19]);
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     }
 
     // -- the migration ----------------------------------------------------------
