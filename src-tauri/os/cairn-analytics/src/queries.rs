@@ -12,12 +12,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use cairn_db::turso::{params, Connection, Value};
+use cairn_db::turso::{params, Value};
 
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};
 use cairn_db::models::Event;
-use cairn_db::storage::{DbResult, LocalDb, RowExt};
+use cairn_db::storage::{DbResult, LocalDb, RowExt, TrackedConnection};
 
 // --- Tier A: token/cost rollup (incremental fold + read queries) ---
 //
@@ -302,7 +302,7 @@ fn token_rollup_event_upsert_sql() -> String {
 /// in the event. The conn already has the event row written, so Tier A's SELECT
 /// by id sees it.
 pub async fn maintain_rollups_on_insert(
-    conn: &Connection,
+    conn: &TrackedConnection,
     event_id: &str,
     run_id: &str,
     created_at: i64,
@@ -331,7 +331,7 @@ pub async fn maintain_rollups_on_insert(
 /// produce; the backfill remains the idempotent safety net that reconciles any
 /// out-of-order results.
 async fn maintain_tool_rollup_event(
-    conn: &Connection,
+    conn: &TrackedConnection,
     event_id: &str,
     run_id: &str,
     created_at: i64,
@@ -365,8 +365,7 @@ async fn maintain_tool_rollup_event(
     } else if event_type == "tool_result" {
         if let Some((tool_use_id, is_error)) = tool_extract::tool_result_error(data) {
             conn.execute(
-                "UPDATE tool_invocations SET is_error = ?3, result_ts = ?4
-                 WHERE run_id = ?1 AND tool_use_id = ?2",
+                TOOL_RESULT_UPDATE_SQL,
                 params![run_id, tool_use_id.as_str(), is_error as i64, created_at],
             )
             .await?;
@@ -374,6 +373,14 @@ async fn maintain_tool_rollup_event(
     }
     Ok(())
 }
+
+/// Link a `tool_result` to its invocation. This statement fires both
+/// `tool_analytics_*_update` triggers, inside the transcript writer's
+/// transaction, once per tool result: their bodies must seek, never walk a
+/// table (cairn/5907; `tool_result_update_seeks_its_buckets` pins the plan).
+pub(crate) const TOOL_RESULT_UPDATE_SQL: &str =
+    "UPDATE tool_invocations SET is_error = ?3, result_ts = ?4
+     WHERE run_id = ?1 AND tool_use_id = ?2";
 
 /// Retained event-scan CTE: the `#[cfg(test)]` oracle the rollup read queries are
 /// proven equal to (no longer a production read path). One row per billable

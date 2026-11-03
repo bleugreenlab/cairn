@@ -9,8 +9,8 @@ use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
 use crate::transcripts::file_activity;
 use cairn_db::db_records::{DbMessageStream, DbMessageStreamChunk};
 use cairn_db::storage::outbox::{self, OutboxEntry};
-use cairn_db::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_db::turso::{params, Connection, Row};
+use cairn_db::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
+use cairn_db::turso::{params, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -89,7 +89,7 @@ pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String
 /// match the id. Non-read results and unmatched ids are no-ops; the full-load
 /// backfill in `apply_lean_read_projection` is the correctness backstop.
 pub async fn record_read_tokens_if_applicable(
-    conn: &Connection,
+    conn: &TrackedConnection,
     event: &EventInsert,
 ) -> DbResult<()> {
     if event.event_type != "tool_result" {
@@ -159,7 +159,7 @@ pub async fn record_read_tokens_if_applicable(
 /// `(run_id, sequence)` unique by construction: the read that computes the next
 /// value and the write that consumes it cannot be separated by another writer
 /// (CAIRN-3290).
-pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResult<u64> {
+pub async fn insert_event_conn(conn: &TrackedConnection, event: &EventInsert) -> DbResult<u64> {
     let sequence = next_sequence_conn(conn, &event.run_id).await?;
     insert_event_at_conn(conn, event, sequence).await
 }
@@ -171,7 +171,7 @@ pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResu
 /// where the message began rather than where it ended. [`next_sequence_conn`]
 /// counts open stream rows, so a reservation is never handed out twice.
 async fn insert_event_at_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     event: &EventInsert,
     sequence: i32,
 ) -> DbResult<u64> {
@@ -478,7 +478,7 @@ pub fn read_active_stream(
 }
 
 pub async fn reconstruct_stream_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream_id: &str,
 ) -> DbResult<Option<ActiveMessageStream>> {
     let Some(stream) = load_stream_optional_conn(conn, stream_id).await? else {
@@ -853,7 +853,9 @@ pub async fn active_stream_for_session(
     .await
 }
 
-async fn list_recoverable_streams_conn(conn: &Connection) -> DbResult<Vec<ActiveMessageStream>> {
+async fn list_recoverable_streams_conn(
+    conn: &TrackedConnection,
+) -> DbResult<Vec<ActiveMessageStream>> {
     let mut rows = conn
         .query(
             "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
@@ -875,7 +877,7 @@ async fn list_recoverable_streams_conn(conn: &Connection) -> DbResult<Vec<Active
 }
 
 async fn abort_active_streams_for_run_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     run_id: &str,
     now: i32,
     reason: &str,
@@ -908,7 +910,7 @@ async fn abort_active_streams_for_run_conn(
 }
 
 async fn abort_stream_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream: &mut DbMessageStream,
     now: i32,
     reason: &str,
@@ -940,7 +942,7 @@ async fn abort_stream_conn(
 /// out twice (CAIRN-3290).
 ///
 /// Call this only from inside the write transaction that consumes the result.
-pub async fn next_sequence_conn(conn: &Connection, run_id: &str) -> DbResult<i32> {
+pub async fn next_sequence_conn(conn: &TrackedConnection, run_id: &str) -> DbResult<i32> {
     let event_max = max_sequence_conn(
         conn,
         "SELECT MAX(sequence) FROM events WHERE run_id = ?1",
@@ -960,7 +962,11 @@ pub async fn next_sequence_conn(conn: &Connection, run_id: &str) -> DbResult<i32
     Ok(std::cmp::max(event_max, stream_max) + 1)
 }
 
-async fn max_sequence_conn(conn: &Connection, sql: &'static str, run_id: &str) -> DbResult<i32> {
+async fn max_sequence_conn(
+    conn: &TrackedConnection,
+    sql: &'static str,
+    run_id: &str,
+) -> DbResult<i32> {
     let mut rows = conn.query(sql, params![run_id]).await?;
     let row = rows
         .next()
@@ -969,14 +975,14 @@ async fn max_sequence_conn(conn: &Connection, sql: &'static str, run_id: &str) -
     Ok(row.opt_i64(0)?.map(|value| value as i32).unwrap_or(-1))
 }
 
-async fn load_stream_conn(conn: &Connection, stream_id: &str) -> DbResult<DbMessageStream> {
+async fn load_stream_conn(conn: &TrackedConnection, stream_id: &str) -> DbResult<DbMessageStream> {
     load_stream_optional_conn(conn, stream_id)
         .await?
         .ok_or_else(|| DbError::internal(format!("Missing stream {}", stream_id)))
 }
 
 async fn load_stream_optional_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream_id: &str,
 ) -> DbResult<Option<DbMessageStream>> {
     let mut rows = conn
@@ -996,7 +1002,7 @@ async fn load_stream_optional_conn(
 }
 
 async fn load_chunks_for_stream_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream_id: &str,
 ) -> DbResult<Vec<DbMessageStreamChunk>> {
     let mut rows = conn
@@ -1040,7 +1046,7 @@ fn stale_writer_error(stream_id: &str, expected_version: i32, found_version: i32
 }
 
 async fn next_chunk_index_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream_id: &str,
     kind: StreamChunkKind,
 ) -> DbResult<i32> {
@@ -1080,7 +1086,7 @@ fn materialize_stream(
     }
 }
 
-async fn event_exists_conn(conn: &Connection, event_id: &str) -> DbResult<bool> {
+async fn event_exists_conn(conn: &TrackedConnection, event_id: &str) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM events WHERE id = ?1 LIMIT 1",
@@ -1091,7 +1097,7 @@ async fn event_exists_conn(conn: &Connection, event_id: &str) -> DbResult<bool> 
 }
 
 async fn load_finalized_stream_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     stream: &DbMessageStream,
 ) -> DbResult<FinalizedStream> {
     let event_id = stream
@@ -1208,7 +1214,11 @@ pub mod testing {
         .unwrap()
     }
 
-    pub async fn table_has_column(conn: &Connection, table: &str, column: &str) -> DbResult<bool> {
+    pub async fn table_has_column(
+        conn: &TrackedConnection,
+        table: &str,
+        column: &str,
+    ) -> DbResult<bool> {
         let mut rows = conn
             .query(format!("PRAGMA table_info({table})"), ())
             .await?;

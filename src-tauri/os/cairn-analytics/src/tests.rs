@@ -102,6 +102,83 @@ async fn tool_summary_recovers_next_maximum_after_result_update() {
     assert_eq!(max, Some(8));
 }
 
+/// A tool result's update fires both `tool_analytics_*_update` triggers inside
+/// the transcript writer's transaction, once per tool result, so their bodies
+/// must seek. A `Rewind` over a real table, or the `MAX` recompute served from
+/// the cross-run shape index, walks that table on every tool result: 84 s cold
+/// on a production clone (cairn/5907). `EXPLAIN` inlines trigger subprograms
+/// where `EXPLAIN QUERY PLAN` shows none, so the bytecode is the witness.
+#[tokio::test]
+async fn tool_result_update_seeks_its_buckets() {
+    let db = fixture_db().await;
+    let ops = db
+        .query_all(
+            format!("EXPLAIN {}", queries::TOOL_RESULT_UPDATE_SQL),
+            params!["run-claude", "plan-tu", 1i64, 90010i64],
+            |row| Ok((row.text(1)?, row.text(7)?)),
+        )
+        .await
+        .unwrap();
+    let listing = ops
+        .iter()
+        .map(|(op, comment)| format!("{op} {comment}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        ops.iter().filter(|(op, _)| op == "Program").count() >= 2,
+        "both update triggers should run as subprograms:\n{listing}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|(op, comment)| op == "Rewind" && !comment.contains("ephemeral")),
+        "a trigger body walks a table:\n{listing}"
+    );
+    assert!(
+        !listing.contains("idx_tool_invocations_shape"),
+        "the MAX recompute walks every run's invocations of the shape:\n{listing}"
+    );
+}
+
+/// The zero-count delete is scoped to the bucket the update just decremented.
+/// A lone invocation's bucket reaches zero, is deleted, and is rebuilt from the
+/// updated fact, so the result lands as one bucket with the new measures.
+#[tokio::test]
+async fn tool_result_update_rebuilds_a_lone_bucket() {
+    let db = fixture_db().await;
+    db.execute_script(
+        "INSERT INTO tool_invocations(id,event_id,tool_use_id,run_id,ts,verb,tool_name,target_scheme,target_kind,target_path,is_error,result_ts)
+         VALUES ('lone','lone','lone-tu','run-claude',90000,'read','read','file','rs','lone.rs',0,NULL);",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        queries::TOOL_RESULT_UPDATE_SQL,
+        params!["run-claude", "lone-tu", 1i64, 90007i64],
+    )
+    .await
+    .unwrap();
+    let buckets = db
+        .query_all(
+            "SELECT invocation_count, error_count, duration_count, duration_error_count,
+                    duration_sum_s, max_duration_s
+             FROM tool_analytics_hourly WHERE target_path = 'lone.rs'",
+            (),
+            |row| {
+                Ok((
+                    row.i64(0)?,
+                    row.i64(1)?,
+                    row.i64(2)?,
+                    row.i64(3)?,
+                    row.i64(4)?,
+                    row.i64(5)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(buckets, vec![(1, 1, 1, 1, 7, 7)]);
+}
+
 #[tokio::test]
 async fn same_group_inserts_do_not_scan_raw_facts() {
     let db = fixture_db().await;

@@ -24,8 +24,8 @@
 //! diff); this stream is the TIMELINE view, and inventing entries for a commit
 //! it cannot see would make the two disagree.
 
-use cairn_db::storage::DbResult;
-use cairn_db::turso::{params, Connection};
+use cairn_db::storage::{DbResult, TrackedConnection};
+use cairn_db::turso::params;
 use serde_json::Value;
 
 /// What a tool call declared it was doing to a path.
@@ -315,7 +315,7 @@ fn truncate(s: &str) -> String {
 /// `INSERT OR REPLACE` keyed on `{event_id}:{tool_use_id}:{ordinal}` makes a
 /// re-insert of the same event idempotent.
 pub async fn record_presence_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     run_id: &str,
     batch: &EventBatch,
     ts_ms: i64,
@@ -348,7 +348,7 @@ pub async fn record_presence_conn(
 }
 
 pub async fn record_touches_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     event_id: &str,
     run_id: &str,
     created_at: i64,
