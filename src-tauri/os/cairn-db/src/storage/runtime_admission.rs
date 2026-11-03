@@ -936,7 +936,16 @@ pub async fn lease_next_admission_with_capacity(
 ) -> DbResult<Option<AdmissionRequest>> {
     Ok(
         match lease_next_admission_within(
-            db, workspace, lane, owner, now, expires_at, capacity, None, None,
+            db,
+            workspace,
+            lane,
+            owner,
+            now,
+            expires_at,
+            capacity,
+            None,
+            None,
+            MemoryPriority::Interactive,
         )
         .await?
         {
@@ -978,13 +987,18 @@ impl HostMemoryEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum LaneShortfall {
-    /// Admitting the head would eat into the memory reserve.
+    /// Admitting the head would eat into the memory reserve, or, for a batch
+    /// lane, into the room it leaves for interactive launches.
     #[serde(rename_all = "camelCase")]
     Memory {
         available_bytes: u64,
         reserve_bytes: u64,
         in_flight_bytes: u64,
         head_estimate_bytes: u64,
+        /// Room above the reserve a batch lane leaves for interactive
+        /// launches ([`MemoryPriority::YieldsTo`]); zero for an interactive lane.
+        #[serde(default)]
+        interactive_room_bytes: u64,
     },
     /// An explicit resident-process ceiling is full.
     #[serde(rename_all = "camelCase")]
@@ -1034,6 +1048,24 @@ pub enum LeaseDecision {
     },
 }
 
+/// How a lane shares the host memory above the reserve with the host's other
+/// lanes. Memory is one host, so the lanes that spawn processes on it are
+/// ranked rather than given separate budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPriority<'a> {
+    /// Interactive work: admits down to the reserve, and a lane holding nothing
+    /// always admits one, so a host below its reserve still makes progress.
+    Interactive,
+    /// Batch work that yields to the interactive lanes of the named workspace.
+    /// It admits only while it leaves room above the reserve for every
+    /// process-spawning launch queued there, and never less than one
+    /// unmeasured claim, so the next interactive launch finds room without
+    /// waiting on a batch process. It has no empty-lane exemption: on a host
+    /// that interactive work has filled, batch work waiting is the intended
+    /// outcome.
+    YieldsTo(&'a str),
+}
+
 fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSet<String>) -> bool {
     claim.resident_process_units > 0
         && claim
@@ -1046,13 +1078,16 @@ fn adds_resident_process(claim: &RuntimeResourceClaim, resident_servers: &HashSe
 /// and, when `memory` is measured, the host memory envelope.
 ///
 /// Memory is charged only for spawns the probe cannot see yet: `leased` and
-/// `starting` rows. An `active` row's process is resident, so the measured
-/// `available_bytes` already accounts for it. A lane holding nothing at all
-/// always admits one request, so a host below its reserve still makes progress
-/// (the executor substrate follows the same liveness rule). An unmeasured host
-/// admits on memory: the unit ceilings and the warm GC's own fallback still
-/// apply. Memory admission is FIFO: once the head is blocked on memory, no later
-/// process-claiming request may pass it, so a large head cannot be starved.
+/// `starting` rows, on every lane of every workspace in this ledger, because
+/// all of them spawn on this host. An `active` row's process is resident, so
+/// the measured `available_bytes` already accounts for it. An interactive lane
+/// holding nothing at all always admits one request, so a host below its
+/// reserve still makes progress (the executor substrate follows the same
+/// liveness rule); a batch lane also keeps room for interactive launches (see
+/// [`MemoryPriority`]). An unmeasured host admits on memory: the unit ceilings
+/// and the warm GC's own fallback still apply. Memory admission is FIFO: once
+/// the head is blocked on memory, no later process-claiming request may pass
+/// it, so a large head cannot be starved.
 ///
 /// A full `spawn_window` passes over background requests that would spawn a
 /// dedicated process; urgent ones and streams on a multiplexed server still
@@ -1069,14 +1104,19 @@ pub async fn lease_next_admission_within(
     capacity: RuntimeResourceCapacity,
     memory: Option<HostMemoryEnvelope>,
     spawn_window: Option<SpawnWindow>,
+    priority: MemoryPriority<'_>,
 ) -> DbResult<LeaseDecision> {
     let (workspace, lane, owner) = (workspace.to_string(), lane.to_string(), owner.to_string());
+    let yields_to = match priority {
+        MemoryPriority::Interactive => None,
+        MemoryPriority::YieldsTo(interactive) => Some(interactive.to_string()),
+    };
     enum Outcome {
         Leased(String),
         Empty,
         Blocked(String, LaneShortfall, u64),
     }
-    let outcome = db.write(move |conn| { let (workspace,lane,owner)=(workspace.clone(),lane.clone(),owner.clone()); Box::pin(async move {
+    let outcome = db.write(move |conn| { let (workspace,lane,owner,yields_to)=(workspace.clone(),lane.clone(),owner.clone(),yields_to.clone()); Box::pin(async move {
         conn.execute("INSERT OR IGNORE INTO runtime_admission_cursors(workspace_key,resource_lane) VALUES(?1,?2)", params![workspace.clone(),lane.clone()]).await?;
         let mut cursor = conn.query("SELECT urgent_streak FROM runtime_admission_cursors WHERE workspace_key=?1 AND resource_lane=?2", params![workspace.clone(),lane.clone()]).await?;
         let streak = cursor.next().await?.expect("cursor row").i64(0)?;
@@ -1109,12 +1149,13 @@ pub async fn lease_next_admission_within(
             }
         }
         // Units are a lane's own, but memory is one host: a spawn in flight on
-        // any private lane spends the same headroom the probe has not seen yet.
-        let mut other_rows = conn.query("SELECT resource_lane,claim_json FROM runtime_admission_requests WHERE workspace_key=?1 AND resource_lane<>?2 AND state IN ('leased','starting')", params![workspace.clone(),lane.clone()]).await?;
+        // any other lane (another private lane, an ephemeral call, a team
+        // launch) spends the same headroom the probe has not seen yet.
+        let mut other_rows = conn.query("SELECT workspace_key,resource_lane,claim_json FROM runtime_admission_requests WHERE NOT (workspace_key=?1 AND resource_lane=?2) AND state IN ('leased','starting')", params![workspace.clone(),lane.clone()]).await?;
         let mut other_servers = HashSet::new();
         while let Some(other_row) = other_rows.next().await? {
-            let other_lane = other_row.text(0)?;
-            let claim: RuntimeResourceClaim = serde_json::from_str(&other_row.text(1)?)
+            let other_lane = (other_row.text(0)?, other_row.text(1)?);
+            let claim: RuntimeResourceClaim = serde_json::from_str(&other_row.text(2)?)
                 .map_err(|error| DbError::internal(format!("invalid in-flight runtime resource claim: {error}")))?;
             let new_process = claim.resident_process_units > 0
                 && match &claim.server_instance_key {
@@ -1126,6 +1167,40 @@ pub async fn lease_next_admission_within(
                     .saturating_add(memory.map_or(0, |memory| memory.charge(&claim)));
             }
         }
+
+        // A batch lane leaves room for the interactive launches waiting on this
+        // host: each queued launch that would add a process, and at least one
+        // unmeasured claim for the next one to arrive.
+        let interactive_room = match (memory, &yields_to) {
+            (Some(memory), Some(interactive)) => {
+                let mut rows = conn.query("SELECT resource_lane,state,claim_json FROM runtime_admission_requests WHERE workspace_key=?1 AND state IN ('queued','leased','starting','active') ORDER BY enqueue_seq", params![interactive.clone()]).await?;
+                let mut servers = HashSet::new();
+                let mut queued = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let interactive_lane = row.text(0)?;
+                    let claim: RuntimeResourceClaim = serde_json::from_str(&row.text(2)?)
+                        .map_err(|error| DbError::internal(format!("invalid interactive runtime resource claim: {error}")))?;
+                    if row.text(1)? == "queued" {
+                        queued.push((interactive_lane, claim));
+                    } else if let Some(key) = &claim.server_instance_key {
+                        servers.insert((interactive_lane, key.clone()));
+                    }
+                }
+                queued
+                    .into_iter()
+                    .filter(|(interactive_lane, claim)| {
+                        claim.resident_process_units > 0
+                            && claim
+                                .server_instance_key
+                                .as_ref()
+                                .is_none_or(|key| servers.insert((interactive_lane.clone(), key.clone())))
+                    })
+                    .map(|(_, claim)| memory.charge(&claim))
+                    .fold(0_u64, u64::saturating_add)
+                    .max(memory.unmeasured_claim_bytes)
+            }
+            _ => 0,
+        };
 
         let mut rows = conn.query("SELECT request_id,priority,claim_json FROM runtime_admission_requests WHERE workspace_key=?1 AND resource_lane=?2 AND state='queued' ORDER BY CASE WHEN ?3=1 THEN priority ELSE 1-priority END DESC, enqueue_seq", params![workspace.clone(),lane.clone(),i64::from(prefer_urgent)]).await?;
         let mut selected = None;
@@ -1153,18 +1228,19 @@ pub async fn lease_next_admission_within(
                 Some(LaneShortfall::Units { active: active_process_units, ceiling: capacity.resident_process_units })
             } else if active_stream_units + u64::from(candidate.logical_stream_units) > u64::from(capacity.logical_stream_units) {
                 Some(LaneShortfall::Streams { active: active_stream_units, ceiling: capacity.logical_stream_units })
-            } else if candidate_process_units == 0 || occupied == 0 {
+            } else if candidate_process_units == 0 || (occupied == 0 && yields_to.is_none()) {
                 None
             } else if memory_blocked {
                 continue;
             } else {
                 memory.and_then(|memory| {
                     let estimate = memory.charge(&candidate);
-                    (memory.headroom(in_flight_bytes) < estimate).then_some(LaneShortfall::Memory {
+                    (memory.headroom(in_flight_bytes) < estimate.saturating_add(interactive_room)).then_some(LaneShortfall::Memory {
                         available_bytes: memory.available_bytes,
                         reserve_bytes: memory.reserve_bytes,
                         in_flight_bytes,
                         head_estimate_bytes: estimate,
+                        interactive_room_bytes: interactive_room,
                     })
                 })
             };
@@ -1226,15 +1302,6 @@ pub struct LaneOccupancy {
     pub typical_claim_bytes: Option<u64>,
 }
 
-impl LaneOccupancy {
-    pub fn in_flight_bytes(&self, unmeasured_claim_bytes: u64) -> u64 {
-        self.in_flight_estimated_bytes.saturating_add(
-            self.in_flight_unestimated
-                .saturating_mul(unmeasured_claim_bytes),
-        )
-    }
-}
-
 /// Every lane of `workspace` that holds a non-terminal admission row.
 pub async fn lane_occupancy(db: &LocalDb, workspace: &str) -> DbResult<Vec<LaneOccupancy>> {
     let rows = db
@@ -1283,6 +1350,38 @@ pub async fn lane_occupancy(db: &LocalDb, workspace: &str) -> DbResult<Vec<LaneO
         }
     }
     Ok(lanes)
+}
+
+/// Bytes charged for spawns in flight anywhere on this host: every `leased` or
+/// `starting` row that adds a process, across every workspace and lane in this
+/// ledger. The same sum a lease nets out of the measured headroom, so a surface
+/// reports the headroom the lease decided against.
+pub async fn host_in_flight_bytes(db: &LocalDb, unmeasured_claim_bytes: u64) -> DbResult<u64> {
+    let rows = db
+        .query_all(
+            "SELECT workspace_key,resource_lane,claim_json FROM runtime_admission_requests WHERE state IN ('leased','starting')",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+        )
+        .await?;
+    let mut servers: HashSet<(String, String, String)> = HashSet::new();
+    let mut bytes = 0_u64;
+    for (workspace, lane, claim_json) in rows {
+        let claim: RuntimeResourceClaim = decode_json(&claim_json, "runtime resource claim")?;
+        let new_process = claim.resident_process_units > 0
+            && claim
+                .server_instance_key
+                .as_ref()
+                .is_none_or(|key| servers.insert((workspace, lane, key.clone())));
+        if new_process {
+            bytes = bytes.saturating_add(
+                claim
+                    .estimated_memory_bytes
+                    .unwrap_or(unmeasured_claim_bytes),
+            );
+        }
+    }
+    Ok(bytes)
 }
 
 /// What a private lane admits against and where it stands, as one projection:
@@ -2411,7 +2510,47 @@ mod tests {
         memory: Option<HostMemoryEnvelope>,
     ) -> LeaseDecision {
         lease_next_admission_within(
-            db, "w", "process", "runner", 10, 300, capacity, memory, None,
+            db,
+            "w",
+            "process",
+            "runner",
+            10,
+            300,
+            capacity,
+            memory,
+            None,
+            MemoryPriority::Interactive,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The interactive workspace the batch lane in these tests yields to.
+    const INTERACTIVE: &str = "w";
+    const BATCH: &str = "calls";
+
+    fn batch_request(id: &str, now: i64) -> NewAdmissionRequest {
+        let mut request = estimated(id, now, Some(450 * MIB));
+        request.workspace_key = BATCH.into();
+        request
+    }
+
+    async fn lease_batch(
+        db: &LocalDb,
+        capacity: RuntimeResourceCapacity,
+        memory: Option<HostMemoryEnvelope>,
+    ) -> LeaseDecision {
+        lease_next_admission_within(
+            db,
+            BATCH,
+            "process",
+            "runner",
+            10,
+            300,
+            capacity,
+            memory,
+            None,
+            MemoryPriority::YieldsTo(INTERACTIVE),
         )
         .await
         .unwrap()
@@ -2428,6 +2567,7 @@ mod tests {
             unbounded(),
             None,
             Some(SpawnWindow { warming, window: 4 }),
+            MemoryPriority::Interactive,
         )
         .await
         .unwrap()
@@ -2669,6 +2809,7 @@ mod tests {
                         reserve_bytes: 1_000 * MIB,
                         in_flight_bytes: 800 * MIB,
                         head_estimate_bytes: 400 * MIB,
+                        interactive_room_bytes: 0,
                     }
                 );
             }
@@ -2740,6 +2881,196 @@ mod tests {
             lease_within(&db, unbounded(), envelope(500, 1_000)).await,
             LeaseDecision::Blocked { .. }
         ));
+    }
+
+    /// A batch lane gets no empty-lane exemption: with nothing of its own in
+    /// flight it still waits when admitting would leave less than one
+    /// interactive session's room above the reserve.
+    #[tokio::test]
+    async fn a_batch_call_waits_at_the_reserve_with_nothing_of_its_own_in_flight() {
+        let db = crate::storage::migrated_test_db("admission-batch-at-reserve.db").await;
+        enqueue_admission_request(&db, batch_request("call", 1))
+            .await
+            .unwrap();
+        // 1200 MiB above the reserve: the call's 450 fits, but not with the
+        // 1024 MiB a batch lane keeps free for the next interactive launch.
+        assert_eq!(
+            lease_batch(&db, unbounded(), envelope(2_200, 1_000)).await,
+            LeaseDecision::Blocked {
+                head_request_id: "call".into(),
+                shortfall: LaneShortfall::Memory {
+                    available_bytes: 2_200 * MIB,
+                    reserve_bytes: 1_000 * MIB,
+                    in_flight_bytes: 0,
+                    head_estimate_bytes: 450 * MIB,
+                    interactive_room_bytes: 1_024 * MIB,
+                },
+                in_flight_requests: 0,
+            }
+        );
+        assert!(matches!(
+            lease_batch(&db, unbounded(), envelope(2_500, 1_000)).await,
+            LeaseDecision::Leased(request) if request.request_id == "call"
+        ));
+    }
+
+    /// One process fits above the reserve, and both an interactive session and
+    /// a batch call want it. Whichever promoter runs first, the session gets it.
+    #[tokio::test]
+    async fn an_interactive_session_wins_the_last_unit_over_a_batch_call() {
+        let db = crate::storage::migrated_test_db("admission-batch-yields.db").await;
+        enqueue_admission_request(&db, estimated("resident", 1, Some(450 * MIB)))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE runtime_admission_requests SET state='active' WHERE request_id='resident'",
+            (),
+        )
+        .await
+        .unwrap();
+        enqueue_admission_request(&db, estimated("session", 2, Some(450 * MIB)))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, batch_request("call", 3))
+            .await
+            .unwrap();
+        // 600 MiB above the reserve: room for exactly one 450 MiB process.
+        let host = || envelope(1_600, 1_000);
+
+        // The call's promoter runs first and yields.
+        assert!(
+            matches!(
+                lease_batch(&db, unbounded(), host()).await,
+                LeaseDecision::Blocked { shortfall: LaneShortfall::Memory { interactive_room_bytes, .. }, .. }
+                    if interactive_room_bytes == 1_024 * MIB
+            ),
+            "a batch call never takes the room a queued session needs"
+        );
+        assert_eq!(state_of(&db, "call").await, "queued");
+        // The session's promoter then takes the unit.
+        assert!(matches!(
+            lease_within(&db, unbounded(), host()).await,
+            LeaseDecision::Leased(request) if request.request_id == "session"
+        ));
+        // The session's spawn in flight is charged against the call too.
+        assert!(matches!(
+            lease_batch(&db, unbounded(), host()).await,
+            LeaseDecision::Blocked { shortfall: LaneShortfall::Memory { in_flight_bytes, .. }, .. }
+                if in_flight_bytes == 450 * MIB
+        ));
+    }
+
+    /// The room a batch lane leaves is every queued interactive launch, not
+    /// just one, and a stream on a resident server costs none of it.
+    #[tokio::test]
+    async fn a_batch_lane_leaves_room_for_every_queued_interactive_launch() {
+        let db = crate::storage::migrated_test_db("admission-batch-room-sum.db").await;
+        for (id, now) in [("first", 1), ("second", 2), ("third", 3)] {
+            enqueue_admission_request(&db, estimated(id, now, Some(450 * MIB)))
+                .await
+                .unwrap();
+        }
+        let mut server = claimed_request("server", false, 4, 1, Some("srv"), 1);
+        server.resource_lane = "pooled".into();
+        let mut stream = claimed_request("stream", false, 5, 1, Some("srv"), 1);
+        stream.resource_lane = "pooled".into();
+        enqueue_admission_request(&db, server).await.unwrap();
+        enqueue_admission_request(&db, stream).await.unwrap();
+        db.execute(
+            "UPDATE runtime_admission_requests SET state='active' WHERE request_id='server'",
+            (),
+        )
+        .await
+        .unwrap();
+        enqueue_admission_request(&db, batch_request("call", 6))
+            .await
+            .unwrap();
+        // Three queued 450 MiB sessions need 1350 MiB, more than the 1024 MiB
+        // floor; the stream rides the resident server. A 1000 MiB reserve with
+        // 1799 MiB of headroom is 1 MiB short of 1350 + the call's 450.
+        assert_eq!(
+            lease_batch(&db, unbounded(), envelope(1_000 + 1_350 + 449, 1_000)).await,
+            LeaseDecision::Blocked {
+                head_request_id: "call".into(),
+                shortfall: LaneShortfall::Memory {
+                    available_bytes: (1_000 + 1_350 + 449) * MIB,
+                    reserve_bytes: 1_000 * MIB,
+                    in_flight_bytes: 0,
+                    head_estimate_bytes: 450 * MIB,
+                    interactive_room_bytes: 1_350 * MIB,
+                },
+                in_flight_requests: 0,
+            }
+        );
+        // 1800 MiB of headroom holds both exactly.
+        assert!(matches!(
+            lease_batch(&db, unbounded(), envelope(1_000 + 1_350 + 450, 1_000)).await,
+            LeaseDecision::Leased(request) if request.request_id == "call"
+        ));
+    }
+
+    /// Memory alone would admit far more than the fan-out cap on a huge host;
+    /// the cap still bounds how many calls run at once.
+    #[tokio::test]
+    async fn the_fan_out_cap_bounds_a_batch_lane_on_a_huge_host() {
+        let db = crate::storage::migrated_test_db("admission-batch-cap.db").await;
+        for n in 0..5 {
+            enqueue_admission_request(&db, batch_request(&format!("call-{n}"), n))
+                .await
+                .unwrap();
+        }
+        let cap = RuntimeResourceCapacity {
+            resident_process_units: 3,
+            logical_stream_units: u32::MAX,
+        };
+        // 1 TiB available above a 100 GiB reserve: 924 GiB of headroom, room
+        // for some two thousand calls, so only the cap of 3 can refuse one.
+        let huge = || envelope(1024 * 1024, 100 * 1024);
+        for n in 0..3 {
+            assert!(matches!(
+                lease_batch(&db, cap, huge()).await,
+                LeaseDecision::Leased(request) if request.request_id == format!("call-{n}")
+            ));
+        }
+        assert!(matches!(
+            lease_batch(&db, cap, huge()).await,
+            LeaseDecision::Blocked {
+                shortfall: LaneShortfall::Units {
+                    active: 3,
+                    ceiling: 3
+                },
+                ..
+            }
+        ));
+    }
+
+    /// The host-wide in-flight sum a surface reports is the one the lease
+    /// charges: every workspace's spawns, one charge per new server.
+    #[tokio::test]
+    async fn host_in_flight_bytes_spans_every_workspace() {
+        let db = crate::storage::migrated_test_db("admission-host-in-flight.db").await;
+        enqueue_admission_request(&db, estimated("session", 1, Some(450 * MIB)))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, batch_request("call", 2))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, estimated("unestimated", 3, None))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, batch_request("queued-call", 4))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE runtime_admission_requests SET state='leased' WHERE request_id IN ('session','call','unestimated')",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host_in_flight_bytes(&db, 1024 * MIB).await.unwrap(),
+            (450 + 450 + 1024) * MIB
+        );
     }
 
     #[tokio::test]

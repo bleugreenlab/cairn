@@ -148,6 +148,7 @@ pub struct OrchestratorBuilder {
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     catalog_rediscovery: bool,
+    host_memory: Arc<dyn crate::agent_process::memory::MemoryProbe>,
     provider_usage_snapshots: ProviderUsageSnapshots,
     provider_usage_captures: ProviderUsageCaptures,
     reconciled_subscriptions: subscription_periods::ReconciledSubscriptions,
@@ -474,6 +475,7 @@ impl OrchestratorBuilder {
             // Off in test builds, with no way to turn it off in any other; see
             // `Orchestrator::catalog_rediscovery`.
             catalog_rediscovery: !cfg!(any(test, feature = "test-utils")),
+            host_memory: default_host_memory(),
             provider_usage_snapshots: Arc::new(cairn_models::usage::book::UsageBook::new()),
             provider_usage_captures: Arc::new(Mutex::new(HashSet::new())),
             reconciled_subscriptions: Arc::default(),
@@ -655,6 +657,18 @@ impl OrchestratorBuilder {
         self
     }
 
+    /// Measure host memory for admission with `probe` instead of the fixed
+    /// [`TEST_HOST_MEMORY`] a test build defaults to, for a test that needs a
+    /// tight or unmeasurable host. A warm GC's own probe still takes precedence.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn host_memory(
+        mut self,
+        probe: Arc<dyn crate::agent_process::memory::MemoryProbe>,
+    ) -> Self {
+        self.host_memory = probe;
+        self
+    }
+
     #[cfg(test)]
     fn team_attention_sender(
         mut self,
@@ -823,6 +837,7 @@ impl OrchestratorBuilder {
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
             catalog_rediscovery: self.catalog_rediscovery,
+            host_memory: self.host_memory,
             provider_usage_snapshots: self.provider_usage_snapshots,
             provider_usage_captures: self.provider_usage_captures,
             reconciled_subscriptions: self.reconciled_subscriptions,
@@ -1779,6 +1794,10 @@ pub struct Orchestrator {
     /// A scoped single-provider refresh is an explicit request and is not
     /// gated.
     catalog_rediscovery: bool,
+    /// Where session and call admission measure host memory when no warm GC
+    /// supplies the probe. The OS outside test builds; a fixed host in them
+    /// (see [`TEST_HOST_MEMORY`]).
+    pub(crate) host_memory: Arc<dyn crate::agent_process::memory::MemoryProbe>,
     /// Latest usage snapshots keyed by backend and requested account.
     pub provider_usage_snapshots: ProviderUsageSnapshots,
     /// Account probes are single-flight so concurrent session starts cannot
@@ -1941,6 +1960,30 @@ impl Drop for JobLaunchClaim {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.job_id);
+    }
+}
+
+/// The host a test orchestrator admits against unless it injects a probe: 64
+/// GiB total and 48 GiB available, so a 6.4 GiB reserve and 41.6 GiB of
+/// headroom. Fixed so that no admission outcome in a test depends on how loaded
+/// the machine running the suite is.
+#[cfg(any(test, feature = "test-utils"))]
+pub const TEST_HOST_MEMORY: crate::agent_process::memory::SystemMemory =
+    crate::agent_process::memory::SystemMemory {
+        total: 64 << 30,
+        available: 48 << 30,
+    };
+
+fn default_host_memory() -> Arc<dyn crate::agent_process::memory::MemoryProbe> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        Arc::new(crate::agent_process::memory::StubMemoryProbe::new(Some(
+            TEST_HOST_MEMORY,
+        )))
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    {
+        Arc::new(crate::agent_process::memory::OsMemoryProbe)
     }
 }
 

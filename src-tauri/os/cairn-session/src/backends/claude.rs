@@ -428,38 +428,57 @@ impl ClaudeTurnProgressWatchdog {
     }
 }
 
-/// Estimated resident memory of a single ephemeral (`cairn:~/calls`) `claude`
-/// process. Claude is permanently CLI-bound, so each call is a dedicated
-/// `claude --print` process carrying a Node.js runtime; ~450 MB is the
-/// steady-state RSS observed for one (CAIRN-2543, where a per-call fan-out of
-/// dozens of such processes reached tens of GB aggregate and OS-killed the
-/// runner). It is an *estimate*, not a live measurement — the admission ceiling
-/// derived from it only needs the right order of magnitude to bound fan-out
-/// memory, so it is a fixed named constant rather than a per-process probe.
-pub(crate) const CLAUDE_CALL_PROCESS_RSS_ESTIMATE: u64 = 450 * 1024 * 1024;
+/// Estimated resident memory of one `claude` process, the claim every Claude
+/// launch (ordinary session or ephemeral call) is admitted against. Claude is
+/// permanently CLI-bound, so each is a dedicated process carrying a Node.js
+/// runtime; ~450 MB is the steady-state RSS observed for one (CAIRN-2543, where
+/// a per-call fan-out of dozens reached tens of GB aggregate and OS-killed the
+/// runner). Admission measures the host and charges this only for spawns the
+/// probe cannot see yet, so it needs the right order of magnitude, not a
+/// per-process reading.
+pub const CLAUDE_PROCESS_RSS_ESTIMATE: u64 = 450 * 1024 * 1024;
 
-/// Divisor applied to total physical RAM to get the memory budget the ceiling
-/// may spend on concurrent `claude` processes. `4` == 25% of RAM: ample
-/// headroom for the agent processes, the runner, and the OS, while still letting
-/// a large workstation run a wide fan-out fully parallel.
-pub(crate) const CLAUDE_CALL_RAM_BUDGET_DIVISOR: u64 = 4;
+/// How many ephemeral Claude calls may run at once. Measured host memory is
+/// the admission decision; these bound only what memory cannot. The cap keeps
+/// process count and file descriptors sane however much memory a host has, and
+/// an unmeasurable host admits at most `unmeasured_host` so it stays protected
+/// (CAIRN-2557 and CAIRN-2548 are the lane's history).
+pub const CLAUDE_CALL_CONCURRENCY: crate::config::CallConcurrency =
+    crate::config::CallConcurrency {
+        cap: 64,
+        unmeasured_host: 4,
+    };
 
-/// Floor on the derived ceiling so even a small machine gets useful call
-/// parallelism (and an unmeasurable system stays protective).
-pub(crate) const CLAUDE_CALL_CONCURRENCY_FLOOR: usize = 4;
-
-/// Cap on the derived ceiling to keep process count and file-descriptor
-/// pressure sane no matter how much RAM the budget would otherwise permit.
-pub(crate) const CLAUDE_CALL_CONCURRENCY_CAP: usize = 64;
-
-/// Pure ceiling formula: `clamp(budget / per-process RSS, FLOOR, CAP)`, where
-/// the budget is a fixed fraction of total physical RAM. Side-effect-free and
-/// keyed only on `total_ram_bytes` so the clamp boundaries are unit-testable
-/// with injected RAM values, never the host's real memory.
-pub fn claude_call_concurrency_ceiling(total_ram_bytes: u64) -> usize {
-    let budget = total_ram_bytes / CLAUDE_CALL_RAM_BUDGET_DIVISOR;
-    let raw = (budget / CLAUDE_CALL_PROCESS_RSS_ESTIMATE) as usize;
-    raw.clamp(CLAUDE_CALL_CONCURRENCY_FLOOR, CLAUDE_CALL_CONCURRENCY_CAP)
+/// The operator-facing line describing what the Claude ephemeral-call lane
+/// admits against on this host, from one memory reading. Logged at startup;
+/// the lane measures again on every lease.
+pub fn claude_call_admission_line(
+    system: Option<crate::agent_process::memory::SystemMemory>,
+) -> String {
+    use crate::agent_process::gc::{memory_reserve, DEFAULT_SPAWN_RSS};
+    let gib = |bytes: u64| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
+    let crate::config::CallConcurrency {
+        cap,
+        unmeasured_host,
+    } = CLAUDE_CALL_CONCURRENCY;
+    match system {
+        Some(memory) => {
+            let reserve = memory_reserve(memory.total);
+            let headroom = memory.available.saturating_sub(reserve);
+            let calls = (headroom.saturating_sub(DEFAULT_SPAWN_RSS) / CLAUDE_PROCESS_RSS_ESTIMATE)
+                .min(cap as u64);
+            format!(
+                "Claude ephemeral-call admission: measured host memory, {} headroom above a {} reserve; calls leave room for queued ordinary sessions (at least {}), so about {calls} calls of {} MiB fit now; fan-out cap {cap}",
+                gib(headroom),
+                gib(reserve),
+                gib(DEFAULT_SPAWN_RSS),
+                CLAUDE_PROCESS_RSS_ESTIMATE / (1024 * 1024),
+            )
+        }
+        None => format!(
+            "Claude ephemeral-call admission: host memory is unmeasurable, so at most {unmeasured_host} calls run at once (fan-out cap {cap})"
+        ),
+    }
 }
 
 /// Claude CLI can report a terminal failure as a `Result` whose subtype is still
@@ -475,34 +494,13 @@ pub(crate) fn terminal_result_error_message(data: &serde_json::Value) -> &'stati
     }
 }
 
-/// Ceiling on simultaneous ephemeral (`cairn:~/calls`) `claude` processes,
-/// derived ONCE at startup from total physical RAM (see
-/// [`claude_call_concurrency_ceiling`]). Admission caps fan-out here so width
-/// stops translating into process count: at the derived ceiling an N-call
-/// fan-out queues onto the slots and Claude call memory stays bounded to
-/// `ceiling × ~450 MB` regardless of N. The cap exists to bound MEMORY, so it is
-/// sized to the machine's RAM rather than a fixed count (CAIRN-2557, superseding
-/// the fixed 6 of CAIRN-2548). When system memory is unmeasurable it falls back
-/// to the protective [`CLAUDE_CALL_CONCURRENCY_FLOOR`]. Computed via `LazyLock`
-/// on first access — the runner/server force and log it at startup.
-pub static CLAUDE_CALL_MAX_CONCURRENCY: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
-    || {
-        let system = OsMemoryProbe.system_memory();
-        let ceiling = match system {
-            Some(mem) => claude_call_concurrency_ceiling(mem.total),
-            None => CLAUDE_CALL_CONCURRENCY_FLOOR,
-        };
-        log::info!(
-            "Claude ephemeral-call concurrency ceiling: {ceiling} (total physical RAM: {}, budget ~{}%, per-process estimate {} MB)",
-            system
-                .map(|m| format!("{} MiB", m.total / (1024 * 1024)))
-                .unwrap_or_else(|| "unmeasurable".to_string()),
-            100 / CLAUDE_CALL_RAM_BUDGET_DIVISOR,
-            CLAUDE_CALL_PROCESS_RSS_ESTIMATE / (1024 * 1024),
-        );
-        ceiling
-    },
-);
+/// Log [`claude_call_admission_line`] for this host's memory now.
+pub fn log_claude_call_admission() {
+    log::info!(
+        "{}",
+        claude_call_admission_line(OsMemoryProbe.system_memory())
+    );
+}
 
 /// State for tracking a durable streaming message.
 #[derive(Debug)]

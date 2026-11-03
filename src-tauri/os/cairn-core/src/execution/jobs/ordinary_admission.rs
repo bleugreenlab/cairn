@@ -943,6 +943,7 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
                 budget.capacity(),
                 budget.memory,
                 spawn_window,
+                crate::storage::MemoryPriority::Interactive,
             )
             .await
             .map_err(|error| error.to_string())
@@ -954,6 +955,10 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
             }
             crate::storage::LeaseDecision::Empty => {
                 orch.private_lanes.record(lane, budget, None);
+                drop(ramp_admission);
+                // Ephemeral calls yield to queued sessions, so a drained queue
+                // is when a call held back for one may admit.
+                super::calls::promote_queued_call_lanes(orch);
                 return Ok(());
             }
             crate::storage::LeaseDecision::Blocked {
@@ -3055,6 +3060,7 @@ mod tests {
             },
             None,
             None,
+            crate::storage::MemoryPriority::Interactive,
         )
         .await
         .unwrap()

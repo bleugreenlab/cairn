@@ -290,11 +290,8 @@ pub(crate) fn start_call_run(
         return Ok(());
     }
 
-    let ceiling = backend
-        .call_batch_capability()
-        .max_concurrency
-        .unwrap_or(usize::MAX);
-    if ceiling == 0 {
+    let concurrency = backend.call_batch_capability().max_concurrency;
+    if concurrency.is_some_and(|bounds| bounds.cap == 0) {
         return Err(format!(
             "runtime admission capacity for {} is zero",
             capability.lane.0
@@ -347,7 +344,7 @@ pub(crate) fn start_call_run(
     // Promotion consumes whichever request durable fairness selects. It may be
     // an older request, so tying handoff to this enqueue's request id would drop
     // a valid lease and leave an otherwise idle lane stuck until expiry.
-    promote_next_call(orch, &capability.lane.0, ceiling);
+    promote_next_call(orch, &capability.lane.0, concurrency);
     Ok(())
 }
 
@@ -382,11 +379,11 @@ pub(crate) fn prepared_call_provider_metadata(
         serde_json::from_value(serde_json::to_value(capability).ok()?).ok()?;
     capability.provider =
         Some(backend_name.unwrap_or_else(|| crate::backends::CLAUDE_FAMILY_BACKEND.to_string()));
-    let ceiling = call_lane_ceiling(Some(&prepared));
+    let cap = call_lane_concurrency(Some(&prepared)).map_or(usize::MAX, |bounds| bounds.cap);
     Some((
         capability,
         crate::storage::RuntimeResourceCapacity {
-            resident_process_units: u32::try_from(ceiling).unwrap_or(u32::MAX),
+            resident_process_units: u32::try_from(cap).unwrap_or(u32::MAX),
             logical_stream_units: u32::MAX,
         },
     ))
@@ -396,14 +393,15 @@ fn decode_prepared_call(prepared_json: &str) -> Option<PreparedCallRun> {
     serde_json::from_str(prepared_json).ok()
 }
 
-/// The concurrency ceiling of the lane a prepared call admits on. `None`
-/// collapses to Claude, matching `backend_for_name`.
-fn call_lane_ceiling(prepared: Option<&PreparedCallRun>) -> usize {
+/// The count bounds of the lane a prepared call admits on. A prepared call
+/// that cannot be read collapses to Claude, matching `backend_for_name`.
+fn call_lane_concurrency(
+    prepared: Option<&PreparedCallRun>,
+) -> Option<crate::backends::CallConcurrency> {
     let backend_name = prepared.and_then(admission_backend_name);
     crate::backends::backend_for_name(backend_name.as_deref())
         .call_batch_capability()
         .max_concurrency
-        .unwrap_or(usize::MAX)
 }
 
 /// Close `lease` into `terminal`, fenced on the owner and generation it was
@@ -442,17 +440,25 @@ fn finish_call_lease(
     })
 }
 
+/// Lease the next call `lane` admits, measured against the same host memory
+/// envelope ordinary sessions lease against. Calls are batch work: they yield
+/// to the private ordinary-session lanes, leaving room above the reserve for
+/// every session queued there, and a call lane with nothing in flight gets no
+/// exemption from that. The backend's count bounds apply only as the fan-out
+/// cap on a measured host and as the whole bound on an unmeasurable one.
 fn lease_next_call(
     orch: &Orchestrator,
     lane: &str,
-    ceiling: usize,
+    concurrency: Option<crate::backends::CallConcurrency>,
 ) -> Result<Option<crate::storage::AdmissionRequest>, String> {
     let db = orch.db.local.clone();
     let lane = lane.to_string();
     let owner = call_lease_owner(orch);
+    let memory = super::private_lane::host_memory_envelope(orch);
+    let units = concurrency.map_or(usize::MAX, |bounds| bounds.units(memory.is_some()));
     let now = chrono::Utc::now().timestamp();
     run_db(async move {
-        crate::storage::lease_next_admission_with_capacity(
+        crate::storage::lease_next_admission_within(
             &db,
             crate::storage::CALL_ADMISSION_WORKSPACE,
             &lane,
@@ -460,11 +466,19 @@ fn lease_next_call(
             now,
             now + 300,
             crate::storage::RuntimeResourceCapacity {
-                resident_process_units: u32::try_from(ceiling).unwrap_or(u32::MAX),
+                resident_process_units: u32::try_from(units).unwrap_or(u32::MAX),
                 logical_stream_units: u32::MAX,
             },
+            memory,
+            None,
+            crate::storage::MemoryPriority::YieldsTo(super::private_lane::WORKSPACE),
         )
         .await
+        .map(|decision| match decision {
+            crate::storage::LeaseDecision::Leased(request) => Some(request),
+            crate::storage::LeaseDecision::Empty
+            | crate::storage::LeaseDecision::Blocked { .. } => None,
+        })
         .map_err(|e| e.to_string())
     })
 }
@@ -724,13 +738,16 @@ fn settle_call_admission(orch: &Orchestrator, run_id: &str) -> Option<SettledCal
         // (e.g. `kill_session_with_reason`), and cheap for a queued/uncapped run
         // (never reached — `held_slot` is false there).
         process_stopped = crate::orchestrator::lifecycle::release_and_stop_process(orch, run_id);
+        // The memory this call held goes to ordinary sessions first; a queued
+        // session also holds back the call promotion below until it leases.
+        super::private_lane::promote_private_lanes(orch);
     }
 
     let finalized_prepared = prepared_call_for(orch, &request.request_id);
     promote_next_call(
         orch,
         &request.resource_lane,
-        call_lane_ceiling(finalized_prepared.as_ref()),
+        call_lane_concurrency(finalized_prepared.as_ref()),
     );
     Some(SettledCallAdmission {
         request_id: request.request_id,
@@ -767,16 +784,20 @@ fn prepared_call_for(orch: &Orchestrator, request_id: &str) -> Option<PreparedCa
 /// triggered it still goes to live work.
 ///
 /// Returns whether a call was started (a start that failed still consumed its
-/// lease and failed its run); `false` when the lane is empty, at its ceiling,
-/// or unreadable.
-fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) -> bool {
+/// lease and failed its run); `false` when the lane is empty, has no room for
+/// its head, or is unreadable.
+fn promote_next_call(
+    orch: &Orchestrator,
+    lane: &str,
+    concurrency: Option<crate::backends::CallConcurrency>,
+) -> bool {
     // The row is durable before any pass reaches here, so a call held for
     // startup recovery waits queued for the drain that follows readiness.
     if !orch.startup_readiness.is_ready() {
         return false;
     }
     loop {
-        let Ok(Some(next_lease)) = lease_next_call(orch, lane, ceiling) else {
+        let Ok(Some(next_lease)) = lease_next_call(orch, lane, concurrency) else {
             return false;
         };
         let Some(next) = prepared_call_for(orch, &next_lease.request_id) else {
@@ -823,12 +844,32 @@ fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) -> bool {
     }
 }
 
-/// Drain every call lane holding queued work as far as its ceiling admits.
+/// [`promote_call_lanes`] in the background, when a call is queued at all.
+/// Ordinary-session promotion runs this once its queue is drained: calls
+/// yield to queued sessions, so that is when they may admit again.
+pub(crate) fn promote_queued_call_lanes(orch: &Orchestrator) {
+    let db = orch.db.local.clone();
+    let queued = run_db(async move {
+        db.query_opt_text(
+            "SELECT request_id FROM runtime_admission_requests WHERE workspace_key=?1 AND state='queued' LIMIT 1",
+            (crate::storage::CALL_ADMISSION_WORKSPACE.to_string(),),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    });
+    if matches!(queued, Ok(Some(_))) {
+        let promoter = orch.clone();
+        orch.spawn_blocking_detached(move || promote_call_lanes(&promoter));
+    }
+}
+
+/// Drain every call lane holding queued work as far as host memory and its
+/// count bounds admit.
 ///
-/// Event-driven promotion (an enqueue, a release) covers the steady state;
-/// this is the backstop that runs at boot and on every process sweep, so a
-/// queued call is never stranded by a slot that freed without an event, such
-/// as one the heal below released.
+/// Event-driven promotion (an enqueue, a release, an ordinary-session queue
+/// draining) covers the steady state; this is the backstop that runs at boot
+/// and on every process sweep, so a queued call is never stranded by memory or
+/// a slot that freed without an event, such as one the heal below released.
 pub(crate) fn promote_call_lanes(orch: &Orchestrator) {
     let rows = match run_db({
         let db = orch.db.local.clone();
@@ -844,16 +885,16 @@ pub(crate) fn promote_call_lanes(orch: &Orchestrator) {
             return;
         }
     };
-    let mut lanes: Vec<(String, usize)> = Vec::new();
+    let mut lanes: Vec<(String, Option<crate::backends::CallConcurrency>)> = Vec::new();
     for row in rows.iter().filter(|row| row.state == "queued") {
         if lanes.iter().any(|(lane, _)| *lane == row.resource_lane) {
             continue;
         }
-        let ceiling = call_lane_ceiling(decode_prepared_call(&row.prepared_json).as_ref());
-        lanes.push((row.resource_lane.clone(), ceiling));
+        let concurrency = call_lane_concurrency(decode_prepared_call(&row.prepared_json).as_ref());
+        lanes.push((row.resource_lane.clone(), concurrency));
     }
-    for (lane, ceiling) in lanes {
-        while promote_next_call(orch, &lane, ceiling) {}
+    for (lane, concurrency) in lanes {
+        while promote_next_call(orch, &lane, concurrency) {}
     }
 }
 
@@ -1676,6 +1717,65 @@ mod restart_call_tests {
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::SearchIndex;
     use std::sync::Arc;
+
+    /// A fixture orchestrator admits calls against the fixed test host, never
+    /// the machine running the suite, and a test can inject a tighter or
+    /// unmeasurable one.
+    #[tokio::test]
+    async fn call_admission_measures_the_fixture_host_not_the_machine() {
+        use crate::agent_process::memory::SystemMemory;
+        use cairn_session::agent_process::gc::{memory_reserve, DEFAULT_SPAWN_RSS};
+        let (orch, _db) = orch_with_db().await;
+        let fixture = crate::orchestrator::TEST_HOST_MEMORY;
+        assert_eq!(
+            super::super::private_lane::host_memory_envelope(&orch),
+            Some(crate::storage::HostMemoryEnvelope {
+                available_bytes: fixture.available,
+                reserve_bytes: memory_reserve(fixture.total),
+                unmeasured_claim_bytes: DEFAULT_SPAWN_RSS,
+            })
+        );
+
+        // 16 GiB total, 3 GiB available: a 2 GiB reserve and 1 GiB of headroom.
+        let tight = orch_with_db_and_probe(Some(SystemMemory {
+            total: 16 << 30,
+            available: 3 << 30,
+        }))
+        .await;
+        assert_eq!(
+            super::super::private_lane::host_memory_envelope(&tight)
+                .map(|envelope| envelope.headroom(0)),
+            Some(1 << 30)
+        );
+        let unmeasured = orch_with_db_and_probe(None).await;
+        assert_eq!(
+            super::super::private_lane::host_memory_envelope(&unmeasured),
+            None
+        );
+    }
+
+    async fn orch_with_db_and_probe(
+        system: Option<crate::agent_process::memory::SystemMemory>,
+    ) -> Orchestrator {
+        let local = Arc::new(
+            LocalDb::open_migrated_for_test(
+                tempfile::tempdir().unwrap().keep().join("calls-probe.db"),
+            )
+            .await
+            .unwrap(),
+        );
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        OrchestratorBuilder::new(
+            Arc::new(DbState::new(local, search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .host_memory(Arc::new(
+            crate::agent_process::memory::StubMemoryProbe::new(system),
+        ))
+        .build()
+    }
 
     async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
         let local = Arc::new(

@@ -597,46 +597,64 @@ pub(crate) mod tests {
             backend.completion_shape(),
             CompletionShape::DedicatedProcess
         );
-        // Claude enforces a bounded ephemeral-call ceiling (CAIRN-2557): each
-        // call is a dedicated ~450 MB `claude` process, so fan-out is capped at
-        // a RAM-derived bound. The descriptor reports exactly the computed
-        // startup value.
+        // Each Claude call is a dedicated ~450 MB `claude` process admitted
+        // against measured host memory; the descriptor carries only the
+        // fan-out cap and the bound for a host that cannot be measured.
         assert_eq!(
             backend.call_batch_capability(),
             CallBatchCapability {
                 shape: CallBatchShape::DedicatedProcess,
-                max_concurrency: Some(*claude::CLAUDE_CALL_MAX_CONCURRENCY),
+                max_concurrency: Some(CallConcurrency {
+                    cap: 64,
+                    unmeasured_host: 4,
+                }),
             }
         );
     }
 
-    /// The RAM-derived ceiling formula (CAIRN-2557) clamps at its documented
-    /// boundaries and scales proportionally between them. Exercised against
-    /// injected RAM values — never the host's real memory — so the boundaries
-    /// are deterministic. Budget is 25% of RAM, per-process estimate 450 MB,
-    /// clamped into [4, 64].
+    /// A measured host leases calls against memory under the fan-out cap; only
+    /// an unmeasurable one falls back to the protective count.
     #[test]
-    fn claude_call_ceiling_clamps_at_boundaries() {
-        use claude::claude_call_concurrency_ceiling as ceiling;
+    fn claude_call_units_are_the_cap_when_measured_and_the_floor_when_not() {
+        assert_eq!(claude::CLAUDE_CALL_CONCURRENCY.units(true), 64);
+        assert_eq!(claude::CLAUDE_CALL_CONCURRENCY.units(false), 4);
+        let inverted = CallConcurrency {
+            cap: 2,
+            unmeasured_host: 4,
+        };
+        assert_eq!(inverted.units(false), 2, "the cap bounds every host");
+    }
+
+    /// The startup line reports the envelope the lane admits against rather
+    /// than a count, and names the fallback on a host it cannot measure.
+    #[test]
+    fn claude_call_admission_line_reports_the_envelope() {
         const GIB: u64 = 1024 * 1024 * 1024;
-
-        // Tiny RAM → FLOOR: 1 GB budgets 256 MB / 450 MB ≈ 0, clamped up to 4;
-        // 8 GB budgets 2 GB / 450 MB ≈ 4, already at the floor.
-        assert_eq!(ceiling(GIB), 4);
-        assert_eq!(ceiling(8 * GIB), 4);
-
-        // Huge RAM → CAP: 128 GB budgets 32 GB / 450 MB ≈ 72, clamped to 64.
-        assert_eq!(ceiling(128 * GIB), 64);
-        assert_eq!(ceiling(1024 * GIB), 64);
-
-        // Mid RAM → proportional: 32 GB budgets 8 GB / 450 MB ≈ 18.
-        assert_eq!(ceiling(32 * GIB), 18);
-
-        // Acceptance anchors (CAIRN-2557): a 128 GB machine runs a 40-call
-        // fan-out fully parallel, and an 8–16 GB machine stays single-digit.
-        assert!(ceiling(128 * GIB) >= 40);
-        assert!(ceiling(8 * GIB) < 10);
-        assert!(ceiling(16 * GIB) < 10);
+        let line =
+            claude::claude_call_admission_line(Some(crate::agent_process::memory::SystemMemory {
+                total: 128 * GIB,
+                available: 70 * GIB,
+            }));
+        // 70 GiB minus the 12.8 GiB reserve is 57.2 GiB of headroom; less the
+        // 1 GiB kept for ordinary sessions, 450 MiB calls fit 127 times, so
+        // the fan-out cap of 64 is what bounds it.
+        assert_eq!(
+            line,
+            "Claude ephemeral-call admission: measured host memory, 57.2 GiB headroom above a 12.8 GiB reserve; calls leave room for queued ordinary sessions (at least 1.0 GiB), so about 64 calls of 450 MiB fit now; fan-out cap 64"
+        );
+        let tight =
+            claude::claude_call_admission_line(Some(crate::agent_process::memory::SystemMemory {
+                total: 16 * GIB,
+                available: 4 * GIB,
+            }));
+        assert!(
+            tight.contains("about 2 calls of 450 MiB fit now"),
+            "{tight}"
+        );
+        assert_eq!(
+            claude::claude_call_admission_line(None),
+            "Claude ephemeral-call admission: host memory is unmeasurable, so at most 4 calls run at once (fan-out cap 64)"
+        );
     }
 
     #[test]
@@ -752,13 +770,19 @@ pub(crate) mod tests {
             fn call_batch_capability(&self) -> CallBatchCapability {
                 CallBatchCapability {
                     shape: CallBatchShape::DedicatedProcess,
-                    max_concurrency: Some(1),
+                    max_concurrency: Some(CallConcurrency {
+                        cap: 1,
+                        unmeasured_host: 1,
+                    }),
                 }
             }
         }
         assert_eq!(
             CappedBackend.call_batch_capability().max_concurrency,
-            Some(1)
+            Some(CallConcurrency {
+                cap: 1,
+                unmeasured_host: 1,
+            })
         );
     }
 

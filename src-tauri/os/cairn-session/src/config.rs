@@ -276,12 +276,35 @@ pub enum CallBatchShape {
 }
 
 /// A backend's ephemeral-call batching capability: the shape it offers plus the
-/// max number of concurrent ephemeral calls it will admit at once. `None` =
-/// unbounded (pure passthrough — no admission bookkeeping).
+/// bounds on how many of its calls run at once. `None` = no count bound; a call
+/// that spawns a process is still admitted against measured host memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallBatchCapability {
     pub shape: CallBatchShape,
-    pub max_concurrency: Option<usize>,
+    pub max_concurrency: Option<CallConcurrency>,
+}
+
+/// Count bounds on a backend's concurrent ephemeral calls. Neither is the
+/// admission decision on a host whose memory can be measured: memory is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallConcurrency {
+    /// Most calls in flight however much memory the host has: a process-count
+    /// and file-descriptor bound on fan-out width, not a memory budget.
+    pub cap: usize,
+    /// Most calls in flight when the host's memory cannot be measured.
+    pub unmeasured_host: usize,
+}
+
+impl CallConcurrency {
+    /// The unit bound one lease applies: the cap on a measured host, the
+    /// unmeasured-host bound (never above the cap) otherwise.
+    pub fn units(self, memory_measured: bool) -> usize {
+        if memory_measured {
+            self.cap
+        } else {
+            self.unmeasured_host.min(self.cap)
+        }
+    }
 }
 
 #[cfg(test)]

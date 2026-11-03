@@ -49,8 +49,8 @@ use cairn_models::types::catalog::DiscoveredModel;
 
 use cairn_session::backends::claude::*;
 pub use cairn_session::backends::claude::{
-    claude_call_concurrency_ceiling, dispatch_claude_result, ClaudeResultContext,
-    CLAUDE_CALL_MAX_CONCURRENCY,
+    claude_call_admission_line, dispatch_claude_result, log_claude_call_admission,
+    ClaudeResultContext, CLAUDE_CALL_CONCURRENCY,
 };
 
 /// Refusal shown only when no Claude credential is configured.
@@ -1900,7 +1900,7 @@ impl AgentBackend for ClaudeBackend {
                 resident_process_units: 1,
                 server_instance_key: None,
                 logical_stream_units: 1,
-                estimated_memory_bytes: Some(450 * 1024 * 1024),
+                estimated_memory_bytes: Some(CLAUDE_PROCESS_RSS_ESTIMATE),
             },
             supports_warm_reuse: true,
         })
@@ -1908,12 +1908,11 @@ impl AgentBackend for ClaudeBackend {
 
     fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
         // Claude is permanently CLI-bound: each ephemeral call is a dedicated
-        // `claude --print` process (~450 MB RSS). The admission ceiling is the
-        // only lever on fan-out memory, so cap concurrency here at a bound
-        // derived from physical RAM (CAIRN-2557).
+        // `claude --print` process. Measured host memory admits it; these
+        // bound only fan-out width and an unmeasurable host.
         crate::backends::CallBatchCapability {
             shape: crate::backends::CallBatchShape::DedicatedProcess,
-            max_concurrency: Some(*CLAUDE_CALL_MAX_CONCURRENCY),
+            max_concurrency: Some(CLAUDE_CALL_CONCURRENCY),
         }
     }
 }

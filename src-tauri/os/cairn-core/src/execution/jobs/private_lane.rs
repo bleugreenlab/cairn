@@ -107,12 +107,23 @@ impl PrivateLaneBudget {
 }
 
 /// The host's system memory through the warm GC's probe when warm retention is
-/// on, so both measure the same way; the OS probe otherwise.
+/// on, so both measure the same way; the orchestrator's host probe otherwise.
 fn host_memory(orch: &Orchestrator) -> Option<crate::agent_process::memory::SystemMemory> {
     match orch.warm_gc.as_ref() {
         Some(gc) => gc.system_memory(),
-        None => cairn_common::memory::system_memory(),
+        None => orch.host_memory.system_memory(),
     }
+}
+
+/// The host memory envelope every process lane on this runner admits against,
+/// measured now: ordinary sessions and ephemeral calls share it, so the host
+/// has one budget and one reserve. `None` when the host cannot be measured.
+pub(crate) fn host_memory_envelope(orch: &Orchestrator) -> Option<HostMemoryEnvelope> {
+    host_memory(orch).map(|system| HostMemoryEnvelope {
+        available_bytes: system.available,
+        reserve_bytes: memory_reserve(system.total),
+        unmeasured_claim_bytes: DEFAULT_SPAWN_RSS,
+    })
 }
 
 /// Measure the budget for one promotion pass: the operator's optional ceiling
@@ -120,11 +131,7 @@ fn host_memory(orch: &Orchestrator) -> Option<crate::agent_process::memory::Syst
 pub(crate) fn private_lane_budget(orch: &Orchestrator) -> PrivateLaneBudget {
     PrivateLaneBudget {
         ceiling: orch.get_settings().private_dedicated_process_capacity,
-        memory: host_memory(orch).map(|system| HostMemoryEnvelope {
-            available_bytes: system.available,
-            reserve_bytes: memory_reserve(system.total),
-            unmeasured_claim_bytes: DEFAULT_SPAWN_RSS,
-        }),
+        memory: host_memory_envelope(orch),
         measured_at: chrono::Utc::now().timestamp(),
     }
 }
@@ -514,11 +521,8 @@ pub(crate) async fn private_lane_budgets_from(
         < boot_at.saturating_add(BOOT_RAMP_HORIZON.as_secs() as i64))
     .then(|| ledger.spawn_window());
     // Memory is one host, so every lane's headroom nets out spawns in flight on
-    // all of them, as the lease does.
-    let host_in_flight = occupancy
-        .iter()
-        .map(|lane| lane.in_flight_bytes(DEFAULT_SPAWN_RSS))
-        .fold(0_u64, u64::saturating_add);
+    // all of them, ephemeral calls included, as the lease does.
+    let host_in_flight = crate::storage::host_in_flight_bytes(db, DEFAULT_SPAWN_RSS).await?;
     Ok(occupancy
         .into_iter()
         .map(|lane| {
@@ -609,14 +613,24 @@ pub(crate) fn describe_shortfall(shortfall: &LaneShortfall) -> String {
             reserve_bytes,
             in_flight_bytes,
             head_estimate_bytes,
-        } => format!(
-            "it needs about {} and only {} is free above the {} reserve",
-            gib(*head_estimate_bytes),
-            gib(available_bytes
-                .saturating_sub(*reserve_bytes)
-                .saturating_sub(*in_flight_bytes)),
-            gib(*reserve_bytes)
-        ),
+            interactive_room_bytes,
+        } => {
+            let mut clause = format!(
+                "it needs about {} and only {} is free above the {} reserve",
+                gib(*head_estimate_bytes),
+                gib(available_bytes
+                    .saturating_sub(*reserve_bytes)
+                    .saturating_sub(*in_flight_bytes)),
+                gib(*reserve_bytes)
+            );
+            if *interactive_room_bytes > 0 {
+                clause.push_str(&format!(
+                    ", of which it leaves {} for ordinary sessions",
+                    gib(*interactive_room_bytes)
+                ));
+            }
+            clause
+        }
         LaneShortfall::Units { active, ceiling } => {
             format!(
                 "the operator ceiling of {ceiling} resident processes is full ({active} active)"
@@ -712,6 +726,13 @@ pub(crate) fn promote_private_lanes_blocking(orch: &Orchestrator) {
             log::warn!("ordinary admission lane {lane} stopped promoting: {error}");
         }
     }
+}
+
+/// [`promote_private_lanes_blocking`] in the background. A finished ephemeral
+/// call frees memory, and ordinary sessions are first to it.
+pub(crate) fn promote_private_lanes(orch: &Orchestrator) {
+    let promoter = orch.clone();
+    orch.spawn_blocking_detached(move || promote_private_lanes_blocking(&promoter));
 }
 
 /// Cancel every queued ordinary request whose run already reached a terminal
@@ -837,6 +858,21 @@ mod tests {
             shortfall,
             boot_ramp: None,
         }
+    }
+
+    #[test]
+    fn a_batch_shortfall_names_the_room_it_leaves_for_ordinary_sessions() {
+        let shortfall = LaneShortfall::Memory {
+            available_bytes: 14 * GIB,
+            reserve_bytes: 12 * GIB,
+            in_flight_bytes: 0,
+            head_estimate_bytes: GIB / 2,
+            interactive_room_bytes: GIB,
+        };
+        assert_eq!(
+            describe_shortfall(&shortfall),
+            "it needs about 0.5 GiB and only 2.0 GiB is free above the 12.0 GiB reserve, of which it leaves 1.0 GiB for ordinary sessions"
+        );
     }
 
     #[test]
