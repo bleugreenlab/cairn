@@ -997,6 +997,29 @@ fn resolve_ctx_self_targets(
     .unwrap_or_default()
 }
 
+/// The orientation line for the job's placement default, when it has an active
+/// one. A read failure degrades to no line rather than failing session startup.
+fn resolve_placement_default_line(
+    orch: &Orchestrator,
+    run_id: &str,
+    job_id: &str,
+) -> Option<String> {
+    let dbs = orch.db.clone();
+    let (run_id, job_id) = (run_id.to_string(), job_id.to_string());
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>(
+            crate::fleet::placement_default::for_job(&db, &job_id)
+                .await
+                .and_then(|default| default.orientation_line()),
+        )
+    })
+    .ok()
+    .flatten()
+}
+
 /// Whether this node is long-running by recipe topology (see
 /// [`crate::execution::jobs::is_long_running_node`]) and so gets the standing-node
 /// framing instead of an output contract. A read failure degrades to `false` — the
@@ -1202,6 +1225,9 @@ fn build_ctx_self_section(
 /// agent can reach belongs to the environment its commands run in, not to the
 /// process beside them, so naming the latter could only mislead \u{2014} the same
 /// reasoning the scratch line below already follows.
+// Each argument is one independent line of the block, absent or present on
+// its own; bundling them would only rename the parameter list.
+#[allow(clippy::too_many_arguments)]
 fn build_orientation_block(
     home_uri: &str,
     project_key: Option<&str>,
@@ -1209,6 +1235,7 @@ fn build_orientation_block(
     base_branch: Option<&str>,
     scratch_dir: Option<&str>,
     model: Option<&str>,
+    placement_default: Option<&str>,
     _ambient: bool,
 ) -> String {
     let mut out = String::from("## Orientation\n\nFor this run:\n\n");
@@ -1228,6 +1255,11 @@ fn build_orientation_block(
     }
     if let Some(branch) = base_branch {
         out.push_str(&format!("- Base branch: `{}`\n", branch));
+    }
+    // A declared default is the one placement fact that does hold across
+    // batches, until it is changed or the fleet clears it.
+    if let Some(line) = placement_default {
+        out.push_str(&format!("- {line}\n"));
     }
     // Deliberately names no OS. The orchestrator's own platform says nothing
     // about where an agent's commands run: the machine serving a job's batches
@@ -1253,7 +1285,7 @@ fn build_orientation_block(
         // that moves it, what never travels, and that a host path is a fact
         // about one machine.
         out.push_str(
-            "- Scratch: `$TMPDIR` \u{2014} this node's scratch and the one place for data you produce. It is shared with your sub-agent tasks (a task's scratch is its parent's), brought current on whichever machine a batch, terminal, or REPL lands on, written back when each batch ends and, from a live terminal or REPL, every two minutes and when it exits (the run result reports bytes and seconds), and kept until this issue resolves (or this thread closes). It is working space, not a record: a write-back can be delayed or refused and the scratch ends with its node, so a task's results belong in what it returns. Up to the project's ceiling travels (512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`); a write-back past it is refused by name and leaves your files where they are on that machine until you shrink the scratch. `node_modules`, `.venv`, `target` and nested git repositories inside it do not travel. A path outside the repository and `$TMPDIR` is a fact about one host that no other machine sees\n",
+            "- Scratch: `$TMPDIR` \u{2014} this node's scratch and the one place for data you produce. It is shared with your sub-agent tasks (a task's scratch is its parent's), brought current on whichever machine a batch, terminal, or REPL lands on, written back when each batch ends and, from a live terminal or REPL, every two minutes and when it exits (the run result reports bytes and seconds), and kept until this issue resolves (or this thread closes). It is working space, not a record: a write-back can be delayed or refused and the scratch ends with its node, so a task's results belong in what it returns. Up to the project's ceiling travels (512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`); a write-back past it is refused by name and leaves your files where they are on that machine until you shrink the scratch. `node_modules`, `.venv`, `target` and nested git repositories inside it do not travel. Nothing else under Cairn's scratch root (`scratch/` in the Cairn home) is writable, and data larger than the ceiling is a build-root or external-volume question for the operator. A path outside the repository and `$TMPDIR` is a fact about one host that no other machine sees\n",
         );
     }
     out.push_str(
@@ -1975,9 +2007,9 @@ const PROMPT_DIR: &str = "prompts";
 /// The prompt reaches the CLI as a `--system-prompt-file` path, so it has to live
 /// somewhere the host can write and the spawned process can read. The residence
 /// is the one place Cairn already guarantees both: it provisions the directory
-/// per job, points the agent's `TMPDIR` at it, grants it to the sandbox by name
-/// (`cairn_sandbox::default_writable_extra`), and reclaims the whole tree at job
-/// teardown.
+/// per job, points a host spawn's `TMPDIR` at it, grants that spawn exactly this
+/// directory (`cairn_sandbox::SandboxPolicy::grant_tmpdir`), and reclaims the
+/// whole tree at job teardown.
 ///
 /// This used to be a hardcoded `~/.cairn/tmp`, a second answer to "where is
 /// Cairn's home" that was wrong twice over. It ignored `CAIRN_HOME`, so a dev
@@ -2698,6 +2730,10 @@ pub fn start_agent_session(
                     .to_string_lossy()
                     .to_string()
             });
+            let placement_default = db_context
+                .job_id
+                .as_deref()
+                .and_then(|job_id| resolve_placement_default_line(orch, run_id, job_id));
             content.push_str(&build_orientation_block(
                 &home_uri,
                 project_key.as_deref(),
@@ -2705,6 +2741,7 @@ pub fn start_agent_session(
                 db_context.effective_base_branch.as_deref(),
                 scratch_dir.as_deref(),
                 resolved_model.as_ref().map(|m| m.as_str()),
+                placement_default.as_deref(),
                 ambient,
             ));
 
@@ -2991,13 +3028,19 @@ mod tests {
     fn the_system_prompt_file_lands_inside_a_sandbox_granted_root() {
         let residence = crate::scratch::job_scratch_dir("job-under-test");
         let path = system_prompt_file_path(&residence, "run-under-test");
+        // The residence is what a host spawn of this job gets as its `TMPDIR`,
+        // and so what the fence grants it.
+        let mut policy =
+            cairn_sandbox::SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
+        policy.grant_tmpdir(&residence);
 
         assert!(
-            cairn_sandbox::default_writable_extra()
+            policy
+                .writable_paths()
                 .iter()
                 .any(|granted| path.starts_with(granted)),
             "{path:?} is outside every writable root the fence grants: {:?}",
-            cairn_sandbox::default_writable_extra()
+            policy.writable_paths()
         );
     }
 
@@ -3097,6 +3140,7 @@ mod tests {
             Some("main"),
             Some("/home/tester/.cairn/scratch/cairn.1288.1.builder"),
             Some("claude-opus-4"),
+            None,
             false,
         );
         assert!(block.contains("## Orientation"));
@@ -3147,6 +3191,8 @@ mod tests {
         assert!(block.contains("kept until this issue resolves (or this thread closes)"));
         assert!(block.contains("512 MiB unless `.cairn/config.yaml` sets `scratch.ceilingMiB`"));
         assert!(block.contains("refused by name"));
+        assert!(block.contains("Nothing else under Cairn's scratch root"));
+        assert!(block.contains("a build-root or external-volume question for the operator"));
         assert!(block.contains("`node_modules`, `.venv`, `target` and nested git repositories"));
         assert!(block.contains("a fact about one host"));
         assert!(!block.contains("not durable"));
@@ -3164,6 +3210,7 @@ mod tests {
             Some("main"),
             Some("/tmp/job-residence"),
             Some("claude-opus-4"),
+            None,
             true,
         );
         // The project's checkout is named and fenced; the CLI's own directory is
@@ -3185,9 +3232,49 @@ mod tests {
             Some("main"),
             Some("/tmp/job-residence"),
             Some("claude-opus-4"),
+            Some(&placement_default_line()),
             false,
         );
         crate::system_prompt::assert_no_substrate_vocabulary("orientation block", &block);
+    }
+
+    fn placement_default_line() -> String {
+        crate::fleet::placement_default::PlacementDefault {
+            selector: cairn_common::executor_protocol::ExecutorSelector {
+                name: Some("bbs".into()),
+                ..Default::default()
+            },
+            executor_id: Some("exec-bbs".into()),
+            set_by: "cairn://p/cairn/execution".into(),
+            set_at: 1_762_125_840,
+            cleared: None,
+        }
+        .orientation_line()
+        .expect("an active default orients")
+    }
+
+    /// A declared placement default is stated beside the base branch, with
+    /// what inherits it and what never does.
+    #[test]
+    fn orientation_block_states_placement_default() {
+        let line = placement_default_line();
+        let block = build_orientation_block(
+            "cairn://p/cairn/execution",
+            Some("cairn"),
+            None,
+            Some("main"),
+            None,
+            None,
+            Some(&line),
+            false,
+        );
+        let base = block.find("- Base branch:").expect("base branch line");
+        let default = block
+            .find("- Placement default: bbs (set ")
+            .expect("placement default line");
+        assert!(base < default, "{block}");
+        assert!(block.contains("sub-agent tasks do not inherit it"));
+        assert!(block.contains("Clear with `write cairn:~ patch {executor:null}`."));
     }
 
     #[tokio::test]
@@ -3226,8 +3313,16 @@ mod tests {
 
     #[test]
     fn orientation_block_omits_missing_optionals() {
-        let block =
-            build_orientation_block("cairn://p/p/1/1/node", None, None, None, None, None, false);
+        let block = build_orientation_block(
+            "cairn://p/p/1/1/node",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
         assert!(block.contains("Working directory:"));
         assert!(!block.contains("Project:"));
         // The trailing guidance mentions repository commands; only the labelled
@@ -3238,6 +3333,7 @@ mod tests {
         assert!(block.contains("Platform:"));
         // No scratch line when the run has no owning job.
         assert!(!block.contains("Scratch:"));
+        assert!(!block.contains("Placement default:"));
     }
 
     /// A terminal contract shaped like the coordinator's `create-pr` port.
@@ -3465,7 +3561,7 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db.clone());
         let project = tempdir().unwrap();
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "UPDATE projects SET repo_path='{}' WHERE id='p';",
             project.path().display()
         ))
@@ -4050,7 +4146,7 @@ mod tests {
             }),
         )
         .unwrap();
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "UPDATE sessions SET account_id='{}' WHERE id='sess';",
             exhausted.id
         ))
@@ -4283,7 +4379,7 @@ mod tests {
     async fn standing_thread_sessions_do_not_receive_provider_goal_objectives() {
         let db = Arc::new(migrated_db().await);
         let fixture = crate::test_support::seed_thread_session(&db).await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                VALUES('thread-session', '{}', 'Codex', 'open', 1, 1, 1);
              UPDATE jobs SET current_session_id='thread-session', task_description='Tend the thread forever'

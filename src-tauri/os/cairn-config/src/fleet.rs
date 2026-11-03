@@ -219,8 +219,19 @@ pub struct FleetConfig {
     /// a host; only the host itself can authoritatively identify it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub remote_host_identities: BTreeMap<String, String>,
-    #[serde(default)]
-    pub desktop_automation: DesktopAutomationConfig,
+    /// Which pack-declared machine services run on which machines: one resident
+    /// per selected machine. Presence of a machine under a service is the whole
+    /// selection; runtime state is derived live and never stored here.
+    #[serde(default, skip_serializing_if = "MachineServicesConfig::is_empty")]
+    pub machine_services: MachineServicesConfig,
+    /// The retired per-machine desktop toggles, read only as input to their
+    /// conversion into `machineServices.axon/axon`
+    /// ([`FleetConfig::adopt_legacy_desktop_automation`]). Every typed read
+    /// converts it through [`FleetConfig::healed`], so a snapshot written back
+    /// by `set_fleet` carries the converted row rather than dropping it, and
+    /// `skip_serializing` removes the key at the first write.
+    #[serde(default, rename = "desktopAutomation", skip_serializing)]
+    pub legacy_desktop_automation: Option<LegacyDesktopAutomation>,
     /// Where this runner listens for executors that dial in. Absent on a runner
     /// with no remote fleet, which binds nothing beyond loopback. A runner with
     /// enrolled machines writes it itself when it first brings the listener up,
@@ -262,52 +273,199 @@ pub struct FleetConfig {
     pub colocated_build_root: Option<cairn_common::executor_paths::BuildRootDeclaration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DesktopAutomationConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub machines: HashMap<String, MachineDesktopAutomation>,
+/// The one segment rule both halves of a machine-service key follow.
+fn is_machine_service_segment(segment: &str) -> bool {
+    let mut characters = segment.chars();
+    segment.len() <= 63
+        && characters
+            .next()
+            .is_some_and(|character| character.is_ascii_lowercase())
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
 }
 
-impl Default for DesktopAutomationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            machines: HashMap::new(),
+pub const MACHINE_SERVICE_KEY_RULE: &str =
+    "a machine-service key is <pack>/<service>, each half matching ^[a-z][a-z0-9-]{0,62}$";
+
+/// A pack-declared service, addressed as `<pack>/<service>`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct MachineServiceKey {
+    pub pack: String,
+    pub service: String,
+}
+
+impl MachineServiceKey {
+    pub fn new(pack: &str, service: &str) -> Result<Self, String> {
+        format!("{pack}/{service}").parse()
+    }
+}
+
+impl std::str::FromStr for MachineServiceKey {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value.split_once('/') {
+            Some((pack, service))
+                if is_machine_service_segment(pack) && is_machine_service_segment(service) =>
+            {
+                Ok(Self {
+                    pack: pack.to_string(),
+                    service: service.to_string(),
+                })
+            }
+            _ => Err(format!(
+                "{value:?} is not a machine service: {MACHINE_SERVICE_KEY_RULE}"
+            )),
         }
     }
 }
 
+impl TryFrom<String> for MachineServiceKey {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, String> {
+        value.parse()
+    }
+}
+
+impl From<MachineServiceKey> for String {
+    fn from(key: MachineServiceKey) -> String {
+        key.to_string()
+    }
+}
+
+impl std::fmt::Display for MachineServiceKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.pack, self.service)
+    }
+}
+
+/// Every machine service this runner places, and on which machines.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct MachineServicesConfig(pub BTreeMap<MachineServiceKey, MachineServiceSelection>);
+
+/// The machines one service is selected on, by public executor name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MachineDesktopAutomation {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binary: Option<String>,
+pub struct MachineServiceSelection {
+    #[serde(default)]
+    pub machines: BTreeMap<String, MachineSelection>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedDesktopAutomation {
-    pub enabled: bool,
-    pub binary: String,
+/// One machine's selection of a service. An empty selection runs the pack's
+/// own artifact; an override runs the operator's binary instead and is shown
+/// as such. There is deliberately no `enabled` flag: presence is the
+/// selection, and a second way to say "off" is a second way to be wrong.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MachineSelection {
+    #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
+    pub override_: Option<CommandOverride>,
 }
 
-fn default_true() -> bool {
-    true
+impl MachineSelection {
+    pub fn override_command(&self) -> Option<&str> {
+        self.override_.as_ref().map(|value| value.command.as_str())
+    }
 }
 
-impl DesktopAutomationConfig {
-    /// Carry a machine's desktop configuration with it when it is renamed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandOverride {
+    pub command: String,
+}
+
+/// Whether `path` is absolute on some platform a machine could run: POSIX
+/// `/...`, a Windows drive path `C:\...`, or a UNC path. The runner cannot know
+/// which platform a machine that has never attached runs, so it accepts the
+/// absolute forms of each; a bare name is refused because it would be a PATH
+/// lookup, which is the managed artifact's job.
+pub fn is_absolute_command_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with(r"\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
+impl MachineServicesConfig {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// One machine's selection of one service, if it is selected there.
+    pub fn selection(&self, key: &MachineServiceKey, machine: &str) -> Option<&MachineSelection> {
+        let machine = normalize_executor_name(machine)?;
+        self.0.get(key)?.machines.get(&machine)
+    }
+
+    /// Every service selected on `machine`, in key order.
+    pub fn selected_on(&self, machine: &str) -> Vec<(&MachineServiceKey, &MachineSelection)> {
+        let Some(machine) = normalize_executor_name(machine) else {
+            return Vec::new();
+        };
+        self.0
+            .iter()
+            .filter_map(|(key, selection)| {
+                selection.machines.get(&machine).map(|chosen| (key, chosen))
+            })
+            .collect()
+    }
+
+    /// Every machine `key` is selected on, in name order.
+    pub fn machines_for(&self, key: &MachineServiceKey) -> Vec<(&str, &MachineSelection)> {
+        self.0
+            .get(key)
+            .map(|selection| {
+                selection
+                    .machines
+                    .iter()
+                    .map(|(name, chosen)| (name.as_str(), chosen))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Select `key` on `machine`, replacing any previous selection there.
+    /// Returns whether the stored row changed.
+    pub fn select(
+        &mut self,
+        key: MachineServiceKey,
+        machine: &str,
+        selection: MachineSelection,
+    ) -> Result<bool, String> {
+        let machine = normalize_executor_name(machine)
+            .ok_or_else(|| format!("{machine:?} has no public name: {EXECUTOR_NAME_RULE}"))?;
+        validate_machine_selection(&key, &machine, &selection)?;
+        let machines = &mut self.0.entry(key).or_default().machines;
+        Ok(machines.insert(machine, selection.clone()) != Some(selection))
+    }
+
+    /// Remove `key` from `machine`. A service selected nowhere leaves the row
+    /// entirely. Returns whether the stored row changed.
+    pub fn unselect(&mut self, key: &MachineServiceKey, machine: &str) -> bool {
+        let Some(machine) = normalize_executor_name(machine) else {
+            return false;
+        };
+        let Some(selection) = self.0.get_mut(key) else {
+            return false;
+        };
+        let removed = selection.machines.remove(&machine).is_some();
+        if selection.machines.is_empty() {
+            self.0.remove(key);
+        }
+        removed
+    }
+
+    /// Carry every selection a machine holds with it when it is renamed.
     ///
-    /// This map is keyed by public name rather than by executor identity,
+    /// The row is keyed by public name rather than by executor identity,
     /// because the colocated machine has no remote declaration to hang it off.
     /// That makes a rename a move: leaving the entry under the old name would
-    /// silently strip the machine of the binary it was configured with, and the
-    /// only symptom would be desktop automation quietly resolving the platform
-    /// default instead.
+    /// silently unselect every service on the machine.
     pub fn rename_machine(&mut self, from: &str, to: &str) {
         let (Some(from), Some(to)) = (normalize_executor_name(from), normalize_executor_name(to))
         else {
@@ -316,35 +474,77 @@ impl DesktopAutomationConfig {
         if from == to {
             return;
         }
-        if let Some(machine) = self.machines.remove(&from) {
-            self.machines.insert(to, machine);
+        for selection in self.0.values_mut() {
+            if let Some(machine) = selection.machines.remove(&from) {
+                selection.machines.insert(to.clone(), machine);
+            }
         }
     }
 
-    /// Drop a removed machine's desktop configuration along with it, so removal
-    /// leaves no entry addressing a machine that no longer exists.
+    /// Drop a removed machine's selections along with it, so removal leaves no
+    /// entry addressing a machine that no longer exists.
     pub fn forget_machine(&mut self, name: &str) {
-        if let Some(name) = normalize_executor_name(name) {
-            self.machines.remove(&name);
+        let Some(name) = normalize_executor_name(name) else {
+            return;
+        };
+        for selection in self.0.values_mut() {
+            selection.machines.remove(&name);
         }
+        self.0.retain(|_, selection| !selection.machines.is_empty());
     }
 
-    pub fn resolve(&self, machine_name: &str, os: &str) -> ResolvedDesktopAutomation {
-        let machine =
-            normalize_executor_name(machine_name).and_then(|name| self.machines.get(&name));
-        ResolvedDesktopAutomation {
-            enabled: machine
-                .and_then(|config| config.enabled)
-                .unwrap_or(self.enabled),
-            binary: machine
-                .and_then(|config| config.binary.clone())
-                .unwrap_or_else(|| match os {
-                    "windows" => "axon-win.exe".to_string(),
-                    "linux" => "axon-linux".to_string(),
-                    _ => "axon".to_string(),
-                }),
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, selection) in &self.0 {
+            for (machine, chosen) in &selection.machines {
+                if normalize_executor_name(machine).as_deref() != Some(machine.as_str()) {
+                    return Err(format!(
+                        "machineServices.{key} names machine {machine:?}, which is not a public executor name: {EXECUTOR_NAME_RULE}"
+                    ));
+                }
+                validate_machine_selection(key, machine, chosen)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_machine_selection(
+    key: &MachineServiceKey,
+    machine: &str,
+    selection: &MachineSelection,
+) -> Result<(), String> {
+    if let Some(command) = selection.override_command() {
+        if command.trim() != command || !is_absolute_command_path(command) {
+            return Err(format!(
+                "machineServices.{key}.machines.{machine}.override.command must be an absolute path, not {command:?}: a bare name would be a PATH lookup, and the pack's managed artifact is what runs without an override"
+            ));
         }
     }
+    Ok(())
+}
+
+/// The service the retired `desktopAutomation` toggles selected.
+pub const AXON_MACHINE_SERVICE: &str = "axon/axon";
+
+/// `buildSlots.desktopAutomation` as it was last written. Deliberately not
+/// `deny_unknown_fields`: it is conversion input, and refusing an odd key in it
+/// would refuse the whole fleet block it sits in.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyDesktopAutomation {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub machines: BTreeMap<String, LegacyMachineDesktopAutomation>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyMachineDesktopAutomation {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub binary: Option<String>,
 }
 
 pub use cairn_common::executor_protocol::RemotePlatform;
@@ -752,6 +952,7 @@ impl FleetConfig {
     /// did not mean; [`Self::validate`] is what keeps a new one from being
     /// written, and the file itself heals on the next fleet-settings save.
     pub fn healed(mut self) -> Self {
+        self.adopt_legacy_desktop_automation();
         if self.capacity_wait_horizon_seconds < MIN_CAPACITY_WAIT_HORIZON_SECONDS {
             log::warn!(
                 "settings.yaml buildSlots.capacityWaitHorizonSeconds is {}, below the {MIN_CAPACITY_WAIT_HORIZON_SECONDS}s floor; \
@@ -778,6 +979,66 @@ impl FleetConfig {
         self
     }
 
+    /// Convert the retired `desktopAutomation` toggles into selections of
+    /// [`AXON_MACHINE_SERVICE`], returning one note per thing that did not carry
+    /// over exactly, or `None` when there was nothing to convert.
+    ///
+    /// A machine listed under `machines` whose effective `enabled` is true (its
+    /// own value, else the global one) is selected; an explicit `false` is not.
+    /// The global default never selects a machine that is not listed: it used to
+    /// mean "every machine that has the binary", and read literally it would put
+    /// a resident on every server in the fleet. An absolute `binary` becomes the
+    /// machine's override; a bare name was a PATH lookup and is dropped, so the
+    /// pack's managed artifact runs there instead. A selection the row already
+    /// holds is kept, which makes the conversion idempotent.
+    pub fn adopt_legacy_desktop_automation(&mut self) -> Option<Vec<String>> {
+        let legacy = self.legacy_desktop_automation.take()?;
+        let key: MachineServiceKey = AXON_MACHINE_SERVICE
+            .parse()
+            .expect("the axon key follows the key rule");
+        let global = legacy.enabled.unwrap_or(true);
+        let mut notes = Vec::new();
+        for (listed, machine) in legacy.machines {
+            if !machine.enabled.unwrap_or(global) {
+                continue;
+            }
+            let Some(name) = normalize_executor_name(&listed) else {
+                notes.push(format!(
+                    "desktopAutomation.machines.{listed} names no public machine, so it was not converted"
+                ));
+                continue;
+            };
+            if self.machine_services.selection(&key, &name).is_some() {
+                continue;
+            }
+            let override_ = match machine.binary {
+                Some(binary) if is_absolute_command_path(&binary) => {
+                    Some(CommandOverride { command: binary })
+                }
+                Some(binary) => {
+                    notes.push(format!(
+                        "{name}: dropped the bare desktop binary {binary:?}; the axon pack's managed artifact runs there now"
+                    ));
+                    None
+                }
+                None => None,
+            };
+            if let Err(error) =
+                self.machine_services
+                    .select(key.clone(), &name, MachineSelection { override_ })
+            {
+                notes.push(format!("{name}: not converted: {error}"));
+            }
+        }
+        if global {
+            notes.push(
+                "desktopAutomation's global default selected every machine with the binary; machineServices selects only the machines listed"
+                    .to_string(),
+            );
+        }
+        Some(notes)
+    }
+
     /// The horizon a caller with no tighter answer of its own waits on.
     pub fn capacity_wait_horizon_ms(&self) -> u64 {
         self.capacity_wait_horizon_seconds.saturating_mul(1_000)
@@ -785,6 +1046,7 @@ impl FleetConfig {
 
     pub fn validate(&self) -> Result<(), String> {
         self.cpu_admission.validate()?;
+        self.machine_services.validate()?;
         for (executor_id, policy) in &self.executor_policies {
             policy
                 .validate()
@@ -860,7 +1122,8 @@ impl Default for FleetConfig {
             executor_policies: HashMap::new(),
             remote_executors: BTreeMap::new(),
             remote_host_identities: BTreeMap::new(),
-            desktop_automation: DesktopAutomationConfig::default(),
+            machine_services: MachineServicesConfig::default(),
+            legacy_desktop_automation: None,
             executor_listener: None,
             drained_machines: BTreeSet::new(),
             machine_roles: BTreeMap::new(),
@@ -962,67 +1225,284 @@ mod tests {
         let error = config.validate().unwrap_err();
         assert!(error.contains("unknown executor ID sp1"), "{error}");
     }
-    /// A machine's desktop configuration is keyed by the name it answers to, so
-    /// the two operations that change which names exist have to move it.
-    #[test]
-    fn desktop_configuration_follows_a_machine_through_rename_and_removal() {
-        let mut config = DesktopAutomationConfig {
-            enabled: true,
-            machines: HashMap::from([(
-                "bglab-win".to_string(),
-                MachineDesktopAutomation {
-                    enabled: None,
-                    binary: Some(r"C:\axon\axon-win.exe".to_string()),
-                },
-            )]),
-        };
+    fn axon() -> MachineServiceKey {
+        "axon/axon".parse().unwrap()
+    }
 
-        config.rename_machine("BGLab Win", "bglab-windows");
+    #[test]
+    fn the_machine_services_row_round_trips_through_yaml() {
+        let yaml = r#"
+machineServices:
+  axon/axon:
+    machines:
+      bgsrv-mac: {}
+      local:
+        override:
+          command: /Applications/Axon.app/Contents/Resources/bin/axon
+"#;
+        let config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.validate(), Ok(()));
         assert_eq!(
-            config.resolve("bglab-windows", "windows").binary,
-            r"C:\axon\axon-win.exe",
-            "a renamed machine keeps the binary it was configured with"
+            config
+                .machine_services
+                .selection(&axon(), "local")
+                .and_then(MachineSelection::override_command),
+            Some("/Applications/Axon.app/Contents/Resources/bin/axon")
         );
+        assert_eq!(
+            config.machine_services.selection(&axon(), "bgsrv-mac"),
+            Some(&MachineSelection::default())
+        );
+        let reparsed: FleetConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.machine_services, config.machine_services);
+        let empty = serde_json::to_value(FleetConfig::default()).unwrap();
         assert!(
-            !config.machines.contains_key("bglab-win"),
+            empty.get("machineServices").is_none(),
+            "a fleet with no selections writes no row"
+        );
+    }
+
+    /// A selection is keyed by the name a machine answers to, so the two
+    /// operations that change which names exist have to move it, for every
+    /// service at once.
+    #[test]
+    fn selections_follow_a_machine_through_rename_and_removal() {
+        let other: MachineServiceKey = "imsg/watch".parse().unwrap();
+        let mut row = MachineServicesConfig::default();
+        row.select(
+            axon(),
+            "BGLab Win",
+            MachineSelection {
+                override_: Some(CommandOverride {
+                    command: r"C:\axon\axon-win.exe".into(),
+                }),
+            },
+        )
+        .unwrap();
+        row.select(other.clone(), "bglab-win", MachineSelection::default())
+            .unwrap();
+        row.select(axon(), "local", MachineSelection::default())
+            .unwrap();
+
+        row.rename_machine("BGLab Win", "bglab-windows");
+        assert_eq!(
+            row.selection(&axon(), "bglab-windows")
+                .and_then(MachineSelection::override_command),
+            Some(r"C:\axon\axon-win.exe"),
+            "a renamed machine keeps its override"
+        );
+        assert!(row.selection(&other, "bglab-windows").is_some());
+        assert!(
+            row.selected_on("bglab-win").is_empty(),
             "the old name is not left behind addressing nothing"
         );
 
-        config.forget_machine("bglab-windows");
-        assert!(config.machines.is_empty());
+        row.forget_machine("bglab-windows");
+        assert!(row.selected_on("bglab-windows").is_empty());
+        assert!(
+            !row.0.contains_key(&other),
+            "a service selected nowhere leaves the row"
+        );
         assert_eq!(
-            config.resolve("bglab-windows", "windows").binary,
-            "axon-win.exe",
-            "a forgotten machine falls back to the platform default"
+            row.machines_for(&axon()),
+            vec![("local", &MachineSelection::default())],
+            "only the forgotten machine loses its selections"
         );
     }
+
     #[test]
-    fn desktop_automation_resolves_inheritance_binary_and_normalized_machine_name() {
-        let mut config = DesktopAutomationConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        config.machines.insert(
-            "bglab-win".into(),
-            MachineDesktopAutomation {
-                enabled: Some(true),
-                binary: Some(r"C:\\Axon\\axon.exe".into()),
-            },
+    fn an_override_must_be_an_absolute_path() {
+        let mut row = MachineServicesConfig::default();
+        for bare in ["axon", "bin/axon", " /abs/with/space", ""] {
+            let error = row
+                .select(
+                    axon(),
+                    "local",
+                    MachineSelection {
+                        override_: Some(CommandOverride {
+                            command: bare.into(),
+                        }),
+                    },
+                )
+                .unwrap_err();
+            assert!(error.contains("must be an absolute path"), "{error}");
+        }
+        for absolute in [
+            "/opt/axon",
+            r"C:\Axon\axon.exe",
+            "D:/axon.exe",
+            r"\\share\axon.exe",
+        ] {
+            assert!(is_absolute_command_path(absolute), "{absolute}");
+        }
+        let yaml = "machineServices:\n  axon/axon:\n    machines:\n      local:\n        override: {command: axon}\n";
+        let config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().unwrap_err().contains("absolute path"));
+    }
+
+    #[test]
+    fn an_enabled_key_and_a_malformed_service_key_are_refused() {
+        let enabled =
+            "machineServices:\n  axon/axon:\n    machines:\n      local: {enabled: true}\n";
+        let error = serde_yaml::from_str::<FleetConfig>(enabled)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("enabled"), "{error}");
+        let service_enabled = "machineServices:\n  axon/axon:\n    enabled: true\n";
+        assert!(serde_yaml::from_str::<FleetConfig>(service_enabled).is_err());
+
+        for malformed in [
+            "axon",
+            "Axon/axon",
+            "axon/",
+            "axon/axon/x",
+            "1x/axon",
+            "axon/a_b",
+        ] {
+            let yaml = format!("machineServices:\n  {malformed}:\n    machines: {{}}\n");
+            let error = serde_yaml::from_str::<FleetConfig>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("not a machine service"),
+                "{malformed}: {error}"
+            );
+        }
+        assert!(MachineServiceKey::new(&"a".repeat(63), "b").is_ok());
+        assert!(MachineServiceKey::new(&"a".repeat(64), "b").is_err());
+    }
+
+    /// The operator's settings, byte for byte as they stood before the row.
+    const OPERATOR_DESKTOP_AUTOMATION: &str = r#"
+desktopAutomation:
+  enabled: true
+  machines:
+    local:
+      binary: /Applications/Axon.app/Contents/Resources/bin/axon
+    bgsrv-mac:
+      enabled: true
+executorListener:
+  bind: 0.0.0.0:3846
+drainedMachines:
+- bgsrv-win
+"#;
+
+    #[test]
+    fn the_operators_desktop_toggles_become_exactly_two_selections() {
+        let mut config: FleetConfig = serde_yaml::from_str(OPERATOR_DESKTOP_AUTOMATION).unwrap();
+        let notes = config.adopt_legacy_desktop_automation().unwrap();
+        let expected: MachineServicesConfig = serde_yaml::from_str(
+            "axon/axon:\n  machines:\n    bgsrv-mac: {}\n    local:\n      override:\n        command: /Applications/Axon.app/Contents/Resources/bin/axon\n",
+        )
+        .unwrap();
+        assert_eq!(config.machine_services, expected);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("only the machines listed")),
+            "{notes:?}"
+        );
+        assert!(
+            config.adopt_legacy_desktop_automation().is_none(),
+            "the conversion runs once"
         );
 
+        let written = serde_yaml::to_string(&config).unwrap();
+        assert!(!written.contains("desktopAutomation"), "{written}");
+        let reread: FleetConfig = serde_yaml::from_str::<FleetConfig>(&written)
+            .unwrap()
+            .healed();
         assert_eq!(
-            config.resolve("BGLAB WIN", "windows"),
-            ResolvedDesktopAutomation {
-                enabled: true,
-                binary: r"C:\\Axon\\axon.exe".into(),
-            }
+            reread.machine_services, expected,
+            "rereading the written block changes nothing"
+        );
+        assert!(reread.is_machine_drained("bgsrv-win"));
+    }
+
+    #[test]
+    fn every_typed_read_converts_so_a_snapshot_write_cannot_drop_the_row() {
+        let healed = serde_yaml::from_str::<FleetConfig>(OPERATOR_DESKTOP_AUTOMATION)
+            .unwrap()
+            .healed();
+        assert_eq!(healed.machine_services.machines_for(&axon()).len(), 2);
+    }
+
+    #[test]
+    fn a_listed_machine_turned_on_is_selected_even_when_the_global_is_off() {
+        let yaml = r#"
+desktopAutomation:
+  enabled: false
+  machines:
+    bglab-win:
+      enabled: true
+      binary: C:\Axon\axon-win.exe
+    bglab-ub:
+      binary: axon-linux
+    bglab-mac:
+      enabled: false
+"#;
+        let mut config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        let notes = config.adopt_legacy_desktop_automation().unwrap();
+        assert_eq!(
+            config.machine_services.machines_for(&axon()),
+            vec![(
+                "bglab-win",
+                &MachineSelection {
+                    override_: Some(CommandOverride {
+                        command: r"C:\Axon\axon-win.exe".into()
+                    })
+                }
+            )],
+            "an inherited false and an explicit false both select nothing"
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn a_bare_binary_is_dropped_with_a_note_and_an_existing_selection_is_kept() {
+        let yaml = r#"
+machineServices:
+  axon/axon:
+    machines:
+      bglab-ub:
+        override: {command: /opt/axon/axon-linux}
+desktopAutomation:
+  machines:
+    bglab-ub:
+      binary: /usr/local/bin/other
+    bgsrv-ub:
+      binary: axon-linux
+"#;
+        let mut config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        let notes = config.adopt_legacy_desktop_automation().unwrap();
+        assert_eq!(
+            config
+                .machine_services
+                .selection(&axon(), "bglab-ub")
+                .and_then(MachineSelection::override_command),
+            Some("/opt/axon/axon-linux"),
+            "the row's own selection wins"
         );
         assert_eq!(
-            DesktopAutomationConfig::default().resolve("local", "linux"),
-            ResolvedDesktopAutomation {
-                enabled: true,
-                binary: "axon-linux".into(),
-            }
+            config.machine_services.selection(&axon(), "bgsrv-ub"),
+            Some(&MachineSelection::default())
         );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("bare desktop binary")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_under_an_unnormalized_machine_name_is_refused() {
+        let yaml = "machineServices:\n  axon/axon:\n    machines:\n      BGLab Win: {}\n";
+        let config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("not a public executor name"));
     }
 }

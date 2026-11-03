@@ -85,20 +85,33 @@ async fn row_exists(db: &LocalDb, sql: &'static str, id: &str) -> Result<bool, C
 /// not routable entity ids and so cannot be prefix-parsed. Every route-prefixed
 /// id resolver now uses [`routing_db_for_id`] instead.
 /// Scans every open database PRIVATE-FIRST, fail-closed on a miss.
+///
+/// The fail-closed refusal is a VERDICT that no open database owns the row, so it
+/// is returned only when every probe answered "absent". A probe that errored (the
+/// database busy during a checkpoint, a read bound, a closed pool) proves nothing
+/// about ownership: if no other database claims the row, the probe's own error is
+/// returned unchanged so the caller sees a transient storage failure, not a
+/// routing decision. A row found in any database still wins, because an entity
+/// lives wholly in one database.
 async fn resolve(
     dbs: &DbState,
     sql: &'static str,
     entity: &'static str,
     id: &str,
 ) -> Result<Arc<LocalDb>, CairnError> {
+    let mut probe_error = None;
     for db in dbs.all_dbs().await {
         match row_exists(&db, sql, id).await {
             Ok(true) => return Ok(db),
             Ok(false) => {}
             Err(error) => {
-                log::warn!("owning_db_for_{entity}: existence probe failed: {error}")
+                log::warn!("owning_db_for_{entity}: existence probe failed for {id}: {error}");
+                probe_error.get_or_insert(error);
             }
         }
+    }
+    if let Some(error) = probe_error {
+        return Err(error);
     }
     Err(CairnError::Internal(format!(
         "fail-closed routing: no open database owns {entity} {id} \
@@ -507,6 +520,68 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &owning_db_for_event(&dbs, event).await.unwrap(),
+            &team
+        ));
+    }
+
+    /// A `DbState` whose PRIVATE database is unmigrated, so every existence probe
+    /// against it fails (`no such table`) — a real probe error standing in for a
+    /// transient one such as `database is locked` during a checkpoint.
+    async fn db_state_with_failing_private_probe() -> (Arc<DbState>, Arc<LocalDb>) {
+        use crate::storage::SearchIndex;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let local = Arc::new(LocalDb::open(dir.join("unmigrated.db")).await.unwrap());
+        let team = Arc::new(crate::storage::migrated_test_db("routing-team.db").await);
+        let index = Arc::new(SearchIndex::open_or_create(dir.join("index")).unwrap());
+        (Arc::new(DbState::new(local, index)), team)
+    }
+
+    /// A probe that ERRORS is not a probe that answered "absent": when no open
+    /// database claims the row, the probe's storage error is propagated as-is,
+    /// never relabelled as the fail-closed "no open database owns" verdict.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_error_is_propagated_not_converted_to_absence() {
+        let (dbs, team) = db_state_with_failing_private_probe().await;
+        dbs.insert_team_db_for_test("team1", team).await;
+
+        for result in [
+            owning_db_for_session(&dbs, "sess-1").await,
+            owning_db_for_parent_tool_use(&dbs, "tool-use-1").await,
+        ] {
+            let error = result.err().expect("a failed probe must not resolve");
+            assert!(
+                matches!(error, CairnError::Storage(_)),
+                "expected the probe's storage error, got {error:?}"
+            );
+            assert!(
+                !error.to_string().contains("fail-closed routing"),
+                "a failed probe was reported as a routing verdict: {error}"
+            );
+        }
+    }
+
+    /// A failed private probe does not mask a row another open database holds:
+    /// the entity lives wholly in one database, so a positive answer is decisive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_error_does_not_mask_a_row_found_elsewhere() {
+        let (dbs, team) = db_state_with_failing_private_probe().await;
+        team.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO runs (id, status, session_id, created_at, updated_at)
+                     VALUES ('run-team', 'live', 'sess-1', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+
+        assert!(Arc::ptr_eq(
+            &owning_db_for_session(&dbs, "sess-1").await.unwrap(),
             &team
         ));
     }

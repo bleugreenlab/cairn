@@ -44,6 +44,9 @@ quick-xml = "0.38"
 # executor's managed tool trees, through one extractor.
 tar = "0.4"
 flate2 = "1"
+# `archive::unpack_zip`: a machine service's published zip (Axon's .app and its
+# Windows build), under the same entry rules as the tar.gz extractor.
+zip = "4.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

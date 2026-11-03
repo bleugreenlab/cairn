@@ -458,9 +458,14 @@ async fn resolve_prepare_session_start_conn(
     if let Some(parent_session_id) = session.parent_session_id.as_deref() {
         match load_session_conn(conn, parent_session_id).await {
             Ok(Some(parent_session)) => {
+                // A rotation successor starts on a seed of its own, except one
+                // a reopen minted, which forks the conversation the resolution
+                // closed so the node resumes with its context.
                 let is_rotation_successor =
                     parent_session.replaced_by_id.as_deref() == Some(session.id.as_str());
-                if !is_rotation_successor && parent_session.backend == job_backend {
+                let forks_parent = !is_rotation_successor
+                    || crate::sessions::queries::continues_closed_work(&parent_session);
+                if forks_parent && parent_session.backend == job_backend {
                     if let Some(source_backend_id) = parent_session.backend_id {
                         return crate::backends::SessionStart::Fork {
                             session_id: session.id.clone(),
@@ -871,6 +876,58 @@ pub(crate) async fn insert_child_job_session_run(
     Ok(())
 }
 
+/// Establish a node-less child's OWN agent in its execution's snapshot, then
+/// insert the child's job, session, and run. Returns the execution the child
+/// settled on.
+///
+/// A run's fence resolves through job → execution → snapshot → the job's agent
+/// (`resolve_fence_policy`). A delegated task's agent joins the snapshot during
+/// DAG expansion and every later turn passes the resume funnel's ensure, but a
+/// node-less child (a cross-node task, an ephemeral call) is never expanded and
+/// starts its first turn straight from here. Skipping this left that whole first
+/// turn refusing every `run` batch with an unresolvable fence.
+///
+/// The snapshot is only ever ADDED to, never re-resolved: the agent entry is
+/// shared with every sibling of the same agent in this execution, and a thread
+/// child would otherwise be classed a tracking host. It is established BEFORE
+/// any row exists, so a child whose agent cannot be snapshotted is refused with
+/// nothing left behind. That ordering matters beyond tidiness: a packet-less
+/// child's status has no reducer, so a child created and then failed here would
+/// sit `running` forever.
+pub(crate) async fn insert_child_with_agent_snapshot(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    input: ChildInsert,
+    project_path: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let Some(execution_id) = input.execution_id.clone() else {
+        // No execution to add to: the host this creates is seeded with the
+        // child's agent, and it needs the child's row to point at it.
+        let job_id = input.job_id.clone();
+        insert_child_job_session_run(db.clone(), input).await?;
+        let job = load_job(db, job_id, "Child job not found").await?;
+        return ensure_host_agent_snapshot(orch, &job, project_path, SnapshotFreshness::Frozen)
+            .await;
+    };
+    ensure_execution_agent_snapshot(
+        orch,
+        &execution_id,
+        &input.agent_config_id,
+        input.model.as_deref(),
+        project_path,
+        SnapshotFreshness::Frozen,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "agent '{}' could not be added to the execution snapshot its fence resolves through: {error}",
+            input.agent_config_id
+        )
+    })?;
+    insert_child_job_session_run(db, input).await?;
+    Ok(Some(execution_id))
+}
+
 #[cfg(test)]
 mod project_path_tests {
     use super::*;
@@ -898,7 +955,7 @@ mod project_path_tests {
 
         let team_db = Arc::new(migrated_test_db("execution-team-path-team.db").await);
         team_db
-            .execute_script(&format!(
+            .execute_script(format!(
                 "
                 INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -1353,5 +1410,295 @@ mod load_run_tests {
         assert_eq!(run.chat_id.as_deref(), Some("chat-1"));
         assert_eq!(run.exit_reason.as_deref(), Some("completed"));
         assert_eq!(run.start_mode, Some(RunStartMode::Resume));
+    }
+}
+
+/// The fence a node-less child runs under, through both kinds of parent that can
+/// spawn one. The builder case is the bug-sink specimens' shape (an Editor task
+/// under a builder, an Investigate rescue under a builder); the thread case is a
+/// call hung off a thread's synthetic host.
+#[cfg(test)]
+mod child_agent_snapshot_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::mcp::handlers::permission::fence_policy_for_run;
+    use crate::models::{Fence, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{migrated_test_db, SearchIndex};
+
+    const BRANCH: &str = "agent/p-1-builder-0";
+
+    /// `models: [lg]` resolves against the built-in pool defaults with no
+    /// settings file; the fence declaration is the part under test.
+    fn agent(name: &str, fence: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: test agent\ntools: mcp__cairn__read, mcp__cairn__run\nmodels: [lg]\nfence: {fence}\n---\n\nDo the work.\n"
+        )
+    }
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        db: Arc<LocalDb>,
+        orch: Orchestrator,
+    }
+
+    async fn fixture(name: &str) -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let agents_dir = config_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        for (id, name, fence) in [
+            ("build", "Build", "ask"),
+            ("thread", "Thread", "allow"),
+            ("rescuer", "Rescuer", "allow"),
+            ("auditor", "Auditor", "deny"),
+        ] {
+            std::fs::write(agents_dir.join(format!("{id}.md")), agent(name, fence)).unwrap();
+        }
+
+        let db = Arc::new(migrated_test_db(name).await);
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build();
+        for sql in [
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'P', 'p', '/tmp/p', 1, 1)",
+            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+             VALUES ('t', 'p', 'general', 'active', 1, 1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        Fixture {
+            _temp: temp,
+            db,
+            orch,
+        }
+    }
+
+    /// A builder on its recipe execution `e`, whose snapshot carries exactly the
+    /// builder's own agent and nothing a child would need.
+    async fn seed_builder(fx: &Fixture) {
+        let snapshot = ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: "r".into(),
+                name: "R".into(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![],
+                edges: vec![],
+            },
+            HashMap::new(),
+            HashMap::new(),
+            TriggerContext {
+                issue_id: Some("i".into()),
+                project_id: "p".into(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        )
+        .to_json()
+        .unwrap();
+        fx.db
+            .execute(
+                "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                 VALUES ('i', 'p', 1, 'T', 'active', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        fx.db
+            .execute(
+                "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+                 VALUES ('e', 'r', 'i', 'p', 'running', 1, 1, ?1)",
+                params![snapshot.as_str()],
+            )
+            .await
+            .unwrap();
+        fx.db
+            .execute(
+                "INSERT INTO jobs (id, execution_id, agent_config_id, issue_id, project_id, node_name,
+                    status, uri_segment, branch, base_commit, created_at, updated_at)
+                 VALUES ('b', 'e', 'build', 'i', 'p', 'builder', 'running', 'builder', ?1, 'base', 1, 1)",
+                params![BRANCH],
+            )
+            .await
+            .unwrap();
+        fx.db
+            .execute(
+                "INSERT INTO runs (id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+                 VALUES ('b-run', 'p', 'i', 'b', 'live', 1, 1, 'resume')",
+                (),
+            )
+            .await
+            .unwrap();
+        let builder = load_job(fx.db.clone(), "b".into(), "builder")
+            .await
+            .unwrap();
+        ensure_host_agent_snapshot(&fx.orch, &builder, None, SnapshotFreshness::Frozen)
+            .await
+            .unwrap();
+    }
+
+    /// A thread session job with its synthetic host established, as delegation
+    /// establishes it before hanging a child off it. Returns the host's id.
+    async fn seed_thread(fx: &Fixture) -> String {
+        for sql in [
+            "INSERT INTO jobs (id, thread_id, project_id, status, agent_config_id, current_session_id,
+                node_name, uri_segment, created_at, updated_at)
+             VALUES ('ts', 't', 'p', 'idle', 'thread', 'ts-session', 'thread', 'thread', 1, 1)",
+            "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('ts-session', 'ts', 'claude', 'open', 1, 1, 1)",
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at, start_mode)
+             VALUES ('ts-run', 'p', 'ts', 'live', 1, 1, 'resume')",
+        ] {
+            fx.db.execute(sql, ()).await.unwrap();
+        }
+        let thread = load_job(fx.db.clone(), "ts".into(), "thread")
+            .await
+            .unwrap();
+        ensure_host_agent_snapshot(&fx.orch, &thread, None, SnapshotFreshness::for_job(&thread))
+            .await
+            .unwrap()
+            .expect("a thread host")
+    }
+
+    fn child(
+        job_id: &str,
+        parent: &str,
+        execution_id: Option<&str>,
+        issue_id: Option<&str>,
+        branch: Option<&str>,
+        agent: &str,
+    ) -> ChildInsert {
+        ChildInsert {
+            job_id: job_id.into(),
+            run_id: format!("{job_id}-run"),
+            session_id: format!("{job_id}-session"),
+            parent_job_id: Some(parent.into()),
+            branch: branch.map(Into::into),
+            agent_config_id: agent.into(),
+            project_id: "p".into(),
+            issue_id: issue_id.map(Into::into),
+            execution_id: execution_id.map(Into::into),
+            description: format!("{agent} task"),
+            model: None,
+            base_commit: Some("base".into()),
+            output_contract: None,
+            label: None,
+            phase: None,
+            parent_tool_use_id: None,
+            task_index: None,
+            now: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_under_a_builder_resolves_its_own_agents_fence() {
+        let fx = fixture("child-snapshot-builder.db").await;
+        seed_builder(&fx).await;
+
+        // What both spawn paths did before: the bare rows, with nothing putting
+        // the child's agent where its fence resolves. The refusal names the link.
+        insert_child_job_session_run(
+            fx.db.clone(),
+            child("bare", "b", Some("e"), Some("i"), Some(BRANCH), "rescuer"),
+        )
+        .await
+        .unwrap();
+        let reason = fence_policy_for_run(&fx.orch, "bare-run")
+            .await
+            .expect_err("no snapshot names the bare child's agent");
+        assert!(
+            reason.contains("'rescuer' is not in its execution snapshot"),
+            "{reason}"
+        );
+
+        let settled = insert_child_with_agent_snapshot(
+            &fx.orch,
+            fx.db.clone(),
+            child("c", "b", Some("e"), Some("i"), Some(BRANCH), "rescuer"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            settled.as_deref(),
+            Some("e"),
+            "the child shares its builder's execution"
+        );
+        assert_eq!(
+            fence_policy_for_run(&fx.orch, "c-run").await,
+            Ok(Fence::Allow)
+        );
+        assert_eq!(
+            fence_policy_for_run(&fx.orch, "b-run").await,
+            Ok(Fence::Ask),
+            "adding the child's agent must not disturb the builder's own entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_under_a_thread_keeps_a_fence_narrower_than_the_threads() {
+        let fx = fixture("child-snapshot-thread.db").await;
+        let host = seed_thread(&fx).await;
+
+        let settled = insert_child_with_agent_snapshot(
+            &fx.orch,
+            fx.db.clone(),
+            child("c", "ts", Some(&host), None, None, "auditor"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            settled.as_deref(),
+            Some(host.as_str()),
+            "the child shares its thread's host"
+        );
+        assert_eq!(
+            fence_policy_for_run(&fx.orch, "c-run").await,
+            Ok(Fence::Deny),
+            "a child whose own agent is narrower than its thread's stays narrowed"
+        );
+        assert_eq!(
+            fence_policy_for_run(&fx.orch, "ts-run").await,
+            Ok(Fence::Allow)
+        );
+    }
+
+    /// A child that would start into a refusal on every `run` batch is refused
+    /// instead, before any row of it exists.
+    #[tokio::test]
+    async fn a_child_whose_agent_cannot_be_snapshotted_is_never_created() {
+        let fx = fixture("child-snapshot-unresolvable.db").await;
+        seed_builder(&fx).await;
+
+        let error = insert_child_with_agent_snapshot(
+            &fx.orch,
+            fx.db.clone(),
+            child("c", "b", Some("e"), Some("i"), Some(BRANCH), "ghost"),
+            None,
+        )
+        .await
+        .expect_err("an agent with no definition has nothing to snapshot");
+
+        assert!(error.contains("'ghost'"), "{error}");
+        for (sql, id) in [
+            ("SELECT status FROM jobs WHERE id = ?1", "c"),
+            ("SELECT status FROM runs WHERE id = ?1", "c-run"),
+        ] {
+            assert_eq!(
+                fx.db.query_opt_text(sql, params![id]).await.unwrap(),
+                None,
+                "a refused child leaves no row behind"
+            );
+        }
     }
 }

@@ -106,43 +106,6 @@ pub(crate) async fn run_condition_sql(
     .map(|page| (page.body, page.shown, page.total))
 }
 
-fn desktop_health_ready(health: &serde_json::Value) -> bool {
-    health
-        .pointer("/daemon/ready")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| health.get("ready").and_then(serde_json::Value::as_bool))
-        .unwrap_or(false)
-}
-
-fn desktop_health_reason(health: &serde_json::Value) -> Option<&str> {
-    health
-        .pointer("/daemon/reason")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| health.get("reason").and_then(serde_json::Value::as_str))
-        .or_else(|| {
-            health
-                .pointer("/session/reason")
-                .and_then(serde_json::Value::as_str)
-        })
-}
-
-fn desktop_reason_sentence(reason: &str) -> String {
-    match reason {
-        "no-graphical-session" => {
-            "No graphical session: the machine is at the login greeter.".into()
-        }
-        "no-interactive-session" => "No interactive session: no user is signed in.".into(),
-        "daemon-not-running" => "The desktop daemon is not running.".into(),
-        "permission-denied" | "accessibility-permission-denied" => {
-            "Desktop control permission has not been granted.".into()
-        }
-        other => format!(
-            "Desktop automation is degraded: {}.",
-            other.replace('-', " ")
-        ),
-    }
-}
-
 fn apply_line_char_offset(content: &str, line_offset: usize, char_offset: usize) -> String {
     content
         .lines()
@@ -2128,6 +2091,7 @@ async fn render_resource_body(
                         &orch.fleet.learned_project_requirements(),
                         captured_at,
                     ));
+                    rendered.push_str(&render_machine_services_overview(orch));
                     rendered.push_str(&crate::resources::executors::render_blocked_questions(
                         &orch.fleet.blocked_questions(None, captured_at),
                         orch.fleet.purpose_debt_journal_error().as_deref(),
@@ -2281,7 +2245,7 @@ async fn render_resource_body(
                                     ),
                                 );
                             }
-                            rendered.push_str(&render_desktop_automation(orch, &name).await);
+                            rendered.push_str(&render_machine_services(orch, &name));
                             rendered
                         }
                         (Some("placements"), _) => crate::resources::executors::render_placements(executor),
@@ -3545,68 +3509,89 @@ fn render_help(params: &[QueryParam]) -> String {
     }
 }
 
-async fn render_desktop_automation(orch: &Orchestrator, name: &str) -> String {
-    let config = crate::config::settings::load_fleet(&orch.config_dir);
-    let os = orch
-        .fleet
-        .inspect_executors(crate::fleet::unix_time_ms())
-        .into_iter()
-        .find(|executor| executor.name == name)
-        .map(|executor| executor.health.advertisement.capabilities.os)
-        .unwrap_or_default();
-    if !config.desktop_automation.resolve(name, &os).enabled {
-        return "\n## Desktop automation\n- Status: off\n- Desktop automation is disabled for this machine.\n".into();
-    }
-    let Ok(state) = cairn_db::storage::get_executor_desktop_automation(&orch.db.local, name).await
-    else {
-        return "\n## Desktop automation\n- Status: degraded\n- The cached desktop probe could not be read.\n".into();
-    };
-    let Some(state) = state else {
-        return "\n## Desktop automation\n- Status: absent\n- This machine has never been probed for desktop automation.\n".into();
-    };
-    if let Some(error) = state.probe_error {
+/// The machine services selected on `name`: what runs there, where it came
+/// from, and the state it is in, derived now.
+fn render_machine_services(orch: &Orchestrator, name: &str) -> String {
+    let instances = crate::project_services::supervisor::machine::instances_on(orch, name);
+    machine_services_section(name, &instances)
+}
+
+fn machine_services_section(
+    name: &str,
+    instances: &[crate::project_services::supervisor::machine::MachineServiceInstance],
+) -> String {
+    if instances.is_empty() {
         return format!(
-            "\n## Desktop automation\n- Status: degraded\n- Probe failed: {error}\n- Probed: {}\n",
-            crate::clock::age_millis(state.probed_at)
+            "\n## Machine services\n- None selected on this machine. Select one with `write cairn://executors/{name}` and `{{machineServices: {{\"<pack>/<service>\": {{}}}}}}`.\n"
         );
     }
-    if let Some(health_json) = state.health_json.as_deref() {
-        match serde_json::from_str::<serde_json::Value>(health_json) {
-            Ok(health) if !desktop_health_ready(&health) => {
-                let reason = desktop_health_reason(&health)
-                    .map(desktop_reason_sentence)
-                    .unwrap_or_else(|| "the desktop daemon is not ready".into());
-                return format!("\n## Desktop automation\n- Status: degraded\n- {reason}\n- Probed: {}\n", crate::clock::age_millis(state.probed_at));
+    let mut out = "\n## Machine services\n".to_string();
+    for instance in instances {
+        out.push_str(&format!(
+            "- {}: {}\n  - Runs: {}\n",
+            instance.key,
+            instance.state.sentence(),
+            instance.provenance
+        ));
+        if let Some(at) = instance.probed_at_ms {
+            out.push_str(&format!("  - Probed: {}\n", crate::clock::age_millis(at)));
+        }
+        if instance.serves_mcp && !instance.catalog.is_empty() {
+            out.push_str("  - Verbs:\n");
+            for tool in &instance.catalog {
+                out.push_str(&format!("    - cairn://executors/{name}/{}\n", tool.name));
             }
-            Err(_) => return format!("\n## Desktop automation\n- Status: degraded\n- The cached desktop health document is invalid.\n- Probed: {}\n", crate::clock::age_millis(state.probed_at)),
-            _ => {}
         }
     }
-    let tools = serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&state.verbs_json)
-        .unwrap_or_default();
-    if tools.is_empty() {
-        return format!("\n## Desktop automation\n- Status: absent\n- The machine was probed and advertised no desktop verbs.\n- Probed: {}\n", crate::clock::age_millis(state.probed_at));
+    out
+}
+
+/// One line per selected machine service, naming each machine it is selected
+/// on and that instance's state.
+fn render_machine_services_overview(orch: &Orchestrator) -> String {
+    let keys = crate::project_services::supervisor::machine::selected_keys(orch);
+    let lines: Vec<(
+        String,
+        Vec<crate::project_services::supervisor::machine::MachineServiceInstance>,
+    )> = keys
+        .into_iter()
+        .map(|key| {
+            let instances = crate::project_services::supervisor::machine::instances(orch, &key);
+            (key.to_string(), instances)
+        })
+        .collect();
+    machine_services_overview(&lines)
+}
+
+fn machine_services_overview(
+    lines: &[(
+        String,
+        Vec<crate::project_services::supervisor::machine::MachineServiceInstance>,
+    )],
+) -> String {
+    if lines.is_empty() {
+        return String::new();
     }
-    let mut out = format!(
-        "\n## Desktop automation\n- Status: available\n- Probed: {}\n- Verbs:\n",
-        crate::clock::age_millis(state.probed_at)
-    );
-    for tool in tools {
-        out.push_str(&format!("  - cairn://executors/{name}/{}\n", tool.name));
+    let mut out = "\n## Machine services\n".to_string();
+    for (key, instances) in lines {
+        let machines: Vec<String> = instances
+            .iter()
+            .map(|instance| format!("{} ({})", instance.machine, instance.state.sentence()))
+            .collect();
+        out.push_str(&format!("- {key}: {}\n", machines.join(", ")));
     }
     out
 }
 
 async fn render_executor_action_contract(orch: &Orchestrator, name: &str, action: &str) -> String {
-    let Ok(Some(state)) =
-        cairn_db::storage::get_executor_desktop_automation(&orch.db.local, name).await
+    let instances = crate::project_services::supervisor::machine::instances_on(orch, name);
+    let Some(tool) = instances
+        .iter()
+        .flat_map(|instance| instance.catalog.iter())
+        .find(|tool| tool.name == action)
+        .cloned()
     else {
-        return format!("Executor action `{action}` on `{name}` has no cached contract yet. Read cairn://executors/{name} for the machine's advertised actions.");
-    };
-    let tools = serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&state.verbs_json)
-        .unwrap_or_default();
-    let Some(tool) = tools.into_iter().find(|tool| tool.name == action) else {
-        return format!("`{name}` does not advertise `{action}`. Read cairn://executors/{name} for its cached desktop verbs.");
+        return format!("`{name}` advertises no `{action}` yet. Read cairn://executors/{name} for its machine services and their verbs.");
     };
     let description = tool
         .description
@@ -3654,21 +3639,87 @@ mod tests {
         assert_eq!(window.shown, 1);
     }
 
-    /// A degraded machine has to say which kind of nothing it is reporting, and
-    /// it has to say it in words rather than in the daemon's reason code.
+    fn instance(
+        machine: &str,
+        state: crate::project_services::supervisor::machine::InstanceState,
+        provenance: &str,
+    ) -> crate::project_services::supervisor::machine::MachineServiceInstance {
+        crate::project_services::supervisor::machine::MachineServiceInstance {
+            key: "axon/axon".parse().unwrap(),
+            machine: machine.into(),
+            state,
+            provenance: provenance.into(),
+            catalog: vec![crate::mcp::gateway::McpToolDef {
+                name: "look".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }],
+            probed_at_ms: None,
+            serves_mcp: true,
+            facade: None,
+        }
+    }
+
+    /// The three ways a machine can come to run a service read as the three
+    /// provenances, beside the state the instance is in.
     #[test]
-    fn desktop_health_parsing_and_reason_rendering_are_human_readable() {
-        let ready = serde_json::json!({"daemon": {"ready": true}});
-        assert!(desktop_health_ready(&ready));
-        let degraded = serde_json::json!({"daemon": {"ready": false}, "session": {"reason": "no-graphical-session"}});
-        assert!(!desktop_health_ready(&degraded));
-        assert_eq!(
-            desktop_health_reason(&degraded),
-            Some("no-graphical-session")
+    fn the_executor_page_says_what_runs_where_it_came_from_and_its_state() {
+        use crate::project_services::supervisor::machine::InstanceState;
+        let page = machine_services_section(
+            "local",
+            &[
+                instance(
+                    "local",
+                    InstanceState::Ready,
+                    "override /Applications/Axon.app/Contents/Resources/bin/axon (operator)",
+                ),
+                instance("local", InstanceState::Ready, "installed 0.3.6 (pack)"),
+                instance(
+                    "local",
+                    InstanceState::NotInstalled {
+                        reason: "artifact unavailable".into(),
+                    },
+                    "not installed: artifact unavailable",
+                ),
+            ],
         );
-        let sentence = desktop_reason_sentence("no-graphical-session");
-        assert!(sentence.contains("login greeter"));
-        assert!(!sentence.contains("no-graphical-session"));
+        for line in [
+            "- axon/axon: ready",
+            "  - Runs: override /Applications/Axon.app/Contents/Resources/bin/axon (operator)",
+            "  - Runs: installed 0.3.6 (pack)",
+            "- axon/axon: not installed: artifact unavailable",
+            "  - Runs: not installed: artifact unavailable",
+            "    - cairn://executors/local/look",
+        ] {
+            assert!(page.contains(line), "{line}\n{page}");
+        }
+        assert!(machine_services_section("local", &[]).contains("None selected"));
+    }
+
+    #[test]
+    fn the_fleet_overview_names_each_machine_a_service_runs_on() {
+        use crate::project_services::supervisor::machine::InstanceState;
+        let overview = machine_services_overview(&[(
+            "axon/axon".to_string(),
+            vec![
+                instance("local", InstanceState::Ready, ""),
+                instance(
+                    "bgsrv-mac",
+                    InstanceState::WaitingForOperator {
+                        reason: "accessibility-permission-denied".into(),
+                    },
+                    "",
+                ),
+                instance("bgsrv-win", InstanceState::MachineAbsent, ""),
+            ],
+        )]);
+        assert!(
+            overview.contains(
+                "- axon/axon: local (ready), bgsrv-mac (waiting for the operator: Accessibility is not granted to this copy (System Settings → Privacy & Security → Accessibility)), bgsrv-win (not running: machine absent)"
+            ),
+            "{overview}"
+        );
+        assert_eq!(machine_services_overview(&[]), "");
     }
 
     fn db_params(query: &str) -> Vec<QueryParam> {

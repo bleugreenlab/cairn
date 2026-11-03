@@ -785,16 +785,6 @@ pub(super) fn parse_wake_filter(
     })
 }
 
-/// Resolve a terminal-exit wake `ref` to its bare slug. Accepts a bare slug,
-/// `cairn:~/terminal/<slug>`, or a canonical `.../terminal/<slug>` URI.
-pub(super) fn terminal_slug_from_ref(reference: &str) -> &str {
-    let trimmed = reference.trim();
-    match trimmed.rfind("terminal/") {
-        Some(pos) => &trimmed[pos + "terminal/".len()..],
-        None => trimmed,
-    }
-}
-
 /// Subscribe an agent-facing `kind:"checks"` wake: resume this node when the
 /// referenced node's project check lanes stop moving.
 ///
@@ -865,8 +855,9 @@ async fn subscribe_checks_wake(
 
 /// Subscribe an agent-facing `kind:"terminal"` wake. Normalizes to the internal
 /// `process` source with a `terminal_exit` fact kind and one-shot semantics,
-/// validates the terminal exists in the caller's job scope, and fires
-/// immediately when the terminal has already exited.
+/// validates the terminal exists in the scope its ref names (see
+/// `mcp::handlers::terminal_ref`), and fires immediately when the terminal has
+/// already exited.
 #[allow(clippy::too_many_arguments)]
 async fn subscribe_terminal_wake(
     orch: &Orchestrator,
@@ -881,49 +872,42 @@ async fn subscribe_terminal_wake(
     exec_seq: i32,
     node_id: &str,
 ) -> ResourceMutationResult<String> {
+    use crate::mcp::handlers::terminal_ref::{
+        resolve_terminal_ref, terminal_not_found, TerminalCaller, TERMINAL_REF_FORMS,
+    };
+
     let reference = filter.reference.as_deref().ok_or_else(|| {
         build_failure(
             index,
             item,
-            "terminal subscribe requires ref (e.g. cairn:~/terminal/<slug> or a bare slug)",
+            format!("terminal subscribe requires ref: {TERMINAL_REF_FORMS}"),
         )
     })?;
-    let slug = terminal_slug_from_ref(reference).to_string();
-    if slug.is_empty() {
-        return Err(build_failure(
-            index,
-            item,
-            "terminal subscribe ref resolved to an empty slug",
-        ));
-    }
-
-    let row = crate::mcp::handlers::terminal::lookup_terminal_for_wake(
-        orch.db.for_project(project).await.as_ref(),
+    let db = orch.db.for_project(project).await;
+    let home = cairn_common::uri::build_node_uri(project, number, exec_seq, node_id);
+    let caller = TerminalCaller {
         job_id,
-        &slug,
+        home: &home,
+        project_key: project,
+    };
+    let target = resolve_terminal_ref(db.as_ref(), &caller, reference)
+        .await
+        .map_err(|error| build_failure(index, item, error))?;
+    let row = crate::mcp::handlers::terminal::lookup_terminal_for_wake(
+        db.as_ref(),
+        &target.owner,
+        &target.slug,
     )
     .await
     .map_err(|error| build_failure(index, item, error.to_string()))?;
     let Some(row) = row else {
-        let slugs = crate::mcp::handlers::terminal::list_job_terminal_slugs(
-            orch.db.for_project(project).await.as_ref(),
-            job_id,
-        )
-        .await
-        .unwrap_or_default();
-        let listed = if slugs.is_empty() {
-            "no terminals exist in this scope".to_string()
-        } else {
-            format!("existing terminals in this scope: {}", slugs.join(", "))
-        };
         return Err(build_failure(
             index,
             item,
-            format!("Terminal '{slug}' not found; {listed}."),
+            terminal_not_found(db.as_ref(), &caller, &target).await,
         ));
     };
-
-    let uri = cairn_common::uri::build_node_terminal_uri(project, number, exec_seq, node_id, &slug);
+    let (slug, uri) = (target.slug, target.uri);
 
     match filter.on.as_deref().unwrap_or("exit") {
         "exit" => {

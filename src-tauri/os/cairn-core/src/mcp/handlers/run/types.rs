@@ -30,7 +30,8 @@ pub struct RunPayload {
     #[serde(default)]
     pub(crate) branch: Option<String>,
     /// Which machine this batch must run on, by public name or platform. An
-    /// omitted selector retains the colocated-executor compatibility path.
+    /// omitted selector runs in the job's execution home, or where the node's
+    /// placement default names when it has one (`run::selector`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) executor: Option<ExecutorSelector>,
     /// A written reason for committing files that contain literal Git conflict

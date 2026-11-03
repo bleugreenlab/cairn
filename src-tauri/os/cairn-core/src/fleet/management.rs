@@ -1137,6 +1137,12 @@ pub async fn remove(
             .operations
             .forget_identity(&executor_id);
         orch.fleet.forget_enrolled_remote(&executor_id);
+        crate::fleet::placement_default::clear_everywhere_for_removed_executor(
+            orch,
+            &executor_id,
+            &operation.name,
+        )
+        .await;
         let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
         return Ok(RemoteExecutorMutationResult {
             config: None,
@@ -1162,6 +1168,15 @@ pub async fn remove(
         .management()
         .operations
         .forget_identity(&executor_id);
+    // A default naming a machine that no longer exists is cleared, with a note
+    // for each node's next result, rather than carried forward for a later
+    // machine to inherit by name.
+    crate::fleet::placement_default::clear_everywhere_for_removed_executor(
+        orch,
+        &executor_id,
+        &name,
+    )
+    .await;
     let _ = orch.services.emitter.emit_empty(ENROLLMENT_CHANGED_EVENT);
     Ok(result)
 }
@@ -1690,6 +1705,144 @@ pub fn mutate_fleet<T>(
     crate::config::settings::mutate_fleet(&orch.config_dir, mutate, |config| {
         orch.fleet.hydrate_machine_roles(config.role_executor_ids())
     })
+}
+
+/// One machine's changes to its machine-service selections, as a patch on
+/// `cairn://executors/<name>` carries them: a selection to set (`{}` for the
+/// pack's artifact, `{override:{command}}` for the operator's binary) or `null`
+/// to unselect.
+pub type MachineServiceChanges =
+    std::collections::BTreeMap<String, Option<cairn_config::fleet::MachineSelection>>;
+
+/// Select and unselect machine services on one machine, in one fleet write.
+///
+/// This is the one write path for the row: the resource patch and the Library
+/// UI both reach it. It reads, changes and writes the row under the fleet lock,
+/// so two selections made at once cannot lose one another. Returns a sentence
+/// per change.
+pub fn set_machine_services(
+    orch: &Orchestrator,
+    reference: &str,
+    changes: &MachineServiceChanges,
+) -> Result<Vec<String>, String> {
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    let machine = public_name(orch, &executor_id);
+    let parsed = changes
+        .iter()
+        .map(|(key, selection)| {
+            key.parse::<cairn_config::fleet::MachineServiceKey>()
+                .map(|key| (key, selection.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let target = machine_target(orch, &executor_id, &machine);
+    for (key, selection) in &parsed {
+        if let Some(selection) = selection {
+            check_selectable(orch, key, &machine, target, selection)?;
+        }
+    }
+    let summaries = mutate_fleet(orch, |config| {
+        let mut summaries = Vec::new();
+        for (key, selection) in parsed {
+            match selection {
+                Some(selection) => {
+                    let provenance = match selection.override_command() {
+                        Some(command) => format!("override {command} (operator)"),
+                        None => "the pack's artifact".to_string(),
+                    };
+                    if config
+                        .machine_services
+                        .select(key.clone(), &machine, selection)?
+                    {
+                        summaries
+                            .push(format!("selected {key} on {machine}, running {provenance}"));
+                    } else {
+                        summaries.push(format!("{key} was already selected on {machine} that way"));
+                    }
+                }
+                None => {
+                    if config.machine_services.unselect(&key, &machine) {
+                        summaries.push(format!("unselected {key} on {machine}"));
+                    } else {
+                        summaries.push(format!("{key} was not selected on {machine}"));
+                    }
+                }
+            }
+        }
+        Ok(summaries)
+    })?;
+    crate::project_services::supervisor::machine::spawn_apply(orch, "machine-service selection");
+    Ok(summaries)
+}
+
+/// The artifact-plane target a machine runs, from its live advertisement, else
+/// its enrollment's platform. `None` for a machine neither can name.
+fn machine_target(orch: &Orchestrator, executor_id: &str, machine: &str) -> Option<&'static str> {
+    let attached = orch
+        .fleet
+        .inspect_executors(unix_time_ms())
+        .into_iter()
+        .find(|executor| executor.name == machine)
+        .and_then(|executor| {
+            let capabilities = &executor.health.advertisement.capabilities;
+            cairn_common::executor_protocol::RemotePlatform::from_os_arch(
+                &capabilities.os,
+                &capabilities.arch,
+            )
+        });
+    attached
+        .or_else(|| {
+            crate::config::settings::load_fleet(&orch.config_dir)
+                .remote_executors
+                .get(executor_id)
+                .map(|config| config.platform)
+        })
+        .map(|platform| platform.target())
+}
+
+/// Refuse a selection nothing could run: a service no installed pack
+/// declares, or a machine whose target the service ships no artifact for when
+/// the selection gives no binary of its own.
+fn check_selectable(
+    orch: &Orchestrator,
+    key: &cairn_config::fleet::MachineServiceKey,
+    machine: &str,
+    target: Option<&str>,
+    selection: &cairn_config::fleet::MachineSelection,
+) -> Result<(), String> {
+    let Some(declared) =
+        crate::project_services::pack_source::declared_machine_service(&orch.config_dir, key)
+    else {
+        let known: Vec<String> =
+            crate::project_services::pack_source::declared_machine_services(&orch.config_dir)
+                .into_iter()
+                .map(|declared| declared.key.to_string())
+                .collect();
+        return Err(format!(
+            "no installed pack declares the machine service {key} (installed: {})",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    };
+    let package = declared
+        .package
+        .map_err(|error| format!("{key}'s declaration does not parse: {error}"))?;
+    if selection.override_command().is_some() {
+        return Ok(());
+    }
+    let (Some(native), Some(target)) = (package.declaration.native(), target) else {
+        return Ok(());
+    };
+    if native.targets.contains_key(target) {
+        return Ok(());
+    }
+    let declared: Vec<&str> = native.targets.keys().map(String::as_str).collect();
+    Err(format!(
+        "{key} ships no artifact for {machine}'s target {target} (it declares {}); select it with override: {{command: /abs/path}} to run a binary of your own there",
+        declared.join(", ")
+    ))
 }
 
 /// What a role write recorded.

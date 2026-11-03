@@ -30,7 +30,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 
-use super::permission::{await_permission_decision, resolve_fence_policy, Handoff, PermissionWait};
+use super::permission::{await_permission_decision, fence_policy_for_run, Handoff, PermissionWait};
 
 mod command_refusal;
 
@@ -55,12 +55,11 @@ pub(crate) async fn resolve_run_fence(
             "permission context unavailable: authenticated run is missing or expired ({error})"
         ));
     }
-    match resolve_fence_policy(orch, Some(&run_id)).await {
-        Some(fence) => RunFenceResolution::Resolved(run_id, fence),
-        None => RunFenceResolution::Unavailable(
-            "permission context unavailable: authenticated run has no resolvable fence policy"
-                .to_string(),
-        ),
+    match fence_policy_for_run(orch, &run_id).await {
+        Ok(fence) => RunFenceResolution::Resolved(run_id, fence),
+        Err(reason) => RunFenceResolution::Unavailable(format!(
+            "permission context unavailable: authenticated run has no resolvable fence policy: {reason}"
+        )),
     }
 }
 
@@ -296,7 +295,19 @@ impl Crossing {
     /// unverified, which is why it may only choose a refusal: a refusal gives
     /// the agent less than the escape prompt it replaces, so a forged line can
     /// cost its author an answer but never widen access.
+    ///
+    /// A write under Cairn's scratch root is refused the same way, after the
+    /// git refusals: by the path a `run` or `write` crossing names, else by the
+    /// reported line. Nothing there is a workspace, and an allow would open a
+    /// sibling of the job's own scratch dir that nothing owns or reclaims.
     fn route_refusal(&self) -> Option<String> {
+        use crate::services::sandbox::scratch_refusal;
+        let written_path = matches!(
+            self.kind,
+            CrossingKind::ShellPathCrossing | CrossingKind::ExternalHostWrite
+        )
+        .then(|| self.host_path())
+        .flatten();
         self.command
             .as_deref()
             .and_then(command_refusal::denied_command_refusal)
@@ -310,6 +321,17 @@ impl Crossing {
                 self.reported
                     .as_deref()
                     .and_then(command_refusal::reported_git_write_refusal)
+            })
+            .or_else(|| {
+                written_path
+                    .filter(|path| scratch_refusal::scratch_root_containing(path).is_some())
+                    .map(scratch_refusal::scratch_root_refusal)
+            })
+            .or_else(|| {
+                self.reported
+                    .as_deref()
+                    .and_then(scratch_refusal::reported_scratch_root_write)
+                    .map(|path| scratch_refusal::scratch_root_refusal(&path))
             })
     }
 }
@@ -848,6 +870,152 @@ mod tests {
         let stored: serde_json::Value = serde_json::from_str(&tool_input).unwrap();
         assert_eq!(stored["kind"], CrossingKind::ShellPathCrossing.tag());
         assert_eq!(stored["descriptor"], "/outside/x");
+    }
+
+    /// A write under Cairn's scratch root, however it reached the fence, is
+    /// answered with the scratch refusal under `ask` and `deny`, ahead of any
+    /// session grant, and puts nothing on anyone's desk; `allow` is unfenced.
+    #[tokio::test]
+    async fn a_write_under_the_scratch_root_is_refused_by_name_on_every_surface() {
+        use crate::services::sandbox::scratch_refusal::scratch_root_refusal;
+        let root = cairn_common::scratch::scratch_root();
+        let sibling = root.join("triome-45-measure");
+        let reported = format!(
+            "mkdir: cannot create directory '{}': Permission denied",
+            root.join("x").display()
+        );
+        type Case = (&'static str, Box<dyn Fn() -> Crossing>, String);
+        let crossings: Vec<Case> = vec![
+            (
+                "recovered run path",
+                Box::new({
+                    let sibling = sibling.clone();
+                    move || Crossing::shell_path(&sibling, "uv run -")
+                }),
+                scratch_root_refusal(&sibling),
+            ),
+            (
+                "write verb",
+                Box::new({
+                    let sibling = sibling.join("notes.md");
+                    move || Crossing::write_outside(&sibling)
+                }),
+                scratch_root_refusal(&sibling.join("notes.md")),
+            ),
+            (
+                "reported Linux line",
+                Box::new({
+                    let reported = reported.clone();
+                    move || Crossing::unattributed_denial("sh -c", "mkdir x", Some(&reported))
+                }),
+                scratch_root_refusal(&root.join("x")),
+            ),
+        ];
+
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        // A grant cannot open the root either: the refusal precedes the check.
+        orch.session_allowed_crossings
+            .lock()
+            .unwrap()
+            .insert(sibling.display().to_string());
+        for (surface, crossing, expected) in &crossings {
+            for fence in [Fence::Ask, Fence::Deny] {
+                match raise_fence(&orch, "run-1", fence, &run_request(), crossing()).await {
+                    FenceDecision::Deny(refusal) => assert_eq!(&refusal, expected, "{surface}"),
+                    other => {
+                        panic!("{surface} {fence:?}: expected the scratch refusal, got {other:?}")
+                    }
+                }
+            }
+            assert!(matches!(
+                raise_fence(&orch, "run-1", Fence::Allow, &run_request(), crossing()).await,
+                FenceDecision::Allow
+            ));
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// A remote executor's scratch root is refused by name too: an approval
+    /// would rerun the item with no fence, which would make the root
+    /// approvable there while it is refused here.
+    #[tokio::test]
+    async fn a_remote_executors_scratch_root_is_refused_by_name_too() {
+        let remote = Path::new("/home/dev/.cairn-executor/scratch/lab");
+        let orch = super::super::permission::tests::test_orchestrator().await;
+        for fence in [Fence::Ask, Fence::Deny] {
+            match raise_fence(
+                &orch,
+                "run-1",
+                fence,
+                &run_request(),
+                Crossing::shell_path(remote, "mkdir lab"),
+            )
+            .await
+            {
+                FenceDecision::Deny(refusal) => {
+                    assert!(
+                        refusal.contains("(`/home/dev/.cairn-executor/scratch`)"),
+                        "{refusal}"
+                    );
+                }
+                other => panic!("{fence:?}: expected the scratch refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(permission_rows(&orch).await, 0);
+    }
+
+    /// A git-internal path keeps its own route even beneath the scratch root,
+    /// and a path outside the root keeps the path prompt.
+    #[test]
+    fn the_scratch_refusal_follows_the_git_refusals_and_only_covers_the_root() {
+        let root = cairn_common::scratch::scratch_root();
+        let git = root.join("lab/repo/.git/refs/heads/main.lock");
+        let refusal = Crossing::shell_path(&git, "uv run -")
+            .route_refusal()
+            .unwrap();
+        assert!(
+            refusal.contains("git's staging records or refs"),
+            "{refusal}"
+        );
+
+        let tmpdir = cairn_common::paths::cairn_home().join("tmp/n1/tree/x");
+        assert_eq!(
+            Crossing::shell_path(&tmpdir, "uv run -").route_refusal(),
+            None
+        );
+        // A read is never a scratch-root write.
+        assert_eq!(Crossing::read_denied(&root.join("x")).route_refusal(), None);
+
+        // A project's own `.cairn/` folder is project content: a crossing into
+        // another checkout's `.cairn/scratch` keeps today's path prompt. (The
+        // node's own worktree is writable, so it never reaches this tier.)
+        let project = Path::new("/home/dev/projects/app/.cairn/scratch/x");
+        assert_eq!(
+            Crossing::shell_path(project, "uv run -").route_refusal(),
+            None
+        );
+        // A dev instance's home is a Cairn home, and the refusal names its root.
+        let dev = Path::new("/home/dev/.cairn-dev/scratch/x");
+        let refusal = Crossing::shell_path(dev, "uv run -")
+            .route_refusal()
+            .unwrap();
+        assert!(
+            refusal.contains("(`/home/dev/.cairn-dev/scratch`)"),
+            "{refusal}"
+        );
+    }
+
+    /// The sentence's own words, that is: the two paths it quotes are wherever
+    /// this process's home is, and a test home may sit under a directory with
+    /// any name.
+    #[test]
+    fn the_scratch_refusal_carries_no_substrate_vocabulary() {
+        let root = cairn_common::scratch::scratch_root();
+        let lab = root.join("lab");
+        let refusal = crate::services::sandbox::scratch_refusal::scratch_root_refusal(&lab)
+            .replace(&lab.display().to_string(), "<path>")
+            .replace(&root.display().to_string(), "<root>");
+        crate::system_prompt::assert_no_substrate_vocabulary("scratch-root refusal", &refusal);
     }
 
     #[test]

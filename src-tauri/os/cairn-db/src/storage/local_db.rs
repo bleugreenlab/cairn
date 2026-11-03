@@ -731,6 +731,7 @@ impl LocalDb {
 
     pub async fn open_with_retry(path: impl AsRef<Path>, retry: RetryConfig) -> DbResult<Self> {
         let path = path.as_ref().to_path_buf();
+        require_db_path(&path)?;
         let path_string = path.to_string_lossy().to_string();
         let database = Arc::new(DbHandle::Local(
             Builder::new_local(&path_string).build().await?,
@@ -1712,7 +1713,7 @@ impl LocalDb {
     /// It is read from the filesystem rather than the engine because it is the
     /// same figure an operator sees in `~/.cairn`.
     pub fn logical_log_bytes(&self) -> u64 {
-        std::fs::metadata(sidecar_path(&self.path, "-log"))
+        std::fs::metadata(logical_log_path(&self.path))
             .map(|meta| meta.len())
             .unwrap_or(0)
     }
@@ -1843,7 +1844,7 @@ impl LocalDb {
                 attempt.clone(),
                 remaining,
                 &self.checkpoint_in_engine,
-                sidecar_path(&self.path, "-log"),
+                logical_log_path(&self.path),
             )
             .await
             {
@@ -1902,11 +1903,14 @@ impl LocalDb {
     /// living in the sidecars; move and validate it as a whole set, never the
     /// `.db` file alone.
     ///
-    /// Refuses to run if any member of `dest`'s file set already exists. `VACUUM`
-    /// cannot run inside a `BEGIN..COMMIT` transaction, so this issues the
-    /// statement on a raw connection (via `consume_query`) rather than the
-    /// transaction-wrapped `execute`/`write` path.
+    /// Refuses a `dest` that does not end in `.db`, for the reason
+    /// [`LocalDb::open`] does, and refuses to run if any member of `dest`'s file
+    /// set already exists. `VACUUM` cannot run inside a `BEGIN..COMMIT`
+    /// transaction, so this issues the statement on a raw connection (via
+    /// `consume_query`) rather than the transaction-wrapped `execute`/`write`
+    /// path.
     pub async fn vacuum_into(&self, dest: &Path) -> DbResult<()> {
+        require_db_path(dest)?;
         for member in db_set_paths(dest) {
             if member.exists() {
                 return Err(DbError::internal(format!(
@@ -2580,18 +2584,47 @@ impl std::fmt::Display for CheckpointReport {
 /// `-wal` and `-log` sidecars. Committed data lives in the sidecars, so any
 /// move, copy, backup, or snapshot of the database must treat all three as one
 /// unit (see docs/database.md). Returned in the order `[main, -wal, -log]`.
+///
+/// Each sidecar is named the way the pinned Turso names it, so the set is
+/// the files the engine actually wrote even for a path [`LocalDb::open`] would
+/// refuse. For a `.db` path that is `{path, path-wal, path-log}`.
 pub fn db_set_paths(base: &Path) -> [PathBuf; 3] {
-    [
-        base.to_path_buf(),
-        sidecar_path(base, "-wal"),
-        sidecar_path(base, "-log"),
-    ]
+    [base.to_path_buf(), wal_path(base), logical_log_path(base)]
 }
 
-fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
+/// Turso's WAL: `-wal` appended to the whole path.
+fn wal_path(base: &Path) -> PathBuf {
     let mut name = base.as_os_str().to_owned();
-    name.push(suffix);
+    name.push("-wal");
     PathBuf::from(name)
+}
+
+/// Turso's MVCC logical log: the path with its extension replaced by
+/// `db-log` (turso_core's `journal_mode.rs`), not `-log` appended. The two
+/// agree only for a `.db` path; `cairn.db.probe` logs to `cairn.db.db-log`.
+fn logical_log_path(base: &Path) -> PathBuf {
+    base.with_extension("db-log")
+}
+
+/// Admit only a path whose file set belongs to it alone: a `.db` file, or
+/// Turso's file-less `:memory:`.
+///
+/// Because Turso derives the logical log by replacing the extension, any two
+/// paths that differ only in their last extension share one log:
+/// `cairn.db.vacuum-staged` and `cairn.db.vacuum-backup` both write
+/// `cairn.db.db-log`, and an extensionless `db` writes `db.db-log`, the log of
+/// `db.db`. Moving, sizing, or deleting either set then acts on the other's
+/// committed data. A `.db` path's log is `{path}-log`, which no other path
+/// produces.
+fn require_db_path(path: &Path) -> DbResult<()> {
+    if path.as_os_str() == ":memory:" || path.extension().is_some_and(|ext| ext == "db") {
+        return Ok(());
+    }
+    Err(DbError::internal(format!(
+        "database path {} must end in .db: Turso names the logical log from the \
+         extension, so under any other name it can share its log with another database",
+        path.display()
+    )))
 }
 
 /// Total size in bytes of every member of `base`'s three-file set that exists on
@@ -4033,6 +4066,84 @@ mod tests {
             db.vacuum_into(&sidecar_only).await.unwrap_err(),
             DbError::Internal(_)
         ));
+
+        // A destination outside `.db` is refused before anything is written.
+        let error = db
+            .vacuum_into(&dir.path().join("image.turso.db.vacuum-staged"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("must end in .db"), "{error}");
+        assert!(!dir.path().join("image.turso.db.vacuum-staged").exists());
+    }
+
+    #[tokio::test]
+    async fn db_set_paths_names_the_log_turso_writes_whatever_the_path() {
+        // Opened through the engine directly, because `LocalDb::open` refuses
+        // every name here but the first.
+        let dir = tempdir().unwrap();
+        for name in ["set.db", "cairn.db.probe", "extensionless"] {
+            let path = dir.path().join(name);
+            let database = Builder::new_local(&path.to_string_lossy())
+                .build()
+                .await
+                .unwrap();
+            let conn = database.connect().unwrap();
+            let mut rows = conn
+                .query("PRAGMA journal_mode = 'mvcc'", ())
+                .await
+                .unwrap();
+            while rows.next().await.unwrap().is_some() {}
+            drop(rows);
+            conn.execute("CREATE TABLE t (x INTEGER)", ())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+
+            // Nothing has folded the log, so the commit lives only there.
+            let [_, _, log] = db_set_paths(&path);
+            let bytes = std::fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
+            assert!(
+                bytes > 0,
+                "{name}: the committed log is not at {}",
+                log.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_refuses_a_path_that_does_not_end_in_db() {
+        let dir = tempdir().unwrap();
+        for name in ["cairn.db.vacuum-staged", "db", "cairn.DB"] {
+            let error = LocalDb::open(dir.path().join(name))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{name} opened"));
+            assert!(error.to_string().contains("must end in .db"), "{error}");
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "a refused open left files behind"
+        );
+        LocalDb::open(":memory:").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_local_db_reports_the_log_its_commits_land_in() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.turso.db");
+        let db = LocalDb::open(&path).await.unwrap();
+        db.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+
+        let [_, _, log] = db_set_paths(&path);
+        assert_eq!(log, dir.path().join("live.turso.db-log"));
+        assert!(db.logical_log_bytes() > 0);
+        assert_eq!(
+            db.logical_log_bytes(),
+            std::fs::metadata(&log).unwrap().len()
+        );
     }
 
     #[test]
@@ -4040,7 +4151,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let live = dir.path().join("live.turso.db");
         let staged = dir.path().join("staged.turso.db");
-        let backup = dir.path().join("live.turso.db.vacuum-backup");
+        let backup = dir.path().join("live.turso.vacuum-backup.db");
 
         // A full live set; a staged set missing its -log sidecar.
         std::fs::write(&live, b"live-db").unwrap();
@@ -4054,11 +4165,11 @@ mod tests {
         assert!(!live.exists());
         assert_eq!(std::fs::read(&backup).unwrap(), b"live-db");
         assert_eq!(
-            std::fs::read(dir.path().join("live.turso.db.vacuum-backup-wal")).unwrap(),
+            std::fs::read(dir.path().join("live.turso.vacuum-backup.db-wal")).unwrap(),
             b"live-wal"
         );
         assert_eq!(
-            std::fs::read(dir.path().join("live.turso.db.vacuum-backup-log")).unwrap(),
+            std::fs::read(dir.path().join("live.turso.vacuum-backup.db-log")).unwrap(),
             b"live-log"
         );
 

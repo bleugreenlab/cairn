@@ -338,6 +338,19 @@ fn render_job_summary_header(
     output
 }
 
+/// The job's placement default line, active or cleared by the fleet, beneath
+/// the summary header. Nothing when it has none.
+async fn push_placement_default(output: &mut String, db: &LocalDb, job_id: &str) {
+    use crate::fleet::placement_default::{load, DefaultOwner};
+    let Ok(owner) = DefaultOwner::for_job(db, job_id).await else {
+        return;
+    };
+    if let Ok(Some(default)) = load(db, &owner).await {
+        output.push_str(&default.line());
+        output.push_str("\n\n");
+    }
+}
+
 /// `"{n} {noun}"` with a plural `s` for any count other than one.
 fn count_phrase(n: i64, noun: &str) -> String {
     format!("{} {}{}", n, noun, if n == 1 { "" } else { "s" })
@@ -1695,6 +1708,7 @@ pub(super) async fn read_node(
         job.started_at.map(i64::from),
         job.completed_at.map(i64::from),
     );
+    push_placement_default(&mut output, db, &job.id).await;
     if job.status == "pending" && job.started_at.is_none() {
         output.push_str(&crate::jobs::queries::pending_dispatch_description(None));
         output.push_str(".\n\n");
@@ -2777,6 +2791,7 @@ pub(super) async fn read_task(
         task_job.started_at.map(i64::from),
         task_job.completed_at.map(i64::from),
     );
+    push_placement_default(&mut output, db, &task_job.id).await;
     if let Some(parent_segment) = parent_segment {
         output.push_str(&crate::jobs::queries::pending_dispatch_description(Some(
             &parent_segment,

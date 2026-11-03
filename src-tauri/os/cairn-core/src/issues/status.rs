@@ -386,7 +386,7 @@ pub(crate) async fn resolve_terminal(
 ) -> Result<(), ResolutionRefusal> {
     let live_work = live_work_for_issue(orch, issue_id).await?;
     if !live_work.is_empty() {
-        if let Err(refusal) = stop_live_work(orch, issue_id, &live_work).await {
+        if let Err(refusal) = stop_live_work(orch, issue_id, &live_work, resolution).await {
             match on_stop_failure {
                 StopFailure::Refuses => return Err(refusal),
                 StopFailure::Escalates => log::warn!(
@@ -694,12 +694,17 @@ async fn open_merge_request_for_issue(
 /// Archival is verified by re-reading every row. A terminal resolution first
 /// uses warm stop as the process-level interrupt mechanism, then deliberately
 /// replaces its resumable row state with the sticky cancelled state.
+///
+/// Every archived job's sessions close with `resolution`'s reason, the jobs of
+/// dependent issues included: the resolution is what ended their work, and the
+/// reason is what tells the operator that reopening the issue picks it back up.
 async fn stop_live_work(
     orch: &Orchestrator,
     issue_id: &str,
     live_work: &[LiveJob],
+    resolution: Resolution,
 ) -> Result<(), ResolutionRefusal> {
-    stop_live_work_with(orch, issue_id, live_work, |orch, job_id| {
+    stop_live_work_with(orch, issue_id, live_work, resolution, |orch, job_id| {
         crate::orchestrator::lifecycle::stop_job(orch, job_id)
     })
     .await
@@ -709,6 +714,7 @@ async fn stop_live_work_with(
     orch: &Orchestrator,
     issue_id: &str,
     live_work: &[LiveJob],
+    resolution: Resolution,
     stop_started: impl Fn(&Orchestrator, &str) -> Result<(), String>,
 ) -> Result<(), ResolutionRefusal> {
     let (started, queued): (Vec<&LiveJob>, Vec<&LiveJob>) =
@@ -744,7 +750,13 @@ async fn stop_live_work_with(
                 let job_ids = job_ids.clone();
                 Box::pin(async move {
                     for job_id in &job_ids {
-                        crate::execution::advancement::cancel_job_conn(conn, job_id, now).await?;
+                        crate::execution::advancement::cancel_job_conn(
+                            conn,
+                            job_id,
+                            now,
+                            resolution.into(),
+                        )
+                        .await?;
                     }
                     Ok(())
                 })
@@ -964,9 +976,14 @@ mod tests {
     async fn stopping_queued_work_cancels_it() {
         let orch = orch_with_queued_job().await;
 
-        stop_live_work(&orch, "issue-1", &[queued("job-queued", "reviewer")])
-            .await
-            .expect("a real queued job cancels");
+        stop_live_work(
+            &orch,
+            "issue-1",
+            &[queued("job-queued", "reviewer")],
+            Resolution::Closed,
+        )
+        .await
+        .expect("a real queued job cancels");
 
         assert!(job_is_cancelled(&orch, "job-queued").await);
     }
@@ -990,11 +1007,12 @@ mod tests {
             from_dependent_issue: false,
         };
 
-        let refusal = stop_live_work_with(&orch, "issue-1", &[running], |_, _| {
-            Err("interrupt unavailable".into())
-        })
-        .await
-        .expect_err("failed process interruption refuses terminal resolution");
+        let refusal =
+            stop_live_work_with(&orch, "issue-1", &[running], Resolution::Closed, |_, _| {
+                Err("interrupt unavailable".into())
+            })
+            .await
+            .expect_err("failed process interruption refuses terminal resolution");
 
         assert!(refusal.to_string().contains("builder"));
         assert_eq!(
@@ -1024,6 +1042,7 @@ mod tests {
                 queued("job-queued", "reviewer"),
                 queued("job-gone", "planner"),
             ],
+            Resolution::Closed,
         )
         .await
         .expect_err("work that did not stop must refuse");
@@ -1054,7 +1073,7 @@ mod tests {
             .await
             .unwrap();
 
-        let refusal = stop_live_work(&orch, "issue-1", &live_work)
+        let refusal = stop_live_work(&orch, "issue-1", &live_work, Resolution::Closed)
             .await
             .expect_err("a vanished job cannot be confirmed stopped");
         assert!(matches!(refusal, ResolutionRefusal::Rejected(_)));
@@ -1166,6 +1185,13 @@ mod projection_tests {
         )
         .await
         .unwrap();
+        // The builder's provider conversation, which a reopen's successor forks.
+        db.execute(
+            "UPDATE sessions SET backend_id = 'native-builder' WHERE id = 's-builder'",
+            (),
+        )
+        .await
+        .unwrap();
 
         let search =
             Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
@@ -1241,6 +1267,38 @@ mod projection_tests {
                         .as_deref(),
                     Some("closed"),
                     "{resolution:?} {session}"
+                );
+            }
+            // The stop closes the sessions of the work it cancels with the
+            // resolution's own reason, which is what tells the operator that
+            // reopening the issue picks the work back up.
+            let reason = match resolution {
+                Resolution::Merged => "issue_merged",
+                Resolution::Closed => "issue_closed",
+            };
+            for session in ["s-builder", "s-coordinator", "s-followup", "s-planner"] {
+                assert_eq!(
+                    text(
+                        &orch,
+                        "SELECT terminal_reason FROM sessions WHERE id = ?1",
+                        session
+                    )
+                    .await
+                    .as_deref(),
+                    Some(reason),
+                    "{resolution:?} {session}"
+                );
+                assert!(
+                    orch.db
+                        .local
+                        .query_opt_i64(
+                            "SELECT closed_at FROM sessions WHERE id = ?1",
+                            params![session],
+                        )
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "{resolution:?} {session} records when it closed"
                 );
             }
             assert_eq!(unsettled_jobs(&orch).await, 0, "{resolution:?}");
@@ -1328,6 +1386,178 @@ mod projection_tests {
             .as_deref(),
             Some("cancelled"),
             "a restart archive stays archived"
+        );
+
+        // The lifted builder and the complete planner each continue on a fresh
+        // open successor of the session the merge closed; the closed one keeps
+        // the merge's reason as history.
+        for (job, closed) in [("builder", "s-builder"), ("planner", "s-planner")] {
+            let current = text(
+                &orch,
+                "SELECT current_session_id FROM jobs WHERE id = ?1",
+                job,
+            )
+            .await
+            .expect("the job points at a session");
+            assert_ne!(current, closed, "{job} moved off its closed session");
+            assert_eq!(
+                text(
+                    &orch,
+                    "SELECT status || ':' || parent_session_id FROM sessions WHERE id = ?1",
+                    &current
+                )
+                .await
+                .as_deref(),
+                Some(format!("open:{closed}").as_str()),
+                "{job}'s successor is open and descends from the closed session"
+            );
+            assert_eq!(
+                text(
+                    &orch,
+                    "SELECT status || ':' || terminal_reason || ':' || replaced_by_id
+                       FROM sessions WHERE id = ?1",
+                    closed
+                )
+                .await
+                .as_deref(),
+                Some(format!("closed:issue_merged:{current}").as_str()),
+                "{job}'s closed session keeps its reason"
+            );
+        }
+        for (job, session) in [
+            ("archived", None),
+            ("old-builder", None),
+            ("builder-attempt-1", Some("s-attempt-1")),
+        ] {
+            assert_eq!(
+                text(
+                    &orch,
+                    "SELECT current_session_id FROM jobs WHERE id = ?1",
+                    job
+                )
+                .await
+                .as_deref(),
+                session,
+                "{job} is not continued"
+            );
+        }
+
+        // The builder's next launch forks the conversation the merge closed,
+        // and the planner's session takes a reply.
+        let builder_session = text(
+            &orch,
+            "SELECT current_session_id FROM jobs WHERE id = ?1",
+            "builder",
+        )
+        .await
+        .unwrap();
+        let (prepared, start, _) =
+            crate::execution::jobs::prepare_session_for_test(db.clone(), "builder", 10)
+                .await
+                .expect("the builder's session prepares");
+        assert_eq!(prepared, builder_session);
+        assert!(
+            matches!(
+                &start,
+                crate::backends::SessionStart::Fork { session_id, source_backend_id }
+                    if session_id == &builder_session && source_backend_id == "native-builder"
+            ),
+            "{start:?}"
+        );
+        assert!(
+            !crate::execution::jobs::current_session_refuses_turns(&db, "planner").await,
+            "the planner's current session takes a turn"
+        );
+    }
+
+    /// The migration converges the open sessions older builds left on
+    /// cancelled jobs, with the reason the job's issue still records, and
+    /// leaves every other job's sessions alone.
+    #[tokio::test]
+    async fn the_migration_closes_the_sessions_of_cancelled_jobs() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("cancelled-sessions.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "close_sessions_of_cancelled_jobs")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the migration must be in the lineage"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('merged', 'p', 1, 'M', 'merged', 'merged', 'none', 1, 1),
+                   ('closed', 'p', 2, 'C', 'closed', 'closed', 'none', 1, 1),
+                   ('open', 'p', 3, 'O', 'active', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, completed_at, created_at, updated_at)
+             VALUES('on-merged', 'p', 'merged', 'cancelled', 50, 1, 1),
+                   ('on-closed', 'p', 'closed', 'cancelled', 60, 1, 1),
+                   ('no-issue', 'p', NULL, 'cancelled', NULL, 1, 1),
+                   ('two-open', 'p', 'merged', 'cancelled', 70, 1, 1),
+                   ('live', 'p', 'open', 'running', NULL, 1, 1),
+                   ('done', 'p', 'merged', 'complete', 80, 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, terminal_reason, sequence, created_at, updated_at)
+             VALUES('s-merged', 'on-merged', 'claude', 'open', NULL, 1, 1, 1),
+                   ('s-closed', 'on-closed', 'claude', 'open', NULL, 1, 1, 1),
+                   ('s-no-issue', 'no-issue', 'claude', 'open', NULL, 1, 1, 1),
+                   ('s-two-a', 'two-open', 'claude', 'open', NULL, 1, 1, 1),
+                   ('s-two-b', 'two-open', 'claude', 'open', NULL, 2, 1, 1),
+                   ('s-earlier', 'on-merged', 'claude', 'closed', 'rotated_reseed', 1, 1, 1),
+                   ('s-live', 'live', 'claude', 'open', NULL, 1, 1, 1),
+                   ('s-done', 'done', 'claude', 'open', NULL, 1, 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        for (session, expected) in [
+            ("s-merged", "closed:issue_merged:50"),
+            ("s-closed", "closed:issue_closed:60"),
+            ("s-two-a", "closed:issue_merged:70"),
+            ("s-two-b", "closed:issue_merged:70"),
+            ("s-earlier", "closed:rotated_reseed:"),
+            ("s-live", "open::"),
+            ("s-done", "open::"),
+        ] {
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT status || ':' || COALESCE(terminal_reason, '') || ':' || COALESCE(closed_at, '')
+                       FROM sessions WHERE id = ?1",
+                    params![session],
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some(expected),
+                "{session}"
+            );
+        }
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status || ':' || terminal_reason || ':' || (closed_at IS NOT NULL)
+                   FROM sessions WHERE id = 's-no-issue'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("closed:job_cancelled:1"),
+            "a job with no issue closes as job_cancelled, stamped with the migration's time"
         );
     }
 }

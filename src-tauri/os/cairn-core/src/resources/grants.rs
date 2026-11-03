@@ -9,6 +9,7 @@ use cairn_common::authorization::{AuthorityGrant, AuthorityLifetime};
 use cairn_db::storage::authority::AuthorizationEventRecord;
 
 use crate::authorization;
+use crate::authorization::revoke::{GrantHolder, OPERATOR_REVOKE_SURFACE};
 use crate::storage::LocalDb;
 
 fn render_uuid_id(id: &str) -> String {
@@ -108,6 +109,11 @@ fn constraint_labels(grant: &AuthorityGrant) -> String {
             cairn_common::authorization::AuthorityConstraint::McpConfig { fingerprint } => {
                 format!("exact MCP configuration {}", fingerprint.short())
             }
+            // The digest, never the act's content: a settings value can carry
+            // a credential.
+            cairn_common::authorization::AuthorityConstraint::ExactAct { digest } => {
+                format!("exactly the approved act {}", digest.short())
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -139,6 +145,55 @@ fn render_decision(event: &AuthorizationEventRecord) -> String {
         event.summary,
         cited
     )
+}
+
+/// One grant as the operator's Settings → Grants page lists it. Every field
+/// is derived from the stored grant; the page decides nothing from it except
+/// whether to offer Revoke, and the runner re-reads the grant before acting.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantSummary {
+    /// The stored id, which `revoke_authority_grant` takes.
+    pub id: String,
+    /// The id as `cairn://grants` renders it.
+    pub display_id: String,
+    pub uri: String,
+    pub scope: String,
+    pub status: &'static str,
+    pub lifetime: String,
+    pub holder: String,
+    pub issued_by: String,
+    pub approved_by: Option<String>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+pub fn grant_summary(grant: &AuthorityGrant, at: i64) -> GrantSummary {
+    GrantSummary {
+        id: grant.id.clone(),
+        display_id: render_uuid_id(&grant.id),
+        uri: format!("cairn://grants/{}", grant_uri_id(&grant.id)),
+        scope: grant.scope.shorthand(),
+        status: grant.status(at),
+        lifetime: lifetime_label(&grant.lifetime),
+        holder: GrantHolder::of(grant).describe(),
+        issued_by: grant.provenance.issuer.clone(),
+        approved_by: grant.provenance.approver.clone(),
+        created_at: grant.created_at,
+        expires_at: grant.expires_at,
+        revoked_at: grant.revoked_at,
+    }
+}
+
+/// Every grant in the workspace, newest first, as the Settings page lists it.
+pub async fn list_grant_summaries(db: &LocalDb) -> Result<Vec<GrantSummary>, String> {
+    let at = now();
+    Ok(authorization::list_grants(db, 200)
+        .await?
+        .iter()
+        .map(|grant| grant_summary(grant, at))
+        .collect())
 }
 
 /// `cairn://grants` — every grant in the workspace.
@@ -422,6 +477,17 @@ pub async fn read_grant(db: &LocalDb, id: &str) -> String {
     if let Some(agent) = grant.principal.agent_id.as_deref() {
         out.push_str(&format!("- Agent: {agent}\n"));
     }
+    let holder = GrantHolder::of(&grant);
+    out.push_str(&format!("- Held by: {}\n", holder.describe()));
+    out.push_str(&match holder {
+        GrantHolder::Operator => {
+            format!("- Revocable by: the operator only, at {OPERATOR_REVOKE_SURFACE}\n")
+        }
+        _ => format!(
+            "- Revocable by: its holder here (`revoke:true`), or the operator at \
+             {OPERATOR_REVOKE_SURFACE}\n"
+        ),
+    });
     out.push_str(&format!("- Issued by: {}\n", grant.provenance.issuer));
     // The approver is the authenticated operator the mint recorded, and it is
     // rendered only when there is one. A grant with an issuer but no approver is

@@ -144,7 +144,7 @@ fn input_value(input: InvalidationInput, build_id: &str, boot: &str) -> Option<S
         // which the executor cannot read. cairn/3391 owns closing it.
         | InvalidationInput::EnvironmentAssemblyPolicy
         | InvalidationInput::DevInstanceIngressPolicy
-        | InvalidationInput::DesktopAutomationConfiguration => None,
+        | InvalidationInput::MachineServiceSelection => None,
     }
 }
 
@@ -221,12 +221,37 @@ pub fn current_fingerprints_from(
 ///
 /// The spawn goes through exactly the wrapping a batch item gets -- `wrap_argv`
 /// then `install_pre_exec` -- because a probe that applied confinement its own
-/// way would measure its own harness. The out-of-bounds target sits directly in
-/// `$HOME`, which is deliberately outside every writable carve-out: the temp
-/// dirs and toolchain caches are granted on purpose, so writing to one would
-/// prove nothing about the boundary.
+/// way would measure its own harness. Two out-of-bounds targets are tried. One
+/// sits directly in `$HOME`, which is deliberately outside every writable
+/// carve-out: the temp dirs and toolchain caches are granted on purpose, so
+/// writing to one would prove nothing about the boundary. The other is a
+/// sibling directory under Cairn's scratch root, which holds every job's
+/// bookkeeping and is granted to no spawn beyond its own `$TMPDIR`; either
+/// write landing is a crossing.
 #[cfg(unix)]
 pub fn probe_batch_spawn_filesystem(mode: PolicyMode) -> Result<ProbeWitness, String> {
+    let home =
+        crate::home_dir().ok_or_else(|| "no home directory to probe outside of".to_string())?;
+    probe_batch_spawn_filesystem_at(mode, &home, &cairn_common::scratch::scratch_root())
+        .map(|(witness, _)| witness)
+}
+
+/// Which of the probe's out-of-bounds writes landed.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchProbeWrites {
+    home: bool,
+    scratch: bool,
+}
+
+/// The probe against a given home and scratch root, so a test can choose a
+/// root the policy grants and one it does not.
+#[cfg(unix)]
+fn probe_batch_spawn_filesystem_at(
+    mode: PolicyMode,
+    home: &Path,
+    scratch_root: &Path,
+) -> Result<(ProbeWitness, BatchProbeWrites), String> {
     let worktree = tempfile::tempdir().map_err(|e| format!("create probe worktree: {e}"))?;
     let worktree = worktree
         .path()
@@ -234,12 +259,12 @@ pub fn probe_batch_spawn_filesystem(mode: PolicyMode) -> Result<ProbeWitness, St
         .unwrap_or_else(|_| worktree.path().into());
     let in_bounds = worktree.join("containment-probe-in-bounds");
 
-    let home =
-        crate::home_dir().ok_or_else(|| "no home directory to probe outside of".to_string())?;
-    let out_of_bounds = home.join(format!(
-        "cairn-containment-probe-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let probe_name = format!("cairn-containment-probe-{}", uuid::Uuid::new_v4().simple());
+    let out_of_bounds = home.join(&probe_name);
+    // Created unconfined first, so a missing parent cannot pass for a refusal.
+    std::fs::create_dir_all(scratch_root)
+        .map_err(|e| format!("create the scratch root {}: {e}", scratch_root.display()))?;
+    let scratch_sibling = scratch_root.join(&probe_name);
 
     // Each mode is exercised through the policy that mode actually builds.
     // `Unconfined` builds none, which is the honest thing to measure: the
@@ -261,9 +286,10 @@ pub fn probe_batch_spawn_filesystem(mode: PolicyMode) -> Result<ProbeWitness, St
         }
     };
     let script = format!(
-        "printf probe > {} 2>/dev/null; printf probe > {} 2>/dev/null; exit 0",
+        "printf probe > {} 2>/dev/null; printf probe > {} 2>/dev/null; mkdir {} 2>/dev/null; exit 0",
         shell_quote(&in_bounds),
-        shell_quote(&out_of_bounds)
+        shell_quote(&out_of_bounds),
+        shell_quote(&scratch_sibling)
     );
     let args = vec!["-c".to_string(), script];
     let (program, args) = match &policy {
@@ -280,23 +306,34 @@ pub fn probe_batch_spawn_filesystem(mode: PolicyMode) -> Result<ProbeWitness, St
         .map_err(|e| format!("spawn the batch-seam probe: {e}"))?;
 
     let positive_control_passed = in_bounds.is_file();
-    let crossing_permitted = out_of_bounds.exists();
+    let home_written = out_of_bounds.exists();
+    let scratch_written = scratch_sibling.exists();
+    let crossing_permitted = home_written || scratch_written;
     // Leave nothing behind on a machine that turned out to be unconfined.
     let _ = std::fs::remove_file(&out_of_bounds);
+    let _ = std::fs::remove_dir(&scratch_sibling);
 
-    let detail = match (positive_control_passed, crossing_permitted) {
-        (true, false) => "in-bounds write succeeded and the out-of-bounds write into the home directory was refused".to_string(),
-        (true, true) => "in-bounds write succeeded and the out-of-bounds write into the home directory also succeeded, so this seam applies no filesystem confinement".to_string(),
-        (false, _) => "the in-bounds control write did not appear, so this probe could not exercise the seam".to_string(),
+    let detail = match (positive_control_passed, home_written, scratch_written) {
+        (true, false, false) => "in-bounds write succeeded, and both out-of-bounds writes were refused: a file in the home directory and a directory beside the jobs' own under Cairn's scratch root".to_string(),
+        (true, true, true) => "in-bounds write succeeded, and both out-of-bounds writes also succeeded (the home directory and Cairn's scratch root), so this seam applies no filesystem confinement".to_string(),
+        (true, true, false) => "in-bounds write succeeded, and the out-of-bounds write into the home directory also succeeded, so this seam applies no filesystem confinement there".to_string(),
+        (true, false, true) => "in-bounds write succeeded and the home-directory write was refused, but a directory beside the jobs' own under Cairn's scratch root was also created, so this seam applies no filesystem confinement there".to_string(),
+        (false, _, _) => "the in-bounds control write did not appear, so this probe could not exercise the seam".to_string(),
     };
 
-    Ok(ProbeWitness {
-        edge: batch_filesystem_edge(mode),
-        effect: EffectClass::Write,
-        positive_control_passed,
-        crossing_permitted,
-        detail,
-    })
+    Ok((
+        ProbeWitness {
+            edge: batch_filesystem_edge(mode),
+            effect: EffectClass::Write,
+            positive_control_passed,
+            crossing_permitted,
+            detail,
+        },
+        BatchProbeWrites {
+            home: home_written,
+            scratch: scratch_written,
+        },
+    ))
 }
 
 #[cfg(not(unix))]
@@ -1850,6 +1887,54 @@ mod tests {
             }
             EdgeDisposition::Constrained { .. } => {
                 panic!("the filesystem seam declares no constrained envelope")
+            }
+        }
+    }
+
+    /// The probe's scratch-root write sees exactly what the confined policy
+    /// grants: a root inside a granted temp dir is written, and the real root
+    /// is written only if the policy happens to grant it on this machine (a
+    /// Cairn home under a temp dir), refused otherwise.
+    #[cfg(unix)]
+    #[test]
+    fn the_batch_seam_probe_sees_the_scratch_root_as_the_policy_grants_it() {
+        let granted_by_policy = |root: &Path| {
+            let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let root = canonical(root);
+            crate::default_writable_extra()
+                .iter()
+                .any(|granted| root.starts_with(canonical(granted)))
+        };
+        let home = tempfile::tempdir().unwrap();
+        let inside_temp = tempfile::tempdir().unwrap();
+        let granted_root = inside_temp.path().join("scratch");
+        for root in [granted_root, cairn_common::scratch::scratch_root()] {
+            let (witness, writes) =
+                probe_batch_spawn_filesystem_at(PolicyMode::Confined, home.path(), &root)
+                    .expect("the batch seam probe runs on unix");
+            if !witness.positive_control_passed {
+                assert!(
+                    witness.detail.contains("could not exercise"),
+                    "{}",
+                    witness.detail
+                );
+                return;
+            }
+            let expected = granted_by_policy(&root);
+            assert_eq!(
+                writes.scratch,
+                expected,
+                "{}: {}",
+                root.display(),
+                witness.detail
+            );
+            if writes.scratch {
+                assert!(witness.crossing_permitted);
+                assert!(
+                    witness.detail.contains("scratch root"),
+                    "{}",
+                    witness.detail
+                );
             }
         }
     }

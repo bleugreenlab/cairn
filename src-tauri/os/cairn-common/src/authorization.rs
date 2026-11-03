@@ -46,6 +46,11 @@ use serde::{Deserialize, Serialize};
 /// MCP tool mutation. Refusing v1 on load is the point rather than a cost: a v1
 /// grant names a server without naming what runs under that name, so honouring
 /// one would let a stale approval authorize an arbitrary command.
+///
+/// [`AuthorityConstraint::ExactAct`] did not bump it. What it changes is the
+/// meaning of one lifetime, `Once`, so its floor lives in the matcher
+/// ([`AuthorityGrant::check`]) rather than here: a version bump would also
+/// refuse every standing grant, whose meaning is unchanged.
 pub const AUTHORITY_MODEL_VERSION: u32 = 2;
 
 /// Adapters that will consume this model, with the failure mode each catches.
@@ -331,6 +336,155 @@ impl McpConfigFingerprint {
     }
 }
 
+/// A canonical sha256 encoder for authority identities: every field is written
+/// as a length-prefixed key and a length-prefixed value, so no value can
+/// impersonate a field boundary and two different inputs cannot produce the
+/// same byte stream by splicing. Every digest a grant binds to (an MCP
+/// configuration, a catalog binding, an act) is taken through this one
+/// encoder, each under its own domain.
+pub struct CanonicalEncoder {
+    hasher: sha2::Sha256,
+}
+
+impl CanonicalEncoder {
+    pub fn new(domain: &str, version: u32) -> Self {
+        let mut encoder = Self {
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+        };
+        encoder.field("domain", domain);
+        encoder.field("encoding", &version.to_string());
+        encoder
+    }
+
+    pub fn field(&mut self, key: &str, value: &str) {
+        use sha2::Digest;
+        self.hasher.update((key.len() as u64).to_be_bytes());
+        self.hasher.update(key.as_bytes());
+        self.hasher.update((value.len() as u64).to_be_bytes());
+        self.hasher.update(value.as_bytes());
+    }
+
+    /// An ordered sequence: the count is hashed too, so a list cannot be
+    /// lengthened or shortened without changing the digest.
+    pub fn sequence(&mut self, key: &str, values: &[String]) {
+        self.field(key, &values.len().to_string());
+        for (index, value) in values.iter().enumerate() {
+            self.field(&format!("{key}[{index}]"), value);
+        }
+    }
+
+    /// An unordered map, canonicalized by sorting keys. `HashMap` iteration
+    /// order is arbitrary and varies run to run, so without this the same
+    /// configuration would fingerprint differently on each attempt and no
+    /// standing grant could ever be reused.
+    pub fn map(&mut self, key: &str, values: &std::collections::HashMap<String, String>) {
+        let sorted: std::collections::BTreeMap<&String, &String> = values.iter().collect();
+        self.field(key, &sorted.len().to_string());
+        for (name, value) in sorted {
+            self.field(&format!("{key}.key"), name);
+            self.field(&format!("{key}.value"), value);
+        }
+    }
+
+    /// A JSON value, canonicalized: every node is tagged with its type before
+    /// its content, arrays keep their order and count, and object keys are
+    /// sorted. The same value therefore digests the same whatever order its
+    /// keys arrived in, while `"1"` and `1`, or `{"a.b":1}` and
+    /// `{"a":{"b":1}}`, stay distinct.
+    pub fn json(&mut self, key: &str, value: &serde_json::Value) {
+        use serde_json::Value;
+        let content = format!("{key}.value");
+        match value {
+            Value::Null => self.field(key, "null"),
+            Value::Bool(flag) => {
+                self.field(key, "bool");
+                self.field(&content, if *flag { "true" } else { "false" });
+            }
+            Value::Number(number) => {
+                self.field(key, "number");
+                self.field(&content, &number.to_string());
+            }
+            Value::String(text) => {
+                self.field(key, "string");
+                self.field(&content, text);
+            }
+            Value::Array(items) => {
+                self.field(key, "array");
+                self.field(&format!("{key}.len"), &items.len().to_string());
+                for (index, item) in items.iter().enumerate() {
+                    self.json(&format!("{key}[{index}]"), item);
+                }
+            }
+            Value::Object(entries) => {
+                self.field(key, "object");
+                self.field(&format!("{key}.len"), &entries.len().to_string());
+                let sorted: std::collections::BTreeMap<&String, &Value> = entries.iter().collect();
+                for (name, item) in sorted {
+                    self.field(&format!("{key}.key"), name);
+                    self.json(&content, item);
+                }
+            }
+        }
+    }
+
+    pub fn finish(self) -> String {
+        use sha2::Digest;
+        format!("{:x}", self.hasher.finalize())
+    }
+}
+
+/// Digest algorithm behind [`ActDigest`].
+pub const ACT_DIGEST_ALGORITHM: &str = "sha256";
+
+/// Version of the canonical encoding fed to an act digest. Bump on any change
+/// to what an adapter feeds it, so one digest can never name two acts.
+pub const ACT_DIGEST_ENCODING_VERSION: u32 = 1;
+
+const ACT_DIGEST_DOMAIN: &str = "cairn.authority.act";
+
+/// The identity of the one concrete act a request performs: the resolved
+/// content of the change, such as the value written to a settings section or
+/// the account a reset is spent from.
+///
+/// A scope names where an act lands and a mutation mode names its kind; this
+/// names the act itself, which is what an operator answering **Once** was
+/// shown. Each adapter computes it from the resolved input both check points
+/// derive the request from, never from the request's summary or other agent
+/// prose, and never from live state that can change between the gate and the
+/// pre-persist re-check, since the two must name the same act.
+///
+/// Only the algorithm, encoding version, and digest are persisted or rendered;
+/// the content it was taken over is not.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActDigest {
+    pub algorithm: String,
+    pub encoding_version: u32,
+    pub digest: String,
+}
+
+impl ActDigest {
+    /// Digest the act `kind` names, with `encode` feeding its resolved content.
+    /// `kind` separates adapters, so two kinds of act never share a digest even
+    /// when their content encodes alike.
+    pub fn of(kind: &str, encode: impl FnOnce(&mut CanonicalEncoder)) -> Self {
+        let mut encoder = CanonicalEncoder::new(ACT_DIGEST_DOMAIN, ACT_DIGEST_ENCODING_VERSION);
+        encoder.field("act", kind);
+        encode(&mut encoder);
+        Self {
+            algorithm: ACT_DIGEST_ALGORITHM.to_string(),
+            encoding_version: ACT_DIGEST_ENCODING_VERSION,
+            digest: encoder.finish(),
+        }
+    }
+
+    /// Short display form for a grant listing.
+    pub fn short(&self) -> String {
+        let head: String = self.digest.chars().take(12).collect();
+        format!("{}:v{}:{head}", self.algorithm, self.encoding_version)
+    }
+}
+
 /// Typed, system-derived facts about the concrete change a request performs.
 ///
 /// These come from the resolved bytes or configuration that would actually be
@@ -345,6 +499,10 @@ pub struct AuthorityFacts {
     /// (for a delete, the entry it would remove).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_config: Option<McpConfigFingerprint>,
+    /// The one concrete act this request performs, which a `Once` grant binds
+    /// to. See [`ActDigest`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActDigest>,
 }
 
 /// A normalized authorization request: the resolved scope plus the concrete
@@ -376,6 +534,12 @@ impl AuthorityRequest {
     /// Attach the resultant MCP configuration identity.
     pub fn with_mcp_config(mut self, fingerprint: McpConfigFingerprint) -> Self {
         self.facts.mcp_config = Some(fingerprint);
+        self
+    }
+
+    /// Attach the identity of the concrete act.
+    pub fn with_act(mut self, act: ActDigest) -> Self {
+        self.facts.act = Some(act);
         self
     }
 
@@ -424,6 +588,13 @@ pub enum AuthorityConstraint {
     /// configuration, enabled state, scope, or server name all change the
     /// digest and re-prompt.
     McpConfig { fingerprint: McpConfigFingerprint },
+    /// Only this exact act.
+    ///
+    /// Attached to `Once` grants only. A card shows one act, and Once answers
+    /// "this, this time", so the grant must not be spendable by a different
+    /// act in the same scope that happens to arrive first. Turn, session and
+    /// standing grants mean "this kind of act" and do not carry it.
+    ExactAct { digest: ActDigest },
 }
 
 impl AuthorityConstraint {
@@ -447,11 +618,18 @@ impl AuthorityConstraint {
                 // constraint exists to prevent.
                 request.facts.mcp_config.as_ref() == Some(fingerprint)
             }
+            // An act is never vacuous: a request that cannot name its act is
+            // not the act the operator approved.
+            AuthorityConstraint::ExactAct { digest } => request.facts.act.as_ref() == Some(digest),
         }
     }
 
     fn is_mcp_config(&self) -> bool {
         matches!(self, AuthorityConstraint::McpConfig { .. })
+    }
+
+    fn is_exact_act(&self) -> bool {
+        matches!(self, AuthorityConstraint::ExactAct { .. })
     }
 }
 
@@ -482,6 +660,49 @@ impl AuthorityConstraintSet {
             version: AUTHORITY_MODEL_VERSION,
             constraints,
         }
+    }
+
+    /// The constraints an operator's approval of `request` earns for
+    /// `lifetime`: exactly what the card showed, and no wider.
+    ///
+    /// - always the mutation mode shown, so approving "reconfigure linear"
+    ///   does not also approve removing it;
+    /// - for an MCP write, the configuration identity, so the approval covers
+    ///   that server and not merely its name;
+    /// - for `Once`, the act itself, so the single use is spent only by the act
+    ///   the card described.
+    ///
+    /// A request missing a fact its approval must bind is an error rather than
+    /// a wider grant: minting without the binding would either authorize more
+    /// than was shown or, under the structural floors, authorize nothing while
+    /// looking valid.
+    pub fn for_approval(
+        request: &AuthorityRequest,
+        lifetime: AuthorityLifetimeKind,
+    ) -> Result<Self, String> {
+        let mut constraints = vec![AuthorityConstraint::MutationModes {
+            modes: vec![request.mutation],
+        }];
+        if request.requires_mcp_config_binding() {
+            let fingerprint = request.facts.mcp_config.clone().ok_or_else(|| {
+                "this MCP approval does not name the configuration it would authorize".to_string()
+            })?;
+            constraints.push(AuthorityConstraint::McpConfig { fingerprint });
+        }
+        if lifetime == AuthorityLifetimeKind::Once {
+            let digest = request.facts.act.clone().ok_or_else(|| {
+                "this approval does not name the exact act it would authorize once".to_string()
+            })?;
+            constraints.push(AuthorityConstraint::ExactAct { digest });
+        }
+        Ok(Self::new(constraints))
+    }
+
+    /// Whether the set binds one exact act.
+    pub fn binds_exact_act(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(AuthorityConstraint::is_exact_act)
     }
 
     /// Parse a persisted constraint set, refusing an unknown encoding version.
@@ -806,6 +1027,18 @@ impl AuthorityGrant {
         if !self.constraints.covers(request) {
             return Err(GrantMismatch::Constraints);
         }
+        // A Once grant authorizes one exact act, structurally: one that does
+        // not bind its act (minted before the binding existed, or by a path
+        // that forgot it) covers nothing, so the operator is asked again
+        // rather than having the first act in scope spend an approval given
+        // for a different one. This floor is per lifetime rather than a model
+        // version bump, because a version bump would also refuse every
+        // standing grant, whose meaning did not change.
+        if matches!(self.lifetime, AuthorityLifetime::Once { .. })
+            && !self.constraints.binds_exact_act()
+        {
+            return Err(GrantMismatch::Constraints);
+        }
         if self.revoked_at.is_some() {
             return Err(GrantMismatch::Revoked);
         }
@@ -1062,8 +1295,15 @@ mod tests {
         }
     }
 
+    /// The act every fixture request performs, so a fixture Once grant binds
+    /// the same act its request names.
+    fn fixture_act() -> ActDigest {
+        ActDigest::of("fixture", |encoder| encoder.field("act", "the shown act"))
+    }
+
     fn request(scope: AuthorityScope, mutation: AuthorityMutation) -> AuthorityRequest {
-        let request = AuthorityRequest::new(scope, mutation, "summary".to_string());
+        let request =
+            AuthorityRequest::new(scope, mutation, "summary".to_string()).with_act(fixture_act());
         if request.requires_mcp_config_binding() {
             request.with_mcp_config(fixture_config())
         } else {
@@ -1074,19 +1314,25 @@ mod tests {
     fn grant(scope: AuthorityScope, lifetime: AuthorityLifetime) -> AuthorityGrant {
         // An MCP grant is always minted with a configuration binding, so a
         // fixture without one would be a grant the system never issues.
-        let constraints = if matches!(
+        // A Once grant is likewise always minted bound to its act.
+        let mut constraints = Vec::new();
+        if matches!(
             scope.place,
             AuthorityPlace::Tool {
                 kind: ToolKind::McpServer,
                 ..
             }
         ) {
-            AuthorityConstraintSet::new(vec![AuthorityConstraint::McpConfig {
+            constraints.push(AuthorityConstraint::McpConfig {
                 fingerprint: fixture_config(),
-            }])
-        } else {
-            AuthorityConstraintSet::default()
-        };
+            });
+        }
+        if matches!(lifetime, AuthorityLifetime::Once { .. }) {
+            constraints.push(AuthorityConstraint::ExactAct {
+                digest: fixture_act(),
+            });
+        }
+        let constraints = AuthorityConstraintSet::new(constraints);
         AuthorityGrant {
             id: "grant-1".to_string(),
             scope,
@@ -1501,6 +1747,181 @@ mod tests {
                 .is_allowed()
         );
         assert!(!AuthorityDecision::Forbidden(AuthorityReason::StructurallyInvalid).is_allowed());
+    }
+}
+
+#[cfg(test)]
+mod exact_act_tests {
+    use super::*;
+
+    fn settings(section: &str) -> AuthorityScope {
+        AuthorityScope::new(
+            AuthorityPlace::WorkspaceSettings {
+                workspace_id: "default".to_string(),
+                section: section.to_string(),
+            },
+            AuthorityAction::Write,
+        )
+    }
+
+    fn value_act(value: serde_json::Value) -> ActDigest {
+        ActDigest::of("test.section", |encoder| encoder.json("value", &value))
+    }
+
+    fn write(value: serde_json::Value) -> AuthorityRequest {
+        AuthorityRequest::new(
+            settings("models"),
+            AuthorityMutation::Update,
+            "change workspace settings section 'models'".to_string(),
+        )
+        .with_act(value_act(value))
+    }
+
+    fn minted(request: &AuthorityRequest, lifetime: AuthorityLifetime) -> AuthorityGrant {
+        AuthorityGrant {
+            id: "g".to_string(),
+            scope: request.scope.clone(),
+            principal: AuthorityPrincipal {
+                run_id: Some("run-1".to_string()),
+                ..Default::default()
+            },
+            audience: AuthorityAudience::workspace("default"),
+            constraints: AuthorityConstraintSet::for_approval(request, lifetime.kind()).unwrap(),
+            lifetime,
+            provenance: AuthorityProvenance::default(),
+            created_at: 1,
+            expires_at: None,
+            consumed_at: None,
+            revoked_at: None,
+        }
+    }
+
+    fn context() -> AuthorityContext {
+        AuthorityContext {
+            audience: Some(AuthorityAudience::workspace("default")),
+            run_id: Some("run-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn once() -> AuthorityLifetime {
+        AuthorityLifetime::Once {
+            request_id: "perm-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_once_grant_covers_the_value_it_was_shown_and_no_other() {
+        let shown = write(serde_json::json!({"pools": ["a"]}));
+        let grant = minted(&shown, once());
+        assert!(grant.matches(&shown, &context(), 2));
+        let other = write(serde_json::json!({"pools": ["b"]}));
+        assert_eq!(
+            grant.check(&other, &context(), 2),
+            Err(GrantMismatch::Constraints)
+        );
+    }
+
+    #[test]
+    fn a_request_that_names_no_act_matches_no_once_grant() {
+        let shown = write(serde_json::json!(1));
+        let grant = minted(&shown, once());
+        let mut unnamed = shown.clone();
+        unnamed.facts.act = None;
+        assert_eq!(
+            grant.check(&unnamed, &context(), 2),
+            Err(GrantMismatch::Constraints)
+        );
+    }
+
+    /// The persisted-without-the-constraint case: a Once grant that does not
+    /// bind its act covers nothing, and the operator is asked again.
+    #[test]
+    fn a_once_grant_that_binds_no_act_covers_nothing() {
+        let shown = write(serde_json::json!(1));
+        let mut legacy = minted(&shown, once());
+        legacy.constraints =
+            AuthorityConstraintSet::new(vec![AuthorityConstraint::MutationModes {
+                modes: vec![AuthorityMutation::Update],
+            }]);
+        assert_eq!(
+            legacy.check(&shown, &context(), 2),
+            Err(GrantMismatch::Constraints)
+        );
+    }
+
+    /// Turn, session and standing grants mean "this kind of act": they bind no
+    /// act, and any act in their scope and mode is covered.
+    #[test]
+    fn wider_lifetimes_cover_every_act_of_their_kind() {
+        let shown = write(serde_json::json!(1));
+        let other = write(serde_json::json!(2));
+        for lifetime in [
+            AuthorityLifetime::Turn {
+                turn_id: "turn-1".to_string(),
+            },
+            AuthorityLifetime::Session {
+                session_id: "session-1".to_string(),
+            },
+            AuthorityLifetime::Standing,
+        ] {
+            let grant = minted(&shown, lifetime.clone());
+            assert!(!grant.constraints.binds_exact_act(), "{lifetime:?}");
+            assert!(grant.matches(&other, &context(), 2), "{lifetime:?}");
+        }
+    }
+
+    #[test]
+    fn a_once_approval_that_cannot_name_its_act_mints_nothing() {
+        let mut unnamed = write(serde_json::json!(1));
+        unnamed.facts.act = None;
+        let error = AuthorityConstraintSet::for_approval(&unnamed, AuthorityLifetimeKind::Once)
+            .unwrap_err();
+        assert!(error.contains("exact act"), "{error}");
+        // The wider lifetimes never needed one.
+        assert!(
+            AuthorityConstraintSet::for_approval(&unnamed, AuthorityLifetimeKind::Standing).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_exact_act_constraint_round_trips_through_storage() {
+        let set = AuthorityConstraintSet::for_approval(
+            &write(serde_json::json!(1)),
+            AuthorityLifetimeKind::Once,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains("\"constraint\":\"exact_act\""), "{json}");
+        assert_eq!(AuthorityConstraintSet::parse(&json).unwrap(), set);
+    }
+
+    #[test]
+    fn the_canonical_json_digest_ignores_key_order_and_nothing_else() {
+        let a = value_act(serde_json::json!({"x": 1, "y": [true, null]}));
+        let b = value_act(serde_json::from_str(r#"{"y":[true,null],"x":1}"#).unwrap());
+        assert_eq!(a, b);
+        for different in [
+            serde_json::json!({"x": "1", "y": [true, null]}),
+            serde_json::json!({"x": 1, "y": [null, true]}),
+            serde_json::json!({"x": 1, "y": [true]}),
+            serde_json::json!({"x": 1}),
+        ] {
+            assert_ne!(value_act(different.clone()), a, "{different}");
+        }
+        assert_ne!(
+            value_act(serde_json::json!({"a.b": 1})),
+            value_act(serde_json::json!({"a": {"b": 1}}))
+        );
+        // Two kinds of act never share a digest over the same content.
+        assert_ne!(
+            ActDigest::of("one", |encoder| encoder
+                .json("value", &serde_json::json!(1))),
+            ActDigest::of("two", |encoder| encoder
+                .json("value", &serde_json::json!(1)))
+        );
     }
 }
 

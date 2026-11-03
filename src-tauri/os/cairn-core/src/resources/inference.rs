@@ -16,7 +16,7 @@ use crate::fleet::models::requests::RequestState;
 use crate::fleet::models::store::ANSWERED_KEPT_MS;
 use crate::fleet::models::{ModelsView, PoolView, ResidentView};
 use crate::orchestrator::inference::InferenceView;
-use crate::orchestrator::inference_control::LoadRow;
+use crate::orchestrator::inference_control::{self, LoadRow};
 use crate::orchestrator::inference_verify::VerificationRow;
 use cairn_inference::control::{gib, Phase as DeploymentPhase};
 use cairn_inference::{unknown_address, Addresses, Deployment, DeploymentId};
@@ -533,6 +533,15 @@ fn need_line(
     }
 }
 
+/// What a cold load's line says of it.
+fn cold_note(load: &LoadRow) -> &'static str {
+    if load.cold {
+        ", cold: its start downloaded what it serves first"
+    } else {
+        ""
+    }
+}
+
 fn load_line(view: &InferenceView, load: &LoadRow) -> String {
     let waited = load
         .sent_at
@@ -545,9 +554,10 @@ fn load_line(view: &InferenceView, load: &LoadRow) -> String {
         .unwrap_or_default();
     match (load.healthy, load.load_ms) {
         (true, Some(ms)) => format!(
-            "- {}: healthy after {}{waited}; settled footprint {}{}",
+            "- {}: healthy after {}{}{waited}; settled footprint {}{}",
             at(view, load.finished_at),
             duration(ms),
+            cold_note(load),
             load.footprint
                 .as_ref()
                 .map_or("not recorded yet".to_string(), footprint_line),
@@ -639,18 +649,32 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
     }
     head_lines(&mut out, view, deployment);
     let loads = view.deployment_control.loads.get(&id);
-    match loads.and_then(|loads| {
+    let latest = loads.and_then(|loads| {
         loads
             .iter()
             .find(|load| load.healthy && load.load_ms.is_some())
-    }) {
+    });
+    match latest {
         Some(load) => {
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                "- last measured load: {} to health, finished {}",
+                "- last measured load: {} to health{}, finished {}",
                 duration(load.load_ms.unwrap_or_default()),
+                cold_note(load),
                 at(view, load.finished_at)
             );
+            let reference = loads.and_then(|loads| inference_control::reference_load(loads));
+            match reference.filter(|reference| !std::ptr::eq(*reference, load)) {
+                Some(warm) => {
+                    let _ = writeln!(
+                        out,
+                        "; its pool's windows weigh its latest load from cache instead, {} to health, finished {}",
+                        duration(warm.load_ms.unwrap_or_default()),
+                        at(view, warm.finished_at)
+                    );
+                }
+                None => out.push_str("; its pool's windows weigh this load for it\n"),
+            }
         }
         None => out.push_str("- last measured load: none yet\n"),
     }
@@ -1576,6 +1600,7 @@ machines:
                     ("sp1".to_string(), 100u64 << 30),
                     ("sp2".to_string(), 98u64 << 30),
                 ])),
+                cold: false,
             }],
         );
         let page = render_deployment(&view, "dsv4f-tp2", &[]);
@@ -1609,9 +1634,34 @@ machines:
             "{page}"
         );
         assert!(
+            page.contains("- last measured load: 5m 12s to health, finished 2027-01-15 07:58:00 UTC (2m ago); its pool's windows weigh this load for it\n"),
+            "{page}"
+        );
+        assert!(
             page.contains(
                 "a write to cairn://inference may not remove it or move it to other machines"
             ),
+            "{page}"
+        );
+
+        // A newer load that pulled its image first: the windows keep
+        // weighing the load from cache.
+        let mut pulled = view.deployment_control.loads[&DeploymentId::from("dsv4f-tp2")][0].clone();
+        pulled.finished_at = NOW - 60_000;
+        pulled.load_ms = Some(611_000);
+        pulled.cold = true;
+        view.deployment_control
+            .loads
+            .get_mut(&DeploymentId::from("dsv4f-tp2"))
+            .unwrap()
+            .insert(0, pulled);
+        let page = render_deployment(&view, "dsv4f-tp2", &[]);
+        assert!(
+            page.contains("- last measured load: 10m 11s to health, cold: its start downloaded what it serves first, finished 2027-01-15 07:59:00 UTC (1m ago); its pool's windows weigh its latest load from cache instead, 5m 12s to health, finished 2027-01-15 07:58:00 UTC (2m ago)\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("healthy after 10m 11s, cold: its start downloaded what it serves first; waited 8s for its machines"),
             "{page}"
         );
 

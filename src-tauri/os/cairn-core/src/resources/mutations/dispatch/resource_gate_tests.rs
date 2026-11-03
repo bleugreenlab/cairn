@@ -2,7 +2,6 @@ use super::feed::ack_token;
 use super::todos::parse_todo_write_items;
 use super::wakes::{
     normalize_posts_filter, parse_schedule_create, parse_schedule_reference, parse_wake_filter,
-    terminal_slug_from_ref,
 };
 use super::*;
 
@@ -441,17 +440,6 @@ fn a_feed_acknowledgement_carries_a_token_and_nothing_else() {
             "payload must be refused: {payload}"
         );
     }
-}
-
-#[test]
-fn terminal_slug_from_ref_strips_prefixes() {
-    assert_eq!(terminal_slug_from_ref("run-1"), "run-1");
-    assert_eq!(terminal_slug_from_ref("cairn:~/terminal/run-1"), "run-1");
-    assert_eq!(
-        terminal_slug_from_ref("cairn://p/cairn/1/1/builder/terminal/run-1"),
-        "run-1"
-    );
-    assert_eq!(terminal_slug_from_ref("  dev  "), "dev");
 }
 
 #[test]

@@ -31,12 +31,22 @@
 //! [`witness`] is the only projection of this store that cache validation may
 //! see. It carries issuer, resource, client, scopes and generation, and has no
 //! field that could hold a token or client secret.
+//!
+//! ## Rejection
+//!
+//! Whether a stored token still works is not knowable offline: a provider can
+//! revoke it at any time. A protected resource answering `401` is the one
+//! definitive signal, and [`reject`] is where it lands. It renews the
+//! credential when it can, and otherwise records the rejection on the record,
+//! so [`status`] reports `needs_auth` and the pack readiness gate
+//! (`config::mcp_servers`) withholds the server, until the user authorizes
+//! again and a fresh record replaces it.
 
 use cairn_packs::server_config::{CatalogOAuthContext, CredentialGeneration};
 use keyring::{Entry, Error};
 use serde::{Deserialize, Serialize};
 
-use super::{refresh_access_token, TokenSet, EXPIRY_SKEW_SECS};
+use super::{refresh_access_token, TokenRequestError, TokenSet, EXPIRY_SKEW_SECS};
 use crate::config::credential_witness::{self, CredentialMutationGuard};
 
 /// Short-lived authorization state stored in the same keychain namespace as
@@ -103,6 +113,13 @@ pub struct StoredAuth {
     /// granted. Surfaced as a step-up prompt; the next authorize widens to these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needs_scopes: Vec<String>,
+    /// When (unix seconds) the protected resource refused this record's access
+    /// token and no refresh could replace it. See [`reject`]. A rejected record
+    /// is never presented again and reports `needs_auth`; it is kept rather
+    /// than signed out because a re-authorize against a server without dynamic
+    /// client registration reuses its client identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at: Option<i64>,
 }
 
 impl StoredAuth {
@@ -117,6 +134,7 @@ impl StoredAuth {
     /// Fold a freshly obtained/refreshed token set into the stored record,
     /// preserving endpoints and client identity.
     fn apply_tokens(&mut self, tokens: TokenSet) {
+        self.rejected_at = None;
         self.access_token = tokens.access_token;
         if tokens.refresh_token.is_some() {
             self.refresh_token = tokens.refresh_token;
@@ -168,6 +186,17 @@ impl OAuthStatus {
             detail: None,
             scopes: Vec::new(),
             needs_scopes: Vec::new(),
+        }
+    }
+
+    /// The server refused the stored token and it could not be renewed.
+    fn rejected() -> Self {
+        Self {
+            detail: Some(
+                "The server rejected the stored authorization. Authorize again to reconnect."
+                    .to_string(),
+            ),
+            ..Self::needs_auth()
         }
     }
 
@@ -359,9 +388,15 @@ fn update(server: &str, change: impl FnOnce(&mut StoredAuth)) -> Result<(), Stri
     write_auth(&guard, server, &current, &auth)
 }
 
-/// Commit a refreshed record only if the stored value is still byte-for-byte
-/// the one the refresh started from. `Ok(false)` means it was superseded.
-fn commit_refresh(server: &str, started_from: &str, auth: &StoredAuth) -> Result<bool, String> {
+/// Commit a record derived from `started_from` (a refresh, a recorded
+/// rejection) only if the stored value is still byte-for-byte that one.
+/// `Ok(false)` means a sign-in or sign-out superseded it, and nothing was
+/// written.
+fn commit_unless_superseded(
+    server: &str,
+    started_from: &str,
+    auth: &StoredAuth,
+) -> Result<bool, String> {
     let guard = credential_witness::acquire()?;
     let (current, raw) = read_current(server);
     if raw.as_deref() != Some(started_from) {
@@ -411,11 +446,13 @@ pub fn witness(server: &str) -> OAuthWitness {
 /// The authorization status for `server`. A stored token reports `authorized`
 /// (the gateway refreshes it on use when a refresh token is present); a stored
 /// token that is already expired AND has no refresh token reports `needs_auth`,
-/// because it cannot be made usable without a fresh authorize. Reporting such a
-/// dead token as `authorized` is what showed a green "Authorized" badge while
-/// every connection failed. Surfaces any pending step-up scopes.
+/// because it cannot be made usable without a fresh authorize, and so does one
+/// the server has [rejected](reject). Reporting such a dead token as
+/// `authorized` is what showed a green "Authorized" badge while every
+/// connection failed. Surfaces any pending step-up scopes.
 pub fn status(server: &str) -> OAuthStatus {
     match load(server) {
+        Some(auth) if auth.rejected_at.is_some() => OAuthStatus::rejected(),
         Some(auth) if auth.is_expired() && auth.refresh_token.is_none() => {
             OAuthStatus::needs_auth()
         }
@@ -447,24 +484,120 @@ pub fn record_scope_step_up(server: &str, required: &[String]) {
     }
 }
 
-/// Drop the cached record for `server` from memory of validity by clearing its
-/// expiry so the next [`get_valid_access_token`] forces a refresh. Used by the
-/// gateway after a `401` to recover from a server-side revocation.
-pub fn force_expire(server: &str) {
-    if let Err(e) = update(server, |auth| auth.expires_at = Some(0)) {
-        log::warn!("Failed to expire OAuth tokens for {server}: {e}");
+/// What became of a stored credential that a protected resource refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    /// A different access token is stored now: renewed here by the refresh
+    /// grant, or replaced by a sign-in while the request was in flight. Worth
+    /// exactly one retry.
+    Retry,
+    /// Recorded. The credential cannot be made usable without the user
+    /// authorizing again, so [`status`] now reports `needs_auth`. The caller
+    /// owns announcing it, because readiness is derived on read and nothing
+    /// else will.
+    NeedsAuth,
+    /// Nothing definitive was learned (a refresh that failed in transit, an
+    /// unreadable keychain, no live credential to reject), so the record is
+    /// untouched.
+    Unchanged,
+}
+
+/// The protected resource answered `401` to a request authenticated as
+/// `server`. `presented` is the bearer that request carried, or `None` when it
+/// went out without one.
+///
+/// A `401` is definitive about the access token, not about the grant behind
+/// it: early expiry and revocation look identical from here. So when
+/// `may_refresh` holds and a refresh token exists, the refresh grant is tried
+/// first, and the rejection is recorded only when no refresh is possible or the
+/// authorization server refuses it too. A refresh that fails in transit proves
+/// nothing and leaves the record alone. The caller passes `may_refresh: false`
+/// when the refused token is one a refresh or sign-in just produced, so a
+/// resource that refuses every token it is given cannot keep a dead credential
+/// looking authorized forever.
+///
+/// Every write is conditional on the record still being the one this read, so
+/// a sign-in or sign-out that lands meanwhile is never overwritten; it reads
+/// as [`Rejection::Retry`].
+pub async fn reject(server: &str, presented: Option<&str>, may_refresh: bool) -> Rejection {
+    let (mut auth, started_from) = match read_current(server) {
+        (Current::Witnessed(auth, _) | Current::Legacy(auth), Some(raw)) => (auth, raw),
+        _ => return Rejection::Unchanged,
+    };
+    if auth.rejected_at.is_some() {
+        return Rejection::Unchanged;
+    }
+    let superseded = match presented {
+        Some(token) => token != auth.access_token,
+        // No bearer went out, yet a usable one is stored: it arrived after the
+        // request was built.
+        None => !auth.is_expired(),
+    };
+    if superseded {
+        return Rejection::Retry;
+    }
+    // A request that went out bare refused no freshly produced token, so a
+    // renewal is still worth trying.
+    let may_refresh = may_refresh || presented.is_none();
+
+    if let Some(refresh_token) = auth.refresh_token.clone().filter(|_| may_refresh) {
+        match refresh_access_token(
+            &auth.token_endpoint,
+            &auth.client_id,
+            auth.client_secret.as_deref(),
+            &refresh_token,
+            &auth.resource,
+            scope_param(&auth.scopes).as_deref(),
+        )
+        .await
+        {
+            Ok(tokens) => {
+                auth.apply_tokens(tokens);
+                // Committed, or superseded by a newer sign-in: either way a
+                // different token is stored now.
+                return match commit_unless_superseded(server, &started_from, &auth) {
+                    Ok(_) => Rejection::Retry,
+                    Err(e) => {
+                        log::warn!("Failed to persist refreshed OAuth tokens for {server}: {e}");
+                        Rejection::Unchanged
+                    }
+                };
+            }
+            Err(TokenRequestError::Refused(e)) => {
+                log::info!("OAuth refresh for {server} was refused after a 401: {e}");
+            }
+            Err(TokenRequestError::Failed(e)) => {
+                log::warn!("OAuth refresh for {server} failed after a 401: {e}");
+                return Rejection::Unchanged;
+            }
+        }
+    }
+
+    auth.rejected_at = Some(chrono::Utc::now().timestamp());
+    match commit_unless_superseded(server, &started_from, &auth) {
+        Ok(true) => {
+            log::warn!(
+                "MCP server {server} rejected its OAuth credential; it needs authorizing again"
+            );
+            Rejection::NeedsAuth
+        }
+        Ok(false) => Rejection::Retry,
+        Err(e) => {
+            log::warn!("Failed to record the OAuth rejection for {server}: {e}");
+            Rejection::Unchanged
+        }
     }
 }
 
 /// Resolve a currently-valid access token for `server`, refreshing via the
 /// refresh-token grant when the stored token is expired (or within the skew
-/// window). Returns `None` when the server has no stored authorization or a
-/// refresh is impossible/failed — the gateway then surfaces "authorization
-/// required".
+/// window). Returns `None` when the server has no stored authorization, the
+/// server has [rejected](reject) it, or a refresh is impossible/failed — the
+/// gateway then surfaces "authorization required".
 pub async fn get_valid_access_token(server: &str) -> Option<String> {
     let (current, raw) = read_current(server);
     let mut auth = match current {
-        Current::Witnessed(auth, _) | Current::Legacy(auth) => auth,
+        Current::Witnessed(auth, _) | Current::Legacy(auth) if auth.rejected_at.is_none() => auth,
         _ => return None,
     };
     if !auth.is_expired() {
@@ -484,7 +617,7 @@ pub async fn get_valid_access_token(server: &str) -> Option<String> {
     {
         Ok(tokens) => {
             auth.apply_tokens(tokens);
-            match commit_refresh(server, &started_from, &auth) {
+            match commit_unless_superseded(server, &started_from, &auth) {
                 Ok(true) => Some(auth.access_token),
                 // Signed out or replaced while the refresh was in flight. The
                 // refreshed tokens belong to the old credential and are dropped;
@@ -537,6 +670,7 @@ mod tests {
             expires_at: Some(chrono::Utc::now().timestamp() + 3600),
             scopes: vec!["read".to_string()],
             needs_scopes: Vec::new(),
+            rejected_at: None,
         }
     }
 
@@ -724,7 +858,7 @@ mod tests {
         );
         assert_eq!(first.generation.incarnation, second.generation.incarnation);
         assert_eq!(second.generation.counter, first.generation.counter + 1);
-        force_expire(server);
+        record_scope_step_up(server, &["write".to_string()]);
         assert_eq!(
             signed_in(server).generation.counter,
             second.generation.counter + 1
@@ -750,10 +884,9 @@ mod tests {
         assert!(tombstone.counter > a.generation.counter);
         assert!(load(server).is_none());
         assert_eq!(status(server).state, "needs_auth");
-        // Signing out twice changes nothing; force-expire and step-up cannot
-        // resurrect a signed-out record.
+        // Signing out twice changes nothing; a step-up cannot resurrect a
+        // signed-out record.
         delete(server).unwrap();
-        force_expire(server);
         record_scope_step_up(server, &["admin".to_string()]);
         assert_eq!(witness(server), OAuthWitness::SignedOut(tombstone.clone()));
         // A sign-in and sign-out leaves a different signed-out witness, never
@@ -800,13 +933,13 @@ mod tests {
         let b = signed_in(server);
         let mut refreshed = sample("account-a");
         refreshed.access_token = "account-a-refreshed".into();
-        assert!(!commit_refresh(server, &started_from, &refreshed).unwrap());
+        assert!(!commit_unless_superseded(server, &started_from, &refreshed).unwrap());
         assert_eq!(load(server).unwrap().access_token, "account-b");
         assert_eq!(signed_in(server), b);
         // Likewise after a sign-out: the refresh must not sign A back in.
         let (_, started_from) = read_current(server);
         delete(server).unwrap();
-        assert!(!commit_refresh(server, &started_from.unwrap(), &refreshed).unwrap());
+        assert!(!commit_unless_superseded(server, &started_from.unwrap(), &refreshed).unwrap());
         assert!(matches!(witness(server), OAuthWitness::SignedOut(_)));
     }
 
@@ -817,9 +950,12 @@ mod tests {
         save(server, &sample("token")).unwrap();
         let before = signed_in(server);
         let (_, started_from) = read_current(server);
-        assert!(
-            commit_refresh(server, &started_from.unwrap(), &sample("token-refreshed")).unwrap()
-        );
+        assert!(commit_unless_superseded(
+            server,
+            &started_from.unwrap(),
+            &sample("token-refreshed")
+        )
+        .unwrap());
         assert_eq!(load(server).unwrap().access_token, "token-refreshed");
         assert_eq!(
             signed_in(server).generation.counter,
@@ -857,6 +993,170 @@ mod tests {
             signed_in(server).generation.incarnation,
             original.generation.incarnation
         );
+    }
+
+    /// A loopback token endpoint answering every request with `status` and
+    /// `body`, counting the requests it receives.
+    async fn token_endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [("content-type", "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://127.0.0.1:{port}/token"), hits)
+    }
+
+    fn refreshable_at(token_endpoint: &str, access_token: &str) -> StoredAuth {
+        StoredAuth {
+            token_endpoint: token_endpoint.to_string(),
+            ..sample(access_token)
+        }
+    }
+
+    fn hits(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_that_cannot_refresh_needs_auth_until_authorized_again() {
+        mock_keychain::install();
+        let server = "reject-no-refresh";
+        let mut auth = sample("revoked");
+        auth.refresh_token = None;
+        save(server, &auth).unwrap();
+        let before = signed_in(server).generation;
+
+        assert_eq!(
+            reject(server, Some("revoked"), true).await,
+            Rejection::NeedsAuth
+        );
+        let st = status(server);
+        assert_eq!(st.state, "needs_auth");
+        assert!(st.detail.is_some(), "the UI should say why: {st:?}");
+        // Never presented again, and the generation moved so caches notice.
+        assert!(get_valid_access_token(server).await.is_none());
+        assert!(signed_in(server).generation.counter > before.counter);
+        // Kept, not signed out: a re-authorize may reuse its client identity.
+        assert_eq!(load(server).unwrap().client_id, "client-123");
+        // Recorded once, so a caller announces the transition once.
+        assert_eq!(
+            reject(server, Some("revoked"), true).await,
+            Rejection::Unchanged
+        );
+        assert_eq!(reject(server, None, true).await, Rejection::Unchanged);
+
+        // Authorizing again writes a fresh record and the rejection is gone.
+        save(server, &sample("fresh")).unwrap();
+        assert_eq!(status(server).state, "authorized");
+        assert_eq!(
+            get_valid_access_token(server).await.as_deref(),
+            Some("fresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejection_of_a_token_no_longer_stored_is_a_retry_and_never_a_write() {
+        mock_keychain::install();
+        let server = "reject-superseded";
+        let mut auth = sample("current");
+        auth.refresh_token = None;
+        save(server, &auth).unwrap();
+        let before = signed_in(server);
+
+        // A sign-in landed after the refused request was sent.
+        assert_eq!(reject(server, Some("stale"), true).await, Rejection::Retry);
+        // The request went out bare, but a usable token is stored now.
+        assert_eq!(reject(server, None, true).await, Rejection::Retry);
+        assert_eq!(signed_in(server), before);
+        assert_eq!(status(server).state, "authorized");
+
+        // A signed-out credential has nothing left to reject or resurrect.
+        delete(server).unwrap();
+        let signed_out = witness(server);
+        assert_eq!(
+            reject(server, Some("current"), true).await,
+            Rejection::Unchanged
+        );
+        assert_eq!(witness(server), signed_out);
+        assert_eq!(
+            reject("reject-never-stored", None, true).await,
+            Rejection::Unchanged
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refreshable_rejection_renews_before_it_demotes() {
+        mock_keychain::install();
+        let server = "reject-renews";
+        let (endpoint, requests) = token_endpoint(
+            200,
+            r#"{"access_token":"renewed","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .await;
+        save(server, &refreshable_at(&endpoint, "revoked")).unwrap();
+
+        assert_eq!(
+            reject(server, Some("revoked"), true).await,
+            Rejection::Retry
+        );
+        assert_eq!(hits(&requests), 1);
+        assert_eq!(load(server).unwrap().access_token, "renewed");
+        assert_eq!(status(server).state, "authorized");
+
+        // The renewed token is refused too: that is definitive, and a second
+        // refresh would only produce another token the resource refuses.
+        assert_eq!(
+            reject(server, Some("renewed"), false).await,
+            Rejection::NeedsAuth
+        );
+        assert_eq!(hits(&requests), 1);
+        assert_eq!(status(server).state, "needs_auth");
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_demotes_and_a_failed_one_changes_nothing() {
+        mock_keychain::install();
+
+        let refused = "reject-refresh-refused";
+        let (endpoint, requests) = token_endpoint(400, r#"{"error":"invalid_grant"}"#).await;
+        save(refused, &refreshable_at(&endpoint, "revoked")).unwrap();
+        assert_eq!(
+            reject(refused, Some("revoked"), true).await,
+            Rejection::NeedsAuth
+        );
+        assert_eq!(hits(&requests), 1);
+        assert_eq!(status(refused).state, "needs_auth");
+
+        // An outage at the authorization server says nothing about the grant.
+        let unavailable = "reject-refresh-unavailable";
+        let (endpoint, requests) = token_endpoint(503, "upstream unavailable").await;
+        save(unavailable, &refreshable_at(&endpoint, "maybe-revoked")).unwrap();
+        let before = signed_in(unavailable);
+        assert_eq!(
+            reject(unavailable, Some("maybe-revoked"), true).await,
+            Rejection::Unchanged
+        );
+        assert_eq!(hits(&requests), 1);
+        assert_eq!(signed_in(unavailable), before);
+        assert_eq!(status(unavailable).state, "authorized");
     }
 
     #[test]

@@ -155,12 +155,6 @@ const GRANT_REVOKE: KeySpec = KeySpec::new(
     "must be true; takes effect on the next authorization check",
 );
 
-const GRANT_REVOKED_BY: KeySpec = KeySpec::new(
-    "revokedBy",
-    KeyType::Str,
-    "who revoked it, recorded on the grant",
-);
-
 pub(crate) const GRANTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Grants,
     uri_template: "cairn://grants",
@@ -179,15 +173,15 @@ pub(crate) const GRANT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Grant,
     uri_template: "cairn://grants/{id}",
     name: "Authority grant",
-    description: "One journaled authority grant: its normalized scope, typed constraints, principal, audience, lifetime and status, provenance, and every authorization decision that cited it. Patch with revoke:true to revoke it; revocation is recorded with the revoker and takes effect on the very next authorization check, so a standing grant stops authorizing immediately rather than at the end of some window. A grant is never deleted — the journal that cites it has to stay readable.",
+    description: "One journaled authority grant: its normalized scope, typed constraints, principal, audience, lifetime and status, provenance, and every authorization decision that cited it. Patch with revoke:true to revoke a grant you hold: a once, turn or session grant minted for your own run, or a standing grant bound to you. Anyone else's grant, and every standing grant with no principal (those are workspace-wide), is the operator's to revoke at Settings → Grants in the Cairn desktop app, and a patch here is refused naming whose grant it is. Revocation records the revoker the runner resolved, never a name the caller gives, and takes effect on the very next authorization check, so a standing grant stops authorizing immediately rather than at the end of some window. A grant is never deleted — the journal that cites it has to stay readable.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
     mutations: &[MutationSpec {
         mode: ChangeMode::Patch,
         required: &[GRANT_REVOKE],
-        optional: &[GRANT_REVOKED_BY],
-        label: "revoke a grant",
+        optional: &[],
+        label: "revoke a grant you hold (the operator revokes any grant at Settings → Grants)",
         example: r#"write({changes:[{target:"cairn://grants/GRANT_ID",mode:"patch",payload:{revoke:true}}]})"#,
     }],
 };
@@ -253,7 +247,7 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
                     EXECUTOR_RUNTIME_POLICY,
                     EXECUTOR_DRAINING,
                     EXECUTOR_ROLE,
-                    EXECUTOR_DESKTOP_AUTOMATION,
+                    EXECUTOR_MACHINE_SERVICES,
                     EXECUTOR_REPAIRED,
                     EXECUTOR_BUILD_ROOT,
                     EXECUTOR_EXPECTED_GENERATION,

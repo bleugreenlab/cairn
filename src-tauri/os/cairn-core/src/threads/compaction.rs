@@ -144,7 +144,6 @@ pub struct EraMint {
     pub started_at: i64,
     pub ended_at: i64,
     pub summary: String,
-    pub source_tokens: i64,
     pub children: Vec<ChildMark>,
 }
 
@@ -329,11 +328,11 @@ pub async fn persist_generation(
                 conn.execute(
                     "INSERT INTO thread_eras (
                          job_id, seq, start_block, end_block, started_at, ended_at,
-                         summary, summary_status, source_tokens, minted_generation, created_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fallback', ?8, ?9, ?10)",
+                         summary, summary_status, minted_generation, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fallback', ?8, ?9)",
                     params![job_id.as_str(), eras_through_seq, mint.start_block, mint.end_block,
                         mint.started_at, mint.ended_at, mint.summary.as_str(),
-                        mint.source_tokens, generation, now],
+                        generation, now],
                 ).await?;
                 for child in &mint.children {
                     conn.execute(

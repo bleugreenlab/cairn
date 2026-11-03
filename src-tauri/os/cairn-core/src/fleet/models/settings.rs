@@ -4,11 +4,19 @@
 //! One idle window governs both directions of a pool's idleness: a resident
 //! with no request for that long may be evicted when other work is refused
 //! for its room, and a pool with no batch work for that long places its warm
-//! model. It derives from the slowest healthy load recorded on the pool, with
-//! one operator override per pool. The minimum residency and the load bound
-//! always derive: a load measured at four minutes is protected for sixteen and
-//! given up at twelve, whatever anyone sets. The multiples are starting
-//! values, not a cost model.
+//! model. It derives from what a reload costs now, with one operator override
+//! per pool. The minimum residency and the load bound always derive: a load
+//! measured at four minutes is protected for sixteen and given up at twelve,
+//! whatever anyone sets. The multiples are starting values, not a cost model.
+//!
+//! What a reload costs now is each deployment's latest healthy load, passing
+//! over one whose start downloaded what it serves (a container image pull)
+//! while a load from cache is on record
+//! ([`inference_control::reference_load`](crate::orchestrator::inference_control::reference_load)),
+//! and the slowest of those across the pool's deployments, since the pool's
+//! windows must cover reloading whichever model it holds. It is never the
+//! slowest load on record: a first load that pulled its image would otherwise
+//! govern the pool for as long as the record kept it.
 
 use std::fmt;
 
@@ -17,14 +25,24 @@ use serde::Serialize;
 /// Epoch milliseconds.
 pub type Ms = i64;
 
+/// The load a pool's windows derive from: its time to health in whole
+/// seconds, and whether it downloaded what it serves first, which it is only
+/// when no load from cache is on record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasuredLoad {
+    pub secs: u64,
+    pub cold: bool,
+}
+
 /// Where an effective setting came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SettingOrigin {
     /// The operator set the pool's idle window.
     Operator,
-    /// Derived from the slowest recorded load on the pool.
-    Measured { load_secs: u64 },
+    /// Derived from the latest measured load on the pool (see the module).
+    Measured(MeasuredLoad),
     /// No load recorded yet.
     BuiltIn,
 }
@@ -48,12 +66,16 @@ impl fmt::Display for Setting {
         write!(f, "{}", duration_label(self.secs))?;
         match self.origin {
             SettingOrigin::Operator => f.write_str(" (operator)"),
-            SettingOrigin::Measured { load_secs } => {
+            SettingOrigin::Measured(load) => {
                 write!(
                     f,
-                    " (from a measured load of {})",
-                    duration_label(load_secs)
-                )
+                    " (from the latest measured load of {}",
+                    duration_label(load.secs)
+                )?;
+                if load.cold {
+                    f.write_str(", which downloaded first; no load from cache is measured yet")?;
+                }
+                f.write_str(")")
             }
             SettingOrigin::BuiltIn => f.write_str(" (built-in; no load measured yet)"),
         }
@@ -102,11 +124,11 @@ const LOAD_BOUND: Rule = Rule {
     built_in: 30 * MINUTE,
 };
 
-fn derived(rule: Rule, measured_load_secs: Option<u64>) -> Setting {
-    match measured_load_secs {
-        Some(load_secs) => Setting {
-            secs: load_secs.saturating_mul(rule.multiple).max(rule.floor),
-            origin: SettingOrigin::Measured { load_secs },
+fn derived(rule: Rule, measured: Option<MeasuredLoad>) -> Setting {
+    match measured {
+        Some(load) => Setting {
+            secs: load.secs.saturating_mul(rule.multiple).max(rule.floor),
+            origin: SettingOrigin::Measured(load),
         },
         None => Setting {
             secs: rule.built_in,
@@ -116,19 +138,19 @@ fn derived(rule: Rule, measured_load_secs: Option<u64>) -> Setting {
 }
 
 impl EffectiveSettings {
-    /// The windows in force, given the pool's idle override and the slowest
-    /// healthy load recorded on it, in whole seconds.
-    pub fn derive(idle_override_secs: Option<u64>, measured_load_secs: Option<u64>) -> Self {
+    /// The windows in force, given the pool's idle override and the load
+    /// they derive from (see the module).
+    pub fn derive(idle_override_secs: Option<u64>, measured: Option<MeasuredLoad>) -> Self {
         Self {
             idle: match idle_override_secs {
                 Some(secs) => Setting {
                     secs,
                     origin: SettingOrigin::Operator,
                 },
-                None => derived(IDLE, measured_load_secs),
+                None => derived(IDLE, measured),
             },
-            min_residency: derived(MIN_RESIDENCY, measured_load_secs),
-            load_bound: derived(LOAD_BOUND, measured_load_secs),
+            min_residency: derived(MIN_RESIDENCY, measured),
+            load_bound: derived(LOAD_BOUND, measured),
         }
     }
 }
@@ -165,9 +187,13 @@ pub fn relative(at: Ms, now: Ms) -> String {
 mod tests {
     use super::*;
 
+    fn warm(secs: u64) -> Option<MeasuredLoad> {
+        Some(MeasuredLoad { secs, cold: false })
+    }
+
     #[test]
     fn the_override_wins_for_the_idle_window_and_the_rest_always_derive() {
-        let measured = EffectiveSettings::derive(Some(90), Some(8 * MINUTE));
+        let measured = EffectiveSettings::derive(Some(90), warm(8 * MINUTE));
         assert_eq!(
             measured.idle,
             Setting {
@@ -179,12 +205,13 @@ mod tests {
         assert_eq!(measured.load_bound.secs, 24 * MINUTE);
         assert_eq!(
             measured.load_bound.origin,
-            SettingOrigin::Measured {
-                load_secs: 8 * MINUTE
-            }
+            SettingOrigin::Measured(MeasuredLoad {
+                secs: 8 * MINUTE,
+                cold: false
+            })
         );
         assert_eq!(
-            EffectiveSettings::derive(None, Some(8 * MINUTE)).idle.secs,
+            EffectiveSettings::derive(None, warm(8 * MINUTE)).idle.secs,
             48 * MINUTE
         );
 
@@ -196,7 +223,7 @@ mod tests {
 
     #[test]
     fn a_fast_load_never_derives_below_the_floor() {
-        let fast = EffectiveSettings::derive(None, Some(20));
+        let fast = EffectiveSettings::derive(None, warm(20));
         assert_eq!(fast.idle.secs, 15 * MINUTE);
         assert_eq!(fast.min_residency.secs, 10 * MINUTE);
         assert_eq!(fast.load_bound.secs, 5 * MINUTE);
@@ -204,10 +231,21 @@ mod tests {
 
     #[test]
     fn settings_render_with_their_origin() {
-        let settings = EffectiveSettings::derive(None, Some(250));
+        let settings = EffectiveSettings::derive(None, warm(250));
         assert_eq!(
             settings.load_bound.to_string(),
-            "12m 30s (from a measured load of 4m 10s)"
+            "12m 30s (from the latest measured load of 4m 10s)"
+        );
+        let pulled = EffectiveSettings::derive(
+            None,
+            Some(MeasuredLoad {
+                secs: 211,
+                cold: true,
+            }),
+        );
+        assert_eq!(
+            pulled.idle.to_string(),
+            "21m 6s (from the latest measured load of 3m 31s, which downloaded first; no load from cache is measured yet)"
         );
         assert_eq!(
             EffectiveSettings::default().idle.to_string(),

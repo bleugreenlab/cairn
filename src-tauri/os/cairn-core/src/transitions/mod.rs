@@ -13,15 +13,23 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! // Transition a run
-//! transitions::transition_run(&mut conn, run_id, RunStatus::Live)?;
+//! // Transition a run (validated against the run state machine)
+//! transitions::transition_run(&db, run_id, RunStatus::Live, &emitter).await?;
 //!
-//! // Transition a job (cascades to execution and issue)
-//! transitions::transition_job(&mut conn, &emitter, job_id, JobStatus::Complete)?;
+//! // Move a job between the readiness states (Pending or Running) by hand
+//! transitions::transition_job_readiness(&db, &emitter, job_id, JobStatus::Pending).await?;
 //!
-//! // Resolve an issue (merge/close — sets timestamp and recomputes)
-//! transitions::resolve_issue(&mut conn, &emitter, issue_id, Resolution::Merged)?;
+//! // Recompute the statuses above the jobs from the jobs themselves
+//! transitions::recompute_execution_status(&db, execution_id).await;
+//! transitions::recompute_issue_status(&db, issue_id).await;
+//!
+//! // Reopen a resolved issue, lifting the jobs its resolution cancelled
+//! transitions::unresolve_issue(&db, &emitter, issue_id).await?;
 //! ```
+//!
+//! Every other job status is derived, not written: the projection in
+//! `cairn_workflow::advancement::recompute` settles each job from its facts.
+//! A terminal resolution goes through `issues::status::resolve_terminal`.
 
 pub mod outcome;
 pub mod projection;

@@ -10,21 +10,34 @@
 //!
 //! The schedule has four properties, each against a specific failure:
 //!
-//! - **One machine at a time.** A bad artifact strands the one machine that
-//!   took it, and the failure halts the rollout of that build before it
-//!   reaches the next.
-//! - **Empty before restart, however long emptying takes.** The machine whose
-//!   turn it is is refused new placement until it is empty, and the directive
+//! - **One machine at a time, the readiest first.** A bad artifact strands
+//!   the one machine that took it, and the failure halts the rollout of that
+//!   build before it reaches the next. The rule counts machines mid-update; it
+//!   does not make one machine's work another machine's wait. The turn (the
+//!   head) goes only to a machine with nothing in flight, which is confirmed
+//!   empty, directed, and awaited on its return. A machine with work in flight
+//!   drains beside it, refused new work but holding no one, so idle machines
+//!   update ahead of it however long its cells run. Once it is empty it takes
+//!   the head next, ahead of any idle machine, since it has refused work the
+//!   longest. One machine drains at a time, so at most two machines refuse new
+//!   work at once: the one updating and the one emptying.
+//! - **Empty before restart, however long emptying takes.** A draining
+//!   machine is refused new placement until it is empty, and the directive
 //!   goes out only once the runner's queue binds nothing to it and two
 //!   snapshots taken after the hold show nothing in flight, so a restart kills
 //!   no work. A busy machine is doing its job, not holding the fleet hostage,
 //!   and handing it work back after a fixed budget only guarantees that a
-//!   machine with a steady stream of work never empties. So the turn is bounded
-//!   per piece of work rather than as a whole: a command may hold it for its
-//!   own learned duration plus margin, and work with no expected end for a
-//!   fixed hold. A command past that bound keeps the turn for as long as its
-//!   own stall stop still sees its tree progressing, because a slow command
-//!   on a stalled disk is busy, not wedged.
+//!   machine with a steady stream of work never empties. So the drain is
+//!   bounded per piece of work rather than as a whole: a command may hold it
+//!   for its own learned duration plus margin, and work with no expected end
+//!   for a fixed hold. A command past that bound keeps the drain for as long
+//!   as its own stall stop still sees its tree progressing, because a slow
+//!   command on a stalled disk is busy, not wedged. Since new placement is
+//!   refused, a draining machine's work only shrinks, save the next command
+//!   for something already resident there. A terminal or REPL that never ends
+//!   is work with no expected end: it holds the drain for the fixed hold and
+//!   then defers the machine like any wedged work, so that machine does not
+//!   update past it, and it holds no other machine's update meanwhile.
 //! - **Long-lived services are cycled, not waited on.** A service instance
 //!   never finishes, and any executor restart ends it whether the rollout waits
 //!   or not; its owner already re-places it whenever its executor is lost. So
@@ -33,8 +46,8 @@
 //!   waited on like any other.
 //! - **No wedged machine holds the fleet hostage.** Work that outruns its bound
 //!   and has stopped progressing, or that outruns it with nothing able to say
-//!   whether it progresses, gives the machine back and passes the turn to the
-//!   next; a machine that
+//!   whether it progresses, gives the machine back and passes the drain to the
+//!   next busy machine; a machine that
 //!   ignores a directive is excluded from that build without halting it. A
 //!   served build that moves during a drain retargets the drain rather than
 //!   ending it, so a nearly empty machine is not sent to the back of the line.
@@ -265,13 +278,26 @@ pub(crate) struct Transition {
     pub cause: String,
 }
 
+/// A directed machine that stayed away past [`RETURN_BUDGET_MS`]: the update
+/// stranded it. Reported once, on the pass that concludes it, because the
+/// conclusion also halts the build, so no later pass directs it there again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Unreturned {
+    pub executor_id: String,
+    pub build_id: String,
+    pub directed_at_unix_ms: u64,
+}
+
 /// What one pass decided.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Step {
-    /// The one machine to refuse new placement, if any.
-    pub hold: Option<String>,
+    /// The machines to refuse new placement: the one mid-update and the one
+    /// emptying for its turn.
+    pub holds: Vec<String>,
     pub direct: Option<Directive>,
     pub transitions: Vec<Transition>,
+    /// Machines this pass concluded did not return from their directive.
+    pub unreturned: Vec<Unreturned>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,12 +387,31 @@ fn listed(items: &[String]) -> String {
     }
 }
 
+/// Which of the rollout's two places a turn holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// The one machine being updated: confirmed empty, directed, or awaited
+    /// on its return.
+    Head,
+    /// The one machine with work in flight, emptying beside the head without
+    /// holding it.
+    Drain,
+}
+
 /// The runner's rolling-update state. In memory: a runner restart begins a
 /// fresh rollout, and what must survive one (a machine's failed update) is the
 /// machine's own durable report, which it carries in every `Hello`.
 #[derive(Debug, Default)]
 pub(crate) struct Rollout {
-    turn: Option<Turn>,
+    /// The machine mid-update. Only a machine with nothing in flight takes
+    /// it, so no machine's work holds another machine's update.
+    head: Option<Turn>,
+    /// The machine emptying for its update: refused new work, holding no
+    /// one, and next to take the head once it is empty.
+    drain: Option<Turn>,
+    /// Every other machine due an update, in the order the last pass would
+    /// hand them the head, for a waiting machine's place in line.
+    line: Vec<String>,
     /// Builds no machine is directed to, with why.
     halted: HashMap<String, String>,
     /// Machines whose work outran its bound, until when.
@@ -376,11 +421,16 @@ pub(crate) struct Rollout {
 }
 
 impl Rollout {
-    /// Whether this machine is the one being emptied or awaited.
+    /// Whether this machine is being emptied or awaited, in either slot.
     pub(crate) fn holds(&self, executor_id: &str) -> bool {
-        self.turn
-            .as_ref()
-            .is_some_and(|turn| turn.executor_id == executor_id)
+        self.turns()
+            .any(|(_, turn)| turn.executor_id == executor_id)
+    }
+
+    fn turns(&self) -> impl Iterator<Item = (Slot, &Turn)> {
+        [(Slot::Head, &self.head), (Slot::Drain, &self.drain)]
+            .into_iter()
+            .filter_map(|(slot, turn)| turn.as_ref().map(|turn| (slot, turn)))
     }
 
     /// One pass over the attached remotes.
@@ -393,43 +443,77 @@ impl Rollout {
         let mut step = Step::default();
         self.absorb_reported_failures(candidates);
         self.deferred.retain(|_, until| *until > now_unix_ms);
-        if let Some(turn) = self.turn.take() {
-            self.turn = self.continue_turn(turn, candidates, artifacts, now_unix_ms, &mut step);
+        if let Some(turn) = self.drain.take() {
+            self.drain = self.continue_turn(
+                turn,
+                Slot::Drain,
+                candidates,
+                artifacts,
+                now_unix_ms,
+                &mut step,
+            );
         }
-        if self.turn.is_none() {
-            if let Some((candidate, target, build_id)) = self.next(candidates, artifacts) {
-                let waiting_on = match candidate.work.len() {
-                    0 => String::new(),
-                    count => format!(" and its {count} in flight have finished"),
-                };
-                step.transitions.push(Transition {
-                    executor_id: candidate.executor_id.clone(),
-                    kind: TransitionKind::Draining,
-                    build_id: build_id.clone(),
-                    cause: format!(
-                        "{} runs {} and the runner serves {build_id} for {target}; it takes no new work until it is empty{waiting_on}",
-                        candidate.name,
-                        candidate.running_build.as_deref().unwrap_or("an unreported build"),
-                    ),
-                });
-                self.turn = Some(Turn {
-                    executor_id: candidate.executor_id.clone(),
-                    name: candidate.name.clone(),
-                    build_id,
+        if let Some(turn) = self.head.take() {
+            self.head = self.continue_turn(
+                turn,
+                Slot::Head,
+                candidates,
+                artifacts,
+                now_unix_ms,
+                &mut step,
+            );
+        }
+        // A drained machine takes the head ahead of any idle one: it has
+        // refused new work the longest.
+        if self.head.is_none()
+            && self
+                .drain
+                .as_ref()
+                .is_some_and(|turn| ready(turn, candidates))
+        {
+            let turn = self.drain.take().expect("checked above");
+            self.head = self.continue_turn(
+                turn,
+                Slot::Head,
+                candidates,
+                artifacts,
+                now_unix_ms,
+                &mut step,
+            );
+        }
+        if self.head.is_none() {
+            if let Some((candidate, target, build_id)) =
+                self.next(Slot::Head, candidates, artifacts)
+            {
+                self.head = Some(begin(
+                    candidate,
+                    Slot::Head,
                     target,
-                    unexplained_returns: 0,
-                    phase: TurnPhase::draining(
-                        candidate,
-                        now_unix_ms,
-                        candidate.generation,
-                        candidate.snapshots_received,
-                        HashMap::new(),
-                        now_unix_ms,
-                    ),
-                });
+                    build_id,
+                    now_unix_ms,
+                    &mut step,
+                ));
             }
         }
-        step.hold = self.turn.as_ref().map(|turn| turn.executor_id.clone());
+        if self.drain.is_none() {
+            if let Some((candidate, target, build_id)) =
+                self.next(Slot::Drain, candidates, artifacts)
+            {
+                self.drain = Some(begin(
+                    candidate,
+                    Slot::Drain,
+                    target,
+                    build_id,
+                    now_unix_ms,
+                    &mut step,
+                ));
+            }
+        }
+        self.line = self.line_up(candidates, artifacts);
+        step.holds = self
+            .turns()
+            .map(|(_, turn)| turn.executor_id.clone())
+            .collect();
         step
     }
 
@@ -438,7 +522,7 @@ impl Rollout {
     /// draining on whatever link the machine has now rather than reading its
     /// return as an update that failed.
     pub(crate) fn directive_undelivered(&mut self, executor_id: &str, now_unix_ms: u64) {
-        if let Some(turn) = self.turn.as_mut() {
+        if let Some(turn) = self.head.as_mut() {
             if turn.executor_id == executor_id {
                 turn.phase = TurnPhase::Draining {
                     since_unix_ms: now_unix_ms,
@@ -483,12 +567,12 @@ impl Rollout {
         if running == build_id {
             return SelfUpdatePhase::Current;
         }
+        let updating = self.head.as_ref().map(|head| head.name.clone());
         // Matched by machine alone: a drain retargets when the served build
         // moves, and a directed machine is awaited on the build it was sent.
-        if let Some(turn) = self
-            .turn
-            .as_ref()
-            .filter(|turn| turn.executor_id == candidate.executor_id)
+        if let Some((slot, turn)) = self
+            .turns()
+            .find(|(_, turn)| turn.executor_id == candidate.executor_id)
         {
             return match &turn.phase {
                 TurnPhase::Draining {
@@ -501,6 +585,8 @@ impl Rollout {
                     since_unix_ms: *since_unix_ms,
                     holds: holds.clone(),
                     cycles: cycles.clone(),
+                    waits_for_turn: slot == Slot::Drain,
+                    updating: updating.filter(|_| slot == Slot::Drain),
                 },
                 TurnPhase::Directed {
                     at_unix_ms, cycled, ..
@@ -529,8 +615,17 @@ impl Rollout {
                 until_unix_ms: *until_unix_ms,
             };
         }
+        // The machine updating now goes before everything in line.
+        let place = self
+            .line
+            .iter()
+            .position(|executor_id| *executor_id == candidate.executor_id)
+            .unwrap_or(self.line.len());
         SelfUpdatePhase::Waiting {
-            behind: self.turn.as_ref().map(|turn| turn.name.clone()),
+            ahead: u32::try_from(place)
+                .unwrap_or(u32::MAX)
+                .saturating_add(u32::from(self.head.is_some())),
+            updating,
         }
     }
 
@@ -577,6 +672,7 @@ impl Rollout {
     fn continue_turn(
         &mut self,
         mut turn: Turn,
+        slot: Slot,
         candidates: &[Candidate],
         artifacts: &HashMap<String, ArtifactBuild>,
         now_unix_ms: u64,
@@ -670,8 +766,42 @@ impl Rollout {
                 } else {
                     (candidate.generation, candidate.snapshots_received)
                 };
-                if candidate.reachable
-                    && candidate.work.is_empty()
+                if slot == Slot::Head && !candidate.work.is_empty() {
+                    // Work arrived after all: bound before the hold, or the
+                    // next command for something resident. The head is for a
+                    // machine that can update now, so this one drains beside
+                    // it, or takes work again while another machine drains.
+                    let in_flight = candidate.work.len();
+                    turn.phase = TurnPhase::draining(
+                        candidate,
+                        since_unix_ms,
+                        generation,
+                        snapshots_at_hold,
+                        first_seen,
+                        now_unix_ms,
+                    );
+                    if let Some(drain) = &self.drain {
+                        step.transitions.push(transition(
+                            TransitionKind::Abandoned,
+                            format!(
+                                "{} has {in_flight} in flight after all and {} is already draining, so it takes work again until it can drain",
+                                turn.name, drain.name
+                            ),
+                        ));
+                        return None;
+                    }
+                    step.transitions.push(transition(
+                        TransitionKind::Draining,
+                        format!(
+                            "{} has {in_flight} in flight after all, so it drains without holding the turn; machines with nothing in flight update ahead of it",
+                            turn.name
+                        ),
+                    ));
+                    self.drain = Some(turn);
+                    return None;
+                }
+                if slot == Slot::Head
+                    && candidate.reachable
                     && candidate.snapshots_received >= snapshots_at_hold + FRESH_SNAPSHOTS
                 {
                     step.direct = Some(Directive {
@@ -712,6 +842,11 @@ impl Rollout {
                     first_seen,
                     now_unix_ms,
                 );
+                // An empty head not yet confirmed empty, or not reachable to
+                // direct: nothing it holds can be wedged.
+                if slot == Slot::Head {
+                    return Some(turn);
+                }
                 let TurnPhase::Draining { first_seen, .. } = &turn.phase else {
                     unreachable!("just set to draining");
                 };
@@ -835,6 +970,11 @@ impl Rollout {
                         self.halted.insert(turn.build_id.clone(), cause.clone());
                         step.transitions
                             .push(transition(TransitionKind::Halted, cause));
+                        step.unreturned.push(Unreturned {
+                            executor_id: turn.executor_id.clone(),
+                            build_id: turn.build_id.clone(),
+                            directed_at_unix_ms: at_unix_ms,
+                        });
                         None
                     }
                     _ => {
@@ -850,34 +990,149 @@ impl Rollout {
         }
     }
 
-    /// The machine whose turn is next: the least busy reachable remote whose
-    /// build differs from what the runner serves for its target, among those
-    /// not halted, deferred, or excluded for that build.
+    /// The target and served build this machine is due, when it is a
+    /// reachable remote whose build differs from what the runner serves for
+    /// its target and is not deferred, nor excluded or halted for that build.
+    fn due(
+        &self,
+        candidate: &Candidate,
+        artifacts: &HashMap<String, ArtifactBuild>,
+    ) -> Option<(&'static str, String)> {
+        if !candidate.reachable || self.deferred.contains_key(&candidate.executor_id) {
+            return None;
+        }
+        let target = candidate.target?;
+        let running = candidate.running_build.as_ref()?;
+        let ArtifactBuild::Resolved(build_id) = artifacts.get(target)? else {
+            return None;
+        };
+        let excluded = self
+            .excluded
+            .get(&candidate.executor_id)
+            .is_some_and(|(excluded_build, _)| excluded_build == build_id);
+        (running != build_id && !excluded && !self.halted.contains_key(build_id))
+            .then(|| (target, build_id.clone()))
+    }
+
+    /// The machine to take a free slot: for the head, a due machine with
+    /// nothing in flight; for the drain, the least busy due machine with work
+    /// in flight. Neither takes a machine already in the other slot.
     fn next<'a>(
         &self,
+        slot: Slot,
         candidates: &'a [Candidate],
         artifacts: &HashMap<String, ArtifactBuild>,
     ) -> Option<(&'a Candidate, &'static str, String)> {
         candidates
             .iter()
-            .filter(|candidate| candidate.reachable)
-            .filter(|candidate| !self.deferred.contains_key(&candidate.executor_id))
+            .filter(|candidate| !self.holds(&candidate.executor_id))
+            .filter(|candidate| candidate.work.is_empty() == (slot == Slot::Head))
             .filter_map(|candidate| {
-                let target = candidate.target?;
-                let running = candidate.running_build.as_ref()?;
-                let ArtifactBuild::Resolved(build_id) = artifacts.get(target)? else {
-                    return None;
-                };
-                let excluded = self
-                    .excluded
-                    .get(&candidate.executor_id)
-                    .is_some_and(|(excluded_build, _)| excluded_build == build_id);
-                (running != build_id && !excluded && !self.halted.contains_key(build_id))
-                    .then(|| (candidate, target, build_id.clone()))
+                self.due(candidate, artifacts)
+                    .map(|(target, build_id)| (candidate, target, build_id))
             })
             .min_by(|(left, ..), (right, ..)| {
                 (left.work.len(), &left.name).cmp(&(right.work.len(), &right.name))
             })
+    }
+
+    /// Every due machine but the head, in the order they would take it: the
+    /// drained machine if it is empty, then the idle, then the draining
+    /// machine if it still has work, then the busy, least busy first.
+    fn line_up(
+        &self,
+        candidates: &[Candidate],
+        artifacts: &HashMap<String, ArtifactBuild>,
+    ) -> Vec<String> {
+        let head = self.head.as_ref().map(|turn| turn.executor_id.as_str());
+        let drain = self.drain.as_ref().map(|turn| turn.executor_id.as_str());
+        let mut line: Vec<(u8, &Candidate)> = candidates
+            .iter()
+            .filter(|candidate| Some(candidate.executor_id.as_str()) != head)
+            .filter_map(|candidate| {
+                let draining = Some(candidate.executor_id.as_str()) == drain;
+                if !draining && self.due(candidate, artifacts).is_none() {
+                    return None;
+                }
+                let idle = candidate.reachable && candidate.work.is_empty();
+                let rank = match (draining, idle) {
+                    (true, true) => 0,
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    (false, false) => 3,
+                };
+                Some((rank, candidate))
+            })
+            .collect();
+        line.sort_by(|(left_rank, left), (right_rank, right)| {
+            (*left_rank, left.work.len(), &left.name).cmp(&(
+                *right_rank,
+                right.work.len(),
+                &right.name,
+            ))
+        });
+        line.into_iter()
+            .map(|(_, candidate)| candidate.executor_id.clone())
+            .collect()
+    }
+}
+
+/// Whether a draining machine can take the head: reachable, and nothing in
+/// flight.
+fn ready(turn: &Turn, candidates: &[Candidate]) -> bool {
+    candidates.iter().any(|candidate| {
+        candidate.executor_id == turn.executor_id
+            && candidate.reachable
+            && candidate.work.is_empty()
+    })
+}
+
+/// A machine's turn begins in `slot`: it is refused new work from now.
+fn begin(
+    candidate: &Candidate,
+    slot: Slot,
+    target: &'static str,
+    build_id: String,
+    now_unix_ms: u64,
+    step: &mut Step,
+) -> Turn {
+    let waiting_on = match slot {
+        Slot::Head => {
+            "; it has nothing in flight, so it takes the turn and takes no new work until it is directed"
+                .to_string()
+        }
+        Slot::Drain => format!(
+            "; it takes no new work until its {} in flight have finished, and holds no other machine's update meanwhile",
+            candidate.work.len()
+        ),
+    };
+    step.transitions.push(Transition {
+        executor_id: candidate.executor_id.clone(),
+        kind: TransitionKind::Draining,
+        build_id: build_id.clone(),
+        cause: format!(
+            "{} runs {} and the runner serves {build_id} for {target}{waiting_on}",
+            candidate.name,
+            candidate
+                .running_build
+                .as_deref()
+                .unwrap_or("an unreported build"),
+        ),
+    });
+    Turn {
+        executor_id: candidate.executor_id.clone(),
+        name: candidate.name.clone(),
+        build_id,
+        target,
+        unexplained_returns: 0,
+        phase: TurnPhase::draining(
+            candidate,
+            now_unix_ms,
+            candidate.generation,
+            candidate.snapshots_received,
+            HashMap::new(),
+            now_unix_ms,
+        ),
     }
 }
 
@@ -970,6 +1225,24 @@ mod tests {
         candidate.snapshots_received = 0;
     }
 
+    fn held(step: &Step) -> Vec<&str> {
+        step.holds.iter().map(String::as_str).collect()
+    }
+
+    fn index_of(fleet: &[Candidate], executor_id: &str) -> usize {
+        fleet
+            .iter()
+            .position(|machine| machine.executor_id == executor_id)
+            .unwrap()
+    }
+
+    fn waiting(ahead: u32, updating: &str) -> SelfUpdatePhase {
+        SelfUpdatePhase::Waiting {
+            ahead,
+            updating: Some(updating.into()),
+        }
+    }
+
     #[test]
     fn a_skewed_machine_is_held_and_directed_only_once_its_work_drains() {
         let artifacts = serving("new");
@@ -978,7 +1251,7 @@ mod tests {
         with_work(&mut machine, 2);
 
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
-        assert_eq!(step.hold.as_deref(), Some("id-bbs"));
+        assert_eq!(held(&step), ["id-bbs"]);
         assert_eq!(step.direct, None);
         assert!(matches!(
             phase(&rollout, &machine, &artifacts),
@@ -1004,11 +1277,7 @@ mod tests {
                 build_id: "new".into(),
             })
         );
-        assert_eq!(
-            step.hold.as_deref(),
-            Some("id-bbs"),
-            "still held while directed"
-        );
+        assert_eq!(held(&step), ["id-bbs"], "still held while directed");
         assert_eq!(
             phase(&rollout, &machine, &artifacts),
             SelfUpdatePhase::Directed {
@@ -1019,10 +1288,10 @@ mod tests {
 
         // It ends the link, is away a while, and returns current.
         let step = rollout.advance(&[], &artifacts, NOW + 60_000);
-        assert_eq!(step.hold.as_deref(), Some("id-bbs"));
+        assert_eq!(held(&step), ["id-bbs"]);
         return_on(&mut machine, "new");
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 90_000);
-        assert_eq!(step.hold, None);
+        assert!(step.holds.is_empty(), "{:?}", step.holds);
         assert_eq!(step.transitions[0].kind, TransitionKind::Updated);
         assert_eq!(
             phase(&rollout, &machine, &artifacts),
@@ -1039,44 +1308,41 @@ mod tests {
             remote("fedora", "old"),
             remote("bgsrv-ub", "old"),
         ];
-        // The least busy goes first; the rest wait behind it.
+        // The idle machine takes the turn, the least busy of the rest drains
+        // beside it, and the busiest waits for the drain.
         with_work(&mut fleet[0], 3);
         with_work(&mut fleet[1], 1);
         let mut order = Vec::new();
         let mut now = NOW;
-        for _ in 0..3 {
+        for _ in 0..8 {
             let step = rollout.advance(&fleet, &artifacts, now);
-            let held = step.hold.clone().expect("a turn begins");
-            for other in fleet.iter().filter(|machine| machine.executor_id != held) {
-                assert!(
-                    matches!(
-                        phase(&rollout, other, &artifacts),
-                        SelfUpdatePhase::Waiting { .. } | SelfUpdatePhase::Current
-                    ),
-                    "only the machine whose turn it is is drained or directed"
-                );
-            }
-            let index = fleet
+            let mid_update = fleet
                 .iter()
-                .position(|machine| machine.executor_id == held)
-                .unwrap();
-            order.push(fleet[index].name.clone());
-            fleet[index].work.clear();
-            settle(&mut fleet[index]);
-            now += 1_000;
-            let step = rollout.advance(&fleet, &artifacts, now);
-            assert_eq!(
-                step.direct
-                    .as_ref()
-                    .map(|direct| direct.executor_id.as_str()),
-                Some(held.as_str())
-            );
-            return_on(&mut fleet[index], "new");
+                .filter(|machine| {
+                    matches!(
+                        phase(&rollout, machine, &artifacts),
+                        SelfUpdatePhase::Directed { .. }
+                    )
+                })
+                .count();
+            assert!(mid_update <= 1, "one machine mid-update at a time");
+            assert!(step.holds.len() <= 2, "{:?}", step.holds);
+            // Whatever is held finishes its work and says so twice.
+            for executor_id in &step.holds {
+                let index = index_of(&fleet, executor_id);
+                fleet[index].work.clear();
+                settle(&mut fleet[index]);
+            }
+            if let Some(direct) = step.direct {
+                let index = index_of(&fleet, &direct.executor_id);
+                order.push(fleet[index].name.clone());
+                return_on(&mut fleet[index], "new");
+            }
             now += 1_000;
         }
         let step = rollout.advance(&fleet, &artifacts, now);
-        assert_eq!(
-            step.hold, None,
+        assert!(
+            step.holds.is_empty(),
             "the rollout ends when every machine is current"
         );
         assert_eq!(order, ["bgsrv-ub", "fedora", "bbs"]);
@@ -1109,8 +1375,8 @@ mod tests {
             at_unix_ms: NOW + 500,
         });
         let step = rollout.advance(&fleet, &artifacts, NOW + 120_000);
-        assert_eq!(
-            step.hold, None,
+        assert!(
+            step.holds.is_empty(),
             "nobody else is drained for a build that failed"
         );
         for machine in &fleet {
@@ -1123,7 +1389,7 @@ mod tests {
         // A different artifact is a new rollout.
         let fixed = serving("fixed");
         let step = rollout.advance(&fleet, &fixed, NOW + 200_000);
-        assert!(step.hold.is_some());
+        assert!(!step.holds.is_empty());
     }
 
     #[test]
@@ -1140,7 +1406,7 @@ mod tests {
         });
         let mut fresh_runner = Rollout::default();
         let step = fresh_runner.advance(&[failed, remote("b", "old")], &artifacts, NOW);
-        assert_eq!(step.hold, None);
+        assert!(step.holds.is_empty(), "{:?}", step.holds);
     }
 
     /// The specimen: a machine the cadence keeps busy, whose lanes finish and
@@ -1152,27 +1418,29 @@ mod tests {
     fn a_machine_with_a_steady_arrival_of_work_keeps_its_turn_until_it_empties() {
         let artifacts = serving("new");
         let mut rollout = Rollout::default();
-        let mut fleet = vec![remote("busy", "old"), remote("idle", "old")];
+        let mut fleet = vec![remote("busy", "old"), remote("other", "old")];
+        fleet[0].work = vec![command("pinned-0", NOW, Some(LANE_MS))];
         fleet[1].work = vec![command("other", NOW, Some(LANE_MS))];
         fleet[1].work.push(command("other-2", NOW, Some(LANE_MS)));
-        assert_eq!(
-            rollout.advance(&fleet, &artifacts, NOW).hold.as_deref(),
-            Some("id-busy")
-        );
+        assert_eq!(held(&rollout.advance(&fleet, &artifacts, NOW)), ["id-busy"]);
 
         // Every five minutes for eighty minutes, a lane finishes and the next
         // pinned one starts, so something is always in flight.
         let mut now = NOW;
-        for arrival in 0..16 {
+        for arrival in 1..16 {
             now = NOW + arrival * 5 * 60_000;
             fleet[0].work = vec![command(&format!("pinned-{arrival}"), now, Some(LANE_MS))];
             let step = rollout.advance(&fleet, &artifacts, now);
-            assert_eq!(step.hold.as_deref(), Some("id-busy"), "at {arrival}");
+            assert_eq!(held(&step), ["id-busy"], "at {arrival}");
             assert!(step.transitions.is_empty(), "{:?}", step.transitions);
-            assert!(matches!(
+            assert_eq!(
                 phase(&rollout, &fleet[1], &artifacts),
-                SelfUpdatePhase::Waiting { behind: Some(ref name) } if name == "busy"
-            ));
+                SelfUpdatePhase::Waiting {
+                    ahead: 1,
+                    updating: None,
+                },
+                "busy itself, it waits for the drain"
+            );
         }
         assert!(
             now - NOW >= 75 * 60_000,
@@ -1189,6 +1457,222 @@ mod tests {
         );
     }
 
+    /// The bginf-sp2 specimen (cairn/5965): a Spark with a long cell in
+    /// flight took the turn while bbs and fedora were busy, and once they went
+    /// idle it held both their updates for up to an hour. Now the busy machine
+    /// drains beside the turn and holds no one: the idle two update first, one
+    /// at a time, and it updates last, once its cell ends.
+    #[test]
+    fn idle_machines_update_ahead_of_one_draining_a_long_cell() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![
+            remote("bbs", "old"),
+            remote("bginf-sp2", "old"),
+            remote("fedora", "old"),
+        ];
+        with_work(&mut fleet[0], 4);
+        fleet[1].work = vec![
+            command("cell", NOW, None),
+            command("b", NOW, Some(LANE_MS)),
+            command("c", NOW, Some(LANE_MS)),
+        ];
+        with_work(&mut fleet[2], 5);
+        let step = rollout.advance(&fleet, &artifacts, NOW);
+        assert_eq!(
+            held(&step),
+            ["id-bginf-sp2"],
+            "nobody can update now, so the least busy drains"
+        );
+        assert!(
+            step.transitions[0]
+                .cause
+                .contains("holds no other machine's update meanwhile"),
+            "{}",
+            step.transitions[0].cause
+        );
+
+        // bbs and fedora finish; the Spark's long cell runs on.
+        fleet[0].work.clear();
+        fleet[2].work.clear();
+        fleet[1].work.truncate(1);
+        let mut now = NOW + 60_000;
+        let step = rollout.advance(&fleet, &artifacts, now);
+        assert_eq!(held(&step), ["id-bbs", "id-bginf-sp2"]);
+        assert_eq!(phase(&rollout, &fleet[2], &artifacts), waiting(1, "bbs"));
+        assert!(matches!(
+            phase(&rollout, &fleet[1], &artifacts),
+            SelfUpdatePhase::Draining {
+                in_flight: 1,
+                waits_for_turn: true,
+                updating: Some(ref name),
+                ..
+            } if name == "bbs"
+        ));
+
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            now += 1_000;
+            fleet.iter_mut().for_each(settle);
+            let step = rollout.advance(&fleet, &artifacts, now);
+            if let Some(direct) = step.direct {
+                let index = index_of(&fleet, &direct.executor_id);
+                order.push(fleet[index].name.clone());
+                return_on(&mut fleet[index], "new");
+            }
+            assert!(
+                fleet
+                    .iter()
+                    .filter(|machine| matches!(
+                        phase(&rollout, machine, &artifacts),
+                        SelfUpdatePhase::Directed { .. }
+                    ))
+                    .count()
+                    <= 1
+            );
+        }
+        assert_eq!(order, ["bbs", "fedora"], "the idle two, one at a time");
+        let step = rollout.advance(&fleet, &artifacts, now + 1_000);
+        assert_eq!(held(&step), ["id-bginf-sp2"]);
+        assert!(matches!(
+            phase(&rollout, &fleet[1], &artifacts),
+            SelfUpdatePhase::Draining {
+                in_flight: 1,
+                waits_for_turn: true,
+                updating: None,
+                ..
+            }
+        ));
+
+        fleet[1].work.clear();
+        let step = rollout.advance(&fleet, &artifacts, now + 2_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-bginf-sp2".to_string()),
+            "it updates the pass its cell ends"
+        );
+    }
+
+    /// A draining machine whose cells end while another machine is mid-update
+    /// waits for that one, then takes the turn ahead of an idle machine that
+    /// has refused no work.
+    #[test]
+    fn a_drained_machine_takes_the_turn_next_once_the_machine_updating_returns() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![
+            remote("bbs", "old"),
+            remote("bginf-sp2", "old"),
+            remote("fedora", "old"),
+        ];
+        fleet[1].work = vec![command("cell", NOW, None)];
+        assert_eq!(
+            held(&rollout.advance(&fleet, &artifacts, NOW)),
+            ["id-bbs", "id-bginf-sp2"]
+        );
+        fleet.iter_mut().for_each(settle);
+        let step = rollout.advance(&fleet, &artifacts, NOW + 1_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-bbs".to_string())
+        );
+
+        // The Spark's cell ends while bbs is away installing.
+        fleet[1].work.clear();
+        let step = rollout.advance(&fleet, &artifacts, NOW + 2_000);
+        assert_eq!(step.direct, None, "bbs is still mid-update");
+        assert_eq!(held(&step), ["id-bbs", "id-bginf-sp2"]);
+        assert_eq!(
+            phase(&rollout, &fleet[1], &artifacts),
+            SelfUpdatePhase::Draining {
+                in_flight: 0,
+                since_unix_ms: NOW,
+                holds: Vec::new(),
+                cycles: Vec::new(),
+                waits_for_turn: true,
+                updating: Some("bbs".into()),
+            }
+        );
+        assert_eq!(
+            phase(&rollout, &fleet[2], &artifacts),
+            waiting(2, "bbs"),
+            "bbs, then the drained Spark"
+        );
+
+        return_on(&mut fleet[0], "new");
+        let step = rollout.advance(&fleet, &artifacts, NOW + 3_000);
+        assert_eq!(step.transitions[0].kind, TransitionKind::Updated);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-bginf-sp2".to_string()),
+            "the drained machine goes before the idle one"
+        );
+        assert_eq!(
+            phase(&rollout, &fleet[2], &artifacts),
+            waiting(1, "bginf-sp2")
+        );
+
+        return_on(&mut fleet[1], "new");
+        assert_eq!(
+            held(&rollout.advance(&fleet, &artifacts, NOW + 4_000)),
+            ["id-fedora"]
+        );
+        settle(&mut fleet[2]);
+        let step = rollout.advance(&fleet, &artifacts, NOW + 5_000);
+        assert_eq!(
+            step.direct.map(|direct| direct.executor_id),
+            Some("id-fedora".to_string())
+        );
+    }
+
+    /// Work can reach a machine after it takes the turn: bound before the
+    /// hold, or the next command for something resident there. The turn is
+    /// for a machine that can update now, so it steps aside, draining beside
+    /// the turn when no one else drains and taking work again when another
+    /// machine does.
+    #[test]
+    fn a_machine_that_finds_work_after_taking_the_turn_steps_aside() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut fleet = vec![remote("a", "old"), remote("b", "old"), remote("c", "old")];
+        with_work(&mut fleet[2], 1);
+        assert_eq!(
+            held(&rollout.advance(&fleet, &artifacts, NOW)),
+            ["id-a", "id-c"]
+        );
+
+        with_work(&mut fleet[0], 1);
+        let step = rollout.advance(&fleet, &artifacts, NOW + 1_000);
+        assert_eq!(held(&step), ["id-b", "id-c"], "a takes work again");
+        assert!(step.transitions.iter().any(|transition| {
+            transition.executor_id == "id-a"
+                && transition.kind == TransitionKind::Abandoned
+                && transition.cause.contains("c is already draining")
+        }));
+        assert_eq!(phase(&rollout, &fleet[0], &artifacts), waiting(2, "b"));
+
+        let mut rollout = Rollout::default();
+        let mut alone = remote("a", "old");
+        rollout.advance(std::slice::from_ref(&alone), &artifacts, NOW);
+        with_work(&mut alone, 1);
+        let step = rollout.advance(std::slice::from_ref(&alone), &artifacts, NOW + 1_000);
+        assert_eq!(held(&step), ["id-a"], "still refused new work");
+        assert_eq!(step.transitions[0].kind, TransitionKind::Draining);
+        assert!(matches!(
+            phase(&rollout, &alone, &artifacts),
+            SelfUpdatePhase::Draining {
+                in_flight: 1,
+                since_unix_ms: NOW,
+                waits_for_turn: true,
+                ..
+            }
+        ));
+        alone.work.clear();
+        settle(&mut alone);
+        let step = rollout.advance(std::slice::from_ref(&alone), &artifacts, NOW + 2_000);
+        assert!(step.direct.is_some(), "and updates once it is empty");
+    }
+
     /// What bounds a turn is each command's own learned duration plus margin:
     /// a lane past that is wedged, and a wedged machine gives its turn away.
     #[test]
@@ -1201,10 +1685,7 @@ mod tests {
             command("rust-tests", NOW, Some(LANE_MS)),
         ];
         fleet[1].work = vec![command("a", NOW, None), command("b", NOW, None)];
-        assert_eq!(
-            rollout.advance(&fleet, &artifacts, NOW).hold.as_deref(),
-            Some("id-busy")
-        );
+        assert_eq!(held(&rollout.advance(&fleet, &artifacts, NOW)), ["id-busy"]);
         let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &fleet[0], &artifacts) else {
             panic!("draining");
         };
@@ -1220,7 +1701,7 @@ mod tests {
         fleet[0].work.remove(0);
         let deadline = NOW + LANE_MS + COMMAND_MARGIN_MS;
         let step = rollout.advance(&fleet, &artifacts, deadline - 1);
-        assert_eq!(step.hold.as_deref(), Some("id-busy"));
+        assert_eq!(held(&step), ["id-busy"]);
 
         let step = rollout.advance(&fleet, &artifacts, deadline);
         assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
@@ -1231,11 +1712,7 @@ mod tests {
             "{}",
             step.transitions[0].cause
         );
-        assert_eq!(
-            step.hold.as_deref(),
-            Some("id-idle"),
-            "the next machine takes the turn"
-        );
+        assert_eq!(held(&step), ["id-idle"], "the next machine takes the turn");
         assert_eq!(
             phase(&rollout, &fleet[0], &artifacts),
             SelfUpdatePhase::Deferred {
@@ -1264,7 +1741,7 @@ mod tests {
                 now,
             )];
             let step = rollout.advance(&fleet, &artifacts, now);
-            assert_eq!(step.hold.as_deref(), Some("id-fedora"), "at {minute}");
+            assert_eq!(held(&step), ["id-fedora"], "at {minute}");
             assert!(
                 step.transitions.is_empty() || minute == 0,
                 "{:?}",
@@ -1306,8 +1783,8 @@ mod tests {
         )];
         let step = rollout.advance(&fleet, &artifacts, now);
         assert_eq!(
-            step.hold.as_deref(),
-            Some("id-fedora"),
+            held(&step),
+            ["id-fedora"],
             "quiet, but not for its whole bound"
         );
 
@@ -1327,7 +1804,7 @@ mod tests {
             "{}",
             step.transitions[0].cause
         );
-        assert_eq!(step.hold.as_deref(), Some("id-busy"));
+        assert_eq!(held(&step), ["id-busy"]);
     }
 
     /// A reading of progress is only as good as the sample that carried it:
@@ -1347,7 +1824,7 @@ mod tests {
         )];
         rollout.advance(&fleet, &artifacts, NOW);
         let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS - 1);
-        assert_eq!(step.hold.as_deref(), Some("id-fedora"));
+        assert_eq!(held(&step), ["id-fedora"]);
         let step = rollout.advance(&fleet, &artifacts, last_sample + REVIEW_BOUND_MS);
         assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
     }
@@ -1369,7 +1846,7 @@ mod tests {
         assert_eq!(holds[0].progressing, None);
 
         let step = rollout.advance(&fleet, &artifacts, deadline - 1);
-        assert_eq!(step.hold.as_deref(), Some("id-fedora"));
+        assert_eq!(held(&step), ["id-fedora"]);
         let step = rollout.advance(&fleet, &artifacts, deadline);
         assert_eq!(step.transitions[0].kind, TransitionKind::Deferred);
         assert!(
@@ -1396,7 +1873,7 @@ mod tests {
         let now = NOW + UNMEASURED_HOLD_MS - 1;
         machine.work = vec![batch(now)];
         let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
-        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        assert_eq!(held(&step), ["id-a"]);
         let SelfUpdatePhase::Draining { holds, .. } = phase(&rollout, &machine, &artifacts) else {
             panic!("draining");
         };
@@ -1430,7 +1907,7 @@ mod tests {
             &artifacts,
             NOW + UNMEASURED_HOLD_MS - 1,
         );
-        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        assert_eq!(held(&step), ["id-a"]);
         let step = rollout.advance(
             std::slice::from_ref(&machine),
             &artifacts,
@@ -1455,7 +1932,7 @@ mod tests {
         let mut machine = remote("bgsrv-mac", "old");
         machine.services = vec![
             "service `iMessage channel`".into(),
-            "service `desktop automation`".into(),
+            "service `axon/axon on bgsrv-mac`".into(),
         ];
         rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
         assert!(matches!(
@@ -1470,7 +1947,7 @@ mod tests {
         );
         assert!(
             step.transitions[0].cause.contains(
-                "the restart cycles service `iMessage channel` and service `desktop automation`, which their owners place again"
+                "the restart cycles service `iMessage channel` and service `axon/axon on bgsrv-mac`, which their owners place again"
             ),
             "{}",
             step.transitions[0].cause
@@ -1492,7 +1969,65 @@ mod tests {
         let others = [remote("fedora", "old")];
         let step = rollout.advance(&others, &artifacts, NOW + 1_000 + RETURN_BUDGET_MS);
         assert_eq!(step.transitions[0].kind, TransitionKind::Halted);
-        assert_eq!(step.hold, None);
+        assert!(step.holds.is_empty(), "{:?}", step.holds);
+    }
+
+    /// The bound's conclusion is handed back as a fact about the machine, with
+    /// when it was directed, exactly once: the build is halted, so no later
+    /// pass directs it again or concludes it again.
+    #[test]
+    fn a_machine_that_never_returns_is_concluded_unreturned_once() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("bgsrv-win", "old");
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        settle(&mut machine);
+        let directed = rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 1_000);
+        assert!(directed.direct.is_some());
+
+        let early = rollout.advance(&[], &artifacts, NOW + RETURN_BUDGET_MS);
+        assert!(
+            early.unreturned.is_empty(),
+            "inside the bound it is updating"
+        );
+
+        let step = rollout.advance(&[], &artifacts, NOW + 1_000 + RETURN_BUDGET_MS);
+        assert_eq!(
+            step.unreturned,
+            [Unreturned {
+                executor_id: "id-bgsrv-win".into(),
+                build_id: "new".into(),
+                directed_at_unix_ms: NOW + 1_000,
+            }]
+        );
+        let later = rollout.advance(&[], &artifacts, NOW + 2 * RETURN_BUDGET_MS);
+        assert!(later.unreturned.is_empty(), "{:?}", later.unreturned);
+    }
+
+    /// A machine that comes back inside the bound is an update, not a stranding.
+    #[test]
+    fn a_machine_that_returns_inside_the_bound_is_never_concluded_unreturned() {
+        let artifacts = serving("new");
+        let mut rollout = Rollout::default();
+        let mut machine = remote("bgsrv-win", "old");
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW);
+        settle(&mut machine);
+        rollout.advance(std::slice::from_ref(&machine), &artifacts, NOW + 1_000);
+        rollout.advance(&[], &artifacts, NOW + RETURN_BUDGET_MS / 2);
+        return_on(&mut machine, "new");
+        let step = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + RETURN_BUDGET_MS,
+        );
+        assert_eq!(step.transitions[0].kind, TransitionKind::Updated);
+        assert!(step.unreturned.is_empty());
+        let later = rollout.advance(
+            std::slice::from_ref(&machine),
+            &artifacts,
+            NOW + 2 * RETURN_BUDGET_MS,
+        );
+        assert!(later.unreturned.is_empty());
     }
 
     #[test]
@@ -1505,7 +2040,7 @@ mod tests {
         rollout.advance(&fleet, &artifacts, NOW + 1_000);
         let step = rollout.advance(&fleet, &artifacts, NOW + 1_000 + ACT_BUDGET_MS);
         assert_eq!(step.transitions[0].kind, TransitionKind::Excluded);
-        assert_eq!(step.hold.as_deref(), Some("id-b"));
+        assert_eq!(held(&step), ["id-b"]);
         assert!(matches!(
             phase(&rollout, &fleet[0], &artifacts),
             SelfUpdatePhase::Excluded { .. }
@@ -1530,11 +2065,7 @@ mod tests {
             now += 1_000;
             let step = rollout.advance(std::slice::from_ref(&machine), &artifacts, now);
             if attempt < UNEXPLAINED_RETURNS {
-                assert_eq!(
-                    step.hold.as_deref(),
-                    Some("id-a"),
-                    "drained again on its new link"
-                );
+                assert_eq!(held(&step), ["id-a"], "drained again on its new link");
             } else {
                 assert_eq!(step.transitions[0].kind, TransitionKind::Halted);
             }
@@ -1576,7 +2107,7 @@ mod tests {
         rollout.advance(std::slice::from_ref(&machine), &serving("new"), NOW);
         let newer = serving("newer");
         let step = rollout.advance(std::slice::from_ref(&machine), &newer, NOW + 60_000);
-        assert_eq!(step.hold.as_deref(), Some("id-a"));
+        assert_eq!(held(&step), ["id-a"]);
         assert_eq!(step.transitions.len(), 1, "{:?}", step.transitions);
         assert_eq!(step.transitions[0].kind, TransitionKind::Draining);
         assert_eq!(step.transitions[0].build_id, "newer");
@@ -1612,7 +2143,7 @@ mod tests {
             .is_some());
         let newer = serving("newer");
         let step = rollout.advance(&[], &newer, NOW + 30_000);
-        assert_eq!(step.hold.as_deref(), Some("id-a"), "held while it installs");
+        assert_eq!(held(&step), ["id-a"], "held while it installs");
         assert!(step.transitions.is_empty(), "{:?}", step.transitions);
 
         return_on(&mut machine, "new");

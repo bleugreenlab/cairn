@@ -31,6 +31,82 @@ pub(crate) struct FakeHost {
     /// Refusals the next placements answer, in order, before any bearer is
     /// minted, as a lease host refuses an acquisition.
     refuse_placement: StdMutex<VecDeque<LaunchError>>,
+    /// Every native resident started, in order.
+    native_launches: StdMutex<Vec<NativeLaunchRecord>>,
+    /// Ends the latest native resident on a machine: (exit code, whether the
+    /// executor was lost).
+    native_exits: StdMutex<HashMap<String, mpsc::UnboundedSender<(Option<i32>, bool)>>>,
+    /// Native residents that have exited, by machine.
+    native_ended: StdMutex<Vec<String>>,
+    /// What the next probes answer: JSON text, or a failure. `None` answers ready.
+    probe_answer: StdMutex<Option<Result<String, String>>>,
+    probes: AtomicU64,
+    /// The machines the supervisor sees, in place of the fleet's.
+    machines: StdMutex<Option<Vec<machine::MachineView>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeLaunchRecord {
+    pub machine: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl FakeHost {
+    /// A native resident: echoes its stdin to its stdout, as a stand-in for
+    /// an MCP server, until it is killed or told to exit.
+    fn launch_native(self: &Arc<Self>, spec: &LaunchSpec) -> Result<HostProcess, LaunchError> {
+        let ServiceOwner::Pack { machine, .. } = &spec.owner else {
+            panic!("a native launch is a machine service's");
+        };
+        let native = spec
+            .native
+            .clone()
+            .expect("a native launch names its program");
+        self.native_launches
+            .lock()
+            .unwrap()
+            .push(NativeLaunchRecord {
+                machine: machine.clone(),
+                program: native.program,
+                args: native.args,
+                env: spec.env.clone(),
+            });
+        let (lines, mut input) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+        let (exit, mut exits) = mpsc::unbounded_channel::<(Option<i32>, bool)>();
+        self.native_exits
+            .lock()
+            .unwrap()
+            .insert(machine.clone(), exit);
+        let (events, receiver) = mpsc::unbounded_channel();
+        let (host, ended) = (self.clone(), machine.clone());
+        tokio::spawn(async move {
+            let (code, detail, executor_lost) = loop {
+                tokio::select! {
+                    line = input.recv() => match line {
+                        Some(Some(bytes)) => { let _ = events.send(HostEvent::Stdout(bytes)); }
+                        _ => break (None, "killed".to_string(), false),
+                    },
+                    exit = exits.recv() => {
+                        let (code, lost) = exit.unwrap_or((None, false));
+                        break (code, "the process exited".to_string(), lost);
+                    }
+                }
+            };
+            host.native_ended.lock().unwrap().push(ended);
+            let _ = events.send(HostEvent::Exited {
+                code,
+                detail,
+                executor_lost,
+            });
+        });
+        Ok(HostProcess {
+            input: Arc::new(FakeInput { lines }),
+            events: receiver,
+            executor: machine.clone(),
+        })
+    }
 }
 
 impl FakeHost {
@@ -91,6 +167,9 @@ impl ServiceHost for Arc<FakeHost> {
         if let Some(refusal) = self.refuse.lock().unwrap().pop_front() {
             return Err(refusal);
         }
+        if spec.native.is_some() {
+            return self.launch_native(spec);
+        }
         self.launches.fetch_add(1, Ordering::AcqRel);
         self.envs.lock().unwrap().push(spec.env.clone());
         let boot = self.next_boot.lock().unwrap().take().unwrap_or(Boot::Ready);
@@ -105,6 +184,7 @@ impl ServiceHost for Arc<FakeHost> {
                 let _ = events.send(HostEvent::Exited {
                     code,
                     detail: "the process exited".into(),
+                    executor_lost: false,
                 });
             };
             loop {
@@ -168,6 +248,38 @@ impl ServiceHost for Arc<FakeHost> {
         })
     }
 
+    async fn probe(
+        &self,
+        _orch: &Orchestrator,
+        _spec: &LaunchSpec,
+        _program: &str,
+        _args: Vec<String>,
+        _timeout: Duration,
+    ) -> Result<ProbeOutput, String> {
+        self.probes.fetch_add(1, Ordering::AcqRel);
+        match self.probe_answer.lock().unwrap().clone() {
+            None => Ok(ProbeOutput {
+                stdout: br#"{"ready": true}"#.to_vec(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+            }),
+            Some(Ok(json)) => Ok(ProbeOutput {
+                stdout: json.into_bytes(),
+                stderr: Vec::new(),
+                exit_code: Some(0),
+            }),
+            Some(Err(error)) => Err(error),
+        }
+    }
+
+    fn machines(&self, orch: &Orchestrator) -> Vec<machine::MachineView> {
+        self.machines
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| machine::attached_machines(orch))
+    }
+
     async fn release(
         &self,
         _orch: &Orchestrator,
@@ -190,6 +302,8 @@ pub(crate) struct FakeSource {
     idle: StdMutex<Option<Duration>>,
     /// A thread whose source reads wait until the test adds a permit.
     held: StdMutex<Option<(String, Arc<tokio::sync::Semaphore>)>>,
+    /// The installed packs, in place of the workspace's.
+    packs: StdMutex<Vec<(String, Arc<dyn ServiceSource>)>>,
 }
 
 impl FakeSource {
@@ -270,7 +384,14 @@ impl SourceProvider for FakeProvider {
             // A thread's services come from the real store, so a test writes
             // them the way a thread does.
             ServiceOwner::Thread { .. } => OwnerSources.open(orch, project_id, owner).await,
+            ServiceOwner::Pack { pack, machine, .. } => {
+                machine::open_source(orch, self.packs(orch), pack, machine)
+            }
         }
+    }
+
+    fn packs(&self, _orch: &Orchestrator) -> Vec<(String, Arc<dyn ServiceSource>)> {
+        self.0.packs.lock().unwrap().clone()
     }
 }
 
@@ -2542,4 +2663,379 @@ async fn a_prompt_from_a_scheduled_call_fails_closed_and_wakes_the_thread_once()
             .is_some_and(|error| error.contains("prompt_refused")));
         assert_eq!(count(&h, notices).await, expected_notices);
     }
+}
+
+// Machine services: a pack's native service as cells of this supervisor.
+
+const PROBE_SHA: &str = "eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54";
+
+fn native_manifest(transport: &str) -> String {
+    format!(
+        "name: Probe\nruntime: native\nplacement: per-machine\ntransport: {transport}\nargs: [serve]\nartifacts:\n  version: 1.0.0\n  prove: [--version]\n  targets:\n    x86_64-unknown-linux-gnu:\n      url: https://example.invalid/probe\n      sha256: {PROBE_SHA}\n      size: 10\n      executable: probe\nprobe:\n  args: [status]\n  every: 5m\n  ready: /ready\n  reason: [/reason]\n  waitingForOperator: [permission-denied]\n"
+    )
+}
+
+struct MachineHarness {
+    h: Harness,
+    _pack: tempfile::TempDir,
+}
+
+fn view(name: &str) -> machine::MachineView {
+    machine::MachineView {
+        name: name.to_string(),
+        target: Some("x86_64-unknown-linux-gnu".to_string()),
+        installed: Vec::new(),
+    }
+}
+
+/// A pack `kit` declaring the native service `probe` (with `transport`), and
+/// the fake host seeing `machines` attached.
+async fn machine_harness(transport: &str, machines: &[&str]) -> MachineHarness {
+    let h = harness().await;
+    let pack = tempfile::tempdir().unwrap();
+    let dir = pack.path().join("services/probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("service.yaml"), native_manifest(transport)).unwrap();
+    h.source.packs.lock().unwrap().push((
+        "kit".to_string(),
+        Arc::new(
+            crate::project_services::pack_source::PackServiceSource::at_root(
+                "kit",
+                pack.path().to_path_buf(),
+            ),
+        ),
+    ));
+    *h.host.machines.lock().unwrap() = Some(machines.iter().map(|name| view(name)).collect());
+    MachineHarness { h, _pack: pack }
+}
+
+fn probe_key() -> cairn_config::fleet::MachineServiceKey {
+    "kit/probe".parse().unwrap()
+}
+
+/// Select `kit/probe` on `machine`, running the operator's binary there.
+fn select(h: &Harness, machine: &str) {
+    crate::config::settings::mutate_fleet(
+        &h.orch.config_dir,
+        |config| {
+            config.machine_services.select(
+                probe_key(),
+                machine,
+                cairn_config::fleet::MachineSelection {
+                    override_: Some(cairn_config::fleet::CommandOverride {
+                        command: "/opt/probe/bin/probe".to_string(),
+                    }),
+                },
+            )
+        },
+        |_| {},
+    )
+    .unwrap();
+}
+
+fn unselect(h: &Harness, machine: &str) {
+    crate::config::settings::mutate_fleet(
+        &h.orch.config_dir,
+        |config| Ok(config.machine_services.unselect(&probe_key(), machine)),
+        |_| {},
+    )
+    .unwrap();
+}
+
+fn machine_cell(h: &Harness, machine: &str) -> Option<Arc<Cell>> {
+    h.orch
+        .project_services
+        .supervisor
+        .existing("", &ServiceOwner::pack("kit", machine), "probe")
+}
+
+fn launched_on(h: &Harness) -> Vec<String> {
+    let mut machines: Vec<String> = h
+        .host
+        .native_launches
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|launch| launch.machine.clone())
+        .collect();
+    machines.sort();
+    machines
+}
+
+fn instance_state(h: &Harness, machine: &str) -> machine::InstanceState {
+    machine::instances(&h.orch, &probe_key())
+        .into_iter()
+        .find(|instance| instance.machine == machine)
+        .expect("the machine is selected")
+        .state
+}
+
+/// One resident per selected machine, and none on a machine the row does
+/// not select; and nothing of Cairn's reaches it.
+#[tokio::test]
+async fn a_selection_of_two_machines_starts_one_resident_on_each() {
+    let m = machine_harness("none", &["alpha", "beta", "gamma"]).await;
+    select(&m.h, "alpha");
+    select(&m.h, "beta");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    assert_eq!(launched_on(&m.h), ["alpha", "beta"]);
+    assert!(machine_cell(&m.h, "gamma").is_none());
+
+    for launch in m.h.host.native_launches.lock().unwrap().iter() {
+        assert_eq!(launch.program, "/opt/probe/bin/probe");
+        assert_eq!(launch.args, ["serve"]);
+        assert!(
+            launch.env.iter().all(|(key, _)| !key.starts_with("CAIRN_")),
+            "no CAIRN_* variable reaches a native resident: {:?}",
+            launch.env
+        );
+    }
+    assert_eq!(instance_state(&m.h, "alpha"), machine::InstanceState::Ready);
+    let alpha = machine::instances(&m.h.orch, &probe_key())
+        .into_iter()
+        .find(|instance| instance.machine == "alpha")
+        .unwrap();
+    assert_eq!(alpha.provenance, "override /opt/probe/bin/probe (operator)");
+
+    // An unchanged row is a no-op.
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    assert_eq!(launched_on(&m.h).len(), 2);
+}
+
+#[tokio::test]
+async fn removing_a_selection_drains_and_forgets_the_cell() {
+    let m = machine_harness("none", &["alpha", "beta"]).await;
+    select(&m.h, "alpha");
+    select(&m.h, "beta");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    unselect(&m.h, "beta");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    eventually("beta's resident to end", || {
+        m.h.host
+            .native_ended
+            .lock()
+            .unwrap()
+            .contains(&"beta".to_string())
+    })
+    .await;
+    assert!(machine_cell(&m.h, "beta").is_none(), "its cell is gone");
+    assert!(machine_cell(&m.h, "alpha").is_some());
+    let left: Vec<String> = machine::instances(&m.h.orch, &probe_key())
+        .into_iter()
+        .map(|instance| instance.machine)
+        .collect();
+    assert_eq!(left, ["alpha"]);
+}
+
+/// A rename moves a machine's selections, and the next apply drains the old
+/// name's cell and starts the new name's; nothing waits for a restart.
+#[tokio::test]
+async fn a_renamed_machine_drains_its_old_cell_and_serves_under_its_new_name() {
+    let m = machine_harness("none", &["alpha"]).await;
+    select(&m.h, "alpha");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    crate::config::settings::mutate_fleet(
+        &m.h.orch.config_dir,
+        |config| {
+            config.machine_services.rename_machine("alpha", "delta");
+            Ok(())
+        },
+        |_| {},
+    )
+    .unwrap();
+    *m.h.host.machines.lock().unwrap() = Some(vec![view("delta")]);
+    machine::apply_machine_services(&m.h.orch, "machine renamed").await;
+    eventually("the old name's resident to end", || {
+        m.h.host
+            .native_ended
+            .lock()
+            .unwrap()
+            .contains(&"alpha".to_string())
+    })
+    .await;
+    assert!(
+        machine_cell(&m.h, "alpha").is_none(),
+        "the old name's cell is drained"
+    );
+    let delta = machine_cell(&m.h, "delta").expect("the new name has a cell");
+    assert!(delta.serving().is_some(), "and it serves");
+    assert_eq!(launched_on(&m.h), ["alpha", "delta"]);
+    assert_eq!(instance_state(&m.h, "delta"), machine::InstanceState::Ready);
+}
+
+#[tokio::test]
+async fn a_selected_machine_that_is_away_starts_when_it_attaches() {
+    let m = machine_harness("none", &["alpha"]).await;
+    select(&m.h, "gamma");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    assert!(launched_on(&m.h).is_empty());
+    assert_eq!(
+        instance_state(&m.h, "gamma"),
+        machine::InstanceState::MachineAbsent
+    );
+    assert_eq!(
+        instance_state(&m.h, "gamma").sentence(),
+        "not running: machine absent"
+    );
+
+    m.h.host
+        .machines
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .push(view("gamma"));
+    eventually("the resident to start on attach", || {
+        launched_on(&m.h) == ["gamma"]
+    })
+    .await;
+
+    // The machine going away is not the service's crash.
+    let exit = m.h.host.native_exits.lock().unwrap()["gamma"].clone();
+    m.h.host.machines.lock().unwrap().as_mut().unwrap().clear();
+    exit.send((None, true)).unwrap();
+    let cell = machine_cell(&m.h, "gamma").unwrap();
+    eventually("the cell to stop", || {
+        cell.state.lock().unwrap().status == ServiceState::Stopped
+    })
+    .await;
+    assert!(cell.state.lock().unwrap().crashes.is_empty());
+    assert_eq!(
+        instance_state(&m.h, "gamma"),
+        machine::InstanceState::MachineAbsent
+    );
+}
+
+#[tokio::test]
+async fn a_machine_service_backs_off_and_fails_like_any_service() {
+    let m = machine_harness("none", &["alpha"]).await;
+    select(&m.h, "alpha");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    let cell = machine_cell(&m.h, "alpha").unwrap();
+    let exit = m.h.host.native_exits.lock().unwrap()["alpha"].clone();
+    exit.send((Some(3), false)).unwrap();
+    eventually("the crash to back off", || {
+        cell.state.lock().unwrap().status == ServiceState::Backoff
+    })
+    .await;
+    assert!(matches!(
+        instance_state(&m.h, "alpha"),
+        machine::InstanceState::Degraded { .. }
+    ));
+    for crash in 1..CRASH_LIMIT {
+        crashed(&m.h.orch, &cell, crash as u64 + 10, "crashed on purpose").await;
+    }
+    assert_eq!(cell.state.lock().unwrap().status, ServiceState::Failed);
+    assert!(matches!(
+        instance_state(&m.h, "alpha"),
+        machine::InstanceState::Failed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_probe_that_does_not_answer_degrades_without_a_crash() {
+    let m = machine_harness("none", &["alpha"]).await;
+    select(&m.h, "alpha");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    let cell = machine_cell(&m.h, "alpha").unwrap();
+    let incarnation = cell.serving().expect("it booted through its probe");
+    assert!(m.h.host.probes.load(Ordering::Acquire) >= 1);
+
+    *m.h.host.probe_answer.lock().unwrap() = Some(Err("timed out".to_string()));
+    let report = machine::probe_once(&m.h.orch, &cell, &incarnation).await;
+    *cell.machine.as_ref().unwrap().probe.lock().unwrap() = Some(report);
+    assert_eq!(
+        instance_state(&m.h, "alpha"),
+        machine::InstanceState::Degraded {
+            reason: "timed out".to_string()
+        }
+    );
+    assert!(cell.state.lock().unwrap().crashes.is_empty());
+    assert_eq!(cell.state.lock().unwrap().status, ServiceState::Running);
+
+    *m.h.host.probe_answer.lock().unwrap() = Some(Ok(
+        r#"{"ready": false, "reason": "permission-denied"}"#.to_string(),
+    ));
+    let report = machine::probe_once(&m.h.orch, &cell, &incarnation).await;
+    *cell.machine.as_ref().unwrap().probe.lock().unwrap() = Some(report);
+    let waiting = instance_state(&m.h, "alpha");
+    assert!(
+        matches!(waiting, machine::InstanceState::WaitingForOperator { .. }),
+        "{waiting:?}"
+    );
+    assert!(
+        waiting.sentence().contains("Accessibility"),
+        "{}",
+        waiting.sentence()
+    );
+}
+
+#[tokio::test]
+async fn a_native_resident_whose_first_probe_fails_does_not_boot() {
+    let m = machine_harness("none", &["alpha"]).await;
+    *m.h.host.probe_answer.lock().unwrap() = Some(Ok("not json".to_string()));
+    select(&m.h, "alpha");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    let cell = machine_cell(&m.h, "alpha").unwrap();
+    assert!(cell.serving().is_none());
+    assert_eq!(
+        cell.state.lock().unwrap().status,
+        ServiceState::Backoff,
+        "a resident that cannot start backs off rather than retrying hot"
+    );
+}
+
+#[tokio::test]
+async fn a_machine_service_is_not_called_as_a_service() {
+    let m = machine_harness("none", &["alpha"]).await;
+    let error = call(
+        &m.h.orch,
+        CallRequest {
+            owner: ServiceOwner::pack("kit", "alpha"),
+            ..request("probe", "status", agent())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code, "not_callable");
+    assert!(error.message.contains("over MCP"), "{}", error.message);
+}
+
+/// One facade per instance, owned by its cell: a second claimant on one
+/// instance's lease is the herd CAIRN-4205 found.
+#[tokio::test]
+async fn an_instance_keeps_one_facade_and_each_connection_gets_a_fresh_process() {
+    let m = machine_harness("mcp-stdio", &["alpha", "beta"]).await;
+    select(&m.h, "alpha");
+    select(&m.h, "beta");
+    machine::apply_machine_services(&m.h.orch, "test").await;
+    let alpha = machine_cell(&m.h, "alpha").unwrap();
+    let beta = machine_cell(&m.h, "beta").unwrap();
+    let probe = machine::facade_for(&m.h.orch, &alpha).unwrap();
+    let verb = machine::facade_for(&m.h.orch, &alpha).unwrap();
+    assert!(Arc::ptr_eq(&probe, &verb), "one instance, one facade");
+    assert_eq!(probe.key(), "kit/probe@alpha");
+    assert_eq!(probe.label(), "kit/probe on alpha");
+    let elsewhere = machine::facade_for(&m.h.orch, &beta).unwrap();
+    assert!(!Arc::ptr_eq(&probe, &elsewhere));
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = probe.open().await.unwrap();
+    stream.write_all(b"{\"jsonrpc\":\"2.0\"}\n").await.unwrap();
+    let mut echoed = [0u8; 18];
+    stream.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(
+        &echoed, b"{\"jsonrpc\":\"2.0\"}\n",
+        "stdin and stdout are the resident's"
+    );
+    let first = alpha.serving().unwrap().generation;
+
+    // A second connection cannot share the first one's MCP session.
+    let _second = probe.open().await.unwrap();
+    let second = alpha.serving().unwrap().generation;
+    assert_ne!(first, second, "a fresh process for a fresh connection");
+    assert!(
+        alpha.state.lock().unwrap().crashes.is_empty(),
+        "letting a resident go is not a crash"
+    );
 }

@@ -1643,7 +1643,8 @@ impl AgentBackend for ClaudeBackend {
         // Transition run to Running AFTER successful spawn (sets started_at accurately)
         if let Err(e) = transition_run_to_live(CLAUDE_BACKEND_NAME, orch, &run_db, &config.run_id) {
             log::warn!("Failed to transition run to running: {}", e);
-            // Job is already Running from start_job's transition_job call — no write needed
+            // The job is already Running: the cold start's compare-and-set or the
+            // resume's `transition_job_to_running` wrote it before the spawn.
         }
 
         let SessionEvents::ClaudeStream { stdout, stderr } = launched.events else {

@@ -103,11 +103,17 @@ pub(crate) const TASK_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Task,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{name}",
     name: "Task summary",
-    description: "Sub-agent task job summary with status and metadata",
+    description: "Sub-agent task job summary with status and metadata. A patch with executor sets the task's own placement default (a task never inherits its parent's); executor:null clears it.",
     read_projections: NO_PROJECTIONS,
     related: TASK_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[PLACEMENT_DEFAULT_EXECUTOR],
+        optional: &[],
+        label: "set or clear the task's placement default",
+        example: "write({changes:[{target:\"cairn:~\",mode:\"patch\",payload:{executor:{name:\"bbs\"}}}]})",
+    }],
 };
 
 pub(crate) const TASK_MESSAGES_CONTRACT: ResourceContract =

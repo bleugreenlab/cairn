@@ -86,6 +86,20 @@ impl Orchestrator {
         Ok(migrated)
     }
 
+    /// Write down the conversion of the retired desktop-automation toggles into
+    /// machine-service selections, if it has not been written yet, and log what
+    /// did not carry over exactly. Idempotent.
+    pub fn migrate_desktop_automation(&self) -> Result<(), String> {
+        let Some(notes) = settings::migrate_desktop_automation(&self.config_dir)? else {
+            return Ok(());
+        };
+        log::info!("Converted buildSlots.desktopAutomation into buildSlots.machineServices");
+        for note in notes {
+            log::info!("desktop automation conversion: {note}");
+        }
+        Ok(())
+    }
+
     /// Convert this workspace's tier grid into pools and a ladder, if it has
     /// not been converted yet, and log what did not carry over exactly.
     ///

@@ -240,6 +240,20 @@ macro_rules! open_thread_child_sql {
     };
 }
 
+/// The execution-queue LANE of issue `i`: the parent that filed the work.
+/// `thread:<id>` for a thread's child, else `issue:<id>` for a child of a
+/// coordinator or other parent issue, else `shared`, one lane for top-level
+/// issues and (with `i` LEFT JOINed and absent) issue-less executions. The
+/// queue releases lanes in rotation (`execution::gates::rotation`), so a burst
+/// one parent files takes one turn per round instead of the whole fleet.
+/// Reads `issues` only. Expects an `issues` row aliased `i`.
+#[macro_export]
+macro_rules! queue_lane_sql {
+    () => {
+        "CASE WHEN i.parent_thread_id IS NOT NULL THEN 'thread:' || i.parent_thread_id WHEN i.parent_issue_id IS NOT NULL THEN 'issue:' || i.parent_issue_id ELSE 'shared' END"
+    };
+}
+
 /// True when condition row `ce` is blocked and its node has no routed row, so
 /// the condition is still routed nowhere. Expects a `condition_evaluations` row
 /// aliased `ce`.
@@ -273,7 +287,7 @@ mod tests {
 
     /// A direct child of `th` with no execution: a backlog child.
     async fn child(db: &LocalDb, number: i32) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO issues(id, project_id, number, title, status, progress, attention,
                                 parent_thread_id, created_at, updated_at)
                VALUES('i{number}', 'p', {number}, 'Child {number}', 'active', 'active', 'none',
@@ -285,7 +299,7 @@ mod tests {
 
     /// A started execution on issue `number` whose one job has `status`.
     async fn started(db: &LocalDb, number: i32, lifecycle: &str, status: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq,
                                     lifecycle)
                VALUES('e{number}', 'r', 'i{number}', 'p', 'running', 1, 1, '{lifecycle}');
@@ -298,7 +312,7 @@ mod tests {
     }
 
     async fn pr(db: &LocalDb, number: i32, status: &str) {
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
                                         target_branch, status, opened_at, updated_at)
                VALUES('mr{number}', 'j{number}', 'p', 'i{number}', 'PR', 'b', 'main', '{status}',

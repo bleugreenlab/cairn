@@ -540,6 +540,30 @@ impl Default for FactRegistry {
                 ("text", Scalar, HYDRATED),
             ]),
         };
+        // A machine the self-update stranded (`fleet::unreturned`): one row
+        // per machine and directed build, minted once the runner's single
+        // restart over the machine's bootstrap has an outcome. Project-less,
+        // so a thread's clause that omits `project` sees it. Every field is
+        // the runner's own words, and the summary is the fleet page's line.
+        let executor_update_unreturned = SourceSpec {
+            dedupe: LogDedupe::Unique,
+            audience: Audience::AllProviders,
+            max_stored_chars: None,
+            addressees: &[],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::Drop,
+            untrusted: None,
+            fields: fields(&[
+                ("executor", Scalar, STORED),
+                ("executorId", Scalar, STORED),
+                ("build", Scalar, STORED),
+                ("directedAt", Scalar, STORED),
+                ("lastSeen", Scalar, STORED),
+                ("restart", Scalar, STORED),
+                ("detailUri", Scalar, STORED),
+            ]),
+        };
         let triggers = [
             ("attention", attention),
             ("thread_stream", thread),
@@ -549,6 +573,10 @@ impl Default for FactRegistry {
             ("post_commented", post_commented),
             ("ingress", ingress),
             ("channel_message", channel_message),
+            (
+                crate::fleet::unreturned::EXECUTOR_UPDATE_UNRETURNED,
+                executor_update_unreturned,
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -809,6 +837,7 @@ mod tests {
             vec![
                 "attention",
                 "channel_message",
+                "executor_update_unreturned",
                 "file_changed",
                 "github_comment",
                 "ingress",
@@ -1252,6 +1281,7 @@ mod tests {
             vec![
                 "attention",
                 "channel_message",
+                "executor_update_unreturned",
                 "file_changed",
                 "github_comment",
                 "ingress",
@@ -1275,7 +1305,8 @@ mod tests {
                 "post_created",
                 "post_commented",
                 "ingress",
-                "channel_message"
+                "channel_message",
+                "executor_update_unreturned"
             ]
         );
         assert_eq!(
@@ -1283,6 +1314,7 @@ mod tests {
             vec![
                 "attention",
                 "channel_message",
+                "executor_update_unreturned",
                 "file_changed",
                 "github_comment",
                 "ingress",

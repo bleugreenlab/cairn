@@ -34,6 +34,7 @@ pub mod macos;
 mod nested;
 pub mod operator_credential;
 pub mod page_call;
+pub mod scratch_refusal;
 mod setuid_refusal;
 mod write_refusal;
 
@@ -560,6 +561,22 @@ impl SandboxPolicy {
         paths
     }
 
+    /// Grant this spawn its `$TMPDIR`: `dir` becomes writable, and a socket
+    /// server bound beneath it stays reachable from the job's later spawns.
+    ///
+    /// The one home for that rule, so every seam that exports a `TMPDIR` grants
+    /// the same two things for it. A read-only checkout's guarantee outranks it,
+    /// as it outranks a session grant: a `dir` overlapping that checkout is not
+    /// made writable.
+    pub fn grant_tmpdir(&mut self, dir: &Path) {
+        let reopens_readonly_checkout =
+            !self.worktree_writable && paths_overlap(dir, &self.worktree);
+        if !reopens_readonly_checkout && !self.writable_extra.iter().any(|path| path == dir) {
+            self.writable_extra.push(dir.to_path_buf());
+        }
+        self.allow_job_sockets_in(dir);
+    }
+
     /// Let later spawns of the same job reach socket servers bound beneath
     /// `dir`, which is the cell's own scratch (its `$TMPDIR`).
     ///
@@ -1021,15 +1038,11 @@ pub fn default_writable_extra() -> Vec<PathBuf> {
             dirs.push(uv_cache);
         }
     }
-    // Cairn's own per-job scratch root (`<cairn_home>/scratch`), which every
-    // spawn's `TMPDIR`/`TMP`/`TEMP` may name and whose job directory is the
-    // residence of a command that has no checkout. It used to live under the
-    // platform temp root and be covered by that wholesale grant; naming it here
-    // is what keeps a scratch write prompt-free now that the root is readable
-    // instead. Granted unconditionally rather than existence-filtered: the very
-    // first spawn of a fresh install writes there, and an absent path is inert
-    // in the generated rules.
-    dirs.push(cairn_common::scratch::scratch_root());
+    // Cairn's scratch root (`<cairn_home>/scratch`) is deliberately absent: it
+    // holds Cairn's per-process bookkeeping, and granting it whole let agents
+    // make unowned sibling workspaces there. A spawn whose `$TMPDIR` is its own
+    // directory under the root is granted exactly that one through
+    // `SandboxPolicy::grant_tmpdir`; see `scratch_refusal`.
     // The executor's tool cache, where a project's setup caches the tools it
     // builds for itself (the pinned `tursodb`). Existence-filtered like the uv
     // cache: the executor creates it before every spawn.
@@ -1220,11 +1233,17 @@ fn is_shared_socket_root(dir: &Path) -> bool {
 
 fn is_shared_socket_root_in(dir: &Path, roots: &[PathBuf]) -> bool {
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let dir = canonical(dir);
+    // Both spellings of `dir`: on macOS `/home` canonicalizes to
+    // `/System/Volumes/Data/home`, which a root that does not exist (and so
+    // keeps its raw spelling) never starts with. Matching more only refuses more.
+    let spellings = [dir.to_path_buf(), canonical(dir)];
     !dir.is_absolute()
-        || roots
-            .iter()
-            .any(|root| canonical(root).starts_with(&dir) || root.starts_with(&dir))
+        || roots.iter().any(|root| {
+            let root_canonical = canonical(root);
+            spellings
+                .iter()
+                .any(|dir| root_canonical.starts_with(dir) || root.starts_with(dir))
+        })
 }
 
 fn temp_dirs() -> Vec<PathBuf> {
@@ -1616,21 +1635,77 @@ mod tests {
         }
     }
 
-    /// Cairn's scratch root left the platform temp root, which the fence grants
-    /// wholesale; without a grant of its own, every ordinary scratch write
-    /// (`mktemp`, a compiler's temp file, a helper script) would become an
-    /// out-of-worktree crossing.
+    /// Cairn's scratch root holds every job's bookkeeping directory. Granted
+    /// whole, it let an agent make a sibling workspace beside its own that
+    /// nothing owned; a spawn is granted only its own `$TMPDIR` there.
     #[test]
-    fn the_cairn_scratch_root_stays_writable() {
+    fn the_scratch_root_is_never_in_a_default_writable_set() {
+        // The root itself is what used to be pushed. (A test process's root may
+        // sit under a temp dir the fence grants for unrelated reasons, so this
+        // asks for the root by name rather than for any ancestor.)
         let scratch = cairn_common::scratch::scratch_root();
+        let covers_root = |paths: &[PathBuf]| paths.contains(&scratch);
         assert!(
-            default_writable_extra().contains(&scratch),
-            "the scratch root must be writable: {}",
+            !covers_root(&default_writable_extra()),
+            "the scratch root must not be writable by default: {}",
             scratch.display()
         );
-        let policy = SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
-        assert!(policy.writable_paths().contains(&scratch));
-        assert!(policy.readable_paths().contains(&scratch));
+        let wt = Path::new("/project/wt");
+        for (name, policy) in [
+            ("for_run", SandboxPolicy::for_run(wt, &[], vec![])),
+            (
+                "for_readonly_checkout",
+                SandboxPolicy::for_readonly_checkout(wt, &[], vec![]),
+            ),
+            (
+                "for_service",
+                SandboxPolicy::for_service(Path::new("/svc/state"), &[], vec![]),
+            ),
+        ] {
+            assert!(
+                !covers_root(&policy.writable_paths()),
+                "{name} must not carry the scratch root into its writable set"
+            );
+            // Reads stay broad: nothing denies the root, so it is still read.
+            assert!(matches!(policy.reach.reads, ReadScope::Broad), "{name}");
+            assert!(
+                !policy
+                    .deny_read
+                    .iter()
+                    .any(|denied| scratch.starts_with(denied)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_tmpdir_opens_exactly_that_directory() {
+        let scratch = cairn_common::scratch::scratch_root();
+        let own = scratch.join("P.1.1.builder");
+        let mut policy = SandboxPolicy::for_run(Path::new("/project/wt"), &[], vec![]);
+        policy.grant_tmpdir(&own);
+        policy.grant_tmpdir(&own);
+
+        assert_eq!(
+            policy
+                .writable_paths()
+                .iter()
+                .filter(|p| **p == own)
+                .count(),
+            1,
+            "granted once, however many seams name it"
+        );
+        assert!(policy.socket_resolvable_paths().contains(&own));
+        assert!(!policy.writable_paths().contains(&scratch));
+        assert!(!policy.socket_resolvable_paths().contains(&scratch));
+    }
+
+    #[test]
+    fn grant_tmpdir_never_reopens_a_readonly_checkout() {
+        let checkout = PathBuf::from("/project/live");
+        let mut policy = SandboxPolicy::for_readonly_checkout(&checkout, &[], vec![]);
+        policy.grant_tmpdir(&checkout.join("tmp"));
+        assert!(!policy.writable_paths().contains(&checkout.join("tmp")));
     }
 
     /// Cairn's own log directory must never join the writable set, however

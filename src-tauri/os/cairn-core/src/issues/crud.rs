@@ -864,12 +864,75 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
             // In the same write, once the issue no longer reads resolved: lift
             // the jobs the resolution cancelled back onto their own facts.
             // Archived and superseded jobs stay Cancelled.
-            cairn_workflow::advancement::rederive_after_reopen_conn(conn, &id).await?;
+            let lifted = cairn_workflow::advancement::rederive_after_reopen_conn(conn, &id).await?;
+            continue_sessions_for_issue_conn(conn, &id, &lifted).await?;
             Ok(())
         })
     })
     .await
     .map_err(CairnError::from)
+}
+
+/// The inverse of [`close_sessions_for_issue_conn`]: move each job a
+/// resolution stopped onto a fresh open successor of the session it closed, so
+/// the reopened issue's work can take its next turn.
+///
+/// A closed session is terminal and is never reopened. The successor forks the
+/// closed conversation instead (`sessions::queries::continues_closed_work`),
+/// and the predecessor keeps its resolution's reason as history. A job
+/// continues when its current session is closed, it is not Cancelled after the
+/// lift, it is not a thread's, its execution was not superseded, and either a
+/// resolution closed the session or the lift just moved the job: a resolution
+/// stop from an older build closed its sessions as `node_removed`.
+///
+/// The reopen's caller announces every job on the issue once the write
+/// commits, these among them.
+async fn continue_sessions_for_issue_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+    lifted: &[String],
+) -> DbResult<()> {
+    let mut rows = conn
+        .query(
+            "SELECT j.id, s.id, s.terminal_reason
+               FROM jobs j
+               JOIN sessions s ON s.id = j.current_session_id
+               LEFT JOIN executions e ON e.id = j.execution_id
+              WHERE j.issue_id = ?1
+                AND j.thread_id IS NULL
+                AND j.status <> 'cancelled'
+                AND s.status = 'closed'
+                AND COALESCE(e.lifecycle, '') <> 'superseded'",
+            params![issue_id],
+        )
+        .await?;
+    let mut candidates = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let (job_id, session_id, reason) = (row.text(0)?, row.text(1)?, row.opt_text(2)?);
+        let closed_by_resolution =
+            matches!(reason.as_deref(), Some("issue_merged" | "issue_closed"));
+        if closed_by_resolution || lifted.contains(&job_id) {
+            candidates.push((job_id, session_id));
+        }
+    }
+    drop(rows);
+
+    for (job_id, session_id) in candidates {
+        let Some(session) = crate::sessions::queries::load_session_conn(conn, &session_id).await?
+        else {
+            continue;
+        };
+        crate::sessions::queries::rotate_session_conn(
+            conn,
+            &session,
+            &job_id,
+            &session.backend,
+            crate::sessions::queries::RotationReason::Reopened,
+            None,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn close_sessions_for_issue_conn(
@@ -1419,7 +1482,7 @@ mod tests {
         for table in ["events", "runs", "issues"] {
             let count = db
                 .query_one(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE id LIKE '%jobless'"),
+                    format!("SELECT COUNT(*) FROM {table} WHERE id LIKE '%jobless'"),
                     (),
                     |row| row.i64(0),
                 )

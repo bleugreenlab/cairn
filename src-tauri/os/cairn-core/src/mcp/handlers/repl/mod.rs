@@ -33,9 +33,9 @@ use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
 use cairn_common::executor_protocol::{
     ExecutorSelector, ProcessSandboxMode, ResidencyFence, ResidencyHolder, ResidencyOperation,
-    ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEventKind, ResidentProcessIoMode,
-    ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentProcessStream,
-    ResidentRuntimeAsset, ResidentStreamFraming,
+    ResidencyResult, ResidentProcessCwdRoot, ResidentProcessEvent, ResidentProcessEventKind,
+    ResidentProcessIoMode, ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus,
+    ResidentProcessStream, ResidentRuntimeAsset, ResidentStreamFraming,
 };
 use store::{ReplExitReason, ReplRowStatus};
 
@@ -326,7 +326,12 @@ pub struct ReplSession {
     process_key: String,
     process_generation: u64,
     responses: Mutex<mpsc::Receiver<String>>,
-    alive: AtomicBool,
+    /// The flag [`protocol_listener`] clears when the interpreter exits or its
+    /// stream loses protocol sync, shared rather than copied so a desync after
+    /// spawn reads as dead at once instead of waiting out a send.
+    alive: Arc<AtomicBool>,
+    /// Keeps [`protocol_listener`] registered for exactly this session's life.
+    _events: crate::fleet::ResidentProcessSubscription,
     created_at: SystemTime,
     /// Serializes request->response round-trips so two `run` items targeting the
     /// same slug (items run in parallel by default) cannot interleave on the
@@ -944,56 +949,20 @@ pub async fn spawn_session(
             ));
         }
     }
+    // Subscribed before the start so the interpreter's first frames are not
+    // missed; the generation it filters on is named once the start returns.
     let (tx, rx) = mpsc::sync_channel(2);
-    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let early_alive = Arc::new(AtomicBool::new(true));
-    let ef = fence.clone();
-    let ek = key.clone();
-    let eb = buffer.clone();
-    let ea = early_alive.clone();
-    orch.fleet.subscribe_resident_process_events(move |event| {
-        if event.holder != ef.holder
-            || event.incarnation_id != ef.incarnation_id
-            || event.cell_epoch != ef.cell_epoch
-            || event.process_key != ek
-        {
-            return;
-        }
-        match event.event {
-            ResidentProcessEventKind::Output {
-                stream: ResidentProcessStream::Stdout,
-                data,
-                ..
-            } => {
-                if let Ok(mut b) = eb.lock() {
-                    if b.len().saturating_add(data.len()) > FRAME_CAP {
-                        b.clear();
-                        ea.store(false, Ordering::Release);
-                        let _ = tx.try_send("oversized REPL protocol frame".to_string());
-                        return;
-                    }
-                    b.extend(data);
-                    while let Some(i) = b.iter().position(|x| *x == b'\n') {
-                        let line = String::from_utf8_lossy(&b[..i]).into_owned();
-                        b.drain(..=i);
-                        if tx.try_send(line).is_err() {
-                            ea.store(false, Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-            }
-            ResidentProcessEventKind::Output {
-                stream: ResidentProcessStream::Stderr,
-                data,
-                ..
-            } => tracing::debug!(diagnostic=%String::from_utf8_lossy(&data),"REPL stderr"),
-            ResidentProcessEventKind::State {
-                status: ResidentProcessStatus::Exited { .. },
-            } => ea.store(false, Ordering::Release),
-            _ => {}
-        }
-    });
+    let alive = Arc::new(AtomicBool::new(true));
+    let started_generation = Arc::new(AtomicU64::new(0));
+    let events = orch
+        .fleet
+        .subscribe_resident_process_events(protocol_listener(
+            fence.clone(),
+            key.clone(),
+            started_generation.clone(),
+            alive.clone(),
+            tx,
+        ));
     let started = orch
         .fleet
         .operate_residency(
@@ -1020,6 +989,7 @@ pub async fn spawn_session(
         let _ = crate::fleet::residency::stop(orch, &fence, &key).await;
         return Err("REPL start returned no process generation".to_string());
     };
+    started_generation.store(generation, Ordering::Release);
     // The process is up, so open a generation on the durable row: insert it on a
     // first create, or bump an exited row back to running on a resume. Doing this
     // after the spawn means a failed spawn never leaves a row claiming to run.
@@ -1048,31 +1018,11 @@ pub async fn spawn_session(
         process_key: key,
         process_generation: generation,
         responses: Mutex::new(rx),
-        alive: AtomicBool::new(early_alive.load(Ordering::Acquire)),
+        alive,
+        _events: events,
         created_at: SystemTime::now(),
         send_lock: tokio::sync::Mutex::new(()),
         seq: AtomicU64::new(start_seq),
-    });
-    let weak = Arc::downgrade(&session);
-    let xf = fence.clone();
-    let xk = session.process_key.clone();
-    orch.fleet.subscribe_resident_process_events(move |e| {
-        if e.holder == xf.holder
-            && e.incarnation_id == xf.incarnation_id
-            && e.cell_epoch == xf.cell_epoch
-            && e.process_key == xk
-            && e.process_generation == generation
-            && matches!(
-                e.event,
-                ResidentProcessEventKind::State {
-                    status: ResidentProcessStatus::Exited { .. }
-                }
-            )
-        {
-            if let Some(s) = weak.upgrade() {
-                s.alive.store(false, Ordering::Release);
-            }
-        }
     });
     let ro = orch.clone();
     let rf = fence;
@@ -1093,6 +1043,72 @@ pub async fn spawn_session(
         }
     });
     Ok(session)
+}
+
+/// What a session hears of its interpreter: stdout reassembled into protocol
+/// lines on `lines`, and `alive` cleared the moment the stream can no longer be
+/// trusted — the process exited, a frame outgrew [`FRAME_CAP`], or a line could
+/// not be queued. Once a line is lost, every later response would answer the
+/// wrong request, so the session is dead rather than merely slow.
+///
+/// Events for any other process are ignored, and so, once `generation` is
+/// non-zero, are events from any other generation of this one: a process
+/// restarted under the same key and fence must not feed an older session.
+/// Before the start names its generation, nothing is known to filter on.
+fn protocol_listener(
+    fence: ResidencyFence,
+    process_key: String,
+    generation: Arc<AtomicU64>,
+    alive: Arc<AtomicBool>,
+    lines: mpsc::SyncSender<String>,
+) -> impl Fn(ResidentProcessEvent) + Send + Sync + 'static {
+    let buffer = Mutex::new(Vec::<u8>::new());
+    move |event| {
+        let expected = generation.load(Ordering::Acquire);
+        if event.holder != fence.holder
+            || event.incarnation_id != fence.incarnation_id
+            || event.cell_epoch != fence.cell_epoch
+            || event.process_key != process_key
+            || (expected != 0 && event.process_generation != expected)
+        {
+            return;
+        }
+        match event.event {
+            ResidentProcessEventKind::Output {
+                stream: ResidentProcessStream::Stdout,
+                data,
+                ..
+            } => {
+                let Ok(mut buffer) = buffer.lock() else {
+                    return;
+                };
+                if buffer.len().saturating_add(data.len()) > FRAME_CAP {
+                    buffer.clear();
+                    alive.store(false, Ordering::Release);
+                    let _ = lines.try_send("oversized REPL protocol frame".to_string());
+                    return;
+                }
+                buffer.extend(data);
+                while let Some(i) = buffer.iter().position(|x| *x == b'\n') {
+                    let line = String::from_utf8_lossy(&buffer[..i]).into_owned();
+                    buffer.drain(..=i);
+                    if lines.try_send(line).is_err() {
+                        alive.store(false, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            ResidentProcessEventKind::Output {
+                stream: ResidentProcessStream::Stderr,
+                data,
+                ..
+            } => tracing::debug!(diagnostic=%String::from_utf8_lossy(&data),"REPL stderr"),
+            ResidentProcessEventKind::State {
+                status: ResidentProcessStatus::Exited { .. },
+            } => alive.store(false, Ordering::Release),
+            _ => {}
+        }
+    }
 }
 
 pub(crate) async fn send(
@@ -1543,6 +1559,128 @@ mod process_env_tests {
                 "http://127.0.0.1:4100/api/mcp".to_string()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod protocol_listener_tests {
+    use super::*;
+
+    /// A [`protocol_listener`] fed directly, with the flag and channel a session
+    /// would hold.
+    struct Listener {
+        feed: Box<dyn Fn(ResidentProcessEvent)>,
+        generation: Arc<AtomicU64>,
+        alive: Arc<AtomicBool>,
+        lines: mpsc::Receiver<String>,
+    }
+
+    fn listener() -> Listener {
+        let (tx, lines) = mpsc::sync_channel(2);
+        let generation = Arc::new(AtomicU64::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        let feed = protocol_listener(
+            repl_fence(),
+            "repl:py".into(),
+            generation.clone(),
+            alive.clone(),
+            tx,
+        );
+        Listener {
+            feed: Box::new(feed),
+            generation,
+            alive,
+            lines,
+        }
+    }
+
+    fn repl_fence() -> ResidencyFence {
+        ResidencyFence {
+            holder: ResidencyHolder::Job {
+                job_id: "job".into(),
+            },
+            incarnation_id: "incarnation".into(),
+            cell_epoch: 7,
+        }
+    }
+
+    fn repl_event(
+        process_generation: u64,
+        event: ResidentProcessEventKind,
+    ) -> ResidentProcessEvent {
+        let fence = repl_fence();
+        ResidentProcessEvent {
+            holder: fence.holder,
+            incarnation_id: fence.incarnation_id,
+            cell_epoch: fence.cell_epoch,
+            process_key: "repl:py".into(),
+            process_generation,
+            event,
+        }
+    }
+
+    fn stdout(data: &[u8]) -> ResidentProcessEventKind {
+        ResidentProcessEventKind::Output {
+            sequence: 1,
+            stream: ResidentProcessStream::Stdout,
+            data: data.to_vec(),
+        }
+    }
+
+    fn exited() -> ResidentProcessEventKind {
+        ResidentProcessEventKind::State {
+            status: ResidentProcessStatus::Exited {
+                finished_at_unix_ms: 1,
+                exit_code: Some(0),
+                restartable: false,
+                executor_lost: false,
+            },
+        }
+    }
+
+    /// A dropped line means every later response answers the wrong request, so
+    /// the flag the session reads must drop with it, long after spawn.
+    #[test]
+    fn a_line_the_session_cannot_queue_reads_as_dead() {
+        let l = listener();
+        l.generation.store(3, Ordering::Release);
+        (l.feed)(repl_event(3, stdout(b"{}\n")));
+        assert!(l.alive.load(Ordering::Acquire));
+        (l.feed)(repl_event(3, stdout(b"{}\n{}\n")));
+        assert!(!l.alive.load(Ordering::Acquire));
+        assert_eq!(l.lines.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn an_oversized_frame_reads_as_dead_and_wakes_the_waiter() {
+        let l = listener();
+        l.generation.store(3, Ordering::Release);
+        (l.feed)(repl_event(3, stdout(&vec![b'x'; FRAME_CAP + 1])));
+        assert!(!l.alive.load(Ordering::Acquire));
+        assert_eq!(
+            l.lines.try_recv().as_deref(),
+            Ok("oversized REPL protocol frame")
+        );
+    }
+
+    /// A process restarted under the same key and fence must not feed, or
+    /// kill, the session of the generation before it.
+    #[test]
+    fn once_started_a_session_hears_only_its_own_generation() {
+        let l = listener();
+        // Before the start names a generation there is nothing to filter on,
+        // and the interpreter's first frames must not be missed.
+        (l.feed)(repl_event(3, stdout(b"early\n")));
+        assert_eq!(l.lines.try_recv().as_deref(), Ok("early"));
+
+        l.generation.store(3, Ordering::Release);
+        (l.feed)(repl_event(2, stdout(b"stale\n")));
+        (l.feed)(repl_event(2, exited()));
+        assert!(l.lines.try_recv().is_err());
+        assert!(l.alive.load(Ordering::Acquire));
+
+        (l.feed)(repl_event(3, exited()));
+        assert!(!l.alive.load(Ordering::Acquire));
     }
 }
 

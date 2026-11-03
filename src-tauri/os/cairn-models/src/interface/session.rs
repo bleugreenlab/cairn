@@ -88,7 +88,8 @@ impl SessionStart {
 /// It has no `Serialize`, and its `Debug` names the variables without their
 /// values, so a spec can be logged or put in a panic message without leaking.
 /// The values leave only through [`SecretEnv::apply`], into a process's
-/// environment.
+/// environment, or through a provider that takes one out to hand it over
+/// another way (the Claude CLI's OAuth token, on an inherited descriptor).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretEnv(BTreeMap<String, String>);
 
@@ -108,6 +109,12 @@ impl SecretEnv {
 
     pub fn extend(&mut self, other: SecretEnv) {
         self.0.extend(other.0);
+    }
+
+    /// Take `name` out, for a launch that delivers it some way other than the
+    /// environment.
+    pub fn remove(&mut self, name: &str) -> Option<String> {
+        self.0.remove(name)
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {

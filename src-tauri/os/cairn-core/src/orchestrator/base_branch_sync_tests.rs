@@ -406,15 +406,21 @@ async fn a_panicking_pass_does_not_wedge_the_project() {
 #[test]
 fn a_successful_check_clears_a_check_error_but_not_a_sync_error() {
     let registry = BaseBranchSyncRegistry::default();
-    registry.record_error("p", "main", Phase::Check, "offline", at(1));
-    registry.record_check("p", "main", Some(NEW.into()), Source::Poll, at(2));
+    registry.record_check_error("p", "main", "offline", registry.observe_at(at(1)));
+    registry.record_check(
+        "p",
+        "main",
+        Some(NEW.into()),
+        Source::Poll,
+        registry.observe_at(at(2)),
+    );
     let state = registry.snapshot("p", "main").unwrap();
     assert_eq!(state.last_error, None);
     assert_eq!(state.remote_tip.as_deref(), Some(NEW));
     assert_eq!(state.remote_tip_source, Some(Source::Poll));
 
-    registry.record_error("p", "main", Phase::Sync, "import failed", at(3));
-    registry.record_check("p", "main", None, Source::Fetch, at(4));
+    registry.record_sync_error("p", "main", "import failed", at(3));
+    registry.record_check("p", "main", None, Source::Fetch, registry.observe_at(at(4)));
     let state = registry.snapshot("p", "main").unwrap();
     assert_eq!(state.last_error.unwrap().phase, Phase::Sync);
     assert_eq!(
@@ -423,6 +429,57 @@ fn a_successful_check_clears_a_check_error_but_not_a_sync_error() {
         "a check that cannot name the tip keeps the last known one"
     );
     assert_eq!(state.checked_at, Some(at(4)));
+}
+
+/// A poll's `ls-remote` asked before the store's own publication and answered
+/// after it is the older observation, however late it is recorded: it must not
+/// put the pre-publication tip back. The same order holds for every other way
+/// of learning about origin, and a newer observation still moves the tip.
+#[test]
+fn an_answer_asked_before_a_publication_and_recorded_after_it_is_dropped() {
+    let registry = BaseBranchSyncRegistry::default();
+    let poll = registry.observe_at(at(10));
+    let publication = registry.observe_at(at(11));
+    assert!(registry.record_check("p", "b", Some(NEW.into()), Source::Publish, publication));
+
+    assert!(
+        !registry.record_check("p", "b", Some(OLD.into()), Source::Poll, poll),
+        "the poll's older answer is not recorded"
+    );
+    assert!(!registry.record_tip("p", "b", OLD, Source::Push, poll));
+    registry.record_absent("p", "b", poll);
+    registry.record_no_origin("p", "b", poll);
+    registry.record_check_error("p", "b", "offline", poll);
+    let state = registry.snapshot("p", "b").unwrap();
+    assert_eq!(state.remote_tip.as_deref(), Some(NEW));
+    assert_eq!(state.remote_tip_source, Some(Source::Publish));
+    assert_eq!(state.checked_at, Some(at(11)));
+    assert!(!state.no_origin);
+    assert_eq!(
+        state.last_error, None,
+        "an older check's failure is not news"
+    );
+
+    let later = registry.observe_at(at(12));
+    assert!(registry.record_check("p", "b", Some(OLD.into()), Source::Poll, later));
+    let state = registry.snapshot("p", "b").unwrap();
+    assert_eq!(state.remote_tip.as_deref(), Some(OLD));
+    assert_eq!(state.remote_tip_source, Some(Source::Poll));
+}
+
+/// A failed check says nothing about the tip, so an older check that did name
+/// one still records it; the failure stays the newest check outcome.
+#[test]
+fn a_newer_failure_does_not_hide_an_older_answer_s_tip() {
+    let registry = BaseBranchSyncRegistry::default();
+    let poll = registry.observe_at(at(10));
+    let fetch = registry.observe_at(at(11));
+    registry.record_check_error("p", "b", "offline", fetch);
+    assert!(registry.record_check("p", "b", Some(NEW.into()), Source::Poll, poll));
+    let state = registry.snapshot("p", "b").unwrap();
+    assert_eq!(state.remote_tip.as_deref(), Some(NEW));
+    assert_eq!(state.checked_at, None);
+    assert_eq!(state.last_error.unwrap().phase, Phase::Check);
 }
 
 #[tokio::test]
@@ -435,8 +492,14 @@ async fn a_failed_poll_keeps_the_last_successful_check_time() {
     git.expect_ls_remote_branches()
         .returning(|_, _, _| Err("git ls-remote origin refs/heads/main failed: offline".into()));
     let orch = test_orchestrator(db, Arc::new(git));
-    orch.base_branch_sync
-        .record_check("proj", "main", Some(OLD.into()), Source::Poll, at(100));
+    let registry = &orch.base_branch_sync;
+    registry.record_check(
+        "proj",
+        "main",
+        Some(OLD.into()),
+        Source::Poll,
+        registry.observe_at(at(100)),
+    );
 
     poll_project(&orch, "proj", Path::new("/repo"), &["main".to_string()]).await;
 
@@ -802,8 +865,8 @@ async fn one_poll_pass_brings_an_outside_push_into_the_store() {
     );
 
     // And a read still pinned to the old commit while origin is ahead says so.
-    orch.base_branch_sync
-        .record_tip("proj-e2e", "main", NEW, Source::Push);
+    let registry = &orch.base_branch_sync;
+    registry.record_tip("proj-e2e", "main", NEW, Source::Push, registry.observe());
     let label = revision_label(&orch, "proj-e2e", "main", "main", &store, &landed).await;
     assert!(
         label.starts_with(&format!(
@@ -918,8 +981,14 @@ async fn one_poll_pass_takes_an_outside_merge_into_a_parent_branch_and_replays_i
     let landed = git_stdout(&clone, &["rev-parse", "HEAD"]);
 
     // While origin is known to be ahead, a read of the parent says STALE.
-    orch.base_branch_sync
-        .record_tip("proj-parent", PARENT, &landed, Source::Push);
+    let registry = &orch.base_branch_sync;
+    registry.record_tip(
+        "proj-parent",
+        PARENT,
+        &landed,
+        Source::Push,
+        registry.observe(),
+    );
     let label = revision_label(&orch, "proj-parent", PARENT, "main", &store, &parent_tip).await;
     assert!(
         label.starts_with(&format!(
@@ -1112,12 +1181,17 @@ impl PublishedParent {
 /// still holds the pre-rewrite tip, which the poll has just confirmed. That tip
 /// is the store's own replaced publication, not drift: the replay's publication
 /// goes ahead, as a sideways move leased on exactly that tip.
+///
+/// A poll that asked origin before the publication and is answered after it
+/// still holds the pre-rewrite tip; recording that answer last must not make
+/// the store's own replaced publication read as drift again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_base_advance_replay_of_a_published_parent_is_published_over_its_old_tip() {
     let Some(f) = PublishedParent::new("base-advance-republish.db").await else {
         eprintln!("skipping: jj not resolvable");
         return;
     };
+    let registry = &f.orch.base_branch_sync;
     poll_project(
         &f.orch,
         "proj-parent",
@@ -1126,34 +1200,62 @@ async fn a_base_advance_replay_of_a_published_parent_is_published_over_its_old_t
     )
     .await;
     assert_eq!(
-        f.orch
-            .base_branch_sync
+        registry
             .snapshot("proj-parent", PARENT)
             .and_then(|state| state.remote_tip),
         Some(f.published.clone()),
         "the poll knows origin's parent is at the published tip"
     );
+    let late_poll = registry.observe();
 
     let main = f.push_outside("main", "main-advance.rs");
     sync(&f.orch, "proj-parent", "main").await;
 
+    // Origin moves inside the publication's push, before the publication is
+    // recorded, so the replay is done only once the record names it.
+    let published_replay = || {
+        registry
+            .snapshot("proj-parent", PARENT)
+            .filter(|state| state.remote_tip_source == Some(Source::Publish))
+            .and_then(|state| state.remote_tip)
+            .filter(|tip| *tip != f.published)
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while f.origin_tip(PARENT) == f.published {
+    let recorded = loop {
+        if let Some(tip) = published_replay() {
+            break tip;
+        }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "the replayed parent never reached origin (store at {}); publishing now says: {:?}",
+                "the replayed parent's publication was never recorded (store at {}, origin at \
+                 {}); publishing now says: {:?}",
                 f.store_tip(),
+                f.origin_tip(PARENT),
                 f.publish().await
             );
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    };
     let tip = f.store_tip();
-    assert_ne!(tip, f.published, "the parent was replayed");
+    assert_eq!(recorded, tip, "the publication recorded the replayed tip");
     assert!(crate::jj::revset_descends_from(
         &f.jj, &f.store, &tip, &main
     ));
     assert_eq!(f.origin_tip(PARENT), tip, "origin took the replay sideways");
+    assert!(
+        !registry.record_check(
+            "proj-parent",
+            PARENT,
+            Some(f.published.clone()),
+            Source::Poll,
+            late_poll
+        ),
+        "the late poll's pre-publication answer is dropped"
+    );
+    assert_eq!(
+        known_drift(&f.orch, "proj-parent", &f.store, PARENT).await,
+        None
+    );
     assert_eq!(
         known_drift(&f.orch, "proj-parent", &f.store, PARENT).await,
         None
@@ -1179,9 +1281,14 @@ async fn publishing_over_a_commit_the_store_never_had_is_refused() {
     };
     let local = f.seal("unpublished.rs");
     let outside = f.push_outside(PARENT, "outside.rs");
-    f.orch
-        .base_branch_sync
-        .record_tip("proj-parent", PARENT, &outside, Source::Push);
+    let registry = &f.orch.base_branch_sync;
+    registry.record_tip(
+        "proj-parent",
+        PARENT,
+        &outside,
+        Source::Push,
+        registry.observe(),
+    );
 
     let error = f.publish().await.unwrap_err();
     assert!(
@@ -1209,9 +1316,14 @@ async fn publishing_takes_an_outside_fast_forward_first() {
         return;
     };
     let outside = f.push_outside(PARENT, "outside.rs");
-    f.orch
-        .base_branch_sync
-        .record_tip("proj-parent", PARENT, &outside, Source::Push);
+    let registry = &f.orch.base_branch_sync;
+    registry.record_tip(
+        "proj-parent",
+        PARENT,
+        &outside,
+        Source::Push,
+        registry.observe(),
+    );
 
     f.publish().await.unwrap();
     assert_eq!(f.store_tip(), outside);

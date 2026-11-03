@@ -136,20 +136,13 @@ pub(super) fn execute_tool_call(
         // already use. A malformed tool call must not reach RunStatus::Crashed.
         PreparedCall::Reject(output) => return Ok(output),
     };
-    let request = crate::mcp::types::McpCallbackRequest {
-        answer_bound_ms: None,
-        thread_id: None,
-        cwd: config.working_dir.clone(),
-        run_id: Some(config.run_id.clone()),
-        tool: if tool_name == "read" && payload.get("paths").is_some() {
-            "read_batch".to_string()
-        } else {
-            tool_name.to_string()
-        },
+    let request = model_callback_request(
+        &config.working_dir,
+        &config.run_id,
+        tool_call,
+        tool_name,
         payload,
-        tool_use_id: Some(tool_call.id.clone()),
-        origin: None,
-    };
+    );
     // read_batch and run return a JSON batch envelope (composed text + image
     // content blocks). The OpenAI tool-message format is text-only, so collapse
     // the envelope to its text on this edge; image blocks cannot ride a
@@ -168,6 +161,41 @@ pub(super) fn execute_tool_call(
         output.content = collapse_envelope_text(output.content);
     }
     Ok(output)
+}
+
+/// The callback request for one model-emitted tool call.
+///
+/// Every result this loop dispatches goes straight back to the model, so every
+/// verb is stamped model-facing: the host gates its per-turn bookkeeping and
+/// tool-boundary delivery on that stamp, and an unstamped verb would defer the
+/// run's queued steers to the turn end. A `read` naming `paths` is the batch
+/// read.
+pub(super) fn model_callback_request(
+    working_dir: &str,
+    run_id: &str,
+    tool_call: &TurnToolCall,
+    verb: &str,
+    mut payload: Value,
+) -> crate::mcp::types::McpCallbackRequest {
+    cairn_common::protocol::stamp_callback_origin(
+        &mut payload,
+        cairn_common::protocol::MODEL_FACING_ORIGIN,
+    );
+    let tool = if verb == "read" && payload.get("paths").is_some() {
+        "read_batch".to_string()
+    } else {
+        verb.to_string()
+    };
+    crate::mcp::types::McpCallbackRequest {
+        answer_bound_ms: None,
+        thread_id: None,
+        cwd: working_dir.to_string(),
+        run_id: Some(run_id.to_string()),
+        tool,
+        payload,
+        tool_use_id: Some(tool_call.id.clone()),
+        origin: None,
+    }
 }
 
 /// Collapse a read/run batch envelope to its composed text for the text-only

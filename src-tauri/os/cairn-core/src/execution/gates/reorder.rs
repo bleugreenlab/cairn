@@ -22,11 +22,14 @@
 //! held on one cap and one held only on the other compare by whichever key
 //! each has; their caps decide them separately, so no release depends on it.
 //!
-//! A row the operator PINNED (its execution was moved by
-//! [`move_held_execution`]) sits out of every rotation: the thread's order
-//! applies within the places its other children hold, and the operator's
-//! place survives. An `order` that lists a pinned child is refused by name. A
-//! pin ends when its execution is released and its rows latch.
+//! A PINNED row (its execution was moved by [`move_held_execution`], or frozen
+//! ahead of such a move) sits out of every rotation: the thread's order
+//! applies within the places its other children hold, and the pinned place
+//! survives. An `order` that lists a pinned child is refused by name, saying
+//! which pin it is: `203's place is the operator's` for one the operator
+//! placed, `203 is held at its place ahead of an operator move until it
+//! starts` for one only frozen. A pin ends when its execution is released and
+//! its rows latch.
 //!
 //! ## No admission lock
 //!
@@ -42,26 +45,40 @@
 //!
 //! ## The operator's fleet move
 //!
-//! The queue page lists every cap-held execution in the fleet's order
-//! (`capacity::fleet_order`), and the operator may move one of them to any
-//! position, across threads ([`move_held_execution`]). The move gives each of
-//! that execution's capacity rows a key FREE in its database. Its fleet row
-//! takes a key strictly between its new neighbours' on the page, ties across
-//! databases broken by database as every reader breaks them. Its thread row
-//! takes a key ahead of every sibling now below it and behind the nearest
-//! sibling above it. Nobody else's key changes, unless no free key is left
-//! between the neighbours (keys are dense inside a burst). Then every key at
-//! or before the lower neighbour, in every database, shifts down by one
-//! second's scale, which keeps every relative order and opens a gap of a
-//! million. The moved execution's rows are pinned (above) and record
-//! `placed_by: the operator` where its key went down.
+//! The queue page lists every cap-held execution in the release order
+//! (`capacity::fleet_order`, the lanes in rotation behind a pinned prefix;
+//! see `rotation`), and the operator may move one of them to any position,
+//! across threads ([`move_held_execution`]). Pinned rows are an ordered
+//! prefix ahead of the rotation, ordered by key among themselves, so a move
+//! of X to position N:
 //!
-//! Two edges the move does not cover. A pin covers the rows that exist when
-//! the move runs: an execution moved while only its thread cap holds it gets
-//! a fresh, unpinned fleet key at the back if the fleet fills later. And a move
-//! to the back takes a key about a second past its neighbour, so a filing in
-//! ANOTHER database within that second mints an earlier key and sorts ahead of
-//! it; a filing in its own database still lands after it.
+//! 1. reads the order `L`, takes X out, and puts it back at N to get `L'`;
+//! 2. pins EVERY row at positions 1..=N of `L'`: the pins already there, X,
+//!    and any rotation rows ahead of X, which are FROZEN exactly where the
+//!    page showed them (a move to N at most one past the pins freezes
+//!    nothing);
+//! 3. gives each newly pinned row, in `L'` order, a fleet key FREE in its
+//!    database strictly between its prefix neighbours' (open-ended after the
+//!    last pin), ties across databases broken by database as every reader
+//!    breaks them, and a thread key ahead of every sibling behind it in `L'`
+//!    and behind the nearest sibling above it, so its thread's cap never
+//!    counts an unpinned sibling ahead of a pinned row;
+//! 4. reports where X landed by reading the order again.
+//!
+//! X is then at N and the prefix is exactly `L'[..N]`. Rows behind X may
+//! re-interleave, because X's lane spent a turn. Only X records `placed_by:
+//! the operator`; a frozen row records `frozen` and keeps whoever placed it.
+//! Freezing grows the prefix, and the prefix drains as its rows release.
+//!
+//! Nobody else's key changes, unless no free key is left between the
+//! neighbours (keys are dense inside a burst). Then every key at or before
+//! the lower neighbour, in every database, shifts down by one second's scale,
+//! which keeps every relative order and opens a gap of a million.
+//!
+//! One edge the move does not cover: a pin covers the rows that exist when
+//! the move runs, so an execution moved while only its thread cap holds it
+//! gets a fresh, unpinned fleet key if the fleet fills later. Its other rows
+//! are still pinned, so it stays in the prefix, at the prefix's back.
 //!
 //! Unlike a rotation, a move takes the admission lock
 //! (`AdmissionSite::OperatorMove`): a renumber spans databases, and no
@@ -107,6 +124,9 @@ pub(crate) struct ThreadQueued {
     pub issue_title: String,
     /// The age held, for display. Never rewritten by a reorder.
     pub held_since: i64,
+    /// Its place in its thread's key order (`queue_key_sql!`), which a
+    /// rotation's arithmetic reads; the listing itself is release order.
+    pub queue_key: i64,
     /// Its blocking capacity rows, the fleet's first.
     pub holds: Vec<QueuedHold>,
     /// Its dormant capacity rows: caps that cleared while another still holds
@@ -133,13 +153,25 @@ impl ThreadQueued {
             .find_map(|row| row.hold.as_ref().and_then(CapacityHold::placed_by))
     }
 
-    /// Whether the operator gave it its place, so its thread's order does not
-    /// move it.
+    /// Whether it is in the queue's pinned prefix, so its thread's order does
+    /// not move it.
     pub fn pinned(&self) -> bool {
         self.holds
             .iter()
             .chain(&self.dormant)
             .any(QueuedHold::pinned)
+    }
+
+    /// Whether its pin is only a freeze: an operator move landed behind it,
+    /// and nobody placed it where it stands.
+    pub fn frozen(&self) -> bool {
+        self.pinned()
+            && self
+                .holds
+                .iter()
+                .chain(&self.dormant)
+                .filter(|row| row.pinned())
+                .all(|row| row.hold.as_ref().is_some_and(CapacityHold::frozen))
     }
 }
 
@@ -149,8 +181,10 @@ impl QueuedHold {
     }
 }
 
-/// The thread's cap-held children's executions, in queue order: exactly the
-/// set the queue page lists, narrowed to this thread. The predicate's gate
+/// The thread's cap-held children's executions, in release order: exactly the
+/// set the queue page lists, narrowed to this thread, in the page's order
+/// restricted to it. A thread is one lane, so that is its pinned prefix by
+/// key, then the rest by key (`fleet_order_key_sql!`). The predicate's gate
 /// list drives it, so `issues` (which has no `parent_thread_id` index) is only
 /// probed by id.
 pub(super) const THREAD_QUEUE_SQL: &str = concat!(
@@ -158,11 +192,15 @@ pub(super) const THREAD_QUEUE_SQL: &str = concat!(
     cairn_workflow::held_since_sql!(),
     ", ",
     cairn_workflow::queue_key_sql!(),
+    ", ",
+    super::capacity::queue_pin_sql!(),
+    ", ",
+    cairn_workflow::fleet_order_key_sql!(),
     "
        FROM executions e JOIN issues i ON i.id = e.issue_id
       WHERE i.parent_thread_id = ?1 AND ",
     super::capacity::cap_held_sql!(),
-    " ORDER BY 5, e.id"
+    " ORDER BY 7 DESC, 8, e.id"
 );
 
 /// Every unlatched capacity row of the thread's children, blocking or dormant.
@@ -193,6 +231,7 @@ pub(crate) async fn thread_queue_conn(
             issue_number: row.i64(1)?,
             issue_title: row.text(2)?,
             held_since: row.opt_i64(3)?.unwrap_or(0),
+            queue_key: row.opt_i64(4)?.unwrap_or(0),
             holds: Vec::new(),
             dormant: Vec::new(),
         });
@@ -258,10 +297,14 @@ pub(crate) async fn rotate_to_front_conn(
         .iter()
         .filter_map(|id| set.iter().find(|queued| &queued.execution_id == id))
         .collect();
-    desired.extend(
-        set.iter()
-            .filter(|queued| !front.contains(&queued.execution_id)),
-    );
+    // The rest keep their key order, not the listing's: a rotation permutes
+    // keys, so it reads the order the keys say.
+    let mut rest: Vec<&ThreadQueued> = set
+        .iter()
+        .filter(|queued| !front.contains(&queued.execution_id))
+        .collect();
+    rest.sort_by(|a, b| (a.queue_key, &a.execution_id).cmp(&(b.queue_key, &b.execution_id)));
+    desired.extend(rest);
 
     let mut moved = HashSet::new();
     for (fact, blocking) in CAPACITY_FACTS
@@ -415,8 +458,12 @@ pub(crate) async fn resolve_order_conn(
             refusals.push(format!("{number} has no cap-held execution ({why})"));
             continue;
         }
-        if queued.iter().any(|queued| queued.pinned()) {
-            refusals.push(format!("{number}'s place is the operator's"));
+        if let Some(pinned) = queued.iter().find(|queued| queued.pinned()) {
+            refusals.push(if pinned.frozen() {
+                format!("{number} is held at its place ahead of an operator move until it starts")
+            } else {
+                format!("{number}'s place is the operator's")
+            });
             continue;
         }
         front.extend(queued.iter().map(|queued| queued.execution_id.clone()));
@@ -777,78 +824,101 @@ async fn move_under_lock(
         let holds = capacity_holds(&order).await?;
         let mut line: Vec<&FleetOrdered> = order.iter().collect();
         let x = line.remove(from);
-        let at = position - 1;
-        line.insert(at, x);
+        line.insert(position - 1, x);
         let spot = |entry: &FleetOrdered| (entry.key, entry.db_index);
-        let page_lo = at.checked_sub(1).map(|index| spot(line[index]));
-        let page_hi = line.get(at + 1).map(|entry| spot(entry));
+        // A pin other than the moved execution keeps its key: the prefix is
+        // ordered by key, and its pins compare only with each other.
+        let fixed =
+            |entry: &FleetOrdered| entry.pinned && entry.queued.execution_id != execution_id;
 
-        // Its thread's order: ahead of every sibling now below it, behind the
-        // nearest sibling above it that still sorts before those.
-        let thread_key = |entry: &&FleetOrdered| -> Option<i64> {
-            let same_thread = entry.db_index == x.db_index
-                && entry.queued.thread_id.is_some()
-                && entry.queued.thread_id == x.queued.thread_id
-                && entry.queued.execution_id != execution_id;
-            if !same_thread {
-                return None;
+        // Every row of positions 1..=N is pinned. Each newly pinned one takes,
+        // in line order, a fleet key strictly between its prefix neighbours
+        // (open-ended after the last fixed pin) and a thread key ahead of every
+        // sibling behind it in the new line.
+        let mut assigned: HashMap<String, i64> = HashMap::new();
+        let mut picked: HashMap<usize, BTreeSet<i64>> = HashMap::new();
+        let mut placed: Vec<Spot> = Vec::with_capacity(position);
+        let mut renumber_at: Option<Option<Spot>> = None;
+        'prefix: for index in 0..position {
+            let entry = line[index];
+            if fixed(entry) {
+                placed.push(spot(entry));
+                continue;
             }
-            holds
-                .get(&entry.queued.execution_id)?
+            let page_lo = placed.last().copied();
+            let page_hi = line[index + 1..]
                 .iter()
-                .find(|row| row.fact == THREAD_FOCUS_FACT)
-                .map(|row| row.queue_key)
-        };
-        let thread_hi = line[at + 1..].iter().filter_map(thread_key).min();
-        let thread_lo = line[..at]
-            .iter()
-            .filter_map(thread_key)
-            .filter(|key| thread_hi.is_none_or(|hi| *key < hi))
-            .max();
-        let thread_gap = (
-            thread_lo.map(|key| (key, x.db_index)),
-            thread_hi.map(|key| (key, x.db_index)),
-        );
+                .find(|later| fixed(later))
+                .map(|later| spot(later));
+            let thread_key = |sibling: &&FleetOrdered| -> Option<i64> {
+                let same_thread = sibling.db_index == entry.db_index
+                    && sibling.queued.thread_id.is_some()
+                    && sibling.queued.thread_id == entry.queued.thread_id
+                    && sibling.queued.execution_id != entry.queued.execution_id;
+                if !same_thread {
+                    return None;
+                }
+                holds
+                    .get(&sibling.queued.execution_id)?
+                    .iter()
+                    .find(|row| row.fact == THREAD_FOCUS_FACT)
+                    .map(|row| assigned.get(&row.gate_id).copied().unwrap_or(row.queue_key))
+            };
+            // Ahead of every sibling now below it, behind the nearest sibling
+            // above it that still sorts before those.
+            let thread_hi = line[index + 1..].iter().filter_map(thread_key).min();
+            let thread_lo = line[..index]
+                .iter()
+                .filter_map(thread_key)
+                .filter(|key| thread_hi.is_none_or(|hi| *key < hi))
+                .max();
+            let thread_gap = (
+                thread_lo.map(|key| (key, entry.db_index)),
+                thread_hi.map(|key| (key, entry.db_index)),
+            );
 
-        let rows = holds.get(execution_id).cloned().unwrap_or_default();
-        let has_fleet_row = rows.iter().any(|row| row.fact == FLEET_SLOT_FACT);
-        let mut picked = BTreeSet::new();
-        let mut keys = Vec::new();
-        let mut renumber_at = None;
-        for row in &rows {
-            let (lo, hi) = if row.fact == FLEET_SLOT_FACT {
-                (page_lo, page_hi)
-            } else if has_fleet_row {
-                thread_gap
-            } else {
-                // With no fleet row its thread key is its place on the page
-                // too: inside both gaps when they meet, else its thread's.
-                let (lo, hi) = (later(thread_gap.0, page_lo), earlier(thread_gap.1, page_hi));
-                match key_range(lo, hi, x.db_index) {
-                    Some((first, last)) if first > last => thread_gap,
-                    _ => (lo, hi),
+            let rows = holds
+                .get(&entry.queued.execution_id)
+                .cloned()
+                .unwrap_or_default();
+            let has_fleet_row = rows.iter().any(|row| row.fact == FLEET_SLOT_FACT);
+            let mut page_key = None;
+            for row in &rows {
+                let (lo, hi) = if row.fact == FLEET_SLOT_FACT {
+                    (page_lo, page_hi)
+                } else if has_fleet_row {
+                    thread_gap
+                } else {
+                    // With no fleet row its thread key is its place on the
+                    // page too: inside both gaps when they meet, else its
+                    // thread's.
+                    let (lo, hi) = (later(thread_gap.0, page_lo), earlier(thread_gap.1, page_hi));
+                    match key_range(lo, hi, entry.db_index) {
+                        Some((first, last)) if first > last => thread_gap,
+                        _ => (lo, hi),
+                    }
+                };
+                let key = if fits(row.queue_key, entry.db_index, lo, hi) {
+                    row.queue_key
+                } else if let Some((first, last)) = key_range(lo, hi, entry.db_index) {
+                    let mut used = keys_in_range(&entry.db, first, last).await?;
+                    let mine = picked.entry(entry.db_index).or_default();
+                    used.extend(mine.iter().copied());
+                    let Some(key) = free_key(first, last, &used) else {
+                        renumber_at = Some(lo);
+                        break 'prefix;
+                    };
+                    mine.insert(key);
+                    assigned.insert(row.gate_id.clone(), key);
+                    key
+                } else {
+                    row.queue_key
+                };
+                if row.fact == FLEET_SLOT_FACT || !has_fleet_row {
+                    page_key = Some(page_key.map_or(key, |known: i64| known.min(key)));
                 }
-            };
-            if fits(row.queue_key, x.db_index, lo, hi) {
-                keys.push(row.queue_key);
-                continue;
             }
-            let Some((first, last)) = key_range(lo, hi, x.db_index) else {
-                keys.push(row.queue_key);
-                continue;
-            };
-            let mut used = keys_in_range(&x.db, first, last).await?;
-            used.extend(picked.iter().copied());
-            match free_key(first, last, &used) {
-                Some(key) => {
-                    picked.insert(key);
-                    keys.push(key);
-                }
-                None => {
-                    renumber_at = Some(lo);
-                    break;
-                }
-            }
+            placed.push((page_key.unwrap_or(entry.key), entry.db_index));
         }
 
         if let Some(lo) = renumber_at {
@@ -878,29 +948,63 @@ async fn move_under_lock(
             continue;
         }
 
-        let mut writes = Vec::new();
-        for (row, key) in rows.iter().zip(&keys) {
-            let detail = row.hold.as_ref().and_then(|hold| {
-                let mut next = hold.clone();
-                next.set_pinned(true);
-                match key.cmp(&row.queue_key) {
-                    std::cmp::Ordering::Less => next.set_placed_by(Some(OPERATOR.to_string())),
-                    std::cmp::Ordering::Greater => next.set_placed_by(None),
-                    std::cmp::Ordering::Equal => {}
+        // Each database's writes in one transaction. Only the moved
+        // execution is placed by the operator; a row ahead of it is frozen
+        // where the page showed it and keeps who placed it, if anyone did.
+        type Write = (String, Option<i64>, Option<String>);
+        let mut writes: Vec<(&FleetOrdered, Vec<Write>)> = Vec::new();
+        for entry in line[..position]
+            .iter()
+            .copied()
+            .filter(|entry| !fixed(entry))
+        {
+            let is_x = entry.queued.execution_id == execution_id;
+            let mut rows_written = Vec::new();
+            for row in holds
+                .get(&entry.queued.execution_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                let key = assigned.get(&row.gate_id).copied();
+                let detail = row.hold.as_ref().and_then(|hold| {
+                    let mut next = hold.clone();
+                    next.set_pinned(true);
+                    if is_x {
+                        // Its place is a position in the prefix, not a key
+                        // going down: the operator placed it, wherever its
+                        // keys landed.
+                        next.set_frozen(false);
+                        next.set_placed_by(Some(OPERATOR.to_string()));
+                    } else if !hold.pinned() {
+                        next.set_frozen(true);
+                    }
+                    (&next != hold).then(|| encode_hold(&next))
+                });
+                if key.is_some() || detail.is_some() {
+                    rows_written.push((row.gate_id.clone(), key, detail));
                 }
-                (&next != hold).then(|| encode_hold(&next))
-            });
-            let key = (*key != row.queue_key).then_some(*key);
-            if key.is_some() || detail.is_some() {
-                writes.push((row.gate_id.clone(), key, detail));
+            }
+            if !rows_written.is_empty() {
+                writes.push((entry, rows_written));
             }
         }
         let moved = !writes.is_empty();
-        if moved {
-            x.db.write(|conn| {
-                let writes = writes.clone();
+        let mut by_db: Vec<(usize, Arc<LocalDb>, Vec<Write>)> = Vec::new();
+        for (entry, rows_written) in &writes {
+            match by_db
+                .iter_mut()
+                .find(|(index, ..)| *index == entry.db_index)
+            {
+                Some((_, _, all)) => all.extend(rows_written.iter().cloned()),
+                None => by_db.push((entry.db_index, entry.db.clone(), rows_written.clone())),
+            }
+            touched.push((entry.db.clone(), entry.queued.execution_id.clone()));
+        }
+        for (_, db, all) in by_db {
+            db.write(|conn| {
+                let all = all.clone();
                 Box::pin(async move {
-                    for (gate_id, key, detail) in &writes {
+                    for (gate_id, key, detail) in &all {
                         if let Some(key) = key {
                             set_gate_queue_key_conn(conn, gate_id, *key).await?;
                         }
@@ -913,23 +1017,14 @@ async fn move_under_lock(
             })
             .await
             .map_err(|error| format!("failed to move it: {error}"))?;
-            touched.push((x.db.clone(), execution_id.to_string()));
         }
 
-        // Where it landed: its new place key among everyone else's.
-        let fleet_key = rows
+        // Where it landed, as the order now reads.
+        let landed = fleet_order(orch)
+            .await?
             .iter()
-            .zip(&keys)
-            .find(|(row, _)| row.fact == FLEET_SLOT_FACT)
-            .map(|(_, key)| *key);
-        let landed_key = fleet_key
-            .or_else(|| keys.iter().copied().min())
-            .unwrap_or(x.key);
-        let landed = 1 + order
-            .iter()
-            .filter(|entry| entry.queued.execution_id != execution_id)
-            .filter(|entry| spot(entry) < (landed_key, x.db_index))
-            .count();
+            .position(|entry| entry.queued.execution_id == execution_id)
+            .map_or(position, |index| index + 1);
         return Ok((
             FleetMove {
                 moved,
@@ -1883,25 +1978,30 @@ mod tests {
                 position: 1
             }
         );
+        // Behind the pin alpha has spent its turn, so beta's b1 is next.
         assert_eq!(
             view_ids(&w.env).await,
-            ids(&[&a4, &w.a1, &w.b1, &w.a2, &w.a3])
+            ids(&[&a4, &w.b1, &w.a1, &w.a2, &w.a3])
         );
         let after = rows(&w.env).await;
-        assert!(key(&after, &a4, FLEET) < key(&before, &w.a1, FLEET));
+        assert_eq!(
+            key(&after, &a4, FLEET),
+            key(&before, &a4, FLEET),
+            "alone in the prefix, it keeps its key"
+        );
         assert_eq!(
             placed_by(&after, &a4, FLEET).as_deref(),
             Some("the operator")
         );
         assert!(hold(&after, &a4, FLEET).pinned());
         assert_eq!(place(&after, &a4, FLEET), Some(1), "renumbered at once");
-        for (id, was) in [(&w.a1, 1), (&w.b1, 2), (&w.a2, 3), (&w.a3, 4)] {
+        for (id, now_at) in [(&w.b1, 2), (&w.a1, 3), (&w.a2, 4), (&w.a3, 5)] {
             assert_eq!(
                 key(&after, id, FLEET),
                 key(&before, id, FLEET),
                 "{id} kept its key"
             );
-            assert_eq!(place(&after, id, FLEET), Some(was + 1));
+            assert_eq!(place(&after, id, FLEET), Some(now_at));
             assert!(!hold(&after, id, FLEET).pinned());
         }
         assert!(detail(&w.env, &a4)
@@ -1962,13 +2062,14 @@ mod tests {
 
     /// The operator moved a3 to the front; alpha then orders its own queue.
     /// a3 keeps its keys and its place, alpha's order permutes a1 and a2
-    /// among their own keys, and an order naming a3 is refused.
+    /// among their own keys, and an order naming a3 is refused. Behind the
+    /// pin, alpha has spent its turn, so beta's b1 comes next.
     #[tokio::test]
     async fn an_operator_placement_survives_a_later_thread_reorder() {
         let w = world("move-survives-order.db", true).await;
         move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
         let placed = rows(&w.env).await;
-        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.b1, &w.a2]));
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a1, &w.a2]));
 
         let rotation = order(&w.env, json!([202, 201]), "alpha").await.unwrap();
         assert_eq!(
@@ -1990,7 +2091,7 @@ mod tests {
                 Some("the operator")
             );
         }
-        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a2, &w.b1, &w.a1]));
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a2, &w.a1]));
 
         let refused = order(&w.env, json!([203]), "alpha").await.unwrap_err();
         assert_eq!(refused, vec!["203's place is the operator's"]);
@@ -2060,7 +2161,7 @@ mod tests {
         let before = rows(&w.env).await;
         move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
         let after = rows(&w.env).await;
-        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.b1, &w.a2]));
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a1, &w.a2]));
         assert_eq!(queue_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.a2]));
         assert!(key(&after, &w.a3, THREAD) < key(&before, &w.a1, THREAD));
         assert_eq!(
@@ -2079,9 +2180,11 @@ mod tests {
         assert!(is_held(&w.env, 201).await);
     }
 
-    /// Consecutive keys leave no room between a1 and b1: the move shifts
-    /// everything up to a1 down a second's scale, lands exactly where asked,
-    /// moves no one else's order, and a fresh filing still lands last.
+    /// Pins compare only with pins, so a gap matters only inside the pinned
+    /// prefix. With a1 and b1 pinned on consecutive keys there is no room
+    /// between them: the move of a4 there shifts everything up to a1 down a
+    /// second's scale, lands exactly where asked, moves no one else's order,
+    /// and a fresh filing never overtakes the prefix.
     #[tokio::test]
     async fn a_move_into_a_one_wide_gap_renumbers_without_reordering() {
         let w = world("move-renumber.db", false).await;
@@ -2103,7 +2206,19 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // b1 to the front, then a1 ahead of it: two pins, keys base, base+1.
+        move_held_execution(&w.env.orch, &w.b1, 1).await.unwrap();
+        move_held_execution(&w.env.orch, &w.a1, 1).await.unwrap();
+        assert_eq!(
+            view_ids(&w.env).await,
+            ids(&[&w.a1, &w.b1, &w.a2, &w.a3, &a4])
+        );
         let before = rows(&w.env).await;
+        assert_eq!(
+            key(&before, &w.b1, FLEET),
+            base + 1,
+            "no room between the pins"
+        );
 
         let moved = move_held_execution(&w.env.orch, &a4, 2).await.unwrap();
         assert_eq!(moved.position, 2);
@@ -2126,12 +2241,14 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), all, "every key stays distinct");
 
+        // A fresh filing in a lane never served goes first in the rotation,
+        // and still behind every pin.
         file(&w.env, 1, json!([])).await.unwrap();
         let fresh = execution(&w.env, 1).await.0;
         assert_eq!(
-            view_ids(&w.env).await.last(),
-            Some(&fresh),
-            "a fresh filing lands last"
+            view_ids(&w.env).await,
+            ids(&[&w.a1, &a4, &w.b1, &fresh, &w.a2, &w.a3]),
+            "a fresh filing never overtakes the prefix"
         );
     }
 

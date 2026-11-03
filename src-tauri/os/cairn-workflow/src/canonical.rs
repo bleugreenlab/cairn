@@ -482,8 +482,14 @@ async fn freeze_execution_conn(
     if cancelled > 0 {
         crate::gates::hint::evidence_changed();
     }
+    // A failed session keeps the reason it failed with; every other session
+    // closes as superseded, so a refusal can say why.
     conn.execute(
-        "UPDATE sessions SET status = 'closed', updated_at = ?1
+        "UPDATE sessions
+            SET status = 'closed',
+                terminal_reason = COALESCE(terminal_reason, 'superseded'),
+                closed_at = COALESCE(closed_at, ?1),
+                updated_at = ?1
           WHERE job_id IN (SELECT id FROM jobs WHERE execution_id = ?2)
             AND status <> 'closed'",
         params![now, execution_id],

@@ -55,14 +55,6 @@ impl Sanitize for DispatchOutput {
     }
 }
 
-pub(crate) fn is_standalone_cli(request: &crate::mcp::types::McpCallbackRequest) -> bool {
-    request
-        .payload
-        .get("_cairn_origin")
-        .and_then(|value| value.as_str())
-        == Some("cli")
-}
-
 /// `process_info` response when the windowless runner has no desktop connected.
 /// This must never fall back to the runner's own pid: callers use the value to
 /// target the native GUI, and the daemon cannot own that window.
@@ -76,7 +68,11 @@ pub(crate) const NO_ATTACHED_UI_PID: &str = "No desktop UI is attached";
 /// [`DispatchOutput::reminders`] for the calling run. This is the Codex-side
 /// delivery path (Codex has no Claude-CLI hook surface) and a redundant
 /// belt-and-suspenders path for Claude. Push delivery is stamped atomically with
-/// its carrying event, so neither boundary double-delivers.
+/// its carrying event, so neither boundary double-delivers. Delivery applies
+/// only to a model-facing call (see [`MODEL_FACING_ORIGIN`]); a program's call
+/// under the same run claims nothing.
+///
+/// [`MODEL_FACING_ORIGIN`]: cairn_common::protocol::MODEL_FACING_ORIGIN
 pub async fn dispatch_tool(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -409,6 +405,13 @@ async fn load_run_ownership(db: &crate::storage::LocalDb, run_id: &str) -> Optio
 /// content changed, where the old fingerprint-only dedup could skip execution.
 /// The cairn:// resources and files this covers are cheap DB and file reads, so
 /// the correctness win outweighs the cost.
+///
+/// Only a model-facing call is deduped or recorded
+/// ([`crate::mcp::types::McpCallbackRequest::is_model_facing`]). The seen-set is
+/// keyed on the run, and code the turn starts (a procedure's or service's
+/// `@cairn/sdk` reads, a `run` item's inline code, the CLI) shares that run, so
+/// gating on the run alone would hand a program the stub for a page it never
+/// received, and let a program's read stub the model's first.
 async fn dispatch_with_dedup(
     orch: &crate::orchestrator::Orchestrator,
     checked: &CheckedInvocation<'_, crate::mcp::types::McpCallbackRequest>,
@@ -417,10 +420,9 @@ async fn dispatch_with_dedup(
     let request = checked.request();
     let result = execute_tool(orch, checked, read_cursors).await;
 
-    // The duplicate stub is guidance for an agent that already holds the prior
-    // body in context. Standalone CLI stdout may be consumed by a polling program,
-    // so it must always receive the real body.
-    if is_standalone_cli(request) || !is_read_family(&request.tool) {
+    // The duplicate stub is guidance for a model that already holds the prior
+    // body in context; any other caller hands the result to a program.
+    if !request.is_model_facing() || !is_read_family(&request.tool) {
         return result;
     }
     let Some(run_id) = request.run_id.as_deref() else {
@@ -636,6 +638,11 @@ async fn augment_with_poll_nudge(
     request: &crate::mcp::types::McpCallbackRequest,
     reminders: &mut Vec<String>,
 ) {
+    // Advice for the model doing the polling: a program's read neither earns a
+    // nudge nor counts toward the model's.
+    if !request.is_model_facing() {
+        return;
+    }
     let Some(run_id) = request.run_id.as_deref() else {
         return;
     };
@@ -661,7 +668,7 @@ async fn augment_with_poll_nudge(
             continue;
         }
         log::info!("terminal_poll_nudge: run={run_id} slug={slug} count={count}");
-        reminders.push(build_terminal_poll_nudge(&slug, count));
+        reminders.push(build_terminal_poll_nudge(&identity, count));
     }
 }
 
@@ -904,11 +911,13 @@ async fn terminal_wake_active(
 
 /// Build the terminal-poll nudge: name the terminal and the poll count, then give
 /// copy-pasteable subscribe calls for both the finishing-command (exit) and
-/// never-exiting-process (output phrase) cases. Uses the agent-facing
-/// `cairn:~/terminal/<slug>` form so the suggested calls paste directly.
-fn build_terminal_poll_nudge(slug: &str, count: u32) -> String {
+/// never-exiting-process (output phrase) cases. Repeats the ref exactly as the
+/// agent read it: a terminal ref resolves only in the scope it names, so
+/// rewriting a project terminal's URI as `cairn:~/terminal/<slug>` would point
+/// the suggested wait at the agent's own same-slug terminal.
+fn build_terminal_poll_nudge(reference: &str, count: u32) -> String {
     format!(
-        "You've read `cairn:~/terminal/{slug}` {count} times this turn and it hasn't finished. Polling spends the current turn waiting.\n\nWait for exit:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"cairn:~/terminal/{slug}\",on:\"exit\"}}}}]}})\n\nWait for readiness output:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"cairn:~/terminal/{slug}\",on:\"output\",phrase:\"<ready line>\"}}}}]}})\n\nUse `cairn:~/wakes` only if your turn is otherwise complete and you want a later notification. Do not keep reading the terminal."
+        "You've read `{reference}` {count} times this turn and it hasn't finished. Polling spends the current turn waiting.\n\nWait for exit:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"{reference}\",on:\"exit\"}}}}]}})\n\nWait for readiness output:\n  run({{commands:[{{waitFor:{{kind:\"terminal\",ref:\"{reference}\",on:\"output\",phrase:\"<ready line>\"}}}}]}})\n\nUse `cairn:~/wakes` only if your turn is otherwise complete and you want a later notification. Do not keep reading the terminal."
     )
 }
 
@@ -958,6 +967,14 @@ async fn augment_with_queued_dms(
     request: &crate::mcp::types::McpCallbackRequest,
     reminders: &mut Vec<String>,
 ) {
+    // Claiming stamps an item delivered, and only a model-facing call hands its
+    // reminders to a model. A program's call under the same run (the SDK,
+    // inline code, a service, the CLI) would claim and then drop them, so it
+    // leaves them pending for the enclosing turn's next model-facing boundary
+    // or for the turn end.
+    if !request.is_model_facing() {
+        return;
+    }
     let Some(run_id) = request.run_id.as_deref() else {
         return;
     };
@@ -1445,13 +1462,18 @@ mod tests {
     }
 
     fn terminal_read_request(run_id: &str, paths: serde_json::Value) -> McpCallbackRequest {
+        let mut payload = serde_json::json!({ "paths": paths });
+        cairn_common::protocol::stamp_callback_origin(
+            &mut payload,
+            cairn_common::protocol::MODEL_FACING_ORIGIN,
+        );
         McpCallbackRequest {
             answer_bound_ms: None,
             thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: Some(run_id.to_string()),
             tool: "read_batch".to_string(),
-            payload: serde_json::json!({ "paths": paths }),
+            payload,
             tool_use_id: None,
             origin: None,
         }
@@ -1482,6 +1504,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_code_callers_terminal_reads_neither_nudge_nor_count() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let model = terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/dev"]));
+        let mut code = model.clone();
+        code.payload
+            .as_object_mut()
+            .unwrap()
+            .remove(cairn_common::protocol::CALLBACK_ORIGIN_KEY);
+
+        for _ in 0..3 {
+            assert!(nudge_for(&orch, &code).await.is_empty());
+        }
+        // The model's own count starts from its own reads.
+        assert!(nudge_for(&orch, &model).await.is_empty(), "model read 1");
+        assert!(nudge_for(&orch, &model).await.is_empty(), "model read 2");
+        assert_eq!(nudge_for(&orch, &model).await.len(), 1, "model read 3");
+    }
+
+    #[tokio::test]
     async fn no_nudge_for_single_read_or_distinct_terminals() {
         let orch = orch_with_tracked_turn("run-1", "turn-1").await;
         let a = nudge_for(
@@ -1507,6 +1548,29 @@ mod tests {
         for _ in 0..5 {
             assert!(nudge_for(&orch, &req).await.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_poll_nudge_for_a_project_terminal_suggests_its_own_uri() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let req = terminal_read_request(
+            "run-1",
+            serde_json::json!(["cairn://p/cairn/terminal/dev?new=true"]),
+        );
+        nudge_for(&orch, &req).await;
+        nudge_for(&orch, &req).await;
+        let fired = nudge_for(&orch, &req).await;
+        assert_eq!(fired.len(), 1, "read 3 should nudge");
+        assert!(
+            fired[0].contains("ref:\"cairn://p/cairn/terminal/dev\""),
+            "{}",
+            fired[0]
+        );
+        assert!(
+            !fired[0].contains("cairn:~/terminal/dev"),
+            "a node-relative ref would name a different terminal: {}",
+            fired[0]
+        );
     }
 
     #[tokio::test]

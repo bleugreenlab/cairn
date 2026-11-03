@@ -339,7 +339,7 @@ mod tests {
                 "runtimePolicy",
                 "draining",
                 "role",
-                "desktopAutomation",
+                "machineServices",
                 "repaired",
                 "buildRoot",
                 "expectedGeneration"

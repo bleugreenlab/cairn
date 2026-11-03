@@ -51,8 +51,16 @@ pub(crate) async fn publish_managed_branch(
     crate::orchestrator::base_branch_sync::refuse_if_behind_origin(orch, store, branch).await?;
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     push_managed_branch(orch, &jj, store, branch).await?;
+    let observation = orch.base_branch_sync.observe();
     if let Some(tip) = crate::jj::bookmark_commit(&jj, store, branch) {
-        crate::orchestrator::base_branch_sync::record_publication(orch, store, branch, &tip).await;
+        crate::orchestrator::base_branch_sync::record_publication(
+            orch,
+            store,
+            branch,
+            &tip,
+            observation,
+        )
+        .await;
     }
     Ok(())
 }

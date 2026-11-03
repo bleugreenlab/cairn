@@ -2602,6 +2602,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::IssueMessages => "cairn://p/cairn/1/messages",
         K::IssueComment => "cairn://p/cairn/1/comments/1",
         K::Node => "cairn://p/cairn/1/1/builder",
+        K::Task => "cairn://p/cairn/1/1/builder/task/sub",
         K::NodeMessages => "cairn://p/cairn/1/1/builder/messages",
         K::NodeProgress => "cairn://p/cairn/1/1/builder/progress",
         K::NodeRebase => "cairn://p/cairn/1/1/builder/rebase",
@@ -3811,5 +3812,74 @@ async fn editing_an_answered_tenet_points_at_a_successor() {
             "Approved: your call (the thread's judgment, trusted) — anonymous device dev,"
         ),
         "the answerer sits beside the verdict: {read}"
+    );
+}
+
+/// A terminal wake binds the terminal its ref names. The node and the project
+/// both own a running `dev`: a project ref subscribes to the project terminal's
+/// canonical URI, which is the key its exit and output are routed by, and a
+/// `cairn:~` ref to the node's own. A miss names the scope it searched.
+#[tokio::test]
+async fn a_terminal_wake_subscribes_to_the_scope_its_ref_names() {
+    let orch = seeded_orch().await;
+    let (issue_id, number) = seed_issue(&orch).await;
+    orch.db
+        .local
+        .execute_script(format!(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               SELECT 'exec-term','recipe',id,project_id,'running',1,1 FROM issues WHERE id='{issue_id}';
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
+               SELECT 'job-term','exec-term',project_id,id,'running','builder','builder','agent/test',1,1
+               FROM issues WHERE id='{issue_id}';
+             INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug)
+               VALUES ('t-node','job-term','s-node','bun dev:instance','running',1,'dev');
+             INSERT INTO job_terminals(id, project_id, session_id, command, status, created_at, slug)
+               SELECT 't-project',project_id,'s-project','bun dev:instance','running',1,'dev'
+               FROM issues WHERE id='{issue_id}';"
+        ))
+        .await
+        .unwrap();
+    let target = format!("cairn://p/cairn/{number}/1/builder/wakes");
+    let subscribe = |reference: &str| {
+        change_item(
+            &target,
+            ChangeMode::Append,
+            Some(
+                serde_json::json!({"subscribe": {"kind": "terminal", "ref": reference, "on": "exit"}}),
+            ),
+        )
+    };
+    let project_uri = "cairn://p/cairn/terminal/dev".to_string();
+    let node_uri = format!("cairn://p/cairn/{number}/1/builder/terminal/dev");
+
+    let summary = apply(&orch, &subscribe(&project_uri)).await.unwrap();
+    assert!(summary.contains(&format!("({project_uri})")), "{summary}");
+    let summary = apply(&orch, &subscribe("cairn:~/terminal/dev"))
+        .await
+        .unwrap();
+    assert!(summary.contains(&format!("({node_uri})")), "{summary}");
+
+    let mut refs: Vec<String> =
+        crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "job-term")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|subscription| subscription.source_kind == "process")
+            .filter_map(|subscription| subscription.source_ref)
+            .collect();
+    refs.sort();
+    let mut expected = vec![project_uri, node_uri];
+    expected.sort();
+    assert_eq!(refs, expected);
+
+    let missing = apply(&orch, &subscribe("cairn://p/cairn/terminal/missing"))
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .error
+            .contains("Searched the project terminals of `cairn`, which holds: dev"),
+        "{}",
+        missing.error
     );
 }

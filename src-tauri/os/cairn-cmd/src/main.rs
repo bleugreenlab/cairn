@@ -318,7 +318,8 @@ enum CheckCommand {
         /// Suite names from the project's `.cairn/config.yaml` `checks` contract.
         #[arg(required = true, num_args = 1..)]
         suites: Vec<String>,
-        /// Optional branch or revision. Defaults to the current logical head.
+        /// Revision to check: a branch name, a commit id, or a node URI
+        /// (cairn://p/PROJECT/ISSUE/EXEC/NODE). Defaults to the current logical head.
         #[arg(long)]
         branch: Option<String>,
         /// Force a fresh execution even when an exact reusable verdict exists.

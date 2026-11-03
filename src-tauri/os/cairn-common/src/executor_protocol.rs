@@ -89,6 +89,16 @@ pub fn executor_tool_artifact_path(target: &str, name: &str) -> String {
     format!("/api/executor/artifact/{target}/tool/{name}")
 }
 
+/// Where a runner serves the [`ExecutorMachineServiceSelection`] for the
+/// authenticated executor and a target (`?target=`): the pack artifacts of the
+/// machine services the fleet row selects on that machine without an override.
+pub const EXECUTOR_MACHINE_SERVICE_SELECTION_PATH: &str = "/api/executor/artifact/machine-services";
+
+/// Where a runner serves the bytes of one selected machine-service artifact.
+pub fn executor_machine_service_artifact_path(target: &str, pack: &str, service: &str) -> String {
+    format!("/api/executor/artifact/{target}/machine-service/{pack}/{service}")
+}
+
 /// The response header on a runner object fetch that names the source
 /// repository's shallow boundary reached by the wanted commit's history, as
 /// space-separated commit IDs. The pack stops at those commits by design, so the
@@ -921,7 +931,11 @@ pub enum EdgeId {
     BuildServiceClientEnv,
     BuildServiceStateDir,
     DevInstanceExternalIngress,
-    DesktopAutomationControl,
+    /// Serialized under the name it had before machine services, because an
+    /// edge id is decoded whole and has no unknown variant: a renamed value
+    /// would make a peer of the other vintage drop the advertisement.
+    #[serde(rename = "desktopAutomationControl")]
+    MachineServiceSelection,
     RunnerExecutorListenerIngress,
     ExecutorDialOutCredential,
     ExecutorArtifactPull,
@@ -1067,7 +1081,10 @@ pub enum InvalidationInput {
     /// entire environment; see cairn/3391.
     EnvironmentAssemblyPolicy,
     DevInstanceIngressPolicy,
-    DesktopAutomationConfiguration,
+    /// Which machine services a machine selects. Serialized under its name
+    /// from before machine services, for the reason [`EdgeId::MachineServiceSelection`] is.
+    #[serde(rename = "desktopAutomationConfiguration")]
+    MachineServiceSelection,
     /// What the page-call policy admits: its system read roots, and the real
     /// path and digest of every interpreter its probe ran. A toolchain update
     /// moves it, so evidence about the old binary stops placing work.
@@ -1168,10 +1185,10 @@ const INGRESS_INPUTS: &[InvalidationInput] = &[
     InvalidationInput::DevInstanceIngressPolicy,
     InvalidationInput::NetworkPolicy,
 ];
-const DESKTOP_INPUTS: &[InvalidationInput] = &[
+const MACHINE_SERVICE_INPUTS: &[InvalidationInput] = &[
     InvalidationInput::ExecutorBuild,
     InvalidationInput::BootGeneration,
-    InvalidationInput::DesktopAutomationConfiguration,
+    InvalidationInput::MachineServiceSelection,
 ];
 /// The listener's reach is set by its link policy and by the network it is bound
 /// to, so a change to either could widen who can reach it.
@@ -1212,7 +1229,7 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         audit_evidence: AuditEvidence::FilesystemProbe,
         revocation: Revocation::ProcessExit,
         invalidation_inputs: FILESYSTEM_INPUTS,
-        claim_revision: 1,
+        claim_revision: 2,
         supported_probe_versions: PROBE_VERSIONS,
     },
     EdgeDefinition {
@@ -1235,7 +1252,7 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         audit_evidence: AuditEvidence::FilesystemProbe,
         revocation: Revocation::ProcessExit,
         invalidation_inputs: FILESYSTEM_INPUTS,
-        claim_revision: 1,
+        claim_revision: 2,
         supported_probe_versions: PROBE_VERSIONS,
     },
     EdgeDefinition {
@@ -2330,7 +2347,7 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         supported_probe_versions: PROBE_VERSIONS,
     },
     EdgeDefinition {
-        id: EdgeId::DesktopAutomationControl,
+        id: EdgeId::MachineServiceSelection,
         key: EdgeKey {
             source: TrustDomain::Cell,
             destination: TrustDomain::ExecutorHost,
@@ -2348,7 +2365,7 @@ pub const CONTAINMENT_EDGE_DEFINITIONS: [EdgeDefinition; EdgeId::COUNT] = [
         persistence: Persistence::Machine,
         audit_evidence: AuditEvidence::None,
         revocation: Revocation::ConfigurationChange,
-        invalidation_inputs: DESKTOP_INPUTS,
+        invalidation_inputs: MACHINE_SERVICE_INPUTS,
         claim_revision: 1,
         supported_probe_versions: PROBE_VERSIONS,
     },
@@ -3057,7 +3074,7 @@ pub const CONTAINMENT_EDGE_IDS: [EdgeId; EdgeId::COUNT] = [
     EdgeId::BuildServiceClientEnv,
     EdgeId::BuildServiceStateDir,
     EdgeId::DevInstanceExternalIngress,
-    EdgeId::DesktopAutomationControl,
+    EdgeId::MachineServiceSelection,
     EdgeId::RunnerExecutorListenerIngress,
     EdgeId::ExecutorDialOutCredential,
     EdgeId::ExecutorArtifactPull,
@@ -4048,6 +4065,13 @@ impl CellCommandClass {
             self,
             Self::CargoCheck | Self::CargoTest | Self::CargoClippy | Self::Build
         )
+    }
+
+    /// Whether a command of this class compiles the project's Rust, so needs
+    /// what a machine's build-prerequisite verdict judges whatever toolchains
+    /// its selector names. `Build` is not: it is the frontend bundle.
+    pub fn compiles_rust(self) -> bool {
+        matches!(self, Self::CargoCheck | Self::CargoTest | Self::CargoClippy)
     }
 
     pub fn classify(command: &str) -> Self {
@@ -5452,6 +5476,16 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/5909 does not move the number. The Windows prerequisite script the
+/// executor embeds also judges `clang-cl` under `-CheckPrerequisites`, so a
+/// Windows host lacking it now reports the existing `Missing` verdict, and
+/// placement holds a cargo command class or a job's execution environment to
+/// that verdict as it already held a `rust` selector; the refusal's sentence
+/// is the runner's rendering. `CellCommandClass::compiles_rust` reads the
+/// field that already crosses. No frame, variant or field changes, and a
+/// runner talking to an older executor gets nothing wrong: that executor runs
+/// the script it embeds, reports `Satisfied` as before, and gates nothing new.
+///
 /// cairn/5917 does not move the number. The executor exports `SHLVL=1` into
 /// every cell command's environment, composed beside `PATH` from the
 /// executor's own facts, and drops a launch-declared `SHLVL` as it drops a
@@ -6686,7 +6720,91 @@ pub struct LearnedResourceEstimate {
 /// machine whose PCI bus shows no NVIDIA display function no longer asks
 /// NVML, so one with no GPU at all reports an empty list where it reported
 /// "NVML not loadable".
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 163;
+///
+/// cairn/5744 does not move the number. [`ResidentProcess`] gains a defaulted
+/// `charge` ([`ResidentCharge`]): the memory the executor charges that live
+/// resident and its basis, a stated reservation, the claim it started under,
+/// or the sampler's measured peak with headroom and the generation it was
+/// measured on. The executor now prices a resident the sampler has measured
+/// at that peak in its budget arithmetic as well as its admission hold, which
+/// changes the numbers in fields it already reports (the committed and active
+/// reservations, the resident inventory) and not their meaning. What a runner
+/// gets wrong talking to an older executor: nothing; it reads no `charge` and
+/// its executor page renders the resident line as before, and that executor
+/// keeps charging the declared claim until it runs a build carrying this. An
+/// older runner ignores the field.
+///
+/// Version 164 (cairn/5932) adds machine services: a pack-declared native
+/// executable the runner places as one resident per selected machine. A
+/// resident's [`ResidentProcessSpec::program`] may now be a
+/// [`RESIDENT_PROCESS_MANAGED_PROGRAM_PREFIX`] intent ([`ManagedProgram`]),
+/// which the executor resolves to `<home>/tools/<pack>-<service>-<sha16>/<executable>`
+/// and refuses as not installed when that file is missing. An older executor
+/// knows no such intent and would try to exec the string, so the start fails
+/// closed rather than running a program of the same name off its PATH; that
+/// behaviour change is why this is a version. The executor installs those
+/// artifacts from a third family on its artifact pull,
+/// [`EXECUTOR_MACHINE_SERVICE_SELECTION_PATH`] and
+/// [`executor_machine_service_artifact_path`], and reports them in a defaulted
+/// [`ExecutorCapabilities::machine_services`] ([`InstalledMachineService`]).
+/// A newer executor reads a 404 on the selection as an older runner and keeps
+/// what it has; an older runner ignores the report. [`EdgeId`] and
+/// [`InvalidationInput`] rename their desktop-automation members to
+/// `MachineServiceSelection` in Rust only: both keep their serialized names.
+///
+/// cairn/5965 does not move the number. [`SelfUpdatePhase::Waiting`] trades
+/// `behind` for a defaulted `ahead` and `updating`, and
+/// [`SelfUpdatePhase::Draining`] gains a defaulted `waitsForTurn` and
+/// `updating`: the rollout now gives its turn only to a machine with nothing
+/// in flight, and a busy machine drains beside it without holding anyone.
+/// [`SelfUpdateStatus`] is the runner's account to its own surfaces and never
+/// crosses to an executor. What a runner gets wrong talking to an older
+/// executor: nothing.
+///
+/// cairn/5849 does not move the number. The runner's resident-process event
+/// subscribers become removable registrations that their REPL session,
+/// workflow run, dev instance or service lease drops when it ends, and a REPL
+/// session hears only the process generation it started. All of it is how the
+/// runner fans out `ResidentProcessEvent` frames it already receives; no frame,
+/// variant or field changes, and a runner talking to an older executor gets
+/// nothing wrong.
+///
+/// cairn/5920 does not move the number. A node's placement default is runner
+/// state: the runner fills a batch's, terminal's or REPL's existing
+/// `executor` selector from it when the call names none, exactly as if the
+/// call had named that selector. No frame, variant or field changes, and a
+/// runner talking to an older executor gets nothing wrong; that executor
+/// receives a selector it has always been able to receive.
+///
+/// cairn/5906 does not move the number. The fence's default writable set no
+/// longer carries Cairn's scratch root, so a fenced spawn writes only its own
+/// `$TMPDIR` there; the executor builds that policy from its own compiled
+/// defaults, and a runner-serialized resident policy simply lists one path
+/// fewer in a `writable_extra` an older executor already applies verbatim. The
+/// batch filesystem probe also tries a scratch-root sibling, and both
+/// `BatchSpawnFilesystem{Confined,ReadOnlyCheckout}` claim revisions move to 2.
+/// No frame, variant or field changes. What a runner gets wrong talking to an
+/// older executor: nothing; placement does not weigh a claim revision, so that
+/// executor's revision-1 evidence satisfies an envelope as it does today, and
+/// its spawns keep the old grant until it runs a build carrying this.
+///
+/// cairn/5992 does not move the number. [`EnrolledRemote`] gains a defaulted
+/// `unreturnedUpdate` ([`UnreturnedUpdate`], [`UpdateRestart`]): the runner's
+/// conclusion that a machine it directed to a self-update did not come back,
+/// and the one restart it made over the machine's bootstrap. It is the
+/// runner's projection of an unattached machine to its own surfaces, built
+/// while that machine has no link, so it never crosses to an executor. What a
+/// runner gets wrong talking to an older executor: nothing.
+///
+/// cairn/5977 does not move the number. [`DeploymentPhaseReport::Healthy`]
+/// gains a defaulted `downloaded`, which a head sets when its start script's
+/// output shows a container image pull, so the runner can keep that load out
+/// of the windows it derives from load times. What a runner gets wrong
+/// talking to an older executor: nothing it decodes differently. Every load
+/// reads as one from cache, and the runner derives from the latest load, so
+/// a pull still stops governing once one later load has run. An older runner
+/// ignores the field. The build-hash rollout delivers it.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -6829,6 +6947,142 @@ pub const EXECUTOR_TREE_TOOLS: &[&str] = &["npm"];
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorToolSelection {
     pub tools: Vec<ToolArtifact>,
+}
+
+/// One pack-published artifact of a machine service, for one target, as a
+/// runner serves it: fetched once from the pack's URL, verified, cached, and
+/// re-served with `url` pointing at the runner
+/// ([`executor_machine_service_artifact_path`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineServiceArtifact {
+    pub pack: String,
+    pub service: String,
+    pub target: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub version: String,
+    /// Absent: the bytes are the executable itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<crate::archive::ArchiveKind>,
+    /// The executable inside the unpacked artifact, `/`-separated.
+    pub executable: String,
+    /// Run on the installed executable before it is placed; its output must
+    /// contain `version`.
+    pub prove_args: Vec<String>,
+}
+
+impl MachineServiceArtifact {
+    /// The directory under the executor's `tools` this artifact installs into.
+    pub fn install_dir_name(&self) -> String {
+        machine_service_install_dir_name(&self.pack, &self.service, &self.sha256)
+    }
+}
+
+/// `<pack>-<service>-<first 16 of sha256>`: the one name a machine-service
+/// install takes under the executor's `tools`, on both sides of the link.
+pub fn machine_service_install_dir_name(pack: &str, service: &str, sha256: &str) -> String {
+    format!("{pack}-{service}-{}", &sha256[..sha256.len().min(16)])
+}
+
+/// What [`EXECUTOR_MACHINE_SERVICE_SELECTION_PATH`] answers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorMachineServiceSelection {
+    pub artifacts: Vec<MachineServiceArtifact>,
+}
+
+/// One machine-service artifact as this executor holds it, reported in its
+/// advertisement so the runner can say what a machine runs and why not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledMachineService {
+    pub pack: String,
+    pub service: String,
+    /// The artifact the selection named.
+    pub sha256: String,
+    pub version: String,
+    pub outcome: MachineServiceInstallOutcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MachineServiceInstallOutcome {
+    /// Placed under `tools/` and proven to print its version.
+    Installed,
+    /// A refresh pass is fetching or unpacking it.
+    Installing,
+    /// Not on this machine, and why: `artifact unavailable` for a runner that
+    /// serves nothing for it, or the failed step's sentence.
+    NotInstalled { reason: String },
+}
+
+/// The [`ResidentProcessSpec::program`] intent for a machine service's managed
+/// executable, in the spirit of [`RESIDENT_PROCESS_DEFAULT_SHELL`]: a name the
+/// executor resolves under its own home rather than a path the runner guesses.
+///
+/// It is an intent rather than a new field so that an executor that predates
+/// it fails closed: it tries to exec the intent string itself and the start
+/// fails, where a field it ignored would have run whatever binary of that name
+/// was first on its PATH.
+pub const RESIDENT_PROCESS_MANAGED_PROGRAM_PREFIX: &str = "cairn:managed-program:";
+
+/// A machine service's installed executable, named by what installed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedProgram {
+    pub pack: String,
+    pub service: String,
+    pub sha256: String,
+    /// Inside the install directory, `/`-separated.
+    pub executable: String,
+}
+
+impl ManagedProgram {
+    /// The program intent this resolves from:
+    /// `cairn:managed-program:<pack>/<service>@<sha256>:<executable>`.
+    pub fn intent(&self) -> String {
+        format!(
+            "{RESIDENT_PROCESS_MANAGED_PROGRAM_PREFIX}{}/{}@{}:{}",
+            self.pack, self.service, self.sha256, self.executable
+        )
+    }
+
+    /// The managed program a [`ResidentProcessSpec::program`] names, or `None`
+    /// for an ordinary program.
+    pub fn parse(program: &str) -> Option<Self> {
+        let rest = program.strip_prefix(RESIDENT_PROCESS_MANAGED_PROGRAM_PREFIX)?;
+        let (key, rest) = rest.split_once('@')?;
+        let (pack, service) = key.split_once('/')?;
+        let (sha256, executable) = rest.split_once(':')?;
+        let plain = |segment: &str| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        };
+        let contained = !executable.is_empty()
+            && !executable.starts_with('/')
+            && !executable.contains('\\')
+            && executable
+                .split('/')
+                .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+        (plain(pack)
+            && plain(service)
+            && sha256.len() == 64
+            && sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            && contained)
+            .then(|| Self {
+                pack: pack.to_string(),
+                service: service.to_string(),
+                sha256: sha256.to_string(),
+                executable: executable.to_string(),
+            })
+    }
+
+    pub fn install_dir_name(&self) -> String {
+        machine_service_install_dir_name(&self.pack, &self.service, &self.sha256)
+    }
 }
 
 /// The target-independent resource tree a headless runner needs beside its
@@ -7854,6 +8108,11 @@ pub struct ExecutorCapabilities {
     /// predates the probe, which reads as unmeasured and gates nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_credential: Option<GithubCredentialEvidence>,
+    /// Each machine-service artifact the runner's selection named, as this
+    /// executor holds it. Absent from an executor that predates machine
+    /// services, which the runner reads as nothing installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machine_services: Vec<InstalledMachineService>,
 }
 
 /// What the executor's GitHub credential probe measured: whether git, run as
@@ -10790,6 +11049,54 @@ pub struct ResidentProcess {
     /// executor's latest [`MachineSample`]; an executor never sets it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_usage: Option<LiveUsageSample>,
+    /// What the executor running this process charges it, and on what
+    /// evidence. Set on each snapshot the executor reports, from the one
+    /// pricing its budget arithmetic and its admission hold both read; never
+    /// persisted, and absent from an executor that predates it and for a
+    /// process that declares nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge: Option<ResidentCharge>,
+}
+
+/// The memory a machine charges one live resident process, and why that
+/// figure rather than another.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentCharge {
+    pub memory_bytes: u64,
+    pub basis: ResidentChargeBasis,
+}
+
+/// Where a [`ResidentCharge`] comes from.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ResidentChargeBasis {
+    /// The surface that started it stated what it costs, as a declared or
+    /// learned reservation, and is charged that. A measurement replaces a
+    /// figure standing in for one, never a statement.
+    Stated,
+    /// The claim it started under, standing in for a measurement this machine
+    /// does not have yet: no generation of this process has been watched long
+    /// enough. `watched_ms` is how long the sampler has watched this one,
+    /// absent while no census has read it.
+    Claimed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watched_ms: Option<u64>,
+    },
+    /// The sampler's peak for it, charged with
+    /// [`MEASURED_RESERVATION_HEADROOM_PERCENT`] above. `generation` is whose
+    /// reading that is: the process's own once it has been watched long
+    /// enough, otherwise the last earlier generation of the same process that
+    /// the sampler read across its life.
+    Measured {
+        peak_bytes: u64,
+        watched_ms: u64,
+        generation: u64,
+    },
 }
 
 impl ResidentProcess {
@@ -10884,20 +11191,29 @@ impl CellOccupancy {
             .filter(|(_, process)| process.is_live())
     }
 
-    /// What the live resident processes in this cell declare against the host.
-    /// Derived from the persisted status of each process, so a recorded exit
-    /// stops contributing without any release call having to run.
-    pub fn resident_reservation(&self) -> ResourceReservation {
+    /// What the live resident processes in this cell are charged against the
+    /// host. Derived from the persisted status of each process, so a recorded
+    /// exit stops contributing without any release call having to run.
+    ///
+    /// `memory_of` is the memory each live process is charged, given its key
+    /// and its record. It is supplied rather than read off the declared
+    /// reservation because a resident's memory is priced by measurement once
+    /// the machine has one, and only the machine running it has that
+    /// measurement; disk and concurrency are charged as declared.
+    pub fn resident_reservation(
+        &self,
+        memory_of: impl Fn(&str, &ResidentProcess) -> u64,
+    ) -> ResourceReservation {
         let mut total = ResourceReservation {
             memory_bytes: 0,
             disk_growth_bytes: 0,
             concurrency_units: 0,
             source: ResourceReservationSource::Declared,
         };
-        for (_, process) in self.live_processes() {
+        for (key, process) in self.live_processes() {
             let fallback = ResourceReservation::default();
             let reservation = process.reservation.as_ref().unwrap_or(&fallback);
-            total.memory_bytes = total.memory_bytes.saturating_add(reservation.memory_bytes);
+            total.memory_bytes = total.memory_bytes.saturating_add(memory_of(key, process));
             total.disk_growth_bytes = total
                 .disk_growth_bytes
                 .saturating_add(reservation.disk_growth_bytes);
@@ -14094,13 +14410,19 @@ pub enum SelfUpdatePhase {
     ArtifactUnavailable { reason: String },
     /// Running a different build and waiting its turn: the fleet updates one
     /// machine at a time, so a bad artifact strands one machine rather than
-    /// all of them. `behind` names the machine whose turn it is.
+    /// all of them. A machine with nothing in flight takes the turn ahead of
+    /// one still draining, so no machine waits on another's work.
     Waiting {
+        /// How many machines update before this one: the one updating now,
+        /// then those ahead of it in line.
+        #[serde(default)]
+        ahead: u32,
+        /// The machine updating now, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        behind: Option<String>,
+        updating: Option<String>,
     },
-    /// This machine's turn. The runner refuses it new work until it is empty,
-    /// however long that takes, and then directs the update.
+    /// Emptying for its update. The runner refuses it new work until it is
+    /// empty, however long that takes, and then directs the update.
     Draining {
         in_flight: u32,
         since_unix_ms: u64,
@@ -14111,6 +14433,15 @@ pub enum SelfUpdatePhase {
         /// finish, so they are not waited on.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         cycles: Vec<String>,
+        /// It drains without holding the fleet's turn: machines with nothing
+        /// in flight update ahead of it and none waits on it, and it takes the
+        /// turn once it is empty. False for the machine whose turn it is,
+        /// being confirmed empty before its directive.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        waits_for_turn: bool,
+        /// The machine updating now, when this one waits for the turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updating: Option<String>,
     },
     /// Directed to update; the runner is waiting for it to return on the new
     /// build.
@@ -15011,6 +15342,47 @@ pub struct EnrolledRemote {
     /// runner, and absent whenever the refusal is one a self-update can clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stranded: Option<StrandedExecutor>,
+    /// Present once the runner has concluded that this machine, directed to a
+    /// self-update, did not come back within its return bound. Cleared when it
+    /// attaches. Absent from an older runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreturned_update: Option<UnreturnedUpdate>,
+}
+
+/// A machine the rolling self-update emptied and directed to install a build,
+/// that did not dial back in within the runner's return bound (the artifact
+/// download's own bound plus the replacement's rollback deadline).
+///
+/// Kept apart from the link, which still reads as the executor's own parting
+/// words (`executor updating to build …`): that sentence is true for the
+/// seconds of a restart and false for every hour after the bound. This is the
+/// runner's conclusion that the update stranded the machine, and the one
+/// restart it made through the machine's bootstrap in response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnreturnedUpdate {
+    /// The build the machine was directed to install.
+    pub build_id: String,
+    pub directed_at_unix_ms: u64,
+    /// When the runner concluded the machine had not returned.
+    pub concluded_at_unix_ms: u64,
+    /// The runner's single restart of the daemon over the machine's bootstrap,
+    /// once it has begun. `None` before it begins, and for a runner that
+    /// holds no bootstrap to attempt one with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<UpdateRestart>,
+}
+
+/// The one restart a runner makes of a daemon that did not return from a
+/// self-update. One per directed build, never a loop: after it, the machine is
+/// the operator's to bring back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRestart {
+    pub attempted_at_unix_ms: u64,
+    /// What the attempt found, in the runner's words; `None` while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 /// A machine that dials in, is refused because it speaks an older executor
@@ -16740,7 +17112,7 @@ impl PlacementRejectionReason {
                 script,
                 detail,
             } => format!(
-                "work that requires the rust toolchain, by its own selector or by {project_id}'s setup, needs the build prerequisites in {script}; this machine reads MISSING as of its last attach: {}",
+                "Rust work for {project_id} (a rust selector or setup, a cargo build, test or lint, or an agent's execution environment, whose shells build it) needs the build prerequisites in {script}; this machine reads MISSING as of its last attach: {}",
                 detail.trim()
             ),
         }
@@ -18271,10 +18643,14 @@ pub enum DeploymentPhaseReport {
     Starting,
     /// The health URL answers 2xx, though the start script may still be
     /// running. `ran_start` is false when it already answered, so the start
-    /// script was not run.
+    /// script was not run. `downloaded` is true when the start script's
+    /// output shows it pulled a container image before the model served, so
+    /// the load took longer than a reload from the machine's cache would.
     Healthy {
         #[serde(default)]
         ran_start: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        downloaded: bool,
     },
     Stopping,
     /// The health URL does not answer: after a stop, or on a probe.
@@ -19561,7 +19937,10 @@ mod tests {
             ExecutorMessage::DeploymentReport {
                 command_id: "start-1".into(),
                 deployment: "dsv4f-tp2".into(),
-                phase: DeploymentPhaseReport::Healthy { ran_start: true },
+                phase: DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: true,
+                },
             },
             ExecutorMessage::DeploymentReport {
                 command_id: "start-1".into(),
@@ -19767,6 +20146,7 @@ mod tests {
                     },
                     reservation: None,
                     live_usage: None,
+                    charge: None,
                 },
             )]),
             clone_source: None,
@@ -19922,6 +20302,13 @@ mod tests {
             status,
             reservation: Some(charged.clone()),
             live_usage: None,
+            charge: None,
+        };
+        let declared = |_: &str, process: &ResidentProcess| {
+            process
+                .reservation
+                .as_ref()
+                .map_or(0, |reservation| reservation.memory_bytes)
         };
         let mut occupancy = CellOccupancy {
             command: None,
@@ -19937,7 +20324,16 @@ mod tests {
             )]),
             clone_source: None,
         };
-        assert_eq!(occupancy.resident_reservation().concurrency_units, 1);
+        assert_eq!(
+            occupancy.resident_reservation(declared).concurrency_units,
+            1
+        );
+        assert_eq!(occupancy.resident_reservation(declared).memory_bytes, 2_048);
+        assert_eq!(
+            occupancy.resident_reservation(|_, _| 64).memory_bytes,
+            64,
+            "memory is charged at the figure the machine prices the process by"
+        );
 
         // Recording the exit is the whole release. No separate call gives the
         // unit back, so no missed call can strand it.
@@ -19950,8 +20346,11 @@ mod tests {
                 executor_lost: false,
             }),
         );
-        assert_eq!(occupancy.resident_reservation().concurrency_units, 0);
-        assert_eq!(occupancy.resident_reservation().memory_bytes, 0);
+        assert_eq!(
+            occupancy.resident_reservation(declared).concurrency_units,
+            0
+        );
+        assert_eq!(occupancy.resident_reservation(|_, _| 64).memory_bytes, 0);
     }
 
     /// The requester's wait horizon and the instant its wait began are what a
@@ -20428,6 +20827,7 @@ mod tests {
                 build_prerequisites: None,
                 page_call_programs: None,
                 github_credential: None,
+                machine_services: Vec::new(),
             },
             current_load: 1,
             warm_roots: vec![VerifiedWarmRoot {
@@ -20772,6 +21172,7 @@ mod tests {
                 source: ResourceReservationSource::Declared,
             }),
             live_usage: None,
+            charge: None,
         }
     }
 
@@ -21525,6 +21926,7 @@ mod tests {
                     drained: false,
                     role: Default::default(),
                     stranded: None,
+                    unreturned_update: None,
                 },
                 EnrolledRemote {
                     executor_id: "bglab-ub".into(),
@@ -21548,6 +21950,7 @@ mod tests {
                     drained: true,
                     role: Default::default(),
                     stranded: None,
+                    unreturned_update: None,
                 },
                 EnrolledRemote {
                     executor_id: "bglab-win".into(),
@@ -21564,6 +21967,7 @@ mod tests {
                     drained: false,
                     role: Default::default(),
                     stranded: None,
+                    unreturned_update: None,
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -22254,6 +22658,7 @@ mod tests {
                 drained: false,
                 role: Default::default(),
                 stranded: None,
+                unreturned_update: None,
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,
@@ -23554,8 +23959,13 @@ mod tests {
         let ingress = EdgeId::DevInstanceExternalIngress.definition();
         assert_eq!(ingress.key.source, TrustDomain::ExternalNetwork);
         assert_eq!(ingress.key.destination, TrustDomain::Cell);
-        let desktop = EdgeId::DesktopAutomationControl.definition();
-        assert_eq!(desktop.key.destination, TrustDomain::ExecutorHost);
+        let machine_service = EdgeId::MachineServiceSelection.definition();
+        assert_eq!(machine_service.key.destination, TrustDomain::ExecutorHost);
+        assert_eq!(
+            serde_json::to_value(EdgeId::MachineServiceSelection).unwrap(),
+            "desktopAutomationControl",
+            "the wire keeps the name a peer of either vintage decodes"
+        );
 
         // A cell reaching a host service's socket (the user bus, an agent, a
         // tmux server) runs outward, from the guest to the host, and is keyed
@@ -23567,7 +23977,7 @@ mod tests {
         assert_eq!(socket.key.direction, Direction::GuestToDest);
         assert_eq!(socket.key.carrier, Carrier::Socket);
         assert_eq!(socket.key.policy_mode, PolicyMode::Confined);
-        assert_ne!(socket.key.policy_mode, desktop.key.policy_mode);
+        assert_ne!(socket.key.policy_mode, machine_service.key.policy_mode);
     }
 
     /// Every process class reaches host sockets through its own edge per

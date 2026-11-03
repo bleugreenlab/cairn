@@ -311,7 +311,10 @@ pub struct RunInput {
     /// `commands` (one batch runs on one machine); one inside a command item is
     /// refused. Every result's first line names the machine the batch ran on.
     /// Read cairn://executors for the names, platforms, and toolchains
-    /// available. Omit unless the batch must land somewhere specific.
+    /// available. Omit unless the batch must land somewhere specific. When the
+    /// node declared a default (`write cairn:~ patch {executor:{...}}`), an
+    /// omitted selector inherits it and the first line says `(node default)`;
+    /// this field overrides it for one call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<RunExecutorSelectorInput>,
     /// A short written reason for committing files that contain literal Git

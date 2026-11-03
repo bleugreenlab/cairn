@@ -20,11 +20,19 @@
 //! [`ClaudeCli::spawn_config`], so the test pins Cairn's arguments rather
 //! than a copy of them.
 //!
+//! It also holds the CLI to how Cairn hands it the token: on an inherited
+//! descriptor (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), so the token is in
+//! neither the CLI's launch environment, which every same-user process can
+//! read, nor anything the CLI starts, and no token endpoint is ever called.
+//!
 //! It runs the real `claude` from PATH, in a fresh home, against a loopback
 //! Messages API stub (and, for the tool surface, a loopback MCP server), with
-//! every HTTPS request sent to a proxy that refuses it. Only dummy tokens are
-//! used. Where no `claude` is installed it skips; where one is, a CLI upgrade
-//! that drops the contract fails here.
+//! every HTTPS request sent to a proxy that records and refuses it. Every launch
+//! is Cairn's own: the arguments and environment of [`ClaudeCli::spawn_config`],
+//! the credential of [`ClaudeSessionCredential::for_launch`], spawned by
+//! [`RealProcessSpawner`]. Only dummy tokens are used. Where no `claude` is
+//! installed it skips; where one is, a CLI upgrade that drops the contract
+//! fails here.
 //!
 //! With `CAIRN_RECORD_CLAUDE_INIT=<dir>` set, the tool-surface tests write the
 //! CLI's raw `system`/`init` event to `<dir>/claude_init_<case>-<version>.json`,
@@ -36,19 +44,24 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cairn_models::claude::tokens::{ClaudeOAuth, ClaudeSessionCredential, OAUTH_TOKEN_ENV};
 use cairn_models::interface::session::{
     ApprovalMode, ClaudeMode, ClaudeSpec, PlacedFile, ProviderSpec, SecretEnv, SessionControl,
     SessionSpec, SessionStart,
 };
-use cairn_models::session::claude::{credential_push_generation, ClaudeCli, ClaudeControl};
-use cairn_models::session::mcp::{McpServer, McpServers, MCP_TOKEN_ENV};
+use cairn_models::session::claude::{
+    credential_push_generation, ClaudeCli, ClaudeControl, OAUTH_TOKEN_FD_ENV,
+};
+use cairn_models::session::mcp::{McpServer, McpServers, McpTransport, MCP_TOKEN_ENV};
 use cairn_models::wire::claude_stream::send_user_message;
 use cairn_models::wire::MessageContent;
+use cairn_platform::services::process::{ChildProcess, ProcessSpawner, RealProcessSpawner};
 use serde_json::{json, Value};
 
 const WAIT: Duration = Duration::from_secs(90);
@@ -281,16 +294,31 @@ impl Stub {
 
 /// A proxy that accepts and immediately hangs up, so any HTTPS request the
 /// CLI makes (telemetry, the real token endpoint) fails without leaving the
-/// machine.
-fn refusing_proxy() -> String {
+/// machine. It keeps the target each request asked for.
+struct Proxy {
+    url: String,
+    targets: Arc<Mutex<Vec<String>>>,
+}
+
+fn refusing_proxy() -> Proxy {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = targets.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            drop(stream);
+            let record = record.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                if let Some(target) = line.split_whitespace().nth(1) {
+                    record.lock().unwrap().push(target.to_string());
+                }
+            });
         }
     });
-    url
+    Proxy { url, targets }
 }
 
 /// A streamable-HTTP MCP server offering Cairn's three verbs, answering
@@ -405,7 +433,9 @@ fn mcp_reply(method: &str, request: &Value) -> (&'static str, String) {
     )
 }
 
-struct SharedStdin(Arc<Mutex<Option<ChildStdin>>>);
+type Stdin = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+struct SharedStdin(Stdin);
 
 impl Write for SharedStdin {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -422,16 +452,37 @@ impl Write for SharedStdin {
     }
 }
 
+/// A fresh home for one CLI: its working directory, and the CLI home inside
+/// it that the launch credential names.
+struct Home {
+    dir: tempfile::TempDir,
+    config: PathBuf,
+}
+
+impl Home {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("claude-home");
+        std::fs::create_dir_all(&config).unwrap();
+        Self { dir, config }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
 struct Cli {
-    child: Child,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    child: Box<dyn ChildProcess>,
+    stdin: Stdin,
     events: Receiver<Value>,
     /// Every event read so far, for a failure to show.
     history: Mutex<Vec<Value>>,
     seen: Arc<Mutex<Vec<(String, String)>>>,
-    stderr: std::path::PathBuf,
+    stderr: Arc<Mutex<String>>,
     control: ClaudeControl,
-    _home: tempfile::TempDir,
+    proxy: Proxy,
+    home: Home,
 }
 
 impl Cli {
@@ -454,7 +505,7 @@ impl Cli {
     }
 
     fn push(&mut self, token: &str, generation: u64) {
-        let env = SecretEnv::new().with("CLAUDE_CODE_OAUTH_TOKEN", token);
+        let env = SecretEnv::new().with(OAUTH_TOKEN_ENV, token);
         self.control.update_credential(&env, generation).unwrap();
     }
 
@@ -471,7 +522,8 @@ impl Cli {
                     }
                 }
                 Err(_) => panic!(
-                    "the CLI never produced {what}.\nevents:\n{}\nrequests: {:?}\nstderr:\n{}",
+                    "the CLI never produced {what}.\nprocess: {}\nevents:\n{}\nrequests: {:?}\nstderr:\n{}",
+                    process_report(self.child.id()),
                     self.history
                         .lock()
                         .unwrap()
@@ -483,7 +535,7 @@ impl Cli {
                         .collect::<Vec<_>>()
                         .join("\n"),
                     self.seen.lock().unwrap(),
-                    std::fs::read_to_string(&self.stderr).unwrap_or_default()
+                    self.stderr.lock().unwrap()
                 ),
             }
         }
@@ -492,13 +544,184 @@ impl Cli {
     fn turn_result(&self) -> Value {
         self.until("a result", |event| event["type"] == "result")
     }
+
+    /// The CLI's launch environment holds none of `tokens` and does not name
+    /// the token variable; it does name the descriptor variable. The stub's
+    /// address, which the launch does put there, is the control that the
+    /// environment was read at all.
+    fn assert_launch_environment_holds_none_of(&self, tokens: &[&str], stub: &Stub) {
+        let env = LaunchEnvironment::of(self.child.id());
+        assert!(
+            env.holds(&stub.base_url),
+            "the launch environment reader read nothing"
+        );
+        for token in tokens {
+            assert!(
+                !env.holds(token),
+                "a token is in the CLI's launch environment"
+            );
+        }
+        assert!(
+            !env.names().any(|name| name == OAUTH_TOKEN_ENV),
+            "the CLI's launch environment names {OAUTH_TOKEN_ENV}"
+        );
+        assert!(
+            env.names().any(|name| name == OAUTH_TOKEN_FD_ENV),
+            "the CLI was not told which descriptor holds its token"
+        );
+    }
+
+    /// Nothing asked for a token: no request reached an OAuth path, through
+    /// the stub or the proxy, and the CLI wrote no credential into its home.
+    fn assert_no_token_was_fetched(&self) {
+        let paths: Vec<String> = self
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert!(
+            !paths.iter().any(|path| path.contains("oauth")),
+            "the CLI called a token endpoint: {paths:?}"
+        );
+        let targets = self.proxy.targets.lock().unwrap().clone();
+        assert!(
+            !targets.iter().any(|target| {
+                ["platform.claude.com", "console.anthropic.com", "claude.ai"]
+                    .iter()
+                    .any(|host| target.starts_with(host))
+            }),
+            "the CLI reached for a token endpoint: {targets:?}"
+        );
+        let written: Vec<String> = std::fs::read_dir(&self.home.config)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("credentials"))
+            .collect();
+        assert!(
+            written.is_empty(),
+            "the CLI wrote {written:?} into its home"
+        );
+    }
 }
 
 impl Drop for Cli {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !matches!(self.child.try_wait(), Ok(Some(_))) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
+}
+
+/// A live process's launch environment, the block `KERN_PROCARGS2` and
+/// `/proc/<pid>/environ` show any process of the same user. Only names and a
+/// containment check leave it, never a value: on a real machine the values
+/// would be real credentials.
+struct LaunchEnvironment(Vec<Vec<u8>>);
+
+impl LaunchEnvironment {
+    fn of(pid: u32) -> Self {
+        Self(launch_environment_entries(pid))
+    }
+
+    fn names(&self) -> impl Iterator<Item = String> + '_ {
+        self.0.iter().filter_map(|entry| {
+            let name = entry.split(|byte| *byte == b'=').next()?;
+            Some(String::from_utf8_lossy(name).into_owned())
+        })
+    }
+
+    fn holds(&self, needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        self.0
+            .iter()
+            .any(|entry| entry.windows(needle.len()).any(|window| window == needle))
+    }
+}
+
+/// `KERN_PROCARGS2` is the argument count, the executable path, NUL padding,
+/// the arguments, then the environment up to the first empty string.
+#[cfg(target_os = "macos")]
+fn launch_environment_entries(pid: u32) -> Vec<Vec<u8>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut buf = vec![0u8; 1 << 20];
+    let mut size = buf.len();
+    // SAFETY: `mib` names three levels and `buf` is writable for `size` bytes.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    assert_eq!(
+        rc,
+        0,
+        "KERN_PROCARGS2 refused pid {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    buf.truncate(size);
+    let argc = i32::from_ne_bytes(buf[..4].try_into().unwrap()) as usize;
+    let mut fields = buf[4..].split(|byte| *byte == 0);
+    fields.next();
+    let mut fields = fields.skip_while(|field| field.is_empty());
+    for _ in 0..argc {
+        fields.next();
+    }
+    fields
+        .take_while(|field| !field.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_environment_entries(pid: u32) -> Vec<Vec<u8>> {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Where a process is stuck, for a failure to show: its state, what it waits
+/// in, and what its descriptors are. Nothing here is a value it holds.
+#[cfg(target_os = "linux")]
+fn process_report(pid: u32) -> String {
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("/proc/{pid}/{name}")).unwrap_or_else(|e| e.to_string())
+    };
+    let state = read("status")
+        .lines()
+        .find(|line| line.starts_with("State:"))
+        .unwrap_or("State: unknown")
+        .to_string();
+    let fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| {
+                    let target = std::fs::read_link(entry.path())
+                        .map(|link| link.display().to_string())
+                        .unwrap_or_default();
+                    format!("{}={target}", entry.file_name().to_string_lossy())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    format!("{state}; wchan {}; fds {fds:?}", read("wchan"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_report(pid: u32) -> String {
+    format!("pid {pid}")
 }
 
 fn installed_claude() -> Option<(String, String)> {
@@ -511,68 +734,63 @@ fn installed_claude() -> Option<(String, String)> {
     })
 }
 
-fn launch(claude: &str, stub: &Stub, token: &str) -> Cli {
-    let home = tempfile::tempdir().unwrap();
-    let mut command = sealed(claude, stub, home.path(), token);
-    command
-        .args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-        ])
-        .env("CLAUDE_CODE_OAUTH_401_WAIT_MS", "60000");
-    spawn(command, home, stub)
+/// What Cairn hands a launch on a managed account whose access token is
+/// `token`.
+fn launch_credential(token: &str, home: &Home) -> SecretEnv {
+    let oauth = ClaudeOAuth::from_cli_credentials(
+        &json!({"claudeAiOauth": {"accessToken": token, "expiresAt": 4_102_444_800_000i64}})
+            .to_string(),
+    )
+    .unwrap();
+    ClaudeSessionCredential::for_launch(&oauth, &home.config).env
 }
 
-/// Launch the CLI with exactly the arguments and environment overlay Cairn's
-/// own `ClaudeCli::spawn_config` gives `spec`, inside the sealed environment.
-fn launch_as_cairn(claude: &str, stub: &Stub, spec: &SessionSpec, env: &[(&str, &str)]) -> Cli {
-    let home = tempfile::tempdir().unwrap();
-    let config = ClaudeCli::spawn_config(claude, spec, None, None).unwrap();
-    let mut command = sealed(claude, stub, home.path(), "at-SEALED");
-    command
-        .args(&config.args)
-        .envs(&config.env)
-        .envs(env.iter().copied());
-    spawn(command, home, stub)
-}
-
-/// The real CLI in a fresh home, able to reach only the loopback stubs.
-fn sealed(claude: &str, stub: &Stub, home: &std::path::Path, token: &str) -> Command {
-    let config = home.join("claude-home");
-    std::fs::create_dir_all(&config).unwrap();
-    let mut command = Command::new(claude);
-    command
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", home)
-        .env("CLAUDE_CONFIG_DIR", &config)
-        .env("CLAUDE_CODE_OAUTH_TOKEN", token)
-        .env("ANTHROPIC_BASE_URL", &stub.base_url)
+/// Launch the CLI exactly as Cairn launches `spec`: the arguments and
+/// environment `ClaudeCli::spawn_config` gives it, spawned by Cairn's own
+/// spawner, with nothing inherited beyond the sealed environment and `env`.
+fn launch_as_cairn(
+    claude: &str,
+    stub: &Stub,
+    home: Home,
+    spec: &SessionSpec,
+    settings: Option<String>,
+    env: &[(&str, &str)],
+) -> Cli {
+    let proxy = refusing_proxy();
+    let mut config = ClaudeCli::spawn_config(claude, spec, None, settings).unwrap();
+    let sealed = [
+        ("PATH", std::env::var("PATH").unwrap_or_default()),
+        ("HOME", home.path().display().to_string()),
+        ("CLAUDE_CONFIG_DIR", home.config.display().to_string()),
+        ("ANTHROPIC_BASE_URL", stub.base_url.clone()),
         // The CLI sends everything through its proxy, plain HTTP included;
         // only the loopback stubs are exempt.
-        .env("HTTPS_PROXY", refusing_proxy())
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env("DISABLE_AUTOUPDATER", "1")
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .current_dir(home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(std::fs::File::create(home.join("stderr.log")).unwrap());
-    command
-}
+        ("HTTPS_PROXY", proxy.url.clone()),
+        ("NO_PROXY", "127.0.0.1,localhost".to_string()),
+        ("DISABLE_AUTOUPDATER", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
+    ];
+    for (name, value) in sealed {
+        config = config.env(name, &value);
+    }
+    for (name, value) in env {
+        config = config.env(name, value);
+    }
+    let inherited: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| !config.env.contains_key(name))
+        .collect();
+    for name in inherited {
+        config = config.env_remove(&name);
+    }
+    config.cwd = Some(home.path().display().to_string());
 
-fn spawn(mut command: Command, home: tempfile::TempDir, stub: &Stub) -> Cli {
-    let stderr = home.path().join("stderr.log");
-    let mut child = command.spawn().expect("spawn claude");
-    let stdin = Arc::new(Mutex::new(child.stdin.take()));
-    let stdout = child.stdout.take().unwrap();
+    let mut child = RealProcessSpawner.spawn(config).expect("spawn claude");
+    let stdin: Stdin = Arc::new(Mutex::new(child.take_stdin()));
+    let stdout = child.take_stdout().unwrap();
     let (tx, events) = channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in stdout.lines().map_while(Result::ok) {
             if let Ok(event) = serde_json::from_str::<Value>(&line) {
                 if tx.send(event).is_err() {
                     return;
@@ -580,6 +798,17 @@ fn spawn(mut command: Command, home: tempfile::TempDir, stub: &Stub) -> Cli {
             }
         }
     });
+    let stderr = Arc::new(Mutex::new(String::new()));
+    if let Some(pipe) = child.take_stderr() {
+        let keep = stderr.clone();
+        std::thread::spawn(move || {
+            for line in pipe.lines().map_while(Result::ok) {
+                let mut kept = keep.lock().unwrap();
+                kept.push_str(&line);
+                kept.push('\n');
+            }
+        });
+    }
     let control = ClaudeControl::new(Box::new(SharedStdin(stdin.clone())));
     Cli {
         child,
@@ -589,7 +818,8 @@ fn spawn(mut command: Command, home: tempfile::TempDir, stub: &Stub) -> Cli {
         seen: stub.seen.clone(),
         stderr,
         control,
-        _home: home,
+        proxy,
+        home,
     }
 }
 
@@ -601,6 +831,9 @@ fn acknowledged(event: &Value, generation: u64) -> bool {
             .any(|id| credential_push_generation(id) == Some(generation))
 }
 
+/// A session launched on its token by descriptor authenticates with it, takes
+/// a pushed token between turns and inside the 401 wait, never asks for a
+/// token itself, and never has any of them in its launch environment.
 #[test]
 fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
     let Some((claude, version)) = installed_claude() else {
@@ -609,7 +842,17 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
     };
     eprintln!("pinning the credential-push contract against Claude CLI {version}");
     let stub = Stub::start();
-    let mut cli = launch(&claude, &stub, "at-OLD");
+    let home = Home::new();
+    let spec = spec(
+        &home,
+        "at-OLD",
+        None,
+        ClaudeMode::Interactive,
+        ApprovalMode::Allow,
+        None,
+        Vec::new(),
+    );
+    let mut cli = launch_as_cairn(&claude, &stub, home, &spec, None, &[]);
 
     cli.send("turn one");
     let first = cli.turn_result();
@@ -618,6 +861,7 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
         stub.inference_tokens().last().map(String::as_str),
         Some("at-OLD")
     );
+    cli.assert_launch_environment_holds_none_of(&["at-OLD"], &stub);
 
     // Between turns: the old token is now refused, and the pushed one is what
     // the next turn sends.
@@ -648,18 +892,150 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
         stub.inference_tokens().last().map(String::as_str),
         Some("at-NEWER")
     );
+
+    // A push changes only the process's memory, never the block every
+    // same-user process can read.
+    cli.assert_launch_environment_holds_none_of(&["at-OLD", "at-NEW", "at-NEWER"], &stub);
+    cli.assert_no_token_was_fetched();
 }
 
-/// A Claude session spec as Cairn's backends build one, for the given
-/// servers, mode, approval, and output schema.
+/// Records, for whatever runs it, whether its environment names or holds a
+/// token and what it reads from descriptor 3. Run as `probe.sh <dir> <who>`.
+const PROBE: &str = r#"dir=$1; tag=$2-$$
+env > "$dir/$tag.env"
+if (exec 9<&3) 2>/dev/null; then
+  cat <&3 > "$dir/$tag.fd3"; echo open > "$dir/$tag.state"
+else
+  : > "$dir/$tag.fd3"; echo closed > "$dir/$tag.state"
+fi
+"#;
+
+/// What the CLI starts (its hooks, and a stdio MCP server, which is how
+/// `cairn-cmd` runs) never sees the token: not in its environment, and not on
+/// descriptor 3, which it either does not hold or finds already drained.
+#[test]
+fn nothing_the_cli_starts_sees_the_token() {
+    let Some((claude, version)) = installed_claude() else {
+        eprintln!("skipping: no `claude` on PATH");
+        return;
+    };
+    eprintln!("pinning what the CLI's children inherit against Claude CLI {version}");
+    const TOKEN: &str = "at-DESCRIPTOR";
+    let stub = Stub::start();
+    let home = Home::new();
+    let probes = home.path().join("probes");
+    std::fs::create_dir_all(&probes).unwrap();
+    let probe = home.path().join("probe.sh");
+    std::fs::write(&probe, PROBE).unwrap();
+    let (probe, probes_dir) = (probe.display().to_string(), probes.display().to_string());
+    let hook = |event: &str| json!([{"hooks": [{"type": "command", "command": format!("/bin/sh {probe} {probes_dir} hook-{event}")}]}]);
+    let settings = home.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        json!({"hooks": {
+            "SessionStart": hook("SessionStart"),
+            "UserPromptSubmit": hook("UserPromptSubmit"),
+            "Stop": hook("Stop"),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let servers = McpServers::new(vec![McpServer {
+        name: "probe".to_string(),
+        transport: McpTransport::Stdio {
+            command: "/bin/sh".to_string(),
+            args: vec![probe.clone(), probes_dir.clone(), "mcp".to_string()],
+            env: Default::default(),
+            inherit_env: Vec::new(),
+        },
+        required_tools: Vec::new(),
+    }])
+    .unwrap();
+    let spec = spec(
+        &home,
+        TOKEN,
+        Some(servers),
+        ClaudeMode::Interactive,
+        ApprovalMode::Allow,
+        None,
+        Vec::new(),
+    );
+    let mut cli = launch_as_cairn(
+        &claude,
+        &stub,
+        home,
+        &spec,
+        Some(settings.display().to_string()),
+        &[],
+    );
+
+    cli.send("turn one");
+    let result = cli.turn_result();
+    assert_eq!(result["subtype"], "success", "{result}");
+    assert_eq!(
+        stub.inference_tokens().last().map(String::as_str),
+        Some(TOKEN)
+    );
+    cli.assert_launch_environment_holds_none_of(&[TOKEN], &stub);
+
+    // Each probe writes its state file last, so one that exists is complete.
+    let states = |prefix: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(&probes)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(prefix) && name.ends_with(".state")
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while states("hook-").is_empty() || states("mcp-").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the hooks and the MCP server never ran"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for state in states("hook-").into_iter().chain(states("mcp-")) {
+        let who = state.file_stem().unwrap().to_string_lossy().into_owned();
+        let env = std::fs::read_to_string(state.with_extension("env")).unwrap();
+        assert!(
+            !env.contains(TOKEN),
+            "{who}: the token is in its environment"
+        );
+        assert!(
+            !env.lines()
+                .any(|line| line.starts_with(&format!("{OAUTH_TOKEN_ENV}="))),
+            "{who}: its environment names {OAUTH_TOKEN_ENV}"
+        );
+        let fd3 = std::fs::read(state.with_extension("fd3")).unwrap();
+        assert!(
+            !fd3.windows(TOKEN.len())
+                .any(|window| window == TOKEN.as_bytes()),
+            "{who}: read the token from descriptor 3"
+        );
+        eprintln!(
+            "{who}: descriptor 3 {}",
+            std::fs::read_to_string(&state).unwrap().trim()
+        );
+    }
+}
+
+/// A Claude session spec as Cairn's backends build one, on the managed-account
+/// credential for `token`, for the given servers, mode, approval, and output
+/// schema.
 fn spec(
-    home: &str,
+    home: &Home,
+    token: &str,
     mcp: Option<McpServers>,
     mode: ClaudeMode,
     approval: ApprovalMode,
     output_schema: Option<Value>,
     allowed_tools: Vec<String>,
 ) -> SessionSpec {
+    let dir = home.path().display().to_string();
     SessionSpec {
         start: SessionStart::New {
             session_id: uuid::Uuid::new_v4().to_string(),
@@ -668,14 +1044,14 @@ fn spec(
         effort: None,
         approval,
         output_schema,
-        cwd: home.to_string(),
+        cwd: dir.clone(),
         env: std::collections::BTreeMap::new(),
         mcp,
-        secrets: SecretEnv::new(),
+        secrets: launch_credential(token, home),
         account_id: None,
         provider: ProviderSpec::Claude(ClaudeSpec {
             system_prompt: PlacedFile {
-                dir: home.to_string(),
+                dir,
                 name: "system.md".to_string(),
                 contents: String::new(),
             },
@@ -730,15 +1106,24 @@ fn the_cli_offers_only_cairn_mcp_tools_under_tools_none() {
     let verbs: Vec<String> = ["read", "write", "run"]
         .map(|verb| format!("mcp__cairn__{verb}"))
         .to_vec();
+    let home = Home::new();
     let spec = spec(
-        "/tmp",
+        &home,
+        "at-SEALED",
         Some(servers),
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
         None,
         verbs,
     );
-    let mut cli = launch_as_cairn(&claude, &stub, &spec, &[(MCP_TOKEN_ENV, "mcp-SEALED")]);
+    let mut cli = launch_as_cairn(
+        &claude,
+        &stub,
+        home,
+        &spec,
+        None,
+        &[(MCP_TOKEN_ENV, "mcp-SEALED")],
+    );
 
     cli.send("turn one");
     let init = cli.init();
@@ -791,15 +1176,24 @@ fn the_cli_sends_a_progress_token_on_tools_call() {
     let verbs: Vec<String> = ["read", "write", "run"]
         .map(|verb| format!("mcp__cairn__{verb}"))
         .to_vec();
+    let home = Home::new();
     let spec = spec(
-        "/tmp",
+        &home,
+        "at-SEALED",
         Some(servers),
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
         None,
         verbs,
     );
-    let mut cli = launch_as_cairn(&claude, &stub, &spec, &[(MCP_TOKEN_ENV, "mcp-SEALED")]);
+    let mut cli = launch_as_cairn(
+        &claude,
+        &stub,
+        home,
+        &spec,
+        None,
+        &[(MCP_TOKEN_ENV, "mcp-SEALED")],
+    );
 
     cli.send("read something");
     let result = cli.turn_result();
@@ -822,8 +1216,9 @@ fn the_cli_sends_a_progress_token_on_tools_call() {
     );
 }
 
-/// A schema-constrained completion runs tool-free, and its answer still
-/// arrives through the CLI's own StructuredOutput tool.
+/// A schema-constrained completion runs tool-free, on its token by
+/// descriptor, and its answer still arrives through the CLI's own
+/// StructuredOutput tool.
 #[test]
 fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
     let Some((claude, version)) = installed_claude() else {
@@ -833,8 +1228,10 @@ fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
     eprintln!("pinning StructuredOutput under --tools \"\" against Claude CLI {version}");
     let stub = Stub::answering(Answer::StructuredOutput);
     let schema: Value = serde_json::from_str(STRUCTURED_SCHEMA).unwrap();
+    let home = Home::new();
     let spec = spec(
-        "/tmp",
+        &home,
+        "at-ONE-SHOT",
         None,
         ClaudeMode::OneShot {
             prompt: "answer".to_string(),
@@ -843,7 +1240,7 @@ fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
         Some(schema),
         Vec::new(),
     );
-    let mut cli = launch_as_cairn(&claude, &stub, &spec, &[]);
+    let mut cli = launch_as_cairn(&claude, &stub, home, &spec, None, &[]);
 
     cli.feed_and_close("what is the answer?");
     let init = cli.init();
@@ -874,4 +1271,10 @@ fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
         built_in.is_empty(),
         "the model was offered tools besides StructuredOutput: {built_in:?}"
     );
+    assert_eq!(
+        stub.inference_tokens().last().map(String::as_str),
+        Some("at-ONE-SHOT")
+    );
+    cli.assert_launch_environment_holds_none_of(&["at-ONE-SHOT"], &stub);
+    cli.assert_no_token_was_fetched();
 }

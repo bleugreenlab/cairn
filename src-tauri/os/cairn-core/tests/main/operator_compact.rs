@@ -7,6 +7,7 @@
 //! fresh session seeded from the digest, carrying whatever was queued.
 
 use crate::common;
+use crate::common::{enqueue_steer, pending};
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -811,27 +812,6 @@ async fn cold_compact_reseeds_when_its_teardown_record_fails() {
         1,
         "the successor session is open"
     );
-}
-
-async fn enqueue_steer(db: &LocalDb, id: &str, content: &str) {
-    db.execute(
-        "INSERT INTO queued_messages(id, job_id, content, delivery, created_at)
-         VALUES (?1, 'job-1', ?2, 'steer', 5)",
-        params![id.to_string(), content.to_string()],
-    )
-    .await
-    .unwrap();
-}
-
-async fn pending(db: &LocalDb, id: &str) -> bool {
-    db.query_one(
-        "SELECT COUNT(*) FROM queued_messages WHERE id = ?1 AND delivered_at IS NULL",
-        params![id.to_string()],
-        |row| row.i64(0),
-    )
-    .await
-    .unwrap()
-        == 1
 }
 
 /// A tool boundary delivers only into a running turn of its own run, and

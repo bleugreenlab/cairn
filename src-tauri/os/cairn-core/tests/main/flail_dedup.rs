@@ -13,6 +13,7 @@ use crate::common;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use cairn_common::protocol::{stamp_callback_origin, CALLBACK_ORIGIN_KEY, MODEL_FACING_ORIGIN};
 use cairn_core::internal::agent_process::process::RunHandle;
 use cairn_core::internal::dispatch::dispatch_tool;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
@@ -29,26 +30,47 @@ fn register_run(orch: &Orchestrator, run_id: &str) {
     processes.register(run_id.to_string(), handle);
 }
 
+/// The stub is for the model holding the earlier result. A caller under the same
+/// run whose result goes to a program (the CLI, or `@cairn/sdk` in a procedure,
+/// which stamps no origin) always gets the body, and leaves the model's own
+/// repeat a duplicate.
 #[tokio::test(flavor = "current_thread")]
-async fn dispatch_does_not_dedup_cli_read_after_agent_read() {
+async fn dispatch_never_stubs_a_read_that_does_not_reach_a_model() {
     let (_temp, orch, cursors) = active_turn_fixture().await;
-    let agent_request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
-    let mut cli_request = agent_request.clone();
-    cli_request.payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
+    let model_request = read_request("run-1", "file:/tmp/cairn-dedup-nonexistent-xyz");
+    let mut cli_request = model_request.clone();
+    stamp_callback_origin(&mut cli_request.payload, "cli");
+    let mut code_request = model_request.clone();
+    code_request
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove(CALLBACK_ORIGIN_KEY);
 
-    let first = dispatch_tool(&orch, &agent_request, &cursors)
+    let first = dispatch_tool(&orch, &model_request, &cursors)
         .await
         .into_inner()
         .content;
-    let cli_poll = dispatch_tool(&orch, &cli_request, &cursors)
-        .await
-        .into_inner()
-        .content;
-
     assert!(!first.starts_with("[duplicate call]"));
-    assert_eq!(
-        cli_poll, first,
-        "standalone CLI reads must return the resource body, not agent-facing dedupe guidance"
+    for request in [&cli_request, &code_request] {
+        let body = dispatch_tool(&orch, request, &cursors)
+            .await
+            .into_inner()
+            .content;
+        assert_eq!(
+            body, first,
+            "a read that reaches a program must return the body: {:?}",
+            request.payload
+        );
+    }
+
+    let repeat = dispatch_tool(&orch, &model_request, &cursors)
+        .await
+        .into_inner()
+        .content;
+    assert!(
+        repeat.starts_with("[duplicate call]"),
+        "the model's own repeat is still a duplicate: {repeat}"
     );
 }
 
@@ -67,14 +89,17 @@ async fn active_turn_fixture() -> (
     (temp, orch, Mutex::new(HashMap::new()))
 }
 
+/// A read as the agent's own `read` tool sends it.
 fn read_request(run_id: &str, path: &str) -> McpCallbackRequest {
+    let mut payload = serde_json::json!({ "path": path });
+    stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
     McpCallbackRequest {
         answer_bound_ms: None,
         thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
         tool: "read".to_string(),
-        payload: serde_json::json!({ "path": path }),
+        payload,
         tool_use_id: None,
         origin: None,
     }

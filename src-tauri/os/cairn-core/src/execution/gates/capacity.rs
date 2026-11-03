@@ -13,15 +13,22 @@
 //!
 //! ## One order
 //!
-//! Every reader of the queue — the sweep's release order, the places in line,
-//! the ahead-counts [`decide`] reads, the queue page — orders by one key: the
-//! capacity row's `queue_key`, unique within its database, then the database,
-//! then the execution id (the sweep, which also releases executions with no
-//! capacity row yet, breaks their same-second ties by issue number first). It
-//! is minted when a row first holds and never
-//! touched by a re-decision, so a hold keeps its place; the row's `created_at`
-//! stays the true age held. A thread may permute the keys its own cap-held set
-//! already occupies (`reorder`), which moves nobody else.
+//! Every reader of the fleet's queue (the sweep's release walk, the fleet
+//! places in line, the fleet ahead-count [`decide`] reads, the queue page and
+//! the operator's move) orders the cap-held executions through ONE function,
+//! [`super::rotation::release_order`] (cairn/5943): an ordered prefix of pinned
+//! executions, then the filing lanes (a thread, a parent issue, or the shared
+//! lane) taking turns round-robin, least recently served first. Each start
+//! records its lane's turn in its own transaction, so the rotation survives a
+//! restart and stays exactly-once.
+//!
+//! Within a lane the order is the capacity row's `queue_key`, unique within
+//! its database, then the database, then the execution id. A key is minted
+//! when a row first holds and never touched by a re-decision, so a hold keeps
+//! its place in its lane; the row's `created_at` stays the true age held. A
+//! thread may permute the keys its own cap-held set already occupies
+//! (`reorder`), which moves nobody else: its lane keeps its turns. The thread
+//! cap counts by key within the thread, as before.
 //!
 //! Being a gate row, a cap-held execution is held by the one definition every surface already reads
 //! (`cairn_db::awaiting_release_sql!`): it has no jobs, so it takes no slot and
@@ -64,8 +71,8 @@
 //!
 //! The lock is cheap to hold and never waited on forever. A decision is one
 //! read of the queue ([`QueueSnapshot`]) and a pure function over it, so a
-//! sweep pass decides every candidate under ONE acquisition, oldest first,
-//! and writes only what changed. Display values (counts and places in line)
+//! sweep pass decides every candidate under ONE acquisition, in the queue's
+//! order, and writes only what changed. Display values (counts and places in line)
 //! are rewritten after the pass, outside the lock. An acquisition that waits
 //! past [`ADMISSION_WAIT_BOUND`] names the holder and fails retryably.
 
@@ -80,6 +87,10 @@ use cairn_workflow::gates::store::{
 };
 use tracing::Instrument;
 
+use super::rotation::{
+    lane_of_issue_conn, mint_turn, newest_turn_conn, note_turn, read_lane_turns_conn,
+    release_order, Entry, LaneTurns, SHARED_LANE,
+};
 use crate::models::{CapacityHold, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -161,6 +172,10 @@ pub const ONLY_START_NOW_SKIPS_THE_QUEUE: &str = "Only the operator's Start now 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Admission {
     pub blocks: Vec<CapacityHold>,
+    /// The turn stamp a start on this decision records for its lane
+    /// (`rotation::record_turn_conn`), minted by the read that decided it, so
+    /// stamps are unique and increasing across every database.
+    pub turn: i64,
 }
 
 impl Admission {
@@ -462,6 +477,7 @@ pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &Capacity
     let prior = prior.and_then(|detail| decode_hold(fact, detail));
     hold.set_place(prior.as_ref().and_then(CapacityHold::place));
     hold.set_pinned(prior.as_ref().is_some_and(CapacityHold::pinned));
+    hold.set_frozen(prior.as_ref().is_some_and(CapacityHold::frozen));
     hold.set_placed_by(
         prior
             .as_ref()
@@ -743,7 +759,8 @@ async fn open_thread_children_conn(
 /// Every unsatisfied capacity row in one database, with what the queue needs
 /// to know about its execution: whether it runs on this device (`?1`),
 /// whether it is in line at all (awaiting release, and not waiting on an
-/// authored gate of its own), and its issue's thread.
+/// authored gate of its own), its issue's thread, its lane
+/// (`cairn_db::queue_lane_sql!`), and whether the row is pinned.
 pub(super) const CAPACITY_ROWS_SQL: &str = concat!(
     "SELECT g.execution_id, json_extract(g.predicate_json, '$.fact'),
             COALESCE(g.queue_key, g.created_at * 1000000),
@@ -754,7 +771,9 @@ pub(super) const CAPACITY_ROWS_SQL: &str = concat!(
     " AND NOT ",
     cairn_db::awaits_authored_gate_sql!(),
     " THEN 1 ELSE 0 END,
-            i.parent_thread_id
+            i.parent_thread_id, ",
+    cairn_db::queue_lane_sql!(),
+    ", COALESCE(json_extract(g.detail, '$.pinned'), 0)
        FROM execution_gates g
        JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
        LEFT JOIN issues i ON i.id = e.issue_id
@@ -778,9 +797,22 @@ struct CapacityRow {
     on_device: bool,
     in_line: bool,
     thread_id: Option<String>,
+    lane: String,
+    /// The operator's move (or a freeze behind one) put it in the ordered
+    /// prefix.
+    pinned: bool,
 }
 
-async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<Vec<CapacityRow>> {
+/// One database's part of a queue read: its capacity rows, the turns of the
+/// lanes they are in (and of the shared lane, which spans databases), and its
+/// newest turn stamp.
+struct CapacityRead {
+    rows: Vec<CapacityRow>,
+    turns: LaneTurns,
+    newest_turn: Option<i64>,
+}
+
+async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<CapacityRead> {
     let device = device.to_string();
     db.read(move |conn| {
         let device = device.clone();
@@ -788,7 +820,7 @@ async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<Vec<CapacityRow>>
             let mut rows = conn
                 .query(CAPACITY_ROWS_SQL, params![device.as_str()])
                 .await?;
-            let mut out = Vec::new();
+            let mut out: Vec<CapacityRow> = Vec::new();
             while let Some(row) = rows.next().await? {
                 let named = row.opt_text(1)?;
                 let Some(fact) = named
@@ -805,9 +837,23 @@ async fn capacity_rows(db: &LocalDb, device: &str) -> DbResult<Vec<CapacityRow>>
                     on_device: row.i64(4)? != 0,
                     in_line: row.i64(5)? != 0,
                     thread_id: row.opt_text(6)?,
+                    lane: row.text(7)?,
+                    pinned: row.opt_i64(8)?.unwrap_or(0) != 0,
                 });
             }
-            Ok(out)
+            drop(rows);
+            let lanes: std::collections::BTreeSet<&str> = out
+                .iter()
+                .map(|row| row.lane.as_str())
+                .chain([SHARED_LANE])
+                .collect();
+            let mut turns = LaneTurns::new();
+            read_lane_turns_conn(conn, lanes, &mut turns).await?;
+            Ok(CapacityRead {
+                newest_turn: newest_turn_conn(conn).await?,
+                rows: out,
+                turns,
+            })
         })
     })
     .await
@@ -833,6 +879,18 @@ struct StoredHold {
 /// One start a snapshot reads for: `(execution id, issue id)`.
 type WantedStart = (Option<String>, Option<String>);
 
+/// What the release order knows of one execution with a capacity row, beyond
+/// its keys (which `QueueSnapshot::stored` holds).
+#[derive(Debug, Clone)]
+struct OrderFacts {
+    db_index: usize,
+    lane: String,
+    pinned: bool,
+    /// In the queue: a cap holds it now and it waits on nothing else
+    /// (`cap_held_sql!`), so it takes a place in the release order.
+    in_queue: bool,
+}
+
 /// The execution queue as one read sees it: the fleet's load, every
 /// capacity row, and the threads of the starts being decided. Read once per
 /// decision under the admission lock, so a sweep pass decides every candidate
@@ -854,11 +912,30 @@ pub(crate) struct QueueSnapshot {
     /// The newest queue key this read has seen, so a hold first recorded
     /// during a pass takes a place behind everything already in line.
     newest_key: i64,
+    /// Every execution with a capacity row: its database, lane and pin.
+    order_facts: HashMap<String, OrderFacts>,
+    /// The turns of every lane this read has seen.
+    turns: LaneTurns,
+    /// The newest turn stamp in any database, so the next start's stamp is
+    /// past it.
+    newest_turn: i64,
+    /// The instant this read was taken, which a minted turn stamp starts from.
+    now: i64,
+    /// The lanes of the starts' issues.
+    issue_lanes: HashMap<String, String>,
+    /// Each open database's address, in `all_dbs` order: a start's database
+    /// index, which breaks key ties.
+    db_addresses: Vec<usize>,
+    /// The release order over the queue ([`release_order`]): execution ->
+    /// rank. Recomputed whenever a release or a hold changes the queue.
+    rank: HashMap<String, usize>,
 }
 
 impl QueueSnapshot {
     /// Read the queue for `starts`: `2D + G` read transactions for `D` open
     /// databases and `G` databases the starts live in, however many starts.
+    /// The lane turns ride in the capacity rows' read of each database, and
+    /// the starts' own lanes in the read of theirs.
     pub(crate) async fn load(orch: &Orchestrator, starts: &[Start<'_>]) -> Result<Self, String> {
         Self::read(orch, starts)
             .instrument(tracing::info_span!(
@@ -884,10 +961,21 @@ impl QueueSnapshot {
             open_children: HashMap::new(),
             on_device: HashMap::new(),
             newest_key: 0,
+            order_facts: HashMap::new(),
+            turns: LaneTurns::new(),
+            newest_turn: 0,
+            now: orch.services.clock.now(),
+            issue_lanes: HashMap::new(),
+            db_addresses: Vec::new(),
+            rank: HashMap::new(),
         };
-        for db in orch.db.all_dbs().await {
-            for row in capacity_rows(&db, &device).await.map_err(reading)? {
-                snapshot.add_row(row);
+        let dbs = orch.db.all_dbs().await;
+        snapshot.db_addresses = dbs.iter().map(|db| Arc::as_ptr(db) as usize).collect();
+        for (db_index, db) in dbs.iter().enumerate() {
+            let read = capacity_rows(db, &device).await.map_err(reading)?;
+            snapshot.merge_turns(read.turns, read.newest_turn);
+            for row in read.rows {
+                snapshot.add_row(db_index, row);
             }
         }
 
@@ -909,12 +997,13 @@ impl QueueSnapshot {
         }
         for (db, wanted) in groups {
             let known: HashSet<String> = snapshot.open_children.keys().cloned().collect();
-            let (devices, issues, children) = db
+            let (devices, issues, children, lanes, turns) = db
                 .read(move |conn| {
                     let (wanted, mut known) = (wanted.clone(), known.clone());
                     Box::pin(async move {
-                        let (mut devices, mut issues, mut children) =
-                            (Vec::new(), Vec::new(), Vec::new());
+                        let (mut devices, mut issues, mut children, mut lanes) =
+                            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                        let mut turns = LaneTurns::new();
                         for (execution_id, issue_id) in &wanted {
                             if let Some(execution_id) = execution_id {
                                 let runner = crate::storage::query_opt_text_conn(
@@ -926,6 +1015,9 @@ impl QueueSnapshot {
                                 devices.push((execution_id.clone(), runner));
                             }
                             let Some(issue_id) = issue_id else { continue };
+                            let lane = lane_of_issue_conn(conn, Some(issue_id)).await?;
+                            read_lane_turns_conn(conn, [lane.as_str()], &mut turns).await?;
+                            lanes.push((issue_id.clone(), lane));
                             let Some(thread) = thread_of_issue_conn(conn, issue_id).await? else {
                                 continue;
                             };
@@ -937,11 +1029,13 @@ impl QueueSnapshot {
                             }
                             issues.push((issue_id.clone(), thread));
                         }
-                        Ok((devices, issues, children))
+                        Ok((devices, issues, children, lanes, turns))
                     })
                 })
                 .await
                 .map_err(reading)?;
+            snapshot.issue_lanes.extend(lanes);
+            snapshot.merge_turns(turns, None);
             for (execution_id, runner) in devices {
                 let on_device = runner.as_deref().is_none_or(|runner| runner == device);
                 snapshot.on_device.insert(execution_id, on_device);
@@ -949,10 +1043,31 @@ impl QueueSnapshot {
             snapshot.issues.extend(issues);
             snapshot.open_children.extend(children);
         }
+        snapshot.recompute_order();
         Ok(snapshot)
     }
 
-    fn add_row(&mut self, row: CapacityRow) {
+    fn merge_turns(&mut self, turns: LaneTurns, newest: Option<i64>) {
+        for (lane, turn) in turns {
+            if let Some(served) = turn.served {
+                note_turn(&mut self.turns, &lane, served);
+            }
+        }
+        self.newest_turn = self.newest_turn.max(newest.unwrap_or(0));
+    }
+
+    fn add_row(&mut self, db_index: usize, row: CapacityRow) {
+        let facts = self
+            .order_facts
+            .entry(row.execution_id.clone())
+            .or_insert_with(|| OrderFacts {
+                db_index,
+                lane: row.lane.clone(),
+                pinned: false,
+                in_queue: false,
+            });
+        facts.pinned |= row.pinned;
+        facts.in_queue |= row.blocking && row.in_line;
         self.newest_key = self.newest_key.max(row.queue_key);
         let key = (row.execution_id.clone(), row.fact);
         let stored = self.stored.entry(key).or_insert(StoredHold {
@@ -1005,24 +1120,111 @@ impl QueueSnapshot {
             .map_or(i64::MAX, |stored| stored.queue_key)
     }
 
-    /// Which caps hold `start` now.
+    /// An execution's key within its lane, as `fleet_order_key_sql!` computes
+    /// it: its fleet row's key, else its earliest blocking row's, else its
+    /// earliest row's.
+    fn order_key(&self, execution_id: &str) -> Option<i64> {
+        let row = |fact: &'static str| self.stored.get(&(execution_id.to_string(), fact));
+        if let Some(fleet) = row(FLEET_SLOT_FACT) {
+            return Some(fleet.queue_key);
+        }
+        let rows: Vec<&StoredHold> = CAPACITY_FACTS.iter().filter_map(|fact| row(fact)).collect();
+        rows.iter()
+            .filter(|stored| stored.blocking)
+            .map(|stored| stored.queue_key)
+            .min()
+            .or_else(|| rows.iter().map(|stored| stored.queue_key).min())
+    }
+
+    /// Rank the queue as it stands ([`release_order`]).
+    fn recompute_order(&mut self) {
+        let entries: Vec<Entry<'_>> = self
+            .order_facts
+            .iter()
+            .filter(|(_, facts)| facts.in_queue)
+            .filter_map(|(id, facts)| {
+                Some(Entry {
+                    execution_id: id,
+                    db_index: facts.db_index,
+                    key: self.order_key(id)?,
+                    lane: &facts.lane,
+                    pinned: facts.pinned,
+                })
+            })
+            .collect();
+        let rank = release_order(&entries, &self.turns)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, index)| (entries[index].execution_id.to_string(), rank))
+            .collect();
+        self.rank = rank;
+    }
+
+    /// Where `start` stands in the release order, `None` when it is not in
+    /// the queue (a new filing, or one whose `after:` gates just cleared),
+    /// which sorts it after everything that is.
+    pub(crate) fn rank_of(&self, start: &Start<'_>) -> Option<usize> {
+        start.execution_id.and_then(|id| self.rank.get(id)).copied()
+    }
+
+    /// The queue's executions in release order.
+    #[cfg(test)]
+    pub(crate) fn order(&self) -> Vec<String> {
+        let mut order: Vec<(&String, &usize)> = self.rank.iter().collect();
+        order.sort_by_key(|(_, rank)| **rank);
+        order.into_iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// The lane a start's turn is recorded in.
+    fn lane_of(&self, start: &Start<'_>) -> String {
+        start
+            .issue_id
+            .and_then(|issue_id| self.issue_lanes.get(issue_id))
+            .or_else(|| {
+                start
+                    .execution_id
+                    .and_then(|id| self.order_facts.get(id))
+                    .map(|facts| &facts.lane)
+            })
+            .cloned()
+            .unwrap_or_else(|| SHARED_LANE.to_string())
+    }
+
+    fn db_index_of(&self, db: &LocalDb) -> usize {
+        let address = db as *const LocalDb as usize;
+        self.db_addresses
+            .iter()
+            .position(|known| *known == address)
+            .unwrap_or(self.db_addresses.len())
+    }
+
+    /// Which caps hold `start` now, and the turn stamp it records if it
+    /// starts.
     ///
-    /// A cap holds when it is full, AND when anything is already held on it
-    /// ahead of this start: a slot that frees between sweeps goes to the
-    /// oldest held execution, never to a fresh filing that happened to land
-    /// first. A start that re-runs an issue already counted as an open child
-    /// of its thread opens no new child, so the thread cap does not hold it;
-    /// nor does it when the issue has no thread.
+    /// The fleet cap holds when it is full, AND when any execution held on it
+    /// comes before this start in the release order: a slot that frees between
+    /// sweeps goes to the next in the rotation, never to a fresh filing that
+    /// happened to land first. The thread cap holds when it is full, or when a
+    /// child of the same thread is held on it with an earlier key. A start
+    /// that re-runs an issue already counted as an open child of its thread
+    /// opens no new child, so the thread cap does not hold it; nor does it
+    /// when the issue has no thread.
     pub(crate) fn decide(&self, start: &Start<'_>) -> Admission {
         let ahead = |line: &HashMap<String, i64>, place: i64| {
             line.iter()
                 .filter(|(id, since)| Some(id.as_str()) != start.execution_id && **since < place)
                 .count()
         };
+        let rank = self.rank_of(start);
+        let fleet_ahead = self.fleet_line.keys().any(|id| {
+            Some(id.as_str()) != start.execution_id
+                && self
+                    .rank
+                    .get(id)
+                    .is_some_and(|ahead| rank.is_none_or(|rank| *ahead < rank))
+        });
         let mut blocks = Vec::new();
-        if self.load.in_progress >= self.fleet_limit
-            || ahead(&self.fleet_line, self.place(start, FLEET_SLOT_FACT)) > 0
-        {
+        if self.load.in_progress >= self.fleet_limit || fleet_ahead {
             blocks.push(CapacityHold::Fleet {
                 running: self.load.in_progress,
                 limit: self.fleet_limit,
@@ -1030,6 +1232,7 @@ impl QueueSnapshot {
                 place: None,
                 placed_by: None,
                 pinned: false,
+                frozen: false,
             });
         }
         let thread = start.issue_id.and_then(|issue_id| {
@@ -1055,10 +1258,14 @@ impl QueueSnapshot {
                     place: None,
                     placed_by: None,
                     pinned: false,
+                    frozen: false,
                 });
             }
         }
-        Admission { blocks }
+        Admission {
+            blocks,
+            turn: mint_turn(self.now, self.newest_turn),
+        }
     }
 
     /// Whether holding `start` on `admission` would change nothing stored: it
@@ -1080,9 +1287,13 @@ impl QueueSnapshot {
             })
     }
 
-    /// `start` was released: it takes a fleet slot, opens its thread's child
-    /// if that was not open yet, and leaves every line.
-    pub(crate) fn record_release(&mut self, start: &Start<'_>) {
+    /// `start` was released on a decision stamped `turn`: it takes a fleet
+    /// slot, opens its thread's child if that was not open yet, leaves every
+    /// line, and its lane has spent its turn.
+    pub(crate) fn record_release(&mut self, start: &Start<'_>, turn: i64) {
+        let lane = self.lane_of(start);
+        note_turn(&mut self.turns, &lane, turn);
+        self.newest_turn = self.newest_turn.max(turn);
         // The fleet counts this device's executions only: releasing one that
         // runs on another device takes no slot here.
         let on_device = start
@@ -1113,7 +1324,9 @@ impl QueueSnapshot {
             for fact in CAPACITY_FACTS {
                 self.stored.remove(&(execution_id.to_string(), *fact));
             }
+            self.order_facts.remove(execution_id);
         }
+        self.recompute_order();
     }
 
     /// `start` was held on `blocks` as of `now`: it stands in line on each of
@@ -1163,6 +1376,18 @@ impl QueueSnapshot {
                 }
             }
         }
+        // Held, it is in the queue: a new hold joins at the back of its lane.
+        let (lane, db_index) = (self.lane_of(start), self.db_index_of(start.db));
+        self.order_facts
+            .entry(execution_id.to_string())
+            .or_insert(OrderFacts {
+                db_index,
+                lane,
+                pinned: false,
+                in_queue: false,
+            })
+            .in_queue = !blocks.is_empty();
+        self.recompute_order();
     }
 
     /// `hold` with this read's counts: the fleet's load and limit, or the
@@ -1228,9 +1453,9 @@ pub async fn decide(
 // Place in line
 // ---------------------------------------------------------------------------
 
-/// Rewrite every blocking capacity gate's place in line: the fleet's in one
-/// order across every database, each thread's within the thread, in the
-/// queue's one order (`queue_key`, then database, then execution). With the `queue` a
+/// Rewrite every blocking capacity gate's place in line: the fleet's in the
+/// release order across every database ([`fleet_order`]), each thread's
+/// within the thread by key (`queue_key`, then database, then execution). With the `queue` a
 /// sweep pass decided against, as it stood once the pass was done, the counts
 /// each hold shows are rewritten too, so a hold the pass left as it was does
 /// not have to be written under the admission lock to stay current. Neither
@@ -1300,13 +1525,36 @@ pub(crate) async fn refresh_places(
             });
         }
     }
+    // A fleet place is a rank in the release order; one this read does not
+    // find there (it moved between the two reads) is numbered after it.
+    let fleet_rank: HashMap<String, usize> = fleet_order(orch)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(rank, entry)| (entry.queued.execution_id, rank))
+        .collect();
+    let rank = |gate: &Blocking| match gate.fact {
+        FLEET_SLOT_FACT => fleet_rank
+            .get(&gate.execution_id)
+            .copied()
+            .unwrap_or(usize::MAX),
+        _ => 0,
+    };
     blocking.sort_by(|a, b| {
-        (a.queue_key, a.db_index, &a.execution_id, &a.gate_id).cmp(&(
-            b.queue_key,
-            b.db_index,
-            &b.execution_id,
-            &b.gate_id,
-        ))
+        (
+            rank(a),
+            a.queue_key,
+            a.db_index,
+            &a.execution_id,
+            &a.gate_id,
+        )
+            .cmp(&(
+                rank(b),
+                b.queue_key,
+                b.db_index,
+                &b.execution_id,
+                &b.gate_id,
+            ))
     });
 
     // (cap, the thread a thread cap's place counts within) -> places so far.
@@ -1426,14 +1674,34 @@ macro_rules! cap_held_sql {
 }
 pub(crate) use cap_held_sql;
 
-/// Every execution a cap holds right now, with its age, its place in the
-/// fleet's order (`fleet_order_key_sql!`) and its thread.
+/// Execution `e`'s lane and whether it is pinned, as two columns: the facts
+/// the release order reads beyond its key. Pinned is any unlatched capacity
+/// row carrying `pinned`, as `CAPACITY_ROWS_SQL` reads it row by row.
+macro_rules! queue_pin_sql {
+    () => {
+        concat!(
+            cairn_db::queue_lane_sql!(),
+            ", EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
+                   AND g.satisfied_at IS NULL AND json_extract(g.detail, '$.pinned') = 1 AND ",
+            cairn_db::capacity_gate_sql!(),
+            ")"
+        )
+    };
+}
+pub(crate) use queue_pin_sql;
+
+/// Every execution a cap holds right now, with its age, its key within its
+/// lane (`fleet_order_key_sql!`), its thread, its lane
+/// (`cairn_db::queue_lane_sql!`), and whether any of its capacity rows is
+/// pinned.
 pub(crate) const QUEUE_ROWS_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, e.seq, i.number, i.title, p.id, p.key, t.name, ",
     cairn_workflow::held_since_sql!(),
     ", ",
     cairn_workflow::fleet_order_key_sql!(),
-    ", i.parent_thread_id
+    ", i.parent_thread_id, ",
+    queue_pin_sql!(),
+    "
        FROM executions e
        LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN projects p ON p.id = i.project_id
@@ -1444,22 +1712,29 @@ pub(crate) const QUEUE_ROWS_SQL: &str = concat!(
 
 /// One cap-held execution in the fleet's order, with where it lives.
 pub(crate) struct FleetOrdered {
-    /// Its `fleet_order_key_sql!`.
+    /// Its key within its lane: `fleet_order_key_sql!`.
     pub key: i64,
     pub db_index: usize,
     pub db: Arc<LocalDb>,
+    /// Its lane (`cairn_db::queue_lane_sql!`).
+    pub lane: String,
+    /// In the ordered prefix ahead of the rotation.
+    pub pinned: bool,
     /// As the page lists it, its census not yet read.
     pub queued: QueuedExecution,
 }
 
-/// Every cap-held execution across every database in the fleet's order: its
-/// fleet row's key (`fleet_order_key_sql!`), then database, then execution.
-/// The ONE order the queue page numbers and the operator's move resolves a
-/// position against, so the two cannot drift apart.
+/// Every cap-held execution across every database in the release order
+/// ([`release_order`]): the pinned prefix, then the lanes in rotation, each
+/// lane by key (`fleet_order_key_sql!`), then database, then execution. The
+/// ONE order the queue page numbers and the operator's move resolves a
+/// position against, and the sweep releases in, so none of them can drift
+/// apart.
 pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>, String> {
     let mut held = Vec::new();
+    let mut turns = LaneTurns::new();
     for (db_index, db) in orch.db.all_dbs().await.into_iter().enumerate() {
-        let rows = db
+        let (rows, found) = db
             .read(|conn| {
                 Box::pin(async move {
                     let mut rows = conn.query(QUEUE_ROWS_SQL, ()).await?;
@@ -1467,6 +1742,8 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
                     while let Some(row) = rows.next().await? {
                         out.push((
                             row.opt_i64(9)?.unwrap_or(0),
+                            row.text(11)?,
+                            row.opt_i64(12)?.unwrap_or(0) != 0,
                             QueuedExecution {
                                 execution_id: row.text(0)?,
                                 issue_id: row.opt_text(1)?,
@@ -1482,26 +1759,54 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
                             },
                         ));
                     }
-                    Ok(out)
+                    drop(rows);
+                    let lanes: std::collections::BTreeSet<&str> = out
+                        .iter()
+                        .map(|(_, lane, ..)| lane.as_str())
+                        .chain([SHARED_LANE])
+                        .collect();
+                    let mut turns = LaneTurns::new();
+                    read_lane_turns_conn(conn, lanes, &mut turns).await?;
+                    Ok((out, turns))
                 })
             })
             .await
             .map_err(|error| format!("failed to list the execution queue: {error}"))?;
-        held.extend(rows.into_iter().map(|(key, queued)| FleetOrdered {
-            key,
-            db_index,
-            db: db.clone(),
-            queued,
-        }));
+        for (lane, turn) in found {
+            if let Some(served) = turn.served {
+                note_turn(&mut turns, &lane, served);
+            }
+        }
+        held.extend(
+            rows.into_iter()
+                .map(|(key, lane, pinned, queued)| FleetOrdered {
+                    key,
+                    db_index,
+                    db: db.clone(),
+                    lane,
+                    pinned,
+                    queued,
+                }),
+        );
     }
-    held.sort_by(|a, b| {
-        (a.key, a.db_index, &a.queued.execution_id).cmp(&(
-            b.key,
-            b.db_index,
-            &b.queued.execution_id,
-        ))
-    });
-    Ok(held)
+    let order = {
+        let entries: Vec<Entry<'_>> = held
+            .iter()
+            .map(|entry| Entry {
+                execution_id: &entry.queued.execution_id,
+                db_index: entry.db_index,
+                key: entry.key,
+                lane: &entry.lane,
+                pinned: entry.pinned,
+            })
+            .collect();
+        release_order(&entries, &turns)
+    };
+    let mut slots: Vec<Option<FleetOrdered>> = held.into_iter().map(Some).collect();
+    Ok(order
+        .into_iter()
+        .filter_map(|index| slots[index].take())
+        .collect())
 }
 
 /// Every cap-held execution across every database, in the fleet's order
@@ -3063,6 +3368,7 @@ pub(crate) mod tests {
             place: None,
             placed_by: None,
             pinned: false,
+            frozen: false,
         };
         let stored = encode_hold(&CapacityHold::Fleet {
             running: 7,
@@ -3071,6 +3377,7 @@ pub(crate) mod tests {
             place: Some(3),
             placed_by: None,
             pinned: false,
+            frozen: false,
         });
         assert_eq!(
             stored,
@@ -3086,6 +3393,7 @@ pub(crate) mod tests {
                 place: Some(3),
                 placed_by: None,
                 pinned: false,
+                frozen: false,
             })
         );
         let placed = encode_hold(&CapacityHold::Fleet {
@@ -3095,6 +3403,7 @@ pub(crate) mod tests {
             place: Some(1),
             placed_by: Some("harness".to_string()),
             pinned: false,
+            frozen: false,
         });
         assert_eq!(
             placed,
@@ -3149,6 +3458,7 @@ pub(crate) mod tests {
             place: Some(1),
             placed_by: None,
             pinned: false,
+            frozen: false,
         };
         assert_eq!(
             decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),

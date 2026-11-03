@@ -386,6 +386,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     // packets are what its delegated children's lineage reads.
     owned("delegated_packets", "executions"),
     owned("execution_gates", "executions"),
+    keep(
+        "queue_lane_turns",
+        "one row per queue lane that has started work: bounded by the threads and parent issues there are",
+    ),
     owned("execution_trigger_sources", "executions"),
     owned("pr_node_port_fires", "executions"),
     owned("pr_publish_attempts", "action_runs"),
@@ -513,7 +517,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("channel_ask_action", SMALL),
     keep("compile_facts", SMALL),
     keep("execution_supersessions", SMALL),
-    keep("executor_desktop_automation", SMALL),
     keep("executor_repairs", SMALL),
     keep("held_publications", SMALL),
     keep("jj_reconcile_intents", SMALL),
@@ -521,6 +524,8 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("job_presence", SMALL),
     keep("landing_allocations", SMALL),
     keep("pending_injections", SMALL),
+    // At most one row per job or thread, deleted with either by cascade.
+    keep("placement_defaults", SMALL),
     keep("project_learned_requirements", SMALL),
     keep("purpose_debts", SMALL),
     keep("ref_store_maintenance", SMALL),

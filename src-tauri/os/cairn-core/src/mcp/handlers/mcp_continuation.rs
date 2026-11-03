@@ -1185,6 +1185,7 @@ mod tests {
             1 => Condition::Terminal {
                 uri: "cairn:~/terminal/t".into(),
                 slug: "t".into(),
+                owner: None,
                 on: super::super::run::TerminalWaitEvent::Exit,
                 phrase: None,
             },

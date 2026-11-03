@@ -49,6 +49,13 @@ pub(crate) enum RotationReason {
     /// provider refuses that id on a second fresh start, so the job continues
     /// on a successor with a fresh id (cairn/4978).
     UnconfirmedStart,
+    /// The job's issue was reopened after a resolution closed its session, and
+    /// the job continues on a successor that forks the closed conversation
+    /// ([`continues_closed_work`]). The source is already closed with the
+    /// resolution's reason, which it keeps as history, so the close below
+    /// leaves it alone and this reason is never the one written; like
+    /// [`RotationReason::RecoveryReplacement`], it names the call site.
+    Reopened,
 }
 
 impl RotationReason {
@@ -63,8 +70,28 @@ impl RotationReason {
             RotationReason::RecoveryReplacement => "rotated_after_recovery",
             RotationReason::OperatorCompact => "operator_compact",
             RotationReason::UnconfirmedStart => "rotated_unconfirmed_start",
+            RotationReason::Reopened => "rotated_reopened",
         }
     }
+}
+
+/// Whether a successor of `parent` continues work a cancel or a resolution
+/// closed, rather than starting over: `parent` was closed with one of the
+/// reasons a cancel records (`issue_merged`, `issue_closed`, `node_removed`,
+/// `job_cancelled`) and is not a superseded attempt.
+///
+/// Only a reopen mints such a successor ([`RotationReason::Reopened`]). Unlike
+/// every other rotation, whose successor starts on a seed of its own, it forks
+/// the closed session's native conversation, so the reopened node picks its
+/// work back up with its context intact.
+pub(crate) fn continues_closed_work(parent: &Session) -> bool {
+    use cairn_workflow::advancement::SessionCloseReason;
+    parent.status == crate::models::SessionStatus::Closed
+        && parent
+            .terminal_reason
+            .as_deref()
+            .and_then(SessionCloseReason::parse)
+            .is_some_and(|reason| reason != SessionCloseReason::Superseded)
 }
 
 /// The durable mark of a session whose provider launch went out under its id
@@ -280,7 +307,6 @@ async fn rotate_session(
 ) -> Result<Session, String> {
     let source = source.clone();
     let job_id = job_id.to_string();
-    let new_id = ids::mint_session_id().into_string();
     // The successor inherits the source backend unless a switch was requested.
     let backend = target_backend.unwrap_or_else(|| source.backend.clone());
 
@@ -288,92 +314,10 @@ async fn rotate_session(
         .write(|conn| {
             let source = source.clone();
             let job_id = job_id.clone();
-            let new_id = new_id.clone();
             let backend = backend.clone();
             let commit = commit.clone();
             Box::pin(async move {
-                let now = chrono::Utc::now().timestamp();
-                let session = create_with_id_and_lineage_conn(
-                    conn,
-                    &new_id,
-                    Some(job_id.as_str()),
-                    None,
-                    &backend,
-                    Some(&source.id),
-                    source.sequence + 1,
-                )
-                .await?;
-
-                let rows = conn
-                    .execute(
-                        "UPDATE jobs
-                         SET current_session_id = ?1, updated_at = ?2
-                         WHERE id = ?3 AND current_session_id = ?4",
-                        params![new_id.as_str(), now, job_id.as_str(), source.id.as_str()],
-                    )
-                    .await?;
-
-                if rows == 0 {
-                    conn.execute(
-                        "DELETE FROM sessions WHERE id = ?1",
-                        params![new_id.as_str()],
-                    )
-                    .await?;
-                    return Err(DbError::internal(
-                        "Concurrent session rotation detected; current_session_id already moved",
-                    ));
-                }
-
-                conn.execute(
-                    "UPDATE sessions SET replaced_by_id = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![new_id.as_str(), now, source.id.as_str()],
-                )
-                .await?;
-
-                // Being replaced is terminal for the predecessor: the job no longer
-                // points at it, so no turn will ever run there again. Closing it in
-                // this same transaction is what lets a reader take `sessions.status`
-                // at face value — there is no window in which both the predecessor
-                // and its successor read open (CAIRN-4613).
-                //
-                // The `status = 'open'` guard is the same one every other closer
-                // carries, and here it is load-bearing rather than defensive: the
-                // legacy recovery rotation starts from a session an older build
-                // already closed with the reason it actually died of, and that
-                // reason describes the death better than the rotation that followed
-                // it does.
-                conn.execute(
-                    "UPDATE sessions
-                     SET status = 'closed', terminal_reason = ?1, closed_at = ?2, updated_at = ?2
-                     WHERE id = ?3 AND status = 'open'",
-                    params![reason.terminal_reason(), now, source.id.as_str()],
-                )
-                .await?;
-
-                // The rest of the transition rides in this transaction, so the
-                // model the job will launch, the session it will launch under,
-                // and the marker explaining the seam either all land or none do.
-                if let Some(commit) = commit.as_ref() {
-                    if let Some(model) = commit.model.as_deref() {
-                        conn.execute(
-                            "UPDATE jobs SET model = ?1, updated_at = ?2 WHERE id = ?3",
-                            params![model, now, job_id.as_str()],
-                        )
-                        .await?;
-                    }
-                    if let Some(boundary) = commit.boundary.as_ref() {
-                        crate::messages::transcript::insert_session_boundary_conn(
-                            conn,
-                            &boundary.run_id,
-                            Some(source.id.as_str()),
-                            boundary.turn_id.as_deref(),
-                            boundary.payload.clone(),
-                        )
-                        .await?;
-                    }
-                }
-
-                Ok(session)
+                rotate_session_conn(conn, &source, &job_id, &backend, reason, commit.as_ref()).await
             })
         })
         .await
@@ -385,6 +329,102 @@ async fn rotate_session(
     );
 
     Ok(rotated)
+}
+
+/// The transaction of [`rotate_session`], for a caller already holding a
+/// write: mint the successor on `backend`, hand the job to it, and close the
+/// predecessor. The caller owns the emit [`rotate_session`] makes after its
+/// write commits.
+pub(crate) async fn rotate_session_conn(
+    conn: &cairn_db::turso::Connection,
+    source: &Session,
+    job_id: &str,
+    backend: &str,
+    reason: RotationReason,
+    commit: Option<&RotationCommit>,
+) -> Result<Session, DbError> {
+    let new_id = ids::mint_session_id().into_string();
+    let now = chrono::Utc::now().timestamp();
+    let session = create_with_id_and_lineage_conn(
+        conn,
+        &new_id,
+        Some(job_id),
+        None,
+        backend,
+        Some(&source.id),
+        source.sequence + 1,
+    )
+    .await?;
+
+    let rows = conn
+        .execute(
+            "UPDATE jobs
+             SET current_session_id = ?1, updated_at = ?2
+             WHERE id = ?3 AND current_session_id = ?4",
+            params![new_id.as_str(), now, job_id, source.id.as_str()],
+        )
+        .await?;
+
+    if rows == 0 {
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![new_id.as_str()],
+        )
+        .await?;
+        return Err(DbError::internal(
+            "Concurrent session rotation detected; current_session_id already moved",
+        ));
+    }
+
+    conn.execute(
+        "UPDATE sessions SET replaced_by_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![new_id.as_str(), now, source.id.as_str()],
+    )
+    .await?;
+
+    // Being replaced is terminal for the predecessor: the job no longer
+    // points at it, so no turn will ever run there again. Closing it in
+    // this same transaction is what lets a reader take `sessions.status`
+    // at face value — there is no window in which both the predecessor
+    // and its successor read open (CAIRN-4613).
+    //
+    // The `status = 'open'` guard is the same one every other closer
+    // carries, and here it is load-bearing rather than defensive: the
+    // legacy recovery rotation and the reopen rotation start from a session
+    // already closed with the reason it actually ended for, and that reason
+    // describes the ending better than the rotation that followed it does.
+    conn.execute(
+        "UPDATE sessions
+         SET status = 'closed', terminal_reason = ?1, closed_at = ?2, updated_at = ?2
+         WHERE id = ?3 AND status = 'open'",
+        params![reason.terminal_reason(), now, source.id.as_str()],
+    )
+    .await?;
+
+    // The rest of the transition rides in this transaction, so the
+    // model the job will launch, the session it will launch under,
+    // and the marker explaining the seam either all land or none do.
+    if let Some(commit) = commit {
+        if let Some(model) = commit.model.as_deref() {
+            conn.execute(
+                "UPDATE jobs SET model = ?1, updated_at = ?2 WHERE id = ?3",
+                params![model, now, job_id],
+            )
+            .await?;
+        }
+        if let Some(boundary) = commit.boundary.as_ref() {
+            crate::messages::transcript::insert_session_boundary_conn(
+                conn,
+                &boundary.run_id,
+                Some(source.id.as_str()),
+                boundary.turn_id.as_deref(),
+                boundary.payload.clone(),
+            )
+            .await?;
+        }
+    }
+
+    Ok(session)
 }
 
 #[cfg(test)]

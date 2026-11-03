@@ -560,7 +560,7 @@ mod tests {
         let declaration = &package.declaration;
         assert_eq!(declaration.id, "tutor");
         assert_eq!(declaration.name, "Spanish tutor");
-        assert_eq!(declaration.entry, "main.ts");
+        assert_eq!(declaration.entry(), Some("main.ts"));
         assert_eq!(declaration.limits.call_timeout_seconds, 60);
         assert_eq!(declaration.env.get("LEVEL").map(String::as_str), Some("a2"));
         let paths: Vec<&str> = package

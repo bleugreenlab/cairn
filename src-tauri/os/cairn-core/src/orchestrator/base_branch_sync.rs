@@ -39,6 +39,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -91,10 +92,44 @@ pub(crate) struct SyncError {
     pub message: String,
 }
 
+/// One look at origin, stamped in the order this registry handed stamps out.
+///
+/// Observations are ordered by when they were taken, not when they are
+/// recorded. A poll's `ls-remote` can be asked before the store's own push and
+/// answered after it; recorded last-writer-wins, that answer would replace the
+/// publication's tip with the pre-push one, and the store's own replaced
+/// publication would read as drift. So the stamp is taken before origin is
+/// asked (a poll, a fetch), on receipt (a webhook, a merge's answer), or once
+/// the push is verified (a publication), and the registry drops whatever is
+/// older than what it already holds for the branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observation {
+    order: u64,
+    /// Wall-clock time of the stamp, which is what `checked_at` and a check
+    /// error report.
+    at: DateTime<Utc>,
+}
+
+/// Whether `observation` is older than the one that last filled `slot`.
+fn older(slot: Option<u64>, observation: Observation) -> bool {
+    slot.is_some_and(|order| observation.order < order)
+}
+
+/// Fill `slot` with `observation` unless it is older. An equal order is the
+/// same observation recorded twice, and is taken.
+fn claim(slot: &mut Option<u64>, observation: Observation) -> bool {
+    if older(*slot, observation) {
+        return false;
+    }
+    *slot = Some(observation.order);
+    true
+}
+
 /// What this process knows about one branch of one project on origin.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BranchSync {
-    /// Last successful `ls-remote` or fetch against origin.
+    /// When the newest successful look at origin (an `ls-remote`, a fetch, or
+    /// a verified publication) was taken.
     pub checked_at: Option<DateTime<Utc>>,
     /// Origin's commit for the branch as last observed, by any source. `None`
     /// after a check that found origin holding no such branch.
@@ -112,6 +147,74 @@ pub(crate) struct BranchSync {
 struct BranchEntry {
     state: BranchSync,
     in_flight: bool,
+    /// The observation the recorded tip, or its absence, came from.
+    tip_observed: Option<u64>,
+    /// The observation behind the newest check outcome, success or failure.
+    /// Separate from the tip's: a failed check says nothing about the tip, so
+    /// it must not stop an older successful check from naming one.
+    check_observed: Option<u64>,
+}
+
+impl BranchEntry {
+    /// Set origin's tip (`None`: origin holds no such branch) from
+    /// `observation`, unless a newer observation already set it.
+    fn take_tip(&mut self, tip: Option<(String, Source)>, observation: Observation) -> bool {
+        if !claim(&mut self.tip_observed, observation) {
+            return false;
+        }
+        let (tip, source) = tip.unzip();
+        self.state.remote_tip = tip;
+        self.state.remote_tip_source = source;
+        self.state.no_origin = false;
+        true
+    }
+
+    /// Origin answered `observation`, unless a newer check outcome is already
+    /// recorded.
+    fn take_check_success(&mut self, project_id: &str, branch: &str, observation: Observation) {
+        if !claim(&mut self.check_observed, observation) {
+            return;
+        }
+        self.state.checked_at = Some(observation.at);
+        self.state.no_origin = false;
+        if self
+            .state
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.phase == Phase::Check)
+        {
+            log::info!("origin check of `{branch}` for project {project_id} recovered");
+            self.state.last_error = None;
+        }
+    }
+}
+
+/// Record a failure, warning only when it is new: a poll that fails the same
+/// way every minute should not flood the log.
+fn set_error(
+    state: &mut BranchSync,
+    project_id: &str,
+    branch: &str,
+    phase: Phase,
+    message: &str,
+    at: DateTime<Utc>,
+) {
+    let repeat = state
+        .last_error
+        .as_ref()
+        .is_some_and(|error| error.phase == phase && error.message == message);
+    if repeat {
+        log::debug!(
+            "origin {phase:?} of `{branch}` for project {project_id} still failing: {message}"
+        );
+    } else {
+        log::warn!("origin {phase:?} of `{branch}` for project {project_id} failed: {message}");
+    }
+    state.last_error = Some(SyncError {
+        at,
+        phase,
+        message: message.to_string(),
+    });
 }
 
 type BranchKey = (String, String);
@@ -124,6 +227,8 @@ fn key(project_id: &str, branch: &str) -> BranchKey {
 #[derive(Default)]
 pub(crate) struct BaseBranchSyncRegistry {
     branches: Mutex<HashMap<BranchKey, BranchEntry>>,
+    /// The next [`Observation`]'s order.
+    observations: AtomicU64,
     /// Keyed by jj store directory: one store per repository, and every fetch
     /// writes that repository's refs.
     fetch_locks: Mutex<HashMap<PathBuf, Arc<TokioMutex<()>>>>,
@@ -140,109 +245,128 @@ impl BaseBranchSyncRegistry {
             .map(|entry| entry.state.clone())
     }
 
+    /// Stamp a look at origin taken now. Take it BEFORE asking origin, so a
+    /// slow answer is ordered behind anything learned while it was pending.
+    pub(crate) fn observe(&self) -> Observation {
+        self.observe_at(Utc::now())
+    }
+
+    pub(crate) fn observe_at(&self, at: DateTime<Utc>) -> Observation {
+        Observation {
+            order: self.observations.fetch_add(1, Ordering::SeqCst),
+            at,
+        }
+    }
+
+    fn with_entry<T>(
+        &self,
+        project_id: &str,
+        branch: &str,
+        f: impl FnOnce(&mut BranchEntry) -> T,
+    ) -> T {
+        let mut branches = self.branches.lock().unwrap();
+        f(branches.entry(key(project_id, branch)).or_default())
+    }
+
     fn with_state<T>(
         &self,
         project_id: &str,
         branch: &str,
         f: impl FnOnce(&mut BranchSync) -> T,
     ) -> T {
-        let mut branches = self.branches.lock().unwrap();
-        f(&mut branches.entry(key(project_id, branch)).or_default().state)
+        self.with_entry(project_id, branch, |entry| f(&mut entry.state))
     }
 
     /// Record a tip learned without asking origin ourselves (webhook, merge).
-    pub(crate) fn record_tip(&self, project_id: &str, branch: &str, tip: &str, source: Source) {
-        self.with_state(project_id, branch, |state| {
-            state.remote_tip = Some(tip.to_string());
-            state.remote_tip_source = Some(source);
-            state.no_origin = false;
-        });
+    /// `false` when a newer observation of the branch is already recorded.
+    pub(crate) fn record_tip(
+        &self,
+        project_id: &str,
+        branch: &str,
+        tip: &str,
+        source: Source,
+        observation: Observation,
+    ) -> bool {
+        self.with_entry(project_id, branch, |entry| {
+            entry.take_tip(Some((tip.to_string(), source)), observation)
+        })
     }
 
     /// Record a successful look at origin. `tip` is `None` when the check
     /// succeeded but could not name the commit, which leaves the last known tip
-    /// in place.
+    /// in place. `true` when `tip` was recorded; `false` when there was none,
+    /// or a newer observation of the branch already named one.
     pub(crate) fn record_check(
         &self,
         project_id: &str,
         branch: &str,
         tip: Option<String>,
         source: Source,
-        at: DateTime<Utc>,
-    ) {
-        self.with_state(project_id, branch, |state| {
-            state.checked_at = Some(at);
-            state.no_origin = false;
-            if let Some(tip) = tip {
-                state.remote_tip = Some(tip);
-                state.remote_tip_source = Some(source);
-            }
-            if state
-                .last_error
-                .as_ref()
-                .is_some_and(|error| error.phase == Phase::Check)
-            {
-                log::info!("origin check of `{branch}` for project {project_id} recovered");
-                state.last_error = None;
-            }
-        });
+        observation: Observation,
+    ) -> bool {
+        self.with_entry(project_id, branch, |entry| {
+            entry.take_check_success(project_id, branch, observation);
+            tip.is_some_and(|tip| entry.take_tip(Some((tip, source)), observation))
+        })
     }
 
     /// Record a check that found origin holding no such branch: there is
     /// nothing to be behind. An integration branch the store has not published
     /// yet, or one deleted once its parent merged.
-    pub(crate) fn record_absent(
-        &self,
-        project_id: &str,
-        branch: &str,
-        source: Source,
-        at: DateTime<Utc>,
-    ) {
-        self.record_check(project_id, branch, None, source, at);
-        self.with_state(project_id, branch, |state| {
-            state.remote_tip = None;
-            state.remote_tip_source = None;
+    pub(crate) fn record_absent(&self, project_id: &str, branch: &str, observation: Observation) {
+        self.with_entry(project_id, branch, |entry| {
+            entry.take_check_success(project_id, branch, observation);
+            entry.take_tip(None, observation);
         });
     }
 
-    pub(crate) fn record_no_origin(&self, project_id: &str, branch: &str) {
-        self.with_state(project_id, branch, |state| {
-            *state = BranchSync {
+    pub(crate) fn record_no_origin(
+        &self,
+        project_id: &str,
+        branch: &str,
+        observation: Observation,
+    ) {
+        self.with_entry(project_id, branch, |entry| {
+            if older(entry.tip_observed, observation) || older(entry.check_observed, observation) {
+                return;
+            }
+            entry.tip_observed = Some(observation.order);
+            entry.check_observed = Some(observation.order);
+            entry.state = BranchSync {
                 no_origin: true,
                 ..BranchSync::default()
             };
         });
     }
 
-    /// Record a failure, warning only when it is new: a poll that fails the
-    /// same way every minute should not flood the log.
-    pub(crate) fn record_error(
+    /// Record a failed look at origin, unless a newer check outcome is already
+    /// recorded.
+    pub(crate) fn record_check_error(
         &self,
         project_id: &str,
         branch: &str,
-        phase: Phase,
         message: &str,
-        at: DateTime<Utc>,
+        observation: Observation,
     ) {
-        self.with_state(project_id, branch, |state| {
-            let repeat = state
-                .last_error
-                .as_ref()
-                .is_some_and(|error| error.phase == phase && error.message == message);
-            if repeat {
-                log::debug!(
-                    "origin {phase:?} of `{branch}` for project {project_id} still failing: {message}"
-                );
-            } else {
-                log::warn!(
-                    "origin {phase:?} of `{branch}` for project {project_id} failed: {message}"
+        self.with_entry(project_id, branch, |entry| {
+            if claim(&mut entry.check_observed, observation) {
+                set_error(
+                    &mut entry.state,
+                    project_id,
+                    branch,
+                    Phase::Check,
+                    message,
+                    observation.at,
                 );
             }
-            state.last_error = Some(SyncError {
-                at,
-                phase,
-                message: message.to_string(),
-            });
+        });
+    }
+
+    /// Record a failed sync. Not an observation of origin, so not ordered
+    /// against them.
+    fn record_sync_error(&self, project_id: &str, branch: &str, message: &str, at: DateTime<Utc>) {
+        self.with_state(project_id, branch, |state| {
+            set_error(state, project_id, branch, Phase::Sync, message, at)
         });
     }
 
@@ -365,7 +489,7 @@ async fn drive<P, PF, B, BF>(
         match pass().await {
             Ok(()) => registry.record_sync_success(project_id, branch),
             Err(error) => {
-                registry.record_error(project_id, branch, Phase::Sync, &error, Utc::now());
+                registry.record_sync_error(project_id, branch, &error, Utc::now());
                 return;
             }
         }
@@ -415,7 +539,8 @@ pub(crate) async fn sync(orch: &Orchestrator, project_id: &str, branch: &str) {
 
 /// Record that origin's `branch` is at `tip`, and if the store does not hold
 /// it, start a [`sync`] in the background. Cheap for an unchanged tip: one
-/// in-process view lookup, no subprocess.
+/// in-process view lookup, no subprocess. An observation older than one
+/// already recorded for the branch is dropped and starts nothing.
 ///
 /// The caller has decided `branch` is one this module tracks (the default, or
 /// a base branch with live work on it); an agent branch nothing is cut from is
@@ -426,9 +551,25 @@ pub(crate) async fn observe_remote_tip(
     branch: &str,
     tip: &str,
     source: Source,
+    observation: Observation,
 ) {
-    orch.base_branch_sync
-        .record_tip(project_id, branch, tip, source);
+    if orch
+        .base_branch_sync
+        .record_tip(project_id, branch, tip, source, observation)
+    {
+        sync_if_behind(orch, project_id, branch, tip, source).await;
+    }
+}
+
+/// Start a [`sync`] in the background when the store does not hold origin's
+/// recorded tip of `branch`, which the caller just recorded as `tip`.
+async fn sync_if_behind(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    tip: &str,
+    source: Source,
+) {
     let Some(repo) = project_repo_path(orch, project_id).await else {
         return;
     };
@@ -612,7 +753,17 @@ pub(crate) async fn refuse_if_behind_origin(
 /// rewritten branch, the store no longer has that tip as `<branch>@origin`, and
 /// the branch would read as drifted until the next poll. Only a branch this
 /// module already tracks is recorded; publishing does not start tracking one.
-pub(crate) async fn record_publication(orch: &Orchestrator, store: &Path, branch: &str, tip: &str) {
+///
+/// `observation` is stamped once the push is verified, so a poll that asked
+/// origin before then is ordered behind the publication even when its answer
+/// is recorded after it.
+pub(crate) async fn record_publication(
+    orch: &Orchestrator,
+    store: &Path,
+    branch: &str,
+    tip: &str,
+    observation: Observation,
+) {
     for project_id in projects_for_store(orch, store).await {
         if orch
             .base_branch_sync
@@ -624,7 +775,7 @@ pub(crate) async fn record_publication(orch: &Orchestrator, store: &Path, branch
                 branch,
                 Some(tip.to_string()),
                 Source::Publish,
-                Utc::now(),
+                observation,
             );
         }
     }
@@ -845,8 +996,11 @@ pub(crate) async fn fetch_origin_serialized(
     let git = orch.services.git.clone();
     let repo = repo_path.to_path_buf();
     let fetched_branch = branch.to_string();
-    let result = with_fetch_lock(orch, &store, || async {
-        tokio::task::spawn_blocking(move || {
+    let registry = &orch.base_branch_sync;
+    let (observation, result) = with_fetch_lock(orch, &store, || async {
+        // Stamped once the lock is held, just before origin is asked.
+        let observation = registry.observe();
+        let fetched = tokio::task::spawn_blocking(move || {
             git.fetch_origin_branch(&repo, &fetched_branch).or_else(|error| {
                 if lost_ref_race_is_settled(&repo, &error) {
                     log::debug!("git fetch origin lost a ref-lock race to a fetch that landed the same update: {error}");
@@ -857,11 +1011,12 @@ pub(crate) async fn fetch_origin_serialized(
             })
         })
         .await
-        .map_err(|error| format!("git fetch origin task failed: {error}"))?
+        .map_err(|error| format!("git fetch origin task failed: {error}"))
+        .and_then(|fetched| fetched);
+        (observation, fetched)
     })
     .await;
     if let Some(record) = record {
-        let registry = &orch.base_branch_sync;
         match &result {
             Ok(()) => {
                 let repo = repo_path.to_path_buf();
@@ -870,10 +1025,10 @@ pub(crate) async fn fetch_origin_serialized(
                     .await
                     .ok()
                     .flatten();
-                registry.record_check(record.project_id, branch, tip, record.source, Utc::now());
+                registry.record_check(record.project_id, branch, tip, record.source, observation);
             }
             Err(error) => {
-                registry.record_error(record.project_id, branch, Phase::Check, error, Utc::now())
+                registry.record_check_error(record.project_id, branch, error, observation)
             }
         }
     }
@@ -896,27 +1051,31 @@ pub(crate) async fn fetch_origin_observation_serialized(
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
     let fetch_store = store.clone();
     let fetched_branch = branch.to_string();
-    let result = with_fetch_lock(orch, &store, || async {
-        tokio::task::spawn_blocking(move || {
+    let registry = &orch.base_branch_sync;
+    let (observation, result) = with_fetch_lock(orch, &store, || async {
+        // Stamped once the lock is held, just before origin is asked.
+        let observation = registry.observe();
+        let fetched = tokio::task::spawn_blocking(move || {
             crate::jj::fetch_origin_observation(&fetch_store, &fetched_branch)
         })
         .await
-        .map_err(|error| format!("git fetch origin task failed: {error}"))?
+        .map_err(|error| format!("git fetch origin task failed: {error}"))
+        .and_then(|fetched| fetched);
+        (observation, fetched)
     })
     .await;
-    let registry = &orch.base_branch_sync;
     match &result {
-        Ok(Some(tip)) => registry.record_check(
-            record.project_id,
-            branch,
-            Some(tip.clone()),
-            record.source,
-            Utc::now(),
-        ),
-        Ok(None) => registry.record_absent(record.project_id, branch, record.source, Utc::now()),
-        Err(error) => {
-            registry.record_error(record.project_id, branch, Phase::Check, error, Utc::now())
+        Ok(Some(tip)) => {
+            registry.record_check(
+                record.project_id,
+                branch,
+                Some(tip.clone()),
+                record.source,
+                observation,
+            );
         }
+        Ok(None) => registry.record_absent(record.project_id, branch, observation),
+        Err(error) => registry.record_check_error(record.project_id, branch, error, observation),
     }
     result
 }
@@ -1053,6 +1212,11 @@ async fn poll_project_within(
     let git = orch.services.git.clone();
     let repo = repo_path.to_path_buf();
     let asked = branches.to_vec();
+    let registry = &orch.base_branch_sync;
+    // Stamped before origin is asked: if Cairn publishes one of these branches
+    // while the `ls-remote` is out, its answer is the older observation and
+    // must not replace the publication's tip.
+    let observation = registry.observe();
     // The subprocess keeps its own, much longer network timeout; this bound is
     // how long the poll waits before saying the check failed.
     let answer = tokio::time::timeout(
@@ -1066,32 +1230,32 @@ async fn poll_project_within(
         }),
     )
     .await;
-    let registry = &orch.base_branch_sync;
     let failed = |message: &str| {
         for branch in branches {
-            registry.record_error(project_id, branch, Phase::Check, message, Utc::now());
+            registry.record_check_error(project_id, branch, message, observation);
         }
     };
     match answer {
         Ok(Ok(None)) => {
             for branch in branches {
-                registry.record_no_origin(project_id, branch);
+                registry.record_no_origin(project_id, branch, observation);
             }
         }
         Ok(Ok(Some(Ok(tips)))) => {
             for branch in branches {
                 match tips.get(branch) {
                     Some(tip) => {
-                        registry.record_check(
+                        if registry.record_check(
                             project_id,
                             branch,
                             Some(tip.clone()),
                             Source::Poll,
-                            Utc::now(),
-                        );
-                        observe_remote_tip(orch, project_id, branch, tip, Source::Poll).await;
+                            observation,
+                        ) {
+                            sync_if_behind(orch, project_id, branch, tip, Source::Poll).await;
+                        }
                     }
-                    None => registry.record_absent(project_id, branch, Source::Poll, Utc::now()),
+                    None => registry.record_absent(project_id, branch, observation),
                 }
             }
         }

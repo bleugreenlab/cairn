@@ -27,8 +27,10 @@ const SCRATCH_ROOT_DIR: &str = "scratch";
 /// temp root: a dev instance (`~/.cairn-dev-<key>`) and the production app can
 /// hold jobs with identical node coordinates without landing on one directory.
 ///
-/// This root sits outside the platform temp dirs the fence grants wholesale, so
-/// `cairn_sandbox::default_writable_extra` grants it by name.
+/// The fence does not grant this root. A spawn whose `$TMPDIR` is its own
+/// directory here is granted exactly that one
+/// (`cairn_sandbox::SandboxPolicy::grant_tmpdir`), and a write anywhere else
+/// under the root is refused by name (`cairn_sandbox::scratch_refusal`).
 ///
 /// A test process that has called [`testing::pin_private_root`] gets that
 /// private root instead.

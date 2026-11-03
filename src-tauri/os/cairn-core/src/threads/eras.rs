@@ -30,7 +30,6 @@ pub struct ThreadEra {
     pub summary: String,
     pub summary_status: String,
     pub summary_model: Option<String>,
-    pub source_tokens: i64,
     pub minted_generation: i64,
     pub created_at: i64,
     pub summarized_at: Option<i64>,
@@ -46,7 +45,7 @@ pub struct EraChild {
 }
 
 const ERA_SELECT: &str = "SELECT seq, start_block, end_block, started_at, ended_at, summary, \
-     summary_status, summary_model, source_tokens, minted_generation, created_at, summarized_at \
+     summary_status, summary_model, minted_generation, created_at, summarized_at \
      FROM thread_eras";
 
 /// Every persisted era for a job, newest sequence first.
@@ -69,10 +68,9 @@ pub async fn list_eras(
                 summary: row.text(5)?,
                 summary_status: row.text(6)?,
                 summary_model: row.opt_text(7)?,
-                source_tokens: row.i64(8)?,
-                minted_generation: row.i64(9)?,
-                created_at: row.i64(10)?,
-                summarized_at: row.opt_i64(11)?,
+                minted_generation: row.i64(8)?,
+                created_at: row.i64(9)?,
+                summarized_at: row.opt_i64(10)?,
             })
         },
     )
@@ -105,10 +103,9 @@ pub async fn get_era(db: &LocalDb, job_id: &str, seq: i32) -> DbResult<Option<Th
                 summary: row.text(5)?,
                 summary_status: row.text(6)?,
                 summary_model: row.opt_text(7)?,
-                source_tokens: row.i64(8)?,
-                minted_generation: row.i64(9)?,
-                created_at: row.i64(10)?,
-                summarized_at: row.opt_i64(11)?,
+                minted_generation: row.i64(8)?,
+                created_at: row.i64(9)?,
+                summarized_at: row.opt_i64(10)?,
             })
         },
     )
@@ -154,8 +151,8 @@ mod tests {
         db.execute(
             "INSERT INTO thread_eras (
                  job_id, seq, start_block, end_block, started_at, ended_at, summary,
-                 summary_status, summary_model, source_tokens, minted_generation, created_at
-             ) VALUES ('j', ?1, ?2, ?3, 100, 200, ?4, ?5, NULL, 900, 1, 300)",
+                 summary_status, summary_model, minted_generation, created_at
+             ) VALUES ('j', ?1, ?2, ?3, 100, 200, ?4, ?5, NULL, 1, 300)",
             params![
                 seq,
                 (seq as i64 - 1) * 10,

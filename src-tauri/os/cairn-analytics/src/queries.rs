@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cairn_db::turso::{params, Value};
 
-use super::pricing::{Components, TieredUsage, LONG_PROMPT_TOKENS};
+use super::pricing::{Components, TieredUsage, ALIAS_GENERATIONS, LONG_PROMPT_TOKENS};
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};
 use cairn_db::models::Event;
@@ -56,6 +56,61 @@ const BILLABLE_TOTAL: &str = "COALESCE(e.input_tokens, 0)
             + COALESCE(e.cache_create_tokens, 0)
             + COALESCE(e.cache_read_tokens, 0)
             + COALESCE(e.output_tokens, 0)";
+
+/// Where an event's model comes from, in precedence order: the job's selected
+/// model (`jobs.model`, the launch fact), else the model its stored selection
+/// chose, else the model the provider reported serving the event
+/// (`events.reported_model`). Selected beats reported, the effective-model
+/// rule the context meter applies too: a router pick such as
+/// `~deepseek/deepseek-flash-latest` is the operator's model whatever concrete
+/// model served it. `COALESCE` stops at its first non-NULL argument, so the
+/// selection is parsed only for a job with no model; the `CASE` guard is there
+/// because Turso's JSON functions raise on malformed JSON instead of yielding
+/// NULL, and only `CASE` short-circuits.
+const MODEL_SOURCE: &str = "COALESCE(NULLIF(j.model, ''),
+        CASE WHEN json_valid(j.selection)
+            THEN NULLIF(json_extract(j.selection, '$.chosen.model'), '') END,
+        e.reported_model)";
+
+/// The canonical `token_rollup.model` key: one key per model, whichever writer
+/// named it. [`MODEL_SOURCE`] is folded onto its Claude alias when it names
+/// that alias in any spelling: a differently cased alias (`Opus`), the
+/// 1M-context variant (`opus[1m]`), or the concrete id of the generation the
+/// alias is priced as ([`ALIAS_GENERATIONS`]: `claude-opus-5-5`, with or
+/// without a date stamp or `[1m]`). Any other generation is a different model
+/// at a different price and keys under its own id (`claude-sonnet-4-5`), as
+/// does every non-Claude model. A model nothing names stays NULL (the chart's
+/// `unknown`). Readers derive a display name from the key.
+fn model_key_expr() -> String {
+    let arms: String = ALIAS_GENERATIONS
+        .iter()
+        .map(|(alias, concrete)| {
+            format!(
+                "WHEN LOWER({MODEL_SOURCE}) IN
+                        ('{alias}', '{alias}[1m]', '{concrete}', '{concrete}[1m]')
+                    OR LOWER({MODEL_SOURCE}) LIKE '{concrete}-%' THEN '{alias}'\n"
+            )
+        })
+        .collect();
+    format!("(CASE {arms} ELSE {MODEL_SOURCE} END)")
+}
+
+/// The `events.reported_model` value for an event about to be stored: the
+/// model the provider reported serving it, for the top-level turn events the
+/// rollup bills (`assistant`, or a backend's `result%`), and NULL for every
+/// other event, which nothing keys by model. The transcript insert seam and
+/// the historical backfill both write the column through this.
+pub fn reported_model_column(
+    event_type: &str,
+    parent_tool_use_id: Option<&str>,
+    data: &str,
+) -> Option<String> {
+    let billing_shape = event_type == "assistant" || event_type.starts_with("result");
+    if parent_tool_use_id.is_some() || !billing_shape {
+        return None;
+    }
+    cairn_db::storage::events::columns::reported_model(data)
+}
 
 /// Whether one event's prompt (input + cache reads + cache writes) is over
 /// [`LONG_PROMPT_TOKENS`], so a model with a long-prompt tier bills it there.
@@ -161,9 +216,12 @@ fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
 /// settlement event is not itself a billable token event. The synthetic `id`
 /// is unique per grouped row because all of its components are functionally
 /// determined by the run (fixed at `?1`) plus the grouped hour/session/model/
-/// backend/agent dimensions. The `long_*` measures repeat the four components
-/// over only the billable events whose own prompt is long, which is what lets
-/// pricing bill each request at its prompt-length tier after summing.
+/// backend/agent dimensions. The model dimension is the canonical key
+/// ([`model_key_expr`]), so it can differ between a run's events only when the
+/// job names no model and the events report different ones. The `long_*`
+/// measures repeat the four components over only the billable events whose own
+/// prompt is long, which is what lets pricing bill each request at its
+/// prompt-length tier after summing.
 fn rollup_insert_sql() -> String {
     format!(
         "INSERT INTO token_rollup (
@@ -175,7 +233,7 @@ fn rollup_insert_sql() -> String {
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
-                COALESCE(e.session_id, '') || ':' || COALESCE(j.model, '') || ':' ||
+                COALESCE(e.session_id, '') || ':' || COALESCE({model_key}, '') || ':' ||
                 {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
             (e.created_at / 3600) * 3600 AS bucket_start,
             COALESCE(r.project_id, j.project_id) AS project_id,
@@ -183,7 +241,7 @@ fn rollup_insert_sql() -> String {
             e.session_id AS session_id,
             COALESCE(r.job_id, s.job_id) AS job_id,
             j.node_name AS node_name,
-            j.model AS model,
+            {model_key} AS model,
             j.agent_config_id AS agent_config_id,
             {backend} AS backend,
             SUM(CASE WHEN {billable} THEN COALESCE(e.input_tokens, 0) ELSE 0 END),
@@ -211,13 +269,14 @@ fn rollup_insert_sql() -> String {
                  e.session_id,
                  COALESCE(r.job_id, s.job_id),
                  j.node_name,
-                 j.model,
+                 {model_key},
                  j.agent_config_id,
                  {backend}",
         backend = BACKEND_EXPR,
         billable = BILLABLE_PREDICATE,
         billable_total = BILLABLE_TOTAL,
         long = long_prompt_predicate(),
+        model_key = model_key_expr(),
     )
 }
 
@@ -289,6 +348,88 @@ pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
     .await
 }
 
+/// Runs whose job names no model of its own (no launch fact and no stored
+/// selection), so their events key by the model the provider reported.
+const MODEL_LESS_RUNS_SQL: &str = "SELECT r.id
+    FROM runs r
+    LEFT JOIN sessions s ON s.id = r.session_id
+    JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+    WHERE NULLIF(j.model, '') IS NULL AND j.selection IS NULL";
+
+/// Events read per page by [`backfill_reported_models`]: a long thread run has
+/// thousands of turns, and each row carries its whole body.
+const REPORTED_MODEL_PAGE: i64 = 200;
+
+/// Fill `events.reported_model` on the billable events of model-less jobs'
+/// runs that were stored before the column existed, so the fold that follows
+/// can attribute them. An archived event's `data` is only an envelope, so each
+/// page is read through `reconstruct_events`. A one-time pass inside the
+/// historical backfill: live events get the column from the insert seam.
+pub(crate) async fn backfill_reported_models(db: &LocalDb) -> DbResult<()> {
+    let runs = db
+        .query_all(MODEL_LESS_RUNS_SQL, (), |row| row.text(0))
+        .await?;
+    let page_sql = format!(
+        "SELECT {cols} FROM events
+         WHERE run_id = ?1 AND sequence > ?2
+           AND parent_tool_use_id IS NULL
+           AND (event_type = 'assistant' OR event_type LIKE 'result%')
+           AND reported_model IS NULL
+         ORDER BY sequence
+         LIMIT ?3",
+        cols = cairn_db::storage::events::columns::EVENT_COLUMNS
+    );
+    for run_id in runs {
+        let mut after = -1i64;
+        loop {
+            let page = db
+                .query_all(
+                    page_sql.clone(),
+                    params![run_id.clone(), after, REPORTED_MODEL_PAGE],
+                    cairn_db::storage::events::columns::event_from_row,
+                )
+                .await?;
+            let Some(last) = page.last() else {
+                break;
+            };
+            after = i64::from(last.sequence);
+            let more = page.len() as i64 == REPORTED_MODEL_PAGE;
+            let reported: Vec<(String, String)> = cairn_db::storage::reconstruct_events(db, page)
+                .await
+                .into_iter()
+                .filter_map(|event| {
+                    reported_model_column(
+                        &event.event_type,
+                        event.parent_tool_use_id.as_deref(),
+                        &event.data,
+                    )
+                    .map(|model| (event.id, model))
+                })
+                .collect();
+            if !reported.is_empty() {
+                db.write(move |conn| {
+                    let reported = reported.clone();
+                    Box::pin(async move {
+                        for (id, model) in &reported {
+                            conn.execute(
+                                "UPDATE events SET reported_model = ?1 WHERE id = ?2",
+                                params![model.as_str(), id.as_str()],
+                            )
+                            .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await?;
+            }
+            if !more {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 // --- Tier A: per-event incremental maintenance (hot insert path) ---
 
 /// The single-event upsert that maintains `token_rollup` as each event lands.
@@ -313,7 +454,7 @@ fn token_rollup_event_upsert_sql() -> String {
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
-                COALESCE(e.session_id, '') || ':' || COALESCE(j.model, '') || ':' ||
+                COALESCE(e.session_id, '') || ':' || COALESCE({model_key}, '') || ':' ||
                 {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
             (e.created_at / 3600) * 3600 AS bucket_start,
             COALESCE(r.project_id, j.project_id) AS project_id,
@@ -321,7 +462,7 @@ fn token_rollup_event_upsert_sql() -> String {
             e.session_id,
             COALESCE(r.job_id, s.job_id) AS job_id,
             j.node_name,
-            j.model,
+            {model_key},
             j.agent_config_id,
             {backend} AS backend,
             CASE WHEN {billable} THEN COALESCE(e.input_tokens, 0) ELSE 0 END,
@@ -362,6 +503,7 @@ fn token_rollup_event_upsert_sql() -> String {
         billable = BILLABLE_PREDICATE,
         billable_total = BILLABLE_TOTAL,
         long = long_prompt_predicate(),
+        model_key = model_key_expr(),
     )
 }
 
@@ -470,7 +612,7 @@ token_events AS (
         e.created_at AS ts,
         COALESCE(r.project_id, j.project_id) AS project_id,
         j.id AS job_id,
-        j.model AS model,
+        {model_key} AS model,
         j.node_name AS node_name,
         j.agent_config_id AS agent_config_id,
         LOWER(COALESCE(s.backend, 'claude')) AS backend,
@@ -501,6 +643,7 @@ token_events AS (
       )
 )",
         long = long_prompt_predicate(),
+        model_key = model_key_expr(),
     )
 }
 
@@ -873,7 +1016,7 @@ pub(crate) async fn cost_components_live(
         "WITH {cte},
         cost_events AS (
             SELECT {cost_bucket} AS bucket_start,
-                   j.model AS model,
+                   {model_key} AS model,
                    LOWER(COALESCE(s.backend, 'claude')) AS backend,
                    COALESCE(r.project_id, j.project_id) AS project_id,
                    e.created_at AS ts,
@@ -918,6 +1061,7 @@ pub(crate) async fn cost_components_live(
            AND cost.backend = tok.backend
         ORDER BY tok.bucket_start",
         cte = token_events_cte(),
+        model_key = model_key_expr(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
@@ -1020,7 +1164,7 @@ pub(crate) async fn provider_model_components_live(
     let sql = format!(
         "WITH {cte},
         cost_events AS (
-            SELECT j.model AS model,
+            SELECT {model_key} AS model,
                    LOWER(COALESCE(s.backend, 'claude')) AS backend,
                    COALESCE(r.project_id, j.project_id) AS project_id,
                    e.created_at AS ts,
@@ -1061,6 +1205,7 @@ pub(crate) async fn provider_model_components_live(
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
            AND cost.backend = tok.backend",
         cte = token_events_cte(),
+        model_key = model_key_expr(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
@@ -1180,7 +1325,7 @@ pub(crate) async fn economics_granular_live(
     let sql = format!(
         "WITH {cte},
         cost_events AS (
-            SELECT j.model AS model,
+            SELECT {model_key} AS model,
                    j.agent_config_id AS agent_config_id,
                    LOWER(COALESCE(s.backend, 'claude')) AS backend,
                    COALESCE(r.project_id, j.project_id) AS project_id,
@@ -1228,6 +1373,7 @@ pub(crate) async fn economics_granular_live(
            AND IFNULL(cost.agent_config_id, '') = IFNULL(tok.agent_config_id, '')
            AND cost.backend = tok.backend",
         cte = token_events_cte(),
+        model_key = model_key_expr(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),

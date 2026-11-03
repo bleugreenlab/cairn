@@ -94,15 +94,24 @@ pub(crate) fn workspace_settings_authority(
         return vec![Err(error)];
     }
     sections
-        .keys()
-        .map(|section| {
-            crate::authorization::normalize::workspace_settings_write(
-                crate::authorization::WORKSPACE_ID,
-                section,
-            )
-            .map_err(|error| error.0)
-        })
+        .iter()
+        .map(|(section, value)| settings_section_request(section, value).map_err(|error| error.0))
         .collect()
+}
+
+/// The request one section of a patch normalizes to, naming the value written
+/// as its act. The gate and the pre-persist re-check both derive it here from
+/// the same payload, so a Once grant minted at the gate is spent only by this
+/// value.
+fn settings_section_request(
+    section: &str,
+    value: &Value,
+) -> Result<AuthorityRequest, crate::authorization::normalize::UnnameableTarget> {
+    crate::authorization::normalize::workspace_settings_section_write(
+        crate::authorization::WORKSPACE_ID,
+        section,
+        value,
+    )
 }
 
 /// The refusal for a key of the tier grid that `models` replaced.
@@ -161,15 +170,12 @@ fn validate_settings_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(),
 async fn authorize_settings_sections<'a>(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
-    sections: impl Iterator<Item = &'a str>,
+    sections: impl Iterator<Item = (&'a String, &'a Value)>,
 ) -> Result<(), String> {
     let requests = sections
-        .map(|section| {
-            crate::authorization::normalize::workspace_settings_write(
-                crate::authorization::WORKSPACE_ID,
-                section,
-            )
-            .map_err(|error| format!("Refused: {}", error.0))
+        .map(|(section, value)| {
+            settings_section_request(section, value)
+                .map_err(|error| format!("Refused: {}", error.0))
         })
         .collect::<Result<Vec<_>, String>>()?;
 
@@ -308,7 +314,7 @@ pub(super) async fn apply_settings_patch(
     // a capability cannot smuggle the capability through on the preference's
     // back.
     if !dry_run {
-        authorize_settings_sections(orch, request, obj.keys().map(String::as_str)).await?;
+        authorize_settings_sections(orch, request, obj.iter()).await?;
     }
 
     let mut summary: Vec<String> = Vec::new();

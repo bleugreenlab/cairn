@@ -298,6 +298,11 @@ async fn setup_with_executor(
     run_id: &str,
     attach_executor: bool,
 ) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    // A suite run from inside a pinned Cairn batch inherits that batch's
+    // `CAIRN_BATCH_EXECUTOR`, and the test executor's shells would inherit it
+    // in turn, so a test asserting what a batch's own pin is would read its
+    // caller's. No test here wants the caller's pin.
+    std::env::remove_var(cairn_common::executor_protocol::BATCH_EXECUTOR_ENV);
     let (temp, db) = common::migrated_db().await;
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
@@ -1285,6 +1290,202 @@ async fn a_pinned_batch_shell_sees_its_pin_and_an_unpinned_one_sees_none() {
         "an unpinned batch states no pin: {unpinned}"
     );
     kill_all_sessions(&orch);
+}
+
+/// A node's placement default (cairn/5920), end to end through the write and
+/// run doors: set on `cairn:~`, it places a selector-less batch and its
+/// terminal, the result says `(node default)`, a call-level selector overrides
+/// it, and `executor:null` lets the next batch place freely.
+///
+/// The default never reaches the shell's `CAIRN_BATCH_EXECUTOR`, which is the
+/// only way a run selector reaches a check lane (a nested `cairn check run`
+/// inherits it as a narrowing): automatic lanes are placed from their
+/// configuration alone. So `pin=[]` here is the check-lane guarantee.
+#[tokio::test]
+async fn a_node_placement_default_places_labels_and_never_reaches_the_shell_pin() {
+    if common::skip_if_fenced(
+        "a_node_placement_default_places_labels_and_never_reaches_the_shell_pin",
+    ) {
+        return;
+    }
+    let run_id = "run-node-default";
+    let (_temp, db, orch, cwd) = setup(run_id).await;
+    let write = |payload: Value| {
+        let (orch, request) = (orch.clone(), request(&cwd, Some(run_id), payload));
+        async move { handle_write(&orch, &request).await }
+    };
+    let run = |payload: Value| {
+        let (orch, request) = (orch.clone(), request(&cwd, Some(run_id), payload));
+        async move { run_text(&handle_run(&orch, &request).await) }
+    };
+    let pin_probe =
+        json!({"commands": [{ "command": "printf 'pin=[%s]' \"$CAIRN_BATCH_EXECUTOR\"" }]});
+
+    let set = write(json!({"changes": [{
+        "target": "cairn:~",
+        "mode": "patch",
+        "payload": {"executor": {"name": "local"}}
+    }]}))
+    .await;
+    assert!(set.contains("Placement default: local (set "), "{set}");
+    let stored = db
+        .query_one(
+            "SELECT selector FROM placement_defaults WHERE job_id = 'job-run-node-default'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored, r#"{"name":"local"}"#);
+
+    let defaulted = run(pin_probe.clone()).await;
+    let first = defaulted.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("Ran on **local**") && first.contains("(node default)"),
+        "a selector-less batch is placed by the default and says so: {defaulted}"
+    );
+    assert!(
+        defaulted.contains("pin=[]"),
+        "a default never reaches the shell's pin: {defaulted}"
+    );
+
+    let mut named = pin_probe.clone();
+    named["executor"] = json!({"name": "local"});
+    let named = run(named).await;
+    assert!(
+        !named.contains("(node default)"),
+        "a call-level selector is the call's: {named}"
+    );
+    assert!(named.contains(r#"pin=[{"name":"local"}]"#), "{named}");
+
+    let terminal = write(json!({"changes": [{
+        "target": "cairn:~/terminal/pd",
+        "mode": "create",
+        "payload": {"command": "sleep 30"}
+    }]}))
+    .await;
+    assert!(
+        terminal.contains("on **local** (node default)"),
+        "a terminal created without a machine inherits the default: {terminal}"
+    );
+    let terminal_selector = db
+        .query_one(
+            "SELECT executor_selector FROM job_terminals WHERE job_id = 'job-run-node-default'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_selector, r#"{"name":"local"}"#,
+        "the default is persisted as the terminal's own selector, so recovery honours it"
+    );
+    kill_all_sessions(&orch);
+
+    let cleared = write(json!({"changes": [{
+        "target": "cairn:~",
+        "mode": "patch",
+        "payload": {"executor": null}
+    }]}))
+    .await;
+    assert!(
+        cleared.contains("Placement default: none (cleared)."),
+        "{cleared}"
+    );
+    let free = run(pin_probe).await;
+    assert!(free.starts_with("Ran on "), "{free}");
+    assert!(!free.contains("(node default)"), "{free}");
+}
+
+/// A default the machine cannot serve refuses the batch by name, with where the
+/// pin came from and the two ways out, rather than placing it elsewhere.
+#[tokio::test]
+async fn a_node_placement_default_that_cannot_serve_refuses_with_the_way_out() {
+    if common::skip_if_fenced("a_node_placement_default_that_cannot_serve_refuses_with_the_way_out")
+    {
+        return;
+    }
+    let run_id = "run-node-default-refused";
+    let (_temp, db, orch, cwd) = setup(run_id).await;
+    // Stored directly: the write door refuses a platform Cairn does not place
+    // work on, and this is the shape of a default whose machine went away.
+    db.execute(
+        "INSERT INTO placement_defaults (id, job_id, selector, set_by, set_at)
+         VALUES ('pd-refused', 'job-run-node-default-refused', '{\"os\":\"plan9\"}', 'operator', 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    let text = run_text(
+        &handle_run(
+            &orch,
+            &request(
+                &cwd,
+                Some(run_id),
+                json!({"commands": [{ "command": "echo never" }]}),
+            ),
+        )
+        .await,
+    );
+    assert!(text.contains("This run could not execute"), "{text}");
+    assert!(text.contains("plan9"), "{text}");
+    assert!(
+        text.contains("os plan9 is this node's placement default"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`write cairn:~ patch {executor:null}`"),
+        "{text}"
+    );
+}
+
+/// A default the fleet cleared (its machine was removed) is announced once, at
+/// the opening of the node's next result, which then places freely.
+#[tokio::test]
+async fn a_cleared_node_placement_default_is_announced_once_and_places_freely() {
+    if common::skip_if_fenced(
+        "a_cleared_node_placement_default_is_announced_once_and_places_freely",
+    ) {
+        return;
+    }
+    let run_id = "run-node-default-cleared";
+    let (_temp, db, orch, cwd) = setup(run_id).await;
+    db.execute(
+        "INSERT INTO placement_defaults
+            (id, job_id, selector, executor_id, set_by, set_at, cleared_reason, cleared_at)
+         VALUES ('pd-cleared', 'job-run-node-default-cleared', '{\"name\":\"bbs\"}',
+                 'exec-bbs', 'operator', 1, 'executor bbs was removed from the fleet', 2)",
+        (),
+    )
+    .await
+    .unwrap();
+    let run = || {
+        let request = request(
+            &cwd,
+            Some(run_id),
+            json!({"commands": [{ "command": "echo placed" }]}),
+        );
+        let orch = orch.clone();
+        async move { run_text(&handle_run(&orch, &request).await) }
+    };
+    let first = run().await;
+    assert!(
+        first.starts_with("Note: this node's placement default (bbs) was cleared"),
+        "{first}"
+    );
+    assert!(
+        first.contains("executor bbs was removed from the fleet"),
+        "{first}"
+    );
+    assert!(
+        first.contains("Ran on ") && !first.contains("(node default)"),
+        "{first}"
+    );
+    let second = run().await;
+    assert!(
+        !second.contains("Note: this node's placement default"),
+        "{second}"
+    );
 }
 
 /// The tracked-writes half of the thread posture, at the `run` door.
@@ -2560,6 +2761,60 @@ async fn timed_out_item_in_subtask_job_creates_no_terminal() {
     );
     assert_eq!(orch.pty_state.sessions.lock().unwrap().len(), 0);
     kill_all_sessions(&orch);
+}
+
+/// A node-less task job under a builder, in the shape a cross-node task or a
+/// call was created in before its spawn path put the child's own agent into the
+/// execution snapshot (the rune/43 Editor and rs/1020 rescue specimens): its
+/// batch is refused with the missing link named, and once the snapshot carries
+/// its agent the same batch runs under that agent's fence. The spawn paths'
+/// shared helper is pinned by `child_agent_snapshot_tests`; this is the batch.
+#[tokio::test]
+async fn a_task_job_runs_its_batch_once_its_own_agent_is_in_the_snapshot() {
+    let (temp, db, orch, cwd) = setup("run-xtask").await;
+    let agents = temp.path().join("config").join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("rescuer.md"),
+        "---\nname: Rescuer\ndescription: test agent\ntools: mcp__cairn__read, mcp__cairn__run\nmodels: [lg]\nfence: allow\n---\n\nRescue.\n",
+    )
+    .unwrap();
+    db.write(move |conn| {
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, status, uri_segment, parent_job_id, branch, base_commit, created_at, updated_at)
+                 SELECT 'job-xtask', execution_id, 'rescuer', issue_id, project_id, 'running', 'rescue', id, branch, base_commit, 1, 1
+                 FROM jobs WHERE id = 'job-run-xtask'",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+                 SELECT 'run-xtask-task', project_id, issue_id, 'job-xtask', 'live', 1, 1, 'fresh' FROM runs WHERE id = 'run-xtask'",
+                (),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    let batch = json!({ "commands": [{ "command": "echo task-batch-ran" }] });
+
+    let refused = handle_run(&orch, &request(&cwd, Some("run-xtask-task"), batch.clone())).await;
+    assert!(
+        refused.contains("no resolvable fence policy")
+            && refused.contains("'rescuer' is not in its execution snapshot"),
+        "the refusal must name the missing link: {refused}"
+    );
+    assert!(!refused.contains("task-batch-ran"), "{refused}");
+
+    cairn_core::internal::execution::jobs::ensure_job_agent_snapshot(&orch, "job-xtask")
+        .await
+        .unwrap();
+
+    let ran = handle_run(&orch, &request(&cwd, Some("run-xtask-task"), batch)).await;
+    assert!(ran.contains("task-batch-ran"), "{ran}");
 }
 
 #[tokio::test]

@@ -20,7 +20,9 @@ pub async fn backfill_tool_invocations(db: &LocalDb) -> DbResult<ToolBackfillSum
 /// but events that predate that seam were never folded. The original historical
 /// pass populates both tiers — the Tier A token/cost fold and the Tier B
 /// reconstruct-based tool-invocation backfill — then records completion so it
-/// never re-scans the whole events table on later startups. A second marker
+/// never re-scans the whole events table on later startups. Before folding, it
+/// fills `events.reported_model` for model-less jobs' events stored before that
+/// column existed, so the fold can attribute them. A second marker
 /// versions the narrower result-timestamp repair added after `result_ts`
 /// existed: installs that already completed the original pass only revisit runs
 /// that have NULL-result tool_invocations rows.
@@ -28,6 +30,7 @@ pub async fn run_historical_backfill(db: &LocalDb) -> DbResult<()> {
     let ran_full_backfill = if historical_backfill_complete(db).await? {
         false
     } else {
+        queries::backfill_reported_models(db).await?;
         queries::fold_token_rollup(db).await?;
         queries::backfill_tool_invocations(db).await?;
         mark_historical_backfill_complete(db).await?;

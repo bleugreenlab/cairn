@@ -11,8 +11,9 @@ use super::requests::{choose_deployment, HoldCause, Request, RequestId, RequestS
 use super::rules::{
     plan, Acquirable, Activity, Input, Left, Pin, Plan, Preference, State, Why, RESTOP_AFTER_MS,
 };
-use super::settings::{EffectiveSettings, Ms, Setting, SettingOrigin};
+use super::settings::{EffectiveSettings, MeasuredLoad, Ms, Setting, SettingOrigin};
 use crate::fleet::pools::{Pool, PoolKey, PoolMember};
+use crate::orchestrator::inference_control::LoadRow;
 
 const MIN: Ms = 60_000;
 const SPARKS: &str = "sp1+sp2";
@@ -1020,6 +1021,128 @@ fn a_request_for_a_verb_goes_only_to_a_deployment_that_serves_it() {
     );
 }
 
+/// A finished load of `secs` to health; `cold` when its start downloaded first.
+fn load(secs: u64, cold: bool) -> LoadRow {
+    LoadRow {
+        profile: String::new(),
+        requested_at: 0,
+        sent_at: None,
+        finished_at: 0,
+        healthy: true,
+        load_ms: Some(secs * 1_000),
+        reason: None,
+        footprint: None,
+        cold,
+    }
+}
+
+fn failed_load() -> LoadRow {
+    LoadRow {
+        healthy: false,
+        load_ms: None,
+        reason: Some("the start command exited 1".into()),
+        ..load(0, false)
+    }
+}
+
+/// The Sparks pool's windows with `history`, each deployment's loads newest
+/// first as `load_history` reads them.
+fn sparks_windows(history: &[(&str, Vec<LoadRow>)]) -> EffectiveSettings {
+    let history = history
+        .iter()
+        .map(|(id, loads)| (d(id), loads.clone()))
+        .collect();
+    let key: PoolKey = SPARKS.into();
+    super::pool_settings(
+        &[pool(&["sp1", "sp2"])],
+        &catalog(),
+        &history,
+        &BTreeMap::new(),
+    )[&key]
+}
+
+fn measured(secs: u64, cold: bool) -> SettingOrigin {
+    SettingOrigin::Measured(MeasuredLoad { secs, cold })
+}
+
+/// The 11-02 bbs case: a first load of 3m 31s that pulled its image, then
+/// two of 12 s. The windows follow the 12 s reload, down to their floors.
+#[test]
+fn a_pools_windows_follow_its_latest_load_not_its_slowest() {
+    let windows = sparks_windows(&[(
+        "dsv4f-tp2",
+        vec![load(12, false), load(12, false), load(211, false)],
+    )]);
+    assert_eq!(windows.idle.origin, measured(12, false));
+    assert_eq!(
+        (
+            windows.idle.secs,
+            windows.min_residency.secs,
+            windows.load_bound.secs
+        ),
+        (15 * 60, 10 * 60, 5 * 60)
+    );
+    assert_eq!(
+        windows.idle.to_string(),
+        "15m (from the latest measured load of 12s)"
+    );
+
+    let failed_since = sparks_windows(&[("dsv4f-tp2", vec![failed_load(), load(12, false)])]);
+    assert_eq!(
+        failed_since.idle.origin,
+        measured(12, false),
+        "a failed start measures nothing"
+    );
+}
+
+#[test]
+fn a_pool_with_one_slow_load_still_derives_from_it() {
+    let windows = sparks_windows(&[("dsv4f-tp2", vec![load(211, false)])]);
+    assert_eq!(windows.idle.origin, measured(211, false));
+    assert_eq!(
+        (
+            windows.idle.secs,
+            windows.min_residency.secs,
+            windows.load_bound.secs
+        ),
+        (1_266, 844, 633)
+    );
+}
+
+#[test]
+fn a_pool_with_no_healthy_load_keeps_the_built_in_windows() {
+    for history in [vec![], vec![("dsv4f-tp2", vec![failed_load()])]] {
+        let windows = sparks_windows(&history);
+        assert_eq!(windows, EffectiveSettings::default());
+        assert_eq!(windows.idle.secs, 30 * 60);
+        assert_eq!(windows.load_bound.origin, SettingOrigin::BuiltIn);
+    }
+}
+
+/// A load whose start pulled its image is passed over while a load from cache
+/// is on record, and counts, marked so, while none is.
+#[test]
+fn a_load_that_downloaded_first_counts_only_until_one_from_cache_is_measured() {
+    let pulled_again = sparks_windows(&[("dsv4f-tp2", vec![load(211, true), load(12, false)])]);
+    assert_eq!(pulled_again.idle.origin, measured(12, false));
+
+    let only_pulled = sparks_windows(&[("dsv4f-tp2", vec![load(211, true)])]);
+    assert_eq!(only_pulled.idle.origin, measured(211, true));
+    assert_eq!(only_pulled.idle.secs, 1_266);
+}
+
+/// One pool's windows cover reloading whichever model it holds: the slowest
+/// of its deployments' latest loads.
+#[test]
+fn a_pool_takes_the_slowest_of_its_deployments_latest_loads() {
+    let windows = sparks_windows(&[
+        ("dsv4f-tp2", vec![load(300, false), load(600, false)]),
+        ("qwen36-fast", vec![load(40, false)]),
+    ]);
+    assert_eq!(windows.idle.origin, measured(300, false));
+    assert_eq!(windows.load_bound.secs, 15 * 60);
+}
+
 /// The host: one pass against a real store and a fake fleet.
 mod host {
     use std::collections::{BTreeMap, HashMap};
@@ -1355,7 +1478,7 @@ mod host {
         .unwrap();
         assert!(said.contains("warm model is dsv4f-tp2"), "{said}");
         assert!(
-            said.contains("idle window 24m (from a measured load of 4m)"),
+            said.contains("idle window 24m (from the latest measured load of 4m)"),
             "6 x the 4m load: {said}"
         );
         assert!(

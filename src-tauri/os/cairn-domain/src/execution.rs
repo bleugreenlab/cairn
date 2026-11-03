@@ -117,8 +117,11 @@ pub enum GateEvidenceState {
 /// cap, `None` until the queue has numbered it. `placed_by` names who moved
 /// this hold ahead of where it was filed: a thread's own reorder (cairn/5848)
 /// or `the operator`'s fleet move (cairn/5895), `None` for a hold in the place
-/// it was filed into. `pinned` says the operator gave this hold its place, so
-/// a thread's own order no longer moves it; it ends when the hold latches.
+/// it was filed into. `pinned` puts this hold in the queue's ordered prefix
+/// ahead of the rotation, so a thread's own order no longer moves it; it ends
+/// when the hold latches. `frozen` says the pin is not anyone's placement: an
+/// operator move landed behind this hold, and pinned it where the page showed
+/// it (cairn/5943).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cap", rename_all = "camelCase")]
 pub enum CapacityHold {
@@ -135,6 +138,8 @@ pub enum CapacityHold {
         placed_by: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        frozen: bool,
     },
     /// The thread focus cap: the thread's open children, by issue number,
     /// against its limit.
@@ -149,6 +154,8 @@ pub enum CapacityHold {
         placed_by: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pinned: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        frozen: bool,
     },
 }
 
@@ -186,6 +193,18 @@ impl CapacityHold {
     pub fn set_pinned(&mut self, to: bool) {
         match self {
             Self::Fleet { pinned, .. } | Self::Thread { pinned, .. } => *pinned = to,
+        }
+    }
+
+    pub fn frozen(&self) -> bool {
+        match self {
+            Self::Fleet { frozen, .. } | Self::Thread { frozen, .. } => *frozen,
+        }
+    }
+
+    pub fn set_frozen(&mut self, to: bool) {
+        match self {
+            Self::Fleet { frozen, .. } | Self::Thread { frozen, .. } => *frozen = to,
         }
     }
 }

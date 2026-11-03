@@ -1172,22 +1172,8 @@ async fn resolve_manual_check_contract_snapshot(
     // head) supplies the content to check AND the definition to check it with.
     let commit = match branch {
         Some(branch) => {
-            let coordinate_repository = {
-                let jj_binary_path = orch.jj_binary_path.clone();
-                let config_dir = orch.config_dir.clone();
-                let project_repo = repository.clone();
-                tokio::task::spawn_blocking(move || {
-                    let jj = crate::jj::environment(&jj_binary_path, &config_dir);
-                    crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
-                })
-                .await
-                .map_err(|error| {
-                    format!("manual check coordinate repository task failed: {error}")
-                })??
-            };
-            cairn_vcs::resolve_coordinate(&coordinate_repository, branch)
-                .await
-                .map_err(|error| format!("branch {branch:?} is unresolvable: {error}"))?
+            resolve_manual_check_branch(orch, &project_id, &repository, &default_branch, branch)
+                .await?
         }
         None => crate::execution::cache::resolve_job_logical_head(orch, &job_id)
             .await
@@ -1214,6 +1200,82 @@ async fn resolve_manual_check_contract_snapshot(
         placement_override,
     )
     .await
+}
+
+/// The forms `--branch` takes, named in each refusal that would otherwise leave
+/// the caller guessing which one it got wrong.
+const MANUAL_CHECK_BRANCH_FORMS: &str = "--branch takes a branch name (`main`, \
+     `agent/cairn-123-builder-0`), a commit id, or a node URI \
+     (`cairn://p/PROJECT/ISSUE/EXEC/NODE`), the same forms `read ?branch=` and `run branch:` take";
+
+/// Resolve the revision a manual check names with `--branch` to the commit it
+/// evaluates, in the project of the run that asked.
+///
+/// The check-run handler calls this before it mints an observation, so a
+/// revision that names nothing is refused before anything is queued.
+pub(crate) async fn resolve_manual_check_revision(
+    orch: &Orchestrator,
+    run_id: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let row = load_manual_run_row(&db, run_id).await?;
+    resolve_manual_check_branch(
+        orch,
+        &row.project_id,
+        Path::new(&row.repository_path),
+        &row.default_branch,
+        branch,
+    )
+    .await
+}
+
+async fn resolve_manual_check_branch(
+    orch: &Orchestrator,
+    project_id: &str,
+    repository: &Path,
+    default_branch: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let coordinate_repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = repository.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::environment(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("manual check coordinate repository task failed: {error}"))??
+    };
+    crate::mcp::handlers::branch::resolve_in_project(
+        orch,
+        project_id,
+        &coordinate_repository,
+        default_branch,
+        branch,
+    )
+    .await
+    .map_err(|error| manual_check_branch_refusal(&error))
+}
+
+fn manual_check_branch_refusal(
+    error: &crate::mcp::handlers::branch::BranchRefResolutionError,
+) -> String {
+    use crate::mcp::handlers::branch::BranchRefResolutionError;
+    match error {
+        BranchRefResolutionError::Invalid { .. }
+        | BranchRefResolutionError::Unresolvable { .. }
+        | BranchRefResolutionError::Ambiguous { .. } => {
+            format!("{error}. {MANUAL_CHECK_BRANCH_FORMS}.")
+        }
+        // A conflicted or lost branch was named correctly; its refusal carries
+        // its own way forward, and a list of forms would only bury it.
+        BranchRefResolutionError::Conflicted { .. }
+        | BranchRefResolutionError::OwnBranchLost { .. } => error.to_string(),
+    }
 }
 
 /// Who a configured check run belongs to and what it is measured against.
@@ -1874,6 +1936,7 @@ pub(crate) async fn execute_check_contract(
         &[CheckPlacementQuestion {
             selector: placement.selector.clone(),
             verdict_platforms: placement.verdict_platforms.clone(),
+            compiles_rust: CheckPlacementQuestion::command_compiles_rust(&plan.command),
         }],
     )
     .await;
@@ -3162,6 +3225,16 @@ pub(crate) async fn execute_job_verdict(
 pub(crate) struct CheckPlacementQuestion {
     pub selector: Option<ExecutorSelector>,
     pub verdict_platforms: Vec<String>,
+    /// Whether the check's command compiles Rust, which placement holds to the
+    /// machine's build-prerequisite verdict whatever the selector names.
+    pub compiles_rust: bool,
+}
+
+impl CheckPlacementQuestion {
+    /// Whether `command` is Rust work as placement classifies the request.
+    pub(crate) fn command_compiles_rust(command: &str) -> bool {
+        cairn_common::executor_protocol::CellCommandClass::classify(command).compiles_rust()
+    }
 }
 
 /// The head and the repository a wave of checks runs against.
@@ -3244,6 +3317,7 @@ pub(crate) async fn plan_infra_scopes(
                 avoided_executor_ids: &[],
                 project_requirements: &project_requirements,
                 work_class: inputs.work_class,
+                compiles_rust: placement.compiles_rust,
             };
             let environments: Vec<(String, String)> = orch
                 .fleet
@@ -3313,6 +3387,7 @@ pub(crate) fn review_placement_occupancy(
         avoided_executor_ids: &[],
         project_requirements: &project_requirements,
         work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
+        compiles_rust: placement.compiles_rust,
     })
 }
 
@@ -3516,6 +3591,9 @@ impl CheckPatience {
             avoided_executor_ids,
             project_requirements: &project_requirements,
             work_class: self.work_class,
+            // The class the batch's request is placed with.
+            compiles_rust:
+                crate::execution::wire::batch_command_class(&batch.items).compiles_rust(),
         }))
     }
 }
@@ -11509,6 +11587,9 @@ async fn run_prospective_tree_checks(
             .map(|index| CheckPlacementQuestion {
                 selector: executors[index].clone(),
                 verdict_platforms: verdict_platforms[index].clone(),
+                compiles_rust: CheckPlacementQuestion::command_compiles_rust(
+                    &keyed[index].0.command,
+                ),
             })
             .collect::<Vec<_>>(),
     )

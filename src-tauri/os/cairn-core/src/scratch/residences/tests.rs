@@ -91,6 +91,42 @@ fn an_entry_is_ended_only_when_every_job_it_answers_to_has_ended() {
     );
 }
 
+/// A residence created as `CAIRN.thread-ux` before its project key was
+/// lowercased is registered as `cairn.thread-ux`. On a volume that folds case
+/// those are one directory and it answers to its job; on one that does not, a
+/// registration naming an absent directory owns nothing.
+#[test]
+fn a_registration_spelled_in_another_case_owns_the_entry_only_when_the_volume_folds_case() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    std::fs::create_dir_all(root.join(SCRATCH_MAP_DIR)).unwrap();
+    std::fs::write(
+        root.join(SCRATCH_MAP_DIR).join(encode_component("job-1")),
+        "cairn.thread-ux",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("CAIRN.thread-ux")).unwrap();
+    std::fs::create_dir_all(root.join("CAIRN.other")).unwrap();
+    let folds = root.join("cairn.thread-ux").exists();
+
+    let scan = scan(root);
+
+    let registered = |name: &str| {
+        scan.candidates
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .unwrap()
+            .registered
+            .clone()
+    };
+    if folds {
+        assert_eq!(registered("CAIRN.thread-ux"), ["job-1"]);
+    } else {
+        assert!(registered("CAIRN.thread-ux").is_empty());
+    }
+    assert!(registered("CAIRN.other").is_empty());
+}
+
 #[test]
 fn measuring_counts_the_tree_and_never_follows_a_link_out_of_it() {
     let temp = tempfile::tempdir().unwrap();
@@ -149,37 +185,59 @@ fn footprint(exclusive_bytes: u64, newest_write_unix_ms: u64) -> Footprint {
     }
 }
 
-/// A tree of clones that is huge logically and frees little must not end the
-/// pass early: credit is exclusive bytes, and the order is coldness.
+fn names(pass: &PressurePass) -> Vec<&str> {
+    pass.removed
+        .iter()
+        .map(|removal| removal.name.as_str())
+        .collect()
+}
+
+const MIB: u64 = 1024 * 1024;
+/// A pressure line of 100 MiB with 10 MiB free: the pass asks for 90 MiB.
+const SMALL_LINES: Lines = Lines {
+    pressure_free_bytes: 100 * MIB,
+    critical_free_bytes: 5 * MIB,
+};
+const SMALL_FREE: u64 = 10 * MIB;
+
+/// Credit is exclusive bytes, so a tree of clones that is huge logically and
+/// frees little does not end the pass early, and the order is size: the ask is
+/// met by taking as few entries as possible, whichever is coldest.
 #[test]
-fn pressure_takes_cold_unowned_entries_coldest_first_until_their_exclusive_bytes_meet_the_ask() {
+fn pressure_takes_the_largest_cold_unowned_entries_until_their_exclusive_bytes_meet_the_ask() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let at = now();
     let mut entries = vec![
         staged_entry(
             root,
+            "secrets",
+            Owner::Unowned,
+            footprint(8192, at - 21 * DAY_MS),
+        ),
+        staged_entry(
+            root,
             "coldest",
             Owner::Unowned,
-            footprint(60, at - 3 * DAY_MS),
+            footprint(40 * MIB, at - 3 * DAY_MS),
         ),
         staged_entry(
             root,
-            "colder",
+            "larger",
             Owner::Unowned,
-            footprint(50, at - 2 * DAY_MS),
+            footprint(70 * MIB, at - 2 * DAY_MS),
         ),
         staged_entry(
             root,
-            "cold",
+            "large",
             Owner::Unowned,
-            footprint(1_000, at - 30 * HOUR_MS),
+            footprint(60 * MIB, at - 30 * HOUR_MS),
         ),
         staged_entry(
             root,
             "recent",
             Owner::Unowned,
-            footprint(5_000, at - HOUR_MS),
+            footprint(500 * MIB, at - HOUR_MS),
         ),
         staged_entry(
             root,
@@ -187,45 +245,103 @@ fn pressure_takes_cold_unowned_entries_coldest_first_until_their_exclusive_bytes
             Owner::Live {
                 jobs: vec!["j".into()],
             },
-            footprint(9_000, at - 9 * DAY_MS),
+            footprint(900 * MIB, at - 9 * DAY_MS),
         ),
     ];
-    let lines = Lines {
-        pressure_free_bytes: 100,
-        critical_free_bytes: 5,
-    };
 
-    let pass = pressure_pass(root, &mut entries, lines, at, &|| Some(10)).unwrap();
+    let pass = pressure_pass(root, &mut entries, SMALL_LINES, at, &|| Some(SMALL_FREE)).unwrap();
 
     assert_eq!(pass.band, StoragePressureBand::Pressure);
-    assert_eq!(pass.asked_bytes, 90);
-    assert_eq!(
-        pass.removed
-            .iter()
-            .map(|removal| removal.name.as_str())
-            .collect::<Vec<_>>(),
-        ["coldest", "colder"]
-    );
-    assert_eq!(pass.credited_bytes, 110);
-    assert!(!root.join("coldest").exists() && !root.join("colder").exists());
-    for kept in ["cold", "recent", "live"] {
+    assert_eq!(pass.asked_bytes, 90 * MIB);
+    assert_eq!(names(&pass), ["larger", "large"]);
+    assert_eq!(pass.credited_bytes, 130 * MIB);
+    assert!(!root.join("larger").exists() && !root.join("large").exists());
+    for kept in ["secrets", "coldest", "recent", "live"] {
         assert!(root.join(kept).exists(), "{kept}");
     }
     assert_eq!(pass.kept_live.count, 1);
     assert_eq!(pass.kept_quiet.count, 1, "written an hour ago");
-    assert_eq!(entries.len(), 3);
+    assert_eq!(pass.kept_small.count, 1, "frees one block");
+    assert_eq!(entries.len(), 4);
 
     let mut entries = vec![staged_entry(
         root,
         "above",
         Owner::Unowned,
-        footprint(1, at - 9 * DAY_MS),
+        footprint(GIB, at - 9 * DAY_MS),
     )];
     assert!(
-        pressure_pass(root, &mut entries, lines, at, &|| Some(101)).is_none(),
+        pressure_pass(root, &mut entries, SMALL_LINES, at, &|| Some(101 * MIB)).is_none(),
         "above the line nothing unowned is taken"
     );
     assert!(root.join("above").exists());
+}
+
+/// A hand-placed key three weeks cold frees one block, which relieves nothing;
+/// a workspace past the quiet floor meets the ask alone. Taking the coldest
+/// first removed the key for a credit of 8 KiB and a volume that gained 0.
+#[test]
+fn pressure_spares_a_tiny_cold_entry_and_takes_a_large_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let at = now();
+    let mut entries = vec![
+        staged_entry(
+            root,
+            "secrets",
+            Owner::Unowned,
+            footprint(8192, at - 21 * DAY_MS),
+        ),
+        staged_entry(
+            root,
+            "workspace",
+            Owner::Unowned,
+            footprint(200 * MIB, at - 2 * DAY_MS),
+        ),
+    ];
+
+    let pass = pressure_pass(root, &mut entries, SMALL_LINES, at, &|| Some(SMALL_FREE)).unwrap();
+
+    assert_eq!(names(&pass), ["workspace"]);
+    assert!(root.join("secrets").exists());
+    assert!(!root.join("workspace").exists());
+}
+
+/// When everything past the quiet floor is under the size floor, even the
+/// critical line takes nothing, and the report counts what it kept.
+#[test]
+fn pressure_with_only_small_candidates_takes_nothing_and_reports_them_kept() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let at = now();
+    let mut entries = vec![
+        staged_entry(
+            root,
+            "secrets",
+            Owner::Unowned,
+            footprint(8192, at - 21 * DAY_MS),
+        ),
+        staged_entry(
+            root,
+            "notes",
+            Owner::Unowned,
+            footprint(UNOWNED_SIZE_FLOOR - 1, at - 9 * DAY_MS),
+        ),
+    ];
+
+    let pass = pressure_pass(root, &mut entries, SMALL_LINES, at, &|| Some(MIB)).unwrap();
+
+    assert_eq!(pass.band, StoragePressureBand::Critical);
+    assert!(pass.removed.is_empty());
+    assert_eq!(pass.credited_bytes, 0);
+    assert_eq!(pass.kept_small.count, 2);
+    assert_eq!(
+        pass.kept_small.exclusive_bytes,
+        8192 + UNOWNED_SIZE_FLOOR - 1
+    );
+    assert_eq!(pass.kept_quiet.count, 0);
+    assert!(root.join("secrets").exists() && root.join("notes").exists());
+    assert_eq!(entries.len(), 2);
 }
 
 struct World {
@@ -373,6 +489,24 @@ async fn world() -> World {
     World { temp, orch }
 }
 
+/// Bytes no compressing filesystem can shrink below their length, so the
+/// file's exclusive bytes are its size on every volume a test runs on.
+fn write_incompressible(path: &Path, len: u64) {
+    use std::io::Write;
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let data: Vec<u8> = (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let mut file = std::fs::File::create(path).unwrap();
+    file.write_all(&data).unwrap();
+    file.sync_all().unwrap();
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Lines far above anything a fixture stages, so an ask under them is never met
 /// before every eligible entry has been taken.
@@ -401,11 +535,10 @@ async fn a_critical_pass_reclaims_everything_ended_and_unowned_and_keeps_the_liv
     world.residence("gone-job", "nsc.9.1.builder");
     let root = world.root();
     std::fs::create_dir_all(root.join("triome-45-measure/data")).unwrap();
-    std::fs::write(
-        root.join("triome-45-measure/data/game.sqlite3"),
-        [7_u8; 4096],
-    )
-    .unwrap();
+    write_incompressible(
+        &root.join("triome-45-measure/data/game.sqlite3"),
+        2 * UNOWNED_SIZE_FLOOR,
+    );
     std::fs::write(root.join("proto.html"), b"<html>").unwrap();
     std::fs::create_dir_all(root.join(RESPONSE_SCRATCH_DIR).join("r")).unwrap();
     let done_scratch = world
@@ -453,10 +586,13 @@ async fn a_critical_pass_reclaims_everything_ended_and_unowned_and_keeps_the_liv
         "nsc.shut",
         "nsc.9.1.builder",
         "triome-45-measure",
-        "proto.html",
     ] {
         assert!(!world.exists(ended), "{ended} must be reclaimed");
     }
+    assert!(
+        world.exists("proto.html"),
+        "an unowned entry under the size floor relieves nothing and is kept"
+    );
     assert!(world.registered("live-job"));
     assert!(world.registered("closed-held"));
     assert!(!world.registered("done-job") && !world.registered("gone-job"));
@@ -489,7 +625,8 @@ async fn a_critical_pass_reclaims_everything_ended_and_unowned_and_keeps_the_liv
         .iter()
         .map(|removal| removal.name.as_str())
         .collect();
-    assert!(taken.contains(&"triome-45-measure") && taken.contains(&"proto.html"));
+    assert_eq!(taken, ["triome-45-measure"]);
+    assert_eq!(pass.kept_small.count, 1);
     assert!(report
         .removals
         .iter()
@@ -499,10 +636,11 @@ async fn a_critical_pass_reclaims_everything_ended_and_unowned_and_keeps_the_liv
         .iter()
         .any(|removal| removal.name == "nsc.shut" && removal.why == "its thread closed"));
     let census = report.census.expect("a pass under pressure measures");
-    assert!(census
-        .entries
-        .iter()
-        .all(|entry| matches!(entry.owner, Owner::Live { .. })));
+    assert!(census.entries.iter().all(|entry| match entry.owner {
+        Owner::Live { .. } => true,
+        Owner::Unowned => entry.name == "proto.html",
+        Owner::Ended { .. } => false,
+    }));
 
     // Once its process ends, the held residence of the closed thread goes too.
     world.release("run-held");
@@ -537,6 +675,120 @@ async fn an_unowned_workspace_in_use_is_left_alone() {
     assert_eq!(pass.kept_quiet.count, 1);
 }
 
+/// A workspace the seven-day rule is for: well past the size floor.
+const LAB_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The size floor binds the seven-day rule as it binds pressure: a small
+/// hand-placed file is never taken, however long it has been quiet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_small_unowned_entry_survives_seven_quiet_days() {
+    let world = world().await;
+    let root = world.root();
+    std::fs::write(root.join("api-key"), b"sk-not-a-real-key").unwrap();
+
+    tick(&world.orch, root, LINES, now() + 30 * DAY_MS, || {
+        Some(ABOVE)
+    })
+    .await;
+
+    assert!(world.exists("api-key"));
+    assert!(world.orch.host_scratch.report().quiet_removals.is_empty());
+}
+
+/// An unowned entry nothing has written to for seven days is reclaimed with the
+/// volume well above the pressure line, measured and reported, and a live
+/// residence beside it is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unowned_entry_quiet_for_seven_days_is_reclaimed_without_pressure() {
+    let world = world().await;
+    world.residence("live-job", "nsc.1.1.builder");
+    let root = world.root();
+    std::fs::create_dir_all(root.join("lab")).unwrap();
+    std::fs::write(root.join("lab/data.bin"), vec![3_u8; LAB_BYTES as usize]).unwrap();
+
+    tick(&world.orch, root, LINES, now() + 8 * DAY_MS, || Some(ABOVE)).await;
+
+    assert!(!world.exists("lab"), "seven days quiet and nobody's");
+    assert!(world.exists("nsc.1.1.builder"));
+    let report = world.orch.host_scratch.report();
+    assert!(report.pressure.is_none(), "no pressure pass ran");
+    let removal = report
+        .quiet_removals
+        .iter()
+        .find(|removal| removal.name == "lab")
+        .expect("the removal is reported");
+    assert_eq!(removal.footprint.logical_bytes, LAB_BYTES);
+    assert!(removal.footprint.newest_write_unix_ms > 0);
+    assert!(removal.why.contains("seven days quiet"), "{}", removal.why);
+    assert_eq!(report.quiet_reclaimed.count, 1);
+    assert_eq!(report.quiet_reclaimed.logical_bytes, LAB_BYTES);
+    assert!(
+        report.removals.iter().all(|removal| removal.name != "lab"),
+        "kept apart from the ended-residence removals"
+    );
+    assert!(report
+        .census
+        .unwrap()
+        .entries
+        .iter()
+        .all(|entry| entry.name != "lab"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unowned_entry_written_within_seven_days_survives_a_pass_above_the_line() {
+    let world = world().await;
+    let root = world.root();
+    std::fs::create_dir_all(root.join("lab")).unwrap();
+    std::fs::write(root.join("lab/data.bin"), vec![3_u8; LAB_BYTES as usize]).unwrap();
+
+    tick(&world.orch, root, LINES, now() + 6 * DAY_MS, || Some(ABOVE)).await;
+
+    assert!(world.exists("lab"));
+    let report = world.orch.host_scratch.report();
+    assert!(report.quiet_removals.is_empty());
+    assert_eq!(report.quiet_reclaimed.count, 0);
+}
+
+/// The rule needs a last write measured in the same pass. A pass that only
+/// carries the previous census forward leaves the entry, however old that
+/// reading says its last write was, and the next measuring pass takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_seven_day_rule_never_acts_on_carried_forward_sizes() {
+    let world = world().await;
+    let root = world.root();
+    std::fs::create_dir_all(root.join("lab")).unwrap();
+    std::fs::write(root.join("lab/data.bin"), vec![3_u8; LAB_BYTES as usize]).unwrap();
+    let first = now() + 7 * DAY_MS - HOUR_MS;
+
+    // Measured, and an hour short of seven days.
+    tick(&world.orch, root.clone(), LINES, first, || Some(ABOVE)).await;
+    assert!(world.exists("lab"));
+
+    // Past seven days by the carried reading, but the census is two hours
+    // old, so nothing is measured and nothing is taken.
+    tick(
+        &world.orch,
+        root.clone(),
+        LINES,
+        first + 2 * HOUR_MS,
+        || Some(ABOVE),
+    )
+    .await;
+    assert!(
+        world.exists("lab"),
+        "a carried-forward reading never removes"
+    );
+    assert!(world.orch.host_scratch.report().quiet_removals.is_empty());
+
+    // The census is due again: measured, and taken.
+    tick(&world.orch, root, LINES, first + 6 * HOUR_MS, || {
+        Some(ABOVE)
+    })
+    .await;
+    assert!(!world.exists("lab"));
+    assert_eq!(world.orch.host_scratch.report().quiet_reclaimed.count, 1);
+}
+
 /// Closing a thread removes the residences of its jobs that nothing holds and
 /// closes its portable scratch, whose replicas are then marked for removal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -549,7 +801,7 @@ async fn closing_a_thread_removes_its_residences_and_closes_its_scratch() {
         .orch
         .db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
                VALUES ('thread-{suffix}', 'p', 'closing-{suffix}', 'active', 'none', 1, 1);
              INSERT INTO jobs(id, project_id, thread_id, node_name, status, uri_segment, created_at, updated_at)
@@ -599,7 +851,7 @@ async fn resolving_an_issue_removes_its_residences_and_marks_its_replicas() {
         .orch
         .db
         .local
-        .execute_script(&format!(
+        .execute_script(format!(
             "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('issue-{suffix}', 'p', 3, 'Resolving', 'merged', 'none', 1, 1);
              INSERT INTO jobs(id, project_id, issue_id, node_name, status, uri_segment, created_at, updated_at)

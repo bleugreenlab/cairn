@@ -928,6 +928,17 @@ mod tests {
         let mutation = rewritten.iter().position(|byte| *byte == b'x').unwrap();
         rewritten[mutation] = b'y';
         std::fs::write(&path, rewritten).unwrap();
+        // A same-length rewrite inside one coarse-clock tick keeps the original
+        // mtime, so step the mtime past it to make the rewrite visible.
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(written + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
 
         let pass = repair_path(&path, "session", &mut index);
         assert!(pass.used_full_scan);

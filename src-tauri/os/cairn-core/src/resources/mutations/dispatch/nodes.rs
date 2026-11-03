@@ -51,6 +51,25 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+            // The contract gate admits `executor` or `action`, never both.
+            if let Some(value) = payload.get("executor") {
+                return placement_default_patch(
+                    orch,
+                    request,
+                    PlacementDefaultHome {
+                        project,
+                        number: *number,
+                        exec_seq: *exec_seq,
+                        node_id,
+                        task_name: None,
+                    },
+                    value,
+                    dry_run,
+                )
+                .await
+                .map(Some)
+                .map_err(|error| build_failure(index, item, error));
+            }
             let action = payload_str(payload, "action", &[]).ok_or_else(|| {
                 build_failure(
                     index,
@@ -231,7 +250,73 @@ pub(super) async fn dispatch(
                 }
             }
         }
+        (
+            CairnResource::Task {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            },
+            ChangeMode::Patch,
+        ) => {
+            let value = item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("executor"))
+                .ok_or_else(|| build_failure(index, item, "payload.executor is required"))?;
+            placement_default_patch(
+                orch,
+                request,
+                PlacementDefaultHome {
+                    project,
+                    number: *number,
+                    exec_seq: *exec_seq,
+                    node_id,
+                    task_name: Some(task_name),
+                },
+                value,
+                dry_run,
+            )
+            .await
+            .map_err(|error| build_failure(index, item, error))?
+        }
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+/// The node or task coordinate an `executor` patch addresses.
+struct PlacementDefaultHome<'a> {
+    project: &'a str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &'a str,
+    task_name: Option<&'a str>,
+}
+
+/// Set or clear the placement default of the job a node or task URI names.
+/// A thread's own session is keyed by its thread, which `DefaultOwner` decides
+/// from the job, so a thread addressed through its reserved node coordinate
+/// lands on the same row as one addressed by name.
+async fn placement_default_patch(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    home: PlacementDefaultHome<'_>,
+    value: &serde_json::Value,
+    dry_run: bool,
+) -> Result<String, String> {
+    use crate::fleet::placement_default::{apply_patch, DefaultOwner};
+    let db = orch.db.for_project(home.project).await;
+    let job_id = crate::resources::resolve_node_or_task_job_id(
+        &db,
+        home.project,
+        home.number,
+        home.exec_seq,
+        home.node_id,
+        home.task_name,
+    )
+    .await?;
+    let owner = DefaultOwner::for_job(&db, &job_id).await?;
+    apply_patch(orch, request, &db, &owner, value, dry_run).await
 }

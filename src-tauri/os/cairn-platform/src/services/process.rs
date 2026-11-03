@@ -18,6 +18,8 @@ use cairn_sandbox::Confinement;
 #[cfg(test)]
 use cairn_sandbox::SandboxPolicy;
 
+pub use super::inherited_secret::InheritedSecret;
+
 /// Configuration for spawning a process.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -27,7 +29,7 @@ pub struct SpawnConfig {
     pub env: HashMap<String, String>,
     pub capture_stdout: bool,
     pub capture_stderr: bool,
-    capture_stdin: bool,
+    pub(super) capture_stdin: bool,
     /// What this spawn is wrapped in. Defaults to `Unconfined`, Cairn's own
     /// process; an agent spawn states `CredentialFloor` or `Fenced`.
     pub confinement: Confinement,
@@ -38,6 +40,10 @@ pub struct SpawnConfig {
     /// (`crate::env::DEV_INSTANCE_ROUTING_ENV`) so a worktree command builds into
     /// its own target dir rather than the shared one.
     pub env_remove: Vec<String>,
+    /// A secret the child reads from an inherited descriptor instead of its
+    /// environment. Only `spawn` delivers one, only on Unix, and only to an
+    /// unconfined spawn; anything else that carries one is refused.
+    pub inherited_secret: Option<InheritedSecret>,
 }
 
 impl SpawnConfig {
@@ -52,7 +58,14 @@ impl SpawnConfig {
             capture_stdin: false,
             confinement: Confinement::Unconfined,
             env_remove: Vec::new(),
+            inherited_secret: None,
         }
+    }
+
+    /// Hand the child `secret` on an inherited descriptor.
+    pub fn inherited_secret(mut self, secret: InheritedSecret) -> Self {
+        self.inherited_secret = Some(secret);
+        self
     }
 
     /// Say what this spawn is wrapped in.
@@ -191,7 +204,7 @@ pub struct RealProcessSpawner;
 /// On macOS the argv is rewritten to run under `sandbox-exec`; on Linux a
 /// landlock `pre_exec` hook is installed. The cwd and env are applied after so
 /// they take effect inside the wrapped invocation.
-fn build_command(config: &SpawnConfig) -> std::process::Command {
+pub(super) fn build_command(config: &SpawnConfig) -> std::process::Command {
     let (program, args) = config.confinement.wrap_argv(&config.program, &config.args);
 
     // Resolve against the PATH the child will actually carry, so an overlay
@@ -236,6 +249,9 @@ fn build_command(config: &SpawnConfig) -> std::process::Command {
 
 impl ProcessSpawner for RealProcessSpawner {
     fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String> {
+        if let Some(secret) = &config.inherited_secret {
+            return super::inherited_secret::spawn(&config, secret);
+        }
         let mut cmd = build_command(&config);
 
         if config.capture_stdout {
@@ -263,6 +279,9 @@ impl ProcessSpawner for RealProcessSpawner {
     }
 
     fn run(&self, config: SpawnConfig) -> Result<CommandOutput, String> {
+        if config.inherited_secret.is_some() {
+            return Err("an inherited secret is delivered only by spawn".to_string());
+        }
         let mut cmd = build_command(&config);
 
         let output = crate::process::observed_output(&mut cmd)

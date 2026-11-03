@@ -11,20 +11,29 @@ pub(crate) const NODE_CONTRACT: ResourceContract =
         kind: ResourceKind::Node,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}",
         name: "Node summary",
-        description: "Execution node summary with status and metadata. A patch with action:stop interrupts a running node's active turn and parks its session warm (resumable, not a kill). A `pr` action node also reads back its live GitHub state and accepts merge/close/refresh/publish actions on this bare URI.",
+        description: "Execution node summary with status and metadata. A patch with action:stop interrupts a running node's active turn and parks its session warm (resumable, not a kill). A patch with executor sets the node's placement default, which its own run batches, terminals and REPLs inherit when a call names no executor (executor:null clears it); a patch carries action or executor, never both. A `pr` action node also reads back its live GitHub state and accepts merge/close/refresh/publish actions on this bare URI.",
         read_projections: &[ProjectionSpec {
             key: "diff",
             values: "full (inline the live PR patch text on a pr action node)",
         }],
         related: NODE_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
-        mutations: &[MutationSpec {
-            mode: ChangeMode::Patch,
-            required: &[NODE_ACTION],
-            optional: &[PR_METHOD, PR_PRECONDITION],
-            label: "stop a running node or act on a pr action node",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE\",mode:\"patch\",payload:{action:\"stop\"}}]})",
-        }],
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[NODE_ACTION],
+                optional: &[PR_METHOD, PR_PRECONDITION],
+                label: "stop a running node or act on a pr action node",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE\",mode:\"patch\",payload:{action:\"stop\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[PLACEMENT_DEFAULT_EXECUTOR],
+                optional: &[],
+                label: "set or clear the node's placement default",
+                example: "write({changes:[{target:\"cairn:~\",mode:\"patch\",payload:{executor:{name:\"bbs\"}}}]})",
+            },
+        ],
     };
 
 pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =

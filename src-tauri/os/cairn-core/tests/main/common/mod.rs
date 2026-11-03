@@ -367,6 +367,7 @@ fn test_executor_advertisement(
             containment: None,
             page_call_programs: None,
             github_credential: None,
+            machine_services: Vec::new(),
         },
         current_load: 0,
         warm_roots: pool.map(ExecutorPool::warm_roots).unwrap_or_default(),
@@ -1090,6 +1091,29 @@ pub async fn seed_authenticated_thread_run(
     )
     .await
     .unwrap();
+}
+
+/// Queue a user `steer` follow-up for job `job-1`.
+pub async fn enqueue_steer(db: &LocalDb, id: &str, content: &str) {
+    db.execute(
+        "INSERT INTO queued_messages(id, job_id, content, delivery, created_at)
+         VALUES (?1, 'job-1', ?2, 'steer', 5)",
+        params![id.to_string(), content.to_string()],
+    )
+    .await
+    .unwrap();
+}
+
+/// Whether queued message `id` is still undelivered.
+pub async fn pending(db: &LocalDb, id: &str) -> bool {
+    db.query_one(
+        "SELECT COUNT(*) FROM queued_messages WHERE id = ?1 AND delivered_at IS NULL",
+        params![id.to_string()],
+        |row| row.i64(0),
+    )
+    .await
+    .unwrap()
+        == 1
 }
 
 pub async fn test_orchestrator() -> (tempfile::TempDir, Orchestrator) {

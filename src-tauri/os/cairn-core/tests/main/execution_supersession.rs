@@ -200,6 +200,16 @@ async fn starting_a_successor_freezes_the_whole_prior_execution_in_one_transacti
     assert_eq!(
         count(
             &db,
+            "SELECT COUNT(*) FROM sessions WHERE job_id IN ('builder-1','review-1','task-1') \
+             AND (terminal_reason IS NOT 'superseded' OR closed_at IS NOT 1000)"
+        )
+        .await,
+        0,
+        "they record why and when the supersession closed them"
+    );
+    assert_eq!(
+        count(
+            &db,
             "SELECT COUNT(*) FROM turns WHERE job_id = 'builder-1' \
              AND state IN ('pending','running','yielded')"
         )

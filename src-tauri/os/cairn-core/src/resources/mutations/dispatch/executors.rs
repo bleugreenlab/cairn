@@ -27,8 +27,11 @@ struct ConfigureRequest {
     /// What the machine is for: buildsOnly, general, or inferenceOnly. Runner
     /// state like draining, so it is durable and unfenced.
     role: Option<cairn_common::executor_protocol::MachineRole>,
-    #[serde(alias = "desktop_automation")]
-    desktop_automation: Option<bool>,
+    /// Pack-declared machine services to select (`{}`, or
+    /// `{override:{command}}`) or unselect (`null`) on this machine, keyed
+    /// `<pack>/<service>`. Stored fleet configuration, not an authorization gate.
+    #[serde(alias = "machine_services")]
+    machine_services: Option<management::MachineServiceChanges>,
     /// Declare this machine repaired, re-arming every check its old environment
     /// had infrastructure-suppressed. For a repair the executor's own attach
     /// probes can see, restarting it does the same thing; this is for the ones
@@ -193,21 +196,21 @@ pub(super) async fn dispatch(
                     build_failure(
                         index,
                         item,
-                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), desktopAutomation, repaired, buildRoot, and expectedGeneration."),
+                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, and expectedGeneration."),
                     )
                 })?;
             if request.new_name.is_none()
                 && request.runtime_policy.is_none()
                 && request.draining.is_none()
                 && request.role.is_none()
-                && request.desktop_automation.is_none()
+                && request.machine_services.is_none()
                 && request.repaired.is_none()
                 && request.build_root.is_none()
             {
                 return Err(build_failure(
                     index,
                     item,
-                    "a patch changes newName, runtimePolicy, draining, role, desktopAutomation, repaired, or buildRoot; none was supplied",
+                    "a patch changes newName, runtimePolicy, draining, role, machineServices, repaired, or buildRoot; none was supplied",
                 ));
             }
             // Resolve first, so an unknown machine is refused identically whether
@@ -232,11 +235,16 @@ pub(super) async fn dispatch(
                 if let Some(new_name) = &request.new_name {
                     planned.push(format!("rename {name} to {new_name}"));
                 }
-                if let Some(enabled) = request.desktop_automation {
-                    planned.push(format!(
-                        "turn desktop automation {}",
-                        if enabled { "on" } else { "off" }
-                    ));
+                for (key, selection) in request.machine_services.iter().flatten() {
+                    planned.push(
+                        match selection.as_ref().map(|chosen| chosen.override_command()) {
+                            Some(Some(command)) => {
+                                format!("select {key} on {name} running {command}")
+                            }
+                            Some(None) => format!("select {key} on {name}"),
+                            None => format!("unselect {key} on {name}"),
+                        },
+                    );
                 }
                 if request.runtime_policy.is_some() {
                     planned.push("apply a runtime policy".to_string());
@@ -273,32 +281,10 @@ pub(super) async fn dispatch(
                 format!("Would {}", planned.join(", "))
             } else {
                 let mut applied = Vec::new();
-                if let Some(enabled) = request.desktop_automation {
-                    let mut fleet = crate::config::settings::load_fleet(orch.mcp_auth.config_dir());
-                    let public_name =
-                        cairn_common::executor_protocol::normalize_executor_name(name).ok_or_else(
-                            || build_failure(index, item, "executor name has no public form"),
-                        )?;
-                    fleet
-                        .desktop_automation
-                        .machines
-                        .entry(public_name)
-                        .or_default()
-                        .enabled = Some(enabled);
-                    crate::config::settings::set_fleet(orch.mcp_auth.config_dir(), &fleet)
+                if let Some(changes) = &request.machine_services {
+                    let summaries = management::set_machine_services(orch, name, changes)
                         .map_err(|error| build_failure(index, item, error))?;
-                    if enabled {
-                        let orch = orch.clone();
-                        tokio::spawn(async move {
-                            crate::fleet::desktop::probe_attached_desktops(&orch).await;
-                        });
-                    } else if let Some(gateway) = orch.mcp_gateway() {
-                        gateway.close_placed(name).await;
-                    }
-                    applied.push(format!(
-                        "desktop automation {}",
-                        if enabled { "enabled" } else { "disabled" }
-                    ));
+                    applied.extend(summaries);
                 }
                 if let Some(policy) = request.runtime_policy {
                     management::set_runtime_policy(

@@ -5,11 +5,20 @@
 //! edited — never on display text, a summary, or anything an agent authored.
 //! That is what makes the scope name mean the same thing to the prompt, to the
 //! grant, and to the re-check immediately before persistence.
+//!
+//! Each request that can raise a card also names its act ([`ActDigest`]), the
+//! resolved content a `Once` grant binds to. The digest is taken over the
+//! inputs both check points derive the request from, the change item and the
+//! target it resolved to, and never over live state that could move between
+//! them, so the gate and the pre-persist re-check name the same act.
 
 use cairn_common::authorization::{
-    AuthorityAction, AuthorityMutation, AuthorityPlace, AuthorityRequest, AuthorityScope,
-    McpConfigFingerprint, ToolKind,
+    ActDigest, AuthorityAction, AuthorityMutation, AuthorityPlace, AuthorityRequest,
+    AuthorityScope, McpConfigFingerprint, ToolKind,
 };
+use serde_json::Value;
+
+use crate::mcp::types::ChangeItem;
 
 /// The one local workspace. Multi-workspace resolution, when it exists, belongs
 /// here rather than at each call site.
@@ -71,6 +80,43 @@ pub fn workspace_settings_write(
     ))
 }
 
+/// One section of a `cairn://settings` patch, naming the act: the value the
+/// patch writes to that section. Each section is its own request, so a Once
+/// approval of one section's value covers neither another value for it nor
+/// another section.
+///
+/// The value is the section's payload as written, an edit list for the
+/// list-shaped sections, rather than the section as it would stand afterwards:
+/// the resultant state reads the live store, which can move between the gate
+/// and the re-check, while the payload is the same at both.
+pub fn workspace_settings_section_write(
+    workspace_id: &str,
+    section: &str,
+    value: &Value,
+) -> Result<AuthorityRequest, UnnameableTarget> {
+    let request = workspace_settings_write(workspace_id, section)?;
+    let act = ActDigest::of("settings.section", |encoder| {
+        encoder.field("workspace", workspace_id);
+        encoder.field("section", section.trim());
+        encoder.json("value", value);
+    });
+    Ok(request.with_act(act))
+}
+
+/// The act a change item performs, for a carrier whose authority is the item
+/// as a whole: its target, its mode, and its payload. `kind` separates the
+/// carriers that use it.
+pub fn change_item_act(kind: &str, item: &ChangeItem) -> ActDigest {
+    ActDigest::of(kind, |encoder| {
+        encoder.field("target", item.target.trim());
+        encoder.json(
+            "mode",
+            &serde_json::to_value(item.mode).unwrap_or(Value::Null),
+        );
+        encoder.json("payload", item.payload.as_ref().unwrap_or(&Value::Null));
+    })
+}
+
 /// Writing Cairn's inference records (`cairn://inference` replace, or a patch
 /// that upserts or removes) → the same `WorkspaceSettings(inference) + Write`
 /// place a `cairn://settings` `inference` patch reaches.
@@ -79,7 +125,9 @@ pub fn workspace_settings_write(
 /// start and stop commands are shell its head machine runs as its account.
 /// Authority is keyed to the place reached rather than the carrier, so a grant
 /// for either door covers the other.
-pub fn inference_records_write(workspace_id: &str) -> AuthorityRequest {
+///
+/// The act is the change item that writes the records.
+pub fn inference_records_write(workspace_id: &str, item: &ChangeItem) -> AuthorityRequest {
     let scope = AuthorityScope::new(
         AuthorityPlace::WorkspaceSettings {
             workspace_id: workspace_id.to_string(),
@@ -93,6 +141,7 @@ pub fn inference_records_write(workspace_id: &str) -> AuthorityRequest {
         "write the inference records, whose start and stop commands run on their head machines"
             .to_string(),
     )
+    .with_act(change_item_act("inference.records", item))
 }
 
 /// Workspace `cairn://mcp` create/patch/delete → `Tool(…, McpServer, …) + Write`.
@@ -127,7 +176,23 @@ pub fn workspace_mcp_write(
         AuthorityMutation::Update => format!("reconfigure workspace MCP server '{server}'"),
         AuthorityMutation::Delete => format!("remove workspace MCP server '{server}'"),
     };
-    Ok(AuthorityRequest::new(scope, mutation, summary).with_mcp_config(fingerprint))
+    // The resultant configuration already names the act, mutation and server
+    // included; the act digest carries it so a Once grant binds the same way
+    // every other kind's does.
+    let act = ActDigest::of("mcp.write", |encoder| {
+        encoder.field("workspace", workspace_id);
+        encoder.field("server", &server);
+        encoder.field("mutation", mutation.as_str());
+        encoder.field("config.algorithm", &fingerprint.algorithm);
+        encoder.field(
+            "config.encoding_version",
+            &fingerprint.encoding_version.to_string(),
+        );
+        encoder.field("config.digest", &fingerprint.digest);
+    });
+    Ok(AuthorityRequest::new(scope, mutation, summary)
+        .with_mcp_config(fingerprint)
+        .with_act(act))
 }
 
 /// Starting a subscription sign-in through `cairn://models/accounts` → the same
@@ -152,6 +217,17 @@ pub fn provider_sign_in(
         AuthorityAction::Write,
     );
     let provider_name = provider_name(provider);
+    let act = ActDigest::of("accounts.sign_in", |encoder| {
+        encoder.field("workspace", workspace_id);
+        encoder.field("provider", provider.backend());
+        match account_id {
+            None => encoder.field("account", "new"),
+            Some(account_id) => {
+                encoder.field("account", "existing");
+                encoder.field("account.id", account_id);
+            }
+        }
+    });
     match account_id {
         None => AuthorityRequest::new(
             scope,
@@ -164,6 +240,7 @@ pub fn provider_sign_in(
             format!("re-authenticate workspace account {account_id} ({provider_name})"),
         ),
     }
+    .with_act(act)
 }
 
 fn provider_name(provider: cairn_models::accounts::RoutedProvider) -> &'static str {
@@ -200,6 +277,10 @@ pub fn usage_reset_spend(
             provider_name(provider)
         ),
     )
+    .with_act(ActDigest::of("accounts.use_reset", |encoder| {
+        encoder.field("provider", provider.backend());
+        encoder.field("account", account_id);
+    }))
 }
 
 #[cfg(test)]
@@ -287,6 +368,72 @@ mod tests {
             new.summary
         );
         assert!(again.summary.contains("acc_1"), "{}", again.summary);
+    }
+
+    /// Every request that can raise a card names its act, and two different
+    /// acts at one place never share one.
+    #[test]
+    fn every_carded_request_names_its_act() {
+        use cairn_models::accounts::RoutedProvider;
+        let section = |value: Value| {
+            workspace_settings_section_write("default", "models", &value)
+                .unwrap()
+                .facts
+                .act
+                .expect("a settings section names its act")
+        };
+        assert_eq!(
+            section(serde_json::json!({"a": 1, "b": 2})),
+            section(serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap())
+        );
+        assert_ne!(
+            section(serde_json::json!({"a": 1})),
+            section(serde_json::json!({"a": 2}))
+        );
+
+        let item = |payload: Value| ChangeItem {
+            target: "cairn://inference".to_string(),
+            mode: crate::mcp::types::ChangeMode::Patch,
+            payload: Some(payload),
+        };
+        let records = |payload: Value| inference_records_write("default", &item(payload)).facts.act;
+        assert!(records(serde_json::json!({"upsert": "a"})).is_some());
+        assert_ne!(
+            records(serde_json::json!({"upsert": "a"})),
+            records(serde_json::json!({"upsert": "b"}))
+        );
+
+        let mcp_act = |digest: &str| {
+            workspace_mcp_write(
+                "default",
+                "linear",
+                AuthorityMutation::Update,
+                fingerprint(digest),
+            )
+            .unwrap()
+            .facts
+            .act
+        };
+        assert!(mcp_act("a").is_some());
+        assert_ne!(mcp_act("a"), mcp_act("b"));
+
+        let new = provider_sign_in("default", RoutedProvider::Claude, None)
+            .facts
+            .act;
+        let codex = provider_sign_in("default", RoutedProvider::Codex, None)
+            .facts
+            .act;
+        let again = provider_sign_in("default", RoutedProvider::Claude, Some("acc_1"))
+            .facts
+            .act;
+        assert!(new.is_some());
+        assert_ne!(new, codex);
+        assert_ne!(new, again);
+
+        let first = usage_reset_spend(RoutedProvider::Codex, "acc_1").facts.act;
+        let second = usage_reset_spend(RoutedProvider::Codex, "acc_2").facts.act;
+        assert!(first.is_some());
+        assert_ne!(first, second);
     }
 
     /// A reset is spent at its account, never at the credential store a

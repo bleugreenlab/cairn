@@ -559,14 +559,14 @@ pub struct HeldExecution {
     /// with no capacity row yet, its oldest gate's `created_at`. The age a
     /// surface shows; never the order.
     pub held_since: i64,
-    /// Its place in the queue: its earliest capacity row's `queue_key`, unique
-    /// within its database, or, with no capacity row yet, its oldest gate's
-    /// `created_at` on the key's scale. The sweep releases in this order across
-    /// every database, ties broken by database, then issue number (none last),
-    /// then seq: only executions with no capacity row can tie, as a burst
-    /// filed in one second does. An execution that waited on its `after:`
-    /// gates takes a capacity key only when those clear, so this agrees with
-    /// the place in line a capacity row renders.
+    /// Its key: its earliest capacity row's `queue_key`, unique within its
+    /// database, or, with no capacity row yet, its oldest gate's `created_at`
+    /// on the key's scale. The sweep EVALUATES held executions in this order
+    /// across every database, ties broken by database, then issue number (none
+    /// last), then seq: only executions with no capacity row can tie, as a
+    /// burst filed in one second does. It is not the release order: the fleet
+    /// releases lanes in rotation, each lane in key order
+    /// (`cairn-core`'s `execution::gates::rotation`).
     pub queue_key: i64,
 }
 

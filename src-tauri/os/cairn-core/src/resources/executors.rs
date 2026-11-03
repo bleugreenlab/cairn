@@ -437,7 +437,10 @@ pub(crate) fn render_executors(
         for remote in enrolled {
             out.push_str(&format!("### {}\n", remote.name));
             out.push_str(&format!("- Platform: {} / {}\n", remote.os, remote.arch));
-            out.push_str(&format!("- Link: {}\n", enrolled_link_summary(remote)));
+            out.push_str(&format!(
+                "- Link: {}\n",
+                enrolled_link_summary(remote, captured_at_unix_ms)
+            ));
             if remote.role != MachineRole::General {
                 out.push_str(&machine_role_line(remote.role));
             }
@@ -646,7 +649,10 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     out.push_str(&format!("- Platform: {} / {}\n\n", remote.os, remote.arch));
 
     out.push_str("## Link\n");
-    out.push_str(&format!("- Status: {}\n", enrolled_link_summary(remote)));
+    out.push_str(&format!(
+        "- Status: {}\n",
+        enrolled_link_summary(remote, captured_at_unix_ms)
+    ));
     // Draining is runner-side state, so it is one of the few things worth
     // saying about a machine that is reporting nothing: it decides what happens
     // when this one comes back.
@@ -701,6 +707,20 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
         out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
         return out;
     }
+    if let Some(update) = &remote.unreturned_update {
+        out.push_str(&format!(
+            "This machine was emptied and directed to install {build}, and did not dial back in within {minutes} minutes: the artifact download's own bound plus the replacement's rollback deadline. Its last words on the link (`executor updating to build …`) were true for the seconds of a restart, not since. The build is halted, so no other machine is sent it. {restart}\n",
+            build = update.build_id,
+            minutes = crate::fleet::rollout::RETURN_BUDGET_MS / 60_000,
+            restart = match &update.restart {
+                None => "The runner restarts its daemon once over this machine's ssh bootstrap; the outcome appears above when it has one.",
+                Some(cairn_common::executor_protocol::UpdateRestart { outcome: None, .. }) => "The runner is restarting its daemon once over this machine's ssh bootstrap now.",
+                Some(cairn_common::executor_protocol::UpdateRestart { outcome: Some(_), .. }) => "The runner restarted its daemon once over this machine's ssh bootstrap, with the outcome above, and does not try again for this build: bringing it back is the operator's from here.",
+            },
+        ));
+        out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
+        return out;
+    }
     out.push_str(match &remote.link {
         RemoteLinkState::Bootstrapping { .. } => {
             "This machine is being bootstrapped: the runner is installing the executor and registering it as a service over SSH. That is a one-time ceremony; once it finishes the machine connects on its own and the runner stops reaching into it.\n"
@@ -740,11 +760,21 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
 }
 
 /// One machine's link condition in a single line.
-fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
+fn enrolled_link_summary(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
     // Ahead of the link state, which still reads absent: the machine does dial
     // in, and what keeps it out is the runner, which is the fact to lead with.
     if let Some(stranded) = &remote.stranded {
         return stranded.describe();
+    }
+    // Ahead of the link too, whose reason is still the executor's parting
+    // `executor updating to build …`: past the return bound the runner has
+    // concluded otherwise, and that conclusion is the fact to lead with.
+    if let Some(update) = &remote.unreturned_update {
+        return crate::fleet::unreturned::describe(
+            update,
+            remote.last_seen_unix_ms,
+            captured_at_unix_ms,
+        );
     }
     let attempt = remote.last_attempt.as_ref();
     let summary = attempt.map(|attempt| attempt.summary.as_str());
@@ -917,12 +947,40 @@ fn render_self_update(
             "not compared: the runner has no {} executor to serve ({reason})",
             status.target
         ),
-        SelfUpdatePhase::Waiting { behind: Some(name) } => format!(
-            "update pending: waiting for {name} to finish updating, since the fleet updates one machine at a time"
+        SelfUpdatePhase::Waiting {
+            ahead,
+            updating: Some(name),
+        } => format!(
+            "update pending: {} ahead, {name} updating now, since the fleet updates one machine at a time",
+            machines(*ahead)
         ),
-        SelfUpdatePhase::Waiting { behind: None } => {
-            "update pending: next in line".to_string()
-        }
+        SelfUpdatePhase::Waiting {
+            ahead: 0,
+            updating: None,
+        } => "update pending: next in line".to_string(),
+        SelfUpdatePhase::Waiting {
+            ahead,
+            updating: None,
+        } => format!(
+            "update pending: {} ahead, none updating now",
+            machines(*ahead)
+        ),
+        SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms,
+            cycles,
+            waits_for_turn: true,
+            updating,
+            ..
+        } => format!(
+            "draining for update: empty, and updates next{} (new work refused since {}){}",
+            match updating {
+                Some(name) => format!(", once {name} has finished updating"),
+                None => String::new(),
+            },
+            age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
+            restart_cycles(cycles)
+        ),
         SelfUpdatePhase::Draining {
             in_flight: 0,
             since_unix_ms,
@@ -938,6 +996,8 @@ fn render_self_update(
             since_unix_ms,
             holds,
             cycles,
+            waits_for_turn,
+            ..
         } => {
             let waiting_on = match holds.first() {
                 Some(hold) => format!(
@@ -949,7 +1009,12 @@ fn render_self_update(
                 None => String::new(),
             };
             format!(
-                "draining for update: {in_flight} in flight{waiting_on}; new work goes elsewhere (since {}){}",
+                "draining for update: {in_flight} in flight{waiting_on}; new work goes elsewhere{} (since {}){}",
+                if *waits_for_turn {
+                    ", and it holds no other machine's update"
+                } else {
+                    ""
+                },
                 age(captured_at_unix_ms.saturating_sub(*since_unix_ms)),
                 restart_cycles(cycles)
             )
@@ -972,6 +1037,14 @@ fn render_self_update(
         SelfUpdatePhase::Excluded { cause } => {
             format!("update skipped on this machine for {served}: {cause}")
         }
+    }
+}
+
+/// `1 machine`, `2 machines`.
+fn machines(count: u32) -> String {
+    match count {
+        1 => "1 machine".to_string(),
+        count => format!("{count} machines"),
     }
 }
 
@@ -2011,14 +2084,20 @@ fn render_holdings(
 }
 
 /// The runner's own scratch root on the colocated machine: who owns what is in
-/// it, what went when its owner ended, and what the last pass under disk
-/// pressure took. Exclusive bytes are what a removal frees at least; logical
+/// it, what went when its owner ended, what went after seven quiet days, and
+/// what the last pass under disk pressure took. Exclusive bytes are what a removal frees at least; logical
 /// bytes overstate a tree of clones.
 pub(crate) fn render_runner_scratch(
     report: &crate::scratch::residences::Report,
     captured_at_unix_ms: u64,
 ) -> String {
-    use crate::scratch::residences::{Footprint, Owner};
+    use crate::scratch::residences::{
+        Footprint, Owner, UNOWNED_QUIET_OUTSIDE_PRESSURE, UNOWNED_SIZE_FLOOR,
+    };
+    let stamp = |unix_ms: u64| {
+        crate::clock::stamp_millis_with_seconds(unix_ms as i64)
+            .unwrap_or_else(|| "an unknown time".to_string())
+    };
     let footprint_text = |footprint: &Footprint| {
         format!(
             "{}, frees at least {}",
@@ -2077,14 +2156,28 @@ pub(crate) fn render_runner_scratch(
             };
             let unowned_largest = largest(|owner| matches!(owner, Owner::Unowned));
             if !unowned_largest.is_empty() {
-                out.push_str("- Unowned, taken under disk pressure coldest first once nothing has been written for 24h (1h at the critical line):\n");
+                out.push_str(&format!(
+                    "- Unowned, reclaimed once nothing has been written for seven days, and sooner under disk pressure (largest first, after 24h; 1h at the critical line); one freeing under {} is never taken:\n",
+                    bytes(UNOWNED_SIZE_FLOOR)
+                ));
                 for entry in unowned_largest {
                     let footprint = entry.footprint.unwrap_or_default();
+                    let due = footprint
+                        .newest_write_unix_ms
+                        .saturating_add(UNOWNED_QUIET_OUTSIDE_PRESSURE.as_millis() as u64);
+                    let due = if footprint.exclusive_bytes < UNOWNED_SIZE_FLOOR {
+                        "never taken: frees under the size floor".to_string()
+                    } else if due <= captured_at_unix_ms {
+                        "due at the next measuring pass".to_string()
+                    } else {
+                        format!("due {}", stamp(due))
+                    };
                     out.push_str(&format!(
-                        "  - `{}`: {}, last written {}\n",
+                        "  - `{}`: {}, last written {} ({}), {due}\n",
                         entry.name,
                         footprint_text(&footprint),
-                        age(captured_at_unix_ms.saturating_sub(footprint.newest_write_unix_ms))
+                        age(captured_at_unix_ms.saturating_sub(footprint.newest_write_unix_ms)),
+                        stamp(footprint.newest_write_unix_ms),
                     ));
                 }
             }
@@ -2113,9 +2206,27 @@ pub(crate) fn render_runner_scratch(
             ));
         }
     }
+    if !report.quiet_removals.is_empty() {
+        let tally = &report.quiet_reclaimed;
+        out.push_str(&format!(
+            "- Reclaimed after seven quiet days, newest last ({} since the runner started: {}, frees at least {}):\n",
+            tally.count,
+            bytes(tally.logical_bytes),
+            bytes(tally.exclusive_bytes),
+        ));
+        for removal in report.quiet_removals.iter().rev().take(5).rev() {
+            out.push_str(&format!(
+                "  - `{}` removed {}: {}, last written {}\n",
+                removal.name,
+                stamp(removal.at_unix_ms),
+                footprint_text(&removal.footprint),
+                stamp(removal.footprint.newest_write_unix_ms),
+            ));
+        }
+    }
     if let Some(pass) = &report.pressure {
         out.push_str(&format!(
-            "- Last pressure pass {}: band {:?}, asked {}, credited {} from {} unowned entr{}; free {} → {}; kept {} live ({}) and {} unowned written inside the quiet floor ({})\n",
+            "- Last pressure pass {}: band {:?}, asked {}, credited {} from {} unowned entr{}; free {} → {}; kept {} live ({}), {} unowned written inside the quiet floor ({}) and {} unowned freeing under {} each ({})\n",
             age(captured_at_unix_ms.saturating_sub(pass.at_unix_ms)),
             pass.band,
             bytes(pass.asked_bytes),
@@ -2128,6 +2239,9 @@ pub(crate) fn render_runner_scratch(
             bytes(pass.kept_live.logical_bytes),
             pass.kept_quiet.count,
             bytes(pass.kept_quiet.logical_bytes),
+            pass.kept_small.count,
+            bytes(UNOWNED_SIZE_FLOOR),
+            bytes(pass.kept_small.logical_bytes),
         ));
         for removal in &pass.removed {
             out.push_str(&format!(
@@ -4302,14 +4416,69 @@ fn render_running_now(
     }
     for (cell, key, process) in residents {
         out.push_str(&format!(
-            "- {}: resident `{}` (generation {}): {}\n",
+            "- {}: resident `{}` (generation {}): {}{}\n",
             cell.cell_id,
             key,
             process.generation,
-            usage(process.live_usage)
+            usage(process.live_usage),
+            describe_resident_charge(process),
         ));
     }
     out
+}
+
+/// What the executor charges a live resident against its memory budget and
+/// its admission hold, which price it alike, and on what evidence: a
+/// measurement, the claim it started under and how long it has been watched,
+/// or a stated reservation. Empty for a process that declares nothing and for
+/// an executor that does not report the charge.
+fn describe_resident_charge(process: &cairn_common::executor_protocol::ResidentProcess) -> String {
+    use cairn_common::executor_protocol::{
+        ResidentChargeBasis, MEASURED_RESERVATION_HEADROOM_PERCENT,
+    };
+    let Some(charge) = process.charge else {
+        return String::new();
+    };
+    let watched = |ms: u64| {
+        if ms < 90_000 {
+            duration_ms(ms)
+        } else {
+            span(ms)
+        }
+    };
+    let why = match charge.basis {
+        ResidentChargeBasis::Stated => "as its reservation states".to_string(),
+        ResidentChargeBasis::Claimed { watched_ms: None } => {
+            "declared, not yet read by the sampler".to_string()
+        }
+        ResidentChargeBasis::Claimed {
+            watched_ms: Some(0),
+        } => "declared, watched under one window".to_string(),
+        ResidentChargeBasis::Claimed {
+            watched_ms: Some(ms),
+        } => format!("declared, watched {}", watched(ms)),
+        ResidentChargeBasis::Measured {
+            peak_bytes,
+            watched_ms,
+            generation,
+        } => {
+            let inherited = if generation == process.generation {
+                String::new()
+            } else {
+                format!(" on generation {generation}")
+            };
+            let over = if watched_ms == 0 {
+                String::new()
+            } else {
+                format!(" over {}", watched(watched_ms))
+            };
+            format!(
+                "{} measured{inherited}{over}, plus {MEASURED_RESERVATION_HEADROOM_PERCENT}%",
+                bytes(peak_bytes)
+            )
+        }
+    };
+    format!("; charged {} ({why})", bytes(charge.memory_bytes))
 }
 
 fn age(ms: u64) -> String {
@@ -4662,7 +4831,8 @@ fn ineligibility_summary(refusals: &[PlacementRejectionReason]) -> Option<String
                 format!("setup needs `{program}`, which is not on its PATH")
             }
             PlacementRejectionReason::BuildPrerequisitesMissing { .. } => {
-                "work requiring the rust toolchain (build prerequisites MISSING)".to_string()
+                "Rust work, agents' execution environments included (build prerequisites MISSING)"
+                    .to_string()
             }
             PlacementRejectionReason::GithubCredentialMissing { .. } => {
                 "it fetches a private GitHub repository and this machine has no credential"
@@ -6764,6 +6934,7 @@ mod tests {
                         containment: None,
                         page_call_programs: None,
                         github_credential: None,
+                        machine_services: Vec::new(),
                     },
                     current_load: 0,
                     warm_roots: Vec::new(),
@@ -7211,7 +7382,7 @@ mod tests {
         );
         assert!(
             listed.contains(
-                "- Not eligible for cairn: setup needs bun; work requiring the rust toolchain (build prerequisites MISSING)\n"
+                "- Not eligible for cairn: setup needs bun; Rust work, agents' execution environments included (build prerequisites MISSING)\n"
             ),
             "{listed}"
         );
@@ -7246,6 +7417,68 @@ mod tests {
         assert!(
             rendered.contains("  - Provision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh\n"),
             "{rendered}"
+        );
+    }
+
+    /// bgsrv-win on 11-02 (cairn/5909): it advertised `rust` truthfully and
+    /// its LLVM satisfied libclang, yet no cairn-core build could get past
+    /// aegis. Its page has to say that the machine cannot build cairn, what
+    /// it lacks, the command that adds it, and that placement keeps cairn's
+    /// Rust work and its agents' environments off it until it re-attaches.
+    #[test]
+    fn a_windows_machine_without_clang_cl_says_what_it_lacks_and_what_placement_withholds() {
+        let missing_clang_cl = BuildPrerequisiteCheck {
+            script: "scripts/setup-self-hosted-runner-windows.ps1 -CheckPrerequisites".into(),
+            status: BuildPrerequisiteStatus::Missing,
+            detail: "Windows build prerequisites on BGSRV-WIN are missing clang-cl: aegis, in cairn-core's turso closure, compiles its C with clang-cl on MSVC, and cc finds clang-cl.exe only in Visual Studio's C++ Clang Compiler for Windows component or on PATH (LLVM's own clang-cl stays off PATH so it never builds whisper.cpp). Add Visual Studio's C++ Clang Compiler for Windows component from an elevated PowerShell with: & \"C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\setup.exe\" modify --installPath \"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\" --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --quiet --norestart".into(),
+        };
+        let mut executor = with_prerequisites("bgsrv-win", Some(missing_clang_cl.clone()));
+        executor.project_eligibility = vec![cairn_common::executor_protocol::ProjectEligibility {
+            project_id: "cairn".into(),
+            refusals: vec![PlacementRejectionReason::BuildPrerequisitesMissing {
+                project_id: "cairn".into(),
+                script: "scripts/setup-self-hosted-runner-windows.ps1".into(),
+                detail: missing_clang_cl.detail,
+            }],
+        }];
+
+        let page = render_executor(&executor);
+        assert!(
+            page.contains("- Build prerequisites: MISSING — `scripts/setup-self-hosted-runner-windows.ps1 -CheckPrerequisites`, as of this machine's last attach\n"),
+            "{page}"
+        );
+        assert!(
+            page.contains("  - Windows build prerequisites on BGSRV-WIN are missing clang-cl: "),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "--add Microsoft.VisualStudio.Component.VC.Llvm.Clang --quiet --norestart\n"
+            ),
+            "{page}"
+        );
+        assert!(
+            page.contains("  - cairn: not eligible — Rust work for cairn (a rust selector or setup, a cargo build, test or lint, or an agent's execution environment, whose shells build it) needs the build prerequisites in scripts/setup-self-hosted-runner-windows.ps1; this machine reads MISSING as of its last attach: Windows build prerequisites on BGSRV-WIN are missing clang-cl:"),
+            "{page}"
+        );
+        assert!(
+            page.contains(
+                "(lifted when the machine re-attaches with the prerequisites installed)\n"
+            ),
+            "{page}"
+        );
+
+        let listed = render_executors(
+            std::slice::from_ref(&executor),
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(
+            listed.contains("- Not eligible for cairn: Rust work, agents' execution environments included (build prerequisites MISSING)\n"),
+            "{listed}"
         );
     }
 
@@ -7804,7 +8037,104 @@ mod tests {
             drained: false,
             role: Default::default(),
             stranded: None,
+            unreturned_update: None,
         }
+    }
+
+    /// bgsrv-win, 11-02: directed to a build, closed its link saying so, and
+    /// never came back.
+    fn updating_specimen(
+        unreturned_update: Option<cairn_common::executor_protocol::UnreturnedUpdate>,
+    ) -> EnrolledRemote {
+        EnrolledRemote {
+            last_attempt: None,
+            unreturned_update,
+            ..enrolled(
+                "bgsrv-win",
+                RemoteLinkState::Absent {
+                    last_beat_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
+                    last_reason:
+                        "the executor closed this link: executor updating to build content-v2:3ee6fabd"
+                            .into(),
+                },
+            )
+        }
+    }
+
+    fn unreturned(
+        restart: Option<cairn_common::executor_protocol::UpdateRestart>,
+    ) -> cairn_common::executor_protocol::UnreturnedUpdate {
+        cairn_common::executor_protocol::UnreturnedUpdate {
+            build_id: "content-v2:3ee6fabd".into(),
+            directed_at_unix_ms: REMOTE_CAPTURED_AT - 7_200_000,
+            concluded_at_unix_ms: REMOTE_CAPTURED_AT - 5_700_000,
+            restart,
+        }
+    }
+
+    /// Past the return bound the page says the update stranded the machine,
+    /// on the fleet page and the machine's own, and no longer says 'updating'.
+    #[test]
+    fn an_unreturned_update_reads_as_did_not_return_not_as_updating() {
+        let remote = updating_specimen(Some(unreturned(None)));
+        let sentence = "did not return from the self-update to content-v2:3ee6fabd directed at 1970-01-01 00:46 UTC; last seen 2h ago";
+
+        let fleet = render_executors(
+            &[],
+            std::slice::from_ref(&remote),
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+        );
+        assert!(fleet.contains(&format!("- Link: {sentence}\n")), "{fleet}");
+        assert!(!fleet.contains("executor updating to build"), "{fleet}");
+
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(page.contains(&format!("- Status: {sentence}\n")), "{page}");
+        assert!(
+            page.contains("did not dial back in within 25 minutes"),
+            "{page}"
+        );
+        assert!(
+            page.contains("restarts its daemon once over this machine's ssh bootstrap"),
+            "{page}"
+        );
+        assert!(!page.contains("reconnects on its own"), "{page}");
+    }
+
+    /// The single restart's outcome rides on the same line, and the page
+    /// says the runner does not try again.
+    #[test]
+    fn the_restart_attempt_and_its_outcome_are_on_the_page() {
+        let remote = updating_specimen(Some(unreturned(Some(
+            cairn_common::executor_protocol::UpdateRestart {
+                attempted_at_unix_ms: REMOTE_CAPTURED_AT - 5_640_000,
+                outcome: Some(
+                    "ssh could not reach it, so its daemon was not restarted: ssh unreachable"
+                        .into(),
+                ),
+            },
+        ))));
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(
+            page.contains("; restart attempted at 1970-01-01 01:12 UTC: ssh could not reach it, so its daemon was not restarted: ssh unreachable\n"),
+            "{page}"
+        );
+        assert!(page.contains("does not try again for this build"), "{page}");
+    }
+
+    /// Before the bound, or once it is back, a machine renders as it always
+    /// has: the conclusion is what changes the sentence, not the absence.
+    #[test]
+    fn a_machine_with_no_unreturned_update_renders_its_link_as_before() {
+        let remote = updating_specimen(None);
+        let page = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(
+            page.contains("- Status: absent — the executor closed this link: executor updating to build content-v2:3ee6fabd\n"),
+            "{page}"
+        );
+        assert!(!page.contains("did not return"), "{page}");
     }
 
     /// A machine that was killed for its size still says how big it was.
@@ -9804,6 +10134,8 @@ mod tests {
                 progressing: None,
             }],
             cycles: vec!["service `iMessage channel`".into()],
+            waits_for_turn: false,
+            updating: None,
         });
         pending.health.build_skew = Some(cairn_common::executor_protocol::BuildSkew {
             runner_build_id: "build-1329".into(),
@@ -9832,6 +10164,8 @@ mod tests {
                 progressing: Some(true),
             }],
             cycles: Vec::new(),
+            waits_for_turn: false,
+            updating: None,
         }));
         assert!(
             slow.contains(
@@ -9851,12 +10185,57 @@ mod tests {
         );
         assert!(rendered.contains("- Self-update: current\n"), "{rendered}");
 
+        // The bginf-sp2 specimen (cairn/5965): an idle machine waits only on
+        // the machine updating now, and a draining one says it holds no one.
         let rendered = render_executor(&self_updating(SelfUpdatePhase::Waiting {
-            behind: Some("fedora".into()),
+            ahead: 1,
+            updating: Some("bbs".into()),
         }));
         assert!(
-            rendered.contains("waiting for fedora to finish updating"),
+            rendered.contains("- Self-update: update pending: 1 machine ahead, bbs updating now, since the fleet updates one machine at a time\n"),
             "{rendered}"
+        );
+        let rendered = render_executor(&self_updating(SelfUpdatePhase::Waiting {
+            ahead: 2,
+            updating: None,
+        }));
+        assert!(
+            rendered
+                .contains("- Self-update: update pending: 2 machines ahead, none updating now\n"),
+            "{rendered}"
+        );
+        let draining = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 3,
+            since_unix_ms: CAPTURED_AT - 60_000,
+            holds: vec![cairn_common::executor_protocol::DrainHold {
+                label: "`rust-tests` for cairn/5130".into(),
+                expected_done_unix_ms: None,
+                deadline_unix_ms: CAPTURED_AT + 57 * 60_000,
+                progressing: None,
+            }],
+            cycles: Vec::new(),
+            waits_for_turn: true,
+            updating: Some("bbs".into()),
+        }));
+        assert!(
+            draining.contains(
+                "- Self-update: draining for update: 3 in flight, the longest `rust-tests` for cairn/5130, no expected finish, waited on up to 57.0m more; new work goes elsewhere, and it holds no other machine's update (since 1m ago)\n"
+            ),
+            "{draining}"
+        );
+        let drained = render_executor(&self_updating(SelfUpdatePhase::Draining {
+            in_flight: 0,
+            since_unix_ms: CAPTURED_AT - 60_000,
+            holds: Vec::new(),
+            cycles: Vec::new(),
+            waits_for_turn: true,
+            updating: Some("bbs".into()),
+        }));
+        assert!(
+            drained.contains(
+                "- Self-update: draining for update: empty, and updates next, once bbs has finished updating (new work refused since 1m ago)\n"
+            ),
+            "{drained}"
         );
 
         let rendered = render_executor(&self_updating(SelfUpdatePhase::Halted {
@@ -10189,6 +10568,101 @@ mod running_now_tests {
         let silent = render_running_now(&running(None), None, 60_000);
         assert!(silent.contains("usage not measured yet\n"), "{silent}");
     }
+
+    /// Each resident line says what the machine charges it and why, so a
+    /// service priced at its claim reads differently from one priced at its
+    /// measurement (cairn/5744).
+    #[test]
+    fn a_resident_row_names_its_charge_and_the_evidence_for_it() {
+        use cairn_common::executor_protocol::{
+            PersistentCellState, ResidentCharge, ResidentChargeBasis, ResidentProcess,
+            ResidentProcessKind, ResidentProcessStatus,
+        };
+        const MIB: u64 = 1 << 20;
+        let resident = |generation, charge| ResidentProcess {
+            generation,
+            kind: ResidentProcessKind::Service {
+                name: "channel-imessage".into(),
+                role: "watch".into(),
+            },
+            spec: None,
+            status: ResidentProcessStatus::Running {
+                started_at_unix_ms: 0,
+                process_group_id: None,
+                ownership: None,
+            },
+            reservation: None,
+            live_usage: None,
+            charge,
+        };
+        let mut cell: PersistentCellState = serde_json::from_value(serde_json::json!({
+            "executorId": "e", "projectId": "p",
+            "slotId": "scratch-service-channel-imessage", "path": "/cells/s",
+            "repository": "/r", "authorityPath": "/a",
+            "lifecycle": "active", "cellEpoch": 1, "lastUsedUnixMs": 0, "sizeBytes": 0,
+            "occupancy": {}
+        }))
+        .unwrap();
+        cell.occupancy.processes.extend([
+            (
+                "imsg-watch".to_string(),
+                resident(
+                    3,
+                    Some(ResidentCharge {
+                        memory_bytes: 19 * MIB,
+                        basis: ResidentChargeBasis::Measured {
+                            peak_bytes: 15 * MIB,
+                            watched_ms: 3_600_000,
+                            generation: 3,
+                        },
+                    }),
+                ),
+            ),
+            (
+                "just-started".to_string(),
+                resident(
+                    1,
+                    Some(ResidentCharge {
+                        memory_bytes: 2 * GIB,
+                        basis: ResidentChargeBasis::Claimed {
+                            watched_ms: Some(20_000),
+                        },
+                    }),
+                ),
+            ),
+            (
+                "service-one-shot".to_string(),
+                resident(
+                    637,
+                    Some(ResidentCharge {
+                        memory_bytes: 5 * MIB,
+                        basis: ResidentChargeBasis::Measured {
+                            peak_bytes: 4 * MIB,
+                            watched_ms: 0,
+                            generation: 636,
+                        },
+                    }),
+                ),
+            ),
+            ("older-executor".to_string(), resident(1, None)),
+        ]);
+        let rendered = render_running_now(
+            &FleetSnapshot {
+                cells: vec![cell],
+                ..FleetSnapshot::default()
+            },
+            None,
+            60_000,
+        );
+        for line in [
+            "resident `imsg-watch` (generation 3): usage not measured yet; charged 19.0 MiB (15.0 MiB measured over 1h, plus 25%)\n",
+            "resident `just-started` (generation 1): usage not measured yet; charged 2.0 GiB (declared, watched 20.0s)\n",
+            "resident `service-one-shot` (generation 637): usage not measured yet; charged 5.0 MiB (4.0 MiB measured on generation 636, plus 25%)\n",
+            "resident `older-executor` (generation 1): usage not measured yet\n",
+        ] {
+            assert!(rendered.contains(line), "{line}in\n{rendered}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10249,6 +10723,21 @@ mod runner_scratch_tests {
                 footprint: Footprint::default(),
                 at_unix_ms: AT - 3 * HOUR_MS,
             }]),
+            quiet_removals: VecDeque::from([Removal {
+                name: "tm7-runs".into(),
+                why: "unowned, seven days quiet".into(),
+                footprint: Footprint {
+                    logical_bytes: 3 * GIB,
+                    exclusive_bytes: 2 * GIB,
+                    newest_write_unix_ms: AT - 200 * HOUR_MS,
+                },
+                at_unix_ms: AT - HOUR_MS,
+            }]),
+            quiet_reclaimed: Tally {
+                count: 4,
+                logical_bytes: 9 * GIB,
+                exclusive_bytes: 5 * GIB,
+            },
             pressure: Some(PressurePass {
                 at_unix_ms: AT - 120_000,
                 band: StoragePressureBand::Pressure,
@@ -10259,18 +10748,38 @@ mod runner_scratch_tests {
                 removed: Vec::new(),
                 kept_live: Tally::default(),
                 kept_quiet: Tally::default(),
+                kept_small: Tally {
+                    count: 1,
+                    logical_bytes: 99,
+                    exclusive_bytes: 8192,
+                },
             }),
         };
 
         let rendered = render_runner_scratch(&report, AT);
+        let stamp = |unix_ms: u64| crate::clock::stamp_millis_with_seconds(unix_ms as i64).unwrap();
+        let triome_line = format!(
+            "  - `triome-45-measure`: 146.0 GiB, frees at least 12.0 GiB, last written 48h ago ({}), due {}\n",
+            stamp(AT - 48 * HOUR_MS),
+            stamp(AT - 48 * HOUR_MS + 7 * 24 * HOUR_MS),
+        );
+        let quiet_line = format!(
+            "  - `tm7-runs` removed {}: 3.0 GiB, frees at least 2.0 GiB, last written {}\n",
+            stamp(AT - HOUR_MS),
+            stamp(AT - 200 * HOUR_MS),
+        );
 
         for expected in [
             "## Runner scratch\n",
             "- Measured 1m ago: 1 live (1.0 GiB, frees at least 1.0 GiB) · 2 unowned (231.0 GiB, frees at least 97.0 GiB) · 0 ended awaiting removal\n",
-            "  - `triome-45-measure`: 146.0 GiB, frees at least 12.0 GiB, last written 48h ago\n",
+            triome_line.as_str(),
+            "- Reclaimed after seven quiet days, newest last (4 since the runner started: 9.0 GiB, frees at least 5.0 GiB):\n",
+            quiet_line.as_str(),
             "  - `cairn.5727.1.builder`: 1.0 GiB, frees at least 1.0 GiB\n",
             "  - `cairn.4897.1.builder` 3h ago: 0 B, frees at least 0 B, its issue merged\n",
             "- Last pressure pass 2m ago: band Pressure, asked 42.0 GiB, credited 12.0 GiB from 0 unowned entries; free 22.0 GiB → 34.0 GiB",
+            "and 1 unowned freeing under 1.0 MiB each (99 B)\n",
+            "- Unowned, reclaimed once nothing has been written for seven days, and sooner under disk pressure (largest first, after 24h; 1h at the critical line); one freeing under 1.0 MiB is never taken:\n",
         ] {
             assert!(
                 rendered.contains(expected),

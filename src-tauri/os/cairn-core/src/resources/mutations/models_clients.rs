@@ -6,7 +6,9 @@
 //! the operator when an agent writes them. Withdrawing remote use and revoking
 //! a key only narrow authority and are direct.
 
-use cairn_common::authorization::{AuthorityDecision, AuthorityProvenance, AuthorityRequest};
+use cairn_common::authorization::{
+    ActDigest, AuthorityDecision, AuthorityProvenance, AuthorityRequest,
+};
 use cairn_common::uri::{parse_uri, CairnResource};
 use serde_json::Value;
 
@@ -65,7 +67,39 @@ impl ClientChange {
             }
             Self::Revoke { .. } => unreachable!("a revoke crosses no boundary"),
         };
-        Some(request)
+        Some(request.with_act(self.act()))
+    }
+
+    /// The act a widening change performs: the client and remote use it mints
+    /// or grants, or every key it imports, so a Once approval of one is not
+    /// spent by another.
+    fn act(&self) -> ActDigest {
+        ActDigest::of("served_api.client", |encoder| match self {
+            Self::Mint { name, remote } => {
+                encoder.field("change", "mint");
+                encoder.field("name", name);
+                encoder.field("remote", &remote.to_string());
+            }
+            Self::Import { origin, keys } => {
+                encoder.field("change", "import");
+                encoder.field("origin", origin);
+                encoder.field("keys", &keys.len().to_string());
+                for (index, (key, remote)) in keys.iter().enumerate() {
+                    encoder.field(&format!("keys[{index}].name"), &key.name);
+                    encoder.field(&format!("keys[{index}].keyHash"), &key.key_hash);
+                    encoder.field(&format!("keys[{index}].remote"), &remote.to_string());
+                }
+            }
+            Self::SetRemote { id, remote } => {
+                encoder.field("change", "set_remote");
+                encoder.field("id", id);
+                encoder.field("remote", &remote.to_string());
+            }
+            Self::Revoke { id } => {
+                encoder.field("change", "revoke");
+                encoder.field("id", id);
+            }
+        })
     }
 }
 

@@ -882,20 +882,24 @@ impl Catalog {
     /// serves: its native id where that reaches it and nothing else, else
     /// `provider/native-id`. Listings name offers this way, so the name a
     /// reader copies is never one the doors refuse as ambiguous.
+    ///
+    /// The native id is resolved as [`Self::offer_for`] resolves it, prefix
+    /// split included: OpenRouter's `typesafe/jev-1.14` starts with the
+    /// TypeSafe provider's key, yet names OpenRouter's offer bare unless
+    /// TypeSafe itself offers a `jev-1.14`.
     pub fn request_names(&self, offers: &[SelectedOffer]) -> Vec<String> {
         let models = self.models();
         offers
             .iter()
             .map(|offer| {
                 let name = offer.model.as_str();
-                let alone = self.qualified_by(name).0.is_none() && {
-                    let query = OfferQuery::new(offer.served.verb.kind());
-                    let (_, capable) = exact_offers(&models, &query, name, None, name);
-                    ambiguity(name, &capable).is_none()
-                        && capable.first().is_some_and(|first| {
-                            first.provider == offer.provider && first.model == offer.model
-                        })
-                };
+                let (qualifier, native) = self.qualified_by(name);
+                let query = OfferQuery::new(offer.served.verb.kind());
+                let (_, capable) = exact_offers(&models, &query, name, qualifier, native);
+                let alone = ambiguity(name, &capable).is_none()
+                    && capable.first().is_some_and(|first| {
+                        first.provider == offer.provider && first.model == offer.model
+                    });
                 if alone {
                     offer.model.clone()
                 } else {
@@ -1664,6 +1668,47 @@ mod tests {
         );
         for (offer, name) in offers.iter().zip(&names) {
             assert_eq!(&embed_offer(&catalog, name).unwrap(), offer, "{name}");
+        }
+    }
+
+    /// A native id that begins with another installed provider's key is still
+    /// named bare when the door takes it bare: only an offer that provider
+    /// actually has under the rest of the id claims the bare name.
+    #[test]
+    fn listings_name_bare_a_native_id_prefixed_by_another_providers_key() {
+        let mut catalog = Catalog {
+            providers: vec![
+                deciding(
+                    provider(
+                        "openrouter",
+                        Some(vec![model(
+                            "typesafe/jev-1.14",
+                            Some("typesafe/jev-1.14-20261014"),
+                        )]),
+                    ),
+                    MeasuredBy::Native,
+                ),
+                deciding(
+                    provider("typesafe", Some(vec![model("jev-1.14.0", None)])),
+                    MeasuredBy::Native,
+                ),
+            ],
+        };
+        let offers = catalog.offers_serving(VerbKind::Decide);
+        let names = catalog.request_names(&offers);
+        assert_eq!(names, ["typesafe/jev-1.14", "jev-1.14.0"]);
+        for (offer, name) in offers.iter().zip(&names) {
+            assert_eq!(&decide(&catalog, Some(name)).unwrap(), offer, "{name}");
+        }
+
+        // Once TypeSafe offers a `jev-1.14`, the bare id is its offer, so
+        // OpenRouter's must be qualified to be reached.
+        catalog.providers[1].models.as_mut().unwrap().models = vec![model("jev-1.14", None)];
+        let offers = catalog.offers_serving(VerbKind::Decide);
+        let names = catalog.request_names(&offers);
+        assert_eq!(names, ["openrouter/typesafe/jev-1.14", "jev-1.14"]);
+        for (offer, name) in offers.iter().zip(&names) {
+            assert_eq!(&decide(&catalog, Some(name)).unwrap(), offer, "{name}");
         }
     }
 

@@ -135,7 +135,13 @@ pub(crate) async fn spawn_workflow_process(
     let (event_generation, event_finished) = (generation.clone(), finished.clone());
     let event_early_exit = early_exit.clone();
     let session_id = params.session_id.clone();
-    orch.fleet.subscribe_resident_process_events(move |event| {
+    // The subscription must outlive this function, until the runtime exits, so
+    // a started run parks it here and whichever side finalizes the run drops it.
+    let subscription_slot = Arc::new(Mutex::new(
+        None::<crate::fleet::ResidentProcessSubscription>,
+    ));
+    let event_subscription = subscription_slot.clone();
+    let subscription = orch.fleet.subscribe_resident_process_events(move |event| {
         let expected = event_generation.load(Ordering::Acquire);
         if event.holder != event_fence.holder
             || event.incarnation_id != event_fence.incarnation_id
@@ -184,7 +190,9 @@ pub(crate) async fn spawn_workflow_process(
                     event_key.clone(),
                     session_id.clone(),
                 );
+                let subscription = event_subscription.clone();
                 tokio::spawn(async move {
+                    drop(subscription.lock().unwrap().take());
                     orch.process_state.clear_workflow_lease(&run_id);
                     finalize_workflow_run(
                         &orch,
@@ -311,6 +319,11 @@ pub(crate) async fn spawn_workflow_process(
             let _ = crate::fleet::residency::release(orch, &fence).await;
             return Ok(());
         }
+    }
+    *subscription_slot.lock().unwrap() = Some(subscription);
+    // An exit that finalized the run before the slot was filled found it empty.
+    if finished.load(Ordering::Acquire) {
+        drop(subscription_slot.lock().unwrap().take());
     }
     let renew_orch = orch.clone();
     tokio::spawn(async move {

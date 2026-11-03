@@ -99,7 +99,7 @@ pub async fn reconcile_removed_nodes_conn(
     let cancelled_job_ids = removed.iter().map(|job| job.id.clone()).collect();
     let now = chrono::Utc::now().timestamp();
     for job in &removed {
-        cancel_job_conn(conn, &job.id, now).await?;
+        cancel_job_conn(conn, &job.id, now, SessionCloseReason::NodeRemoved).await?;
     }
 
     Ok(RemovedNodesReconcile { cancelled_job_ids })
@@ -126,21 +126,137 @@ pub fn reconcile_removed_nodes(
     })
 }
 
-/// Archive a job: flip it to `cancelled` and close any open session, leaving the
-/// transcript (runs, events, turns, sessions, artifacts) intact for history.
+/// Why a cancelled job's sessions were closed, as `sessions.terminal_reason`
+/// records it.
+///
+/// The reason is what the launch funnel turns into the operator's next step
+/// (`closed_session_refusal` in cairn-core), so each cancel names its own cause
+/// rather than one constant: a merged builder told to "add the node back to the
+/// execution" has been told something false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCloseReason {
+    /// The job's issue was merged.
+    IssueMerged,
+    /// The job's issue was closed.
+    IssueClosed,
+    /// The job's node was removed from its snapshot, or the job was a prior
+    /// attempt archived by a restart.
+    NodeRemoved,
+    /// The job's execution was superseded by another attempt on its issue.
+    Superseded,
+    /// The job was cancelled with no resolution to name: a node-less job with no
+    /// issue, or one whose issue is not resolved.
+    JobCancelled,
+}
+
+impl SessionCloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IssueMerged => "issue_merged",
+            Self::IssueClosed => "issue_closed",
+            Self::NodeRemoved => "node_removed",
+            Self::Superseded => "superseded",
+            Self::JobCancelled => "job_cancelled",
+        }
+    }
+
+    /// The reason a recorded `terminal_reason` names, when it is one of these.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "issue_merged" => Self::IssueMerged,
+            "issue_closed" => Self::IssueClosed,
+            "node_removed" => Self::NodeRemoved,
+            "superseded" => Self::Superseded,
+            "job_cancelled" => Self::JobCancelled,
+            _ => return None,
+        })
+    }
+
+    /// The reason for a cancel derived on a job whose issue reads `issue_status`
+    /// (`None` when the job has no issue).
+    pub fn for_issue_status(issue_status: Option<&str>) -> Self {
+        match issue_status {
+            Some("merged") => Self::IssueMerged,
+            Some("closed") => Self::IssueClosed,
+            _ => Self::JobCancelled,
+        }
+    }
+}
+
+impl From<crate::transitions::status::Resolution> for SessionCloseReason {
+    fn from(resolution: crate::transitions::status::Resolution) -> Self {
+        match resolution {
+            crate::transitions::status::Resolution::Merged => Self::IssueMerged,
+            crate::transitions::status::Resolution::Closed => Self::IssueClosed,
+        }
+    }
+}
+
+/// Close every open session of a cancelled job with `reason`, returning the ids
+/// it closed.
+///
+/// The one way a cancel closes its sessions, so a cancelled job never keeps an
+/// open session that would let a turn through or tell the operator nothing. A
+/// job whose memory review turn is live keeps its session: the review is still
+/// running there, and its finalizer closes the session once the review ends. A
+/// review that was sent but never started gets no such hold, because the
+/// cancel means it never will start, and nothing else would close the session.
+pub async fn close_job_sessions_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    reason: SessionCloseReason,
+    now: i64,
+) -> DbResult<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT s.id FROM sessions s JOIN jobs j ON j.id = s.job_id
+              WHERE s.job_id = ?1 AND s.status = 'open'
+                AND NOT (
+                    COALESCE(j.memory_review_state, '') = 'sent'
+                    AND EXISTS (
+                        SELECT 1 FROM turns t
+                         WHERE t.job_id = j.id AND t.start_reason = 'memory_review'
+                           AND t.state IN ('pending', 'running', 'yielded')
+                    )
+                )",
+            params![job_id],
+        )
+        .await?;
+    let mut closed = Vec::new();
+    while let Some(row) = rows.next().await? {
+        closed.push(row.text(0)?);
+    }
+    drop(rows);
+    for session_id in &closed {
+        conn.execute(
+            "UPDATE sessions
+             SET status = 'closed', terminal_reason = ?1, closed_at = ?2, updated_at = ?2
+             WHERE id = ?3 AND status = 'open'",
+            params![reason.as_str(), now, session_id.as_str()],
+        )
+        .await?;
+    }
+    Ok(closed)
+}
+
+/// Archive a job: flip it to `cancelled` and close any open session with
+/// `reason`, leaving the transcript (runs, events, turns, sessions, artifacts)
+/// intact for history.
 ///
 /// `cancelled` is terminal and sticky — the status projection never re-derives
 /// it (see `recompute`), so this single write is durable. Closing the open
 /// session (without deleting it) keeps the resume/warm-process machinery from
 /// treating an archived job as live work while preserving its record.
 ///
-/// Two callers share it: removing a node from a live snapshot, and confirming a
-/// terminal issue resolution, which cancels the DAG entries that never started
-/// (`issues::status`).
+/// Two callers share it: removing a node from a live snapshot (and a restart's
+/// archive of prior attempts), which closes with `node_removed`, and confirming
+/// a terminal issue resolution, which stops the issue's live work and closes
+/// with the resolution's own reason (`issues::status`).
 pub async fn cancel_job_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     now: i64,
+    reason: SessionCloseReason,
 ) -> DbResult<()> {
     conn.execute(
         "UPDATE jobs SET status = 'cancelled', completed_at = ?1, updated_at = ?1 WHERE id = ?2",
@@ -149,13 +265,7 @@ pub async fn cancel_job_conn(
     .await?;
     // An ended job may free a fleet slot or a thread's open-children count.
     crate::gates::hint::evidence_changed();
-    conn.execute(
-        "UPDATE sessions
-         SET status = 'closed', terminal_reason = 'node_removed', closed_at = ?1, updated_at = ?1
-         WHERE job_id = ?2 AND status = 'open'",
-        params![now, job_id],
-    )
-    .await?;
+    close_job_sessions_conn(conn, job_id, reason, now).await?;
     Ok(())
 }
 
@@ -659,6 +769,150 @@ mod tests {
                     derived,
                     JobStatus::Cancelled,
                     "recompute leaves a cancelled job cancelled"
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn session_state(conn: &cairn_db::turso::Connection, session_id: &str) -> String {
+        let mut rows = conn
+            .query(
+                "SELECT status || ':' || COALESCE(terminal_reason, '') || ':' || (closed_at IS NOT NULL)
+                   FROM sessions WHERE id = ?1",
+                params![session_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().text(0).unwrap()
+    }
+
+    /// The projection sweep that settles a job onto a merged issue closes its
+    /// session with the merge's reason. On 10-14 a sweep like it cancelled 999
+    /// jobs and closed none of their sessions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_derived_cancel_closes_the_session_with_the_issue_reason() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                let snap = snapshot(
+                    vec![
+                        node("trigger", RecipeNodeType::Trigger),
+                        node("builder", RecipeNodeType::Agent),
+                    ],
+                    vec![control_edge("e1", "trigger", "builder")],
+                );
+                seed_project_issue_execution(conn, &snap).await;
+                seed_job(conn, "job-builder", "builder", "pending", None, true).await;
+                conn.execute(
+                    "UPDATE issues SET status = 'merged', merged_at = 2 WHERE id = 'issue-1'",
+                    (),
+                )
+                .await?;
+
+                recompute_execution_jobs_conn(conn, "exec-1", &HashSet::new()).await?;
+
+                assert_eq!(
+                    job_status(conn, "job-builder").await.as_deref(),
+                    Some("cancelled")
+                );
+                assert_eq!(
+                    session_state(conn, "sess-job-builder").await,
+                    "closed:issue_merged:1"
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A cancel no resolution explains closes as `job_cancelled`. A job whose
+    /// memory review turn is live keeps its session for that turn; one whose
+    /// review was sent but never started does not, since nothing would close it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_derived_cancel_without_a_resolution_or_during_a_review() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                let snap = snapshot(vec![node("trigger", RecipeNodeType::Trigger)], vec![]);
+                seed_project_issue_execution(conn, &snap).await;
+                for sql in [
+                    "INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+                       VALUES ('job-task', 'proj-1', 'running', 1, 1)",
+                    "INSERT INTO jobs (id, project_id, issue_id, status, memory_review_state,
+                                       created_at, updated_at)
+                       VALUES ('job-review', 'proj-1', 'issue-1', 'running', 'sent', 1, 1)",
+                    "INSERT INTO jobs (id, project_id, issue_id, status, memory_review_state,
+                                       created_at, updated_at)
+                       VALUES ('job-unstarted', 'proj-1', 'issue-1', 'running', 'sent', 1, 1)",
+                    "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at)
+                       VALUES ('sess-task', 'job-task', 'claude', 'open', 1, 1, 1),
+                              ('sess-review', 'job-review', 'claude', 'open', 1, 1, 1),
+                              ('sess-unstarted', 'job-unstarted', 'claude', 'open', 1, 1, 1)",
+                    "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason,
+                                        created_at, updated_at)
+                       VALUES ('turn-review', 'sess-review', 'job-review', 1, 'running',
+                               'memory_review', 1, 1)",
+                ] {
+                    conn.execute(sql, ()).await?;
+                }
+
+                for job in ["job-task", "job-review", "job-unstarted"] {
+                    crate::advancement::recompute::write_job_status(
+                        conn,
+                        job,
+                        &JobStatus::Running,
+                        &JobStatus::Cancelled,
+                    )
+                    .await?;
+                }
+
+                assert_eq!(
+                    session_state(conn, "sess-task").await,
+                    "closed:job_cancelled:1"
+                );
+                assert_eq!(
+                    session_state(conn, "sess-review").await,
+                    "open::0",
+                    "the review's finalizer closes it once the review ends"
+                );
+                assert_eq!(
+                    session_state(conn, "sess-unstarted").await,
+                    "closed:job_cancelled:1",
+                    "a review that never started will not start on a cancelled job"
+                );
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Node removal keeps its own reason.
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_a_node_closes_its_session_as_node_removed() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                let snap = snapshot(
+                    vec![
+                        node("trigger", RecipeNodeType::Trigger),
+                        node("drop", RecipeNodeType::Agent),
+                    ],
+                    vec![control_edge("e1", "trigger", "drop")],
+                );
+                seed_project_issue_execution(conn, &snap).await;
+                seed_job(conn, "job-drop", "drop", "pending", None, true).await;
+
+                let removed: HashSet<String> = ["drop".to_string()].into_iter().collect();
+                reconcile_removed_nodes_conn(conn, "exec-1", &removed).await?;
+
+                assert_eq!(
+                    session_state(conn, "sess-job-drop").await,
+                    "closed:node_removed:1"
                 );
                 Ok(())
             })

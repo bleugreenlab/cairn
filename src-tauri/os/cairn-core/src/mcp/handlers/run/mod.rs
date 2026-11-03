@@ -21,6 +21,7 @@ mod redact;
 mod resolve;
 mod sandbox_policy;
 mod search;
+mod selector;
 mod tip;
 mod types;
 
@@ -4326,37 +4327,55 @@ async fn prepare_and_run_batch(
         }
         _ => None,
     };
+    // The node's placement default, and the note owed when the fleet cleared
+    // the one it had. Read for every agent tree-bound batch, so the note
+    // reaches the next result whatever that batch names; applied only when the
+    // call names no machine of its own (`selector::EffectiveSelector`).
+    let (node_default, default_clear_notice) = match (run_context.as_ref(), run_db.as_deref()) {
+        (Some(ctx), Some(db)) if selector::default_applies(page_call, has_process, true) => {
+            crate::fleet::placement_default::for_job_work(db, &ctx.job_id).await
+        }
+        _ => (None, None),
+    };
+    let mut effective =
+        selector::EffectiveSelector::declared(payload.executor.as_ref(), node_default);
     // What the holders' affinity did with this batch. Carried to every
     // outcome, so a refusal on a holder's machine names the holder rather than
     // reading as a selector the agent passed.
     let mut scratch_affinity: Option<String> = None;
-    if let (Some((_, resolved)), Some(db), Some(ctx)) = (
+    if let (None, Some((_, resolved)), Some(db), Some(ctx)) = (
+        effective.as_ref(),
         node_scratch.as_ref(),
         run_db.as_deref(),
         run_context.as_ref(),
     ) {
-        let unselected = payload
-            .executor
-            .as_ref()
-            .is_none_or(|selector| selector.is_empty());
-        if unselected {
-            if let Some(affinity) =
-                crate::node_scratch::holders::affinity(orch, db, resolved, &ctx.job_id).await
+        if let Some(affinity) =
+            crate::node_scratch::holders::affinity(orch, db, resolved, &ctx.job_id).await
+        {
+            if let Some(name) = affinity
+                .executor_id
+                .as_deref()
+                .and_then(|executor_id| orch.fleet.executor_display_name(executor_id))
             {
-                if let Some(name) = affinity
-                    .executor_id
-                    .as_deref()
-                    .and_then(|executor_id| orch.fleet.executor_display_name(executor_id))
-                {
-                    payload.executor = Some(ExecutorSelector {
+                effective = Some(selector::EffectiveSelector::from_affinity(
+                    ExecutorSelector {
                         name: Some(name),
                         ..ExecutorSelector::default()
-                    });
-                }
-                scratch_affinity = Some(affinity.note);
+                    },
+                ));
             }
+            scratch_affinity = Some(affinity.note);
         }
     }
+    // The default that placed this batch, when one did: its label on the
+    // first line and its suffix on every refusal.
+    let node_default = effective
+        .as_ref()
+        .and_then(selector::EffectiveSelector::node_default)
+        .cloned();
+    // What placement reads, and what the shells' `CAIRN_BATCH_EXECUTOR`
+    // carries, which is never a default.
+    let selectors = selector::BatchSelectors::of(effective.as_ref());
     let batch_residence = match if page_call {
         // A page call has no execution home: it runs wherever the page-call
         // policy is proven, in a directory of its own.
@@ -4367,7 +4386,7 @@ async fn prepare_and_run_batch(
             run_db.as_deref(),
             logical_resolution.as_ref(),
             run_context.as_ref(),
-            payload.executor.as_ref(),
+            selectors.placement.as_ref(),
             commit_present,
         )
         .await
@@ -4378,7 +4397,14 @@ async fn prepare_and_run_batch(
                 Some(note) => format!("{refusal}.\n\n{note}"),
                 None => format!("{refusal}."),
             };
-            return run_envelope(RunFailure::NotExecuted(detail).text(), Vec::new());
+            let detail = selector::with_default_suffix(node_default.as_ref(), detail);
+            return run_envelope(
+                selector::with_clear_notice(
+                    default_clear_notice.as_deref(),
+                    RunFailure::NotExecuted(detail).text(),
+                ),
+                Vec::new(),
+            );
         }
     };
     let slot_target = if page_call {
@@ -4471,10 +4497,13 @@ async fn prepare_and_run_batch(
     };
     if has_process && slot_target.is_none() {
         return run_envelope(
-            RunFailure::NotExecuted(
-                "this batch's working directory could not be resolved.".to_string(),
-            )
-            .text(),
+            selector::with_clear_notice(
+                default_clear_notice.as_deref(),
+                RunFailure::NotExecuted(
+                    "this batch's working directory could not be resolved.".to_string(),
+                )
+                .text(),
+            ),
             Vec::new(),
         );
     }
@@ -4550,7 +4579,7 @@ async fn prepare_and_run_batch(
                         logical_resolution
                             .as_ref()
                             .map(|resolution| resolution.rev.as_str()),
-                        payload.executor.as_ref(),
+                        selectors.shell_pin.as_ref(),
                     )
                     .into_iter()
                     .chain(
@@ -4572,7 +4601,12 @@ async fn prepare_and_run_batch(
                 // Placement is settled by the lease when there is one; the
                 // affinity key only steers cell selection for unbound batches.
                 affinity_key: run_context.as_ref().map(|ctx| ctx.run_id.clone()),
-                executor: payload.executor.clone(),
+                // A page call's selector is the page-call policy's, set above
+                // and never a declared one.
+                executor: selectors
+                    .placement
+                    .clone()
+                    .or_else(|| payload.executor.clone()),
                 pinned_executor_id: None,
                 // An agent's batch is home-bound unless its own selector sent it
                 // elsewhere: its working tree is a leased cell that a residency
@@ -4628,6 +4662,7 @@ async fn prepare_and_run_batch(
                     sequential,
                 ),
                 ceiling_horizon_unix_ms,
+                node_default: node_default.is_some(),
                 template,
             };
             let batch = ResolvedRunBatch {
@@ -4644,6 +4679,8 @@ async fn prepare_and_run_batch(
             let settlement = RunBatchSettlement {
                 node_scratch: node_scratch.map(|(_, resolved)| resolved.scratch),
                 scratch_affinity,
+                node_default,
+                default_clear_notice,
                 request: request.clone(),
                 run_context,
                 commit_msg: payload.commit_msg,
@@ -4697,9 +4734,12 @@ async fn prepare_and_run_batch(
         vcs,
         status_before,
         marker_escape,
-        // Host items (MCP calls, REPL sends, model calls) have no `$TMPDIR`.
+        // Host items (MCP calls, REPL sends, model calls) have no `$TMPDIR`,
+        // and no machine of the node's choosing.
         node_scratch: None,
         scratch_affinity: None,
+        node_default: None,
+        default_clear_notice: None,
     };
     let suspendable = batch.may_outlive_grace();
     off_frame(|| run_host_batch(orch, settlement, batch, control, deadlines, suspendable)).await
@@ -5211,6 +5251,7 @@ fn ran_on_line(
     claimed: Option<&crate::fleet::CellPlacement>,
     outcome: &CellOutcome,
     detached_from: Option<&str>,
+    node_default: bool,
 ) -> Option<String> {
     let (name, os) = match claimed {
         Some(placement) => (
@@ -5238,16 +5279,32 @@ fn ran_on_line(
             )
         }
     };
-    Some(ran_on_text(&name, os.as_deref(), detached_from))
+    Some(ran_on_text(
+        &name,
+        os.as_deref(),
+        detached_from,
+        node_default,
+    ))
 }
 
-fn ran_on_text(name: &str, os: Option<&str>, detached_from: Option<&str>) -> String {
+/// `node_default` marks a batch the node's placement default sent there, so a
+/// stale default shows on every result it places.
+fn ran_on_text(
+    name: &str,
+    os: Option<&str>,
+    detached_from: Option<&str>,
+    node_default: bool,
+) -> String {
     let platform = os.map(|os| format!(" ({os})")).unwrap_or_default();
+    let source = match node_default {
+        true => format!(" {}", crate::fleet::placement_default::NODE_DEFAULT_LABEL),
+        false => String::new(),
+    };
     match detached_from.filter(|home| *home != name) {
         Some(home) => format!(
-            "Ran on **{name}**{platform}, detached from the job's environment on **{home}**."
+            "Ran on **{name}**{platform}{source}, detached from the job's environment on **{home}**."
         ),
-        None => format!("Ran on **{name}**{platform}."),
+        None => format!("Ran on **{name}**{platform}{source}."),
     }
 }
 
@@ -5364,6 +5421,12 @@ struct RunBatchSettlement {
     /// What the node scratch's holders' affinity did with this batch, when it
     /// named no machine of its own.
     scratch_affinity: Option<String>,
+    /// The node's placement default, when it is what placed this batch. Every
+    /// refusal carries its suffix.
+    node_default: Option<crate::fleet::placement_default::PlacementDefault>,
+    /// The note that the fleet cleared the node's default, owed to this
+    /// result's opening.
+    default_clear_notice: Option<String>,
 }
 
 impl RunBatchSettlement {
@@ -5444,6 +5507,9 @@ struct BatchPlacement {
     /// the job's execution home waits on this rather than on the declared
     /// budget, and the declared horizon is capped by it.
     ceiling_horizon_unix_ms: u64,
+    /// The template's selector is the node's placement default, so the
+    /// result's first line says so.
+    node_default: bool,
 }
 
 impl BatchPlacement {
@@ -5948,7 +6014,13 @@ async fn place_and_run_attempts(
                 BatchResidence::Home => None,
             };
             let notes = PlacementNotes {
-                ran_on: ran_on_line(orch, claimed.as_ref(), &outcome, detached_from),
+                ran_on: ran_on_line(
+                    orch,
+                    claimed.as_ref(),
+                    &outcome,
+                    detached_from,
+                    placement.node_default,
+                ),
                 ran_elsewhere: detached_for_memory.map(|cannot_hold| {
                     cannot_hold.ran_elsewhere_note(home_name.as_deref().unwrap_or("its home"))
                 }),
@@ -7134,11 +7206,12 @@ async fn settle_joined_batch(
             Some(note) => format!("{detail}\n\n{note}"),
             None => detail,
         };
+        let detail = selector::with_default_suffix(settlement.node_default.as_ref(), detail);
         SettledRunBatch::failure(
             unexecuted_failure(detail, grant_without_result.clone(), commits).text(),
         )
     };
-    match placed {
+    let mut settled = match placed {
         PlacedBatch::Cell(outcome, residence, notes) => {
             let notes = PlacementNotes {
                 scratch_affinity: settlement.scratch_affinity.clone(),
@@ -7160,7 +7233,14 @@ async fn settle_joined_batch(
         PlacedBatch::Refused(refusal) => refused(format!("{refusal}.")),
         PlacedBatch::NoEnvironment(diagnostic) => refused(no_environment_detail(&diagnostic)),
         PlacedBatch::NoRoom(detail) => refused(detail),
+    };
+    if !settled.suspended {
+        settled.text = selector::with_clear_notice(
+            settlement.default_clear_notice.as_deref(),
+            std::mem::take(&mut settled.text),
+        );
     }
+    settled
 }
 
 /// The sentence for a batch whose environment could not be acquired. A project
@@ -7237,7 +7317,11 @@ async fn settle_routed_run_batch(
         ceiling,
         &notes,
     ) {
-        return SettledRunBatch::failure(text);
+        return SettledRunBatch::failure(refusal_under_default(
+            &outcome,
+            settlement.node_default.as_ref(),
+            text,
+        ));
     }
     let CellOutcome::Completed {
         attempt_id,
@@ -7313,6 +7397,67 @@ async fn settle_routed_run_batch(
         )
     })
     .await
+}
+
+/// A settled failure of a batch the node's default placed. A structural
+/// placement refusal is the default's to explain (drained, absent, braked, or
+/// short a toolchain); a failure after the batch ran is not.
+fn refusal_under_default(
+    outcome: &CellOutcome,
+    default: Option<&crate::fleet::placement_default::PlacementDefault>,
+    text: String,
+) -> String {
+    match outcome {
+        CellOutcome::Unavailable { .. } => selector::with_default_suffix(default, text),
+        _ => text,
+    }
+}
+
+#[cfg(test)]
+mod refusal_under_default_tests {
+    use super::*;
+
+    /// A defaulted batch refused because its machine is drained says the drain
+    /// and then where the pin came from; one that ran and failed says nothing
+    /// about the default.
+    #[test]
+    fn a_drained_default_refuses_with_the_drain_and_the_way_out() {
+        let default = crate::fleet::placement_default::PlacementDefault {
+            selector: ExecutorSelector {
+                name: Some("bbs".into()),
+                ..ExecutorSelector::default()
+            },
+            executor_id: Some("exec-bbs".into()),
+            set_by: "cairn://p/cairn/execution".into(),
+            set_at: 100,
+            cleared: None,
+        };
+        let drained = CellOutcome::Unavailable {
+            reason: cairn_common::executor_protocol::CellUnavailableReason::NoMatchingExecutor,
+            diagnostic: "bbs is drained by an operator, so the runner is refusing new work there"
+                .into(),
+        };
+        let text =
+            settled_failure_text(&drained, None, false, None, &PlacementNotes::default()).unwrap();
+        let text = refusal_under_default(&drained, Some(&default), text);
+        assert!(text.contains("This run could not execute"), "{text}");
+        assert!(text.contains("bbs is drained by an operator"), "{text}");
+        assert!(
+            text.contains("bbs is this node's placement default (set "),
+            "{text}"
+        );
+        assert!(
+            text.contains("`write cairn:~ patch {executor:null}`"),
+            "{text}"
+        );
+
+        let ran = CellOutcome::FailedAfterExecution {
+            request_id: "r".into(),
+            attempt_id: "a".into(),
+            diagnostic: "killed".into(),
+        };
+        assert_eq!(refusal_under_default(&ran, Some(&default), "x".into()), "x");
+    }
 }
 
 /// The first line of a verdict-only result: the revision it ran against and,
@@ -8172,16 +8317,30 @@ mod tests {
     #[test]
     fn the_ran_on_line_names_the_machine_and_any_environment_left() {
         assert_eq!(
-            ran_on_text("bgsrv-ub", Some("linux"), None),
+            ran_on_text("bgsrv-ub", Some("linux"), None, false),
             "Ran on **bgsrv-ub** (linux)."
         );
         assert_eq!(
-            ran_on_text("bglab-ub", Some("linux"), Some("bgsrv-mac")),
+            ran_on_text("bglab-ub", Some("linux"), Some("bgsrv-mac"), false),
             "Ran on **bglab-ub** (linux), detached from the job's environment on **bgsrv-mac**."
         );
         assert_eq!(
-            ran_on_text("bgsrv-mac", None, Some("bgsrv-mac")),
+            ran_on_text("bgsrv-mac", None, Some("bgsrv-mac"), false),
             "Ran on **bgsrv-mac**."
+        );
+    }
+
+    /// A batch the node's placement default sent says so beside the machine,
+    /// detached or not, so a stale default shows on every result it places.
+    #[test]
+    fn the_ran_on_line_names_a_node_default() {
+        assert_eq!(
+            ran_on_text("bbs", Some("linux"), None, true),
+            "Ran on **bbs** (linux) (node default)."
+        );
+        assert_eq!(
+            ran_on_text("bbs", Some("linux"), Some("bgsrv-mac"), true),
+            "Ran on **bbs** (linux) (node default), detached from the job's environment on **bgsrv-mac**."
         );
     }
 
@@ -8637,6 +8796,7 @@ mod tests {
             commit_present,
             capacity_wait_budget: None,
             ceiling_horizon_unix_ms: u64::MAX,
+            node_default: false,
         }
     }
 
@@ -9413,6 +9573,21 @@ mod decide_door_tests {
         }
     }
 
+    /// A model-facing edge stamps its run calls with the callback origin; the
+    /// grammar check must let that envelope key through rather than refuse a
+    /// well-formed batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stamped_run_passes_the_grammar_check() {
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
+        let payload = json!({"commands": [{"command": "true"}], "_cairn_origin": "model"});
+        let envelope = super::handle_run(&orch, &request(payload)).await;
+        assert!(
+            !envelope.contains("outside the run grammar")
+                && !envelope.contains("This `run` call was refused"),
+            "{envelope}"
+        );
+    }
+
     /// Every advertised run target reaches its own dispatch arm, never the
     /// skill-script fallback: the table and the resolver cannot drift apart.
     #[tokio::test(flavor = "multi_thread")]
@@ -9810,6 +9985,8 @@ mod host_batch_tests {
             marker_escape: None,
             node_scratch: None,
             scratch_affinity: None,
+            node_default: None,
+            default_clear_notice: None,
         };
         let batch = HostBatch {
             request: request.clone(),

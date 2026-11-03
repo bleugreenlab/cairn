@@ -61,6 +61,15 @@ pub fn spawn_stats() -> SpawnStats {
 /// tagged as the `process.spawn` region for the stall watchdog, and logged
 /// when it takes long enough to mean the spawn forked.
 pub fn observed_spawn(command: &mut Command) -> std::io::Result<Child> {
+    let program = command.get_program().to_owned();
+    observed(&program, || command.spawn())
+}
+
+/// Any spawn of `program`, accounted as [`observed_spawn`] accounts one.
+pub(crate) fn observed<T>(
+    program: &std::ffi::OsStr,
+    spawn: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let started = Instant::now();
     let id = SPAWNS.lock().ok().map(|mut ledger| {
         let id = ledger.next_id;
@@ -70,7 +79,7 @@ pub fn observed_spawn(command: &mut Command) -> std::io::Result<Child> {
     });
     let result = {
         let _region = crate::runtime_regions::enter("process.spawn");
-        command.spawn()
+        spawn()
     };
     let elapsed = started.elapsed();
     if let (Some(id), Ok(mut ledger)) = (id, SPAWNS.lock()) {
@@ -88,7 +97,7 @@ pub fn observed_spawn(command: &mut Command) -> std::io::Result<Child> {
     if elapsed >= SLOW_SPAWN {
         log::warn!(
             "slow process spawn: program={} elapsed_ms={}",
-            command.get_program().to_string_lossy(),
+            program.to_string_lossy(),
             elapsed.as_millis()
         );
     }

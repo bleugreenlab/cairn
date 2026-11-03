@@ -312,11 +312,16 @@ pub(crate) fn inference_records_authority(
         (CairnResource::InferenceProfiles, ChangeMode::Append) => true,
         _ => false,
     };
-    authoring.then(|| {
-        Ok(crate::authorization::normalize::inference_records_write(
-            crate::authorization::WORKSPACE_ID,
-        ))
-    })
+    authoring.then(|| Ok(records_authority(item)))
+}
+
+/// The request a records write normalizes to, naming the item as its act. The
+/// gate and the pre-persist re-check both derive it here.
+fn records_authority(item: &ChangeItem) -> AuthorityRequest {
+    crate::authorization::normalize::inference_records_write(
+        crate::authorization::WORKSPACE_ID,
+        item,
+    )
 }
 
 /// Write Cairn's own records, once this write is authorized: the final check,
@@ -324,15 +329,14 @@ pub(crate) fn inference_records_authority(
 async fn author(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
+    item: &ChangeItem,
     authoring: &Authoring,
     dry_run: bool,
 ) -> Result<String, String> {
     if dry_run {
         return Ok("Would write the inference records".into());
     }
-    let authority = crate::authorization::normalize::inference_records_write(
-        crate::authorization::WORKSPACE_ID,
-    );
+    let authority = records_authority(item);
     crate::resources::mutations::authorize_account_change(orch, request, &authority).await?;
     let written = write_inventory(&orch.db.local, authoring).await?;
     refresh_offers(orch);
@@ -350,14 +354,13 @@ fn refresh_offers(orch: &Orchestrator) {
 async fn authorized<F>(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
+    item: &ChangeItem,
     write: F,
 ) -> Result<String, String>
 where
     F: std::future::Future<Output = Result<String, String>>,
 {
-    let authority = crate::authorization::normalize::inference_records_write(
-        crate::authorization::WORKSPACE_ID,
-    );
+    let authority = records_authority(item);
     crate::resources::mutations::authorize_account_change(orch, request, &authority).await?;
     write.await
 }
@@ -413,10 +416,12 @@ pub(super) async fn dispatch(
                     refresh_offers(orch);
                     Ok(Some(adopted))
                 }
-                InventoryPatch::Author(authoring) => author(orch, request, &authoring, dry_run)
-                    .await
-                    .map(Some)
-                    .map_err(fail),
+                InventoryPatch::Author(authoring) => {
+                    author(orch, request, item, &authoring, dry_run)
+                        .await
+                        .map(Some)
+                        .map_err(fail)
+                }
             }
         }
         (CairnResource::Inference, ChangeMode::Replace) => {
@@ -425,7 +430,7 @@ pub(super) async fn dispatch(
                 .as_ref()
                 .ok_or_else(|| fail("mode=replace requires payload".into()))?;
             let authoring = parse_inventory_replace(payload).map_err(fail)?;
-            author(orch, request, &authoring, dry_run)
+            author(orch, request, item, &authoring, dry_run)
                 .await
                 .map(Some)
                 .map_err(fail)
@@ -540,6 +545,7 @@ pub(super) async fn dispatch(
             authorized(
                 orch,
                 request,
+                item,
                 register(&orch.db.local, &hub, repo, revision),
             )
             .await
@@ -556,10 +562,15 @@ pub(super) async fn dispatch(
                     return Ok(Some(format!("Would read {name}'s config again")));
                 }
                 let hub = Web::new().map_err(fail)?;
-                return authorized(orch, request, register(&orch.db.local, &hub, name, None))
-                    .await
-                    .map(Some)
-                    .map_err(fail);
+                return authorized(
+                    orch,
+                    request,
+                    item,
+                    register(&orch.db.local, &hub, name, None),
+                )
+                .await
+                .map(Some)
+                .map_err(fail);
             }
             let (pool, all) = pool_of(payload, "verify").map_err(|why| {
                 fail(format!(
@@ -608,7 +619,7 @@ pub(super) async fn dispatch(
                     ..Removals::default()
                 },
             };
-            author(orch, request, &authoring, false)
+            author(orch, request, item, &authoring, false)
                 .await
                 .map(Some)
                 .map_err(fail)
@@ -629,7 +640,7 @@ pub(super) async fn dispatch(
                     )));
                 }
                 let hub = Web::new().map_err(fail)?;
-                return authorized(orch, request, async {
+                return authorized(orch, request, item, async {
                     import(&orch.db.local, &hub, &spec)
                         .await
                         .map_err(|refusal| refusal.to_string())
@@ -670,7 +681,7 @@ pub(super) async fn dispatch(
             let hub = Web::new().map_err(fail)?;
             let snapshots = snapshots(orch);
             let network = orch.fleet.network();
-            authorized(orch, request, async {
+            authorized(orch, request, item, async {
                 generate(
                     &orch.db.local,
                     &hub,
@@ -897,9 +908,7 @@ mod tests {
             ..item(ChangeMode::Patch, serde_json::json!({"pool": "halo"}))
         };
         assert_eq!(scope(&pools), None);
-        let request = crate::authorization::normalize::inference_records_write(
-            crate::authorization::WORKSPACE_ID,
-        );
+        let request = records_authority(&refresh);
         assert!(!matches!(
             crate::authorization::policy::classify(&request.scope, false),
             cairn_common::authorization::AuthorityPolicy::Direct

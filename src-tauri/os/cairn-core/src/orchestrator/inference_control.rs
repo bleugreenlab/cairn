@@ -196,6 +196,22 @@ pub struct LoadRow {
     pub reason: Option<String>,
     /// GPU-allocated bytes per machine once the load had settled.
     pub footprint: Option<BTreeMap<String, u64>>,
+    /// The start downloaded what it serves before serving it, as its head saw
+    /// in the start's output, so this load is not what a reload costs.
+    pub cold: bool,
+}
+
+/// The load a deployment's reload is judged by, from its loads newest first:
+/// the newest healthy measured load that downloaded nothing, else the newest
+/// healthy measured load. Never the slowest on record, which lets one load
+/// that pulled an image, or ran on a saturated machine, set its pool's
+/// windows for as long as the record keeps it.
+pub fn reference_load(loads: &[LoadRow]) -> Option<&LoadRow> {
+    let mut measured = loads
+        .iter()
+        .filter(|load| load.healthy && load.load_ms.is_some());
+    let newest = measured.clone().next()?;
+    Some(measured.find(|load| !load.cold).unwrap_or(newest))
 }
 
 pub async fn load_states(db: &LocalDb) -> Result<BTreeMap<DeploymentId, StateRow>, String> {
@@ -235,7 +251,7 @@ pub async fn load_history(db: &LocalDb) -> Result<BTreeMap<DeploymentId, Vec<Loa
     let rows = db
         .query_all(
             "SELECT deployment_id, profile_id, requested_at, sent_at, finished_at, outcome, load_ms,
-                    reason, footprint_json
+                    reason, footprint_json, cold
                FROM inference_deployment_loads ORDER BY deployment_id, id DESC",
             (),
             |row| {
@@ -252,6 +268,7 @@ pub async fn load_history(db: &LocalDb) -> Result<BTreeMap<DeploymentId, Vec<Loa
                         footprint: row
                             .opt_text(8)?
                             .and_then(|json| serde_json::from_str(&json).ok()),
+                        cold: row.i64(9)? != 0,
                     },
                 ))
             },
@@ -479,6 +496,30 @@ async fn record_late_exit(
         "UPDATE inference_deployment_loads SET reason = ?3
           WHERE deployment_id = ?1 AND finished_at = ?2 AND outcome = 'healthy'",
         params![id.as_str(), finished_at, reason],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("write inference_deployment_loads: {error}"))
+}
+
+/// Mark the load that made `id` healthy cold when its start, `command_id`,
+/// downloaded what it serves. Health may have been seen first by a probe, so
+/// the load is found through the start the row still holds, not through the
+/// transition the report made.
+async fn record_cold(db: &LocalDb, id: &DeploymentId, command_id: &str) -> Result<(), String> {
+    let Some(row) = load_states(db).await?.remove(id) else {
+        return Ok(());
+    };
+    let Phase::Healthy { since_ms, .. } = row.phase else {
+        return Ok(());
+    };
+    if row.command_id.as_deref() != Some(command_id) {
+        return Ok(());
+    }
+    db.execute(
+        "UPDATE inference_deployment_loads SET cold = 1
+          WHERE deployment_id = ?1 AND finished_at = ?2 AND outcome = 'healthy'",
+        params![id.as_str(), since_ms],
     )
     .await
     .map(|_| ())
@@ -787,7 +828,7 @@ pub(crate) async fn request(
 fn report_of(phase: DeploymentPhaseReport) -> Report {
     match phase {
         DeploymentPhaseReport::Starting => Report::Starting,
-        DeploymentPhaseReport::Healthy { ran_start } => Report::Healthy { ran_start },
+        DeploymentPhaseReport::Healthy { ran_start, .. } => Report::Healthy { ran_start },
         DeploymentPhaseReport::Stopping => Report::Stopping,
         DeploymentPhaseReport::Stopped => Report::Stopped,
         DeploymentPhaseReport::Failed { reason } => Report::Failed { reason },
@@ -802,6 +843,14 @@ pub(crate) async fn on_report(
 ) -> Result<(), String> {
     let inventory = load_inventory(db).await?;
     let id = DeploymentId::new(report.deployment.as_str());
+    let downloaded = matches!(
+        report.phase,
+        DeploymentPhaseReport::Healthy {
+            ran_start: true,
+            downloaded: true
+        }
+    );
+    let command_id = report.command_id.clone();
     let (observation, matching) = if report.command_id.starts_with(PROBE_PREFIX) {
         (
             Observation::Probed {
@@ -820,6 +869,9 @@ pub(crate) async fn on_report(
         )
     };
     apply(db, &inventory, &id, observation, matching, None, now_ms).await?;
+    if downloaded {
+        record_cold(db, &id, &command_id).await?;
+    }
     Ok(())
 }
 
@@ -1553,7 +1605,10 @@ pub(crate) mod tests {
             &db,
             report(
                 "start-old",
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             3_000,
         )
@@ -1572,7 +1627,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &start_id,
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             302_000,
         )
@@ -1730,7 +1788,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &probe_id,
-                DeploymentPhaseReport::Healthy { ran_start: false },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: false,
+                    downloaded: false,
+                },
             ),
             403_000,
         )
@@ -1755,7 +1816,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &start_id,
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             404_000,
         )
@@ -1794,6 +1858,67 @@ pub(crate) mod tests {
         );
     }
 
+    /// A start that pulled its image marks its load cold, whether its own
+    /// report or a probe saw health first.
+    #[tokio::test]
+    async fn a_start_that_downloaded_marks_its_load_cold() {
+        let pulled = DeploymentPhaseReport::Healthy {
+            ran_start: true,
+            downloaded: true,
+        };
+        async fn cold(db: &LocalDb) -> Vec<(Option<u64>, bool)> {
+            load_history(db).await.unwrap()[&DeploymentId::from(DSV4F)]
+                .iter()
+                .map(|load| (load.load_ms, load.cold))
+                .collect()
+        }
+
+        let db = sparks_db("inference-control-cold-reported").await;
+        let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let start_id = started(&db, &heads).await;
+        on_report(&db, report(&start_id, pulled.clone()), 213_000)
+            .await
+            .unwrap();
+        assert_eq!(cold(&db).await, [(Some(211_000), true)]);
+
+        let db = sparks_db("inference-control-cold-probed").await;
+        let heads = FakeHeads::default();
+        heads.attach(SP1, 110, 0);
+        heads.attach(SP2, 110, 0);
+        let mut probes = Probes::default();
+        let start_id = started(&db, &heads).await;
+        tick(&db, &heads, &mut probes, 40_000).await.unwrap();
+        let (_, probe_id, _, _) = heads.last_sent();
+        on_report(
+            &db,
+            report(
+                &probe_id,
+                DeploymentPhaseReport::Healthy {
+                    ran_start: false,
+                    downloaded: false,
+                },
+            ),
+            213_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cold(&db).await, [(Some(211_000), false)]);
+        on_report(&db, report("start-old", pulled.clone()), 214_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            cold(&db).await,
+            [(Some(211_000), false)],
+            "another command's report marks nothing"
+        );
+        on_report(&db, report(&start_id, pulled), 214_000)
+            .await
+            .unwrap();
+        assert_eq!(cold(&db).await, [(Some(211_000), true)]);
+    }
+
     #[tokio::test]
     async fn a_start_script_that_never_exits_is_healthy_and_stays_so() {
         let db = sparks_db("inference-control-foreground").await;
@@ -1806,7 +1931,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &start_id,
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             302_000,
         )
@@ -1837,7 +1965,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &start_id,
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             400_000,
         )
@@ -1908,7 +2039,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &start_id,
-                DeploymentPhaseReport::Healthy { ran_start: true },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: true,
+                    downloaded: false,
+                },
             ),
             100_000,
         )
@@ -1984,7 +2118,10 @@ pub(crate) mod tests {
             &db,
             report(
                 "probe-1",
-                DeploymentPhaseReport::Healthy { ran_start: false },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: false,
+                    downloaded: false,
+                },
             ),
             2_000,
         )
@@ -2054,7 +2191,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &probe_id,
-                DeploymentPhaseReport::Healthy { ran_start: false },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: false,
+                    downloaded: false,
+                },
             ),
             4_000,
         )
@@ -2105,7 +2245,10 @@ pub(crate) mod tests {
             &db,
             report(
                 &probe_id,
-                DeploymentPhaseReport::Healthy { ran_start: false },
+                DeploymentPhaseReport::Healthy {
+                    ran_start: false,
+                    downloaded: false,
+                },
             ),
             3_000,
         )

@@ -199,6 +199,8 @@ pub(crate) struct LeaseCore {
     release_notify: tokio::sync::Notify,
     health: Arc<StdMutex<ServicePlacementHealth>>,
     routes: ProcessRoutes,
+    /// Keeps [`subscribe_lease_events`] registered for exactly the lease's life.
+    _events: super::ResidentProcessSubscription,
 }
 
 /// An owner's handle on a placed service residency.
@@ -269,7 +271,7 @@ pub(crate) async fn acquire_service_lease(
 
     let fence = Arc::new(RwLock::new(fence));
     let routes = ProcessRoutes::default();
-    subscribe_lease_events(orch, &fence, &routes);
+    let events = subscribe_lease_events(orch, &fence, &routes);
     Ok(ServiceLease {
         core: Arc::new(LeaseCore {
             orch: orch.clone(),
@@ -284,6 +286,7 @@ pub(crate) async fn acquire_service_lease(
             release_notify: tokio::sync::Notify::new(),
             health: Arc::new(StdMutex::new(ServicePlacementHealth::Ready)),
             routes,
+            _events: events,
         }),
     })
 }
@@ -304,22 +307,23 @@ fn placed_executor_name(
 /// Install the lease's single subscription on the fleet's resident-process
 /// event stream.
 ///
-/// One per lease, not one per process start. Subscribers are never removed, so
-/// subscribing at each start left a closure behind for every one-shot the
-/// service ever ran — a health check a minute is fourteen hundred a day — and
-/// dispatched every resident event on the machine through all of them.
+/// One per lease, not one per process start: every resident event on the
+/// machine is dispatched through every subscriber, and a service's one-shots
+/// (a health check a minute is fourteen hundred a day) each want only the
+/// routing the lease already does. The lease holds the returned subscription,
+/// so it unregisters when the lease's core is dropped.
 ///
 /// The fence is read through the lease's own handle rather than copied, because
 /// a lease that reacquired after an executor bounce holds a different fence than
 /// the one it started with. A captured copy would match nothing afterwards, and
-/// a resident watch fed by it would park in silence rather than fail. Weak
-/// handles let a released lease's subscription go inert instead of keeping its
-/// state alive.
+/// a resident watch fed by it would park in silence rather than fail. The
+/// handles are weak because the lease's core owns the subscription, so a strong
+/// one would be a cycle.
 fn subscribe_lease_events(
     orch: &Orchestrator,
     fence: &Arc<RwLock<ResidencyFence>>,
     routes: &ProcessRoutes,
-) {
+) -> super::ResidentProcessSubscription {
     let fence = Arc::downgrade(fence);
     let routes = Arc::downgrade(routes);
     orch.fleet.subscribe_resident_process_events(move |event| {
@@ -337,7 +341,7 @@ fn subscribe_lease_events(
             return;
         }
         let _ = route.events.send(event);
-    });
+    })
 }
 
 fn service_acquire_request(
@@ -1063,8 +1067,8 @@ pub(crate) mod tests {
         let lease = acquire_service_lease(
             &orch,
             ServiceIdentity {
-                id: "desktop-automation",
-                label: "desktop automation",
+                id: "axon/axon@local",
+                label: "axon/axon on local",
             },
             named_executor(LOCAL_EXECUTOR_NAME),
             ResidencyFootprint {
@@ -1263,8 +1267,8 @@ pub(crate) mod tests {
             acquire_service_lease(
                 &orch,
                 ServiceIdentity {
-                    id: "desktop-automation",
-                    label: "desktop automation",
+                    id: "axon/axon@local",
+                    label: "axon/axon on local",
                 },
                 named_executor(LOCAL_EXECUTOR_NAME),
                 ResidencyFootprint {

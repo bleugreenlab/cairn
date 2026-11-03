@@ -995,6 +995,34 @@ pub(super) async fn dispatch(
                             }
                         };
                     }
+                    // The placement default is the thread's, keyed by its id, so
+                    // it rides beside any metadata change and a rename leaves it
+                    // where it was.
+                    // Validated (and a name resolved) before anything is
+                    // written, like every other key here: a refused patch
+                    // applies none of its keys.
+                    let placement_default = payload
+                        .get("executor")
+                        .map(|value| crate::fleet::placement_default::prepare_patch(orch, value))
+                        .transpose()
+                        .map_err(|e| build_failure(index, item, e))?;
+                    let placement_owner =
+                        crate::fleet::placement_default::DefaultOwner::Thread(thread.id.clone());
+                    if payload.len() == 1 {
+                        if let Some(prepared) = placement_default {
+                            return crate::fleet::placement_default::commit_patch(
+                                orch,
+                                request,
+                                &db,
+                                &placement_owner,
+                                prepared,
+                                dry_run,
+                            )
+                            .await
+                            .map(Some)
+                            .map_err(|e| build_failure(index, item, e));
+                        }
+                    }
                     if let Some(new_name) = payload.get("name").and_then(|v| v.as_str()) {
                         validate_thread_name(new_name)
                             .map_err(|e| build_failure(index, item, e))?;
@@ -1024,7 +1052,7 @@ pub(super) async fn dispatch(
                                 })
                         })
                         .transpose()?;
-                    if dry_run {
+                    let patched = if dry_run {
                         format!("Would patch thread {project}/{name}")
                     } else {
                         // One update operation, the same one the desktop command
@@ -1073,6 +1101,22 @@ pub(super) async fn dispatch(
                             ),
                         );
                         format!("Patched thread cairn://p/{project}/{}", outcome.thread.name)
+                    };
+                    match placement_default {
+                        Some(prepared) => {
+                            let line = crate::fleet::placement_default::commit_patch(
+                                orch,
+                                request,
+                                &db,
+                                &placement_owner,
+                                prepared,
+                                dry_run,
+                            )
+                            .await
+                            .map_err(|e| build_failure(index, item, e))?;
+                            format!("{patched}. {line}")
+                        }
+                        None => patched,
                     }
                 }
                 _ => return Ok(None),

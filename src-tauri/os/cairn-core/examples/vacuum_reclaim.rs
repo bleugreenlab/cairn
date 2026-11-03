@@ -15,12 +15,16 @@
 //!   1. `VACUUM INTO` a staged compacted image (no checkpoint — in-place VACUUM
 //!      corrupts the migrated MVCC schema; see docs/database.md).
 //!   2. Open the staged image and require `PRAGMA integrity_check` = `ok`.
-//!   3. Move the live three-file set aside to a `.vacuum-backup` set.
+//!   3. Move the live three-file set aside to a `<stem>.vacuum-backup.db` set.
 //!   4. Move the staged set into the live location.
+//!
+//! The staged image is `<stem>.vacuum-staged.db`. Both keep the `.db`
+//! extension because Turso names the logical log from it: under any other name
+//! the staged and backup sets would share one log file (cairn/5590).
 //!
 //! The original is preserved as the backup until you confirm a clean app open;
 //! nothing is deleted automatically. If the process dies mid-move, inspect the
-//! `.vacuum-staged` / `.vacuum-backup` / live sets and restore the backup.
+//! `.vacuum-staged.db` / `.vacuum-backup.db` / live sets and restore the backup.
 //!
 //! Usage (the app MUST be fully quit first):
 //!   cargo run -p cairn-core --example vacuum_reclaim --features internal-api -- <path-to-cairn.turso.db>
@@ -32,7 +36,6 @@
 //!
 //! Exit code 0 = reclaimed; non-zero = aborted (live DB left untouched).
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -58,8 +61,8 @@ async fn main() {
 
 async fn run(live: &Path) -> Result<(), String> {
     let live = live.to_path_buf();
-    let staged = with_suffix(&live, ".vacuum-staged");
-    let backup = with_suffix(&live, ".vacuum-backup");
+    let staged = sibling(&live, "vacuum-staged");
+    let backup = sibling(&live, "vacuum-backup");
 
     if !live.exists() {
         return Err(format!("live database not found: {}", live.display()));
@@ -165,11 +168,10 @@ fn remove_db_set(base: &Path) {
     }
 }
 
-/// Append `suffix` to the file name of `base` (e.g. `<db>` -> `<db>.vacuum-staged`).
-fn with_suffix(base: &Path, suffix: &str) -> PathBuf {
-    let mut name = base.as_os_str().to_owned();
-    name.push(OsString::from(suffix));
-    PathBuf::from(name)
+/// The `<stem>.<label>.db` set beside `live`
+/// (`cairn.turso.db` -> `cairn.turso.vacuum-staged.db`).
+fn sibling(live: &Path, label: &str) -> PathBuf {
+    live.with_extension(format!("{label}.db"))
 }
 
 async fn integrity_check(db: &LocalDb) -> Result<String, String> {

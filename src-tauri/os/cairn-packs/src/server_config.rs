@@ -1,7 +1,9 @@
 //! Authored MCP server configuration and pure substitution/fingerprint operations.
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+
+use cairn_common::authorization::CanonicalEncoder;
 
 use crate::mcp::McpVarRequirement;
 
@@ -123,59 +125,6 @@ pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 3;
 /// Domain separator. Keeps these digests from colliding with any other
 /// sha256-over-config in the system, now or later.
 const MCP_CONFIG_FINGERPRINT_DOMAIN: &str = "cairn.authority.mcp-config";
-
-/// A canonical encoder: every field is written as a length-prefixed key and a
-/// length-prefixed value, so no value can impersonate a field boundary and two
-/// different configurations cannot produce the same byte stream by splicing.
-struct CanonicalEncoder {
-    hasher: sha2::Sha256,
-}
-
-impl CanonicalEncoder {
-    fn new(domain: &str, version: u32) -> Self {
-        let mut encoder = Self {
-            hasher: <sha2::Sha256 as sha2::Digest>::new(),
-        };
-        encoder.field("domain", domain);
-        encoder.field("encoding", &version.to_string());
-        encoder
-    }
-
-    fn field(&mut self, key: &str, value: &str) {
-        use sha2::Digest;
-        self.hasher.update((key.len() as u64).to_be_bytes());
-        self.hasher.update(key.as_bytes());
-        self.hasher.update((value.len() as u64).to_be_bytes());
-        self.hasher.update(value.as_bytes());
-    }
-
-    /// An ordered sequence: the count is hashed too, so a list cannot be
-    /// lengthened or shortened without changing the digest.
-    fn sequence(&mut self, key: &str, values: &[String]) {
-        self.field(key, &values.len().to_string());
-        for (index, value) in values.iter().enumerate() {
-            self.field(&format!("{key}[{index}]"), value);
-        }
-    }
-
-    /// An unordered map, canonicalized by sorting keys. `HashMap` iteration
-    /// order is arbitrary and varies run to run, so without this the same
-    /// configuration would fingerprint differently on each attempt and no
-    /// standing grant could ever be reused.
-    fn map(&mut self, key: &str, values: &HashMap<String, String>) {
-        let sorted: BTreeMap<&String, &String> = values.iter().collect();
-        self.field(key, &sorted.len().to_string());
-        for (name, value) in sorted {
-            self.field(&format!("{key}.key"), name);
-            self.field(&format!("{key}.value"), value);
-        }
-    }
-
-    fn finish(self) -> String {
-        use sha2::Digest;
-        format!("{:x}", self.hasher.finalize())
-    }
-}
 
 /// Fingerprint the **resultant** configuration of an MCP registry mutation:
 /// what would be registered under this name once the change has been applied,

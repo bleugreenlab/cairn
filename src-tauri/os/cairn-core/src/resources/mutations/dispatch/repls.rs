@@ -168,7 +168,19 @@ async fn create_repl(
         .to_string_lossy()
         .into_owned();
 
-    crate::repl_host::open_repl(
+    // A REPL created without a machine of its own goes where the node's
+    // placement default names. REPLs are never recovered (a host restart marks
+    // them exited), so a resume is a create and reads the default afresh.
+    let job_default = match selector {
+        Some(_) => None,
+        None => {
+            let db = orch.db.for_project(project).await;
+            crate::fleet::placement_default::for_job(&db, &ctx.job_id).await
+        }
+    };
+    let (selector, node_default) =
+        crate::fleet::placement_default::resident_selector(selector.cloned(), || job_default);
+    let opened = crate::repl_host::open_repl(
         orch,
         &ctx.job_id,
         &ctx.project_id,
@@ -177,10 +189,11 @@ async fn create_repl(
         slug,
         interpreter,
         deps,
-        selector,
+        selector.as_ref(),
     )
     .await
-    .map(|opened| opened.summary())
+    .map(|opened| opened.summary());
+    crate::fleet::placement_default::resident_outcome(node_default.as_ref(), opened)
 }
 
 async fn delete_repl(

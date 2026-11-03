@@ -180,21 +180,45 @@ pub(crate) async fn ensure_host_agent_snapshot(
     };
     // A job with no agent of its own (a workflow run, say) still wants a host to
     // book its packets in; there is simply nothing to snapshot for it.
-    let Some(agent_config_id) = job.agent_config_id.clone() else {
+    let Some(agent_config_id) = job.agent_config_id.as_deref() else {
         return Ok(Some(execution_id));
     };
+    ensure_execution_agent_snapshot(
+        orch,
+        &execution_id,
+        agent_config_id,
+        job.model.as_deref(),
+        project_path,
+        freshness,
+    )
+    .await?;
+    Ok(Some(execution_id))
+}
 
-    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &execution_id)
+/// The half of [`ensure_host_agent_snapshot`] that needs no job row: guarantee
+/// that an existing execution's snapshot carries `agent_config_id`, resolved
+/// with `job_model` composed in. A caller about to create a job on that
+/// execution establishes its agent here first, so a job whose fence could never
+/// resolve is refused before any row of it exists.
+pub(crate) async fn ensure_execution_agent_snapshot(
+    orch: &Orchestrator,
+    execution_id: &str,
+    agent_config_id: &str,
+    job_model: Option<&str>,
+    project_path: Option<&Path>,
+    freshness: SnapshotFreshness,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
         .await
         .map_err(|e| e.to_string())?;
     // Serialize the read-modify-write against `persist_task_packet`, which books
     // delegated packets into this same snapshot.
-    let lock = orch.execution_lock(&execution_id);
+    let lock = orch.execution_lock(execution_id);
     let _guard = lock.lock().await;
 
     let loaded = db
         .read({
-            let execution_id = execution_id.clone();
+            let execution_id = execution_id.to_string();
             move |conn| {
                 let execution_id = execution_id.clone();
                 Box::pin(async move { load_execution_snapshot_conn(conn, &execution_id).await })
@@ -203,16 +227,16 @@ pub(crate) async fn ensure_host_agent_snapshot(
         .await
         .map_err(|e| db_error("Failed to load execution snapshot", e))?;
     let Some(mut snapshot) = loaded else {
-        return Ok(Some(execution_id));
+        return Ok(());
     };
 
-    let stored = snapshot.agents.get(&agent_config_id).cloned();
+    let stored = snapshot.agents.get(agent_config_id).cloned();
     let refresh = match &stored {
         None => true,
         Some(agent) => freshness == SnapshotFreshness::Tracking && agent.edited_at.is_none(),
     };
     if !refresh {
-        return Ok(Some(execution_id));
+        return Ok(());
     }
 
     // Establishing the invariant is loud; keeping it CURRENT is not. A stored
@@ -223,8 +247,8 @@ pub(crate) async fn ensure_host_agent_snapshot(
     // such fallback, and that case propagates below.
     let resolved = match resolve_host_agent(
         &orch.config_dir,
-        &agent_config_id,
-        job.model.as_deref(),
+        agent_config_id,
+        job_model,
         project_path,
     ) {
         Ok(resolved) => resolved,
@@ -232,7 +256,7 @@ pub(crate) async fn ensure_host_agent_snapshot(
             log::warn!(
                 "Keeping the stored snapshot for agent '{agent_config_id}' on execution {execution_id}: {error}"
             );
-            return Ok(Some(execution_id));
+            return Ok(());
         }
         Err(error) => return Err(error),
     };
@@ -240,16 +264,17 @@ pub(crate) async fn ensure_host_agent_snapshot(
         .as_ref()
         .is_some_and(|stored| agent_snapshots_match(stored, &resolved))
     {
-        return Ok(Some(execution_id));
+        return Ok(());
     }
 
     for (skill_id, skill) in host_skill_snapshots(&orch.config_dir, &resolved, project_path) {
         snapshot.skills.entry(skill_id).or_insert(skill);
     }
-    snapshot.agents.insert(agent_config_id, resolved);
+    snapshot
+        .agents
+        .insert(agent_config_id.to_string(), resolved);
     let snapshot_json = snapshot.to_json()?;
-    write_execution_snapshot(&db, &execution_id, snapshot_json).await?;
-    Ok(Some(execution_id))
+    write_execution_snapshot(&db, execution_id, snapshot_json).await
 }
 
 /// [`ensure_host_agent_snapshot`] addressed by job id, for a caller that holds

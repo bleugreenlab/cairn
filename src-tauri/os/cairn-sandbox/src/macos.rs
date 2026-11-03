@@ -2042,6 +2042,87 @@ mod tests {
         assert!(!sibling.exists());
     }
 
+    /// A host spawn's `$TMPDIR` is its own directory under Cairn's scratch
+    /// root: the profile grants that directory and never the root.
+    #[test]
+    fn a_granted_tmpdir_under_the_scratch_root_is_writable_and_the_root_is_not() {
+        let base = tempdir().unwrap();
+        let root = base.path().join("scratch");
+        let own = root.join("P.1.1.builder");
+        std::fs::create_dir_all(&own).unwrap();
+        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], vec![]);
+        policy.grant_tmpdir(&own);
+        let profile = sbpl_profile(&policy, &test_floor());
+        let write_allow_line = profile
+            .lines()
+            .find(|l| l.starts_with("(allow file-write*"))
+            .unwrap_or("");
+
+        let spellings = |path: &Path| {
+            [
+                path.display().to_string(),
+                path.canonicalize().unwrap().display().to_string(),
+            ]
+        };
+        assert!(
+            spellings(&own)
+                .iter()
+                .any(|own| write_allow_line.contains(&format!("(subpath \"{own}\")"))),
+            "the spawn's own TMPDIR must be writable: {write_allow_line}"
+        );
+        for root in spellings(&root) {
+            assert!(
+                !write_allow_line.contains(&format!("(subpath \"{root}\")")),
+                "the scratch root must not be writable: {write_allow_line}"
+            );
+        }
+    }
+
+    /// Live: under a policy granting only the worktree and one directory under
+    /// a scratch root, the kernel lets a spawn write that directory and refuses
+    /// a sibling beside it.
+    #[test]
+    fn a_granted_tmpdir_is_writable_live_and_its_sibling_is_refused() {
+        if skip_without_nested_sandbox_exec(
+            "a_granted_tmpdir_is_writable_live_and_its_sibling_is_refused",
+        ) {
+            return;
+        }
+        let wt = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        let root = base.path().join("scratch");
+        let own = root.join("P.1.1.builder");
+        std::fs::create_dir_all(&own).unwrap();
+        let mut policy = SandboxPolicy {
+            worktree: wt.path().to_path_buf(),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+            socket_resolvable: vec![],
+            violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
+        };
+        policy.grant_tmpdir(&own);
+        let run = |cmd: &str| -> std::process::Output {
+            let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
+            Command::new(program).args(args).output().unwrap()
+        };
+
+        let inside = own.join("x");
+        assert!(run(&format!("mkdir {}", inside.display())).status.success());
+        assert!(inside.is_dir());
+
+        let sibling = root.join("sibling");
+        assert!(!run(&format!("mkdir {}", sibling.display()))
+            .status
+            .success());
+        assert!(
+            !sibling.exists(),
+            "a sibling under the scratch root is refused"
+        );
+    }
+
     #[test]
     fn readonly_checkout_profile_reads_but_does_not_write_cwd() {
         // A non-worktree live-checkout policy keeps the checkout readable but

@@ -1104,6 +1104,7 @@ mod resident_callback_tests {
                         containment: None,
                         page_call_programs: None,
                         github_credential: None,
+                        machine_services: Vec::new(),
                     },
                     current_load: 0,
                     warm_roots: Vec::new(),

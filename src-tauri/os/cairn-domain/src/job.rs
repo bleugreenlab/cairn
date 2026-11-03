@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 
 /// Job status in the execution lifecycle.
 ///
-/// Transitions are validated by `transitions::transition_job`.
+/// Statuses are derived by the job-status projection
+/// (`cairn_workflow::advancement::recompute`). Running is the one status a
+/// launch writes directly: the transport's `start_job_background`
+/// compare-and-set on a cold start, and `transition_job_to_running` on a
+/// resume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {

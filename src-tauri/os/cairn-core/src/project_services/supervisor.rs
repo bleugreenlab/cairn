@@ -31,7 +31,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 
 use super::authority::{self, ServiceRun, ServiceRunRole};
-use super::declaration::{ServiceDeclaration, ServicePackage, ServiceSource, StartPolicy};
+use super::declaration::{
+    Callback, NativeLaunch, ServiceDeclaration, ServicePackage, ServiceSource, StartPolicy,
+    Transport,
+};
 use super::log::{LogEntry, LogKind};
 use super::protocol::{
     CallAuthority, CallerFrame, CallerKind, Line, LineAssembler, RunnerFrame, ServiceFrame,
@@ -167,13 +170,29 @@ pub(crate) struct LaunchSpec {
     pub declaration: ServiceDeclaration,
     pub files: Vec<(String, Vec<u8>)>,
     pub env: Vec<(String, String)>,
+    /// A native service's executable on this machine; `None` for bun.
+    pub native: Option<NativeLaunch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HostEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
-    Exited { code: Option<i32>, detail: String },
+    /// `executor_lost`: the machine went away, which says nothing about the
+    /// service.
+    Exited {
+        code: Option<i32>,
+        detail: String,
+        executor_lost: bool,
+    },
+}
+
+/// What a probe one-shot printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: Option<i32>,
 }
 
 #[async_trait]
@@ -208,6 +227,22 @@ pub(crate) trait ServiceHost: Send + Sync {
         orch: &Orchestrator,
         spec: &LaunchSpec,
     ) -> Result<HostProcess, LaunchError>;
+    /// Run `program args` once where `spec` is placed, as a native service's
+    /// status probe.
+    async fn probe(
+        &self,
+        _orch: &Orchestrator,
+        _spec: &LaunchSpec,
+        _program: &str,
+        _args: Vec<String>,
+        _timeout: Duration,
+    ) -> Result<ProbeOutput, String> {
+        Err("this host runs no probes".to_string())
+    }
+    /// The machines attached now, as machine services see them.
+    fn machines(&self, orch: &Orchestrator) -> Vec<machine::MachineView> {
+        machine::attached_machines(orch)
+    }
     /// The service has stopped; give back whatever its placement holds.
     async fn release(
         &self,
@@ -227,6 +262,17 @@ pub(crate) trait SourceProvider: Send + Sync {
         project_id: &str,
         owner: &ServiceOwner,
     ) -> Result<Arc<dyn ServiceSource>, String>;
+
+    /// Every installed pack's service source, by pack id.
+    fn packs(&self, orch: &Orchestrator) -> Vec<(String, Arc<dyn ServiceSource>)> {
+        super::pack_source::PackServiceSource::installed(&orch.config_dir)
+            .into_iter()
+            .map(|source| {
+                let pack = source.pack().to_string();
+                (pack, Arc::new(source) as Arc<dyn ServiceSource>)
+            })
+            .collect()
+    }
 }
 
 /// The production sources: a project's default-branch tip, and a thread's
@@ -254,6 +300,9 @@ impl SourceProvider for OwnerSources {
                 let source = super::thread_store::ThreadSource::load(&db, &key, owner).await?;
                 Ok(Arc::new(source))
             }
+            ServiceOwner::Pack { pack, machine, .. } => {
+                machine::open_source(orch, self.packs(orch), pack, machine)
+            }
         }
     }
 }
@@ -270,9 +319,21 @@ type Reply = oneshot::Sender<Result<Value, CallError>>;
 /// One running process of a service.
 struct Incarnation {
     generation: u64,
-    run_id: String,
+    /// The standing run, for a service with a Cairn callback; a native
+    /// resident has none.
+    run_id: Option<String>,
     source_hash: String,
     declaration: ServiceDeclaration,
+    /// What its stdio carries, which decides how its stdout is read.
+    transport: Transport,
+    /// A native service's executable, which its probe runs too.
+    launch: Option<NativeLaunch>,
+    /// Where an `mcp-stdio` resident's stdout goes: the one gateway
+    /// connection attached to it, once one is.
+    stdout_sink: StdMutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    /// Whether a gateway connection has taken this process's stdio. An MCP
+    /// session is one per process, so a second connection gets a fresh one.
+    attached: AtomicBool,
     executor: String,
     /// Where this process calls back, as the audience its bearers are bound
     /// to: each call's delegated bearer is minted for it too.
@@ -385,6 +446,9 @@ struct Cell {
     /// race where a replacement lands between choosing one and sending.
     #[cfg(test)]
     force_first_pick: StdMutex<Option<Arc<Incarnation>>>,
+    /// A machine service's per-machine state: its probe, its facade, and why
+    /// it cannot start. `None` for every other owner.
+    machine: Option<machine::MachineCell>,
 }
 
 impl Cell {
@@ -458,6 +522,8 @@ pub(crate) struct ServiceSupervisor {
     /// catch-up has brought every base tip current. Until then a project
     /// service's scheduled occurrence is deferred, not run from a stale tip.
     projects_current: AtomicBool,
+    /// Serializes [`machine::apply_machine_services`] passes.
+    machine_apply: tokio::sync::Mutex<()>,
 }
 
 impl Default for ServiceSupervisor {
@@ -467,6 +533,7 @@ impl Default for ServiceSupervisor {
             sources: RwLock::new(Arc::new(OwnerSources)),
             cells: StdMutex::default(),
             projects_current: AtomicBool::new(false),
+            machine_apply: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -517,6 +584,7 @@ impl ServiceSupervisor {
                     placement_retries: StdMutex::default(),
                     #[cfg(test)]
                     force_first_pick: StdMutex::default(),
+                    machine: machine::MachineCell::for_owner(owner, service),
                 })
             })
             .clone()
@@ -555,7 +623,7 @@ impl ServiceSupervisor {
             state: state.status,
             sticky_stop: state.sticky_stop,
             generation: current.map(|i| i.generation),
-            run_id: current.map(|i| i.run_id.clone()),
+            run_id: current.and_then(|i| i.run_id.clone()),
             executor: current.map(|i| i.executor.clone()),
             source_hash: current
                 .map(|i| i.source_hash.clone())
@@ -599,8 +667,7 @@ async fn log(
     text: &str,
     detail: Value,
 ) {
-    let Ok(db) = crate::execution::routing::owning_db_for_project(&orch.db, &cell.project_id).await
-    else {
+    let Ok(db) = cell_db(orch, &cell.project_id).await else {
         return;
     };
     let policy = crate::security::redaction_policy(&orch.config_dir);
@@ -616,6 +683,20 @@ async fn log(
     if let Err(error) = super::log::record(&db, &policy, &entry).await {
         tracing::warn!(%error, service = %cell.service, "could not write a service log row");
     }
+}
+
+/// The database a cell's rows live in: its project's, or for a machine
+/// service, which belongs to no project, this runner's own.
+async fn cell_db(
+    orch: &Orchestrator,
+    project_id: &str,
+) -> Result<Arc<crate::storage::LocalDb>, String> {
+    if project_id.is_empty() {
+        return Ok(orch.db.local.clone());
+    }
+    crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn lifecycle(orch: &Orchestrator, cell: &Cell, generation: u64, text: &str, actor: &str) {
@@ -730,6 +811,9 @@ async fn read_package(orch: &Orchestrator, cell: &Cell) -> Result<ServicePackage
                 cell.service,
                 cell.home()
             ),
+            ServiceOwner::Pack { pack, machine, .. } => {
+                format!("{pack}/{} is not selected on {machine}", cell.service)
+            }
         };
         CallError::new("unknown_service", message)
     })
@@ -767,16 +851,6 @@ async fn boot_incarnation(
         }
         state.generation
     };
-    let db = crate::execution::routing::owning_db_for_project(&orch.db, &cell.project_id)
-        .await
-        .map_err(|error| CallError::new("start_failed", error.to_string()))?;
-    let job_id = rows::ensure_service_job(&db, &cell.project_id, &cell.owner, &cell.service)
-        .await
-        .map_err(|error| CallError::new("start_failed", error))?;
-    let run_id = rows::mint_run(&db, &cell.project_id, &job_id)
-        .await
-        .map_err(|error| CallError::new("start_failed", error))?;
-    let home = cell.home();
     let mut spec = LaunchSpec {
         project_id: cell.project_id.clone(),
         project_key: cell.project_key.clone(),
@@ -786,11 +860,171 @@ async fn boot_incarnation(
         declaration: package.declaration.clone(),
         files: package.files.clone(),
         env: Vec::new(),
+        native: package.launch.clone(),
     };
+    // A service with no callback (every native one) gets no job, no run, no
+    // bearer, and no `CAIRN_*` environment: nothing of Cairn's reaches it.
+    let standing = match package.declaration.callback {
+        Callback::Cairn => {
+            Some(standing_run(orch, cell, generation, package, &mut spec, actor).await?)
+        }
+        Callback::None => None,
+    };
+
+    let process = match supervisor(orch).host().launch(orch, &spec).await {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(standing) = &standing {
+                end_run(orch, &cell.project_id, &standing.run_id, "start failed").await;
+            }
+            let error = error.into_call_error();
+            lifecycle(orch, cell, generation, &error.message, actor).await;
+            return Err(error);
+        }
+    };
+    let audience = match &standing {
+        Some(standing) => standing.audience.clone(),
+        // Never presented: a resident with no callback holds no bearer. The
+        // runner's own loopback stands in so the field keeps one shape.
+        None => crate::fleet::residency::ResidentCallback::Direct {
+            url: crate::fleet::residency::runner_callback_url(orch),
+        }
+        .audience()
+        .map_err(|error| CallError::new("start_failed", error))?,
+    };
+
+    let limits = package.declaration.limits;
+    let (phase, mut phase_rx) = watch::channel(Phase::Booting);
+    let incarnation = Arc::new(Incarnation {
+        generation,
+        run_id: standing.as_ref().map(|standing| standing.run_id.clone()),
+        source_hash: package.source_hash.clone(),
+        declaration: package.declaration.clone(),
+        transport: package.declaration.transport,
+        launch: package.launch.clone(),
+        stdout_sink: StdMutex::new(None),
+        attached: AtomicBool::new(false),
+        executor: process.executor.clone(),
+        callback_audience: audience,
+        input: process.input.clone(),
+        pending: StdMutex::default(),
+        phase,
+        drained: AtomicBool::new(false),
+        drained_notify: Notify::new(),
+        gate: Arc::new(Semaphore::new(limits.concurrency as usize)),
+        waiting: AtomicUsize::new(0),
+        retiring: AtomicBool::new(false),
+        started_at: Instant::now(),
+    });
+    tokio::spawn(read_events(
+        orch.clone(),
+        cell.clone(),
+        incarnation.clone(),
+        process.events,
+    ));
+
+    // Readiness is the transport's: a `ready` frame for the service protocol,
+    // and for a native resident, its probe answering at all, whatever state
+    // it reports.
+    let outcome = match package.declaration.transport {
+        Transport::Ndjson => greet(cell, package, &incarnation, &mut phase_rx).await,
+        Transport::McpStdio | Transport::None => {
+            machine::first_probe(orch, cell, &spec, &incarnation, &mut phase_rx).await
+        }
+    };
+    if let Err(reason) = outcome {
+        incarnation.retiring.store(true, Ordering::Release);
+        incarnation.input.kill().await;
+        let message = format!(
+            "generation {generation} (source {}) failed to start: {reason}; its stderr is in this log",
+            short(&package.source_hash)
+        );
+        lifecycle(orch, cell, generation, &message, actor).await;
+        return Err(CallError::new("start_failed", message));
+    }
+    lifecycle(
+        orch,
+        cell,
+        generation,
+        &format!(
+            "started generation {generation} (source {}) on {}",
+            short(&package.source_hash),
+            incarnation.executor
+        ),
+        actor,
+    )
+    .await;
+    Ok(incarnation)
+}
+
+/// Send `hello` and wait for `ready`, within [`READY_TIMEOUT`].
+async fn greet(
+    cell: &Cell,
+    package: &ServicePackage,
+    incarnation: &Incarnation,
+    phase_rx: &mut watch::Receiver<Phase>,
+) -> Result<(), String> {
+    let hello = RunnerFrame::Hello {
+        protocol: PROTOCOL_VERSION,
+        project: cell.project_key.clone(),
+        service: cell.service.clone(),
+        source: package.source_hash.clone(),
+    };
+    let ready = async {
+        incarnation
+            .send(&hello)
+            .await
+            .map_err(|error| format!("could not greet the service: {error}"))?;
+        loop {
+            match *phase_rx.borrow_and_update() {
+                Phase::Ready => return Ok(()),
+                Phase::Exited => return Err("the service exited before it was ready".to_string()),
+                Phase::Booting => {}
+            }
+            if phase_rx.changed().await.is_err() {
+                return Err("the service's event stream closed".to_string());
+            }
+        }
+    };
+    match tokio::time::timeout(READY_TIMEOUT, ready).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(format!(
+            "the service did not answer `hello` within {}s",
+            READY_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// A Cairn-callback service's standing run for one incarnation.
+struct Standing {
+    run_id: String,
+    audience: crate::security::LeaseAudience,
+}
+
+/// Mint the standing run and its bearer, and write the `CAIRN_*` environment
+/// into `spec`.
+async fn standing_run(
+    orch: &Orchestrator,
+    cell: &Arc<Cell>,
+    generation: u64,
+    package: &ServicePackage,
+    spec: &mut LaunchSpec,
+    actor: &str,
+) -> Result<Standing, CallError> {
+    let db = cell_db(orch, &cell.project_id)
+        .await
+        .map_err(|error| CallError::new("start_failed", error))?;
+    let job_id = rows::ensure_service_job(&db, &cell.project_id, &cell.owner, &cell.service)
+        .await
+        .map_err(|error| CallError::new("start_failed", error))?;
+    let run_id = rows::mint_run(&db, &cell.project_id, &job_id)
+        .await
+        .map_err(|error| CallError::new("start_failed", error))?;
+    let home = cell.home();
     // Placed before any bearer exists, because where the service calls back
     // from is what its bearers are bound to: this runner's loopback, or the
     // relay of the one executor it runs on.
-    let callback = match supervisor(orch).host().callback(orch, &spec).await {
+    let callback = match supervisor(orch).host().callback(orch, spec).await {
         Ok(callback) => callback,
         Err(error) => {
             end_run(orch, &cell.project_id, &run_id, "start failed").await;
@@ -852,95 +1086,7 @@ async fn boot_incarnation(
         env.push(("CAIRN_CALLBACK_URL".to_string(), url.clone()));
     }
     spec.env = env;
-
-    let process = match supervisor(orch).host().launch(orch, &spec).await {
-        Ok(process) => process,
-        Err(error) => {
-            end_run(orch, &cell.project_id, &run_id, "start failed").await;
-            let error = error.into_call_error();
-            lifecycle(orch, cell, generation, &error.message, actor).await;
-            return Err(error);
-        }
-    };
-
-    let limits = package.declaration.limits;
-    let (phase, mut phase_rx) = watch::channel(Phase::Booting);
-    let incarnation = Arc::new(Incarnation {
-        generation,
-        run_id: run_id.clone(),
-        source_hash: package.source_hash.clone(),
-        declaration: package.declaration.clone(),
-        executor: process.executor.clone(),
-        callback_audience: audience,
-        input: process.input.clone(),
-        pending: StdMutex::default(),
-        phase,
-        drained: AtomicBool::new(false),
-        drained_notify: Notify::new(),
-        gate: Arc::new(Semaphore::new(limits.concurrency as usize)),
-        waiting: AtomicUsize::new(0),
-        retiring: AtomicBool::new(false),
-        started_at: Instant::now(),
-    });
-    tokio::spawn(read_events(
-        orch.clone(),
-        cell.clone(),
-        incarnation.clone(),
-        process.events,
-    ));
-
-    let hello = RunnerFrame::Hello {
-        protocol: PROTOCOL_VERSION,
-        project: cell.project_key.clone(),
-        service: cell.service.clone(),
-        source: package.source_hash.clone(),
-    };
-    let ready = async {
-        incarnation
-            .send(&hello)
-            .await
-            .map_err(|error| format!("could not greet the service: {error}"))?;
-        loop {
-            match *phase_rx.borrow_and_update() {
-                Phase::Ready => return Ok(()),
-                Phase::Exited => return Err("the service exited before it was ready".to_string()),
-                Phase::Booting => {}
-            }
-            if phase_rx.changed().await.is_err() {
-                return Err("the service's event stream closed".to_string());
-            }
-        }
-    };
-    let outcome = match tokio::time::timeout(READY_TIMEOUT, ready).await {
-        Ok(outcome) => outcome,
-        Err(_) => Err(format!(
-            "the service did not answer `hello` within {}s",
-            READY_TIMEOUT.as_secs()
-        )),
-    };
-    if let Err(reason) = outcome {
-        incarnation.retiring.store(true, Ordering::Release);
-        incarnation.input.kill().await;
-        let message = format!(
-            "generation {generation} (source {}) failed to start: {reason}; its stderr is in this log",
-            short(&package.source_hash)
-        );
-        lifecycle(orch, cell, generation, &message, actor).await;
-        return Err(CallError::new("start_failed", message));
-    }
-    lifecycle(
-        orch,
-        cell,
-        generation,
-        &format!(
-            "started generation {generation} (source {}) on {}",
-            short(&package.source_hash),
-            incarnation.executor
-        ),
-        actor,
-    )
-    .await;
-    Ok(incarnation)
+    Ok(Standing { run_id, audience })
 }
 
 fn install(orch: &Orchestrator, cell: &Arc<Cell>, incarnation: Arc<Incarnation>) {
@@ -1023,6 +1169,12 @@ async fn retire(incarnation: Arc<Incarnation>) {
     if incarnation.phase() == Phase::Exited {
         return;
     }
+    // Only the service protocol has a drain to ask for; anything else is
+    // stopped, as a resident always was.
+    if incarnation.transport != Transport::Ndjson {
+        incarnation.input.kill().await;
+        return;
+    }
     let _ = incarnation.send(&RunnerFrame::Drain).await;
     let grace = Duration::from_secs(incarnation.declaration.limits.call_timeout_seconds as u64)
         + DRAIN_GRACE;
@@ -1057,11 +1209,17 @@ async fn read_events(
     let mut stderr = LineAssembler::new(super::log::TEXT_MAX_BYTES);
     let mut violations = ViolationWindow::default();
     let generation = incarnation.generation;
-    let (code, detail) = loop {
+    let (code, detail, executor_lost) = loop {
         let Some(event) = events.recv().await else {
-            break (None, "its event stream closed".to_string());
+            break (None, "its event stream closed".to_string(), false);
         };
         match event {
+            HostEvent::Stdout(bytes) if incarnation.transport == Transport::McpStdio => {
+                if let Some(sink) = incarnation.stdout_sink.lock().unwrap().as_ref() {
+                    let _ = sink.send(bytes);
+                }
+            }
+            HostEvent::Stdout(_) if incarnation.transport == Transport::None => {}
             HostEvent::Stdout(bytes) => {
                 for line in stdout.push(&bytes) {
                     let problem = match line {
@@ -1098,13 +1256,17 @@ async fn read_events(
                     stderr_row(&orch, &cell, generation, line).await;
                 }
             }
-            HostEvent::Exited { code, detail } => break (code, detail),
+            HostEvent::Exited {
+                code,
+                detail,
+                executor_lost,
+            } => break (code, detail, executor_lost),
         }
     };
     if let Some(line) = stderr.finish() {
         stderr_row(&orch, &cell, generation, line).await;
     }
-    on_exit(&orch, &cell, &incarnation, code, &detail).await;
+    on_exit(&orch, &cell, &incarnation, code, &detail, executor_lost).await;
 }
 
 async fn stderr_row(orch: &Orchestrator, cell: &Cell, generation: u64, line: Line) {
@@ -1161,9 +1323,12 @@ async fn on_exit(
     incarnation: &Arc<Incarnation>,
     code: Option<i32>,
     detail: &str,
+    executor_lost: bool,
 ) {
     let booting = incarnation.phase() == Phase::Booting;
     let _ = incarnation.phase.send(Phase::Exited);
+    // The attached gateway connection sees its stream end.
+    incarnation.stdout_sink.lock().unwrap().take();
     let generation = incarnation.generation;
     let code_text = code.map_or("no exit code".to_string(), |code| {
         format!("exit code {code}")
@@ -1172,14 +1337,30 @@ async fn on_exit(
         "service_crashed",
         format!("the service exited ({code_text}, {detail}) while the call was in flight"),
     ));
-    let expected = booting || incarnation.retiring.load(Ordering::Acquire);
-    end_run(
-        orch,
-        &cell.project_id,
-        &incarnation.run_id,
-        if expected { "stopped" } else { "crashed" },
-    )
-    .await;
+    // A machine service whose machine went away did nothing wrong: it waits
+    // for the machine, and starts again when it attaches.
+    let machine_absent = executor_lost && cell.machine.is_some();
+    if machine_absent {
+        let mut state = cell.state.lock().unwrap();
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.generation == generation)
+        {
+            state.current = None;
+            state.status = ServiceState::Stopped;
+        }
+    }
+    let expected = booting || machine_absent || incarnation.retiring.load(Ordering::Acquire);
+    if let Some(run_id) = &incarnation.run_id {
+        end_run(
+            orch,
+            &cell.project_id,
+            run_id,
+            if expected { "stopped" } else { "crashed" },
+        )
+        .await;
+    }
     if expected {
         lifecycle(
             orch,
@@ -2149,7 +2330,7 @@ pub(crate) async fn start_at_boot(orch: &Orchestrator) {
 async fn apply_owner_at_boot(orch: &Orchestrator, project_id: &str, owner: &ServiceOwner) {
     let thread = match owner {
         ServiceOwner::Thread { name, .. } => name.as_str(),
-        ServiceOwner::Project => "",
+        ServiceOwner::Project | ServiceOwner::Pack { .. } => "",
     };
     tracing::info!(project_id, thread, "boot: applying a thread's services");
     let began = Instant::now();
@@ -2392,6 +2573,12 @@ async fn call_body(
         return Err(CallError::new(
             "params_too_large",
             format!("params are {params_bytes} bytes; a call may carry at most {MAX_PARAMS_BYTES}"),
+        ));
+    }
+    if matches!(request.owner, ServiceOwner::Pack { .. }) {
+        return Err(CallError::new(
+            "not_callable",
+            super::MACHINE_SERVICE_REFUSAL,
         ));
     }
     let cell = supervisor(orch).cell(
@@ -2801,3 +2988,5 @@ async fn record_call(
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 pub(crate) mod tests;
+
+pub(crate) mod machine;

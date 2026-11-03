@@ -1304,6 +1304,7 @@ mod tests {
             place: Some(3),
             placed_by: None,
             pinned: false,
+            frozen: false,
         };
         let thread = CapacityHold::Thread {
             thread: "harness".into(),
@@ -1312,6 +1313,7 @@ mod tests {
             place: Some(1),
             placed_by: None,
             pinned: false,
+            frozen: false,
         };
         let fleet_gate = capacity_gate("gf", FLEET_SLOT_FACT, 1000, Some(&fleet));
         let thread_gate = capacity_gate("gt", THREAD_FOCUS_FACT, 1001, Some(&thread));
@@ -1383,6 +1385,7 @@ mod tests {
             place: None,
             placed_by: None,
             pinned: false,
+            frozen: false,
         };
         let fresh = read(&[capacity_gate(
             "gn",

@@ -1891,6 +1891,9 @@ pub(crate) fn review_check_placement_question(
         verdict_platforms: check
             .map(crate::execution::check_identity::verdict_platforms)
             .unwrap_or_default(),
+        compiles_rust: check.is_some_and(|check| {
+            crate::execution::checks::CheckPlacementQuestion::command_compiles_rust(&check.command)
+        }),
     }
 }
 

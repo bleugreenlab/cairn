@@ -106,6 +106,79 @@ struct ScheduleManifestEntry {
     args: Option<serde_json::Value>,
 }
 
+/// What runs a service, as written.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RuntimeKind {
+    #[default]
+    Bun,
+    Native,
+}
+
+/// How many instances of a service run.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Placement {
+    /// One instance, wherever its `executor` places it.
+    #[default]
+    Single,
+    /// One resident on each machine the fleet row selects it on.
+    PerMachine,
+}
+
+/// What a service's stdio carries.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Transport {
+    /// The service protocol, one JSON frame per line (`@cairn/sdk/service`).
+    Ndjson,
+    /// An MCP server on stdio, which the gateway reaches through the cell.
+    McpStdio,
+    /// Nothing: the process is supervised and probed, and its stdout dropped.
+    None,
+}
+
+/// Whether a service holds a Cairn callback bearer.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Callback {
+    /// A standing run and bearer, as every bun service has.
+    Cairn,
+    /// No run, no bearer, no `CAIRN_*` environment.
+    None,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArtifactsManifest {
+    version: String,
+    prove: Vec<String>,
+    targets: BTreeMap<String, ArtifactTargetManifest>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ArtifactTargetManifest {
+    url: String,
+    sha256: String,
+    size: u64,
+    #[serde(default)]
+    archive: Option<cairn_common::archive::ArchiveKind>,
+    executable: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProbeManifest {
+    args: Vec<String>,
+    every: String,
+    ready: String,
+    #[serde(default)]
+    reason: Vec<String>,
+    #[serde(default)]
+    waiting_for_operator: Vec<String>,
+}
+
 /// `service.yaml` as written.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -114,19 +187,88 @@ struct ServiceManifest {
     #[serde(default)]
     description: String,
     #[serde(default)]
+    runtime: RuntimeKind,
+    #[serde(default)]
+    placement: Placement,
+    #[serde(default)]
+    callback: Option<Callback>,
+    #[serde(default)]
+    transport: Option<Transport>,
+    #[serde(default)]
     entry: Option<String>,
     #[serde(default)]
-    start: StartPolicy,
+    start: Option<StartPolicy>,
     #[serde(default)]
     executor: Option<ServiceExecutor>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    env: Option<BTreeMap<String, String>>,
     #[serde(default)]
     limits: ServiceLimitsManifest,
     #[serde(default)]
-    schedule: Vec<ScheduleManifestEntry>,
+    schedule: Option<Vec<ScheduleManifestEntry>>,
     #[serde(default)]
     idle_stop_after: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    artifacts: Option<ArtifactsManifest>,
+    #[serde(default)]
+    probe: Option<ProbeManifest>,
+}
+
+/// The largest artifact a declaration may name: the install plane's own cap.
+pub(crate) const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARGS: usize = 32;
+const MIN_PROBE_EVERY: Duration = Duration::from_secs(60);
+const MAX_PROBE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One published artifact of a native service, for one target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeArtifact {
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub archive: Option<cairn_common::archive::ArchiveKind>,
+    /// The executable's path inside the unpacked artifact, `/`-separated.
+    pub executable: String,
+}
+
+/// How the supervisor asks a native service what state it is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeSpec {
+    /// Run on the executable as a one-shot; its stdout must be JSON.
+    pub args: Vec<String>,
+    pub every: Duration,
+    /// A JSON pointer to the boolean that means "ready".
+    pub ready: String,
+    /// JSON pointers tried in order for the reason it is not ready.
+    pub reason: Vec<String>,
+    /// Reasons that mean a person has to act on the machine (grant a
+    /// permission, log in), as opposed to the service being degraded.
+    pub waiting_for_operator: Vec<String>,
+}
+
+/// A pinned native executable a pack ships per target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeSpec {
+    /// The resident's arguments.
+    pub args: Vec<String>,
+    pub version: String,
+    /// Run on the installed executable; its output must contain `version`.
+    pub prove: Vec<String>,
+    /// By the artifact plane's target triple.
+    pub targets: BTreeMap<String, NativeArtifact>,
+    pub probe: ProbeSpec,
+}
+
+/// What runs a validated service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Runtime {
+    /// `bun` importing `entry` from the package, built on `@cairn/sdk/service`.
+    Bun {
+        entry: String,
+    },
+    Native(NativeSpec),
 }
 
 /// A method the supervisor calls on a fixed cadence, with no caller but the
@@ -191,7 +333,10 @@ pub(crate) struct ServiceDeclaration {
     pub id: String,
     pub name: String,
     pub description: String,
-    pub entry: String,
+    pub runtime: Runtime,
+    pub placement: Placement,
+    pub transport: Transport,
+    pub callback: Callback,
     pub start: StartPolicy,
     /// `None` lets the fleet choose.
     pub executor: Option<ExecutorSelector>,
@@ -206,6 +351,23 @@ pub(crate) struct ServiceDeclaration {
     pub manifest_text: String,
 }
 
+impl ServiceDeclaration {
+    /// The bun entry, or `None` for a native service.
+    pub(crate) fn entry(&self) -> Option<&str> {
+        match &self.runtime {
+            Runtime::Bun { entry } => Some(entry),
+            Runtime::Native(_) => None,
+        }
+    }
+
+    pub(crate) fn native(&self) -> Option<&NativeSpec> {
+        match &self.runtime {
+            Runtime::Native(native) => Some(native),
+            Runtime::Bun { .. } => None,
+        }
+    }
+}
+
 /// A declaration together with the files it runs, read at one revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServicePackage {
@@ -213,6 +375,18 @@ pub(crate) struct ServicePackage {
     /// Package-relative paths, sorted, with their bytes.
     pub files: Vec<(String, Vec<u8>)>,
     pub source_hash: String,
+    /// For a native service, what this one machine runs: set by the machine's
+    /// source, whose `source_hash` then covers it too.
+    pub launch: Option<NativeLaunch>,
+}
+
+/// The native executable one machine runs, and how it was chosen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeLaunch {
+    /// The operator's absolute override, or a managed-program intent the
+    /// executor resolves under its home.
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 /// One entry in a source's listing. A malformed declaration is listed with its
@@ -243,6 +417,9 @@ pub(crate) trait ServiceSource: Send + Sync {
 pub(crate) struct PackageOrigin {
     package: String,
     manifest: String,
+    /// Whether a pack owns the service: only a pack may declare one resident
+    /// per machine, because only the operator's fleet row selects machines.
+    pack_owned: bool,
 }
 
 impl PackageOrigin {
@@ -251,6 +428,7 @@ impl PackageOrigin {
         Self {
             package: format!("{SERVICES_DIR}/{id}"),
             manifest: format!("{SERVICES_DIR}/{id}/{MANIFEST_FILE}"),
+            pack_owned: false,
         }
     }
 
@@ -260,9 +438,22 @@ impl PackageOrigin {
         Self {
             package: uri.to_string(),
             manifest: format!("{uri} (title, description, entry, manifest)"),
+            pack_owned: false,
+        }
+    }
+
+    /// `services/<id>` in the installed pack `pack`.
+    pub(crate) fn pack(pack: &str, id: &str) -> Self {
+        Self {
+            package: format!("pack {pack}: {PACK_SERVICES_DIR}/{id}"),
+            manifest: format!("pack {pack}: {PACK_SERVICES_DIR}/{id}/{MANIFEST_FILE}"),
+            pack_owned: true,
         }
     }
 }
+
+/// The directory a pack's service declarations live under, in its source.
+pub(crate) const PACK_SERVICES_DIR: &str = "services";
 
 /// Whether `id` may name a service: a lowercase letter, then up to 62
 /// lowercase letters, digits, or hyphens.
@@ -300,6 +491,42 @@ pub(crate) fn parse_service_manifest_in(
             "{manifest_place}: `name` must say what a person calls this service"
         ));
     }
+    if manifest.placement == Placement::PerMachine && !origin.pack_owned {
+        return Err(format!(
+            "{manifest_place}: `placement: per-machine` is legal only for a service a pack ships; a project or thread service runs one instance"
+        ));
+    }
+    if manifest.runtime == RuntimeKind::Native {
+        return parse_native(origin, id, text, manifest);
+    }
+    for (key, present) in [
+        ("args", manifest.args.is_some()),
+        ("artifacts", manifest.artifacts.is_some()),
+        ("probe", manifest.probe.is_some()),
+    ] {
+        if present {
+            return Err(format!(
+                "{manifest_place}: `{key}` applies only to `runtime: native`"
+            ));
+        }
+    }
+    if manifest.placement == Placement::PerMachine {
+        return Err(format!(
+            "{manifest_place}: `placement: per-machine` needs `runtime: native`; a bun service runs one instance"
+        ));
+    }
+    if manifest.callback == Some(Callback::None) {
+        return Err(format!(
+            "{manifest_place}: `callback: none` is refused for a bun service, which reaches Cairn only through its callback"
+        ));
+    }
+    if let Some(transport @ (Transport::McpStdio | Transport::None)) = manifest.transport {
+        return Err(format!(
+            "{manifest_place}: `transport: {}` is refused for a bun service, whose transport is ndjson",
+            transport_word(transport)
+        ));
+    }
+    let start = manifest.start.unwrap_or_default();
 
     let entry = manifest
         .entry
@@ -308,7 +535,8 @@ pub(crate) fn parse_service_manifest_in(
         .to_string();
     validate_entry(&entry).map_err(|error| format!("{package}: {error}"))?;
 
-    for key in manifest.env.keys() {
+    let env = manifest.env.unwrap_or_default();
+    for key in env.keys() {
         validate_env_key(key).map_err(|error| format!("{package}: {error}"))?;
     }
 
@@ -330,24 +558,276 @@ pub(crate) fn parse_service_manifest_in(
 
     let limits =
         resolve_limits(&manifest.limits).map_err(|error| format!("{package}: limits: {error}"))?;
-    let schedule =
-        resolve_schedule(&manifest.schedule).map_err(|error| format!("{package}: {error}"))?;
-    let idle_stop_after = resolve_idle_stop(manifest.start, manifest.idle_stop_after.as_deref())
+    let schedule = resolve_schedule(manifest.schedule.as_deref().unwrap_or_default())
+        .map_err(|error| format!("{package}: {error}"))?;
+    let idle_stop_after = resolve_idle_stop(start, manifest.idle_stop_after.as_deref())
         .map_err(|error| format!("{package}: {error}"))?;
 
     Ok(ServiceDeclaration {
         id: id.to_string(),
         name: manifest.name.trim().to_string(),
         description: manifest.description.trim().to_string(),
-        entry,
-        start: manifest.start,
+        runtime: Runtime::Bun { entry },
+        placement: Placement::Single,
+        transport: Transport::Ndjson,
+        callback: Callback::Cairn,
+        start,
         executor,
-        env: manifest.env,
+        env,
         limits,
         schedule,
         idle_stop_after,
         manifest_text: text.to_string(),
     })
+}
+
+fn transport_word(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Ndjson => "ndjson",
+        Transport::McpStdio => "mcp-stdio",
+        Transport::None => "none",
+    }
+}
+
+/// A `runtime: native` declaration: a pinned executable per target, one
+/// resident per selected machine, no Cairn callback, and a probe that says
+/// whether it is ready.
+fn parse_native(
+    origin: &PackageOrigin,
+    id: &str,
+    text: &str,
+    manifest: ServiceManifest,
+) -> Result<ServiceDeclaration, String> {
+    let place = &origin.manifest;
+    for (key, present, why) in [
+        (
+            "entry",
+            manifest.entry.is_some(),
+            "it runs a pinned executable, not a bun entry",
+        ),
+        (
+            "env",
+            manifest.env.is_some(),
+            "its environment is the executor's own, and nothing of Cairn's reaches it",
+        ),
+        (
+            "schedule",
+            manifest.schedule.is_some(),
+            "it has no methods for the supervisor to call",
+        ),
+        (
+            "idleStopAfter",
+            manifest.idle_stop_after.is_some(),
+            "it runs for as long as it is selected",
+        ),
+        (
+            "executor",
+            manifest.executor.is_some(),
+            "the fleet row's machine selection places it",
+        ),
+        (
+            "start",
+            manifest.start.is_some(),
+            "it starts on every machine that selects it",
+        ),
+    ] {
+        if present {
+            return Err(format!(
+                "{place}: `{key}` is refused for `runtime: native`: {why}"
+            ));
+        }
+    }
+    if manifest.placement != Placement::PerMachine {
+        return Err(format!(
+            "{place}: `runtime: native` needs `placement: per-machine`: a native service runs one resident on each machine that selects it"
+        ));
+    }
+    if manifest.callback == Some(Callback::Cairn) {
+        return Err(format!(
+            "{place}: `callback` must be `none` for `runtime: native`: no Cairn bearer ever reaches a native resident"
+        ));
+    }
+    let transport = match manifest.transport {
+        Some(transport @ (Transport::McpStdio | Transport::None)) => transport,
+        Some(Transport::Ndjson) => {
+            return Err(format!(
+                "{place}: `transport: ndjson` is the bun service protocol; a native service is `mcp-stdio` or `none`"
+            ))
+        }
+        None => {
+            return Err(format!(
+                "{place}: `transport` is required for `runtime: native`: `mcp-stdio` or `none`"
+            ))
+        }
+    };
+    let required = |key: &str| format!("{place}: `{key}` is required for `runtime: native`");
+    let args = manifest.args.ok_or_else(|| required("args"))?;
+    let artifacts = manifest.artifacts.ok_or_else(|| required("artifacts"))?;
+    let probe = manifest.probe.ok_or_else(|| required("probe"))?;
+    if args.len() > MAX_ARGS {
+        return Err(format!("{place}: `args` has more than {MAX_ARGS} entries"));
+    }
+    validate_args(&args).map_err(|error| format!("{place}: args: {error}"))?;
+    let limits =
+        resolve_limits(&manifest.limits).map_err(|error| format!("{place}: limits: {error}"))?;
+    let native =
+        resolve_native(args, artifacts, probe).map_err(|error| format!("{place}: {error}"))?;
+    Ok(ServiceDeclaration {
+        id: id.to_string(),
+        name: manifest.name.trim().to_string(),
+        description: manifest.description.trim().to_string(),
+        runtime: Runtime::Native(native),
+        placement: Placement::PerMachine,
+        transport,
+        callback: Callback::None,
+        start: StartPolicy::Launch,
+        executor: None,
+        env: BTreeMap::new(),
+        limits,
+        schedule: Vec::new(),
+        idle_stop_after: None,
+        manifest_text: text.to_string(),
+    })
+}
+
+fn validate_args(args: &[String]) -> Result<(), String> {
+    for arg in args {
+        if arg.is_empty() || arg.chars().any(char::is_control) {
+            return Err(format!(
+                "{arg:?} must be a non-empty argument with no control characters"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_native(
+    args: Vec<String>,
+    artifacts: ArtifactsManifest,
+    probe: ProbeManifest,
+) -> Result<NativeSpec, String> {
+    let version = artifacts.version.trim();
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        return Err("artifacts.version must be one word, the version every artifact proves".into());
+    }
+    if artifacts.prove.is_empty() {
+        return Err(
+            "artifacts.prove must name the arguments that make the executable print its version"
+                .into(),
+        );
+    }
+    validate_args(&artifacts.prove).map_err(|error| format!("artifacts.prove: {error}"))?;
+    if artifacts.targets.is_empty() {
+        return Err("artifacts.targets must name at least one target".into());
+    }
+    let known: Vec<&str> = [
+        cairn_common::executor_protocol::RemotePlatform::DarwinArm64,
+        cairn_common::executor_protocol::RemotePlatform::LinuxX86_64,
+        cairn_common::executor_protocol::RemotePlatform::LinuxArm64,
+        cairn_common::executor_protocol::RemotePlatform::WindowsX86_64,
+    ]
+    .into_iter()
+    .map(|platform| platform.target())
+    .collect();
+    let mut targets = BTreeMap::new();
+    for (target, artifact) in artifacts.targets {
+        let at = format!("artifacts.targets.{target}");
+        if !known.contains(&target.as_str()) {
+            return Err(format!(
+                "{at}: `{target}` is not a target the artifact plane serves ({})",
+                known.join(", ")
+            ));
+        }
+        if !artifact.url.starts_with("https://") {
+            return Err(format!("{at}.url must be an https URL"));
+        }
+        if !cairn_packs::is_canonical_sha256(&artifact.sha256) {
+            return Err(format!("{at}.sha256 must be 64 lowercase hex digits"));
+        }
+        if artifact.size == 0 || artifact.size > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "{at}.size must be between 1 and {MAX_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        validate_executable(&artifact.executable, artifact.archive.is_some())
+            .map_err(|error| format!("{at}.executable: {error}"))?;
+        targets.insert(
+            target,
+            NativeArtifact {
+                url: artifact.url,
+                sha256: artifact.sha256,
+                size: artifact.size,
+                archive: artifact.archive,
+                executable: artifact.executable,
+            },
+        );
+    }
+    if probe.args.is_empty() {
+        return Err("probe.args must name the arguments of the status one-shot".into());
+    }
+    validate_args(&probe.args).map_err(|error| format!("probe.args: {error}"))?;
+    let every = crate::duration::parse_duration_ms(probe.every.trim())
+        .ok()
+        .map(Duration::from_millis)
+        .filter(|every| (MIN_PROBE_EVERY..=MAX_PROBE_EVERY).contains(every))
+        .ok_or_else(|| {
+            format!(
+                "probe.every `{}` must be a duration from 1m to 24h (like 5m)",
+                probe.every.trim()
+            )
+        })?;
+    for (key, pointer) in std::iter::once(("probe.ready", &probe.ready))
+        .chain(probe.reason.iter().map(|pointer| ("probe.reason", pointer)))
+    {
+        if !pointer.starts_with('/') {
+            return Err(format!(
+                "{key} `{pointer}` must be a JSON pointer, starting with `/`"
+            ));
+        }
+    }
+    if probe
+        .waiting_for_operator
+        .iter()
+        .any(|reason| reason.trim().is_empty())
+    {
+        return Err("probe.waitingForOperator entries must be non-empty reasons".into());
+    }
+    Ok(NativeSpec {
+        args,
+        version: version.to_string(),
+        prove: artifacts.prove,
+        targets,
+        probe: ProbeSpec {
+            args: probe.args,
+            every,
+            ready: probe.ready,
+            reason: probe.reason,
+            waiting_for_operator: probe.waiting_for_operator,
+        },
+    })
+}
+
+/// An executable's place inside its unpacked artifact: a plain relative path
+/// that stays inside it, and for a bare file (no archive) a single name.
+fn validate_executable(executable: &str, archived: bool) -> Result<(), String> {
+    let plain = !executable.is_empty()
+        && !executable.starts_with('/')
+        && !executable.contains('\\')
+        && !executable.chars().any(char::is_control)
+        && executable
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if !plain {
+        return Err(format!(
+            "`{executable}` must be a plain relative path inside the artifact, `/`-separated"
+        ));
+    }
+    if !archived && executable.contains('/') {
+        return Err(format!(
+            "`{executable}` must be a file name: an artifact with no `archive` is the executable itself"
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_schedule(entries: &[ScheduleManifestEntry]) -> Result<Vec<ScheduleEntry>, String> {
@@ -550,7 +1030,10 @@ pub(crate) fn package_from_files_in(
     let text = std::str::from_utf8(&manifest.1)
         .map_err(|_| format!("{} is not UTF-8", origin.manifest))?;
     let declaration = parse_service_manifest_in(origin, id, text)?;
-    if !files.iter().any(|(path, _)| *path == declaration.entry) {
+    if let Some(entry) = declaration
+        .entry()
+        .filter(|entry| !files.iter().any(|(path, _)| path == entry))
+    {
         let mut paths: Vec<&str> = files
             .iter()
             .map(|(path, _)| path.as_str())
@@ -558,8 +1041,7 @@ pub(crate) fn package_from_files_in(
             .collect();
         paths.sort_unstable();
         return Err(format!(
-            "{package}: entry `{}` is not in the package ({})",
-            declaration.entry,
+            "{package}: entry `{entry}` is not in the package ({})",
             paths.join(", ")
         ));
     }
@@ -568,6 +1050,7 @@ pub(crate) fn package_from_files_in(
         declaration,
         files,
         source_hash,
+        launch: None,
     })
 }
 
@@ -739,11 +1222,170 @@ mod tests {
         }
     }
 
+    const NATIVE: &str = "name: Probe
+runtime: native
+placement: per-machine
+callback: none
+transport: mcp-stdio
+args: [mcp]
+artifacts:
+  version: 1.2.3
+  prove: [--version]
+  targets:
+    aarch64-apple-darwin:
+      url: https://example.invalid/probe.zip
+      sha256: 5748ce7e08ee1e521fb4044ffa30577acf588a02d368a2f3d2bb459264d9c141
+      size: 10
+      archive: zip
+      executable: Probe.app/Contents/MacOS/probe
+    x86_64-unknown-linux-gnu:
+      url: https://example.invalid/probe
+      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54
+      size: 10
+      executable: probe
+probe:
+  args: [status, --json]
+  every: 5m
+  ready: /daemon/ready
+  reason: [/reason]
+  waitingForOperator: [permission-denied]
+";
+
+    fn pack_manifest(text: &str) -> Result<ServiceDeclaration, String> {
+        parse_service_manifest_in(&PackageOrigin::pack("probe", "probe"), "probe", text)
+    }
+
+    #[test]
+    fn the_native_keys_parse() {
+        let declaration = pack_manifest(NATIVE).unwrap();
+        assert_eq!(declaration.placement, Placement::PerMachine);
+        assert_eq!(declaration.transport, Transport::McpStdio);
+        assert_eq!(declaration.callback, Callback::None);
+        assert_eq!(declaration.start, StartPolicy::Launch);
+        assert_eq!(declaration.idle_stop_after, None);
+        assert_eq!(declaration.entry(), None);
+        let native = declaration.native().unwrap();
+        assert_eq!(native.prove, vec!["--version".to_string()]);
+        let mac = &native.targets["aarch64-apple-darwin"];
+        assert_eq!(mac.archive, Some(cairn_common::archive::ArchiveKind::Zip));
+        assert_eq!(mac.size, 10);
+        assert_eq!(native.targets["x86_64-unknown-linux-gnu"].archive, None);
+        assert_eq!(native.probe.reason, vec!["/reason".to_string()]);
+        let package = package_from_files_in(
+            &PackageOrigin::pack("probe", "probe"),
+            "probe",
+            files(&[("service.yaml", NATIVE)]),
+        )
+        .expect("a native package is its manifest alone");
+        assert_eq!(package.files.len(), 1);
+    }
+
+    #[test]
+    fn a_transport_none_fixture_parses() {
+        let none = NATIVE.replace("transport: mcp-stdio", "transport: none");
+        assert_eq!(pack_manifest(&none).unwrap().transport, Transport::None);
+    }
+
+    /// Each refusal names the key it is about.
+    #[test]
+    fn the_native_rules_refuse_with_the_key_named() {
+        for (edit, says) in [
+            (
+                NATIVE.replace(
+                    "      size: 10\n      archive: zip\n",
+                    "      archive: zip\n",
+                ),
+                "size",
+            ),
+            (format!("{NATIVE}port: 1\n"), "port"),
+            (
+                NATIVE.replace("  every: 5m\n", "  every: 5m\n  cron: x\n"),
+                "cron",
+            ),
+            (format!("{NATIVE}entry: main.ts\n"), "`entry`"),
+            (format!("{NATIVE}env:\n  A: b\n"), "`env`"),
+            (format!("{NATIVE}schedule: []\n"), "`schedule`"),
+            (format!("{NATIVE}idleStopAfter: 5m\n"), "`idleStopAfter`"),
+            (format!("{NATIVE}executor:\n  os: linux\n"), "`executor`"),
+            (
+                NATIVE.replace("callback: none", "callback: cairn"),
+                "`callback`",
+            ),
+            (NATIVE.replace("transport: mcp-stdio\n", ""), "`transport`"),
+            (
+                NATIVE.replace("transport: mcp-stdio", "transport: ndjson"),
+                "ndjson",
+            ),
+            (NATIVE.replace("placement: per-machine\n", ""), "placement"),
+            (NATIVE.replace("args: [mcp]\n", ""), "`args`"),
+            (
+                NATIVE.replace("aarch64-apple-darwin", "riscv64-unknown-linux-gnu"),
+                "riscv64",
+            ),
+            (
+                NATIVE.replace(
+                    "https://example.invalid/probe.zip",
+                    "http://example.invalid/probe.zip",
+                ),
+                "url",
+            ),
+            (
+                NATIVE.replace("      executable: probe\n", "      executable: bin/probe\n"),
+                "executable",
+            ),
+            (
+                NATIVE.replace("Probe.app/Contents/MacOS/probe", "../probe"),
+                "executable",
+            ),
+            (
+                NATIVE.replace("ready: /daemon/ready", "ready: daemon.ready"),
+                "probe.ready",
+            ),
+            (NATIVE.replace("every: 5m", "every: 10s"), "probe.every"),
+        ] {
+            let error = pack_manifest(&edit).unwrap_err();
+            assert!(error.contains(says), "{says}: {error}");
+        }
+    }
+
+    #[test]
+    fn per_machine_placement_is_a_packs_alone() {
+        let error = parse_service_manifest("probe", NATIVE).unwrap_err();
+        assert!(error.contains("per-machine"), "{error}");
+        assert!(
+            error.contains(".cairn/services/probe/service.yaml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_bun_service_keeps_its_one_transport_and_its_callback() {
+        for (text, says) in [
+            ("name: Echo\ntransport: mcp-stdio\n", "transport: mcp-stdio"),
+            ("name: Echo\ntransport: none\n", "transport: none"),
+            ("name: Echo\ncallback: none\n", "callback: none"),
+            ("name: Echo\nargs: [x]\n", "`args`"),
+        ] {
+            let error = parse_service_manifest("echo", text).unwrap_err();
+            assert!(error.contains(says), "{says}: {error}");
+        }
+        let explicit =
+            parse_service_manifest("echo", "name: Echo\ntransport: ndjson\ncallback: cairn\n")
+                .unwrap();
+        assert_eq!(explicit.transport, Transport::Ndjson);
+        assert_eq!(explicit.callback, Callback::Cairn);
+        let bun_per_machine = pack_manifest("name: Echo\nplacement: per-machine\n").unwrap_err();
+        assert!(
+            bun_per_machine.contains("needs `runtime: native`"),
+            "{bun_per_machine}"
+        );
+    }
+
     #[test]
     fn a_minimal_manifest_resolves_every_default() {
         let declaration = parse_service_manifest("echo", ECHO).unwrap();
         assert_eq!(declaration.name, "Echo");
-        assert_eq!(declaration.entry, DEFAULT_ENTRY);
+        assert_eq!(declaration.entry(), Some(DEFAULT_ENTRY));
         assert_eq!(declaration.start, StartPolicy::OnDemand);
         assert_eq!(declaration.executor, None);
         assert_eq!(declaration.limits, ServiceLimits::default());
@@ -757,7 +1399,7 @@ mod tests {
             "name: Judge\nentry: src/main.ts\nstart: launch\nexecutor:\n  os: linux\n  requiredToolchains: [uv]\nenv:\n  JUDGE_TIMEOUT_SECONDS: \"20\"\nlimits:\n  memoryMb: 512\n  concurrency: 4\n  callTimeoutSeconds: 60\n",
         )
         .unwrap();
-        assert_eq!(declaration.entry, "src/main.ts");
+        assert_eq!(declaration.entry(), Some("src/main.ts"));
         assert_eq!(declaration.start, StartPolicy::Launch);
         let executor = declaration.executor.unwrap();
         assert_eq!(executor.os.as_deref(), Some("linux"));

@@ -1,4 +1,5 @@
 //! Latest persisted context-token observation.
+use super::events::columns::reported_model;
 use super::{DbResult, LocalDb, RowExt};
 use cairn_domain::ContextTokenEventSnapshot;
 use serde_json::Value;
@@ -66,8 +67,8 @@ pub async fn get_latest_context_token_event(
             // What the provider named the model as: at init, else on this event.
             let resolved_model = init_data
                 .as_deref()
-                .and_then(extract_model_from_event_data)
-                .or_else(|| extract_model_from_event_data(&data));
+                .and_then(reported_model)
+                .or_else(|| reported_model(&data));
             // The effective-model rule (the live path applies it through
             // `AgentProcessState::effective_model`): selected, else resolved.
             let model = db_model.or_else(|| resolved_model.clone());
@@ -91,24 +92,6 @@ pub async fn get_latest_context_token_event(
         },
     )
     .await
-}
-
-fn extract_model_from_event_data(data: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(data).ok()?;
-    for pointer in [
-        "/model",
-        "/raw/model",
-        "/raw/message/model",
-        "/raw/response/model",
-        "/raw/turn/model",
-    ] {
-        if let Some(model) = value.pointer(pointer).and_then(Value::as_str) {
-            if !model.is_empty() {
-                return Some(model.to_string());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

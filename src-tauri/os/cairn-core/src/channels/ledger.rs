@@ -683,6 +683,22 @@ pub async fn follow_target(
     .await
 }
 
+/// Every `(conversation, target_uri)` key bound for `provider`: the identity
+/// `bind_target` inserts under, so a sweep can bind only what is missing.
+pub async fn bound_conversation_targets(
+    db: &LocalDb,
+    provider: &str,
+) -> Result<std::collections::HashSet<(String, String)>, String> {
+    db.query_all(
+        "SELECT conversation, target_uri FROM channel_conversation_binding WHERE provider = ?1",
+        (provider.to_string(),),
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
+    .await
+    .map(|rows| rows.into_iter().collect())
+    .map_err(|error| error.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn bind_target(
     db: &LocalDb,

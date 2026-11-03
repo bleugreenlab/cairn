@@ -16,6 +16,9 @@ pub struct QuestionOption {
 pub struct Question {
     pub question: String,
     pub header: Option<String>,
+    /// Empty (or omitted) makes the question free-form: the answer is typed
+    /// text rather than a selection.
+    #[serde(default)]
     pub options: Vec<QuestionOption>,
     #[serde(default)]
     pub multi_select: bool,
@@ -274,6 +277,16 @@ mod tests {
             options: Vec::new(),
             multi_select: false,
         }
+    }
+
+    #[test]
+    fn a_question_without_options_is_free_form() {
+        let question: Question =
+            serde_json::from_value(serde_json::json!({"question": "What should change?"})).unwrap();
+        assert_eq!(question.question, "What should change?");
+        assert!(question.options.is_empty());
+        assert!(!question.multi_select);
+        assert_eq!(question.header, None);
     }
 
     #[test]

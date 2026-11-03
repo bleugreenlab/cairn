@@ -213,7 +213,10 @@ fn read_cairn_extension_manifest(
     Ok(Some(metadata))
 }
 
-fn validate_skill(root: &Path, id: &str, dir: &Path) -> Result<(), String> {
+/// The Agent Skills package rules a skill must meet to be installed: contained
+/// in `root` (which must be canonical), a `SKILL.md` opening with frontmatter
+/// whose `name` is the directory's own and whose `description` is 1-1024 bytes.
+pub(crate) fn validate_skill(root: &Path, id: &str, dir: &Path) -> Result<(), String> {
     let resolved = dir.canonicalize().map_err(|e| e.to_string())?;
     contained(root, &resolved)?;
     if !resolved.is_dir() {

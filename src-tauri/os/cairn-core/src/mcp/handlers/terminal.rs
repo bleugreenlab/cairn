@@ -4,6 +4,7 @@
 //! batches, but share the same process/sandbox primitives where behavior overlaps.
 
 use super::run::MAX_BUFFER_SIZE;
+use super::terminal_ref::TerminalOwner;
 use crate::services::{ensure_submitted_line, LeaseTerminalBinding, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{
@@ -1795,55 +1796,31 @@ pub(crate) struct TerminalWakeRow {
     pub exit_reason: Option<String>,
 }
 
-/// Look up a terminal by job scope + slug for wake subscription.
+/// Look up the terminal one owner holds under `slug`, for a wake subscription or
+/// a `waitFor`. The owner is the whole scope: a job row never answers for a
+/// project, nor a project row for a job.
 pub(crate) async fn lookup_terminal_for_wake(
     db: &LocalDb,
-    job_id: &str,
+    owner: &TerminalOwner,
     slug: &str,
 ) -> DbResult<Option<TerminalWakeRow>> {
-    let job_id = job_id.to_string();
+    let owner = owner.clone();
     let slug = slug.to_string();
     db.read(|conn| {
-        let job_id = job_id.clone();
+        let owner = owner.clone();
         let slug = slug.clone();
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
-                            exit_reason
-                     FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
-                    params![job_id.as_str(), slug.as_str()],
-                )
-                .await?;
-            terminal_wake_row_from_rows(&mut rows).await
-        })
-    })
-    .await
-}
-
-async fn lookup_terminal_for_wake_target(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-) -> DbResult<Option<TerminalWakeRow>> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let slug = slug.clone();
-        Box::pin(async move {
-            let mut rows = match job_id.as_deref() {
-                Some(job_id) => {
+            let mut rows = match &owner {
+                TerminalOwner::Job { job_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
                                 exit_reason
                          FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
-                        params![job_id, slug.as_str()],
+                        params![job_id.as_str(), slug.as_str()],
                     )
                     .await?
                 }
-                None => {
+                TerminalOwner::Project { project_id } => {
                     conn.query(
                         "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
                                 exit_reason
@@ -1858,6 +1835,21 @@ async fn lookup_terminal_for_wake_target(
         })
     })
     .await
+}
+
+async fn lookup_terminal_for_wake_target(
+    db: &LocalDb,
+    target: &TerminalResourceTarget,
+) -> DbResult<Option<TerminalWakeRow>> {
+    let owner = match &target.job_id {
+        Some(job_id) => TerminalOwner::Job {
+            job_id: job_id.clone(),
+        },
+        None => TerminalOwner::Project {
+            project_id: target.project_id.clone(),
+        },
+    };
+    lookup_terminal_for_wake(db, &owner, &target.slug).await
 }
 
 async fn lookup_terminal_for_wake_by_session_id(
@@ -1897,29 +1889,6 @@ async fn terminal_wake_row_from_rows(
         session_id: row.opt_text(5)?,
         exit_reason: row.opt_text(6)?,
     }))
-}
-
-/// List the terminal slugs owned by a job, for a precise unknown-slug error.
-pub(crate) async fn list_job_terminal_slugs(db: &LocalDb, job_id: &str) -> DbResult<Vec<String>> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT slug FROM job_terminals
-                     WHERE job_id = ?1 AND slug IS NOT NULL ORDER BY slug",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            let mut slugs = Vec::new();
-            while let Some(row) = rows.next().await? {
-                slugs.push(row.text(0)?);
-            }
-            Ok(slugs)
-        })
-    })
-    .await
 }
 
 pub(crate) async fn subscribe_terminal_exit_wake_once(
@@ -2736,19 +2705,21 @@ async fn spawn_terminal_session(
         .swap(true, Ordering::SeqCst)
     {
         let state = orch.pty_state.clone();
-        orch.fleet.subscribe_resident_process_events(move |event| {
-            let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
-                handlers
-                    .get(&(
-                        event.holder.storage_key().clone(),
-                        event.process_key.clone(),
-                    ))
-                    .cloned()
-            });
-            if let Some(handler) = handler {
-                handler(event);
-            }
-        });
+        orch.fleet
+            .subscribe_resident_process_events(move |event| {
+                let handler = state.lifetime_handlers.lock().ok().and_then(|handlers| {
+                    handlers
+                        .get(&(
+                            event.holder.storage_key().clone(),
+                            event.process_key.clone(),
+                        ))
+                        .cloned()
+                });
+                if let Some(handler) = handler {
+                    handler(event);
+                }
+            })
+            .detach();
     }
 
     let session_id = ids::mint_session_id().into_string();
@@ -4850,6 +4821,7 @@ mod terminal_finalize_tests {
                         status: ResidentProcessStatus::Starting,
                         reservation: None,
                         live_usage: None,
+                        charge: None,
                     },
                 )]),
                 clone_source: None,
@@ -5887,9 +5859,13 @@ mod terminal_finalize_tests {
         block_on(seed_live_turn(&orch.db.local));
 
         let uri = node_uri();
-        let row = block_on(lookup_terminal_for_wake(&orch.db.local, "j", "run-1"))
-            .unwrap()
-            .unwrap();
+        let row = block_on(lookup_terminal_for_wake(
+            &orch.db.local,
+            &TerminalOwner::Job { job_id: "j".into() },
+            "run-1",
+        ))
+        .unwrap()
+        .unwrap();
         let outcome = block_on(subscribe_terminal_exit_wake_once(
             &orch,
             "j",
@@ -5906,9 +5882,13 @@ mod terminal_finalize_tests {
         ));
 
         assert!(block_on(crate::terminal_host::prepare_terminal_recovery(&orch)).unwrap() >= 1);
-        let terminal = block_on(lookup_terminal_for_wake(&orch.db.local, "j", "run-1"))
-            .unwrap()
-            .unwrap();
+        let terminal = block_on(lookup_terminal_for_wake(
+            &orch.db.local,
+            &TerminalOwner::Job { job_id: "j".into() },
+            "run-1",
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(terminal.status, "exited");
         assert!(terminal.exited_at.is_some());
 
@@ -6585,6 +6565,7 @@ mod terminal_finalize_tests {
                 condition: crate::mcp::handlers::durable_suspend::Condition::Terminal {
                     uri: cairn_common::uri::build_node_terminal_uri("p", 7, 2, "builder", "tests"),
                     slug: "tests".into(),
+                    owner: None,
                     on: crate::mcp::handlers::run::TerminalWaitEvent::Exit,
                     phrase: None,
                 },

@@ -1440,6 +1440,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn importing_a_plugin_with_a_rejected_skill_installs_nothing() {
+        let ws = workspace().await;
+        let plugin = ws._temp.path().join("plugin");
+        write(
+            &plugin.join("plugin.json"),
+            &format!(
+                r#"{{"$schema":"{}","name":"skill-check"}}"#,
+                pack::agent_plugin::PLUGIN_SCHEMA_URI
+            ),
+        );
+        write(
+            &plugin.join("skills/good/SKILL.md"),
+            "---\nname: good\ndescription: Useful.\n---\n",
+        );
+        write(&plugin.join("skills/bad/SKILL.md"), "---\nname: bad\n---\n");
+
+        let error = import_agent_plugin(&ws.orch, &plugin).expect_err("a rejected skill refuses");
+        assert!(error.contains("skill `bad`"), "{error}");
+        assert!(error.contains("requires string 'description'"), "{error}");
+        assert!(!ws.home.join("skills/bad").exists());
+        assert!(!ws.home.join("skills/good").exists());
+        assert!(pack::lock::read_lock(&ws.home, "skill-check").is_none());
+        assert!(!pack::lock::pack_dir(&ws.home, "skill-check")
+            .join("source")
+            .exists());
+
+        std::fs::remove_dir_all(plugin.join("skills/bad")).unwrap();
+        import_agent_plugin(&ws.orch, &plugin).unwrap();
+        let lock = pack::lock::read_lock(&ws.home, "skill-check").unwrap();
+        assert!(lock.item(PackItemKind::Skill, "good").is_some());
+        assert!(ws.home.join("skills/good/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
     async fn the_catalog_reports_installed_available_default_source_and_readiness() {
         let ws = workspace().await;
         let catalog = pack_catalog(&ws.home);

@@ -199,6 +199,36 @@ pub fn mutate_fleet<T>(
     Ok(result)
 }
 
+/// Persist the conversion of the retired `buildSlots.desktopAutomation` toggles
+/// into `buildSlots.machineServices`, once, and return its notes.
+///
+/// Every typed read already converts in memory ([`crate::fleet::FleetConfig::healed`]),
+/// so nothing waits on this; it exists to write the result down under the
+/// fleet lock, remove the retired key, and give the operator the notes on what
+/// did not carry over exactly. `None` when there was nothing to convert, which
+/// is every run after the first.
+pub fn migrate_desktop_automation(
+    config_dir: &std::path::Path,
+) -> Result<Option<Vec<String>>, String> {
+    let _fleet = fleet_mutation_guard();
+    mutate_workspace_settings(
+        config_dir,
+        "cairn: convert desktop automation to machine services",
+        |root| {
+            let Some(slots) = root.get(BUILD_SLOTS_KEY) else {
+                return Ok(None);
+            };
+            let mut config = serde_yaml::from_value::<crate::fleet::FleetConfig>(slots.clone())
+                .map_err(|error| format!("Failed to parse buildSlots: {error}"))?;
+            let Some(notes) = config.adopt_legacy_desktop_automation() else {
+                return Ok(None);
+            };
+            insert_fleet(root, &config.healed())?;
+            Ok(Some(notes))
+        },
+    )
+}
+
 /// Settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3602,6 +3632,51 @@ extraSshArgs: []
         )
         .unwrap();
         assert!(super::mutate_fleet(dir, |_| Ok(()), |_: &FleetConfig| {}).is_err());
+    }
+
+    #[test]
+    fn the_desktop_automation_conversion_is_persisted_once() {
+        use crate::fleet::{MachineServiceKey, AXON_MACHINE_SERVICE};
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::write(
+            super::get_settings_path(dir),
+            "voice:\n  enabled: false\nbuildSlots:\n  desktopAutomation:\n    enabled: true\n    machines:\n      local:\n        binary: /Applications/Axon.app/Contents/Resources/bin/axon\n      bgsrv-mac:\n        enabled: true\n",
+        )
+        .unwrap();
+        let key: MachineServiceKey = AXON_MACHINE_SERVICE.parse().unwrap();
+        assert_eq!(
+            super::load_fleet(dir)
+                .machine_services
+                .machines_for(&key)
+                .len(),
+            2,
+            "a read before the conversion is written already sees it"
+        );
+        let notes = super::migrate_desktop_automation(dir).unwrap().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let written = std::fs::read_to_string(super::get_settings_path(dir)).unwrap();
+        assert!(!written.contains("desktopAutomation"), "{written}");
+        assert!(written.contains("machineServices"), "{written}");
+        assert!(written.contains("voice:"), "unrelated settings survive");
+        assert!(super::migrate_desktop_automation(dir).unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(super::get_settings_path(dir)).unwrap(),
+            written,
+            "a second run writes nothing"
+        );
+        let fleet = super::load_fleet(dir);
+        assert_eq!(
+            fleet
+                .machine_services
+                .selection(&key, "local")
+                .and_then(crate::fleet::MachineSelection::override_command),
+            Some("/Applications/Axon.app/Contents/Resources/bin/axon")
+        );
+        assert!(fleet
+            .machine_services
+            .selection(&key, "bgsrv-mac")
+            .is_some());
     }
 
     #[test]

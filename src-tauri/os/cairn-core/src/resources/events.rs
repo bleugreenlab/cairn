@@ -542,6 +542,7 @@ fn record_id_label(source: &str) -> &'static str {
         "post_commented" => "post_comments.id",
         "ingress" => "ingress_events.id",
         "channel_message" => "channel_inbound.id",
+        crate::fleet::unreturned::EXECUTOR_UPDATE_UNRETURNED => "executor id",
         _ => "record id",
     }
 }

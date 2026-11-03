@@ -2,8 +2,9 @@
 //!
 //! A managed account's OAuth tokens live in Cairn's credential store, never in
 //! the CLI's home: a Claude CLI is launched with only the access token
-//! (`CLAUDE_CODE_OAUTH_TOKEN`), and the refresh token is spent by Cairn's
-//! single refresh authority alone. Spending it is subscription mechanics and
+//! (`CLAUDE_CODE_OAUTH_TOKEN`, which the launch hands over on an inherited
+//! descriptor where the platform has one), and the refresh token is spent by
+//! Cairn's single refresh authority alone. Spending it is subscription mechanics and
 //! lives behind [`crate::subscription::Subscriptions`]; this module holds the
 //! values either side needs around that: the stored token shape, which
 //! rotation of it a process was fed, and what a launch receives.
@@ -30,7 +31,9 @@ pub const GENERATION_FIELD: &str = "cairn_refresh_generation";
 /// but cannot do what was asked, not an expired one, so it is not renewed.
 pub const PUBLISHED_AT_FIELD: &str = "cairn_published_at";
 
-/// The environment variable a Claude CLI authenticates with.
+/// The name a Claude CLI knows its OAuth token by. A launch carries the token
+/// under this name and `ClaudeCli` decides how it travels; a stdin push sets
+/// it in the running process's in-memory environment.
 pub const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 
 /// How long the CLI waits, on an inference 401, for its environment to carry a
@@ -249,10 +252,12 @@ pub struct ClaudeSessionCredential {
 }
 
 impl ClaudeSessionCredential {
-    /// The launch environment for `oauth`, running in the CLI home `home`.
+    /// What a launch on `oauth` receives, running in the CLI home `home`.
     ///
-    /// The home is kept for the CLI's transcripts and state; it holds no
-    /// secret. The 401 wait lets a process that missed a rotation recover the
+    /// The token is named [`OAUTH_TOKEN_ENV`] here; `ClaudeCli::spawn_config`
+    /// moves it onto an inherited descriptor, so on Unix it never enters the
+    /// launch environment. The home is kept for the CLI's transcripts and
+    /// state; it holds no secret. The 401 wait lets a process that missed a rotation recover the
     /// same turn when the renewed token is pushed.
     pub fn for_launch(oauth: &ClaudeOAuth, home: &std::path::Path) -> Self {
         Self {

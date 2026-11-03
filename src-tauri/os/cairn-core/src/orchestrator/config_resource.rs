@@ -1077,6 +1077,9 @@ impl Orchestrator {
     /// unmatched that a restored route should have taken.
     pub fn emit_pack_registry_change(&self) {
         crate::routes::invalidate_trigger_index(self);
+        // A pack installed or removed may declare a machine service the row
+        // selects; its cells start or drain with it.
+        crate::project_services::supervisor::machine::spawn_apply(self, "pack change");
         let _ = self
             .services
             .emitter

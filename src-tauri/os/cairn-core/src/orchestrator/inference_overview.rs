@@ -118,7 +118,8 @@ pub struct RunningModel {
 #[serde(rename_all = "camelCase")]
 pub struct Loading {
     pub elapsed_ms: u64,
-    /// The slowest healthy load this deployment has had.
+    /// What a reload of this deployment costs now, as its pool's windows
+    /// weigh it ([`inference_control::reference_load`]).
     pub expected_ms: Option<u64>,
     /// Requests waiting for it.
     pub waiting: u32,
@@ -381,13 +382,8 @@ impl Sources<'_> {
             .collect()
     }
 
-    fn slowest_load_ms(&self, deployment: &DeploymentId) -> Option<u64> {
-        self.loads
-            .get(deployment)?
-            .iter()
-            .filter(|load| load.healthy)
-            .filter_map(|load| load.load_ms)
-            .max()
+    fn reference_load_ms(&self, deployment: &DeploymentId) -> Option<u64> {
+        inference_control::reference_load(self.loads.get(deployment)?)?.load_ms
     }
 
     /// The newest measured footprint, per machine.
@@ -419,7 +415,7 @@ impl Sources<'_> {
         let profile = self.model_of(deployment)?;
         let resident = self.models.resident(deployment);
         let waiting = self.waiting(deployment);
-        let expected_ms = self.slowest_load_ms(deployment);
+        let expected_ms = self.reference_load_ms(deployment);
         let loading = |at: i64| Loading {
             elapsed_ms: since(self.now, at),
             expected_ms,
@@ -892,7 +888,7 @@ impl Sources<'_> {
                     pool: key,
                     fits: fits_here,
                     memory_bytes: size,
-                    load_ms: self.slowest_load_ms(id),
+                    load_ms: self.reference_load_ms(id),
                     decode_tokens_per_sec: None,
                     failed: loads
                         .and_then(|loads| loads.first())
@@ -1507,7 +1503,7 @@ pub async fn verify_profile(
 mod tests {
     use super::*;
     use crate::fleet::models::rules::{Pin, Why};
-    use crate::fleet::models::settings::EffectiveSettings;
+    use crate::fleet::models::settings::{EffectiveSettings, MeasuredLoad};
     use crate::fleet::models::{DeploymentPlacement, RequestView, ResidentView};
     use crate::fleet::pools::PoolMember;
 
@@ -1635,6 +1631,7 @@ deployments:
             load_ms: Some(ms),
             reason: None,
             footprint: Some(footprint.iter().map(|(m, b)| (m.to_string(), *b)).collect()),
+            cold: false,
         }
     }
 
@@ -1813,7 +1810,7 @@ deployments:
     }
 
     #[test]
-    fn a_loading_model_says_how_long_against_its_slowest_load_and_who_waits() {
+    fn a_loading_model_says_how_long_against_its_latest_load_and_who_waits() {
         let mut world = World::new();
         world.phases.insert(
             "dsv4f-tp2".into(),
@@ -1840,9 +1837,10 @@ deployments:
             running.loading,
             Some(Loading {
                 elapsed_ms: 180_000,
-                expected_ms: Some(420_000),
+                expected_ms: Some(300_000),
                 waiting: 2,
-            })
+            }),
+            "the newer load, not the slower"
         );
     }
 
@@ -1928,7 +1926,11 @@ deployments:
             }
         );
         // 6 × 2 min is under the 15-minute floor.
-        world.sparks().settings = EffectiveSettings::derive(None, Some(120));
+        let two_minutes = Some(MeasuredLoad {
+            secs: 120,
+            cold: false,
+        });
+        world.sparks().settings = EffectiveSettings::derive(None, two_minutes);
         assert_eq!(
             pool(&world.overview(), SPARKS).unload_idle,
             UnloadIdle {
@@ -1936,7 +1938,7 @@ deployments:
                 auto: true
             }
         );
-        world.sparks().settings = EffectiveSettings::derive(Some(600), Some(120));
+        world.sparks().settings = EffectiveSettings::derive(Some(600), two_minutes);
         assert_eq!(
             pool(&world.overview(), SPARKS).unload_idle,
             UnloadIdle {

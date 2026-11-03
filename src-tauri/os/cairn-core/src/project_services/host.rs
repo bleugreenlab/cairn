@@ -34,6 +34,7 @@ fn holder_id(project_id: &str, owner: &ServiceOwner, service: &str) -> String {
     match owner {
         ServiceOwner::Project => format!("project:{project_id}:{service}"),
         ServiceOwner::Thread { id, .. } => format!("thread:{project_id}:{id}:{service}"),
+        ServiceOwner::Pack { pack, machine, .. } => format!("{pack}/{service}@{machine}"),
     }
 }
 
@@ -43,6 +44,9 @@ fn holder_label(spec: &LaunchSpec) -> String {
         ServiceOwner::Project => format!("{}/{}", spec.project_key, spec.service),
         ServiceOwner::Thread { name, .. } => {
             format!("{}/{name}/{}", spec.project_key, spec.service)
+        }
+        ServiceOwner::Pack { pack, machine, .. } => {
+            format!("{pack}/{} on {machine}", spec.service)
         }
     }
 }
@@ -71,15 +75,29 @@ fn runtime_assets(spec: &LaunchSpec) -> Result<Vec<ResidentRuntimeAsset>, String
 /// The service process: `bun` importing the package's entry. Always
 /// confined, whatever the service is for.
 pub(crate) fn launch_for(spec: &LaunchSpec) -> Result<ResidentLaunch, String> {
+    if let Some(native) = &spec.native {
+        return Ok(native_launch(native));
+    }
     let mut launch = process_for(spec);
     launch.runtime_assets = runtime_assets(spec)?;
     Ok(launch)
 }
 
+/// A machine service's resident: its pinned executable, unconfined like every
+/// helper a lease ran before project services, because it exists to reach the
+/// machine (Axon talks to the accessibility daemon's socket). It carries no
+/// environment of Cairn's and no relay: a native resident holds no bearer.
+fn native_launch(native: &super::declaration::NativeLaunch) -> ResidentLaunch {
+    ResidentLaunch::command(native.program.clone(), native.args.clone())
+}
+
 fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
     let loader = format!(
         "await import(process.env.CAIRN_RUNTIME_ASSETS + \"/service/{}\")",
-        spec.declaration.entry.replace('"', "\\\"")
+        spec.declaration
+            .entry()
+            .unwrap_or(super::declaration::DEFAULT_ENTRY)
+            .replace('"', "\\\"")
     );
     ResidentLaunch {
         program: "bun".to_string(),
@@ -107,6 +125,9 @@ fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
 /// with bearers bound to that relay, so placement is a choice and not a pin.
 fn service_selector(spec: &LaunchSpec) -> cairn_common::executor_protocol::ExecutorSelector {
     use cairn_common::executor_protocol::{ExecutorSelector, LOCAL_EXECUTOR_NAME};
+    if let ServiceOwner::Pack { machine, .. } = &spec.owner {
+        return crate::fleet::service_placement::named_executor(machine);
+    }
     let declared = spec.declaration.executor.clone().unwrap_or_default();
     if declared.name.is_none() && declared.os.is_none() {
         return ExecutorSelector {
@@ -148,6 +169,19 @@ impl LeaseHost {
         }
         let label = holder_label(spec);
         let selector = service_selector(spec);
+        // A machine service claims nothing, as desktop automation did: it is
+        // the machine's own program, not work admitted onto the machine.
+        let footprint = if spec.native.is_some() {
+            ResidencyFootprint {
+                memory_bytes: 0,
+                disk_growth_bytes: 0,
+            }
+        } else {
+            ResidencyFootprint {
+                memory_bytes: spec.declaration.limits.memory_mb as u64 * 1024 * 1024,
+                disk_growth_bytes: 64 * 1024 * 1024,
+            }
+        };
         let lease = Arc::new(
             acquire_service_lease(
                 orch,
@@ -156,10 +190,7 @@ impl LeaseHost {
                     label: &label,
                 },
                 selector,
-                ResidencyFootprint {
-                    memory_bytes: spec.declaration.limits.memory_mb as u64 * 1024 * 1024,
-                    disk_growth_bytes: 64 * 1024 * 1024,
-                },
+                footprint,
                 OwnerDeathPolicy {
                     heartbeat_timeout_ms: 90_000,
                     reclaim_grace_ms: 30_000,
@@ -199,10 +230,21 @@ impl ServiceHost for LeaseHost {
         // replaces rather than over it.
         let key = format!("svc-{}", spec.generation);
         // On another machine the service calls back through its executor's
-        // relay, which accepts only bearers of this incarnation's runs.
-        if let crate::fleet::residency::ResidentCallback::Relayed { executor_id } =
-            crate::fleet::residency::resident_callback(orch, lease.executor_id().as_deref())
-        {
+        // relay, which accepts only bearers of this incarnation's runs. A
+        // native resident has neither a bearer nor a relay.
+        let relayed = match spec.native {
+            Some(_) => None,
+            None => match crate::fleet::residency::resident_callback(
+                orch,
+                lease.executor_id().as_deref(),
+            ) {
+                crate::fleet::residency::ResidentCallback::Relayed { executor_id } => {
+                    Some(executor_id)
+                }
+                crate::fleet::residency::ResidentCallback::Direct { .. } => None,
+            },
+        };
+        if let Some(executor_id) = relayed {
             crate::fleet::residency::refuse_runner_credentials(orch, &launch.env)?;
             let holder = cairn_common::executor_protocol::ResidencyHolder::Service {
                 service_id: holder_id(&spec.project_id, &spec.owner, &spec.service),
@@ -255,6 +297,7 @@ impl ServiceHost for LeaseHost {
                         let _ = sender.send(HostEvent::Exited {
                             code: exit_code,
                             detail: detail.to_string(),
+                            executor_lost,
                         });
                         return;
                     }
@@ -264,12 +307,36 @@ impl ServiceHost for LeaseHost {
             let _ = sender.send(HostEvent::Exited {
                 code: None,
                 detail: "its event stream closed".to_string(),
+                executor_lost: false,
             });
         });
         Ok(HostProcess {
             executor: lease.executor_name(),
             input: Arc::new(LeaseInput { lease, key }),
             events,
+        })
+    }
+
+    async fn probe(
+        &self,
+        orch: &Orchestrator,
+        spec: &LaunchSpec,
+        program: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> Result<super::supervisor::ProbeOutput, String> {
+        let lease = self
+            .lease(orch, spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        let output = lease
+            .run_one_shot(program, args, timeout)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(super::supervisor::ProbeOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code: output.exit_code,
         })
     }
 
@@ -343,6 +410,7 @@ mod tests {
             declaration: package.declaration,
             files: package.files,
             env: vec![("CAIRN_SERVICE".into(), "echo".into())],
+            native: None,
         }
     }
 
@@ -364,7 +432,7 @@ mod tests {
                     }
                 }
                 HostEvent::Stderr(bytes) => stderr.push_str(&String::from_utf8_lossy(&bytes)),
-                HostEvent::Exited { code, detail } => {
+                HostEvent::Exited { code, detail, .. } => {
                     panic!("exited ({code:?}, {detail}) before a frame; stderr: {stderr}")
                 }
             }
@@ -462,6 +530,29 @@ mod tests {
             .await;
     }
 
+    /// A machine service's holder carries `/` and `@`. The storage key splits
+    /// on its first `:` only, and the executor names the scratch it keys by the
+    /// owner id only after `safe_component`, so both take the id as it is.
+    #[test]
+    fn a_machine_service_holder_round_trips_through_its_storage_key() {
+        use cairn_common::executor_protocol::{RepositoryLocator, ResidencyHolder};
+        let id = holder_id("", &ServiceOwner::pack("axon", "bgsrv-mac"), "axon");
+        assert_eq!(id, "axon/axon@bgsrv-mac");
+        let holder = ResidencyHolder::Service {
+            service_id: id.clone(),
+        };
+        assert_eq!(holder.storage_key(), "service:axon/axon@bgsrv-mac");
+        assert_eq!(
+            ResidencyHolder::parse_storage_key(&holder.storage_key()),
+            Some(holder)
+        );
+        let scratch = RepositoryLocator::ScratchOnly {
+            owner_id: id.clone(),
+        };
+        assert_eq!(scratch.project_id(), id);
+        assert_eq!(scratch.repository_id(), id);
+    }
+
     /// Only the substrate's own refusals reach the supervisor as `Unplaced`:
     /// a start it could not route, and a residency it would not grant.
     #[test]
@@ -502,6 +593,7 @@ mod tests {
             declaration: package.declaration,
             files: package.files,
             env: vec![("CAIRN_SERVICE".into(), "echo".into())],
+            native: None,
         };
         let selector = service_selector(&spec);
         assert_eq!(
@@ -558,6 +650,7 @@ mod tests {
             declaration: package.declaration,
             files: package.files,
             env: vec![("CAIRN_SERVICE".into(), "echo".into())],
+            native: None,
         };
         let launch = process_for(&spec);
         assert_eq!(launch.sandbox_mode, ProcessSandboxMode::Confined);

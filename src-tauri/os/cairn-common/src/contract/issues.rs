@@ -330,9 +330,10 @@ pub(crate) const THREAD_CONTRACT: ResourceContract = ResourceContract {
                     KeyType::Str,
                     "model this thread's session runs on; effective next turn",
                 ),
+                PLACEMENT_DEFAULT_EXECUTOR,
             ],
             label: "patch or stop thread",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NAME\",mode:\"patch\",payload:{action:\"stop\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NAME\",mode:\"patch\",payload:{action:\"stop\"}}]}) | set the placement default: write({changes:[{target:\"cairn:~\",mode:\"patch\",payload:{executor:{name:\"bbs\"}}}]})",
         },
         MutationSpec {
             mode: ChangeMode::Append,

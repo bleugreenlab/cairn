@@ -545,6 +545,7 @@ async fn an_attach_grants_the_scratches_it_advertises_before_it_returns() {
             containment: None,
             page_call_programs: None,
             github_credential: None,
+            machine_services: Vec::new(),
         },
         current_load: 0,
         warm_roots: Vec::new(),

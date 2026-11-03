@@ -64,6 +64,22 @@ fn note(policy: &SandboxPolicy, refused: &Path) -> String {
     } else {
         refused.parent().unwrap_or(refused)
     };
+    let opening = format!(
+        "Cairn: this command ran in a confined cell, and `{refused}` is outside every directory \
+         the cell may write. The cell's sandbox refuses that write whatever the file's own \
+         permissions say, so changing its permissions or ownership will not help: the confined \
+         cell may not write `{scope}`.",
+        refused = refused.display(),
+        scope = scope.display(),
+    );
+    // Listing the writable scopes would invite a sibling of the one granted
+    // directory under the scratch root; the scratch refusal names the place.
+    if crate::scratch_refusal::is_scratch_root_write(refused) {
+        return format!(
+            "{opening} {}",
+            crate::scratch_refusal::scratch_root_refusal(refused)
+        );
+    }
     let writable = policy
         .writable_paths()
         .iter()
@@ -84,14 +100,7 @@ fn note(policy: &SandboxPolicy, refused: &Path) -> String {
                  outlive the batch belongs under `$TMPDIR`."
             .to_string(),
     };
-    format!(
-        "Cairn: this command ran in a confined cell, and `{refused}` is outside every directory \
-         the cell may write. The cell's sandbox refuses that write whatever the file's own \
-         permissions say, so changing its permissions or ownership will not help: the confined \
-         cell may not write `{scope}`. It may write {writable}. {where_caches_go}",
-        refused = refused.display(),
-        scope = scope.display(),
-    )
+    format!("{opening} It may write {writable}. {where_caches_go}")
 }
 
 /// Absolute paths named on each denial-signature line and the lines above it,
@@ -117,7 +126,7 @@ fn refused_paths_in_output(output: &str) -> Vec<PathBuf> {
 
 /// Words in `line` that are absolute paths, with the quoting and trailing
 /// punctuation tools wrap them in removed.
-fn absolute_paths_in(line: &str) -> impl Iterator<Item = PathBuf> + '_ {
+pub(crate) fn absolute_paths_in(line: &str) -> impl Iterator<Item = PathBuf> + '_ {
     line.split(|c: char| {
         c.is_whitespace()
             || matches!(
@@ -167,7 +176,7 @@ fn nearest_existing(path: &Path) -> Option<&Path> {
 /// `path` with its deepest existing ancestor canonicalized, so a refused path
 /// spelled through `/tmp` or `/var` on macOS compares against writable roots
 /// that resolve to `/private/...`.
-fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
+pub(crate) fn resolve_through_existing_ancestor(path: &Path) -> PathBuf {
     let Some(existing) = nearest_existing(path) else {
         return path.to_path_buf();
     };
@@ -373,6 +382,23 @@ mod tests {
         .unwrap();
         assert!(note.contains(&logged.display().to_string()), "{note}");
         assert!(!note.contains(&printed.display().to_string()), "{note}");
+    }
+
+    /// A write under the scratch root gets the scratch refusal, which names
+    /// `$TMPDIR`, instead of a list of scopes a sibling directory could copy.
+    #[test]
+    fn a_refused_write_under_the_scratch_root_names_tmpdir() {
+        let worktree = tempfile::tempdir().unwrap();
+        let lab = cairn_common::scratch::scratch_root().join("measure-lab");
+        let Confinement::Fenced(policy) = fenced(worktree.path()) else {
+            unreachable!()
+        };
+        let note = note(&policy, &lab);
+        assert!(
+            note.contains(&crate::scratch_refusal::scratch_root_refusal(&lab)),
+            "{note}"
+        );
+        assert!(!note.contains("It may write"), "{note}");
     }
 
     #[test]

@@ -870,6 +870,52 @@ pub(crate) async fn resolve_for_run(
     })
 }
 
+/// Resolve a revision named for a surface already bound to one project, taking
+/// every form `read ?branch=` and `run branch:` take: a branch name (`main`
+/// standing for the project's default branch), a commit or change id, or a node
+/// URI standing for the branch that node recorded. Resolution runs through the
+/// same conflict-repairing path, in `repository`.
+///
+/// A node URI must name a node of `project_id`. The answer is about this
+/// project's repository, and quietly substituting another project's branch would
+/// answer a different question.
+pub(crate) async fn resolve_in_project(
+    orch: &Orchestrator,
+    project_id: &str,
+    repository: &Path,
+    default_branch: &str,
+    requested: &str,
+) -> Result<String, BranchRefResolutionError> {
+    let unresolvable = |diagnostic: String| BranchRefResolutionError::Unresolvable {
+        requested: requested.to_string(),
+        diagnostic,
+    };
+    if requested.trim().is_empty() {
+        return Err(BranchRefResolutionError::Invalid {
+            requested: requested.to_string(),
+        });
+    }
+    let rev = match resolve_node_uri(orch, requested)
+        .await
+        .map_err(unresolvable)?
+    {
+        Some(job) if job.project_id != project_id => {
+            return Err(unresolvable(format!(
+                "it names a node of another project, and this request belongs to project \
+                 '{project_id}'"
+            )));
+        }
+        Some(job) => job
+            .branch
+            .ok_or_else(|| unresolvable("the node has no recorded branch".into()))?,
+        None if requested.trim() == "main" => default_branch.to_string(),
+        None => requested.trim().to_string(),
+    };
+    resolve_coordinate_repairing_conflicts(orch, repository, &rev, default_branch)
+        .await
+        .map_err(|error| map_coordinate_error(error, requested))
+}
+
 async fn project_context_for_request(
     orch: &Orchestrator,
     request: &McpCallbackRequest,

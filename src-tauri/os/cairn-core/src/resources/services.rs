@@ -93,6 +93,8 @@ fn status_uri(target: &ServiceRef) -> String {
         ServiceOwner::Thread { name, .. } => {
             build_thread_service_status_uri(&target.project_key, name, &target.service)
         }
+        // A machine service has no service URI; its status is its machine's.
+        ServiceOwner::Pack { machine, .. } => format!("cairn://executors/{machine}"),
     }
 }
 
@@ -104,6 +106,7 @@ fn log_uri(target: &ServiceRef) -> String {
         ServiceOwner::Thread { name, .. } => {
             build_thread_service_log_uri(&target.project_key, name, &target.service)
         }
+        ServiceOwner::Pack { machine, .. } => format!("cairn://executors/{machine}"),
     }
 }
 

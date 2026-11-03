@@ -60,6 +60,11 @@ pub(crate) enum Condition {
     Terminal {
         uri: String,
         slug: String,
+        /// The row the wait polls, resolved from the ref's own scope when the
+        /// wait armed. `None` only on a row armed before the owner was
+        /// recorded, which only ever named the waiting job's own terminal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<super::terminal_ref::TerminalOwner>,
         on: TerminalWaitEvent,
         phrase: Option<String>,
     },
@@ -3323,6 +3328,7 @@ mod tests {
             Condition::Terminal {
                 uri: "cairn:~/terminal/t".into(),
                 slug: "t".into(),
+                owner: None,
                 on: TerminalWaitEvent::Exit,
                 phrase: None,
             },
@@ -3659,6 +3665,7 @@ mod tests {
                 Condition::Terminal {
                     uri: "cairn:~/terminal/t".into(),
                     slug: "t".into(),
+                    owner: None,
                     on: TerminalWaitEvent::Output,
                     phrase: Some(phrase.clone()),
                 },
@@ -5532,6 +5539,7 @@ mod tests {
         record.condition = Condition::Terminal {
             uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
             slug: "tests".into(),
+            owner: None,
             on: TerminalWaitEvent::Exit,
             phrase: None,
         };
@@ -6223,6 +6231,7 @@ mod tests {
                 Condition::Terminal {
                     uri: "cairn://p/prj/1/1/builder/terminal/dev".into(),
                     slug: "dev".into(),
+                    owner: None,
                     on: TerminalWaitEvent::Output,
                     phrase: Some("ready".into()),
                 },

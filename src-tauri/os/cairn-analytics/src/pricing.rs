@@ -228,6 +228,20 @@ const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 0.50, 5.0, 30.0);
 const GPT_5_4: ModelPrice = ModelPrice::new(2.50, 0.25, 2.50, 15.0);
 const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
 
+/// The concrete Claude id each bare alias is priced as: the generation
+/// [`price_for`] reads the alias as (its tier boundaries below), so the id
+/// costs exactly what the alias does. The `token_rollup` model key folds this
+/// generation onto its alias (`claude-opus-5-5` keys as `opus`) and leaves
+/// every other generation under its own id, so keying never moves usage
+/// between price tiers. When an alias moves to a new generation, update this
+/// row with the tier boundary and re-fold.
+pub(crate) const ALIAS_GENERATIONS: [(&str, &str); 4] = [
+    ("haiku", "claude-haiku-5-5"),
+    ("sonnet", "claude-sonnet-5-5"),
+    ("opus", "claude-opus-5-5"),
+    ("fable", "claude-fable-5-1"),
+];
+
 /// Resolve a `jobs.model` value to its price tier, or `None` when the model is
 /// unrecognized.
 fn price_for(model: Option<&str>) -> Option<ModelPrice> {
@@ -484,6 +498,32 @@ mod tests {
         assert_ne!(price_for(Some("gpt-6.1-sol")), Some(GPT_6_SOL));
         assert_eq!(price_for(Some("gpt-6-1-sol")), Some(GPT_6_1_SOL));
         assert_eq!(price_for(Some("gpt-6.1")), Some(GPT_6_1_SOL));
+    }
+
+    #[test]
+    fn each_alias_generation_costs_what_its_alias_costs() {
+        for (alias, concrete) in ALIAS_GENERATIONS {
+            let price = price_for(Some(alias));
+            assert!(price.is_some(), "{alias} is priced");
+            for spelling in [concrete.to_string(), format!("{concrete}[1m]")] {
+                assert_eq!(price_for(Some(&spelling)), price, "{spelling} vs {alias}");
+            }
+        }
+    }
+
+    #[test]
+    fn alias_generations_cover_every_claude_alias() {
+        let mut aliases: Vec<String> = cairn_models_types::catalog::claude_models()
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        let mut covered: Vec<String> = ALIAS_GENERATIONS
+            .iter()
+            .map(|(alias, _)| alias.to_string())
+            .collect();
+        aliases.sort();
+        covered.sort();
+        assert_eq!(covered, aliases);
     }
 
     #[test]

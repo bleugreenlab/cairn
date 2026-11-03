@@ -6,16 +6,17 @@
 
 mod coalescing;
 pub(crate) mod decline_condition;
-pub mod desktop;
 pub(crate) mod inference;
 pub(crate) mod learned_requirements;
 pub mod link_clock;
 pub mod load;
+pub mod machine_services;
 pub mod management;
 pub mod models;
 pub(crate) mod occupancy;
 pub(crate) mod output_guard;
 pub(crate) mod placement;
+pub(crate) mod placement_default;
 pub mod pools;
 pub(crate) mod preparation;
 pub(crate) mod purpose;
@@ -30,6 +31,7 @@ pub use rollout::ArtifactUnavailable;
 pub mod runner_events;
 pub(crate) mod service_placement;
 pub mod telemetry;
+pub mod unreturned;
 
 pub use cairn_config::fleet::*;
 
@@ -1177,6 +1179,49 @@ impl Drop for PublicationGuard {
 
 type ResidentProcessSubscriber = Arc<dyn Fn(ResidentProcessEvent) + Send + Sync>;
 
+/// The resident-process subscribers, each under the id its
+/// [`ResidentProcessSubscription`] removes it by.
+#[derive(Default)]
+struct ResidentProcessSubscribers {
+    next_id: u64,
+    entries: Vec<(u64, ResidentProcessSubscriber)>,
+}
+
+/// A registration on the fleet's resident-process event stream, held for as
+/// long as its subscriber should hear events.
+///
+/// Dropping it unregisters the subscriber, so a per-process subscriber leaves
+/// with the session, run, or lease that owns it rather than accumulating for the
+/// life of the runner. A dispatch already in progress may still deliver to it
+/// once after the drop: dispatch calls subscribers outside the registry lock so
+/// that a subscriber, or anything it releases, can drop a subscription without
+/// deadlocking.
+#[must_use = "dropping the subscription unregisters the subscriber at once; hold it for as long as events matter, or `detach` it for a subscriber that lives as long as the fleet"]
+pub(crate) struct ResidentProcessSubscription {
+    id: u64,
+    subscribers: std::sync::Weak<Mutex<ResidentProcessSubscribers>>,
+}
+
+impl ResidentProcessSubscription {
+    /// Keep the subscriber registered for as long as the fleet exists.
+    pub(crate) fn detach(mut self) {
+        self.subscribers = std::sync::Weak::new();
+    }
+}
+
+impl Drop for ResidentProcessSubscription {
+    fn drop(&mut self) {
+        if let Some(subscribers) = self.subscribers.upgrade() {
+            let id = self.id;
+            subscribers
+                .lock()
+                .unwrap()
+                .entries
+                .retain(|(entry, _)| *entry != id);
+        }
+    }
+}
+
 pub(crate) mod node_scratch;
 pub use inference::DeploymentReportReceived;
 pub(crate) use node_scratch::NodeScratchEvent;
@@ -1207,6 +1252,9 @@ struct EnrolledRemoteRecord {
     /// The run of protocol refusals this machine is in, if its last dial was
     /// refused on protocol. Cleared when it attaches.
     protocol_refusal: Option<ProtocolRefusalRun>,
+    /// The self-update this machine was directed to and did not return from
+    /// (see [`unreturned`]). Cleared when it attaches.
+    unreturned_update: Option<cairn_common::executor_protocol::UnreturnedUpdate>,
 }
 
 /// Consecutive refusals of one machine on the same pair of protocols.
@@ -1529,7 +1577,7 @@ pub struct Fleet {
     /// has heard from is already gone, and making its replacement wait behind
     /// another machine's recovery would only extend the outage.
     last_telemetry_bounce_unix_ms: Arc<Mutex<u64>>,
-    resident_process_subscribers: Arc<Mutex<Vec<ResidentProcessSubscriber>>>,
+    resident_process_subscribers: Arc<Mutex<ResidentProcessSubscribers>>,
     node_scratch_subscribers: Arc<Mutex<Vec<node_scratch::NodeScratchSubscriber>>>,
     /// At most one live work item per question. The single chokepoint fact that
     /// makes duplicate answers unrepresentable rather than merely suppressed;
@@ -1582,6 +1630,9 @@ pub struct Fleet {
     /// runner serves (see [`rollout`]). Locked alone or after `connections`,
     /// never before it.
     self_update: Arc<Mutex<rollout::Rollout>>,
+    /// Machines the rollout concluded did not return from a self-update,
+    /// waiting for the holder of their bootstrap (see [`unreturned`]).
+    update_recoveries: Arc<unreturned::UpdateRecoveries>,
     /// The placement decisions this runner most recently took, newest last.
     recent_placements: Arc<Mutex<VecDeque<PlacementDecision>>>,
     /// Which placement rejections have been logged, so an unchanged verdict
@@ -2677,11 +2728,44 @@ impl Fleet {
     pub(crate) fn subscribe_resident_process_events(
         &self,
         subscriber: impl Fn(ResidentProcessEvent) + Send + Sync + 'static,
-    ) {
+    ) -> ResidentProcessSubscription {
+        let mut subscribers = self.resident_process_subscribers.lock().unwrap();
+        let id = subscribers.next_id;
+        subscribers.next_id += 1;
+        subscribers.entries.push((id, Arc::new(subscriber)));
+        ResidentProcessSubscription {
+            id,
+            subscribers: Arc::downgrade(&self.resident_process_subscribers),
+        }
+    }
+
+    /// Hand one event to every subscriber registered when it arrived.
+    ///
+    /// The registry is snapshotted and released before any subscriber runs, so a
+    /// subscriber that drops a [`ResidentProcessSubscription`] cannot deadlock on
+    /// it. Ordering per process is unchanged: one executor link ingests its
+    /// messages one at a time.
+    fn publish_resident_process_event(&self, event: ResidentProcessEvent) {
+        let subscribers: Vec<ResidentProcessSubscriber> = self
+            .resident_process_subscribers
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|(_, subscriber)| subscriber.clone())
+            .collect();
+        for subscriber in subscribers {
+            subscriber(event.clone());
+        }
+    }
+
+    #[cfg(test)]
+    fn resident_process_subscriber_count(&self) -> usize {
         self.resident_process_subscribers
             .lock()
             .unwrap()
-            .push(Arc::new(subscriber));
+            .entries
+            .len()
     }
 
     pub(crate) fn with_residency_route_path(path: PathBuf) -> Self {
@@ -3996,6 +4080,7 @@ impl Fleet {
                 containment: None,
                 page_call_programs: None,
                 github_credential: None,
+                machine_services: Vec::new(),
             },
             current_load: 0,
             warm_roots: Vec::new(),
@@ -4228,6 +4313,7 @@ impl Fleet {
                     since_unix_ms: unix_time_ms(),
                 };
                 record.protocol_refusal = None;
+                record.unreturned_update = None;
             }
         }
         self.connection_ready.notify_waiters();
@@ -4734,6 +4820,7 @@ impl Fleet {
                     connection_timeline: VecDeque::new(),
                     last_process_report: None,
                     protocol_refusal: None,
+                    unreturned_update: None,
                 });
         record.name = name.to_string();
         record.os = os.to_string();
@@ -4940,6 +5027,7 @@ impl Fleet {
                         &artifacts,
                     )
                 }),
+                unreturned_update: record.unreturned_update.clone(),
                 drained: drained.contains(executor_id),
                 role: roles.get(executor_id).copied().unwrap_or_default(),
                 executor_id: executor_id.clone(),
@@ -6020,9 +6108,7 @@ impl Fleet {
                 if self.resident_event_is_current(executor_id, generation, &event) {
                     self.end_relay_of_exited_process(executor_id, &event);
                     for event in self.settle_resident_event(executor_id, event) {
-                        for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
-                            subscriber(event.clone());
-                        }
+                        self.publish_resident_process_event(event);
                     }
                 }
                 false
@@ -6410,9 +6496,7 @@ impl Fleet {
         }
         for event in reconciled_process_events {
             self.end_relay_of_exited_process(executor_id, &event);
-            for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
-                subscriber(event.clone());
-            }
+            self.publish_resident_process_event(event);
         }
         self.connection_ready.notify_waiters();
         snapshot_changed
@@ -7518,9 +7602,10 @@ impl Fleet {
         run.stranding(target?, &artifacts)
     }
 
-    /// One pass of the rolling self-update (see [`rollout`]): stamp the hold
-    /// placement reads, send the directive once the machine whose turn it is
-    /// has emptied, and journal what changed.
+    /// One pass of the rolling self-update (see [`rollout`]): stamp the holds
+    /// placement reads (the machine updating and the one draining), send the
+    /// directive once the machine whose turn it is has emptied, and journal
+    /// what changed.
     ///
     /// Each lock is taken alone. The queue and the pending-residency map are
     /// read between two acquisitions of the connection table rather than
@@ -7565,7 +7650,7 @@ impl Fleet {
         let delivered = {
             let mut connections = self.lock_connections();
             for (executor_id, entry) in connections.iter_mut() {
-                let held = step.hold.as_deref() == Some(executor_id.as_str());
+                let held = step.holds.contains(executor_id);
                 released |= entry.update_hold && !held;
                 entry.update_hold = held;
             }
@@ -7620,6 +7705,99 @@ impl Fleet {
                     })),
             );
         }
+        self.note_unreturned(step.unreturned, now_unix_ms);
+    }
+
+    fn note_unreturned(&self, unreturned: Vec<rollout::Unreturned>, now_unix_ms: u64) {
+        for conclusion in unreturned {
+            self.conclude_unreturned_update(
+                &conclusion.executor_id,
+                &conclusion.build_id,
+                conclusion.directed_at_unix_ms,
+                now_unix_ms,
+            );
+        }
+    }
+
+    /// Record that this machine, directed to install `build_id`, did not
+    /// return: on its enrolment record, where the fleet page reads it, and in
+    /// the queue its bootstrap holder restarts it from. `false` for a machine
+    /// this runner has not enrolled, which has no record or bootstrap.
+    pub fn conclude_unreturned_update(
+        &self,
+        executor_id: &str,
+        build_id: &str,
+        directed_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> bool {
+        let recovery = {
+            let mut enrolled = self.enrolled_remotes.lock().unwrap();
+            let Some(record) = enrolled.get_mut(executor_id) else {
+                return false;
+            };
+            let update = cairn_common::executor_protocol::UnreturnedUpdate {
+                build_id: build_id.to_string(),
+                directed_at_unix_ms,
+                concluded_at_unix_ms: now_unix_ms,
+                restart: None,
+            };
+            record.unreturned_update = Some(update.clone());
+            unreturned::UpdateRecovery {
+                executor_id: executor_id.to_string(),
+                name: record.name.clone(),
+                last_seen_unix_ms: record.last_seen_unix_ms,
+                update,
+            }
+        };
+        self.update_recoveries.push(recovery);
+        true
+    }
+
+    /// The strandings queued since the last call, for the holder of the
+    /// machines' bootstrap.
+    pub fn take_update_recoveries(&self) -> Vec<unreturned::UpdateRecovery> {
+        self.update_recoveries.take()
+    }
+
+    /// Signalled whenever a stranding is queued.
+    pub fn update_recovery_arrived(&self) -> Arc<tokio::sync::Notify> {
+        self.update_recoveries.arrived()
+    }
+
+    /// Record the restart made for a machine that did not return from the
+    /// update to `build_id`, on its page and in the runner journal. `false`
+    /// when the machine no longer stands unreturned from that build: it
+    /// attached meanwhile, or it was removed.
+    pub fn record_update_restart(
+        &self,
+        executor_id: &str,
+        build_id: &str,
+        restart: cairn_common::executor_protocol::UpdateRestart,
+    ) -> bool {
+        let recorded = self
+            .enrolled_remotes
+            .lock()
+            .unwrap()
+            .get_mut(executor_id)
+            .and_then(|record| record.unreturned_update.as_mut())
+            .filter(|update| update.build_id == build_id)
+            .map(|update| update.restart = Some(restart.clone()))
+            .is_some();
+        if let Some(outcome) = &restart.outcome {
+            log::info!(
+                "executor self-update restart executor_id={executor_id} build={build_id}: {outcome}"
+            );
+            self.runner_events.record(
+                runner_events::RunnerEvent::new(runner_events::RunnerEventKind::ExecutorSelfUpdate)
+                    .executor(executor_id)
+                    .cause(unreturned::restart_text(&restart))
+                    .detail(serde_json::json!({
+                        "phase": "restarted",
+                        "build": build_id,
+                    })),
+            );
+        }
+        recorded
     }
 
     /// The build each attached executor should be running: the one the
@@ -14197,6 +14375,15 @@ pub(crate) fn residency_queue_entry_id(holder: &ResidencyHolder) -> String {
     format!("residency-acquire:{}", holder.storage_key())
 }
 
+/// The holder an acquisition request places, read back from the request
+/// [`residency_placement_request`] builds: its attempt marks an acquisition
+/// and its command is the holder's storage key.
+fn acquired_residency_holder(request: &CellRequest) -> Option<ResidencyHolder> {
+    (request.attempt_id == RESIDENCY_ACQUIRE_ATTEMPT_ID)
+        .then(|| ResidencyHolder::parse_storage_key(&request.command))
+        .flatten()
+}
+
 #[cfg(test)]
 pub(crate) fn residency_placement_request_for_test(
     request: &ResidencyAcquireRequest,
@@ -14627,6 +14814,13 @@ pub(crate) struct PlacementScope<'a> {
     pub(crate) project_requirements: &'a ProjectPlacementRequirements,
     /// The class of work asking, which a machine's role accepts or refuses.
     pub(crate) work_class: PlacementWorkClass,
+    /// Whether the work compiles the project's Rust whatever its selector
+    /// names: its command is a cargo build, test or lint, or it is a job's
+    /// execution environment, whose shells and terminals are where an agent
+    /// builds. An unpinned `bun run test:rust` selects nothing and runs in
+    /// that environment, so without this a machine that cannot build the
+    /// project got both (cairn/5909).
+    pub(crate) compiles_rust: bool,
 }
 
 /// The opening of every refusal caused by a project config that cannot be
@@ -14692,6 +14886,11 @@ impl<'a> PlacementScope<'a> {
             avoided_executor_ids: &request.avoided_executor_ids,
             project_requirements: &request.project_requirements,
             work_class: request.placement_work_class,
+            compiles_rust: request.command_class.compiles_rust()
+                || matches!(
+                    acquired_residency_holder(request),
+                    Some(ResidencyHolder::Job { .. })
+                ),
         }
     }
 
@@ -14910,6 +15109,7 @@ fn candidate_rejection(
         scope.project_id,
         scope.project_requirements,
         scope.selector,
+        scope.compiles_rust,
     ) {
         Some(reason)
     } else if !scope.targeted() && !entry.colocated && !scope.mobility.may_spill() {
@@ -18050,7 +18250,8 @@ fn github_credential_deficiency(
 /// MISSING, when the project declares the script that verdict came from.
 ///
 /// Rust work is whatever needs `rust`, by the work's own selector or by the
-/// project's setup. `Unchecked` and an absent verdict gate nothing, since
+/// project's setup, or `compiles_rust` work ([`PlacementScope::compiles_rust`]).
+/// `Unchecked` and an absent verdict gate nothing, since
 /// nothing is known, and that includes a `Missing` from a probe that could not
 /// run its script (`BuildPrerequisiteCheck::effective_status`); a project that
 /// does not declare the script is described by nothing the probe measured.
@@ -18059,12 +18260,14 @@ fn build_prerequisite_deficiency(
     project_id: &str,
     requirements: &ProjectPlacementRequirements,
     selector: Option<&ExecutorSelector>,
+    compiles_rust: bool,
 ) -> Option<PlacementRejectionReason> {
     const RUST: &str = "rust";
-    let needs_rust = requirements
-        .setup_toolchains
-        .iter()
-        .any(|toolchain| toolchain == RUST)
+    let needs_rust = compiles_rust
+        || requirements
+            .setup_toolchains
+            .iter()
+            .any(|toolchain| toolchain == RUST)
         || selector.is_some_and(|selector| {
             selector
                 .required_toolchains
@@ -18099,10 +18302,6 @@ fn project_eligibility(
     entry: &ExecutorConnectionState,
     known: &HashMap<String, ProjectPlacementRequirements>,
 ) -> Vec<cairn_common::executor_protocol::ProjectEligibility> {
-    let rust_work = ExecutorSelector {
-        required_toolchains: vec!["rust".into()],
-        ..Default::default()
-    };
     let capabilities = &entry.advertisement.capabilities;
     let mut projects: Vec<&String> = known
         .keys()
@@ -18139,7 +18338,8 @@ fn project_eligibility(
                 capabilities,
                 project_id,
                 &requirements,
-                Some(&rust_work),
+                None,
+                true,
             ));
             cairn_common::executor_protocol::ProjectEligibility {
                 project_id: project_id.clone(),
@@ -21745,6 +21945,7 @@ mod tests {
             containment: None,
             page_call_programs: None,
             github_credential: None,
+            machine_services: Vec::new(),
         }
     }
 
@@ -21879,6 +22080,7 @@ mod tests {
             containment,
             page_call_programs: None,
             github_credential: None,
+            machine_services: Vec::new(),
         }
     }
 
@@ -24726,6 +24928,7 @@ mod tests {
                         containment: None,
                         page_call_programs: None,
                         github_credential: None,
+                        machine_services: Vec::new(),
                     },
                     current_load: load,
                     warm_roots: warm
@@ -26221,6 +26424,7 @@ mod tests {
                     containment: None,
                     page_call_programs: None,
                     github_credential: None,
+                    machine_services: Vec::new(),
                 },
             ),
             None,
@@ -31482,6 +31686,7 @@ mod tests {
             avoided_executor_ids: &[],
             project_requirements: &NO_PROJECT_REQUIREMENTS,
             work_class: PlacementWorkClass::ReviewChecks,
+            compiles_rust: false,
         }
     }
 
@@ -33750,6 +33955,7 @@ mod tests {
                 status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                 reservation: None,
                 live_usage: None,
+                charge: None,
             },
         );
         Arc::make_mut(&mut entry.snapshot).cells = vec![cell];
@@ -34321,6 +34527,7 @@ mod tests {
             retired: Vec::new(),
             connection_timeline: Vec::new(),
             stranded: None,
+            unreturned_update: None,
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[absent], &request, &[]);
         assert!(diagnostic.contains("bglab-win (windows/x86_64)"));
@@ -34346,6 +34553,7 @@ mod tests {
             retired: Vec::new(),
             connection_timeline: Vec::new(),
             stranded: None,
+            unreturned_update: None,
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[linux], &request, &[]);
         assert!(diagnostic.contains("No enrolled machine on windows exists."));
@@ -34377,6 +34585,7 @@ mod tests {
             retired: Vec::new(),
             connection_timeline: Vec::new(),
             stranded: None,
+            unreturned_update: None,
         };
         let bystander = EnrolledRemote {
             executor_id: "elsewhere".into(),
@@ -35593,7 +35802,8 @@ mod tests {
         let captured = received.clone();
         pool.subscribe_resident_process_events(move |event| {
             captured.lock().unwrap().push(event);
-        });
+        })
+        .detach();
         let residency = fleet_residency(
             ResidencyHolder::Job {
                 job_id: "job".into(),
@@ -35686,6 +35896,7 @@ mod tests {
                         status,
                         reservation: None,
                         live_usage: None,
+                        charge: None,
                     },
                 )]),
                 clone_source: None,
@@ -35720,8 +35931,102 @@ mod tests {
         let captured = received.clone();
         pool.subscribe_resident_process_events(move |event| {
             captured.lock().unwrap().push(event);
-        });
+        })
+        .detach();
         received
+    }
+
+    /// One stdout chunk from the service fixture's process, as an executor
+    /// would send it.
+    fn service_output(residency: &CellResidency) -> ExecutorMessage {
+        ExecutorMessage::ResidentProcessEvent {
+            event: ResidentProcessEvent {
+                holder: residency.holder.clone(),
+                incarnation_id: residency.incarnation_id.clone(),
+                cell_epoch: 7,
+                process_key: "main".into(),
+                process_generation: 2,
+                event: ResidentProcessEventKind::Output {
+                    sequence: 1,
+                    stream: cairn_common::executor_protocol::ResidentProcessStream::Stdout,
+                    data: b"guid".to_vec(),
+                },
+            },
+        }
+    }
+
+    /// A per-process subscriber leaves with its owner instead of accumulating
+    /// for the runner's life, while a detached one stays.
+    #[test]
+    fn a_dropped_resident_subscription_hears_nothing_more() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let residency = fleet_residency(
+            ResidencyHolder::Service {
+                service_id: "channel-imessage".into(),
+            },
+            None,
+        );
+        let detached = subscribed_events(&pool);
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let captured = held.clone();
+        let subscription = pool.subscribe_resident_process_events(move |event| {
+            captured.lock().unwrap().push(event);
+        });
+
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            service_output(&residency),
+        );
+        assert_eq!(held.lock().unwrap().len(), 1);
+
+        drop(subscription);
+        assert_eq!(pool.resident_process_subscriber_count(), 1);
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            service_output(&residency),
+        );
+        assert_eq!(
+            held.lock().unwrap().len(),
+            1,
+            "an unregistered subscriber hears nothing more"
+        );
+        assert_eq!(
+            detached.lock().unwrap().len(),
+            2,
+            "a detached subscriber stays registered"
+        );
+    }
+
+    /// Dispatch does not hold the registry while subscribers run, so the owner
+    /// a subscriber releases can unregister it without deadlocking.
+    #[test]
+    fn a_subscriber_can_unregister_itself_while_it_is_dispatched_to() {
+        let pool = Fleet::default();
+        let (executor_tx, _executor_rx) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(executor_tx);
+        let residency = fleet_residency(
+            ResidencyHolder::Service {
+                service_id: "channel-imessage".into(),
+            },
+            None,
+        );
+        let slot = Arc::new(Mutex::new(None::<ResidentProcessSubscription>));
+        let owner = slot.clone();
+        let subscription = pool.subscribe_resident_process_events(move |_| {
+            drop(owner.lock().unwrap().take());
+        });
+        *slot.lock().unwrap() = Some(subscription);
+
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            service_output(&residency),
+        );
+        assert_eq!(pool.resident_process_subscriber_count(), 0);
     }
 
     fn resident_output_text(events: &[ResidentProcessEvent]) -> String {
@@ -36022,7 +36327,8 @@ mod tests {
         let captured = received.clone();
         pool.subscribe_resident_process_events(move |event| {
             captured.lock().unwrap().push(event);
-        });
+        })
+        .detach();
         let residency = fleet_residency(
             ResidencyHolder::Service {
                 service_id: "channel-imessage".into(),
@@ -39567,6 +39873,135 @@ mod tests {
         );
     }
 
+    const WINDOWS_PREREQUISITES: &str = "scripts/setup-self-hosted-runner-windows.ps1";
+
+    /// bgsrv-win as its Windows script now reports it: LLVM for libclang, and
+    /// no clang-cl where cc looks for one.
+    fn missing_clang_cl() -> cairn_common::executor_protocol::BuildPrerequisiteCheck {
+        cairn_common::executor_protocol::BuildPrerequisiteCheck {
+            script: format!("{WINDOWS_PREREQUISITES} -CheckPrerequisites"),
+            status: cairn_common::executor_protocol::BuildPrerequisiteStatus::Missing,
+            detail: "Windows build prerequisites on BGSRV-WIN are missing clang-cl: aegis, in cairn-core's turso closure, compiles its C with clang-cl on MSVC. Add Visual Studio's C++ Clang Compiler for Windows component with: --add Microsoft.VisualStudio.Component.VC.Llvm.Clang".into(),
+        }
+    }
+
+    fn windows_without_clang_cl() -> ExecutorConnectionState {
+        let (_, mut win) = fleet_entry("bgsrv-win", "windows", 0, &[]);
+        advertising(&mut win, &["bun", "rust"]);
+        win.advertisement.capabilities.build_prerequisites = Some(missing_clang_cl());
+        win
+    }
+
+    /// The specimen (cairn://posts/524): an unpinned
+    /// `bun run test:rust -p cairn-core` names no toolchain and cairn's setup is
+    /// `bun install`, so only the command says it builds Rust. It is refused,
+    /// naming what the machine lacks; work that builds no Rust still lands.
+    #[test]
+    fn a_cargo_command_is_rust_work_without_a_rust_selector() {
+        let win = windows_without_clang_cl();
+        let batch = |command: &str| {
+            let mut request = spillable_request();
+            request.executor = None;
+            request.command = command.into();
+            request.command_class = CellCommandClass::classify(command);
+            request.project_requirements = project_needs(&["bun"], &[WINDOWS_PREREQUISITES]).into();
+            request
+        };
+        let verdict =
+            |request: &CellRequest| candidate_rejection(&win, PlacementScope::of(request), NOW);
+
+        for rust in [
+            "bun run test:rust -p cairn-core",
+            "bun run check:rust",
+            "cargo check -p cairn-exec",
+        ] {
+            let refused = verdict(&batch(rust))
+                .unwrap_or_else(|| panic!("{rust} was offered a machine that cannot build it"));
+            assert!(
+                matches!(
+                    refused,
+                    PlacementRejectionReason::BuildPrerequisitesMissing { .. }
+                ),
+                "{rust}: {refused:?}"
+            );
+            let described = refused.describe();
+            assert!(described.contains("missing clang-cl"), "{described}");
+            assert!(
+                described.contains("Microsoft.VisualStudio.Component.VC.Llvm.Clang"),
+                "{described}"
+            );
+        }
+        for other in [
+            "bunx --bun tsc --noEmit",
+            "bun run test:frontend",
+            "bunx --bun vite build",
+        ] {
+            assert!(
+                !matches!(
+                    verdict(&batch(other)),
+                    Some(PlacementRejectionReason::BuildPrerequisitesMissing { .. })
+                ),
+                "{other}"
+            );
+        }
+    }
+
+    /// A job's execution environment is where its terminals and unpinned
+    /// batches run, so it is placed as Rust work: a terminal that lands on a
+    /// machine that cannot build the project takes every later build with it.
+    /// Residencies that are not an agent's working tree are not.
+    #[test]
+    fn a_jobs_execution_environment_is_rust_work_and_other_residencies_are_not() {
+        let mut win = windows_without_clang_cl();
+        let acquisition = |holder: ResidencyHolder| {
+            let mut request = residency_placement_request(&fleet_residency_request(holder));
+            request.project_requirements = project_needs(&["bun"], &[WINDOWS_PREREQUISITES]).into();
+            request
+        };
+        let gated = |entry: &ExecutorConnectionState, request: &CellRequest| {
+            matches!(
+                candidate_rejection(entry, PlacementScope::of(request), NOW),
+                Some(PlacementRejectionReason::BuildPrerequisitesMissing { .. })
+            )
+        };
+
+        let home = acquisition(ResidencyHolder::Job {
+            job_id: "job-1".into(),
+        });
+        assert!(PlacementScope::of(&home).compiles_rust);
+        assert!(gated(&win, &home));
+
+        for holder in [
+            ResidencyHolder::Service {
+                service_id: "svc".into(),
+            },
+            ResidencyHolder::Workflow {
+                run_id: "run".into(),
+            },
+            ResidencyHolder::ProjectTerminals {
+                project_id: "p".into(),
+            },
+        ] {
+            let other = acquisition(holder.clone());
+            assert!(!PlacementScope::of(&other).compiles_rust, "{holder:?}");
+            assert!(!gated(&win, &other), "{holder:?}");
+        }
+        // A request that only carries a job's storage key as its command is not
+        // an acquisition.
+        let mut lookalike = spillable_request();
+        lookalike.command = "job:job-1".into();
+        assert!(!PlacementScope::of(&lookalike).compiles_rust);
+
+        // The verdict a re-attach brings once clang-cl is installed lets the
+        // environment in.
+        win.advertisement.capabilities.build_prerequisites =
+            Some(cairn_common::executor_protocol::BuildPrerequisiteCheck {
+                status: cairn_common::executor_protocol::BuildPrerequisiteStatus::Satisfied,
+                ..missing_clang_cl()
+            });
+        assert!(!gated(&win, &home));
+    }
+
     /// The executors page shows what placement enforces, per project.
     #[test]
     fn the_executors_page_reports_project_eligibility_as_placement_decides_it() {
@@ -40079,6 +40514,7 @@ mod tests {
                     status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                     reservation: None,
                     live_usage: None,
+                    charge: None,
                 },
             );
         }
@@ -40234,6 +40670,7 @@ mod tests {
                 status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
                 reservation: None,
                 live_usage: None,
+                charge: None,
             },
         );
         let mut unowned = materialization_read_cell("unowned", "nobody");

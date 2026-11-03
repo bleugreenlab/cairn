@@ -14,5 +14,8 @@ pub mod census;
 mod held_reads_tests;
 pub mod pulse;
 pub mod reorder;
+pub mod rotation;
+#[cfg(test)]
+mod rotation_tests;
 pub mod sweep;
 pub mod vocabulary;

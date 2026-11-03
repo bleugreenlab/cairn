@@ -239,12 +239,20 @@ pub(crate) async fn compose_thread_seed_with_policy(
         .collect();
 
     let blocks = group_turn_blocks(&events);
+    let mentions = Mentions::index(
+        &blocks,
+        open_children
+            .iter()
+            .map(String::as_str)
+            .chain(marks.iter().map(|mark| mark.child_issue_uri.as_str())),
+    );
     let plan = plan_chapters(
         &blocks,
         &marks,
         &open_children,
         &prior_entries,
         blocks.len().saturating_sub(RECENCY_FLOOR_TURNS),
+        &mentions,
     );
 
     let new_entries: Vec<TocEntry> = plan
@@ -257,14 +265,18 @@ pub(crate) async fn compose_thread_seed_with_policy(
         .into_iter()
         .filter(|entry| entry.content_uri != "era:covered")
         .collect();
+    let mut carried: HashSet<(String, i64, i64)> = entries
+        .iter()
+        .map(|entry| {
+            let (uri, start, end) = entry.dedupe_key();
+            (uri.to_string(), start, end)
+        })
+        .collect();
     for entry in new_entries.iter() {
-        if entries
-            .iter()
-            .any(|kept| kept.dedupe_key() == entry.dedupe_key())
-        {
-            continue;
+        let (uri, start, end) = entry.dedupe_key();
+        if carried.insert((uri.to_string(), start, end)) {
+            entries.push(entry.clone());
         }
-        entries.push(entry.clone());
     }
     entries.sort_by_key(|entry| (entry.start_block, entry.end_block));
 
@@ -313,67 +325,59 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let verbatim_budget = policy.budget_tokens.saturating_sub(framing_tokens);
     let floor_start = blocks.len().saturating_sub(RECENCY_FLOOR_TURNS);
     let live_start = era_end.map_or(0, |end| (end + 1).max(0) as usize);
-    let live_tokens: usize = (live_start..blocks.len())
-        .map(|index| seed_tokens(&block_text(&blocks[index])))
-        .sum();
+    let mut weights = SourceWeights::new(&blocks);
 
     let mut minted_eras = Vec::new();
     let mut covered_through = era_end;
-    if live_tokens > verbatim_budget && live_start < floor_start {
-        let target = ERA_MIN_SOURCE_TOKENS.max(live_tokens.saturating_sub(verbatim_budget / 2));
-        let mut taken_tokens = 0usize;
-        let mut end = live_start;
-        while end < floor_start && taken_tokens < target {
-            taken_tokens += seed_tokens(&block_text(&blocks[end]));
-            end += 1;
-        }
-        if end > live_start {
-            let end_index = end - 1;
-            let span_text = (live_start..=end_index)
-                .map(|index| block_text(&blocks[index]))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let era_children: Vec<ChildMark> = marks
+    if let Some(end) = era_fold_end(
+        blocks.len(),
+        live_start,
+        floor_start,
+        verbatim_budget,
+        |index| weights.of(index),
+    ) {
+        let end_index = end - 1;
+        let era_children: Vec<ChildMark> = marks
+            .iter()
+            .filter(|mark| {
+                (live_start..end).any(|index| mentions.names(index, &mark.child_issue_uri))
+            })
+            .cloned()
+            .collect();
+        let child_text = if era_children.is_empty() {
+            "no child resolutions".to_string()
+        } else {
+            era_children
                 .iter()
-                .filter(|mark| mentions_uri(&span_text, &mark.child_issue_uri))
-                .cloned()
-                .collect();
-            let child_text = if era_children.is_empty() {
-                "no child resolutions".to_string()
-            } else {
-                era_children
-                    .iter()
-                    .map(|child| format!("{} ({})", child.child_title, child.child_issue_uri))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let start_at = blocks[live_start]
-                .events
-                .first()
-                .map_or(now, |event| event.created_at);
-            let end_at = blocks[end_index]
-                .events
-                .last()
-                .map_or(now, |event| event.created_at);
-            let summary = format!(
-                "Turns {}–{} ({} to {}) covered {}; the source remains addressable in this era's chat range.",
-                live_start + 1,
-                end_index + 1,
-                start_at,
-                end_at,
-                child_text
-            );
-            minted_eras.push(crate::threads::compaction::EraMint {
-                start_block: live_start as i64,
-                end_block: end_index as i64,
-                started_at: start_at,
-                ended_at: end_at,
-                summary,
-                source_tokens: taken_tokens as i64,
-                children: era_children,
-            });
-            covered_through = Some(end_index as i64);
-        }
+                .map(|child| format!("{} ({})", child.child_title, child.child_issue_uri))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let start_at = blocks[live_start]
+            .events
+            .first()
+            .map_or(now, |event| event.created_at);
+        let end_at = blocks[end_index]
+            .events
+            .last()
+            .map_or(now, |event| event.created_at);
+        let summary = format!(
+            "Turns {}–{} ({} to {}) covered {}; the source remains addressable in this era's chat range.",
+            live_start + 1,
+            end_index + 1,
+            start_at,
+            end_at,
+            child_text
+        );
+        minted_eras.push(crate::threads::compaction::EraMint {
+            start_block: live_start as i64,
+            end_block: end_index as i64,
+            started_at: start_at,
+            ended_at: end_at,
+            summary,
+            children: era_children,
+        });
+        covered_through = Some(end_index as i64);
     }
 
     // Selection priority differs from render order: preserve immediate recency,
@@ -382,13 +386,10 @@ pub(crate) async fn compose_thread_seed_with_policy(
     let pinned_cap = verbatim_budget * UNRESOLVED_CHILD_SHARE / 100;
     let mut pinned_tokens = 0usize;
     for index in (0..floor_start).rev() {
-        if !open_children
-            .iter()
-            .any(|uri| mentions_uri(&block_text(&blocks[index]), uri))
-        {
+        if !open_children.iter().any(|uri| mentions.names(index, uri)) {
             continue;
         }
-        let weight = seed_tokens(&block_text(&blocks[index]));
+        let weight = weights.of(index);
         if pinned_tokens + weight <= pinned_cap {
             selected.push(index);
             pinned_tokens += weight;
@@ -484,6 +485,78 @@ pub(crate) async fn compose_thread_seed_with_policy(
     })
 }
 
+/// What each turn weighs as era source: the tokens of its raw event payloads,
+/// the text an era summary is written from (`era_source_digest`). Tokenizing
+/// payloads is the costliest step in composing a seed, so a turn is measured on
+/// first use and at most once.
+struct SourceWeights<'a, 'b> {
+    blocks: &'a [TurnBlock<'b>],
+    measured: Vec<Option<usize>>,
+}
+
+impl<'a, 'b> SourceWeights<'a, 'b> {
+    fn new(blocks: &'a [TurnBlock<'b>]) -> Self {
+        Self {
+            blocks,
+            measured: vec![None; blocks.len()],
+        }
+    }
+
+    fn of(&mut self, index: usize) -> usize {
+        let blocks = self.blocks;
+        *self.measured[index].get_or_insert_with(|| seed_tokens(&block_text(&blocks[index])))
+    }
+}
+
+/// Where the era this composition mints ends (exclusive), or `None` when the
+/// live turns `live_start..len` are not folded.
+///
+/// The live history folds once it outweighs the verbatim budget. The fold takes
+/// the oldest live turns until what stays live weighs at most half that budget,
+/// takes at least `ERA_MIN_SOURCE_TOKENS`, and never reaches the recency floor.
+/// Past `max(budget, ERA_MIN_SOURCE_TOKENS + budget / 2)` of newest weight the
+/// fold is certain, exceeds its minimum, and ends where the newest half budget
+/// begins, so a backward scan stops there. A long history is never weighed
+/// whole, and a short one is decided by the rule above as written.
+fn era_fold_end(
+    len: usize,
+    live_start: usize,
+    floor_start: usize,
+    verbatim_budget: usize,
+    mut weight: impl FnMut(usize) -> usize,
+) -> Option<usize> {
+    if live_start >= floor_start {
+        return None;
+    }
+    let keep = verbatim_budget / 2;
+    let decisive = verbatim_budget.max(ERA_MIN_SOURCE_TOKENS + keep);
+    // `newest` weighs the turns from `index` on; `kept_from` is the oldest turn
+    // from which the newest turns still weigh at most `keep`.
+    let (mut newest, mut kept_from, mut index) = (0usize, len, len);
+    while index > live_start {
+        index -= 1;
+        newest += weight(index);
+        if newest <= keep {
+            kept_from = index;
+        }
+        if newest > decisive {
+            return Some(kept_from.min(floor_start));
+        }
+    }
+
+    let live = newest;
+    if live <= verbatim_budget {
+        return None;
+    }
+    let target = ERA_MIN_SOURCE_TOKENS.max(live.saturating_sub(keep));
+    let (mut taken, mut end) = (0usize, live_start);
+    while end < floor_start && taken < target {
+        taken += weight(end);
+        end += 1;
+    }
+    (end > live_start).then_some(end)
+}
+
 /// The session the job is on right now. Composition is measured against it, and
 /// the generation it produces is pending until the job leaves it.
 async fn current_session_id(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
@@ -531,6 +604,7 @@ fn plan_chapters(
     open_children: &[String],
     prior_entries: &[TocEntry],
     recency_start: usize,
+    mentions: &Mentions<'_, '_>,
 ) -> ChapterPlan {
     let already_compacted = |index: usize| {
         prior_entries
@@ -557,8 +631,7 @@ fn plan_chapters(
             continue;
         }
 
-        let text = block_text(block);
-        if open_children.iter().any(|uri| mentions_uri(&text, uri)) {
+        if open_children.iter().any(|uri| mentions.names(index, uri)) {
             // Never drop a turn that also touches work still in flight.
             if let Some(chapter) = open.take() {
                 chapters.push(chapter);
@@ -568,7 +641,7 @@ fn plan_chapters(
 
         let kind = match marks
             .iter()
-            .position(|mark| mentions_uri(&text, &mark.child_issue_uri))
+            .position(|mark| mentions.names(index, &mark.child_issue_uri))
         {
             Some(mark) => ChapterKind::Child(mark),
             None => ChapterKind::Interstitial,
@@ -944,23 +1017,13 @@ fn collapsed_census(children: &[ChildStatus], thread_uri: &str, budget: usize) -
         .map(ChildStatus::census_line)
         .collect();
 
-    // The longest prefix that fits, found by binary search over the measured
-    // section. Only a measured candidate is ever accepted, so the bound holds
-    // whatever the search converges on, and the marker standing for the rest is
-    // inside every measurement rather than added to a section already sized.
-    let (mut low, mut high) = (0usize, lines.len());
-    let mut best = 0usize;
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        if seed_tokens(&render_collapsed_census(&lines, mid, thread_uri)) <= budget {
-            best = mid;
-            low = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            high = mid - 1;
-        }
-    }
+    // The longest prefix that fits. Only a measured candidate is ever accepted,
+    // so the bound holds whatever the search converges on, and the marker
+    // standing for the rest is inside every measurement rather than added to a
+    // section already sized.
+    let best = largest_fitting(0, lines.len(), |take| {
+        seed_tokens(&render_collapsed_census(&lines, take, thread_uri)) <= budget
+    });
     render_collapsed_census(&lines, best, thread_uri)
 }
 
@@ -1014,16 +1077,11 @@ fn bounded_recent(
         };
     };
 
-    let mut selected = vec![newest];
-    for index in (blocks.len().saturating_sub(max_turns)..newest).rev() {
-        let mut trial = selected.clone();
-        trial.push(index);
-        trial.sort_unstable();
-        if recent_section_tokens(blocks, &trial, chat_uri, meta) > budget {
-            break;
-        }
-        selected = trial;
-    }
+    let window = |count: usize| -> Vec<usize> { (blocks.len() - count..blocks.len()).collect() };
+    let count = largest_fitting(1, max_turns.clamp(1, blocks.len()), |count| {
+        recent_section_tokens(blocks, &window(count), chat_uri, meta) <= budget
+    });
+    let selected = window(count);
 
     let mut section = String::from("## Recent\n\n");
     section.push_str(&render_gap_markers(&selected, blocks.len(), chat_uri));
@@ -1036,6 +1094,36 @@ fn bounded_recent(
         section: cut_newest_turn(blocks, newest, budget, chat_uri, meta),
         selected: vec![newest],
     }
+}
+
+/// The largest count in `floor..=ceiling` for which `fits` holds, `floor` taken
+/// as fitting without a measurement.
+///
+/// Every caller measures a section that grows with the count, so the counts
+/// that fit are a prefix of the range. The search gallops up from `floor` and
+/// bisects the last step, so it takes logarithmically many measurements and
+/// each stays near the answer: a measurement costs what its section weighs, and
+/// the answer usually sits far below `ceiling`.
+fn largest_fitting(floor: usize, ceiling: usize, mut fits: impl FnMut(usize) -> bool) -> usize {
+    let (mut fit, mut step) = (floor, 1usize);
+    while fit < ceiling {
+        let probe = fit.saturating_add(step).min(ceiling);
+        if !fits(probe) {
+            let mut misfit = probe;
+            while misfit - fit > 1 {
+                let mid = fit + (misfit - fit) / 2;
+                if fits(mid) {
+                    fit = mid;
+                } else {
+                    misfit = mid;
+                }
+            }
+            break;
+        }
+        fit = probe;
+        step = step.saturating_mul(2);
+    }
+    fit
 }
 
 /// The head of one turn, under `budget`, followed by the address of the whole.
@@ -1599,6 +1687,110 @@ fn block_text(block: &TurnBlock<'_>) -> String {
         text.push('\n');
     }
     text
+}
+
+/// Whether any of the turn's events names `uri` as a whole issue address.
+///
+/// Each payload is searched on its own. That finds exactly what a search of the
+/// joined turn would, since an address never spans the newline that joins two
+/// payloads, and it never copies a turn's payloads to search them.
+fn block_mentions(block: &TurnBlock<'_>, uri: &str) -> bool {
+    block
+        .events
+        .iter()
+        .any(|event| mentions_uri(&event.data, uri))
+}
+
+const ISSUE_SCHEME: &str = "cairn://p/";
+
+/// The issue addresses each turn names, among the URIs a composition asks about.
+///
+/// A thread asks of every turn whether it mentions each open child and each
+/// marked child, and asked a URI at a time that is a search of every payload per
+/// URI. A canonical issue address (`cairn://p/{project}/{number}`) is indexed
+/// instead, in one pass: each occurrence of the scheme is read to the end of its
+/// number, and is a mention of exactly the address it spells, which is
+/// [`mentions_uri`]'s rule that a longer number names another issue. A URI of
+/// any other shape is searched for as before.
+struct Mentions<'a, 'b> {
+    blocks: &'a [TurnBlock<'b>],
+    ids: HashMap<String, u32>,
+    named: Vec<Vec<u32>>,
+}
+
+impl<'a, 'b> Mentions<'a, 'b> {
+    fn none(blocks: &'a [TurnBlock<'b>]) -> Self {
+        Self::index(blocks, std::iter::empty())
+    }
+
+    fn index<'u>(blocks: &'a [TurnBlock<'b>], uris: impl IntoIterator<Item = &'u str>) -> Self {
+        let mut ids: HashMap<String, u32> = HashMap::new();
+        let mut longest_project = 0;
+        for uri in uris {
+            if let Some(project) = canonical_issue_project(uri) {
+                longest_project = longest_project.max(project.len());
+                let next = ids.len() as u32;
+                ids.entry(uri.to_string()).or_insert(next);
+            }
+        }
+        let named = if ids.is_empty() {
+            vec![Vec::new(); blocks.len()]
+        } else {
+            blocks
+                .iter()
+                .map(|block| {
+                    let mut found: Vec<u32> = Vec::new();
+                    for event in &block.events {
+                        for (at, _) in event.data.match_indices(ISSUE_SCHEME) {
+                            let id = issue_uri_at(&event.data, at, longest_project)
+                                .and_then(|uri| ids.get(uri));
+                            if let Some(id) = id {
+                                if !found.contains(id) {
+                                    found.push(*id);
+                                }
+                            }
+                        }
+                    }
+                    found
+                })
+                .collect()
+        };
+        Self { blocks, ids, named }
+    }
+
+    /// Whether turn `index` mentions `uri` as a whole issue address.
+    fn names(&self, index: usize, uri: &str) -> bool {
+        match self.ids.get(uri) {
+            Some(id) => self.named[index].contains(id),
+            None => block_mentions(&self.blocks[index], uri),
+        }
+    }
+}
+
+/// The project segment of a canonical issue address, `None` for any other URI.
+fn canonical_issue_project(uri: &str) -> Option<&str> {
+    let (project, number) = uri.strip_prefix(ISSUE_SCHEME)?.split_once('/')?;
+    (!project.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(project)
+}
+
+/// The canonical issue address spelled at `at`, where `text` holds the scheme,
+/// read through the whole of its number. A project segment longer than
+/// `longest_project` cannot be one the caller indexed, so the read stops there
+/// rather than searching an arbitrarily long tail for its slash.
+fn issue_uri_at(text: &str, at: usize, longest_project: usize) -> Option<&str> {
+    let start = at + ISSUE_SCHEME.len();
+    let rest = &text.as_bytes()[start..];
+    let slash = rest
+        .iter()
+        .take(longest_project + 1)
+        .position(|byte| *byte == b'/')
+        .filter(|slash| *slash > 0)?;
+    let digits = rest[slash + 1..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    (digits > 0).then(|| &text[at..start + slash + 1 + digits])
 }
 
 /// Whether `haystack` names `uri` as a whole issue address.
@@ -2499,27 +2691,17 @@ fn earlier_turns(blocks: &[TurnBlock<'_>], end: usize, chat_uri: &str, budget: u
     if end == 0 {
         return String::new();
     }
-    let entries: Vec<TocEntry> = plan_chapters(blocks, &[], &[], &[], end)
+    let entries: Vec<TocEntry> = plan_chapters(blocks, &[], &[], &[], end, &Mentions::none(blocks))
         .chapters
         .iter()
         .map(|chapter| build_entry(chapter, blocks, &[], chat_uri))
         .collect();
 
-    // The most entries that fit, found by binary search over the measured
-    // section, as the collapsed census is. Only a measured candidate is accepted.
-    let (mut low, mut high) = (0usize, entries.len());
-    let mut best = 0usize;
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        if seed_tokens(&render_earlier_turns(&entries, mid, end, chat_uri)) <= budget {
-            best = mid;
-            low = mid + 1;
-        } else if mid == 0 {
-            break;
-        } else {
-            high = mid - 1;
-        }
-    }
+    // The most entries that fit, as the collapsed census is fitted. Only a
+    // measured candidate is accepted.
+    let best = largest_fitting(0, entries.len(), |take| {
+        seed_tokens(&render_earlier_turns(&entries, take, end, chat_uri)) <= budget
+    });
     render_earlier_turns(&entries, best, end, chat_uri)
 }
 
@@ -2616,6 +2798,172 @@ mod tests {
     /// Composition time for every test. The fixture's newest event is at 141, so
     /// a child's last activity reads as a couple of hours old.
     const NOW: i64 = 10_000;
+
+    /// The era fold as it was written before the scan: weigh the whole live
+    /// history, then take from the oldest turn.
+    fn whole_history_fold_end(
+        weights: &[usize],
+        live_start: usize,
+        floor_start: usize,
+        verbatim_budget: usize,
+    ) -> Option<usize> {
+        let live: usize = weights[live_start..].iter().sum();
+        if live <= verbatim_budget || live_start >= floor_start {
+            return None;
+        }
+        let target = ERA_MIN_SOURCE_TOKENS.max(live.saturating_sub(verbatim_budget / 2));
+        let (mut taken, mut end) = (0, live_start);
+        while end < floor_start && taken < target {
+            taken += weights[end];
+            end += 1;
+        }
+        (end > live_start).then_some(end)
+    }
+
+    #[test]
+    fn the_era_fold_ends_where_the_whole_history_rule_does() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..5_000 {
+            let len = 1 + next(80);
+            let heavy = [40, 600, 4_000, 30_000][next(4)];
+            let weights: Vec<usize> = (0..len).map(|_| next(heavy)).collect();
+            let live_start = next(len);
+            let floor_start = len.saturating_sub(RECENCY_FLOOR_TURNS);
+            let budget = [0, 300, 6_000, 12_000, 40_000][next(5)];
+            assert_eq!(
+                era_fold_end(len, live_start, floor_start, budget, |index| weights[index]),
+                whole_history_fold_end(&weights, live_start, floor_start, budget),
+                "weights {weights:?} live from {live_start} under {budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_history_is_folded_from_its_newest_turns_without_weighing_the_rest() {
+        let len = 10_000;
+        let mut weighed = 0;
+        let end = era_fold_end(len, 0, len - RECENCY_FLOOR_TURNS, 12_000, |_| {
+            weighed += 1;
+            1_000
+        });
+        // Six turns stay live at half the budget; the fold takes everything older.
+        assert_eq!(end, Some(len - 6));
+        assert!(weighed <= 15, "weighed {weighed} turns");
+    }
+
+    #[test]
+    fn the_largest_fitting_count_matches_a_walk_in_logarithmic_probes() {
+        for ceiling in [0usize, 1, 2, 7, 64, 1_000, 15_000] {
+            for floor in [0usize, 1] {
+                if floor > ceiling {
+                    continue;
+                }
+                for answer in [0usize, 1, 2, 3, 63, 500, 14_999, usize::MAX] {
+                    let expected = answer.clamp(floor, ceiling);
+                    let mut probes = 0;
+                    let found = largest_fitting(floor, ceiling, |count| {
+                        probes += 1;
+                        count <= answer
+                    });
+                    assert_eq!(found, expected, "floor {floor} ceiling {ceiling}");
+                    assert!(probes <= 2 * (usize::BITS - ceiling.leading_zeros()) as usize + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_indexed_mention_answers_as_the_search_does() {
+        let payloads = [
+            "see cairn://p/prj/33 and cairn://p/prj/3/1/builder",
+            "cairn://p/prj/31x cairn://p/other/7",
+            "cairn://p/prj/ cairn://p//4 cairn://p/averyveryverylongprojectkey/9",
+            "cairn://p/prj/5",
+        ];
+        let rows: Vec<EventRow> = payloads
+            .iter()
+            .map(|data| EventRow {
+                run_id: "run".to_string(),
+                sequence: 0,
+                event_type: "assistant".to_string(),
+                data: (*data).to_string(),
+                turn_id: None,
+                created_at: 0,
+            })
+            .collect();
+        let blocks: Vec<TurnBlock<'_>> = rows
+            .iter()
+            .map(|row| TurnBlock {
+                turn_id: None,
+                events: vec![row],
+            })
+            .collect();
+        let uris = [
+            "cairn://p/prj/3",
+            "cairn://p/prj/33",
+            "cairn://p/prj/31",
+            "cairn://p/prj/5",
+            "cairn://p/other/7",
+            "cairn://p/averyveryverylongprojectkey/9",
+            "cairn://p/prj/4",
+            "cairn://p/prj",
+            "cairn://p/cairn/general",
+        ];
+        let mentions = Mentions::index(
+            &blocks,
+            uris.iter().copied().filter(|uri| *uri != "cairn://p/prj/5"),
+        );
+        for (index, block) in blocks.iter().enumerate() {
+            for uri in uris {
+                assert_eq!(
+                    mentions.names(index, uri),
+                    mentions_uri(&block_text(block), uri),
+                    "turn {index}, {uri}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mention_is_found_per_payload_exactly_as_in_the_joined_turn() {
+        let rows: Vec<EventRow> = [
+            "see cairn://p/prj/33",
+            "cairn://p/prj/3",
+            "x cairn://p/prj/31",
+        ]
+        .iter()
+        .map(|data| EventRow {
+            run_id: "run".to_string(),
+            sequence: 0,
+            event_type: "assistant".to_string(),
+            data: (*data).to_string(),
+            turn_id: None,
+            created_at: 0,
+        })
+        .collect();
+        let block = TurnBlock {
+            turn_id: None,
+            events: rows.iter().collect(),
+        };
+        for uri in [
+            "cairn://p/prj/3",
+            "cairn://p/prj/33",
+            "cairn://p/prj/31",
+            "cairn://p/prj/4",
+        ] {
+            assert_eq!(
+                block_mentions(&block, uri),
+                mentions_uri(&block_text(&block), uri),
+                "{uri}"
+            );
+        }
+    }
 
     #[test]
     fn branch_census_keeps_active_and_caps_terminal_branches() {
@@ -4410,6 +4758,106 @@ mod tests {
             println!("  {pass}");
         }
         pressure.assert_stayed_out_of_the_way();
+    }
+
+    /// What a digest preview costs on a real history, per job: the paged
+    /// transcript load, then the composition the preview runs, first against
+    /// cold reads and again warm. Same clone discipline as the probe above, and
+    /// set `CAIRN_HOME` to a directory holding cloned thread stores so no live
+    /// store is opened. Test builds leave workspace crates unoptimized, which
+    /// overstates tokenizing and rendering several times over; for numbers that
+    /// stand for a release, build with `CARGO_PROFILE_DEV_OPT_LEVEL=3` and
+    /// `CARGO_PROFILE_TEST_OPT_LEVEL=3`. `CAIRN_PROBE_JOB` takes a comma-separated
+    /// list, and `CAIRN_PROBE_MIGRATE` brings an older copy's schema forward.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real database copy via CAIRN_CHECKPOINT_PROBE_DB"]
+    async fn digest_timing_probe_against_a_real_database_copy() {
+        use std::time::Instant;
+        let path = std::env::var("CAIRN_CHECKPOINT_PROBE_DB")
+            .expect("set CAIRN_CHECKPOINT_PROBE_DB to a copy of a real database set");
+        crate::mcp::handlers::read::register_archived_file_renderer();
+        let db = LocalDb::open(&path).await.unwrap();
+        if std::env::var_os("CAIRN_PROBE_MIGRATE").is_some() {
+            crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+                .run(&db)
+                .await
+                .unwrap();
+        }
+        let jobs: Vec<String> = match std::env::var("CAIRN_PROBE_JOB") {
+            Ok(list) => list.split(',').map(str::to_string).collect(),
+            Err(_) => db
+                .query_opt_text(
+                    "SELECT group_concat(job_id, ',') FROM (\
+                       SELECT r.job_id AS job_id, sum(c) AS n FROM \
+                         (SELECT run_id, count(*) AS c FROM events GROUP BY run_id) x \
+                       JOIN runs r ON r.id = x.run_id GROUP BY r.job_id \
+                       ORDER BY n DESC LIMIT 12)",
+                    (),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for job_id in jobs {
+            let thread = matches!(
+                crate::threads::compaction_capability_for_job(&db, &job_id).await,
+                crate::threads::ThreadCompaction::Enabled
+            );
+            let job = {
+                let job_id = job_id.clone();
+                db.read(move |conn| {
+                    Box::pin(async move {
+                        crate::execution::jobs::load_job_conn(conn, &job_id)
+                            .await
+                            .map(Option::unwrap)
+                    })
+                })
+                .await
+                .unwrap()
+            };
+            async fn compose(
+                db: &LocalDb,
+                job: &crate::db_records::DbJob,
+                thread: bool,
+                now: i64,
+            ) -> (std::time::Duration, usize) {
+                let started = std::time::Instant::now();
+                let seed_bytes = if thread {
+                    compose_thread_seed_with_policy(db, &job.id, now, SeedPolicy::default())
+                        .await
+                        .map(|seed| seed.content.len())
+                        .unwrap()
+                } else {
+                    compose_node_seed(db, job, SeedPolicy::default().budget_tokens)
+                        .await
+                        .unwrap()
+                        .unwrap_or_default()
+                        .len()
+                };
+                (started.elapsed(), seed_bytes)
+            }
+            let (cold, seed_bytes) = compose(&db, &job, thread, now).await;
+            let (warm, _) = compose(&db, &job, thread, now).await;
+            let started = Instant::now();
+            let events = load_job_events_ordered(&db, &job_id).await.unwrap();
+            let load = started.elapsed();
+            let event_bytes: usize = events.iter().map(|event| event.data.len()).sum();
+            println!(
+                "job {job_id} ({}): {} events, {} event MB, {} turns; compose {cold:?} cold, \
+                 {warm:?} warm -> {seed_bytes} seed bytes; of which a warm load {load:?}",
+                if thread { "thread" } else { "node" },
+                events.len(),
+                event_bytes / 1_000_000,
+                group_turn_blocks(&events).len(),
+            );
+        }
     }
 
     #[tokio::test]

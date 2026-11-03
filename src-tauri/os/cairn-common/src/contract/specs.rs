@@ -31,9 +31,9 @@ pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
     KeyType::Str,
     "phase name (kind=phase) or log message (kind=log)",
 );
-pub(crate) const EXECUTOR_DESKTOP_AUTOMATION: KeySpec = KeySpec::with_aliases(
-    "desktopAutomation", &["desktop_automation"], KeyType::Bool,
-    "whether desktop automation is enabled for this machine; stored fleet configuration, not an authorization gate",
+pub(crate) const EXECUTOR_MACHINE_SERVICES: KeySpec = KeySpec::with_aliases(
+    "machineServices", &["machine_services"], KeyType::Object,
+    "{\"<pack>/<service>\": {} | {override:{command:\"/abs/path\"}} | null}: select a pack-declared machine service on this machine (running the pack's artifact, or the operator's own absolute binary) or unselect it. Stored fleet configuration, not an authorization gate; the service's state is read from cairn://executors/<name>",
 );
 pub(crate) const EXECUTOR_REPAIRED: KeySpec = KeySpec::new(
     "repaired",
@@ -97,6 +97,13 @@ pub(crate) const RESIDENT_EXECUTOR: KeySpec = KeySpec::new(
     "executor",
     KeyType::Object,
     "{name} for one machine as cairn://executors lists it, or {os} for any machine on that platform, optionally with requiredToolchains (the selector run takes). Started there or refused naming what prevents it, such as a live terminal or REPL holding this job's environment on another machine; an idle environment on another machine moves, losing its uncommitted files. Omit to join the job's environment wherever it is. The reply and the page name the machine",
+);
+/// A home's placement default (cairn/5920), on the node, task and thread
+/// patches alike, so one sentence says what it is wherever it is advertised.
+pub(crate) const PLACEMENT_DEFAULT_EXECUTOR: KeySpec = KeySpec::new(
+    "executor",
+    KeyType::Object,
+    "this home's placement default: {name} for one machine as cairn://executors lists it, or {os} for any machine on that platform, optionally with requiredToolchains (the selector run takes); null clears it. Its own run batches, terminals and REPLs created without an `executor` go there, the result says `(node default)`, and a machine that cannot serve refuses the work by name. A call-level `executor` overrides it; sub-agent tasks and check lanes never inherit it",
 );
 pub(crate) const WAKE: KeySpec = KeySpec::new(
     "wake",

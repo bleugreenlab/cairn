@@ -53,6 +53,8 @@ impl LogKind {
 /// One row to record.
 #[derive(Debug, Clone)]
 pub(crate) struct LogEntry<'a> {
+    /// Empty for a machine service, which belongs to no project and is stored
+    /// with a NULL `project_id`.
     pub project_id: &'a str,
     /// [`super::ServiceOwner::key`]: the owning thread's id, or empty.
     pub owner_thread: &'a str,
@@ -71,6 +73,11 @@ pub(crate) struct LogRow {
     pub text: String,
     pub detail: Value,
     pub created_at: i64,
+}
+
+/// The `project_id` a row is stored under: NULL for a machine service.
+fn stored_project(project_id: &str) -> Option<String> {
+    (!project_id.is_empty()).then(|| project_id.to_string())
 }
 
 fn clip(text: &mut String, max: usize) {
@@ -117,7 +124,7 @@ pub(crate) async fn record_retaining(
     retain: usize,
 ) -> Result<(), String> {
     let (text, detail) = prepare(entry, policy);
-    let project_id = entry.project_id.to_string();
+    let project_id = stored_project(entry.project_id);
     let owner = entry.owner_thread.to_string();
     let service = entry.service.to_string();
     let generation = entry.generation as i64;
@@ -136,7 +143,7 @@ pub(crate) async fn record_retaining(
                 "INSERT INTO service_log (project_id, owner_thread, service, generation, kind, text, detail_json, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    project_id.as_str(),
+                    project_id.clone(),
                     owner.as_str(),
                     service.as_str(),
                     generation,
@@ -150,10 +157,10 @@ pub(crate) async fn record_retaining(
             let mut cutoff = conn
                 .query(
                     "SELECT id FROM service_log
-                     WHERE project_id = ?1 AND service = ?2 AND owner_thread = ?3
+                     WHERE project_id IS ?1 AND service = ?2 AND owner_thread = ?3
                      ORDER BY id DESC LIMIT 1 OFFSET ?4",
                     params![
-                        project_id.as_str(),
+                        project_id.clone(),
                         service.as_str(),
                         owner.as_str(),
                         (retain as i64).saturating_sub(1)
@@ -168,8 +175,8 @@ pub(crate) async fn record_retaining(
             if let Some(id) = boundary {
                 conn.execute(
                     "DELETE FROM service_log
-                     WHERE project_id = ?1 AND service = ?2 AND owner_thread = ?3 AND id < ?4",
-                    params![project_id.as_str(), service.as_str(), owner.as_str(), id],
+                     WHERE project_id IS ?1 AND service = ?2 AND owner_thread = ?3 AND id < ?4",
+                    params![project_id.clone(), service.as_str(), owner.as_str(), id],
                 )
                 .await?;
             }
@@ -190,7 +197,7 @@ pub(crate) async fn list(
     kind: Option<LogKind>,
     limit: usize,
 ) -> Result<Vec<LogRow>, String> {
-    let project_id = project_id.to_string();
+    let project_id = stored_project(project_id);
     let owner = owner_thread.to_string();
     let service = service.to_string();
     let since = since_ms.unwrap_or(i64::MIN);
@@ -203,11 +210,11 @@ pub(crate) async fn list(
                 let mut rows = conn
                     .query(
                         "SELECT generation, kind, text, detail_json, created_at FROM service_log
-                         WHERE project_id = ?1 AND service = ?2 AND owner_thread = ?3
+                         WHERE project_id IS ?1 AND service = ?2 AND owner_thread = ?3
                            AND created_at >= ?4 AND (?5 = '' OR kind = ?5)
                          ORDER BY id DESC LIMIT ?6",
                         params![
-                            project_id.as_str(),
+                            project_id.clone(),
                             service.as_str(),
                             owner.as_str(),
                             since,

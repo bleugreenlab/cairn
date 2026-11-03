@@ -580,8 +580,8 @@ mod tests {
         // A run per call: run-a terminated, run-b still live.
         exec(&db, "INSERT INTO runs (id, job_id, project_id, status, started_at, exited_at, created_at, updated_at, label, phase) VALUES ('run-a', 'call-a', 'proj', 'exited', 100, 160, 1, 1, 'search:x', 'search')").await;
         exec(&db, "INSERT INTO runs (id, job_id, project_id, status, started_at, exited_at, created_at, updated_at, label, phase) VALUES ('run-b', 'call-b', 'proj', 'live', 200, NULL, 2, 2, 'search:y', 'search')").await;
-        // Two rollup rows for run-a to prove the component SUMs (and thus the
-        // priced cost) fold across rows; none for run-b. billable_tokens equals
+        // Two rollup rows for run-a to prove the token total and its component
+        // SUMs fold across rows; none for run-b. billable_tokens equals
         // input + cache_read + cache_create + output per row, mirroring the
         // backend-shaped Claude billable rule the fold writes.
         exec(&db, "INSERT INTO token_rollup (id, bucket_start, run_id, backend, input_tokens, cache_read_tokens, cache_create_tokens, output_tokens, billable_tokens) VALUES ('tr1', 0, 'run-a', 'claude', 100, 800, 0, 100, 1000)").await;

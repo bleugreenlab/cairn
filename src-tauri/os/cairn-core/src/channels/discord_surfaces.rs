@@ -653,6 +653,89 @@ mod tests {
         }
     }
 
+    /// Under Turso a conflicting `INSERT OR IGNORE` changes no row but still
+    /// advances the table's rowid allocator, so `MAX(rowid)` is exactly what a
+    /// pass that re-binds already-bound surfaces moves.
+    #[tokio::test]
+    async fn a_steady_pass_inserts_no_bindings_and_a_new_surface_still_binds() {
+        let db = Arc::new(crate::storage::migrated_test_db("discord-surface-steady-pass.db").await);
+        seed_issue(&db, 7, "Steady pass", "Bind only what is missing.").await;
+        let category = ensure_surface(
+            &db,
+            1,
+            SurfaceKind::ProjectCategory,
+            "cairn",
+            None,
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let api = Arc::new(FakeDiscordApi::default());
+        let reconciler = DiscordSurfaceReconciler::new(db.clone(), api.clone());
+        reconciler.reconcile_due(11).await.unwrap();
+        ensure_surface(
+            &db,
+            1,
+            SurfaceKind::IssueThread,
+            "cairn",
+            Some("cairn://p/cairn/7"),
+            Some(category.id),
+            12,
+        )
+        .await
+        .unwrap();
+        reconciler.reconcile_due(12).await.unwrap();
+        let high_water = || async {
+            db.query_opt_i64("SELECT MAX(rowid) FROM channel_conversation_binding", ())
+                .await
+                .unwrap()
+        };
+        let before = high_water().await.expect("the issue thread is bound");
+
+        for now in [20, 30] {
+            reconciler.reconcile_due(now).await.unwrap();
+        }
+        assert_eq!(
+            high_water().await,
+            Some(before),
+            "a pass re-inserted a binding that already exists"
+        );
+
+        ensure_ambient_homes(&db, 40).await.unwrap();
+        reconciler.reconcile_due(40).await.unwrap();
+        assert_eq!(
+            db.query_opt_i64(
+                "SELECT COUNT(*) FROM channel_conversation_binding
+                  WHERE conversation = 'discord:1/103' AND target_uri = 'cairn://p/cairn'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "the surface activated on this pass is bound on this pass"
+        );
+        assert_eq!(high_water().await, Some(before + 1));
+
+        let sequence = || async {
+            db.query_opt_i64(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'discord_surface'",
+                (),
+            )
+            .await
+            .unwrap()
+        };
+        let surfaces = sequence().await;
+        for now in [41, 42] {
+            ensure_ambient_homes(&db, now).await.unwrap();
+        }
+        assert_eq!(
+            sequence().await,
+            surfaces,
+            "ensuring an existing surface advanced its id sequence"
+        );
+    }
+
     #[tokio::test]
     async fn lock_waits_for_state_cards_to_settle() {
         let db = Arc::new(crate::storage::migrated_test_db("discord-lock-card-settle.db").await);
@@ -858,7 +941,7 @@ mod tests {
         reconciler.reconcile_due(3).await.unwrap();
         let recovered = db
             .query_one(
-                &format!("SELECT {COLUMNS} FROM discord_surface WHERE id=?1"),
+                format!("SELECT {COLUMNS} FROM discord_surface WHERE id=?1"),
                 (issue.id,),
                 DiscordSurface::from_row,
             )
@@ -1068,7 +1151,7 @@ mod tests {
         assert_eq!(&*api.locks.lock().unwrap(), &[200]);
         let recovered = db
             .query_one(
-                &format!("SELECT {COLUMNS} FROM discord_surface WHERE id=?1"),
+                format!("SELECT {COLUMNS} FROM discord_surface WHERE id=?1"),
                 (issue.id,),
                 DiscordSurface::from_row,
             )
@@ -1263,6 +1346,13 @@ pub async fn ensure_surface(
     let guild = guild_id.to_string();
     let kind_name = kind.as_str().to_string();
     let project = project_key.to_ascii_lowercase();
+    let find = || find_surface(db, &guild, &kind_name, &project, target_uri.as_deref());
+    // Look first: the ambient sweep ensures every live category's home on
+    // every pass, and an ignored insert still advances the AUTOINCREMENT
+    // sequence under Turso. The insert stays OR IGNORE for concurrent ensures.
+    if let Some(row) = find().await? {
+        return Ok(row);
+    }
     db.execute(
         "INSERT OR IGNORE INTO discord_surface
          (guild_id, surface_kind, project_key, target_uri, parent_surface_id, updated_at)
@@ -1278,17 +1368,28 @@ pub async fn ensure_surface(
     )
     .await
     .map_err(|error| error.to_string())?;
+    find()
+        .await?
+        .ok_or_else(|| "Discord surface missing after insert".to_string())
+}
 
+async fn find_surface(
+    db: &LocalDb,
+    guild: &str,
+    kind_name: &str,
+    project: &str,
+    target_uri: Option<&str>,
+) -> Result<Option<DiscordSurface>, String> {
     let row = if let Some(target_uri) = target_uri {
-        db.query_one(
-            &format!("SELECT {COLUMNS} FROM discord_surface WHERE guild_id = ?1 AND surface_kind = ?2 AND target_uri = ?3"),
-            params![guild, kind_name, target_uri],
+        db.query_opt(
+            format!("SELECT {COLUMNS} FROM discord_surface WHERE guild_id = ?1 AND surface_kind = ?2 AND target_uri = ?3"),
+            params![guild.to_string(), kind_name.to_string(), target_uri.to_string()],
             DiscordSurface::from_row,
         ).await
     } else {
-        db.query_one(
-            &format!("SELECT {COLUMNS} FROM discord_surface WHERE guild_id = ?1 AND surface_kind = ?2 AND project_key = ?3 AND target_uri IS NULL"),
-            params![guild, kind_name, project],
+        db.query_opt(
+            format!("SELECT {COLUMNS} FROM discord_surface WHERE guild_id = ?1 AND surface_kind = ?2 AND project_key = ?3 AND target_uri IS NULL"),
+            params![guild.to_string(), kind_name.to_string(), project.to_string()],
             DiscordSurface::from_row,
         ).await
     };
@@ -1381,8 +1482,16 @@ impl DiscordSurfaceReconciler {
             (),
             DiscordSurface::from_row,
         ).await.map_err(|error| error.to_string())?;
+        // Under Turso an ignored `INSERT OR IGNORE` still commits a write
+        // transaction and advances the rowid allocator, so re-binding every
+        // active surface on every pass is a standing writer. Bind only the
+        // ones that are missing.
+        let bound = super::ledger::bound_conversation_targets(&self.binding_db, "discord").await?;
         let mut first_error = None;
         for row in rows {
+            if binding_key(&row).is_some_and(|key| bound.contains(&key)) {
+                continue;
+            }
             if let Err(error) = self.install_binding(&row, now).await {
                 log::warn!(
                     "could not install Discord surface binding {}: {error}",
@@ -1658,7 +1767,7 @@ impl DiscordSurfaceReconciler {
             vec![id.into(), to.to_string().into(), now.into()];
         values.extend(from.iter().map(|value| (*value).to_string().into()));
         self.db.execute(
-            &format!("UPDATE discord_surface SET observed_state = ?2, updated_at = ?3 WHERE id = ?1 AND observed_state IN ({placeholders})"),
+            format!("UPDATE discord_surface SET observed_state = ?2, updated_at = ?3 WHERE id = ?1 AND observed_state IN ({placeholders})"),
             values,
         ).await.map(|changed| changed == 1).map_err(|error| error.to_string())
     }
@@ -1678,7 +1787,7 @@ impl DiscordSurfaceReconciler {
         let row = self
             .db
             .query_one(
-                &format!("SELECT {COLUMNS} FROM discord_surface WHERE id = ?1"),
+                format!("SELECT {COLUMNS} FROM discord_surface WHERE id = ?1"),
                 (id,),
                 DiscordSurface::from_row,
             )
@@ -1688,8 +1797,7 @@ impl DiscordSurfaceReconciler {
     }
 
     async fn install_binding(&self, row: &DiscordSurface, now: i64) -> Result<(), String> {
-        let (Some(target), Some(remote)) = (row.target_uri.as_deref(), row.remote_channel_id)
-        else {
+        let Some((conversation, target)) = binding_key(row) else {
             return Ok(());
         };
         let (kind, classes) = match row.kind {
@@ -1712,8 +1820,8 @@ impl DiscordSurfaceReconciler {
         super::ledger::bind_target(
             &self.binding_db,
             "discord",
-            &format!("discord:{}/{}", row.guild_id, remote),
-            target,
+            &conversation,
+            &target,
             kind,
             classes,
             now,
@@ -1729,6 +1837,18 @@ impl DiscordSurfaceReconciler {
             params![id, now, error.to_string()],
         ).await.map(|_| ()).map_err(|error| error.to_string())
     }
+}
+
+/// The `(conversation, target_uri)` key a surface's binding is stored under,
+/// once the surface has both a target and a remote channel.
+fn binding_key(row: &DiscordSurface) -> Option<(String, String)> {
+    let (Some(target), Some(remote)) = (row.target_uri.as_deref(), row.remote_channel_id) else {
+        return None;
+    };
+    Some((
+        format!("discord:{}/{}", row.guild_id, remote),
+        cairn_common::uri::canonicalize_uri_identity(target),
+    ))
 }
 
 fn required_remote(row: &DiscordSurface) -> Result<u64, String> {

@@ -44,8 +44,13 @@ impl<T> DuplexIo for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static 
 /// connection. Core owns placement; transport owns the MCP protocol lifecycle.
 #[async_trait]
 pub trait PlacedFacade: Send + Sync {
-    /// Stable machine identity used by the gateway connection pool.
+    /// Stable identity used by the gateway connection pool.
     fn key(&self) -> &str;
+
+    /// What a person calls the facade in the gateway's own diagnostics.
+    fn label(&self) -> String {
+        self.key().to_string()
+    }
 
     /// Open a fresh byte stream to the facade process on that machine.
     async fn open(&self) -> Result<Box<dyn DuplexIo>, String>;

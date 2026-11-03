@@ -201,7 +201,7 @@ async fn session_model(orch: &Orchestrator, thread_id: &str) -> Option<String> {
     orch.db
         .local
         .query_one(
-            &format!(
+            format!(
                 "SELECT j.model FROM jobs j WHERE j.thread_id = ?1 AND {}",
                 crate::threads::SESSION_JOB_SHAPE
             ),
@@ -216,7 +216,7 @@ async fn current_session(orch: &Orchestrator, thread_id: &str) -> (String, Strin
     orch.db
         .local
         .query_one(
-            &format!(
+            format!(
                 "SELECT s.id, s.backend FROM sessions s
                  JOIN jobs j ON j.current_session_id = s.id
                  WHERE j.thread_id = ?1 AND {}",
@@ -585,6 +585,7 @@ async fn the_patch_contract_advertises_every_key_the_arm_accepts() {
         "definition",
         "name",
         "model",
+        "executor",
     ] {
         assert!(
             patch_spec.optional.iter().any(|spec| spec.key == key),
@@ -750,4 +751,192 @@ async fn an_unknown_status_is_refused_and_changes_nothing() {
         thread.jurisdiction, None,
         "a refused patch applies none of its keys"
     );
+}
+
+async fn thread_overview(orch: &Orchestrator) -> String {
+    crate::resources::threads::read_thread(&orch.db.local, "prj", "roadmap", &[], 3).await
+}
+
+/// A thread's placement default (cairn/5920): the patch echoes the line, the
+/// overview shows it, and `executor:null` takes it away again.
+#[tokio::test]
+async fn a_thread_placement_default_round_trips_through_patch_and_overview() {
+    let orch = seeded_orch().await;
+    seed_thread(&orch).await;
+
+    let set = apply(
+        &orch,
+        &patch(serde_json::json!({ "executor": { "os": "linux" } })),
+    )
+    .await
+    .unwrap();
+    assert!(
+        set.starts_with("Placement default: os linux (set ") && set.ends_with(" by operator)."),
+        "{set}"
+    );
+    let overview = thread_overview(&orch).await;
+    assert!(
+        overview.contains("Placement default: os linux (set "),
+        "{overview}"
+    );
+
+    // A rename leaves the default where it was: it is the thread's, by id.
+    let renamed = apply(
+        &orch,
+        &patch(serde_json::json!({ "name": "north-star", "executor": { "os": "macos" } })),
+    )
+    .await
+    .unwrap();
+    assert!(
+        renamed.contains("Patched thread cairn://p/prj/north-star"),
+        "{renamed}"
+    );
+    assert!(renamed.contains("Placement default: os macos"), "{renamed}");
+    let back = ChangeItem {
+        target: "cairn://p/prj/north-star".into(),
+        mode: ChangeMode::Patch,
+        payload: Some(serde_json::json!({ "name": "roadmap" })),
+    };
+    apply(&orch, &back).await.unwrap();
+    assert!(thread_overview(&orch)
+        .await
+        .contains("Placement default: os macos"));
+
+    let cleared = apply(&orch, &patch(serde_json::json!({ "executor": null })))
+        .await
+        .unwrap();
+    assert_eq!(cleared, "Placement default: none (cleared).");
+    assert!(!thread_overview(&orch).await.contains("Placement default"));
+}
+
+/// The patch takes the selector rules a per-call `executor` does, and a name
+/// is refused at set time when no machine answers to it.
+#[tokio::test]
+async fn a_placement_default_naming_nothing_is_refused_with_the_machines_that_exist() {
+    let orch = seeded_orch().await;
+    seed_thread(&orch).await;
+    let ghost = apply(
+        &orch,
+        &patch(serde_json::json!({ "executor": { "name": "ghost" } })),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        ghost.error.contains("no executor is named ghost"),
+        "{}",
+        ghost.error
+    );
+    assert!(ghost.error.contains("cairn://executors"), "{}", ghost.error);
+    let both = apply(
+        &orch,
+        &patch(serde_json::json!({ "executor": { "name": "bbs", "os": "linux" } })),
+    )
+    .await
+    .unwrap_err();
+    assert!(both.error.contains("never both"), "{}", both.error);
+    let empty = apply(&orch, &patch(serde_json::json!({ "executor": {} })))
+        .await
+        .unwrap_err();
+    assert!(empty.error.contains("executor:null"), "{}", empty.error);
+    assert!(!thread_overview(&orch).await.contains("Placement default"));
+}
+
+/// A thread's task has a default of its own, on its own job, and never shares
+/// the thread's.
+#[tokio::test]
+async fn a_thread_tasks_placement_default_is_its_own() {
+    let orch = seeded_orch().await;
+    let thread_id = seed_thread(&orch).await;
+    let session = crate::threads::ensure_thread_session(&orch.db.local, &thread_id)
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO jobs (id, parent_job_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('j-probe', ?1, 'p', 'running', 'probe', 'probe', 3, 3)",
+            (session.as_str(),),
+        )
+        .await
+        .unwrap();
+    apply(
+        &orch,
+        &patch(serde_json::json!({ "executor": { "os": "linux" } })),
+    )
+    .await
+    .unwrap();
+    let task = ChangeItem {
+        target: "cairn://p/prj/roadmap/task/probe".into(),
+        mode: ChangeMode::Patch,
+        payload: Some(serde_json::json!({ "executor": { "os": "macos" } })),
+    };
+    let set = apply(&orch, &task).await.unwrap();
+    assert!(set.starts_with("Placement default: os macos"), "{set}");
+    use crate::fleet::placement_default::{load, DefaultOwner};
+    let task_default = load(&orch.db.local, &DefaultOwner::Job("j-probe".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task_default.selector.os.as_deref(), Some("macos"));
+    let thread_default = load(&orch.db.local, &DefaultOwner::Thread(thread_id.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread_default.selector.os.as_deref(), Some("linux"));
+    // The session job resolves to its thread's row, not a row of its own.
+    assert_eq!(
+        DefaultOwner::for_job(&orch.db.local, &session)
+            .await
+            .unwrap(),
+        DefaultOwner::Thread(thread_id)
+    );
+}
+
+/// A node patch says one thing: an action or a placement default, never both,
+/// refused at the contract before anything resolves.
+#[tokio::test]
+async fn a_node_patch_carrying_both_action_and_executor_is_refused() {
+    let orch = seeded_orch().await;
+    let item = ChangeItem {
+        target: "cairn://p/prj/1/1/builder".into(),
+        mode: ChangeMode::Patch,
+        payload: Some(serde_json::json!({ "action": "stop", "executor": { "os": "linux" } })),
+    };
+    let refused = apply(&orch, &item).await.unwrap_err();
+    assert!(
+        refused.error.contains("Unknown payload key"),
+        "{}",
+        refused.error
+    );
+    assert!(
+        refused
+            .error
+            .contains("set or clear the node's placement default")
+            || refused.error.contains("stop a running node"),
+        "{}",
+        refused.error
+    );
+}
+
+/// An `executor` beside other keys is validated with them: a default naming
+/// nothing refuses the whole patch, so the rename it rode with never happens.
+#[tokio::test]
+async fn a_refused_placement_default_applies_none_of_the_patch() {
+    let orch = seeded_orch().await;
+    let thread_id = seed_thread(&orch).await;
+    for executor in [
+        serde_json::json!({ "name": "ghost" }),
+        serde_json::json!({ "name": "bbs", "os": "linux" }),
+    ] {
+        apply(
+            &orch,
+            &patch(serde_json::json!({ "name": "north-star", "executor": executor })),
+        )
+        .await
+        .expect_err("an invalid default refuses the patch");
+        let thread = crate::threads::crud::get(&orch.db.local, &thread_id)
+            .await
+            .unwrap()
+            .expect("the thread still exists");
+        assert_eq!(thread.name, "roadmap", "the rename must not have applied");
+    }
 }

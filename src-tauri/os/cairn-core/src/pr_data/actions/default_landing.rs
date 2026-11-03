@@ -511,11 +511,13 @@ async fn github_merge_at(
     // so a default-branch read between now and the store import says it is
     // behind instead of passing the pre-merge tree off as current.
     if let Some(merge_commit) = merge_commit.as_deref() {
-        orch.base_branch_sync.record_tip(
+        let registry = &orch.base_branch_sync;
+        registry.record_tip(
             &merge_context.project_id,
             &merge_context.target_branch,
             merge_commit,
             crate::orchestrator::base_branch_sync::Source::Merge,
+            registry.observe(),
         );
     }
     log::info!("landing: GitHub merge_pr took {:?}", started.elapsed());

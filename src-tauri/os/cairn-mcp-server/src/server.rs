@@ -25,7 +25,7 @@ use rmcp::{
 use serde::Deserialize;
 use std::{borrow::Cow, future::Future, sync::Arc, time::Duration};
 
-use cairn_common::protocol::CallbackRequest;
+use cairn_common::protocol::{stamp_callback_origin, CallbackRequest, MODEL_FACING_ORIGIN};
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
 use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
@@ -173,9 +173,12 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
         };
 
         let mut payload = serde_json::to_value(&rewritten).unwrap_or_default();
-        if standalone_cli {
-            payload["_cairn_origin"] = serde_json::Value::String("cli".into());
-        }
+        let origin = if standalone_cli {
+            "cli"
+        } else {
+            MODEL_FACING_ORIGIN
+        };
+        stamp_callback_origin(&mut payload, origin);
         let request = CallbackRequest {
             answer_bound_ms: None,
             cwd: self.cwd.to_string(),
@@ -292,10 +295,15 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
             })
             .collect();
 
+        // The MCP tool's result lands in the model's context; the CLI and the
+        // shell print theirs for whoever ran them.
         let mut payload = serde_json::json!({ "paths": resolved });
-        if standalone_cli {
-            payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
-        }
+        let origin = if standalone_cli {
+            "cli"
+        } else {
+            MODEL_FACING_ORIGIN
+        };
+        stamp_callback_origin(&mut payload, origin);
         let request = CallbackRequest {
             answer_bound_ms: None,
             cwd: self.cwd.to_string(),
@@ -335,7 +343,7 @@ Partial failures never abort: a failed target stays in place under an `[error]` 
 
 Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out, in the same turn whenever it can be. A batch in which every item declares a `timeout` stays open for their parallel maximum or sequential sum (at least the 120-second synchronous window, at most the 6-hour batch ceiling). Only a batch that outlives its window suspends: one with an item that omits `timeout` after 120 seconds, or a declared one past its sum; it resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling. A response item (`cairn://responses/...`) runs to its `timeout`, or without one to its definition's declared timeout, under the same ceiling, and its batch suspends past the window like a long shell batch. An MCP-tool item runs to its declared `timeout` under the same ceiling and suspends the same way; without one it keeps the MCP gateway's 30-second default, so declare `timeout` on a tool call you know runs long. Stopping the run cancels an in-flight MCP request. A `cairn.run` of a response or MCP-tool item from @cairn/sdk inside a shell item has no call of its own to suspend on and ends at 120 seconds. REPL, decide (`cairn://models/decide`), and embed (`cairn://models/embed`) items execute on the host inside the 120-second window, and a longer `timeout` is cut to 120 seconds; a complete (`cairn://models/complete`) item runs like a response item.
 
-If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on.
+If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base (read `cairn:@/check-results/<base>?suite=S&environment=current` first: the ledger may already hold that verdict, and diffs and ancestry are `cairn:@/vcs/...` reads, not branch runs); it is verdict-only: tracked writes are discarded (its `$TMPDIR` is still the node's scratch, so writes there persist), and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`: the batch runs on a machine that satisfies it or is refused naming what prevents it, never quietly elsewhere. It is a call-level option beside `commands` (one batch runs on one machine), and one inside a command item is refused like any key outside this grammar; read cairn://executors for what is available, and omit it otherwise. Every result's first line names the machine the batch ran on. A node may set a default machine with `write cairn:~ patch {executor:{...}}`; a call that names none inherits it (the result says `(node default)`), and sub-agent tasks and check lanes never do.
 
 A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#,
         meta = run_tool_meta()
@@ -364,12 +372,16 @@ A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`
             &redacted[..redacted.len().min(100)]
         );
 
+        // Stamped after `validate_run_input`, which judges only the caller's
+        // own keys; the host's grammar check accepts the stamp by name.
+        let mut payload = serde_json::to_value(&input).unwrap_or_default();
+        stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
         let request = CallbackRequest {
             answer_bound_ms: None,
             cwd: self.cwd.to_string(),
             run_id: self.run_id.as_ref().map(|r| r.to_string()),
             tool: "run".to_string(),
-            payload: serde_json::to_value(&input).unwrap_or_default(),
+            payload,
             tool_use_id: None,
             thread_id,
             origin: None,
@@ -575,13 +587,15 @@ impl ServerHandler for CairnMcpServer {
             ));
         };
 
-        // Call Tauri callback
+        // Call Tauri callback. An MCP resource read is the client's, for its model.
+        let mut payload = serde_json::json!({ "uri": uri });
+        stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
         let callback_request = CallbackRequest {
             answer_bound_ms: None,
             cwd: server.cwd.to_string(),
             run_id: server.run_id.as_ref().map(|r| r.to_string()),
             tool: tool_name.to_string(),
-            payload: serde_json::json!({ "uri": uri }),
+            payload,
             tool_use_id: None,
             thread_id,
             origin: None,
@@ -908,6 +922,100 @@ mod tests {
         assert_eq!(
             sink.requests()[0].payload["paths"][0],
             "cairn:~/arc?format=json"
+        );
+    }
+
+    /// The host keeps its per-turn context bookkeeping (duplicate stubs,
+    /// affordance collapse) only for reads marked model-facing, so the MCP tool
+    /// must mark its reads and the CLI must not.
+    #[tokio::test]
+    async fn the_read_tool_marks_its_reads_model_facing_and_the_cli_does_not() {
+        let envelope = serde_json::json!({"text": "body", "images": [], "segments": []});
+        let sink = RecordingSink::answering(CallbackOutcome {
+            result: envelope.to_string(),
+            reminders: Vec::new(),
+            transport_ok: true,
+            failure: None,
+        });
+        let mcp = CairnMcpServer::new(
+            sink.clone(),
+            Caller::Fixed {
+                run_id: Some("run-1".to_string()),
+                cwd: "/test/path".to_string(),
+            },
+        );
+        let input = || ReadFileInput {
+            paths: vec!["https://example.com/hiscores".to_string()],
+        };
+        mcp.read(
+            Parameters(input()),
+            rmcp::model::RequestMetaObject::default(),
+        )
+        .await
+        .expect("tool read");
+        mcp.read_cli(input()).await.expect("cli read");
+
+        let requests = sink.requests();
+        assert!(requests[0].is_model_facing(), "{:?}", requests[0].payload);
+        assert!(!requests[1].is_model_facing(), "{:?}", requests[1].payload);
+        assert_eq!(requests[1].payload["_cairn_origin"], "cli");
+    }
+
+    /// The host claims a run's queued deliveries only at a model-facing tool
+    /// boundary, so the write and run tools must mark their calls too, or
+    /// Codex's mid-turn steers would wait for the turn end. The CLI's write is
+    /// not model-facing.
+    #[tokio::test]
+    async fn the_write_and_run_tools_mark_their_calls_model_facing_and_the_cli_does_not() {
+        let sink = RecordingSink::answering(CallbackOutcome {
+            result: "ok".to_string(),
+            transport_ok: true,
+            ..Default::default()
+        });
+        let mcp = CairnMcpServer::new(
+            sink.clone(),
+            Caller::Fixed {
+                run_id: Some("run-1".to_string()),
+                cwd: "/test/path".to_string(),
+            },
+        );
+        let change = || {
+            Parameters(
+                serde_json::from_value::<ChangeInput>(serde_json::json!({
+                    "changes": [{
+                        "target": "cairn://p/CAIRN/1/messages",
+                        "mode": "append",
+                        "payload": {"content": "hi"}
+                    }]
+                }))
+                .expect("valid ChangeInput"),
+            )
+        };
+        mcp.write(change(), rmcp::model::RequestMetaObject::default())
+            .await
+            .expect("tool write");
+        mcp.write_cli(change()).await.expect("cli write");
+        mcp.run(
+            Parameters(crate::test_support::run_input(
+                serde_json::json!({"commands": [{"command": "true"}]}),
+            )),
+            rmcp::model::RequestMetaObject::default(),
+        )
+        .await
+        .expect("tool run");
+
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].tool, "write");
+        assert!(requests[0].is_model_facing(), "{:?}", requests[0].payload);
+        assert!(!requests[1].is_model_facing(), "{:?}", requests[1].payload);
+        assert_eq!(requests[1].payload["_cairn_origin"], "cli");
+        assert_eq!(requests[2].tool, "run");
+        assert!(requests[2].is_model_facing(), "{:?}", requests[2].payload);
+        // What the host's front door will see: the stamp passes the grammar.
+        assert_eq!(
+            cairn_common::run_grammar::run_grammar_refusal(&requests[2].payload),
+            None
         );
     }
 

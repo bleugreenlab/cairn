@@ -159,6 +159,10 @@ pub fn resolve_sidecar(name: &str) -> String {
 pub struct SidecarResolution {
     pub path: String,
     pub beside_executable: bool,
+    /// False when the binary is neither beside the executable nor on PATH:
+    /// `path` is then the bare name, and spawning it fails. A PATH fallback
+    /// still runs something; this resolves to nothing.
+    pub resolved: bool,
 }
 
 pub fn resolve_sidecar_detailed(name: &str) -> SidecarResolution {
@@ -179,12 +183,21 @@ fn resolve_sidecar_from(
             return SidecarResolution {
                 path: candidate.to_string_lossy().into_owned(),
                 beside_executable: true,
+                resolved: true,
             };
         }
     }
-    SidecarResolution {
-        path: path_lookup(name).unwrap_or_else(|_| name.to_string()),
-        beside_executable: false,
+    match path_lookup(name) {
+        Ok(path) => SidecarResolution {
+            path,
+            beside_executable: false,
+            resolved: true,
+        },
+        Err(_) => SidecarResolution {
+            path: name.to_string(),
+            beside_executable: false,
+            resolved: false,
+        },
     }
 }
 
@@ -644,17 +657,22 @@ mod tests {
         let on_path = |name: &str| Ok(format!("/usr/bin/{name}"));
 
         let beside = resolve_sidecar_from(Some(dir.path()), "jj", on_path);
-        assert!(beside.beside_executable);
+        assert!(beside.beside_executable && beside.resolved);
         assert_eq!(beside.path, dir.path().join("jj").to_string_lossy());
 
         // Absent beside the executable, the PATH answer still comes back, but
         // it says so: this is the fallback that once selected a foreign `cairn`.
         let fallback = resolve_sidecar_from(Some(dir.path()), "cairn-cmd", on_path);
-        assert!(!fallback.beside_executable);
+        assert!(!fallback.beside_executable && fallback.resolved);
         assert_eq!(fallback.path, "/usr/bin/cairn-cmd");
 
+        // Found nowhere, the bare name comes back and says it resolved to
+        // nothing: a later spawn of it will fail.
         let bare = resolve_sidecar_from(None, "uv", |_: &str| Err("missing".to_string()));
-        assert_eq!((bare.path.as_str(), bare.beside_executable), ("uv", false));
+        assert_eq!(
+            (bare.path.as_str(), bare.beside_executable, bare.resolved),
+            ("uv", false, false)
+        );
     }
 
     #[test]

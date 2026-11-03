@@ -14,7 +14,7 @@ use crate::{
         sql_policy,
         sql_schema::{quote_identifier, USER_TABLE_PREDICATE},
     },
-    storage::{LocalDb, MigrationRunner},
+    storage::{db_set_paths, LocalDb, MigrationRunner},
 };
 
 static CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<LocalDb>>>> = OnceLock::new();
@@ -703,13 +703,10 @@ pub(crate) async fn remove_path(path: &Path) -> Result<(), String> {
 }
 
 fn sidecar_paths(path: &Path) -> [PathBuf; 4] {
-    let display = path.to_string_lossy();
-    [
-        path.to_path_buf(),
-        PathBuf::from(format!("{display}-wal")),
-        PathBuf::from(format!("{display}-log")),
-        PathBuf::from(format!("{display}-shm")),
-    ]
+    let [main, wal, log] = db_set_paths(path);
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    [main, wal, log, PathBuf::from(shm)]
 }
 
 /// Split SQL a caller supplied into statements, refusing an empty write. The

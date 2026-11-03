@@ -79,9 +79,55 @@ pub fn event_from_row(row: &Row) -> DbResult<Event> {
 /// difference is not a failed read but an event the database refuses to store.
 pub const PROSE_SHAPE: &str = "((CASE WHEN json_valid(e.data) AND (e.storage_mode IS NULL OR e.storage_mode='full') THEN json_type(e.data,'$.content')='text' AND trim(json_extract(e.data,'$.content'))<>'' ELSE 0 END) OR (e.storage_mode='zstd' AND e.data_blob IS NOT NULL AND e.codec IS NOT NULL))";
 
+/// The model Claude's CLI names on a message it wrote itself (an API error,
+/// an interrupted turn) rather than one a model produced.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// The model the provider says served an event, read from the event's full
+/// JSON body: the value the transcript seam stores in `events.reported_model`,
+/// and what a session's context meter names when its job selected no model.
+///
+/// Providers report it in different places (Claude's assistant message and
+/// init, an OpenAI-compatible response, a Codex turn), so each known spot is
+/// tried in order. Claude's `<synthetic>` names no model and is skipped.
+/// An archived event's `data` is only an envelope; read it through
+/// [`super::reconstruct_events`] first.
+pub fn reported_model(data: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    [
+        "/model",
+        "/raw/model",
+        "/raw/message/model",
+        "/raw/response/model",
+        "/raw/turn/model",
+    ]
+    .into_iter()
+    .filter_map(|pointer| value.pointer(pointer).and_then(serde_json::Value::as_str))
+    .find(|model| !model.is_empty() && *model != SYNTHETIC_MODEL)
+    .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PROSE_SHAPE;
+    use super::{reported_model, PROSE_SHAPE};
+
+    #[test]
+    fn reported_model_reads_each_provider_shape_and_skips_synthetic() {
+        assert_eq!(
+            reported_model(r#"{"raw":{"message":{"model":"claude-opus-5-5"}}}"#).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            reported_model(r#"{"raw":{"response":{"model":"gpt-6-astra"}}}"#).as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(
+            reported_model(r#"{"raw":{"message":{"model":"<synthetic>"}}}"#),
+            None
+        );
+        assert_eq!(reported_model(r#"{"raw":null}"#), None);
+        assert_eq!(reported_model("not json"), None);
+    }
 
     /// The index predicate and the query predicate are one fact spelled twice.
     ///

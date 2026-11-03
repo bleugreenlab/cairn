@@ -483,8 +483,8 @@ async fn a_long_description_never_crowds_out_the_pull_request() {
 async fn seed_era(db: &LocalDb, status: &str) {
     db.execute_script(&format!(
         "INSERT INTO thread_eras (job_id, seq, start_block, end_block, started_at, ended_at, summary,
-             summary_status, summary_model, source_tokens, minted_generation, created_at)
-           VALUES ('j-design', 1, 0, 10, 100, 200, 'mechanical', '{status}', NULL, 900, 1, 300);
+             summary_status, summary_model, minted_generation, created_at)
+           VALUES ('j-design', 1, 0, 10, 100, 200, 'mechanical', '{status}', NULL, 1, 300);
          INSERT INTO thread_era_children (job_id, era_seq, child_issue_id, child_issue_uri, child_title, final_status)
            VALUES ('j-design', 1, 'i', 'cairn://p/prj/7', 'Move uploads', 'merged');"
     ))

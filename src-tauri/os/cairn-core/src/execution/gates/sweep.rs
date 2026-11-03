@@ -26,8 +26,8 @@
 //! ## A burst is released in order, and never rate-limited
 //!
 //! One merge can release every execution a plan filed after it. They are
-//! released in the queue's one order (`queue_key`, then database, then
-//! execution; see `capacity`), because admission ranks by queue time and a
+//! released in the queue's one order (the lanes in rotation, each by
+//! `queue_key`; see `rotation`), because admission ranks by queue time and a
 //! nondeterministic release order would turn a plan's implicit priority into a
 //! coin flip. There is deliberately NO stagger, cap,
 //! or rate limit here: a count cap wearing a schedule would be a second brake
@@ -294,10 +294,17 @@ struct Candidate {
     gates_moved: bool,
 }
 
-/// The release phase of a pass: every candidate, oldest first, decided against
-/// ONE read of the queue under ONE acquisition of the admission lock. The read
-/// is kept current as candidates release and hold, so a held candidate stays
-/// ahead of the ones after it exactly as if each had been decided alone.
+/// The release phase of a pass: every candidate, in the queue's release order,
+/// decided against ONE read of the queue under ONE acquisition of the admission
+/// lock. The read is kept current as candidates release and hold, and the next
+/// candidate decided is always the first undecided one in the order as it
+/// stands then: a release spends its lane's turn and so re-ranks the lanes.
+/// Candidates the order does not hold yet (no cap held them) follow, in their
+/// evaluation order. A candidate its thread's cap holds is held and its lane's
+/// turn untouched, so a lane at its focus cap keeps its rank.
+///
+/// The walk costs `O(candidates × n log n)` of pure compute under the lock
+/// for `n` queued executions; it reads nothing more.
 ///
 /// A candidate the caps hold on exactly the caps its rows already record
 /// costs no write: its facts are refreshed with the rest of the queue's after
@@ -352,13 +359,23 @@ async fn release_candidates(
     };
     let mut released = Vec::new();
     let mut moved = HashSet::new();
-    for (index, (candidate, start)) in candidates.iter().zip(&starts).enumerate() {
+    let mut decided = vec![false; candidates.len()];
+    while let Some(index) = (0..candidates.len())
+        .filter(|index| !decided[*index])
+        .min_by_key(|index| {
+            let rank = queue.rank_of(&starts[*index]);
+            (rank.is_none(), rank.unwrap_or(0), *index)
+        })
+    {
+        decided[index] = true;
+        let (candidate, start) = (&candidates[index], &starts[index]);
         let admission = queue.decide(start);
         if queue.holds_as_stored(start, &admission) {
             report.held_by_cap += 1;
             continue;
         }
         let execution_id = candidate.execution.execution_id.as_str();
+        let turn = admission.turn;
         let outcome = candidate
             .db
             .write(|conn| {
@@ -378,7 +395,7 @@ async fn release_candidates(
             .await;
         match outcome {
             Ok(ConnRelease::Released(tail)) => {
-                queue.record_release(start);
+                queue.record_release(start, turn);
                 released.push((index, tail));
             }
             Ok(ConnRelease::HeldByCap {
@@ -871,7 +888,9 @@ pub(crate) enum ConnRelease {
 /// not license `cause` — so it owns nothing and mints nothing.
 ///
 /// `admission` is the execution queue's decision, taken under the admission
-/// lock the caller holds. Unless the cause is the operator's
+/// lock the caller holds. A release records its lane's turn with the stamp
+/// that decision minted (`rotation::record_turn_conn`), after the guarded
+/// update, so a caller that lost the race records nothing. Unless the cause is the operator's
 /// [`OverrideScope::Everything`], a blocking cap is written as (or kept as) a
 /// capacity gate row in THIS transaction and the execution stays held, so a
 /// held execution is never left without the rows that hold it. A cap that no
@@ -1035,6 +1054,10 @@ pub(crate) async fn release_conn(
         None => return Ok(ConnRelease::NotHeld),
     };
     drop(rows);
+    // A start is a turn, whatever the cause: Start now spends its lane's turn
+    // as surely as a sweep's release does.
+    super::rotation::record_turn_conn(conn, issue_id.as_deref(), execution_id, admission.turn, now)
+        .await?;
 
     let mut supersessions = Vec::new();
     if let (Some(issue_id), "pending") = (issue_id.as_deref(), lifecycle.as_str()) {
@@ -1518,8 +1541,35 @@ pub(crate) mod tests {
             ));
         }
         db.execute_script(&seed).await.unwrap();
+        let (orch, effects) = orchestrator_over(temp.path(), "search", db.clone());
+        Env {
+            _temp: temp,
+            orch,
+            db,
+            effects,
+        }
+    }
 
-        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    /// `env` as after a restart: a new orchestrator over the same database
+    /// and configuration, with nothing it held in memory.
+    pub(crate) fn restarted(env: Env) -> Env {
+        let Env { _temp, db, .. } = env;
+        let (orch, effects) = orchestrator_over(_temp.path(), "search-restarted", db.clone());
+        Env {
+            _temp,
+            orch,
+            db,
+            effects,
+        }
+    }
+
+    fn orchestrator_over(
+        root: &std::path::Path,
+        search_dir: &str,
+        db: Arc<LocalDb>,
+    ) -> (Orchestrator, mpsc::UnboundedReceiver<WorkflowEffect>) {
+        let config_dir = root.join("config");
+        let search = Arc::new(SearchIndex::open_or_create(root.join(search_dir)).unwrap());
         // Creation-time evaluation reads the services clock, so it is pinned to
         // the same instant every explicit sweep below is taken at.
         let mut clock = crate::services::testing::MockClock::new();
@@ -1539,12 +1589,7 @@ pub(crate) mod tests {
         )
         .effect_tx(Some(tx))
         .build();
-        Env {
-            _temp: temp,
-            orch,
-            db,
-            effects,
-        }
+        (orch, effects)
     }
 
     fn merged_after(number: i32) -> Value {
@@ -3027,7 +3072,7 @@ pub(crate) mod tests {
     }
 
     /// A team replica holding project `tp` with issues 1 (merged) and 2 (live).
-    async fn attach_team(env: &Env, name: &str) -> Arc<LocalDb> {
+    pub(crate) async fn attach_team(env: &Env, name: &str) -> Arc<LocalDb> {
         let team_db = Arc::new(crate::storage::migrated_test_db(name).await);
         team_db
             .execute_script(

@@ -474,7 +474,7 @@ async fn launch_recipe_execution(
     // between. One with `after:` gates files as before: its caps are decided
     // when those gates clear, so it takes no place in line while it waits on
     // something else.
-    let (admission_guard, caps) = if starter == Starter::Capped && gates.is_empty() {
+    let (admission_guard, caps, turn) = if starter == Starter::Capped && gates.is_empty() {
         // A busy lock refuses the filing before anything is written, so the
         // caller can retry it as it stands.
         let guard = orch
@@ -487,9 +487,9 @@ async fn launch_recipe_execution(
             .map_err(|busy| busy.to_string())?;
         let admission =
             crate::execution::gates::capacity::decide(orch, &db, Some(issue_id), None).await?;
-        (Some(guard), admission.blocks)
+        (Some(guard), admission.blocks, Some(admission.turn))
     } else {
-        (None, Vec::new())
+        (None, Vec::new(), None)
     };
     let held = !gates.is_empty() || !caps.is_empty();
 
@@ -527,6 +527,7 @@ async fn launch_recipe_execution(
             caps: caps.clone(),
             filed_at: orch.services.clock.now(),
             place,
+            turn,
         },
     )
     .await?;
@@ -1299,6 +1300,7 @@ pub(crate) async fn file_held_with_observed_satisfaction(
             caps: Vec::new(),
             filed_at: orch.services.clock.now(),
             place: QueuePlace::Tail,
+            turn: None,
         },
     )
     .await?;
@@ -1319,6 +1321,10 @@ pub(crate) async fn file_held_with_observed_satisfaction(
 /// `place` is where a capped hold takes its place in line: a `Head` filing
 /// rotates its thread's cap-held set in the same transaction, so the hold is
 /// never visible at the tail.
+///
+/// `turn` is the stamp the admission decision minted for a capped filing. One
+/// that starts at once spends its lane's turn in the same transaction, as a
+/// release does (`gates::rotation`).
 #[derive(Default)]
 struct LaunchGates {
     predicates: Vec<String>,
@@ -1326,6 +1332,7 @@ struct LaunchGates {
     caps: Vec<crate::models::CapacityHold>,
     filed_at: i64,
     place: QueuePlace,
+    turn: Option<i64>,
 }
 
 /// What starting an issue's execution actually did to its lineage.
@@ -1372,6 +1379,7 @@ async fn insert_issue_execution_atomic(
         caps,
         filed_at,
         place,
+        turn,
     } = gates;
     if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
         return Err(
@@ -1451,6 +1459,16 @@ async fn insert_issue_execution_atomic(
             execution.seq = Some(seq);
             execution.lifecycle = lifecycle;
             insert_execution_conn(conn, &execution).await?;
+            if let (Some(turn), false) = (turn, held) {
+                crate::execution::gates::rotation::record_turn_conn(
+                    conn,
+                    Some(&issue_id),
+                    execution.id.as_str(),
+                    turn,
+                    filed_at,
+                )
+                .await?;
+            }
             for cap in &caps {
                 use crate::execution::gates::capacity::{
                     capacity_predicate, encode_hold, CapacityHoldExt,

@@ -2391,10 +2391,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // wherever the execution they hold is read -- the status projection derives
     // `held` from their presence -- so they share its scope.
     ("execution_gates", TableScope::ProjectScoped),
+    // cairn/5943: when each queue lane last started work. Written beside the
+    // release it records, in the database that owns the released execution.
+    ("queue_lane_turns", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
     // cairn/5935: conditions on a pending ask (a deferred gated artifact). Read
     // and written wherever the artifact they defer is, so they share its scope.
     ("ask_conditions", TableScope::ProjectScoped),
+    // cairn/5920: a node's or thread's placement default. Read and written
+    // wherever its job or thread is, so it shares their scope.
+    ("placement_defaults", TableScope::ProjectScoped),
     // cairn/5597: an execution's delegated packets, moved out of its snapshot.
     // Read and written wherever the execution is, so they share its scope.
     ("delegated_packets", TableScope::ProjectScoped),
@@ -2580,14 +2586,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     (
         "inference_requests",
         TableScope::Private(PrivateReason::RunnerTransient),
-    ),
-    // The desktop-automation capabilities this runner last probed off each
-    // enrolled executor (0158). A cached answer about machines THIS runner can
-    // reach, refreshed by probing again; a teammate's replica would describe a
-    // different fleet.
-    (
-        "executor_desktop_automation",
-        TableScope::Private(PrivateReason::RebuildableCache),
     ),
     // ── Private: identity & credentials ──────────────────────────────────────
     (
@@ -3113,9 +3111,19 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         table: "execution_gates",
         id_columns: &["id", "execution_id"],
     },
+    // `lane` embeds a thread or issue id behind a prefix and stays bare: a
+    // moved project's lanes read as never served, which costs one round.
+    RekeyTableManifest {
+        table: "queue_lane_turns",
+        id_columns: &["execution_id"],
+    },
     RekeyTableManifest {
         table: "ask_conditions",
         id_columns: &["id", "ask_id", "job_id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "placement_defaults",
+        id_columns: &["id", "job_id", "thread_id"],
     },
     RekeyTableManifest {
         table: "executions",
@@ -8884,16 +8892,13 @@ mod tests {
                 .unwrap(),
             "org/Model"
         );
-        assert_eq!(
-            query_text(
-                &db,
-                "SELECT body_json FROM inference_deployments WHERE id = 'd'"
-            )
-            .await
-            .unwrap()
-            .contains("recipe"),
-            false
-        );
+        assert!(!query_text(
+            &db,
+            "SELECT body_json FROM inference_deployments WHERE id = 'd'"
+        )
+        .await
+        .unwrap()
+        .contains("recipe"));
         assert_eq!(
             query_text(&db, "SELECT json_extract(body_json, '$.profile') FROM inference_deployments WHERE id = 'd'")
                 .await

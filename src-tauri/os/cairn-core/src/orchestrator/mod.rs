@@ -820,7 +820,6 @@ impl OrchestratorBuilder {
             browser_loading: Arc::new(Mutex::new(HashMap::new())),
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
-            desktop_facades: Arc::default(),
             model_catalog: self.model_catalog,
             catalog_rediscovery: self.catalog_rediscovery,
             provider_usage_snapshots: self.provider_usage_snapshots,
@@ -1763,12 +1762,6 @@ pub struct Orchestrator {
     /// clear error when unset. Wrapped like `executor` so it's Clone-compatible
     /// and settable after construction via `&self`.
     mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
-
-    /// One desktop-automation facade per machine, each owning that machine's
-    /// service residency. Held here because the residency outlives any single
-    /// probe or verb call, and a second facade for a machine is a second
-    /// claimant on a holder that has room for exactly one.
-    pub(crate) desktop_facades: Arc<crate::fleet::desktop::DesktopFacadeRegistry>,
 
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
@@ -4445,6 +4438,7 @@ mod tests {
                     containment: None,
                     page_call_programs: None,
                     github_credential: None,
+                    machine_services: Vec::new(),
                 },
                 current_load: 0,
                 warm_roots: Vec::new(),

@@ -47,6 +47,7 @@ pub fn sync_resolved_pack(
     manifest: PackManifest,
     source: PackSource,
 ) -> Result<PackSyncResult, String> {
+    refuse_invalid_skills(&manifest)?;
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack_lock::clear_uninstall(fs, config_dir, &manifest.id)?;
@@ -64,6 +65,54 @@ pub fn sync_resolved_pack(
             source,
         }],
     )
+}
+
+/// Refuse a whole pack when any skill its source ships fails the skill-package
+/// rules, before anything is written.
+///
+/// The sync re-derives items from the source tree by convention at every step
+/// (lock, retirement, collisions), so a skill the plugin loader skipped would
+/// still be installed, and skipping it here alone would let a later
+/// re-derivation bring it back. Refusing keeps one item set throughout.
+fn refuse_invalid_skills(manifest: &PackManifest) -> Result<(), String> {
+    let skills: Vec<_> = manifest
+        .items()
+        .into_iter()
+        .filter(|item| item.kind == PackItemKind::Skill)
+        .collect();
+    if skills.is_empty() {
+        return Ok(());
+    }
+    let root = manifest.root.canonicalize().map_err(|e| {
+        format!(
+            "Failed to resolve pack `{}` source {:?}: {e}",
+            manifest.id, manifest.root
+        )
+    })?;
+    let rejected: Vec<String> = skills
+        .iter()
+        .filter_map(|item| {
+            let dir = root.join(item.path.as_deref().unwrap_or_default());
+            pack::agent_plugin::validate_skill(&root, &item.id, &dir)
+                .err()
+                .map(|reason| format!("`{}` ({reason})", item.id))
+        })
+        .collect();
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "Pack `{}` was refused: {} {} failed skill validation. Nothing was written; fix or \
+         remove {} in the pack's source and try again.",
+        manifest.id,
+        if rejected.len() == 1 {
+            "skill"
+        } else {
+            "skills"
+        },
+        rejected.join(", "),
+        if rejected.len() == 1 { "it" } else { "them" },
+    ))
 }
 
 /// Explicitly replace every currently shipped item in one bundled pack and
@@ -789,5 +838,40 @@ mod tests {
         assert!(!is_pack_authored_subject("Snapshot workspace config"));
         assert!(!is_pack_authored_subject("Merge branch 'bundle'"));
         assert!(!is_pack_authored_subject("User edits explore"));
+    }
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn a_source_skill_that_fails_validation_refuses_the_whole_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source/notes-pack");
+        let config = temp.path().join("home");
+        write(
+            &source.join("skills/good/SKILL.md"),
+            "---\nname: good\ndescription: Useful.\n---\n",
+        );
+        write(
+            &source.join("skills/bad/SKILL.md"),
+            "---\nname: other\ndescription: Broken.\n---\n",
+        );
+        let manifest = pack::manifest::load(&source).unwrap();
+
+        let error = sync_resolved_pack(
+            &cairn_platform::services::RealGitClient,
+            &cairn_platform::services::RealFileSystem,
+            &config,
+            manifest,
+            PackSource::local("source".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("skill `bad`"), "{error}");
+        assert!(error.contains("does not match directory 'bad'"), "{error}");
+        assert!(!error.contains("`good`"), "{error}");
+        assert!(!config.exists(), "nothing is written");
     }
 }

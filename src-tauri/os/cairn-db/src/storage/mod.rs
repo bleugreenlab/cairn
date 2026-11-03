@@ -1,7 +1,6 @@
 mod blocking;
 mod context_tokens;
 mod error;
-mod executor_desktop_automation;
 mod fact_log;
 mod feed;
 mod local_db;
@@ -36,10 +35,6 @@ pub type TeamId = String;
 pub use blocking::{panic_message, run_db_blocking};
 pub use context_tokens::get_latest_context_token_event;
 pub use error::{DbError, DbResult};
-pub use executor_desktop_automation::{
-    delete_executor_desktop_automation, get_executor_desktop_automation,
-    upsert_executor_desktop_automation, ExecutorDesktopAutomation,
-};
 pub use fact_log::{
     claim_due_wake as claim_due_fact_wake, claim_for_index, claim_next_queued,
     coalesce_wake as coalesce_fact_wake, count_facts, finish as finish_fact,
@@ -112,13 +107,19 @@ pub use events::{
     ResolvePathError, CODEC_NONE, CODEC_ZSTD_V1, RECONSTRUCT_BATCH_BYTES, RECONSTRUCT_BATCH_ROWS,
 };
 
-/// A freshly migrated, temp-backed test database. Exposed under `test-utils`
-/// (not just `cfg(test)`) so cairn-core's cross-crate test modules keep
-/// resolving `crate::storage::migrated_test_db`.
+/// A freshly migrated, temp-backed test database named `name`, with `.db`
+/// added when `name` lacks it (`LocalDb::open` admits only `.db` paths).
+/// Exposed under `test-utils` (not just `cfg(test)`) so cairn-core's
+/// cross-crate test modules keep resolving `crate::storage::migrated_test_db`.
 #[cfg(any(test, feature = "test-utils"))]
 pub async fn migrated_test_db(name: &str) -> LocalDb {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.keep().join(name);
+    let file = if name.ends_with(".db") {
+        name.to_string()
+    } else {
+        format!("{name}.db")
+    };
+    let path = temp.keep().join(file);
     LocalDb::open_migrated_for_test(path).await.unwrap()
 }
 

@@ -175,14 +175,23 @@ async fn insert_event_at_conn(
     event: &EventInsert,
     sequence: i32,
 ) -> DbResult<u64> {
+    // The model the provider reported, stored beside the token columns so the
+    // analytics rollup can still attribute the event after archival has
+    // compressed its body.
+    let reported_model = cairn_analytics::queries::reported_model_column(
+        &event.event_type,
+        event.parent_tool_use_id.as_deref(),
+        &event.data,
+    );
     let count = conn
         .execute(
             "INSERT INTO events(
                 id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
-                cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd
+                cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd,
+                reported_model
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 event.id.as_str(),
                 event.run_id.as_str(),
@@ -199,7 +208,8 @@ async fn insert_event_at_conn(
                 event.output_tokens,
                 event.thinking_tokens,
                 event.turn_id.as_deref(),
-                event.cost_usd
+                event.cost_usd,
+                reported_model.as_deref()
             ],
         )
         .await?;

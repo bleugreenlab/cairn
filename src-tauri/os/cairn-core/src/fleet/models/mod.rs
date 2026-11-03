@@ -46,7 +46,7 @@ use self::room::{drain, Drain, GangMachine, Room};
 use self::rules::{
     Acquirable, Activity, Departure, Input, Left, Pin, Plan, Preference, State, Why,
 };
-use self::settings::{EffectiveSettings, Ms};
+use self::settings::{EffectiveSettings, MeasuredLoad, Ms};
 use self::store::StoredPin;
 use super::pools::{Pool, PoolKey, PoolMember};
 use super::{executor_public_name, Fleet};
@@ -196,43 +196,33 @@ impl Host for Fleet {
     }
 }
 
-/// The slowest healthy load recorded for each deployment, in milliseconds.
-fn slowest_loads(history: &BTreeMap<DeploymentId, Vec<LoadRow>>) -> BTreeMap<DeploymentId, u64> {
-    history
-        .iter()
-        .filter_map(|(id, loads)| {
-            loads
-                .iter()
-                .filter(|load| load.healthy)
-                .filter_map(|load| load.load_ms)
-                .max()
-                .map(|ms| (id.clone(), ms))
-        })
-        .collect()
-}
-
-/// Each pool's windows: the idle override, else derived from the slowest
-/// healthy load of a deployment on the pool.
+/// Each pool's windows: the idle override, else derived from what a reload
+/// costs now, the slowest of its deployments' reference loads
+/// ([`inference_control::reference_load`]).
 fn pool_settings(
     pools: &[Pool],
     catalog: &BTreeMap<DeploymentId, Acquirable>,
     history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
     preferences: &BTreeMap<PoolKey, Preference>,
 ) -> BTreeMap<PoolKey, EffectiveSettings> {
-    let slowest = slowest_loads(history);
     pools
         .iter()
         .map(|pool| {
-            let load_secs = catalog
+            let measured = catalog
                 .values()
                 .filter(|a| a.pool.as_ref() == Some(&pool.key))
-                .filter_map(|a| slowest.get(&a.deployment))
-                .map(|ms| ms.div_ceil(1_000))
-                .max();
+                .filter_map(|a| inference_control::reference_load(history.get(&a.deployment)?))
+                .filter_map(|load| {
+                    Some(MeasuredLoad {
+                        secs: load.load_ms?.div_ceil(1_000),
+                        cold: load.cold,
+                    })
+                })
+                .max_by_key(|load| load.secs);
             let idle = preferences
                 .get(&pool.key)
                 .and_then(|p| p.idle_override_secs);
-            (pool.key.clone(), EffectiveSettings::derive(idle, load_secs))
+            (pool.key.clone(), EffectiveSettings::derive(idle, measured))
         })
         .collect()
 }

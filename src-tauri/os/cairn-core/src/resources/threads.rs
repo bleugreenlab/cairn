@@ -765,6 +765,12 @@ pub(super) async fn read_thread(
             if let Some(definition) = definition {
                 out.push_str(&format!("Definition: {definition}\n\n"));
             }
+            let owner = crate::fleet::placement_default::DefaultOwner::Thread(id.clone());
+            if let Ok(Some(default)) =
+                crate::fleet::placement_default::load_conn(conn, &owner).await
+            {
+                out.push_str(&format!("{}\n\n", default.line()));
+            }
             out.push_str(&format!("- [arc]({canonical}/arc)\n"));
             match session {
                 Some((job_id, segment, session_status)) => out.push_str(&format!(
@@ -1494,8 +1500,8 @@ mod tests {
         db.execute(
             "INSERT INTO thread_eras (
                  job_id, seq, start_block, end_block, started_at, ended_at, summary,
-                 summary_status, summary_model, source_tokens, minted_generation, created_at
-             ) VALUES (?1, 1, 0, 2, 10, 20, 'Settled the initial layout question.', 'fallback', NULL, 500, 1, 30)",
+                 summary_status, summary_model, minted_generation, created_at
+             ) VALUES (?1, 1, 0, 2, 10, 20, 'Settled the initial layout question.', 'fallback', NULL, 1, 30)",
             (job_id.as_str(),),
         )
         .await

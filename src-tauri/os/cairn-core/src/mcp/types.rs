@@ -257,6 +257,16 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_payload_accepts_a_free_form_question_without_options() {
+        let payload: AskUserPayload = serde_json::from_value(serde_json::json!({
+            "questions": [{"question": "What should change?"}]
+        }))
+        .unwrap();
+        assert_eq!(payload.questions.len(), 1);
+        assert!(payload.questions[0].options.is_empty());
+    }
+
+    #[test]
     fn change_payload_missing_optional_fields() {
         let json = serde_json::json!({
             "changes": [{"target": "file:f.rs", "mode": "delete"}]

@@ -258,6 +258,17 @@ pub async fn token_is_known(db: &LocalDb, kind: DeviceKind, raw: &str) -> bool {
     })}).await.unwrap_or(false)
 }
 
+/// The public name of the enrolled executor whose live credential `raw` is,
+/// for an artifact route that answers per machine.
+pub async fn executor_name_for_token(db: &LocalDb, kind: DeviceKind, raw: &str) -> Option<String> {
+    let kind = kind.as_str();
+    let digest = hash(raw);
+    db.read(|conn| { let digest=digest.clone(); Box::pin(async move {
+        let mut rows=conn.query("SELECT executor_name FROM executor_enrollments WHERE device_kind=?2 AND revoked_at IS NULL AND ((credential_hash=?1 AND expires_at>?3) OR (previous_credential_hash=?1 AND previous_expires_at>?3)) LIMIT 1", params![digest, kind, chrono::Utc::now().timestamp()]).await?;
+        Ok(match rows.next().await? { Some(row) => row.opt_text(0)?, None => None })
+    })}).await.ok().flatten()
+}
+
 /// Mint a recovery grant only while the exact runner-owned machine remains
 /// actively enrolled. The authority check and grant insertion share one write
 /// transaction; `revoke` invalidates any grant inserted before its own write, so

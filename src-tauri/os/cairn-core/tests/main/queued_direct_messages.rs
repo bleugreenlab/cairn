@@ -48,6 +48,17 @@ fn callback_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
     }
 }
 
+/// A request as a model-facing edge sends it: the only kind that claims the
+/// run's queued deliveries at its tool boundary.
+fn model_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
+    let mut request = callback_request(tool, run_id);
+    cairn_common::protocol::stamp_callback_origin(
+        &mut request.payload,
+        cairn_common::protocol::MODEL_FACING_ORIGIN,
+    );
+    request
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_tool_augments_result_with_queued_direct_messages() {
     // A direct message to a busy recipient becomes an undelivered `direct:` push;
@@ -71,7 +82,7 @@ async fn dispatch_tool_augments_result_with_queued_direct_messages() {
     .await
     .expect("external user DM should be accepted");
 
-    let request = callback_request("bogus_tool", Some("run-1"));
+    let request = model_request("bogus_tool", Some("run-1"));
     let cursors = Mutex::new(HashMap::new());
     let result = dispatch_tool(&orch, &request, &cursors).await;
 
@@ -97,6 +108,63 @@ async fn dispatch_tool_augments_result_with_queued_direct_messages() {
         "delivered direct must not re-surface: {:?}",
         again.reminders
     );
+}
+
+/// A program's call under an agent's run (`@cairn/sdk` from a procedure, a
+/// `run` item's inline code, a service, the CLI) carries the same run id but
+/// hands its result to a program, not the model. Claiming at its boundary
+/// stamped the steer delivered and the SDK dropped it, so it was lost. Only a
+/// model-facing call claims; the others leave the steer pending for it.
+///
+/// The gate reads only the origin stamp, never the tool, so the calls name a
+/// tool no handler answers and the test measures delivery alone.
+#[tokio::test(flavor = "current_thread")]
+async fn only_a_model_facing_call_claims_the_runs_queued_steer() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = orch.db.local.clone();
+    insert_dm_recipient(&db, "proj", "running").await;
+    common::enqueue_steer(&db, "qm-steer", "look at the parser").await;
+    let cursors = Mutex::new(HashMap::new());
+
+    let read = |origin: Option<&str>| {
+        let mut request = callback_request("bogus_tool", Some("run-1"));
+        if let Some(origin) = origin {
+            cairn_common::protocol::stamp_callback_origin(&mut request.payload, origin);
+        }
+        request
+    };
+
+    for (label, origin) in [("unstamped (SDK)", None), ("cli", Some("cli"))] {
+        let output = dispatch_tool(&orch, &read(origin), &cursors)
+            .await
+            .into_inner();
+        assert!(
+            output.reminders.is_empty(),
+            "{label}: a program's call must not deliver: {:?}",
+            output.reminders
+        );
+        assert!(
+            common::pending(&db, "qm-steer").await,
+            "{label}: the steer stays pending for the model"
+        );
+    }
+
+    let output = dispatch_tool(
+        &orch,
+        &read(Some(cairn_common::protocol::MODEL_FACING_ORIGIN)),
+        &cursors,
+    )
+    .await
+    .into_inner();
+    assert!(
+        output
+            .reminders
+            .iter()
+            .any(|reminder| reminder.contains("look at the parser")),
+        "the model-facing call delivers the steer: {:?}",
+        output.reminders
+    );
+    assert!(!common::pending(&db, "qm-steer").await);
 }
 
 /// Insert the minimum DB shape `append_direct_message` needs to resolve a

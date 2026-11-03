@@ -117,6 +117,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     export_only("execution_gates", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     export_only("execution_supersessions", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     export_only("ask_conditions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    export_only("placement_defaults", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR thread_id IN (SELECT id FROM threads WHERE project_id = ?1)"),
     export_only("job_file_activity", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     export_only("job_presence", "project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     export_only("pack_catalog_backfill_attempts", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
@@ -194,6 +195,10 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
     (
         "service_schedules",
         "this runner's cadence for the service processes it supervises: anchors and last outcomes of scheduled methods; a destination runner anchors its own cadence from the declarations, which export with their thread or live in the repository",
+    ),
+    (
+        "queue_lane_turns",
+        "when each execution-queue lane last started work on this runner's queue; a lane spans projects (the shared lane spans every one), and a destination with no row simply serves the lane as never served",
     ),
     (
         "search_outbox",

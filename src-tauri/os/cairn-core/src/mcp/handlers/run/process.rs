@@ -37,23 +37,61 @@ struct ExecOutput {
     setuid_refusal: Option<String>,
 }
 
-/// The verbs a cached probe positively proves a machine has, if it proves any.
+/// The verbs a probed catalog positively proves an instance has, if it proves
+/// any.
 ///
-/// A failed probe and a machine nobody has probed yet both leave an empty
+/// A failed probe and an instance nobody has probed yet both leave an empty
 /// catalog, and an empty catalog is not evidence of absence. Refusing a verb on
 /// it would tell an agent the machine cannot do something when the truth is that
-/// nobody could ask — which is exactly what a dropped link produces. Only a
+/// nobody could ask, which is exactly what a dropped link produces. Only a
 /// probe that came back with a real catalog can refute a verb.
-fn advertised_verbs(cached: &cairn_db::storage::ExecutorDesktopAutomation) -> Option<Vec<String>> {
-    if cached.probe_error.is_some() {
+fn advertised_verbs(catalog: &[crate::mcp::gateway::McpToolDef]) -> Option<Vec<String>> {
+    if catalog.is_empty() {
         return None;
     }
-    let tools =
-        serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&cached.verbs_json).ok()?;
-    if tools.is_empty() {
-        return None;
+    Some(catalog.iter().map(|tool| tool.name.clone()).collect())
+}
+
+use crate::project_services::supervisor::machine::{InstanceState, MachineServiceInstance};
+
+/// Which of a machine's MCP-speaking machine services takes `action`: the one
+/// whose catalog advertises it, or the only one there is while nothing has
+/// refuted it. `Err` is the refusal.
+fn instance_for_verb<'a>(
+    machine: &str,
+    action: &str,
+    instances: &'a [MachineServiceInstance],
+) -> Result<&'a MachineServiceInstance, String> {
+    let mcp: Vec<&MachineServiceInstance> = instances
+        .iter()
+        .filter(|instance| instance.serves_mcp)
+        .collect();
+    if mcp.is_empty() {
+        return Err(format!(
+            "no machine service that serves MCP is selected on {machine}; select one on cairn://executors/{machine} with machineServices"
+        ));
     }
-    Some(tools.into_iter().map(|tool| tool.name).collect())
+    if let Some(serving) = mcp
+        .iter()
+        .find(|instance| instance.catalog.iter().any(|tool| tool.name == action))
+    {
+        return Ok(serving);
+    }
+    let advertised: Vec<String> = mcp
+        .iter()
+        .filter_map(|instance| advertised_verbs(&instance.catalog))
+        .flatten()
+        .collect();
+    match mcp.as_slice() {
+        [only] if advertised.is_empty() => Ok(only),
+        _ if advertised.is_empty() => Err(format!(
+            "no machine service on {machine} has advertised its verbs yet; read cairn://executors/{machine}"
+        )),
+        _ => Err(format!(
+            "{machine} does not advertise `{action}`. Its verbs are: {}. Read cairn://executors/{machine}.",
+            advertised.join(", ")
+        )),
+    }
 }
 
 async fn run_executor_action(
@@ -64,54 +102,42 @@ async fn run_executor_action(
     let Some(gateway) = orch.mcp_gateway() else {
         return ItemOutcome::failed(header, "MCP gateway is not available in this host");
     };
-    let config = crate::config::settings::load_fleet(&orch.config_dir);
-    let os = orch
-        .fleet
-        .inspect_executors(crate::fleet::unix_time_ms())
-        .into_iter()
-        .find(|executor| executor.name == spec.executor_name)
-        .map(|executor| executor.health.advertisement.capabilities.os)
-        .unwrap_or_default();
-    let desktop = config.desktop_automation.resolve(&spec.executor_name, &os);
-    if !desktop.enabled {
+    let instances =
+        crate::project_services::supervisor::machine::instances_on(orch, &spec.executor_name);
+    let instance = match instance_for_verb(&spec.executor_name, &spec.action, &instances) {
+        Ok(instance) => instance,
+        Err(refusal) => return ItemOutcome::failed(header, refusal),
+    };
+    // A state that cannot answer is said as itself rather than as a failed
+    // call: an agent can tell the operator what to do about it.
+    if matches!(
+        instance.state,
+        InstanceState::NotInstalled { .. }
+            | InstanceState::Installing
+            | InstanceState::MachineAbsent
+            | InstanceState::WaitingForOperator { .. }
+            | InstanceState::Failed { .. }
+    ) {
         return ItemOutcome::failed(
             header,
-            format!("Desktop automation is off for {}", spec.executor_name),
+            format!(
+                "{} on {} is {}",
+                instance.key,
+                spec.executor_name,
+                instance.state.sentence()
+            ),
         );
     }
-    if let Ok(Some(cached)) =
-        cairn_db::storage::get_executor_desktop_automation(&orch.db.local, &spec.executor_name)
-            .await
-    {
-        if let Some(verbs) = advertised_verbs(&cached) {
-            if !verbs.iter().any(|verb| verb == &spec.action) {
-                return ItemOutcome::failed(header, format!(
-                    "{} does not advertise `{}`. Its desktop verbs are: {}. Read cairn://executors/{}.",
-                    spec.executor_name, spec.action, verbs.join(", "), spec.executor_name
-                ));
-            }
-        }
-    }
-    let facade =
-        crate::fleet::desktop::placed_desktop_facade(orch, &spec.executor_name, desktop.binary);
+    let Some(facade) = instance.facade.clone() else {
+        return ItemOutcome::failed(
+            header,
+            format!("{} on {} is starting", instance.key, spec.executor_name),
+        );
+    };
     let timeout = super::clamp_host_item_timeout_ms(spec.timeout);
     let outcome = gateway
-        .call_placed_tool_once(facade.clone(), &spec.action, spec.args, timeout)
+        .call_placed_tool_once(facade, &spec.action, spec.args, timeout)
         .await;
-    if let Ok(catalog) = gateway.list_placed_tools(facade).await {
-        let state = cairn_db::storage::ExecutorDesktopAutomation {
-            executor_id: spec.executor_name.clone(),
-            probed_at: chrono::Utc::now().timestamp_millis(),
-            health_json: None,
-            verbs_json: serde_json::to_string(&catalog.tools).unwrap_or_else(|_| "[]".into()),
-            probe_error: None,
-        };
-        if let Err(error) =
-            cairn_db::storage::upsert_executor_desktop_automation(&orch.db.local, &state).await
-        {
-            tracing::warn!(machine = %spec.executor_name, %error, "could not cache desktop verb catalog");
-        }
-    }
     match outcome {
         Ok(McpCallOutcome::Complete(result)) => ItemOutcome {
             header,
@@ -123,7 +149,10 @@ async fn run_executor_action(
             data: None,
             whole: false,
         },
-        Ok(_) => ItemOutcome::failed(header, "Desktop verbs cannot suspend for follow-up input"),
+        Ok(_) => ItemOutcome::failed(
+            header,
+            "Machine-service verbs cannot suspend for follow-up input",
+        ),
         Err(error) => ItemOutcome::failed(header, format!("{}: {error}", spec.executor_name)),
     }
 }
@@ -1124,8 +1153,24 @@ pub(crate) async fn build_agent_spawn_config(
     run_context: Option<&RunContext>,
     program: &str,
     args: &[String],
-    confinement: sandbox::Confinement,
+    mut confinement: sandbox::Confinement,
 ) -> SpawnConfig {
+    // The per-job scratch dir this spawn gets as its `TMPDIR`, with the job's
+    // canonical home URI (`cairn:~` shorthand resolution and the readable
+    // scratch name both use it). Resolved before the confinement is attached,
+    // so the one directory exported as `TMPDIR` is the one the fence grants:
+    // nothing else under the scratch root is writable.
+    let job_scratch = match run_context {
+        Some(ctx) => {
+            let home_uri = super::job_home_uri(orch, &ctx.run_id, &ctx.job_id).await;
+            let scratch = crate::scratch::ensure_job_scratch_dir(&ctx.job_id, home_uri.as_deref());
+            Some((scratch, home_uri))
+        }
+        None => None,
+    };
+    if let (Some(policy), Some((scratch, _))) = (confinement.policy_mut(), &job_scratch) {
+        policy.grant_tmpdir(scratch);
+    }
     // Inject the MCP callback env so an in-run `cairn read|change ...` shell
     // invocation can authenticate and forward to this same app (the basis for
     // composability like `cairn read <uri> | rg ...`). The CLI is a thin client;
@@ -1213,13 +1258,11 @@ pub(crate) async fn build_agent_spawn_config(
                 .env("GIT_COMMITTER_NAME", &name)
                 .env("GIT_COMMITTER_EMAIL", &email);
         }
-        // `cairn:~` shorthand resolution and the readable per-node scratch name
-        // both use the job's canonical home URI.
-        let home_uri = super::job_home_uri(orch, &ctx.run_id, &ctx.job_id).await;
+    }
+    if let Some((scratch, home_uri)) = job_scratch {
         // Point the command's temp-file handling at a per-job scratch dir so
         // default tooling (mktemp, cargo, compilers, harness logs) writes there
         // with no agent awareness. TMP/TEMP cover tools that ignore TMPDIR.
-        let scratch = crate::scratch::ensure_job_scratch_dir(&ctx.job_id, home_uri.as_deref());
         // Give a helper script written there the dependency resolution a script
         // inside the checkout gets for free.
         cairn_common::scratch::link_scratch_dependency_resolution(
@@ -2125,41 +2168,74 @@ mod tests {
         }
     }
 
-    fn cached_desktop(
-        verbs_json: &str,
-        probe_error: Option<&str>,
-    ) -> cairn_db::storage::ExecutorDesktopAutomation {
-        cairn_db::storage::ExecutorDesktopAutomation {
-            executor_id: "bglab-win".into(),
-            probed_at: 0,
-            health_json: None,
-            verbs_json: verbs_json.into(),
-            probe_error: probe_error.map(str::to_string),
+    fn instance(
+        state: crate::project_services::supervisor::machine::InstanceState,
+        verbs: &[&str],
+    ) -> MachineServiceInstance {
+        MachineServiceInstance {
+            key: "axon/axon".parse().unwrap(),
+            machine: "bgsrv-mac".into(),
+            state,
+            provenance: "installed 0.3.6 (pack)".into(),
+            catalog: verbs
+                .iter()
+                .map(|name| crate::mcp::gateway::McpToolDef {
+                    name: name.to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                })
+                .collect(),
+            probed_at_ms: None,
+            serves_mcp: true,
+            facade: None,
         }
     }
 
-    /// A real catalog is the only thing that may refute a verb. The other two
-    /// shapes are a machine whose probe failed and one nobody has probed, and
-    /// treating either as "advertises nothing" is how a dropped link turns into
+    /// A real catalog is the only thing that may refute a verb. An instance
+    /// whose probe failed or that nobody has probed has an empty one, and
+    /// treating that as "advertises nothing" is how a dropped link turns into
     /// a refusal claiming the verb does not exist.
     #[test]
     fn only_a_probed_catalog_can_refute_a_verb() {
-        let probed = cached_desktop(r#"[{"name":"look","input_schema":{}}]"#, None);
+        use crate::project_services::supervisor::machine::InstanceState;
+        let probed = [instance(InstanceState::Ready, &["look"])];
         assert_eq!(
-            advertised_verbs(&probed),
-            Some(vec!["look".to_string()]),
-            "a probed catalog is evidence"
+            instance_for_verb("bgsrv-mac", "look", &probed)
+                .unwrap()
+                .key
+                .to_string(),
+            "axon/axon"
         );
+        let refused = instance_for_verb("bgsrv-mac", "fly", &probed).unwrap_err();
+        assert!(refused.contains("does not advertise `fly`"), "{refused}");
+        assert!(refused.contains("look"), "{refused}");
 
-        assert_eq!(
-            advertised_verbs(&cached_desktop("[]", Some("Transport closed"))),
-            None,
-            "a failed probe proves nothing about the machine's verbs"
-        );
-        assert_eq!(
-            advertised_verbs(&cached_desktop("[]", None)),
-            None,
+        let unprobed = [instance(InstanceState::Starting, &[])];
+        assert!(
+            instance_for_verb("bgsrv-mac", "look", &unprobed).is_ok(),
             "an empty catalog is not evidence of absence"
+        );
+        let none = instance_for_verb("bgsrv-mac", "look", &[]).unwrap_err();
+        assert!(none.contains("no machine service"), "{none}");
+    }
+
+    /// An instance waiting on its operator is refused in those words, before
+    /// any call is tried.
+    #[test]
+    fn a_waiting_instance_is_refused_by_its_state() {
+        use crate::project_services::supervisor::machine::InstanceState;
+        let waiting = instance(
+            InstanceState::WaitingForOperator {
+                reason: "accessibility-permission-denied".into(),
+            },
+            &["look"],
+        );
+        let chosen =
+            instance_for_verb("bgsrv-mac", "look", std::slice::from_ref(&waiting)).unwrap();
+        let sentence = format!("{} on bgsrv-mac is {}", chosen.key, chosen.state.sentence());
+        assert_eq!(
+            sentence,
+            "axon/axon on bgsrv-mac is waiting for the operator: Accessibility is not granted to this copy (System Settings → Privacy & Security → Accessibility)"
         );
     }
 

@@ -4,11 +4,12 @@
 //! The root holds one residence per job (see [`super`]): the agent process's
 //! working directory, named for its node. It is not the node's `$TMPDIR`,
 //! which is the portable node scratch ([`crate::node_scratch`]), but it is the
-//! node's all the same and it ends with the node. Because the fence grants the
-//! whole root for writes, the root also collects directories nothing
-//! registered: an agent that wanted a large host-local workspace made one
-//! beside its residence. Those belong to no node, so no node's end reclaims
-//! them.
+//! node's all the same and it ends with the node. The root also holds
+//! directories nothing registered: before the fence stopped granting the whole
+//! root for writes (it now grants a spawn only its own `$TMPDIR`, see
+//! `cairn_sandbox::scratch_refusal`), an agent that wanted a large host-local
+//! workspace could make one beside its residence. Those belong to no node, so
+//! no node's end reclaims them.
 //!
 //! Every top-level entry is therefore one of:
 //!
@@ -19,9 +20,19 @@
 //! - **unowned**: nothing registered names it.
 //!
 //! An ended residence goes as soon as nothing holds it: when its owner ends,
-//! at runner start, and on every maintenance tick. An unowned entry goes only
-//! under disk pressure, coldest first, once nothing has been written into it
-//! for a quiet floor. A live residence is never taken, only reported.
+//! at runner start, and on every maintenance tick. A live residence is never
+//! taken, only reported. An unowned entry goes once nothing has been written
+//! into it for seven days, on any pass that measured it, pressure or not.
+//! Under disk pressure it goes sooner, after a shorter quiet floor, and among
+//! those the largest goes first, so the pass meets its ask by destroying as few
+//! entries as it can. Either way an unowned entry goes only if its removal
+//! would free at least [`UNOWNED_SIZE_FLOOR`]. An entry under the size floor is
+//! never taken: removing it relieves nothing a volume can notice, and a small
+//! hand-placed file (a key, a config, a note) is exactly what someone keeps on
+//! purpose and cannot regenerate.
+//!
+//! The root is Cairn's: a large unowned directory in it is reclaimed once it
+//! goes quiet, so durable files, credentials especially, belong outside it.
 //!
 //! Sizes are measured twice: logically (what `du` reports) and as exclusive
 //! bytes ([`cairn_common::cow::exclusive_bytes`]), which on a copy-on-write
@@ -60,6 +71,20 @@ const CENSUS_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const UNOWNED_QUIET_UNDER_PRESSURE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The same floor at the critical line, where admission is close.
 const UNOWNED_QUIET_WHEN_CRITICAL: Duration = Duration::from_secs(60 * 60);
+/// How long nothing may have been written into an unowned entry before a pass
+/// takes it with no disk pressure at all. Nothing owns such an entry, so no
+/// node's end will ever reclaim it; a week of silence is the evidence that
+/// nobody is still working in it.
+pub const UNOWNED_QUIET_OUTSIDE_PRESSURE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The fewest exclusive bytes an unowned entry must hold for pressure to take
+/// it, in either band. The pressure line is 64 GiB, so an ask is normally
+/// gigabytes, and an entry under this frees a sixty-thousandth of the line at
+/// most: what pressure is relieved by (build trees, datasets, clones) sits
+/// orders above it, and what a person places by hand sits well below it. A
+/// fixed floor, rather than a share of the ask, gives an author one rule to
+/// read, where a share would spare a file under one ask and take it under the
+/// next.
+pub(crate) const UNOWNED_SIZE_FLOOR: u64 = 1024 * 1024;
 /// What an entry is renamed to before its removal starts, so nothing resolves
 /// its name to a half-deleted tree, and a removal the runner dies in the middle
 /// of is finished by the next tick.
@@ -184,6 +209,9 @@ pub struct PressurePass {
     pub kept_live: Tally,
     /// Unowned entries written to inside the quiet floor.
     pub kept_quiet: Tally,
+    /// Unowned entries past the quiet floor whose exclusive bytes are under
+    /// [`UNOWNED_SIZE_FLOOR`], which pressure never takes.
+    pub kept_small: Tally,
 }
 
 /// Every entry as the last measurement found it.
@@ -194,11 +222,17 @@ pub struct Census {
 }
 
 /// What the executor page renders: the last census, recent removals of ended
-/// residences, and the last pressure pass.
+/// residences, recent seven-day removals of unowned entries, and the last
+/// pressure pass.
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub census: Option<Census>,
     pub removals: VecDeque<Removal>,
+    /// Kept apart from `removals`: the ended residences a first pass sweeps
+    /// number in the hundreds and would push these out.
+    pub quiet_removals: VecDeque<Removal>,
+    /// Every seven-day removal since the runner started.
+    pub quiet_reclaimed: Tally,
     pub pressure: Option<PressurePass>,
 }
 
@@ -249,11 +283,45 @@ fn registrations(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Whether two paths name one directory entry, without following a link.
+#[cfg(unix)]
+fn same_entry(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::symlink_metadata(left),
+        std::fs::symlink_metadata(right),
+    ) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+/// Whether two paths name one directory entry. Without a file id in std this
+/// resolves both; a link entry read as its target errs toward live.
+#[cfg(not(unix))]
+fn same_entry(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn scan(root: &Path) -> Scan {
     let registrations = registrations(root);
     let mut by_name: HashMap<&str, Vec<String>> = HashMap::new();
     for (job, name) in &registrations {
         by_name.entry(name.as_str()).or_default().push(job.clone());
+    }
+    // A case-insensitive volume (APFS, NTFS) lists a residence under the
+    // spelling it was created with, which a registration rewritten since (a
+    // project key lowercased) no longer matches as text. Read as text, a live
+    // thread's residence was unowned, and the live-process check never ran.
+    let mut by_folded: HashMap<String, Vec<&str>> = HashMap::new();
+    for name in by_name.keys() {
+        by_folded
+            .entry(name.to_lowercase())
+            .or_default()
+            .push(*name);
     }
     let mut candidates = Vec::new();
     let mut staged = Vec::new();
@@ -267,7 +335,16 @@ fn scan(root: &Path) -> Scan {
         if name == SCRATCH_MAP_DIR || name == RESPONSE_SCRATCH_DIR {
             continue;
         }
-        let registered = by_name.get(name.as_str()).cloned().unwrap_or_default();
+        let registered = match by_name.get(name.as_str()) {
+            Some(jobs) => jobs.clone(),
+            None => by_folded
+                .get(&name.to_lowercase())
+                .into_iter()
+                .flatten()
+                .filter(|spelling| same_entry(&root.join(spelling), &path))
+                .flat_map(|spelling| by_name[spelling].iter().cloned())
+                .collect(),
+        };
         let unregistered_job = registered
             .is_empty()
             .then(|| decode_component(&name))
@@ -463,6 +540,61 @@ fn remove_ended(root: &Path, entries: &mut Vec<Entry>, now_unix_ms: u64) -> Vec<
     removals
 }
 
+/// Remove every unowned entry nothing has written into for
+/// [`UNOWNED_QUIET_OUTSIDE_PRESSURE`], whatever the volume's free space, unless
+/// its removal would free less than [`UNOWNED_SIZE_FLOOR`], which no pass takes.
+///
+/// Acts only on footprints this pass measured, never on a carried-forward
+/// reading: the last write that makes an entry due must be current, so the
+/// rule is late by at most one census interval and never early.
+fn remove_quiet_unowned(root: &Path, entries: &mut Vec<Entry>, now_unix_ms: u64) -> Vec<Removal> {
+    let cutoff = now_unix_ms.saturating_sub(UNOWNED_QUIET_OUTSIDE_PRESSURE.as_millis() as u64);
+    let mut removals = Vec::new();
+    entries.retain(|entry| {
+        let (Owner::Unowned, Some(footprint)) = (&entry.owner, entry.footprint) else {
+            return true;
+        };
+        if footprint.newest_write_unix_ms > cutoff
+            || footprint.exclusive_bytes < UNOWNED_SIZE_FLOOR
+        {
+            return true;
+        }
+        let last_write = rfc3339(footprint.newest_write_unix_ms);
+        match remove(root, &entry.path) {
+            Ok(()) => {
+                log::info!(
+                    "scratch: removed unowned {} ({} logical, {} exclusive): nothing written since {last_write}, seven days quiet",
+                    entry.name,
+                    footprint.logical_bytes,
+                    footprint.exclusive_bytes
+                );
+                removals.push(Removal {
+                    name: entry.name.clone(),
+                    why: format!("unowned, nothing written since {last_write}, seven days quiet"),
+                    footprint,
+                    at_unix_ms: now_unix_ms,
+                });
+                false
+            }
+            Err(error) => {
+                log::warn!(
+                    "scratch: could not remove unowned {} (seven days quiet); retried next pass: {error}",
+                    entry.name
+                );
+                true
+            }
+        }
+    });
+    removals
+}
+
+fn rfc3339(unix_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(unix_ms as i64).map_or_else(
+        || format!("{unix_ms} ms"),
+        |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
 /// Drop the registry record of every ended job whose directory is gone.
 fn unregister_ended(root: &Path, registrations: &[(String, String)], ended_jobs: &HashSet<String>) {
     for (job, name) in registrations {
@@ -478,8 +610,9 @@ fn unregister_ended(root: &Path, registrations: &[(String, String)], ended_jobs:
     }
 }
 
-/// Take unowned entries, coldest first, until the volume is back above the
-/// pressure line. `None` when the volume is above it, or cannot be read.
+/// Take unowned entries past the quiet floor and the size floor, largest first,
+/// until the volume is back above the pressure line. `None` when the volume is
+/// above it, or cannot be read.
 fn pressure_pass(
     root: &Path,
     entries: &mut Vec<Entry>,
@@ -497,6 +630,7 @@ fn pressure_pass(
         .max(1);
     let mut kept_live = Tally::default();
     let mut kept_quiet = Tally::default();
+    let mut kept_small = Tally::default();
     let mut candidates = Vec::new();
     for (at, entry) in entries.iter().enumerate() {
         let Some(footprint) = entry.footprint else {
@@ -504,19 +638,20 @@ fn pressure_pass(
         };
         match entry.owner {
             Owner::Live { .. } => kept_live.add(&footprint),
-            Owner::Unowned if footprint.newest_write_unix_ms <= cutoff => {
-                candidates.push((at, footprint))
+            Owner::Unowned if footprint.newest_write_unix_ms > cutoff => kept_quiet.add(&footprint),
+            Owner::Unowned if footprint.exclusive_bytes < UNOWNED_SIZE_FLOOR => {
+                kept_small.add(&footprint)
             }
-            Owner::Unowned => kept_quiet.add(&footprint),
+            Owner::Unowned => candidates.push((at, footprint)),
             // Removed before any pass; one whose removal failed is retried
             // there, not here.
             Owner::Ended { .. } => {}
         }
     }
     candidates.sort_by(|(a_at, a), (b_at, b)| {
-        a.newest_write_unix_ms
-            .cmp(&b.newest_write_unix_ms)
-            .then(b.exclusive_bytes.cmp(&a.exclusive_bytes))
+        b.exclusive_bytes
+            .cmp(&a.exclusive_bytes)
+            .then(a.newest_write_unix_ms.cmp(&b.newest_write_unix_ms))
             .then(entries[*a_at].name.cmp(&entries[*b_at].name))
     });
     let why = format!(
@@ -574,6 +709,7 @@ fn pressure_pass(
         removed,
         kept_live,
         kept_quiet,
+        kept_small,
     })
 }
 
@@ -600,7 +736,8 @@ pub async fn maintain(orch: &Orchestrator) {
 /// The pass itself, over `root` with `free` reading the volume, so a test can
 /// stage both. Closes the portable scratch of every ended node, removes every
 /// ended residence, and, when the census is stale or the volume is under the
-/// pressure line, measures every entry and takes unowned ones under pressure.
+/// pressure line, measures every entry, takes unowned ones seven days quiet,
+/// and then takes further unowned ones under pressure.
 pub(crate) async fn tick<F>(
     orch: &Orchestrator,
     root: PathBuf,
@@ -682,18 +819,21 @@ pub(crate) async fn tick<F>(
         let pressured = free().is_some_and(|free_bytes| lines.band(free_bytes).is_some());
         let measured = census_stale || pressured;
         let mut pressure = None;
+        let mut quiet = Vec::new();
         if measured {
             for entry in &mut entries {
                 entry.footprint = Some(measure(&entry.path));
             }
+            // Before pressure, so its accounting sees only what is left.
+            quiet = remove_quiet_unowned(&root, &mut entries, now_unix_ms);
             if pressured {
                 pressure = pressure_pass(&root, &mut entries, lines, now_unix_ms, &free);
             }
         }
-        (entries, removals, measured, pressure)
+        (entries, removals, quiet, measured, pressure)
     })
     .await;
-    let (entries, removals, measured, pressure) = match work {
+    let (entries, removals, quiet, measured, pressure) = match work {
         Ok(done) => done,
         Err(error) => {
             log::warn!("scratch: maintenance pass failed: {error}");
@@ -707,6 +847,13 @@ pub(crate) async fn tick<F>(
     }
     while report.removals.len() > REMOVALS_KEPT {
         report.removals.pop_front();
+    }
+    for removal in quiet {
+        report.quiet_reclaimed.add(&removal.footprint);
+        report.quiet_removals.push_back(removal);
+    }
+    while report.quiet_removals.len() > REMOVALS_KEPT {
+        report.quiet_removals.pop_front();
     }
     if measured {
         report.census = Some(Census {

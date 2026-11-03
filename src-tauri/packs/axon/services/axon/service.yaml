@@ -1,0 +1,39 @@
+name: Axon
+description: Drives desktop apps for agents through the accessibility layer.
+runtime: native
+placement: per-machine
+callback: none
+transport: mcp-stdio
+args: [mcp]
+artifacts:
+  version: 0.3.6
+  prove: [--version]
+  targets:
+    aarch64-apple-darwin:
+      url: https://github.com/bleugreen/axon/releases/download/v0.3.6/Axon-0.3.6-macos-aarch64.zip
+      sha256: 5748ce7e08ee1e521fb4044ffa30577acf588a02d368a2f3d2bb459264d9c141
+      size: 5914115
+      archive: zip
+      executable: Axon.app/Contents/Resources/bin/axon
+    x86_64-unknown-linux-gnu:
+      url: https://github.com/bleugreen/axon/releases/download/v0.3.6/axon-linux-0.3.6-linux-x86_64.tar.gz
+      sha256: eb5765e715747caccda94ba30266d6d8616861bc9893ca152700546db938df54
+      size: 4294953
+      archive: tar.gz
+      executable: axon-linux-0.3.6-linux-x86_64/axon-linux
+    x86_64-pc-windows-msvc:
+      url: https://github.com/bleugreen/axon/releases/download/v0.3.6/axon-win-0.3.6-windows-x86_64.zip
+      sha256: 19b03900377a2c5e266fde4ec477f3900b8bf24ac605ff2ea2b6daf2873b3b21
+      size: 2255745
+      archive: zip
+      executable: axon-win-0.3.6-windows-x86_64/axon-win.exe
+probe:
+  args: [status, --json]
+  every: 5m
+  ready: /daemon/ready
+  reason: [/daemon/reason, /reason, /session/reason]
+  waitingForOperator:
+    - permission-denied
+    - accessibility-permission-denied
+    - no-graphical-session
+    - no-interactive-session

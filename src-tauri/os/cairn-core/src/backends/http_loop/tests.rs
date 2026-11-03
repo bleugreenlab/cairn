@@ -2,7 +2,10 @@ use super::persist::{
     store_assistant_tool_call, store_tool_result, tool_call_usage, TranscriptSink,
 };
 use super::scripted::{self, chat_text, chat_tool_calls_with_ids};
-use super::tools::{collapse_envelope_text, prepare_tool_call, render_tool_result, PreparedCall};
+use super::tools::{
+    collapse_envelope_text, model_callback_request, prepare_tool_call, render_tool_result,
+    PreparedCall,
+};
 use super::{HttpUsageExt, TurnToolCall, TurnUsage, WireAdapter};
 use crate::agent_process::process::AgentProcessState;
 use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
@@ -196,6 +199,27 @@ fn prepare_tool_call_dispatches_valid_call() {
             assert!(!repaired_args);
         }
         PreparedCall::Reject(_) => panic!("valid call should dispatch"),
+    }
+}
+
+/// The loop hands every result back to the model, so every verb it dispatches
+/// is stamped model-facing; a missing stamp would leave the run's queued
+/// steers undelivered until the turn ends.
+#[test]
+fn every_verb_the_loop_dispatches_is_stamped_model_facing() {
+    let call = tool_call("read", "{}");
+    for (verb, payload, tool) in [
+        ("read", json!({"paths": ["file:a"]}), "read_batch"),
+        ("read", json!({"uri": "file:a"}), "read"),
+        ("write", json!({"changes": []}), "write"),
+        ("run", json!({"commands": [{"command": "true"}]}), "run"),
+    ] {
+        let request = model_callback_request("/work", "run-1", &call, verb, payload);
+        assert!(request.is_model_facing(), "{verb}: {:?}", request.payload);
+        assert_eq!(request.tool, tool, "{verb}");
+        assert_eq!(request.run_id.as_deref(), Some("run-1"));
+        assert_eq!(request.cwd, "/work");
+        assert_eq!(request.tool_use_id.as_deref(), Some("call-1"));
     }
 }
 

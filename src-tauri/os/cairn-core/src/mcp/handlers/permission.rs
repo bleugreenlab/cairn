@@ -1133,23 +1133,36 @@ pub fn deny_response(message: &str) -> String {
 /// Path: run → job → execution → snapshot → agent.fence, applying
 /// [`Fence::default`] when the field is `None`. The run ID is routed to its
 /// owning private or team database before reading the execution snapshot.
-/// Returns `None` when the authenticated coordinate cannot resolve.
+/// Returns `None` when the authenticated coordinate cannot resolve; the reason
+/// is [`fence_policy_for_run`]'s.
 pub(crate) async fn resolve_fence_policy(
     orch: &Orchestrator,
     run_id: Option<&str>,
 ) -> Option<Fence> {
-    let run_id = run_id?.to_string();
+    fence_policy_for_run(orch, run_id?).await.ok()
+}
+
+/// [`resolve_fence_policy`], saying which link of the walk did not resolve.
+///
+/// The walk only answers for a job whose OWN agent some execution snapshot
+/// names, so an unresolvable fence is nearly always a job that started without
+/// that invariant being established. Naming the missing link is what turns a
+/// refused `run` batch from a dead end into a pointer at the path that skipped it.
+pub(crate) async fn fence_policy_for_run(
+    orch: &Orchestrator,
+    run_id: &str,
+) -> Result<Fence, String> {
     // A live service run is fenced before any lookup that could fail.
-    if orch.project_services.runs.get(&run_id).is_some() {
-        return Some(Fence::Deny);
+    if orch.project_services.runs.get(run_id).is_some() {
+        return Ok(Fence::Deny);
     }
-    let owning_db = crate::execution::routing::routing_db_for_id(&orch.db, &run_id)
+    let owning_db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
         .await
-        .ok()?;
+        .map_err(|e| format!("the run's database could not be resolved ({e})"))?;
 
     let (agent_config_id, execution_id) = owning_db
         .read(|conn| {
-            let run_id = run_id.clone();
+            let run_id = run_id.to_string();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
@@ -1170,19 +1183,18 @@ pub(crate) async fn resolve_fence_policy(
             })
         })
         .await
-        .ok()
-        .flatten()?;
+        .map_err(|e| format!("the run's job could not be read ({e})"))?
+        .ok_or_else(|| "the run has no job".to_string())?;
 
     // A project service runs merged code on behalf of whoever calls it, so its
     // fence is fixed: never a prompt, never allowed. It has no execution
-    // snapshot to fall through to, and must not reach the `None` below.
+    // snapshot to fall through to, and must not reach the refusals below.
     if agent_config_id.as_deref() == Some(crate::project_services::SERVICE_AGENT_CONFIG) {
-        return Some(Fence::Deny);
+        return Ok(Fence::Deny);
     }
 
-    // Look up the agent snapshot from the execution
-    let execution_id = execution_id?;
-    let agent_config_id = agent_config_id?;
+    let execution_id = execution_id.ok_or_else(|| "its job belongs to no execution".to_string())?;
+    let agent_config_id = agent_config_id.ok_or_else(|| "its job names no agent".to_string())?;
 
     let snapshot_json = owning_db
         .query_opt_text(
@@ -1190,12 +1202,16 @@ pub(crate) async fn resolve_fence_policy(
             params![execution_id.as_str()],
         )
         .await
-        .ok()
-        .flatten()?;
+        .map_err(|e| format!("its execution could not be read ({e})"))?
+        .ok_or_else(|| "its execution has no snapshot".to_string())?;
 
-    let snapshot = crate::config::snapshot_migrate::load(&snapshot_json).ok()?;
-    let agent = snapshot.agents.get(&agent_config_id)?;
-    Some(agent.fence.unwrap_or_default())
+    let snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
+        .map_err(|e| format!("its execution snapshot could not be read ({e})"))?;
+    let agent = snapshot
+        .agents
+        .get(&agent_config_id)
+        .ok_or_else(|| format!("its agent '{agent_config_id}' is not in its execution snapshot"))?;
+    Ok(agent.fence.unwrap_or_default())
 }
 
 // ============================================================================
@@ -3201,30 +3217,15 @@ async fn mint_authority_grant(
     answer: &PermissionAnswer,
     resume: &PermissionResponseResume,
 ) -> Result<(), String> {
-    // The operator approved exactly the mutation they were shown, so the grant
-    // is narrowed to that mode: approving "reconfigure linear" must not silently
-    // also approve removing it.
-    let mut constraints = vec![
-        cairn_common::authorization::AuthorityConstraint::MutationModes {
-            modes: vec![detail.authority.mutation],
-        },
-    ];
-
-    // An MCP write is additionally bound to the identity of the configuration
-    // the prompt described, so the approval covers that server and not merely
-    // its name. A prompt that reached the operator without one cannot be turned
-    // into a grant at all: minting an unbound grant would either authorize an
-    // arbitrary later command or (with the structural floor in
-    // `AuthorityConstraintSet::covers`) authorize nothing while looking valid.
-    if detail.authority.requires_mcp_config_binding() {
-        let Some(fingerprint) = detail.authority.facts.mcp_config.clone() else {
-            return Err(
-                "this MCP approval does not name the configuration it would authorize".to_string(),
-            );
-        };
-        constraints
-            .push(cairn_common::authorization::AuthorityConstraint::McpConfig { fingerprint });
-    }
+    // The operator approved exactly what the card showed: the mutation mode,
+    // the MCP configuration for an MCP write, and, for Once, the act itself. A
+    // prompt that reached the operator without a fact its approval must bind
+    // cannot be turned into a grant at all.
+    let lifetime = answer.grant_lifetime();
+    let constraints = cairn_common::authorization::AuthorityConstraintSet::for_approval(
+        &detail.authority,
+        lifetime,
+    )?;
 
     let (decision_actor, appearance_snapshot) = answer.decision_attribution().ok_or_else(|| {
         "an authority grant requires authenticated decision attribution".to_string()
@@ -3243,7 +3244,7 @@ async fn mint_authority_grant(
         request: detail.authority.clone(),
         principal: detail.principal.clone(),
         audience: detail.audience.clone(),
-        lifetime: answer.grant_lifetime(),
+        lifetime,
         request_id: Some(record.id.clone()),
         turn_id: resume
             .successor_turn_id()
@@ -3265,7 +3266,7 @@ async fn mint_authority_grant(
             node_uri: detail.principal.node_uri.clone(),
             rationale: None,
         },
-        constraints: cairn_common::authorization::AuthorityConstraintSet::new(constraints),
+        constraints,
     };
     // Grants live in the private database on every path, so what enforcement
     // reads is what the grant list shows and what revocation reaches.

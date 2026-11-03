@@ -938,7 +938,7 @@ async fn cost_db() -> LocalDb {
 
 /// Seed a job/session/run triple keyed by `suffix` for one backend+model.
 async fn seed_run(db: &LocalDb, suffix: &str, backend: &str, model: &str) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
             "INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
               VALUES ('job-{s}', 'proj', 'running', '{model}', 'builder', 'builder', 1, 1);
              INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
@@ -969,7 +969,7 @@ async fn add_event(
     let cost_sql = cost.map_or_else(|| "NULL".to_string(), |c| c.to_string());
     // `sequence` is allocated here rather than hardcoded so a run can carry more
     // than one seeded event: `events(run_id, sequence)` is UNIQUE (CAIRN-3290).
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
@@ -2242,7 +2242,7 @@ async fn ins_ev(
     cost: Option<f64>,
 ) {
     let cost_sql = cost.map_or_else(|| "NULL".to_string(), |c| c.to_string());
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
@@ -2617,13 +2617,19 @@ async fn seam_insert(db: &LocalDb, ev: EventInsert) {
     db.write(|conn| {
         let ev = ev.clone();
         Box::pin(async move {
+            let reported_model = queries::reported_model_column(
+                &ev.event_type,
+                ev.parent_tool_use_id.as_deref(),
+                &ev.data,
+            );
             let count = conn
                 .execute(
                     "INSERT INTO events(
                     id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
-                    cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    cache_create_tokens, output_tokens, thinking_tokens, turn_id, cost_usd,
+                    reported_model
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                     params![
                         ev.id.as_str(),
                         ev.run_id.as_str(),
@@ -2640,7 +2646,8 @@ async fn seam_insert(db: &LocalDb, ev: EventInsert) {
                         ev.output_tokens,
                         ev.thinking_tokens,
                         ev.turn_id.as_deref(),
-                        ev.cost_usd
+                        ev.cost_usd,
+                        reported_model.as_deref()
                     ],
                 )
                 .await?;
@@ -2926,7 +2933,8 @@ async fn haiku_five_five_prices_each_request_at_its_prompt_tier() {
             let economics = model_role_economics(&db, &Scope::default(), &TimeRange::default())
                 .await
                 .unwrap();
-            let by_model = econ(&economics.by_model, model).cost_usd;
+            // The alias's own generation is the alias, so both key as `haiku`.
+            let by_model = econ(&economics.by_model, "haiku").cost_usd;
             assert!(
                 (by_model - (short_cost + long_cost)).abs() < 1e-12,
                 "{ctx}: economics cost {by_model}"
@@ -3293,4 +3301,263 @@ fn bucket_parses_hour() {
     assert_eq!(Bucket::parse(Some("HOUR")), Bucket::Hour);
     assert_eq!(Bucket::parse(Some("week")), Bucket::Week);
     assert_eq!(Bucket::parse(None), Bucket::Day);
+}
+
+// --- Model keys: one key per model, attributed when the job names none ---
+
+/// Seed a job/session/run triple keyed by `suffix` with an explicit (possibly
+/// NULL) model and stored selection, as SQL literals.
+async fn seed_job(db: &LocalDb, suffix: &str, model_sql: &str, selection_sql: &str) {
+    db.execute_script(format!(
+        "INSERT INTO jobs(id, project_id, status, model, selection, node_name, agent_config_id,
+                          created_at, updated_at)
+          VALUES ('job-{suffix}', 'proj', 'running', {model_sql}, {selection_sql}, 'thread',
+                  'thread', 1, 1);
+         INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+          VALUES ('sess-{suffix}', 'job-{suffix}', 'claude', 'open', 1, 1, 1);
+         INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+          VALUES ('run-{suffix}', 'proj', 'job-{suffix}', 'exited', 'sess-{suffix}', 1, 1);"
+    ))
+    .await
+    .unwrap();
+}
+
+/// An assistant event on `run-{suffix}` carrying `data` and `tokens` of input.
+fn assistant(id: &str, suffix: &str, seq: i32, ts: i32, tokens: i32, data: &str) -> EventInsert {
+    let mut ev = ev_insert(
+        id,
+        &format!("run-{suffix}"),
+        &format!("sess-{suffix}"),
+        seq,
+        "assistant",
+        ts,
+        tokens,
+        0,
+        0,
+        0,
+        0,
+        None,
+    );
+    ev.data = data.to_string();
+    ev
+}
+
+fn claude_message(model: &str) -> String {
+    format!(r#"{{"eventType":"assistant","raw":{{"message":{{"model":"{model}"}}}}}}"#)
+}
+
+async fn rollup_models(db: &LocalDb) -> Vec<(Option<String>, i64)> {
+    db.query_all(
+        "SELECT model, SUM(billable_tokens) FROM token_rollup GROUP BY model ORDER BY model",
+        (),
+        |row| Ok((row.opt_text(0)?, row.i64(1)?)),
+    )
+    .await
+    .unwrap()
+}
+
+/// Re-derive every run from `events`, as a reopened historical backfill does.
+async fn refold(db: &LocalDb) {
+    db.execute("DELETE FROM token_rollup_runs", ())
+        .await
+        .unwrap();
+    queries::fold_token_rollup(db).await.unwrap();
+}
+
+/// One session whose model is named three ways over its life (the concrete id
+/// the CLI reported while the job had no model, then `Opus` from a model edit,
+/// then `opus`), beside another job on `opus[1m]`, is one Opus series: the
+/// rollup keys all four under the catalog id, through the insert seam and
+/// after a full re-fold alike.
+#[tokio::test]
+async fn split_model_labels_roll_up_under_one_key() {
+    let db = cost_db().await;
+    seed_job(&db, "s", "NULL", "NULL").await;
+    seed_job(&db, "t", "'opus[1m]'", "NULL").await;
+
+    seam_insert(
+        &db,
+        assistant("s1", "s", 1, 100, 10, &claude_message("claude-opus-5-5")),
+    )
+    .await;
+    db.execute("UPDATE jobs SET model = 'Opus' WHERE id = 'job-s'", ())
+        .await
+        .unwrap();
+    seam_insert(&db, assistant("s2", "s", 2, 110, 20, "{}")).await;
+    db.execute("UPDATE jobs SET model = 'opus' WHERE id = 'job-s'", ())
+        .await
+        .unwrap();
+    seam_insert(&db, assistant("s3", "s", 3, 120, 40, "{}")).await;
+    seam_insert(&db, assistant("t1", "t", 1, 100, 80, "{}")).await;
+
+    let expected = vec![(Some("opus".to_string()), 150)];
+    assert_eq!(
+        rollup_models(&db).await,
+        expected,
+        "through the insert seam"
+    );
+    let incremental = dump_rollup(&db).await;
+    refold(&db).await;
+    assert_eq!(rollup_models(&db).await, expected, "after a re-fold");
+    assert_eq!(incremental, dump_rollup(&db).await);
+
+    let points =
+        tokens_by_model_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+    assert!(points.iter().all(|p| p.model == "opus"), "{points:?}");
+    assert_eq!(points.iter().map(|p| p.billable_tokens).sum::<i64>(), 150);
+}
+
+/// A job whose launch fact is gone is attributed from its stored selection.
+/// A job that selected a model is keyed by that selection even when the
+/// provider reports another, and a malformed selection leaves its events
+/// unattributed without failing the fold.
+#[tokio::test]
+async fn a_model_less_job_is_attributed_from_its_selection_then_its_reported_model() {
+    let db = cost_db().await;
+    seed_job(
+        &db,
+        "sel",
+        "NULL",
+        r#"'{"chosen":{"backend":"claude","model":"Sonnet"},"provenance":"lg: top of allotment"}'"#,
+    )
+    .await;
+    seed_job(&db, "pin", "'haiku'", "NULL").await;
+    seed_job(&db, "rep", "NULL", "NULL").await;
+    seed_job(&db, "bad", "NULL", "'not json'").await;
+
+    seam_insert(&db, assistant("sel1", "sel", 1, 100, 1, "{}")).await;
+    seam_insert(
+        &db,
+        assistant("pin1", "pin", 1, 100, 2, &claude_message("claude-opus-5-5")),
+    )
+    .await;
+    seam_insert(
+        &db,
+        assistant(
+            "rep1",
+            "rep",
+            1,
+            100,
+            4,
+            &claude_message("claude-fable-5-1"),
+        ),
+    )
+    .await;
+    // The CLI's own messages name no model.
+    seam_insert(
+        &db,
+        assistant("rep2", "rep", 2, 110, 8, &claude_message("<synthetic>")),
+    )
+    .await;
+    seam_insert(&db, assistant("bad1", "bad", 1, 100, 16, "{}")).await;
+
+    let expected = vec![
+        (None, 24),
+        (Some("fable".to_string()), 4),
+        (Some("haiku".to_string()), 2),
+        (Some("sonnet".to_string()), 1),
+    ];
+    assert_eq!(
+        rollup_models(&db).await,
+        expected,
+        "through the insert seam"
+    );
+    refold(&db).await;
+    assert_eq!(rollup_models(&db).await, expected, "after a re-fold");
+}
+
+/// Events stored before `events.reported_model` existed are attributed by the
+/// reopened historical backfill, archived ones included: their body is only an
+/// envelope in `data`, so the backfill reads them reconstructed. A sub-agent's
+/// event is not a billed turn and gets no column. The archived event is an
+/// older Sonnet, so it keeps its own key (and price) rather than `sonnet`'s.
+#[tokio::test]
+async fn historical_backfill_attributes_model_less_runs_including_archived_events() {
+    let db = cost_db().await;
+    seed_job(&db, "old", "NULL", "NULL").await;
+    let archived_body = claude_message("claude-sonnet-4-5-20250929");
+    let blob = cairn_db::storage::events::compress(archived_body.as_bytes()).unwrap();
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+             parent_tool_use_id, created_at, input_tokens, storage_mode, data_blob, codec)
+         VALUES ('arch', 'run-old', 'sess-old', 1, 100, 'assistant',
+             '{\"archived\":\"zstd\",\"eventType\":\"assistant\",\"toolUseId\":null}',
+             NULL, 100, 3, 'zstd', ?1, 'zstd_v1')",
+        (blob,),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+             parent_tool_use_id, created_at, input_tokens)
+         VALUES ('hot', 'run-old', 'sess-old', 2, 110, 'assistant', ?1, NULL, 110, 5),
+                ('child', 'run-old', 'sess-old', 3, 120, 'assistant', ?1, 'tool-1', 120, 7)",
+        (claude_message("claude-opus-5-5"),),
+    )
+    .await
+    .unwrap();
+
+    run_historical_backfill(&db).await.unwrap();
+
+    let reported = db
+        .query_all(
+            "SELECT id, reported_model FROM events WHERE run_id = 'run-old' ORDER BY sequence",
+            (),
+            |row| Ok((row.text(0)?, row.opt_text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reported,
+        vec![
+            (
+                "arch".to_string(),
+                Some("claude-sonnet-4-5-20250929".to_string())
+            ),
+            ("hot".to_string(), Some("claude-opus-5-5".to_string())),
+            ("child".to_string(), None),
+        ]
+    );
+    assert_eq!(
+        rollup_models(&db).await,
+        vec![
+            (Some("claude-sonnet-4-5-20250929".to_string()), 3),
+            (Some("opus".to_string()), 5),
+        ]
+    );
+}
+
+/// Every Claude alias folds its own spellings (upper case, its priced
+/// generation's concrete id, that id date-stamped) and nothing else: an older
+/// generation is another model at another price and keys under its own id.
+#[tokio::test]
+async fn every_claude_alias_keys_its_own_spellings_and_only_its_generation() {
+    let db = cost_db().await;
+    let mut expected: Vec<(Option<String>, i64)> = Vec::new();
+    for (i, (alias, concrete)) in pricing::ALIAS_GENERATIONS.iter().enumerate() {
+        let upper = alias.to_uppercase();
+        seed_job(&db, &format!("{i}"), &format!("'{upper}'"), "NULL").await;
+        seed_job(&db, &format!("{i}c"), "NULL", "NULL").await;
+        seed_job(&db, &format!("{i}d"), "NULL", "NULL").await;
+        seed_job(&db, &format!("{i}o"), "NULL", "NULL").await;
+        let older = format!("claude-{alias}-1-0");
+        for (id, suffix, data) in [
+            (format!("u{i}"), format!("{i}"), "{}".to_string()),
+            (format!("c{i}"), format!("{i}c"), claude_message(concrete)),
+            (
+                format!("d{i}"),
+                format!("{i}d"),
+                claude_message(&format!("{concrete}-20990101")),
+            ),
+            (format!("o{i}"), format!("{i}o"), claude_message(&older)),
+        ] {
+            seam_insert(&db, assistant(&id, &suffix, 1, 100, 1, &data)).await;
+        }
+        expected.push((Some(alias.to_string()), 3));
+        expected.push((Some(older), 1));
+    }
+    expected.sort();
+    assert_eq!(rollup_models(&db).await, expected);
 }

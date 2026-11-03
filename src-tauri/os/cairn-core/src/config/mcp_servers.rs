@@ -738,6 +738,7 @@ mod tests {
             expires_at: Some(chrono::Utc::now().timestamp() - 10),
             scopes: vec![],
             needs_scopes: vec![],
+            rejected_at: None,
         };
         crate::mcp::oauth::store::save("readiness-linear", &auth).unwrap();
         assert!(!resolve_mcp_servers(ws.path(), None).contains_key("readiness-linear"));
@@ -749,6 +750,58 @@ mod tests {
         assert!(workspace_mcp_entries(ws.path())["readiness-linear"]
             .not_ready
             .is_none());
+    }
+
+    /// A credential present and unexpired can still be dead: the provider
+    /// revoked it. Presence passes the static gate, so the resource's `401` is
+    /// what withdraws the server, and authorizing again is what restores it.
+    #[tokio::test]
+    async fn a_revoked_credential_withdraws_an_oauth_pack_server_until_reauthorized() {
+        use crate::mcp::oauth::store::{self, Rejection, StoredAuth};
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "linear",
+            "mcpServers:\n  revoked-linear:\n    type: http\n    url: https://mcp.example.test/mcp\n    oauth:\n      scopes: []\n",
+        );
+        let auth = StoredAuth {
+            issuer: Some("https://auth.example.test".into()),
+            resource: "https://mcp.example.test/mcp".into(),
+            authorization_endpoint: "https://auth.example.test/authorize".into(),
+            token_endpoint: "https://auth.example.test/token".into(),
+            registration_endpoint: None,
+            client_id: "client".into(),
+            client_secret: None,
+            access_token: "revoked-upstream".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: vec![],
+            needs_scopes: vec![],
+            rejected_at: None,
+        };
+        store::save("revoked-linear", &auth).unwrap();
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("revoked-linear"));
+
+        assert_eq!(
+            store::reject("revoked-linear", Some("revoked-upstream"), true).await,
+            Rejection::NeedsAuth
+        );
+        assert!(!resolve_mcp_servers(ws.path(), None).contains_key("revoked-linear"));
+        assert_eq!(
+            workspace_mcp_entries(ws.path())["revoked-linear"].not_ready,
+            Some(NotReady::NeedsAuth)
+        );
+
+        store::save(
+            "revoked-linear",
+            &StoredAuth {
+                access_token: "reauthorized".into(),
+                ..auth
+            },
+        )
+        .unwrap();
+        assert!(resolve_mcp_servers(ws.path(), None).contains_key("revoked-linear"));
     }
 
     /// Deleting a pack-provided server removes THAT server, not the pack around

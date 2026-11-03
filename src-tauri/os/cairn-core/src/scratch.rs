@@ -19,10 +19,11 @@
 //! the platform temp root this tree used to sit under contributed an opaque
 //! per-user hash segment to every one of them and nothing else.
 //!
-//! The root is outside the platform temp dirs the fence grants wholesale, so
-//! `services::sandbox::default_writable_extra` grants it by name — a write here
-//! remains in-bounds for both `run` (OS sandbox) and the `write` verb, and takes
-//! no prompt.
+//! The fence does not grant the root. A host spawn is granted exactly its own
+//! job directory, which it exports as `TMPDIR`
+//! (`services::sandbox::SandboxPolicy::grant_tmpdir`), and the `write` verb
+//! treats that directory as in-sandbox. A write anywhere else under the root
+//! is refused by name (`services::sandbox::scratch_refusal`).
 //!
 //! ## Not a security boundary
 //!

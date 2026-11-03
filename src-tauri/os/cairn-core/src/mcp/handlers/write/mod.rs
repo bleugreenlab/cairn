@@ -870,6 +870,7 @@ async fn handle_write_attempt(
                     fence_mode @ (Fence::Ask | Fence::Deny),
                 ) => {
                     let residence = std::path::Path::new(&request.cwd);
+                    let in_sandbox = in_sandbox_write_roots(residence);
                     let mut any_escape = false;
                     for (index, item) in payload.changes.iter().enumerate() {
                         if !matches!(target_family(&item.target), Ok(TargetFamily::File)) {
@@ -903,10 +904,7 @@ async fn handle_write_attempt(
                         // in-sandbox (parity with a shell write under `run`) and
                         // takes no prompt. Mark the escape so the apply path
                         // permits the absolute target, but don't raise the fence.
-                        if crate::mcp::file_targets::path_within_any(
-                            &full,
-                            &crate::services::sandbox::default_writable_extra(),
-                        ) {
+                        if crate::mcp::file_targets::path_within_any(&full, &in_sandbox) {
                             any_escape = true;
                             continue;
                         }
@@ -2790,6 +2788,52 @@ async fn handle_write_attempt(
         let _ = replay::finalize_owned_report(&orch.db.local, call, owner, &result).await;
     }
     result
+}
+
+/// What a fenced `write` may target by absolute path without a prompt: what a
+/// shell write under `run` from the same directory may write. That is the
+/// static carve-outs, plus `residence` when it is a job's own directory under
+/// the scratch root, which a host spawn is granted as its `TMPDIR`. The rest of
+/// the scratch root is refused by the fence.
+fn in_sandbox_write_roots(residence: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = crate::services::sandbox::default_writable_extra();
+    // Strictly beneath the root: the root itself is no job's.
+    if residence
+        .parent()
+        .is_some_and(crate::services::sandbox::scratch_refusal::is_scratch_root_write)
+    {
+        roots.push(residence.to_path_buf());
+    }
+    roots
+}
+
+#[cfg(test)]
+mod in_sandbox_write_tests {
+    use super::in_sandbox_write_roots;
+    use crate::mcp::file_targets::path_within_any;
+
+    #[test]
+    fn a_jobs_own_scratch_dir_is_in_sandbox_and_its_siblings_are_not() {
+        let root = cairn_common::scratch::scratch_root();
+        // A job's directory exists before anything writes into it, and the
+        // classification resolves a target through its existing ancestors.
+        let own = root.join(format!("P.1.1.builder-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&own).unwrap();
+        let roots = in_sandbox_write_roots(&own);
+        assert!(path_within_any(&own.join("notes.md"), &roots));
+        assert!(!roots.contains(&root));
+        assert!(!roots.contains(&root.join("triome-45-measure")));
+
+        // A cwd that is the root itself, or no scratch dir at all, adds nothing.
+        assert_eq!(
+            in_sandbox_write_roots(&root),
+            crate::services::sandbox::default_writable_extra()
+        );
+        assert_eq!(
+            in_sandbox_write_roots(std::path::Path::new("/project/live")),
+            crate::services::sandbox::default_writable_extra()
+        );
+    }
 }
 
 #[cfg(test)]

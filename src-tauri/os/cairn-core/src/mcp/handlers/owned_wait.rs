@@ -5,6 +5,9 @@
 
 use super::durable_suspend::{self, Condition, Record};
 use super::run::{ChecksWaitEvent, TerminalWaitEvent, WaitDuration, WaitFor};
+use super::terminal_ref::{
+    project_key_of_home, resolve_terminal_ref, terminal_not_found, TerminalCaller, TerminalOwner,
+};
 use super::tool_use_correlation::{claim_tool_use_id, Claim};
 use crate::execution::checks_settlement::{
     node_checks_settlement, resolve_checks_target, ChecksSnapshot, Settlement, VERDICTLESS_DWELL_MS,
@@ -108,10 +111,11 @@ pub(crate) async fn handle_owned_wait(
     // see [`bind_call`].
     let tool_use_id = request.tool_use_id.clone().unwrap_or_default();
     let created = chrono::Utc::now().timestamp_millis();
-    let (condition, deadline) = match normalize(orch, request, &ctx.job_id, wait, created).await {
-        Ok(value) => value,
-        Err(error) => return error,
-    };
+    let (condition, deadline) =
+        match normalize(orch, request, &db, &ctx.job_id, wait, created).await {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
     // A reissue of a wait whose answer was lost after it armed. Its turn is
     // already yielded (so the process reports no live turn), which is why the
     // turn is the one its active suspension belongs to.
@@ -281,6 +285,7 @@ async fn bind_call(db: &LocalDb, record: Record, wait: &WaitFor) -> Result<Recor
 async fn normalize(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
+    db: &LocalDb,
     caller_job_id: &str,
     wait: &WaitFor,
     now: i64,
@@ -296,18 +301,6 @@ async fn normalize(
             phrase,
             ..
         } => {
-            let uri = if reference.starts_with("cairn:~/") {
-                let home = super::run_context::lookup_home_uri_routed(&orch.db, request).await?;
-                format!("{}{}", home.trim_end_matches('/'), &reference[7..])
-            } else {
-                reference.clone()
-            };
-            let slug = uri
-                .rsplit_once("/terminal/")
-                .map(|v| v.1)
-                .filter(|v| !v.is_empty() && !v.contains('/'))
-                .ok_or("terminal ref must be a canonical terminal URI")?
-                .to_string();
             match on {
                 TerminalWaitEvent::Exit if phrase.is_some() => {
                     return Err("terminal exit wait does not accept phrase".into())
@@ -319,10 +312,28 @@ async fn normalize(
                 }
                 _ => {}
             }
+            let home = super::run_context::lookup_home_uri_routed(&orch.db, request).await?;
+            let project_key = project_key_of_home(&home)?;
+            let caller = TerminalCaller {
+                job_id: caller_job_id,
+                home: &home,
+                project_key: &project_key,
+            };
+            let target = resolve_terminal_ref(db, &caller, reference).await?;
+            // Refused now, naming the scope searched, rather than parking a turn
+            // on a terminal the poller can never find.
+            let present =
+                super::terminal::lookup_terminal_for_wake(db, &target.owner, &target.slug)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if present.is_none() {
+                return Err(terminal_not_found(db, &caller, &target).await);
+            }
             Ok((
                 Condition::Terminal {
-                    uri,
-                    slug,
+                    uri: target.uri,
+                    slug: target.slug,
+                    owner: Some(target.owner),
                     on: on.clone(),
                     phrase: phrase.clone(),
                 },
@@ -425,16 +436,22 @@ pub(super) async fn trigger(
         Condition::Terminal {
             uri,
             slug,
+            owner,
             on,
             phrase,
-        } => loop {
-            if let Some(v) =
-                terminal(&orch, &db, &r.job_id, uri, slug, on, phrase.as_deref()).await?
-            {
-                return Ok(v);
+        } => {
+            let owner = owner.clone().unwrap_or_else(|| TerminalOwner::Job {
+                job_id: r.job_id.clone(),
+            });
+            loop {
+                if let Some(v) =
+                    terminal(&orch, &db, &owner, uri, slug, on, phrase.as_deref()).await?
+                {
+                    return Ok(v);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await
             }
-            tokio::time::sleep(Duration::from_millis(100)).await
-        },
+        }
         Condition::Checks { uri, job_id, suite } => {
             checks(&orch, uri, job_id, suite.as_deref(), r.created).await
         }
@@ -580,44 +597,22 @@ fn settled_result(
 async fn terminal(
     orch: &Orchestrator,
     db: &LocalDb,
-    job: &str,
+    owner: &TerminalOwner,
     uri: &str,
     slug: &str,
     on: &TerminalWaitEvent,
     phrase: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let (j, s) = (job.to_string(), slug.to_string());
-    let row = db
-        .read(|c| {
-            let (j, s) = (j.clone(), s.clone());
-            Box::pin(async move {
-                let mut r = c
-                    .query(
-                        "SELECT session_id, status, exit_code, output_tail, exit_reason
-                         FROM job_terminals WHERE job_id = ?1 AND slug = ?2",
-                        params![j, s],
-                    )
-                    .await?;
-                r.next()
-                    .await?
-                    .map(|x| {
-                        Ok((
-                            x.text(0)?,
-                            x.text(1)?,
-                            x.opt_i64(2)?,
-                            x.opt_text(3)?,
-                            x.opt_text(4)?,
-                        ))
-                    })
-                    .transpose()
-            })
-        })
+    let row = super::terminal::lookup_terminal_for_wake(db, owner, slug)
         .await
         .map_err(|e| e.to_string())?;
-    let Some((sid, status, code, tail, reason)) = row else {
-        return Err(format!("Terminal not found: {uri}"));
+    let Some(row) = row else {
+        return Err(format!(
+            "Terminal not found: {uri} no longer exists in the scope this wait was armed against, so the wait can never fire"
+        ));
     };
-    let exited = status == "exited";
+    let (code, tail, reason) = (row.exit_code, row.output_tail, row.exit_reason);
+    let exited = row.status == "exited";
     // A terminal Cairn settled after proving its process gone says why, so the
     // waiting agent learns the command did not finish rather than reading a
     // missing exit code as one.
@@ -633,12 +628,10 @@ async fn terminal(
         )));
     }
     if matches!(on, TerminalWaitEvent::Output) {
-        let live = orch
-            .pty_state
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&sid).cloned())
+        let live = row
+            .session_id
+            .as_ref()
+            .and_then(|sid| orch.pty_state.sessions.lock().ok()?.get(sid).cloned())
             .and_then(|s| s.lock().ok()?.output_buffer.clone())
             .and_then(|b| {
                 let bytes: Vec<u8> = b.lock().ok()?.iter().copied().collect();
@@ -952,6 +945,7 @@ mod tests {
             &Condition::Terminal {
                 uri: "cairn://p/prj/1/1/builder/terminal/t".into(),
                 slug: "t".into(),
+                owner: None,
                 on: TerminalWaitEvent::Exit,
                 phrase: None,
             },
@@ -992,6 +986,7 @@ mod tests {
         let old = Condition::Terminal {
             uri: "cairn://p/prj/1/1/builder/terminal/t".into(),
             slug: "t".into(),
+            owner: None,
             on: TerminalWaitEvent::Exit,
             phrase: None,
         };
@@ -1077,6 +1072,7 @@ mod tests {
                 Condition::Terminal {
                     uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                     slug: "tests".into(),
+                    owner: None,
                     on: TerminalWaitEvent::Output,
                     phrase: Some("ready".into()),
                 },
@@ -1420,6 +1416,7 @@ mod tests {
                 Condition::Terminal {
                     uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                     slug: "tests".into(),
+                    owner: None,
                     on: TerminalWaitEvent::Exit,
                     phrase: None,
                 },
@@ -1464,6 +1461,7 @@ mod tests {
             Condition::Terminal {
                 uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                 slug: "tests".into(),
+                owner: None,
                 on: TerminalWaitEvent::Exit,
                 phrase: None,
             },
@@ -1497,6 +1495,87 @@ mod tests {
         assert_eq!(value["exitCode"], 7);
     }
 
+    /// The poller's half of the scope contract. The waiting node owns a running
+    /// `dev` and the project owns an exited `dev` that printed its readiness
+    /// line: a wait armed on the project terminal answers from the project row,
+    /// and one armed on the node's own keeps waiting on its running process.
+    #[tokio::test]
+    async fn a_project_terminal_wait_polls_the_project_row_not_a_same_slug_node_terminal() {
+        let orch = test_orchestrator().await;
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO job_terminals (id, job_id, session_id, command, status, created_at, slug, output_tail)
+                 VALUES ('t-node','job-1','sess-node','bun dev:instance','running',1,'dev','compiling cairn');
+                 INSERT INTO job_terminals (id, project_id, session_id, command, status, exit_code, created_at, exited_at, slug, output_tail)
+                 VALUES ('t-project','p','sess-project','bun dev:instance','exited',4,1,50,'dev','cairn_lib: app starting
+                 then it crashed');",
+            )
+            .await
+            .unwrap();
+        let project = |on: TerminalWaitEvent, phrase: Option<&str>| {
+            record(
+                Condition::Terminal {
+                    uri: "cairn://p/prj/terminal/dev".into(),
+                    slug: "dev".into(),
+                    owner: Some(TerminalOwner::Project {
+                        project_id: "p".into(),
+                    }),
+                    on,
+                    phrase: phrase.map(str::to_string),
+                },
+                None,
+            )
+        };
+        let answer = |result: String| serde_json::from_str::<serde_json::Value>(&result).unwrap();
+
+        let exit = answer(
+            trigger(
+                orch.clone(),
+                orch.db.local.clone(),
+                project(TerminalWaitEvent::Exit, None),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(exit["outcome"], "exited", "{exit}");
+        assert_eq!(exit["exitCode"], 4, "{exit}");
+        assert_eq!(exit["terminal"], "cairn://p/prj/terminal/dev", "{exit}");
+
+        let output = answer(
+            trigger(
+                orch.clone(),
+                orch.db.local.clone(),
+                project(TerminalWaitEvent::Output, Some("cairn_lib: app starting")),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(output["outcome"], "matched", "{output}");
+
+        let node = record(
+            Condition::Terminal {
+                uri: "cairn://p/prj/1/1/builder/terminal/dev".into(),
+                slug: "dev".into(),
+                owner: Some(TerminalOwner::Job {
+                    job_id: "job-1".into(),
+                }),
+                on: TerminalWaitEvent::Exit,
+                phrase: None,
+            },
+            None,
+        );
+        let pending = tokio::time::timeout(
+            Duration::from_millis(300),
+            trigger(orch.clone(), orch.db.local.clone(), node),
+        )
+        .await;
+        assert!(
+            pending.is_err(),
+            "the node's own `dev` is still running; the project terminal's exit is not its exit"
+        );
+    }
+
     #[tokio::test]
     async fn missing_terminal_fails_before_any_durable_wait_exists() {
         let orch = test_orchestrator().await;
@@ -1507,6 +1586,7 @@ mod tests {
                 Condition::Terminal {
                     uri: "cairn://p/prj/1/1/builder/terminal/missing".into(),
                     slug: "missing".into(),
+                    owner: None,
                     on: TerminalWaitEvent::Exit,
                     phrase: None,
                 },

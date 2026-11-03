@@ -43,6 +43,7 @@ mod execution_supersession;
 mod executor_offer_lifecycle;
 mod flail_dedup;
 mod github_credentials;
+mod grant_revocation;
 mod issue_outcome;
 mod issue_status_resolution;
 mod issues;

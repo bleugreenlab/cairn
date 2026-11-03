@@ -11,6 +11,7 @@ pub(crate) mod authority;
 pub(crate) mod declaration;
 pub(crate) mod host;
 pub(crate) mod log;
+pub(crate) mod pack_source;
 pub(crate) mod protocol;
 pub(crate) mod rows;
 pub(crate) mod schedule;
@@ -36,20 +37,43 @@ pub(crate) enum ServiceOwner {
     /// Written by one thread at `cairn:~/services/<name>`. `id` keys every
     /// record the service has; `name` is the thread's address, for its home.
     Thread { id: String, name: String },
+    /// Shipped by an installed pack and run on one machine the fleet row
+    /// (`buildSlots.machineServices`) selects it on: one cell per machine.
+    /// Belongs to no project. `key` is `pack:<pack>@<machine>`, held so
+    /// [`Self::key`] can lend it; build one with [`Self::pack`].
+    Pack {
+        pack: String,
+        machine: String,
+        key: String,
+    },
 }
 
 impl ServiceOwner {
+    /// The pack `pack`'s services on the machine `machine`.
+    pub(crate) fn pack(pack: &str, machine: &str) -> Self {
+        ServiceOwner::Pack {
+            pack: pack.to_string(),
+            machine: machine.to_string(),
+            key: format!("pack:{pack}@{machine}"),
+        }
+    }
+
     pub(crate) fn thread_id(&self) -> Option<&str> {
         match self {
-            ServiceOwner::Project => None,
+            ServiceOwner::Project | ServiceOwner::Pack { .. } => None,
             ServiceOwner::Thread { id, .. } => Some(id),
         }
     }
 
-    /// The owner as one stored value: the thread's id, or empty for the
-    /// project (`service_log.owner_thread`, and the supervisor's cell key).
+    /// The owner as one stored value: the thread's id, empty for the project,
+    /// or `pack:<pack>@<machine>` (`service_log.owner_thread`, and the
+    /// supervisor's cell key).
     pub(crate) fn key(&self) -> &str {
-        self.thread_id().unwrap_or("")
+        match self {
+            ServiceOwner::Project => "",
+            ServiceOwner::Thread { id, .. } => id,
+            ServiceOwner::Pack { key, .. } => key,
+        }
     }
 
     /// The home a call from the owner itself acts for: the project, or the
@@ -60,6 +84,7 @@ impl ServiceOwner {
             ServiceOwner::Thread { name, .. } => {
                 cairn_common::uri::build_thread_uri(project_key, name)
             }
+            ServiceOwner::Pack { machine, .. } => executor_uri(machine),
         }
     }
 
@@ -72,9 +97,19 @@ impl ServiceOwner {
             ServiceOwner::Thread { name, .. } => {
                 cairn_common::uri::build_thread_service_uri(project_key, name, service)
             }
+            ServiceOwner::Pack { machine, .. } => executor_uri(machine),
         }
     }
 }
+
+/// A machine service's home: the machine it runs on.
+fn executor_uri(machine: &str) -> String {
+    format!("cairn://executors/{machine}")
+}
+
+/// The one refusal every project-only path gives a machine service.
+pub(crate) const MACHINE_SERVICE_REFUSAL: &str =
+    "machine services are reached over MCP, not called as a service";
 
 /// The runner's project-services state, held on the orchestrator.
 #[derive(Default)]

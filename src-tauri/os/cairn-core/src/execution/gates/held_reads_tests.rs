@@ -41,6 +41,30 @@ const FIRST_NUMBER: usize = 1000;
 const AUTHORED_GATE: &str =
     r#"{"fact":"check_verdict","check":"rust-tests","issue":"cairn://p/prj/1","verdict":"passed"}"#;
 
+/// A seeded gate: (predicate, satisfied, outcome, queue key).
+type SeededGate<'a> = (&'a str, bool, &'a str, Option<i64>);
+
+/// A seeded execution: (id, status, lifecycle, released_at, gates, job status).
+type SeededExecution<'a> = (
+    String,
+    &'a str,
+    &'a str,
+    Option<i64>,
+    Vec<SeededGate<'a>>,
+    Option<&'a str>,
+);
+
+/// A seeded gate row: (execution, gate seq, predicate, satisfied_at,
+/// last_outcome, queue key).
+type SeededGateRow<'a> = (
+    &'a str,
+    i64,
+    &'a str,
+    Option<i64>,
+    Option<&'a str>,
+    Option<i64>,
+);
+
 fn held_id(k: usize) -> String {
     format!("held-{k:04}")
 }
@@ -76,57 +100,51 @@ async fn seed(env: &Env, executions: usize) -> Vec<String> {
                         .await?;
                         // (id, status, lifecycle, released_at, gates as
                         // (predicate, satisfied, outcome, queue key), job status)
-                        let (id, status, lifecycle, released, gates, job): (
-                            String,
-                            &str,
-                            &str,
-                            Option<i64>,
-                            Vec<(&str, bool, &str, Option<i64>)>,
-                            Option<&str>,
-                        ) = if k < CAP_HELD {
-                            let key = Some(1_000_000 + k as i64);
-                            let mut gates = vec![(fleet.as_str(), false, "no_evidence", key)];
-                            if k < THREAD_CHILDREN {
-                                gates.push((focus.as_str(), false, "no_evidence", key));
-                            }
-                            (held_id(k), "held", "canonical", None, gates, None)
-                        } else {
-                            let id = format!("past-{k:04}");
-                            match k % 4 {
-                                1 => (
-                                    id,
-                                    "complete",
-                                    "canonical",
-                                    Some(1),
-                                    vec![(AUTHORED_GATE, true, "satisfied", None)],
-                                    Some("complete"),
-                                ),
-                                2 => (
-                                    id,
-                                    "held",
-                                    "superseded",
-                                    None,
-                                    vec![(AUTHORED_GATE, false, "no_evidence", None)],
-                                    None,
-                                ),
-                                3 if k % 40 == 3 => (
-                                    id,
-                                    "held",
-                                    "canonical",
-                                    None,
-                                    vec![(AUTHORED_GATE, false, "no_evidence", None)],
-                                    None,
-                                ),
-                                _ => (
-                                    id,
-                                    "complete",
-                                    "canonical",
-                                    None,
-                                    Vec::new(),
-                                    Some("complete"),
-                                ),
-                            }
-                        };
+                        let (id, status, lifecycle, released, gates, job): SeededExecution<'_> =
+                            if k < CAP_HELD {
+                                let key = Some(1_000_000 + k as i64);
+                                let mut gates = vec![(fleet.as_str(), false, "no_evidence", key)];
+                                if k < THREAD_CHILDREN {
+                                    gates.push((focus.as_str(), false, "no_evidence", key));
+                                }
+                                (held_id(k), "held", "canonical", None, gates, None)
+                            } else {
+                                let id = format!("past-{k:04}");
+                                match k % 4 {
+                                    1 => (
+                                        id,
+                                        "complete",
+                                        "canonical",
+                                        Some(1),
+                                        vec![(AUTHORED_GATE, true, "satisfied", None)],
+                                        Some("complete"),
+                                    ),
+                                    2 => (
+                                        id,
+                                        "held",
+                                        "superseded",
+                                        None,
+                                        vec![(AUTHORED_GATE, false, "no_evidence", None)],
+                                        None,
+                                    ),
+                                    3 if k % 40 == 3 => (
+                                        id,
+                                        "held",
+                                        "canonical",
+                                        None,
+                                        vec![(AUTHORED_GATE, false, "no_evidence", None)],
+                                        None,
+                                    ),
+                                    _ => (
+                                        id,
+                                        "complete",
+                                        "canonical",
+                                        None,
+                                        Vec::new(),
+                                        Some("complete"),
+                                    ),
+                                }
+                            };
                         conn.execute(
                             "INSERT INTO executions(id, recipe_id, issue_id, project_id, status,
                                                     started_at, seq, lifecycle, released_at,
@@ -268,9 +286,17 @@ async fn measure(name: &str, executions: usize) -> Legs {
     let view = queue_view(&env.orch).await.unwrap();
     let queue_view = started.elapsed();
     let listed: Vec<String> = view.held.iter().map(|q| q.execution_id.clone()).collect();
+    // Two lanes, neither served: alpha's three children and the shared lane's
+    // top-level rest take turns, alpha first by its head's key.
+    let (alpha, shared) = queued.split_at(THREAD_CHILDREN);
+    let mut rotation = Vec::new();
+    for round in 0..shared.len().max(alpha.len()) {
+        rotation.extend(alpha.get(round).cloned());
+        rotation.extend(shared.get(round).cloned());
+    }
     assert_eq!(
-        listed, queued,
-        "the queue lists the cap-held set, in queue order"
+        listed, rotation,
+        "the queue lists the cap-held set, in release order"
     );
 
     let started = Instant::now();
@@ -527,7 +553,9 @@ const REFERENCE_QUEUE_ROWS_SQL: &str = concat!(
     cairn_workflow::held_since_sql!(),
     ", ",
     cairn_workflow::fleet_order_key_sql!(),
-    ", i.parent_thread_id
+    ", i.parent_thread_id, ",
+    super::capacity::queue_pin_sql!(),
+    "
        FROM executions e
        LEFT JOIN issues i ON i.id = e.issue_id
        LEFT JOIN projects p ON p.id = i.project_id
@@ -541,11 +569,15 @@ const REFERENCE_THREAD_QUEUE_SQL: &str = concat!(
     cairn_workflow::held_since_sql!(),
     ", ",
     cairn_workflow::queue_key_sql!(),
+    ", ",
+    super::capacity::queue_pin_sql!(),
+    ", ",
+    cairn_workflow::fleet_order_key_sql!(),
     "
        FROM executions e JOIN issues i ON i.id = e.issue_id
       WHERE i.parent_thread_id = ?1 AND ",
     reference_cap_held_sql!(),
-    " ORDER BY 5, e.id"
+    " ORDER BY 7 DESC, 8, e.id"
 );
 
 const REFERENCE_HELD_EXECUTIONS_SQL: &str = concat!(
@@ -807,7 +839,7 @@ async fn matrix() -> crate::storage::LocalDb {
         ));
     }
     // (execution, gate seq, predicate, satisfied_at, last_outcome, queue key)
-    let gates: Vec<(&str, i64, &str, Option<i64>, Option<&str>, Option<i64>)> = vec![
+    let gates: Vec<SeededGateRow<'_>> = vec![
         (
             "e2-authored",
             0,

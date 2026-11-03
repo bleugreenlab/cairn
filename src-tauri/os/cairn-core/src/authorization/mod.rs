@@ -31,6 +31,7 @@ pub mod normalize;
 pub mod policy;
 pub mod prepare;
 pub mod protected;
+pub mod revoke;
 
 use std::sync::Arc;
 
@@ -737,20 +738,93 @@ mod tests {
                 issuer: "operator_prompt".to_string(),
                 ..Default::default()
             },
-            // Mirrors what `mint_authority_grant` actually attaches: the
-            // mutation the operator was shown, plus — for an MCP write — the
-            // configuration identity that write is bound to. A fixture that
+            // The same derivation `mint_authority_grant` uses. A fixture that
             // minted less than the real path does would test a grant the system
             // never issues.
-            constraints: AuthorityConstraintSet::new({
-                let mut constraints = vec![AuthorityConstraint::MutationModes {
-                    modes: vec![request.mutation],
-                }];
-                if let Some(fingerprint) = request.facts.mcp_config.clone() {
-                    constraints.push(AuthorityConstraint::McpConfig { fingerprint });
-                }
-                constraints
-            }),
+            constraints: AuthorityConstraintSet::for_approval(request, lifetime)
+                .expect("a fixture request names everything its approval binds"),
+        }
+    }
+
+    fn settings_value(value: serde_json::Value) -> AuthorityRequest {
+        normalize::workspace_settings_section_write(WORKSPACE_ID, "models", &value).unwrap()
+    }
+
+    /// A card shows one value; Once spends only on that value, and a different
+    /// value by the same run is asked about afresh.
+    #[tokio::test]
+    async fn a_once_grant_for_one_settings_value_does_not_cover_another() {
+        let actor = actor("authz-once-value.db").await;
+        let shown = settings_value(serde_json::json!({"pools": {"fast": ["a"]}}));
+        let other = settings_value(serde_json::json!({"pools": {"fast": ["b"]}}));
+        issue_grant(&actor.db, issue(&shown, AuthorityLifetimeKind::Once))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            gate(&actor, &other).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+        assert_eq!(
+            authorize(&actor, &other).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+        // The different value did not spend it: the shown value still lands,
+        // exactly once.
+        assert!(authorize(&actor, &shown).await.unwrap().is_allowed());
+        assert_eq!(
+            authorize(&actor, &shown).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+    }
+
+    /// The same for an MCP write: a Once approval of one configuration is not
+    /// spent by another configuration under the same name and mutation.
+    #[tokio::test]
+    async fn a_once_grant_for_one_mcp_configuration_does_not_cover_another() {
+        let actor = actor("authz-once-mcp.db").await;
+        let shown = mcp_request_with("linear", AuthorityMutation::Update, "config-a");
+        let other = mcp_request_with("linear", AuthorityMutation::Update, "config-b");
+        issue_grant(&actor.db, issue(&shown, AuthorityLifetimeKind::Once))
+            .await
+            .unwrap();
+        assert!(!authorize(&actor, &other).await.unwrap().is_allowed());
+        assert!(authorize(&actor, &shown).await.unwrap().is_allowed());
+    }
+
+    /// A Once grant persisted before the act binding existed carries no
+    /// `ExactAct`. It covers nothing, so the operator is asked again.
+    #[tokio::test]
+    async fn a_once_grant_that_binds_no_act_is_asked_about_again() {
+        let actor = actor("authz-once-legacy.db").await;
+        let request = settings_value(serde_json::json!(1));
+        let mut legacy = issue(&request, AuthorityLifetimeKind::Once);
+        legacy.constraints =
+            AuthorityConstraintSet::new(vec![AuthorityConstraint::MutationModes {
+                modes: vec![request.mutation],
+            }]);
+        issue_grant(&actor.db, legacy).await.unwrap();
+        assert_eq!(
+            gate(&actor, &request).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+    }
+
+    /// Standing means "this kind of act": it is minted without an act binding
+    /// and covers every value written to its section.
+    #[tokio::test]
+    async fn a_standing_grant_covers_every_value_of_its_section() {
+        let actor = actor("authz-standing-value.db").await;
+        let shown = settings_value(serde_json::json!(1));
+        let grant = issue_grant(&actor.db, issue(&shown, AuthorityLifetimeKind::Standing))
+            .await
+            .unwrap();
+        assert!(!grant.constraints.binds_exact_act());
+        for value in [serde_json::json!(1), serde_json::json!(2)] {
+            assert!(authorize(&actor, &settings_value(value))
+                .await
+                .unwrap()
+                .is_allowed());
         }
     }
 

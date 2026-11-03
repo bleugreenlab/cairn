@@ -996,7 +996,7 @@ mod tests {
 
     async fn seeded_db() -> (tempfile::TempDir, LocalDb) {
         let dir = tempfile::tempdir().unwrap();
-        let db = LocalDb::open_migrated_for_test(dir.path().join("db"))
+        let db = LocalDb::open_migrated_for_test(dir.path().join("attachments.db"))
             .await
             .unwrap();
         for sql in [
@@ -1533,7 +1533,9 @@ mod tests {
     #[tokio::test]
     async fn addresses_minted_against_image_refs_still_resolve() {
         let dir = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(dir.path().join("db")).await.unwrap();
+        let db = LocalDb::open(dir.path().join("attachments.db"))
+            .await
+            .unwrap();
         let before = TURSO_MIGRATIONS
             .iter()
             .take_while(|migration| migration.version() != "0227")
@@ -1601,7 +1603,7 @@ mod tests {
         let mut dirs = Vec::new();
         for _ in 0..2 {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = LocalDb::open_migrated_for_test(dir.path().join("db"))
+            let mut db = LocalDb::open_migrated_for_test(dir.path().join("attachments.db"))
                 .await
                 .unwrap();
             db.set_team_context(

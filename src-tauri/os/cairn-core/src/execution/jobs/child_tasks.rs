@@ -36,7 +36,8 @@ pub fn create_child_task(
     let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
 
     // ---- Load agent config from files -----------------------------------
-    let config_dir = config::get_config_dir()?;
+    // The same root the child's snapshot entry is resolved from below.
+    let config_dir = orch.config_dir.clone();
     let mut agent_config: AgentConfig = {
         let file_agent = match config_agents::get_agent(
             &config_dir,
@@ -101,7 +102,8 @@ pub fn create_child_task(
     // and refusing the spawn over it was substrate state failing a verb.
     let base_commit = parent_job.base_commit.clone();
 
-    run_db(insert_child_job_session_run(
+    let execution_id = run_db_borrowed(insert_child_with_agent_snapshot(
+        orch,
         db.clone(),
         ChildInsert {
             job_id: job_id.clone(),
@@ -126,6 +128,7 @@ pub fn create_child_task(
             task_index: None,
             now,
         },
+        project_path.as_deref(),
     ))?;
 
     orch.store_job_selection(&job_id, &record)?;

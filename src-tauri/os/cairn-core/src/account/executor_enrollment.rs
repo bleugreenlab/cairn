@@ -28,6 +28,9 @@ pub async fn token_may_open_handshake(db: &LocalDb, raw: &str) -> bool {
 pub async fn token_is_known(db: &LocalDb, raw: &str) -> bool {
     device_enrollment::token_is_known(db, DeviceKind::Executor, raw).await
 }
+pub async fn executor_name_for_token(db: &LocalDb, raw: &str) -> Option<String> {
+    device_enrollment::executor_name_for_token(db, DeviceKind::Executor, raw).await
+}
 pub async fn describe_unrecognized_bearer(db: &LocalDb, raw: &str) -> UnrecognizedBearer {
     device_enrollment::describe_unrecognized_bearer(db, DeviceKind::Executor, raw).await
 }

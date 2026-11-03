@@ -34,6 +34,7 @@ pub mod skills_resources;
 pub mod slug;
 pub(crate) mod target;
 pub mod terminal;
+pub(crate) mod terminal_ref;
 pub(crate) mod tool_use_correlation;
 pub mod watch;
 pub mod web;

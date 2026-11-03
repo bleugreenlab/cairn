@@ -4,6 +4,8 @@
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
+    hash::{BuildHasherDefault, Hasher},
+    ops::Range,
     sync::OnceLock,
 };
 use unicode_general_category::{get_general_category, GeneralCategory as G};
@@ -132,10 +134,32 @@ struct Doc {
     bytes: Vec<String>,
     contractions: Vec<String>,
 }
+/// A multiplicative hash for `char` keys. Every scalar the tiler reads costs a
+/// trie lookup, and SipHash's DoS resistance buys nothing over a vocabulary
+/// compiled into the binary. Nothing iterates these maps, so the hasher cannot
+/// move a count.
+#[derive(Default, Clone, Copy)]
+struct CharHasher(u64);
+impl Hasher for CharHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u32(u32::from(*byte));
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(n)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+type CharMap<V> = HashMap<char, V, BuildHasherDefault<CharHasher>>;
+type CharSet = HashSet<char, BuildHasherDefault<CharHasher>>;
+
 #[derive(Default)]
 struct Trie {
     end: bool,
-    next: HashMap<char, Trie>,
+    next: CharMap<Trie>,
 }
 impl Trie {
     fn add(&mut self, s: &str) {
@@ -148,15 +172,18 @@ impl Trie {
 }
 struct Model {
     trie: Trie,
-    units: HashSet<char>,
+    units: CharSet,
     bytes: HashSet<Vec<u8>>,
+    /// [`Model::unit_of`] for every ASCII scalar, which is nearly all of what
+    /// the tiler reads.
+    ascii_units: [u32; 128],
 }
 static MODEL: OnceLock<Model> = OnceLock::new();
 fn model() -> &'static Model {
     MODEL.get_or_init(|| {
         let d: Doc = serde_json::from_str(include_str!("../data/pieces_v4_7.json")).unwrap();
         let mut trie = Trie::default();
-        let mut units = HashSet::new();
+        let mut units = CharSet::default();
         for p in d.pieces {
             let p = parse(&p);
             let mut cs = p.chars();
@@ -172,15 +199,26 @@ fn model() -> &'static Model {
         for c in d.contractions {
             trie.add(&(c + &EOW.to_string()))
         }
-        Model {
+        let mut model = Model {
             trie,
             units,
             bytes: d.bytes.into_iter().map(|s| hex(&s)).collect(),
+            ascii_units: [0; 128],
+        };
+        for code in 0u8..128 {
+            model.ascii_units[usize::from(code)] = model.unit_of(char::from(code));
         }
+        model
     })
 }
 impl Model {
     fn unit(&self, c: char) -> u32 {
+        match self.ascii_units.get(c as usize) {
+            Some(cost) => *cost,
+            None => self.unit_of(c),
+        }
+    }
+    fn unit_of(&self, c: char) -> u32 {
         if matches!(c, BOW | EOW | SHIFT) {
             return 1;
         }
@@ -292,9 +330,17 @@ fn normalize(text: &str) -> Vec<Mark> {
     // separately and attach every produced scalar to the sequence's source end;
     // this keeps offsets monotonic and on original UTF-8 boundaries even when a
     // decomposed sequence contracts to one scalar.
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(text.len());
     let mut cluster: Vec<(char, usize)> = Vec::new();
     let flush = |cluster: &mut Vec<(char, usize)>, out: &mut Vec<Mark>| {
+        // NFC leaves a lone ASCII scalar as it is.
+        if let [(c, end)] = cluster.as_slice() {
+            if c.is_ascii() {
+                out.push(Mark { c: *c, end: *end });
+                cluster.clear();
+                return;
+            }
+        }
         if let Some(end) = cluster.last().map(|item| item.1) {
             let source: String = cluster.iter().map(|item| item.0).collect();
             out.extend(source.nfc().map(|c| Mark { c, end }));
@@ -302,6 +348,14 @@ fn normalize(text: &str) -> Vec<Mark> {
         }
     };
     for item in raw {
+        // An ASCII scalar is a starter, and no canonical composition takes one as
+        // its second element, so it always ends the cluster before it: the
+        // general test below would answer the same after two NFC passes.
+        if item.0.is_ascii() {
+            flush(&mut cluster, &mut out);
+            cluster.push(item);
+            continue;
+        }
         if canonical_combining_class(item.0) == 0 && !cluster.is_empty() {
             let before: String = cluster.iter().map(|part| part.0).collect();
             let mut with_next = before.clone();
@@ -372,8 +426,10 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
         cs.remove(0);
     }
 
-    let mut runs: Vec<(Class, Vec<Mark>)> = Vec::new();
-    for m in cs {
+    // A run is a range of `cs`; holding each word, space and punctuation run in
+    // a vector of its own cost an allocation per run.
+    let mut runs: Vec<(Class, Range<usize>)> = Vec::new();
+    for (index, m) in cs.iter().enumerate() {
         let mut class = classify(m.c);
         if class == Class::Word
             && stray_mark(m.c)
@@ -383,33 +439,32 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
         {
             class = Class::Stray;
         }
-        if runs.last().is_some_and(|r| r.0 == class) {
-            runs.last_mut().unwrap().1.push(m);
-        } else {
-            runs.push((class, vec![m]));
+        match runs.last_mut() {
+            Some(run) if run.0 == class => run.1.end = index + 1,
+            _ => runs.push((class, index..index + 1)),
         }
     }
     // HARD is our storage class, not a pretoken class: split letters, numbers, and punctuation.
-    let mut split = Vec::new();
-    for (cl, body) in runs {
-        if cl != Class::Hard || body.len() == 1 {
-            split.push((cl, body));
+    let mut split: Vec<(Class, Range<usize>)> = Vec::with_capacity(runs.len());
+    for (cl, range) in runs {
+        if cl != Class::Hard || range.len() == 1 {
+            split.push((cl, range));
             continue;
         }
-        for m in body {
-            let k = hard_kind(m.c);
+        for index in range {
+            let c = cs[index].c;
+            let k = hard_kind(c);
             // A variation selector never opens a sub-run: it rides its base's, or
             // a symbol would sever at the selector and lose the marker it is due.
-            if split.last().is_some_and(|(c, b): &(Class, Vec<Mark>)| {
-                *c == Class::Hard && (is_selector(m.c) || hard_kind(b[0].c) == k)
-            }) {
-                split.last_mut().unwrap().1.push(m)
-            } else {
-                split.push((Class::Hard, vec![m]));
+            match split.last_mut() {
+                Some((Class::Hard, run)) if is_selector(c) || hard_kind(cs[run.start].c) == k => {
+                    run.end = index + 1
+                }
+                _ => split.push((Class::Hard, index..index + 1)),
             }
         }
     }
-    runs = split;
+    let runs = split;
     if runs.is_empty() {
         return if family == Family::V4_7 {
             vec![Mark { c: BOW, end: 0 }]
@@ -418,67 +473,72 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
         };
     }
 
+    let run_body = |i: usize| &cs[runs[i].1.clone()];
     let border_space = |i: usize, left: bool| -> bool {
         if left {
             if i == 0 {
                 return family == Family::V4_7;
             }
-            runs[i - 1].0 == Class::Space && runs[i - 1].1.last().is_some_and(|m| m.c == ' ')
+            runs[i - 1].0 == Class::Space && run_body(i - 1).last().is_some_and(|m| m.c == ' ')
         } else {
             runs.get(i + 1).is_some_and(|r| {
+                let next = &cs[r.1.clone()];
                 r.0 == Class::Space
-                    && r.1.first().is_some_and(|m| m.c == ' ')
-                    && r.1.get(1).is_none_or(|m| m.c != ' ')
+                    && next.first().is_some_and(|m| m.c == ' ')
+                    && next.get(1).is_none_or(|m| m.c != ' ')
             })
         }
     };
+    let is_apostrophe = |i: usize| runs[i].0 == Class::Punct && spells(run_body(i), "'");
     let opens_word = |i: usize| {
-        runs[i].0 == Class::Punct
-            && body_string(&runs[i].1) == "'"
+        is_apostrophe(i)
             && runs
                 .get(i + 1)
                 .is_some_and(|r| matches!(r.0, Class::Word | Class::Stray))
     };
     let first_own = !opens_word(0)
         && (matches!(runs[0].0, Class::Word | Class::Punct | Class::Stray)
-            || hard_bow(&runs[0].1)
-            || digit_bow(&runs[0].1)
-            || runs[0].0 == Class::Space && runs[0].1[0].c == ' ');
-    let mut out = Vec::new();
+            || hard_bow(run_body(0))
+            || digit_bow(run_body(0))
+            || runs[0].0 == Class::Space && run_body(0)[0].c == ' ');
+    let mut out = Vec::with_capacity(cs.len() + cs.len() / 2);
     if family == Family::V4_7 && !first_own {
         push(
             &mut out,
             if opens_word(0) { ' ' } else { BOW },
-            runs[0].1[0].end,
+            run_body(0)[0].end,
         );
     }
     for i in 0..runs.len() {
-        let (cl, body) = &runs[i];
+        let cl = runs[i].0;
+        let body = run_body(i);
         let end = body.last().unwrap().end;
         match cl {
             Class::Word => {
                 let fused = i > 0 && runs[i - 1].0 == Class::Stray;
                 let contraction = i > 0
-                    && runs[i - 1].0 == Class::Punct
-                    && body_string(&runs[i - 1].1) == "'"
-                    && matches!(
-                        body_string(body).as_str(),
-                        "s" | "t" | "d" | "m" | "ll" | "re" | "ve"
-                    )
-                    && (i < 2 || !takes_right_border(&runs[i - 2]));
-                let (marker, lower) = mark_case(body, fused);
-                if let Some(c) = marker {
-                    push(&mut out, c, body[0].end);
+                    && is_apostrophe(i - 1)
+                    && ["s", "t", "d", "m", "ll", "re", "ve"]
+                        .iter()
+                        .any(|suffix| spells(body, suffix))
+                    && (i < 2 || !takes_right_border(runs[i - 2].0, run_body(i - 2)));
+                let shifted = case_fires(body, fused);
+                if shifted {
+                    push(&mut out, SHIFT, body[0].end);
                 }
                 if !fused && !contraction {
                     push(&mut out, BOW, body[0].end);
                 }
-                out.extend(lower);
+                if shifted {
+                    push_lowered(&mut out, body);
+                } else {
+                    out.extend_from_slice(body);
+                }
                 push(&mut out, EOW, end);
             }
             Class::Stray => {
                 push(&mut out, BOW, body[0].end);
-                out.extend(body.iter().copied());
+                out.extend_from_slice(body);
                 if runs.get(i + 1).is_none_or(|r| r.0 != Class::Word) {
                     push(&mut out, EOW, end);
                 }
@@ -487,7 +547,7 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
                 if border_space(i, true) && (body[0].c as u32) < 0x10000 {
                     push(&mut out, BOW, body[0].end)
                 }
-                out.extend(body.iter().copied());
+                out.extend_from_slice(body);
                 if border_space(i, false) && (body.last().unwrap().c as u32) < 0x10000 {
                     push(&mut out, EOW, end)
                 }
@@ -496,7 +556,7 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
                 if border_space(i, true) && !opens_word(i) {
                     push(&mut out, BOW, body[0].end)
                 }
-                out.extend(body.iter().copied());
+                out.extend_from_slice(body);
                 if border_space(i, false) {
                     push(&mut out, EOW, end)
                 }
@@ -505,7 +565,7 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
                 if border_space(i, true) && hard_bow(body) {
                     push(&mut out, BOW, body[0].end)
                 }
-                out.extend(body.iter().copied());
+                out.extend_from_slice(body);
                 if border_space(i, false) && hard_eow(body) {
                     push(&mut out, EOW, end)
                 }
@@ -514,16 +574,16 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
                 if border_space(i, true) && digit_bow(body) {
                     push(&mut out, BOW, body[0].end)
                 }
-                out.extend(body.iter().copied());
+                out.extend_from_slice(body);
                 if border_space(i, false) && digit_eow(body) {
                     push(&mut out, EOW, end)
                 }
             }
-            _ => out.extend(body.iter().copied()),
+            _ => out.extend_from_slice(body),
         }
     }
     // eow + one seam space + case markers + bow => eow + case markers + bow
-    let mut joined = Vec::new();
+    let mut joined = Vec::with_capacity(out.len());
     let mut i = 0;
     while i < out.len() {
         if out[i].c == EOW && out.get(i + 1).is_some_and(|m| m.c == ' ') {
@@ -546,8 +606,10 @@ fn marked(text: &str, family: Family) -> Vec<Mark> {
 fn push(v: &mut Vec<Mark>, c: char, end: usize) {
     v.push(Mark { c, end })
 }
-fn body_string(v: &[Mark]) -> String {
-    v.iter().map(|m| m.c).collect()
+/// Whether the run spells exactly `text`.
+fn spells(body: &[Mark], text: &str) -> bool {
+    let mut chars = text.chars();
+    body.iter().all(|m| chars.next() == Some(m.c)) && chars.next().is_none()
 }
 
 /// Case pairs the measured models know that the host Unicode tables need not:
@@ -597,35 +659,44 @@ fn lowers(c: char) -> bool {
 /// body, so it blocks a marker only as the span's own head.
 const DOTTED: char = 'İ';
 
-fn mark_case(body: &[Mark], head_mark: bool) -> (Option<char>, Vec<Mark>) {
+/// Whether a word span takes a ⟨shift⟩ marker, behind which it is spelled
+/// lowered by [`push_lowered`].
+fn case_fires(body: &[Mark], head_mark: bool) -> bool {
     // ẞ blocks a marker from anywhere in the span; a caseless or unlowerable
     // head blocks it too, and an unattached mark that opened the word has taken
     // the head position already.
     if head_mark || body.iter().any(|m| m.c == 'ẞ') {
-        return (None, body.to_vec());
+        return false;
     }
     let head = body[0].c;
     let tail_is_lower = body[1..].iter().all(|m| m.c == DOTTED || !is_upper(m.c));
-    let fires = if body.iter().any(|m| m.c == DOTTED) {
+    if body.iter().any(|m| m.c == DOTTED) {
         head != DOTTED && is_upper(head) && tail_is_lower
     } else {
         is_upper(head) && tail_is_lower && lowers(head)
-    };
-    if !fires {
-        return (None, body.to_vec());
     }
-    let mut lower = Vec::new();
+}
+fn push_lowered(out: &mut Vec<Mark>, body: &[Mark]) {
     for (i, m) in body.iter().enumerate() {
         match pinned_lower(m.c) {
-            _ if i > 0 && m.c == DOTTED => lower.push(*m),
-            Some(c) => lower.push(Mark { c, end: m.end }),
-            None => lower.extend(m.c.to_lowercase().map(|c| Mark { c, end: m.end })),
+            _ if i > 0 && m.c == DOTTED => out.push(*m),
+            Some(c) => out.push(Mark { c, end: m.end }),
+            None => out.extend(m.c.to_lowercase().map(|c| Mark { c, end: m.end })),
         }
     }
-    (Some(SHIFT), lower)
 }
 
 fn classify(c: char) -> Class {
+    static ASCII: OnceLock<[Class; 128]> = OnceLock::new();
+    match ASCII
+        .get_or_init(|| std::array::from_fn(|code| classify_scalar(char::from(code as u8))))
+        .get(c as usize)
+    {
+        Some(class) => *class,
+        None => classify_scalar(c),
+    }
+}
+fn classify_scalar(c: char) -> Class {
     if is_killer(c) {
         return Class::Killer;
     }
@@ -848,10 +919,10 @@ fn digit_bow(b: &[Mark]) -> bool {
 fn digit_eow(b: &[Mark]) -> bool {
     digit_run(b) && digit_border(b.last().unwrap().c)
 }
-fn takes_right_border(r: &(Class, Vec<Mark>)) -> bool {
-    r.0 == Class::Punct
-        || hard_eow(&r.1)
-        || (matches!(r.0, Class::Digit | Class::Hard) && digit_eow(&r.1))
+fn takes_right_border(class: Class, body: &[Mark]) -> bool {
+    class == Class::Punct
+        || hard_eow(body)
+        || (matches!(class, Class::Digit | Class::Hard) && digit_eow(body))
 }
 
 #[cfg(test)]

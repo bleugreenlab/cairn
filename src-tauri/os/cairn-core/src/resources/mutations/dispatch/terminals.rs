@@ -63,13 +63,58 @@ pub(super) async fn dispatch(
                 }
                 None => None,
             };
-            let selector = match payload.get("executor") {
+            let own_selector = match payload.get("executor") {
                 Some(value) => Some(
                     crate::fleet::residency::parse_resident_selector(value)
                         .map_err(|error| build_failure(index, item, error))?,
                 ),
                 None => None,
             };
+            // A job's terminal created without a machine of its own goes where
+            // the job's placement default names, and persists that selector on
+            // its row so recovery places it by the same rule. A project
+            // terminal belongs to no job and has no default.
+            let job_default = match (own_selector.as_ref(), resource) {
+                (
+                    None,
+                    CairnResource::NodeTerminal {
+                        project,
+                        number,
+                        exec_seq,
+                        node_id,
+                        ..
+                    },
+                ) => {
+                    crate::fleet::placement_default::for_job_resource(
+                        orch, project, *number, *exec_seq, node_id, None,
+                    )
+                    .await
+                }
+                (
+                    None,
+                    CairnResource::TaskTerminal {
+                        project,
+                        number,
+                        exec_seq,
+                        node_id,
+                        task_name,
+                        ..
+                    },
+                ) => {
+                    crate::fleet::placement_default::for_job_resource(
+                        orch,
+                        project,
+                        *number,
+                        *exec_seq,
+                        node_id,
+                        Some(task_name),
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            let (selector, node_default) =
+                crate::fleet::placement_default::resident_selector(own_selector, || job_default);
             if wake.is_some()
                 && matches!(resource, CairnResource::ProjectTerminal { .. })
                 && request.run_id.is_none()
@@ -87,18 +132,25 @@ pub(super) async fn dispatch(
                 let placement = selector.as_ref().map_or_else(String::new, |selector| {
                     format!(" on {}", selector.describe())
                 });
-                format!("Would start terminal {slug}{placement}: {command}{wake_suffix}")
+                let source = match node_default {
+                    Some(_) => " (node default)",
+                    None => "",
+                };
+                format!("Would start terminal {slug}{placement}{source}: {command}{wake_suffix}")
             } else {
-                terminal::create_terminal_from_resource(
-                    orch,
-                    resource,
-                    command,
-                    description,
-                    wake,
-                    request.run_id.as_deref(),
-                    selector.as_ref(),
+                crate::fleet::placement_default::resident_outcome(
+                    node_default.as_ref(),
+                    terminal::create_terminal_from_resource(
+                        orch,
+                        resource,
+                        command,
+                        description,
+                        wake,
+                        request.run_id.as_deref(),
+                        selector.as_ref(),
+                    )
+                    .await,
                 )
-                .await
                 .map_err(|error| build_failure(index, item, error))?
             }
         }

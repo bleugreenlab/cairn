@@ -102,6 +102,17 @@ async fn grant(
     let actor = resolve_actor(&f.orch, &as_run(&f.run_id))
         .await
         .expect("the seeded run resolves");
+    // A Once approval is always bound to the act its card showed.
+    let mut constraints = constraints;
+    if lifetime == AuthorityLifetimeKind::Once {
+        constraints.push(AuthorityConstraint::ExactAct {
+            digest: request
+                .facts
+                .act
+                .clone()
+                .expect("a carded request names its act"),
+        });
+    }
     issue_grant(
         &f.orch.db.local,
         GrantIssue {

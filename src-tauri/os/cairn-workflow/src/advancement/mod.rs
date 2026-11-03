@@ -52,7 +52,8 @@ pub use recompute::{
 };
 pub use restart::{restart_node, RestartNodeOutcome};
 pub use snapshot_edit::{
-    cancel_job_conn, reconcile_removed_nodes, reconcile_removed_nodes_conn, RemovedNodesReconcile,
+    cancel_job_conn, close_job_sessions_conn, reconcile_removed_nodes,
+    reconcile_removed_nodes_conn, RemovedNodesReconcile, SessionCloseReason,
 };
 pub use snapshots::{
     load_execution_snapshot, load_nodes_from_execution, update_execution_snapshot,

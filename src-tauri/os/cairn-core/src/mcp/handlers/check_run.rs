@@ -232,6 +232,17 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
             .filter(|suite| !suite.trim().is_empty())
             .ok_or_else(|| "configured suite name must not be empty".to_string())?;
         let placement = payload.placement()?;
+        // Resolved, and refused, before a handle exists: a caller told its check
+        // was queued must not then learn the revision never named anything. The
+        // commit, not the name, is what the run evaluates, so a branch that moves
+        // after this point does not change which revision the answer is about.
+        let commit = match payload.branch.as_deref() {
+            Some(branch) => Some(
+                crate::execution::checks::resolve_manual_check_revision(orch, run_id, branch)
+                    .await?,
+            ),
+            None => None,
+        };
         let handle = uuid::Uuid::new_v4().to_string();
         retain_observation(
             &mut *MANUAL_CHECKS
@@ -245,7 +256,7 @@ pub(crate) async fn handle_check_run(orch: &Orchestrator, request: &McpCallbackR
         let task_orch = orch.clone();
         let task_run_id = run_id.to_string();
         let task_suite = suite.to_string();
-        let task_branch = payload.branch.clone();
+        let task_branch = commit;
         let task_retry = payload.retry;
         spawn_manual_observation(handle.clone(), move |progress| async move {
             crate::execution::checks::run_manual_configured_check_with_progress(
@@ -443,6 +454,171 @@ mod tests {
         until(|observation| matches!(observation, ManualCheckObservation::Failed { .. }))
             .await
             .expect("the run settled its observation with nobody polling it");
+    }
+
+    const AGENT_BRANCH: &str = "agent/proj-7-builder-0";
+    const NODE_URI: &str = "cairn://p/proj/7/1/builder";
+    const FOREIGN_NODE_URI: &str = "cairn://p/other/8/1/builder";
+
+    /// A project whose managed store holds `main` and one agent branch a commit
+    /// ahead of it, a builder node recording that branch, and a run of it:
+    /// everything `--branch` can name. A second project's node records the
+    /// same branch name, so a node URI resolving across projects would be
+    /// indistinguishable from one resolving correctly.
+    struct BranchFixture {
+        _root: tempfile::TempDir,
+        orch: Orchestrator,
+        main: String,
+        agent: String,
+    }
+
+    async fn branch_fixture(bin: &str) -> BranchFixture {
+        use crate::jj::testing::{git, git_stdout, init_project};
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_project(&repo);
+        let main = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-q", "-b", AGENT_BRANCH]);
+        std::fs::write(repo.join("shared.rs"), "agent\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "agent work"]);
+        let agent = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-q", "main"]);
+
+        let db = crate::storage::migrated_test_db("check-run-branch.db").await;
+        let repo_path = repo.to_string_lossy();
+        db.execute_script(format!(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+               VALUES('p','w','P','proj','{repo_path}','main',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,default_branch,created_at,updated_at)
+               VALUES('q','w','Q','other','{repo_path}','main',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',7,'I','active','active','none',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('k','q',8,'K','active','active','none',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('e','r','i','p','running',1,1);
+             INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+               VALUES('f','r','k','q','running',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+               VALUES('j','p','i','e','running','builder','builder','{AGENT_BRANCH}','main',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,execution_id,status,node_name,uri_segment,branch,base_branch,created_at,updated_at)
+               VALUES('m','q','k','f','running','builder','builder','{AGENT_BRANCH}','main',1,1);
+             INSERT INTO runs(id,issue_id,project_id,job_id,status,created_at,updated_at)
+               VALUES('run-1','i','p','j','running',1,1);"
+        ))
+        .await
+        .unwrap();
+
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let search = Arc::new(
+            crate::storage::SearchIndex::open_or_create(config_dir.join("search")).unwrap(),
+        );
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(Arc::new(db), search)),
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .jj_binary_path(bin.to_string())
+        .build();
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, &repo);
+        crate::jj::ensure_project_store(&jj, &store, &repo).unwrap();
+        BranchFixture {
+            _root: root,
+            orch,
+            main,
+            agent,
+        }
+    }
+
+    fn check_run_request(branch: &str) -> McpCallbackRequest {
+        McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: Some("run-1".into()),
+            tool: "check_run".into(),
+            payload: serde_json::json!({ "suite": "rust-tests", "branch": branch }),
+            tool_use_id: None,
+            origin: None,
+        }
+    }
+
+    /// `--branch` takes every form `read ?branch=` and `run branch:` take, and
+    /// each lands on the commit that form names.
+    #[tokio::test]
+    async fn branch_takes_a_branch_name_a_commit_id_and_a_node_uri() {
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture(&bin).await;
+        for (requested, expected) in [
+            ("main", &fixture.main),
+            (AGENT_BRANCH, &fixture.agent),
+            (fixture.agent.as_str(), &fixture.agent),
+            (&fixture.agent[..12], &fixture.agent),
+            (NODE_URI, &fixture.agent),
+        ] {
+            let resolved = crate::execution::checks::resolve_manual_check_revision(
+                &fixture.orch,
+                "run-1",
+                requested,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{requested:?} did not resolve: {error}"));
+            assert_eq!(&resolved, expected, "{requested:?}");
+        }
+    }
+
+    /// A revision that names nothing is refused before an observation exists,
+    /// so the caller never sees a queued check turn into a failure, and the
+    /// refusal names the forms `--branch` takes.
+    #[tokio::test]
+    async fn an_unresolvable_branch_is_refused_before_anything_is_queued() {
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture(&bin).await;
+        for requested in ["agent/proj-7-builder-1", "cairn://p/proj/7/1/coordinator"] {
+            let response: serde_json::Value = serde_json::from_str(
+                &handle_check_run(&fixture.orch, &check_run_request(requested)).await,
+            )
+            .unwrap();
+            assert_eq!(response["ok"], false, "{requested:?}: {response}");
+            assert!(
+                response.get("observationHandle").is_none(),
+                "{requested:?} minted an observation before it was refused: {response}"
+            );
+            let error = response["error"].as_str().unwrap();
+            assert!(error.contains(requested), "{error}");
+            for form in ["branch name", "commit id", "node URI"] {
+                assert!(
+                    error.contains(form),
+                    "{requested:?} omits {form:?}: {error}"
+                );
+            }
+        }
+    }
+
+    /// A node of another project is refused rather than resolved, even when
+    /// its branch name happens to exist here.
+    #[tokio::test]
+    async fn a_node_of_another_project_is_refused() {
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let fixture = branch_fixture(&bin).await;
+        let error = crate::execution::checks::resolve_manual_check_revision(
+            &fixture.orch,
+            "run-1",
+            FOREIGN_NODE_URI,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("another project"), "{error}");
     }
 
     #[test]

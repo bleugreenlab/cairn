@@ -142,18 +142,9 @@ async fn main() {
     }
 }
 
-/// Refuse a path whose three-file set Cairn and Turso would name differently,
-/// or one inside a live Cairn data directory.
-///
-/// Turso names the logical log `path.with_extension("db-log")`, while
-/// `db_set_paths` appends `-log` to the whole path. The two agree only for a
-/// path ending in `.db`; for `cairn.db.probe` Turso writes `cairn.db.db-log`.
+/// Refuse a path inside a live Cairn data directory. A path that does not end
+/// in `.db` is refused by `LocalDb::open` itself.
 fn check_path(path: &str) -> Res<()> {
-    if !path.ends_with(".db") {
-        return Err(format!(
-            "{path} must end in .db: Turso derives the logical log's name from the extension"
-        ));
-    }
     let Some(home) = std::env::var_os("HOME") else {
         return Ok(());
     };

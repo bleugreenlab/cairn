@@ -77,14 +77,20 @@ pub(crate) async fn read_batch(
         }
     }
 
+    // Both passes below are per-turn bookkeeping for the model this result is
+    // composed for. A read from code under the same run (`@cairn/sdk` in a
+    // procedure or service, a `run` item's inline code, the CLI) gets every body
+    // and full affordance block, and records nothing that would stub or collapse
+    // the model's own later read.
+    let model_run = request
+        .run_id
+        .as_deref()
+        .filter(|_| request.is_model_facing());
+
     // Per-target flail dedup: re-applied here because `read_batch` is kept out of
     // the outer `is_read_family` so the batch granularity does not collapse the
     // per-target `[duplicate call]` stub.
-    if let Some(run_id) = request
-        .run_id
-        .as_deref()
-        .filter(|_| !crate::dispatch::is_standalone_cli(request))
-    {
+    if let Some(run_id) = model_run {
         // Deictic targets are classified on the resource they name, so the home
         // is resolved once for the batch, and only when some target needs it. A
         // failed lookup leaves deictic targets unresolved; their producer failed
@@ -108,10 +114,8 @@ pub(crate) async fn read_batch(
     // keeping the full reference one cheap read away without re-paying the whole
     // block. Runs on the post-flail segment list (error stubs carry no
     // affordance, so the two passes never fight). Keyed by block-content hash so
-    // schema-distinct artifact blocks never collapse into one another. Skipped
-    // without a run id (tests / external runs keep full blocks), matching the
-    // flail-dedup gate above.
-    if let Some(run_id) = request.run_id.as_deref() {
+    // schema-distinct artifact blocks never collapse into one another.
+    if let Some(run_id) = model_run {
         // Distinct affordance blocks still present. Deciding per distinct hash
         // (not per segment) keeps a kind uniformly full-or-pointer within one
         // batch, so `assemble`'s batch-local `(kind, block)` dedup never emits a
@@ -964,7 +968,7 @@ mod tests {
             cwd: worktree.path().display().to_string(),
             run_id: Some("run-paging-dedup".to_string()),
             tool: "read_batch".to_string(),
-            payload: serde_json::json!({"paths":[path], "include_bodies":true}),
+            payload: model_facing(serde_json::json!({"paths":[path], "include_bodies":true})),
             tool_use_id: None,
             origin: None,
         };
@@ -1351,8 +1355,8 @@ mod tests {
             let sql = format!(
                 "INSERT INTO thread_eras (
                      job_id, seq, start_block, end_block, started_at, ended_at, summary,
-                     summary_status, summary_model, source_tokens, minted_generation, created_at
-                 ) VALUES ('job-rb', {seq}, {seq}, {seq}, 10, 20, 'Era summary {seq}.', 'fallback', NULL, 500, 1, 30)"
+                     summary_status, summary_model, minted_generation, created_at
+                 ) VALUES ('job-rb', {seq}, {seq}, {seq}, 10, 20, 'Era summary {seq}.', 'fallback', NULL, 1, 30)"
             );
             orch.db
                 .local
@@ -1596,23 +1600,35 @@ mod tests {
         assert!(miss.text.contains("No files matched"), "{}", miss.text);
     }
 
+    /// `payload` as the agent's own `read` tool sends it.
+    fn model_facing(mut payload: serde_json::Value) -> serde_json::Value {
+        cairn_common::protocol::stamp_callback_origin(
+            &mut payload,
+            cairn_common::protocol::MODEL_FACING_ORIGIN,
+        );
+        payload
+    }
+
+    /// A read as the agent's own `read` tool sends it.
     async fn read_batch_envelope_for_run(
         orch: &Orchestrator,
         paths: serde_json::Value,
         run_id: Option<&str>,
     ) -> ReadBatchEnvelope {
-        read_batch_envelope_for_origin(orch, paths, run_id, false).await
+        let origin = Some(cairn_common::protocol::MODEL_FACING_ORIGIN);
+        read_batch_envelope_for_origin(orch, paths, run_id, origin).await
     }
 
+    /// A read stamped with `origin`. `None` is how `@cairn/sdk` sends one.
     async fn read_batch_envelope_for_origin(
         orch: &Orchestrator,
         paths: serde_json::Value,
         run_id: Option<&str>,
-        standalone_cli: bool,
+        origin: Option<&str>,
     ) -> ReadBatchEnvelope {
         let mut payload = serde_json::json!({ "paths": paths });
-        if standalone_cli {
-            payload["_cairn_origin"] = serde_json::Value::String("cli".to_string());
+        if let Some(origin) = origin {
+            cairn_common::protocol::stamp_callback_origin(&mut payload, origin);
         }
         let request = McpCallbackRequest {
             answer_bound_ms: None,
@@ -1686,7 +1702,7 @@ mod tests {
         let agent_read =
             read_batch_envelope_for_run(&orch, paths.clone(), Some("run-cli-poll")).await;
         let cli_poll =
-            read_batch_envelope_for_origin(&orch, paths, Some("run-cli-poll"), true).await;
+            read_batch_envelope_for_origin(&orch, paths, Some("run-cli-poll"), Some("cli")).await;
 
         assert!(
             agent_read.text.contains("Polled issue"),
@@ -1698,6 +1714,102 @@ mod tests {
             !cli_poll.text.contains("[duplicate call]"),
             "{}",
             cli_poll.text
+        );
+    }
+
+    /// A procedure's `@cairn/sdk` read shares the invoking turn's run but not
+    /// its context. Whatever the model already read, the program gets the body;
+    /// whatever the program reads, the model's own reads are judged on the
+    /// model's reads alone.
+    #[tokio::test]
+    async fn a_code_callers_read_neither_receives_nor_records_the_duplicate_stub() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-code-1', 'proj-rb', 1, 'Leaderboard', 'active', 1, 1),
+                    ('issue-code-2', 'proj-rb', 2, 'Standings', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-code", "turn-code");
+        let run = Some("run-code");
+        let one = || serde_json::json!(["cairn://p/RB/1"]);
+        let two = || serde_json::json!(["cairn://p/RB/2"]);
+
+        let model_first = read_batch_envelope_for_run(&orch, one(), run).await;
+        assert!(
+            model_first.text.contains("Leaderboard"),
+            "{}",
+            model_first.text
+        );
+
+        let program = read_batch_envelope_for_origin(&orch, one(), run, None).await;
+        assert_ne!(program.segments[0].kind, SegmentKind::Duplicate);
+        assert!(program.text.contains("Leaderboard"), "{}", program.text);
+        assert!(
+            !program.text.contains("[duplicate call]"),
+            "{}",
+            program.text
+        );
+
+        let model_repeat = read_batch_envelope_for_run(&orch, one(), run).await;
+        assert_eq!(model_repeat.segments[0].kind, SegmentKind::Duplicate);
+
+        // The program reads first this time; the model's first read is fresh.
+        read_batch_envelope_for_origin(&orch, two(), run, None).await;
+        let model_after = read_batch_envelope_for_run(&orch, two(), run).await;
+        assert_ne!(
+            model_after.segments[0].kind,
+            SegmentKind::Duplicate,
+            "{}",
+            model_after.text
+        );
+        assert!(
+            model_after.text.contains("Standings"),
+            "{}",
+            model_after.text
+        );
+    }
+
+    /// The session affordance collapse assumes the reader saw the full block
+    /// before. A program's read neither receives the pointer nor counts as the
+    /// model having seen the block.
+    #[tokio::test]
+    async fn a_code_callers_read_keeps_full_affordances_and_marks_none_seen() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-caf-1', 'proj-rb', 1, 'First', 'active', 1, 1),
+                    ('issue-caf-2', 'proj-rb', 2, 'Second', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-caf", "turn-caf");
+        let run = Some("run-caf");
+
+        let program =
+            read_batch_envelope_for_origin(&orch, serde_json::json!(["cairn://p/RB/1"]), run, None)
+                .await;
+        assert!(program.text.contains("### actions"), "{}", program.text);
+
+        let model =
+            read_batch_envelope_for_run(&orch, serde_json::json!(["cairn://p/RB/2"]), run).await;
+        assert!(model.text.contains("### actions"), "{}", model.text);
+        assert!(
+            !model.text.contains("cairn://help?kind=issue"),
+            "{}",
+            model.text
+        );
+
+        let program_again =
+            read_batch_envelope_for_origin(&orch, serde_json::json!(["cairn://p/RB/1"]), run, None)
+                .await;
+        assert!(
+            program_again.text.contains("### actions"),
+            "{}",
+            program_again.text
         );
     }
 

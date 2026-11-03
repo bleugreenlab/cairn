@@ -961,6 +961,14 @@ async fn load_sweep_jobs(
     Ok(jobs)
 }
 
+/// Write a derived job status, with the side effects its edge carries.
+///
+/// A derived edge into Cancelled closes the job's open sessions too, in the
+/// same write: every derived cancel comes through here (settling onto a
+/// resolved issue, the node-less default, the boot settlement of stranded
+/// jobs), and a cancelled job left holding an open session would take turns
+/// the cancel was meant to end and give the operator no reason when refused.
+/// The reason is the issue's resolution when it has one.
 pub async fn write_job_status(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
@@ -985,6 +993,27 @@ pub async fn write_job_status(
             .await?;
             if *to == JobStatus::Complete {
                 cairn_db::todos::complete_in_progress_todos_conn(conn, job_id, now).await?;
+            }
+            if *to == JobStatus::Cancelled && *from != JobStatus::Cancelled {
+                let issue_status = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT i.status FROM jobs j JOIN issues i ON i.id = j.issue_id
+                              WHERE j.id = ?1",
+                            (job_id,),
+                        )
+                        .await?;
+                    crate::storage::next_opt_text(&mut rows, 0).await?
+                };
+                super::snapshot_edit::close_job_sessions_conn(
+                    conn,
+                    job_id,
+                    super::snapshot_edit::SessionCloseReason::for_issue_status(
+                        issue_status.as_deref(),
+                    ),
+                    now,
+                )
+                .await?;
             }
         }
         _ => {

@@ -1229,7 +1229,8 @@ pub async fn run_launch_session(
     let callback_fence = fence.clone();
     let generation = Arc::new(AtomicU64::new(0));
     let callback_generation = generation.clone();
-    orch.fleet.subscribe_resident_process_events(move |event| {
+    // Held until the launch returns, which is when nothing reads the events.
+    let _events = orch.fleet.subscribe_resident_process_events(move |event| {
         let expected = callback_generation.load(Ordering::Acquire);
         if event.holder == callback_fence.holder
             && event.incarnation_id == callback_fence.incarnation_id
@@ -2051,6 +2052,7 @@ mod tests {
                 containment: None,
                 page_call_programs: None,
                 github_credential: None,
+                machine_services: Vec::new(),
             },
             current_load: 0,
             warm_roots: Vec::new(),

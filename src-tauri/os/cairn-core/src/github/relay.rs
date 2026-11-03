@@ -234,6 +234,7 @@ async fn handle_branch_push(
         return Ok(BranchPushOutcome::Untracked);
     };
     let source = crate::orchestrator::base_branch_sync::Source::Push;
+    let observation = orch.base_branch_sync.observe();
     if crate::projects::remote::is_default_branch_push(&push.git_ref, &push.default_branch) {
         let outcome = crate::projects::remote::pull_project_on_default_branch_push(
             &orch.db.local,
@@ -255,6 +256,7 @@ async fn handle_branch_push(
                 default_branch,
                 &push.after,
                 source,
+                observation,
             )
             .await;
         }
@@ -292,6 +294,7 @@ async fn handle_branch_push(
         branch,
         &push.after,
         source,
+        observation,
     )
     .await;
     Ok(BranchPushOutcome::Observed {

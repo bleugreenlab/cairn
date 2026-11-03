@@ -53,7 +53,8 @@ pub(crate) fn prepare_call_run(
     let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
 
     // ---- Load agent config from files (mirrors create_child_task) --------
-    let config_dir = config::get_config_dir()?;
+    // The same root the call's snapshot entry is resolved from below.
+    let config_dir = orch.config_dir.clone();
     let mut agent_config: AgentConfig = {
         let file_agent = match config_agents::get_agent(
             &config_dir,
@@ -137,7 +138,8 @@ pub(crate) fn prepare_call_run(
     let output_contract_json = serde_json::to_string(&input.output_contract)
         .map_err(|e| format!("Failed to serialize call output contract: {e}"))?;
 
-    run_db(insert_child_job_session_run(
+    let execution_id = run_db_borrowed(insert_child_with_agent_snapshot(
+        orch,
         db.clone(),
         ChildInsert {
             job_id: job_id.clone(),
@@ -159,6 +161,7 @@ pub(crate) fn prepare_call_run(
             task_index: input.task_index,
             now,
         },
+        project_path.as_deref(),
     ))?;
 
     orch.store_job_selection(&job_id, &record)?;

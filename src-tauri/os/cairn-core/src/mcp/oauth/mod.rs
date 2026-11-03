@@ -497,7 +497,34 @@ pub async fn exchange_code(
     if let Some(secret) = client_secret {
         form.push(("client_secret", secret.to_string()));
     }
-    post_token_request(client, token_endpoint, &form, None).await
+    post_token_request(client, token_endpoint, &form, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Why a token-endpoint request produced no token set.
+///
+/// The split exists for revocation: a refused grant means the stored credential
+/// can never be renewed and the user has to authorize again, while a request
+/// that merely failed says nothing about the grant and must not cost anyone
+/// their authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenRequestError {
+    /// The authorization server answered and refused the grant. RFC 6749 §5.2
+    /// errors (`invalid_grant`, `invalid_client`, ...) come back as `400`, or
+    /// `401` for client authentication; repeating the request cannot succeed.
+    Refused(String),
+    /// No usable answer: the request failed in transit, the server errored or
+    /// throttled, or the body was unreadable.
+    Failed(String),
+}
+
+impl std::fmt::Display for TokenRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Refresh an access token via the refresh-token grant, re-binding `resource`.
@@ -508,11 +535,17 @@ pub(crate) async fn refresh_access_token(
     refresh_token: &str,
     resource: &str,
     scope: Option<&str>,
-) -> Result<TokenSet, String> {
+) -> Result<TokenSet, TokenRequestError> {
+    // A stored endpoint that is not HTTPS can never be refreshed against; only
+    // a fresh authorize, which rediscovers it, can repair the record.
     if !is_secure_endpoint(token_endpoint) {
-        return Err(format!("Token endpoint must be HTTPS: {token_endpoint}"));
+        return Err(TokenRequestError::Refused(format!(
+            "Token endpoint must be HTTPS: {token_endpoint}"
+        )));
     }
-    let client = oauth_http_client().await?;
+    let client = oauth_http_client()
+        .await
+        .map_err(TokenRequestError::Failed)?;
     let mut form = vec![
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
@@ -542,20 +575,30 @@ async fn post_token_request(
     token_endpoint: &str,
     form: &[(&str, String)],
     prior_refresh: Option<String>,
-) -> Result<TokenSet, String> {
+) -> Result<TokenSet, TokenRequestError> {
     let resp = client
         .post(token_endpoint)
         .form(form)
         .send()
         .await
-        .map_err(|e| format!("Token request failed: {e}"))?;
+        .map_err(|e| TokenRequestError::Failed(format!("Token request failed: {e}")))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("Token endpoint returned {status}: {body}"));
+        let message = format!("Token endpoint returned {status}: {body}");
+        return Err(
+            if matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
+            ) {
+                TokenRequestError::Refused(message)
+            } else {
+                TokenRequestError::Failed(message)
+            },
+        );
     }
-    let parsed: TokenResponseBody =
-        serde_json::from_str(&body).map_err(|e| format!("Invalid token response: {e}: {body}"))?;
+    let parsed: TokenResponseBody = serde_json::from_str(&body)
+        .map_err(|e| TokenRequestError::Failed(format!("Invalid token response: {e}: {body}")))?;
     Ok(parsed.into_token_set(prior_refresh))
 }
 

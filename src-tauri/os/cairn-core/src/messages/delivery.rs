@@ -159,25 +159,33 @@ fn session_refuses_turns_sync(db: &LocalDb, job_id: &str) -> bool {
 
 /// Why nothing queued for a job can reach it right now.
 ///
-/// The one answer to "is this recipient deliverable": the idle flush consults
-/// it before deciding to resume, and the pending list consults it before
-/// showing anything as pending, so the composer can never promise a delivery
-/// the flush would decline. Every refusal is reversible (reopening the issue or
-/// the thread, or lifting a cancel), which is why callers filter on it rather
-/// than retiring the rows it covers.
+/// The one answer to "can this job take a turn": the launch funnel asks it
+/// before writing anything, the idle flush consults it before deciding to
+/// resume, and the pending list consults it before showing anything as
+/// pending, so the composer can never promise a delivery the flush would
+/// decline and the funnel would refuse. Every refusal is reversible (reopening
+/// the issue or the thread, or lifting a cancel), which is why callers filter
+/// on it rather than retiring the rows it covers.
+///
+/// The variants are checked in declaration order and the first that holds is
+/// the answer. That order is what lets the funnel name a specific next step: a
+/// cancelled job whose session a resolution closed reports
+/// [`Self::SessionRefusesTurns`], whose session carries the reason, rather
+/// than the bare [`Self::Cancelled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryRefusal {
     /// The job is a closed thread's session.
     DormantThread,
     /// The job's execution was superseded by another attempt on its issue.
     Superseded,
-    /// The job is cancelled. Cancelled to Running is not a transition; a lifted
-    /// cancel passes through Pending first, so a job still reading Cancelled
-    /// cannot take a turn now.
-    Cancelled,
     /// The job's current session was closed by a resolution or a node removal,
-    /// or failed.
+    /// or failed. The session's `terminal_reason` names why.
     SessionRefusesTurns,
+    /// The job is cancelled while its current session still reads open.
+    /// Cancelled to Running is not a transition; a lifted cancel passes
+    /// through Pending first, so a job still reading Cancelled cannot take a
+    /// turn now.
+    Cancelled,
 }
 
 impl DeliveryRefusal {
@@ -209,6 +217,9 @@ pub(crate) async fn delivery_refusal(
     if fence.is_superseded() {
         return Ok(Some(DeliveryRefusal::Superseded));
     }
+    if crate::execution::jobs::current_session_refuses_turns(db, job_id).await {
+        return Ok(Some(DeliveryRefusal::SessionRefusesTurns));
+    }
     let status = db
         .query_opt_text(
             "SELECT status FROM jobs WHERE id = ?1",
@@ -218,9 +229,6 @@ pub(crate) async fn delivery_refusal(
         .map_err(|error| format!("failed to read status of job {job_id}: {error}"))?;
     if status.as_deref() == Some("cancelled") {
         return Ok(Some(DeliveryRefusal::Cancelled));
-    }
-    if crate::execution::jobs::current_session_refuses_turns(db, job_id).await {
-        return Ok(Some(DeliveryRefusal::SessionRefusesTurns));
     }
     Ok(None)
 }
@@ -1587,5 +1595,38 @@ mod tests {
             .await,
             event_count
         );
+    }
+
+    /// A cancelled job whose session is closed reports the closed session, so
+    /// the launch funnel can answer with the session's reason; only a cancelled
+    /// job whose session still reads open reports the bare cancel.
+    #[tokio::test]
+    async fn a_closed_session_outranks_the_bare_cancelled_refusal() {
+        let db = crate::storage::migrated_test_db("delivery-refusal-order.db").await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-1','default','P','proj','/tmp/p',1,1);
+             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+               VALUES ('closed-cancelled','proj-1','cancelled','s-closed',1,1),
+                      ('open-cancelled','proj-1','cancelled','s-open',1,1),
+                      ('open-complete','proj-1','complete','s-live',1,1);
+             INSERT INTO sessions(id, job_id, backend, status, terminal_reason, sequence, created_at, updated_at)
+               VALUES ('s-closed','closed-cancelled','claude','closed','issue_merged',1,1,1),
+                      ('s-open','open-cancelled','claude','open',NULL,1,1,1),
+                      ('s-live','open-complete','claude','open',NULL,1,1,1);",
+        )
+        .await
+        .unwrap();
+
+        for (job, expected) in [
+            (
+                "closed-cancelled",
+                Some(DeliveryRefusal::SessionRefusesTurns),
+            ),
+            ("open-cancelled", Some(DeliveryRefusal::Cancelled)),
+            ("open-complete", None),
+        ] {
+            assert_eq!(delivery_refusal(&db, job).await.unwrap(), expected, "{job}");
+        }
     }
 }

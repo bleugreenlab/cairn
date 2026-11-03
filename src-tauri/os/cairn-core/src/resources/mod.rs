@@ -19,7 +19,7 @@ pub(crate) mod events;
 mod executors;
 pub(crate) mod feed;
 mod files;
-mod grants;
+pub mod grants;
 pub mod home;
 mod inference;
 mod issue;

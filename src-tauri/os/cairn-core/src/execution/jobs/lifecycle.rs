@@ -500,6 +500,9 @@ impl Drop for PendingLaunchTurnGuard<'_> {
 ///
 /// The one closed session that can still take a turn is the legacy
 /// already-terminal reconciliation, which a launch replaces with a fresh session.
+///
+/// Reopening a merged or closed issue is enough on its own: the reopen moves
+/// each job it lifts onto a fresh successor session (`issues::crud::unresolve`).
 fn closed_session_refusal(session: &Session) -> Option<String> {
     match session.status {
         SessionStatus::Open => None,
@@ -510,12 +513,52 @@ fn closed_session_refusal(session: &Session) -> Option<String> {
             None
         }
         SessionStatus::Closed => Some(match session.terminal_reason.as_deref() {
-            Some("issue_merged") => "This node's issue has been merged, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
-            Some("issue_closed") => "This node's issue has been closed, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
+            Some("issue_merged") => "This node's issue has been merged, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog).".to_string(),
+            Some("issue_closed") => "This node's issue has been closed, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog).".to_string(),
             Some("node_removed") => "This node was removed from its execution, which closed its session, so it cannot take another turn. Add the node back to the execution to run it again.".to_string(),
+            Some("job_cancelled") => CANCELLED_JOB_REFUSAL.to_string(),
             _ => "This node's session has been closed, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string(),
         }),
         SessionStatus::Failed => Some("This node's session ended in a failure, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string()),
+    }
+}
+
+/// The refusal for a cancelled job, whose cancel no resolution explains.
+const CANCELLED_JOB_REFUSAL: &str = "This node's work was cancelled, so it cannot take another turn. To carry the work forward, start it again: a new execution on its issue, or, for a sub-agent task, a new task from the agent that delegated it.";
+
+/// The launch funnel's operator-facing text for a [`DeliveryRefusal`].
+///
+/// The predicate's own descriptions are for logs; what the operator reads is
+/// what would work instead, so a closed session answers with its reason's
+/// next step (CAIRN-3253) and each other refusal with its own.
+///
+/// [`DeliveryRefusal`]: crate::messages::delivery::DeliveryRefusal
+fn launch_refusal(
+    owning_db: &Arc<crate::storage::LocalDb>,
+    job_id: &str,
+    session_id: &str,
+    refusal: crate::messages::delivery::DeliveryRefusal,
+) -> String {
+    use crate::messages::delivery::DeliveryRefusal;
+    const CLOSED_SESSION: &str = "This node's session has been closed, so it cannot take another turn. Start a new execution on the issue to carry the work forward.";
+    match refusal {
+        DeliveryRefusal::DormantThread => crate::threads::dormant_thread_refusal(),
+        DeliveryRefusal::Superseded => crate::execution::canonical::job_refusal(owning_db, job_id)
+            .unwrap_or_else(|| {
+                "This node's execution no longer owns its issue's attempt, so it cannot take another turn."
+                    .to_string()
+            }),
+        DeliveryRefusal::SessionRefusesTurns => {
+            match run_db(load_session_optional(
+                owning_db.clone(),
+                session_id.to_string(),
+            )) {
+                Ok(Some(session)) => closed_session_refusal(&session)
+                    .unwrap_or_else(|| CLOSED_SESSION.to_string()),
+                _ => CLOSED_SESSION.to_string(),
+            }
+        }
+        DeliveryRefusal::Cancelled => CANCELLED_JOB_REFUSAL.to_string(),
     }
 }
 
@@ -2593,18 +2636,30 @@ fn continue_job_launch_locked(
             "Job has no current session to resume".to_string()
         }
     })?;
-    // A session that can never take another turn refuses here, before the
-    // follow-up turn and the `running` transition below are written. Refusing
-    // after them left a post-resolution push (a turn-end check verdict, a
-    // base-advance failure) writing a merged issue's builder back to Running
-    // over a cancelled turn that nothing re-derived.
-    if let Some(session) = run_db(load_session_optional(
-        owning_db.clone(),
-        current_session_id.clone(),
-    ))? {
-        if let Some(refusal) = closed_session_refusal(&session) {
-            return Err(refusal);
-        }
+    // A job that cannot take a turn refuses here, before the follow-up turn and
+    // the `running` transition below are written. Refusing after them left a
+    // post-resolution push (a turn-end check verdict, a base-advance failure)
+    // writing a merged issue's builder back to Running over a cancelled turn
+    // that nothing re-derived. The question is the one the idle flush and the
+    // pending list ask, so the funnel cannot launch what they decline; a read
+    // failure refuses, as the canonical gate above does.
+    let refusal = run_db({
+        let db = owning_db.clone();
+        let job_id = job_id.to_string();
+        async move { crate::messages::delivery::delivery_refusal(&db, &job_id).await }
+    })
+    .map_err(|error| {
+        format!(
+            "Cannot determine whether this node can take another turn, so the resume is refused: {error}"
+        )
+    })?;
+    if let Some(refusal) = refusal {
+        return Err(launch_refusal(
+            &owning_db,
+            job_id,
+            current_session_id,
+            refusal,
+        ));
     }
 
     let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_session_selected")
@@ -2664,6 +2719,10 @@ fn continue_job_launch_locked(
                 pending_launch_turn.wrote_running(job_id);
                 JobRunnable::Attested
             }
+            // Not a refusal: a job that cannot take a turn (a cancelled one
+            // among them) was refused above by `delivery_refusal`, the one
+            // answer to that question. What reaches here is a transient write
+            // failure, which the launch survives and the projection repairs.
             Err(e) => {
                 log::warn!("Failed to transition job {} to running: {}", job_id, e);
                 JobRunnable::Unknown
@@ -2960,7 +3019,7 @@ fn continue_job_launch_locked(
                             // never reached the backend handshake. Retry the fresh start
                             // under the same Cairn session identity so its transcript and
                             // pending turn remain attached rather than rotating again.
-                            let session_start = crate::backends::SessionStart::New {
+                            let mut session_start = crate::backends::SessionStart::New {
                                 session_id: session.id.clone(),
                             };
                             if let Some(parent_id) = session.parent_session_id.as_deref() {
@@ -2969,24 +3028,52 @@ fn continue_job_launch_locked(
                                 if let Ok(parent) = run_db(async move {
                                     crate::sessions::queries::get(db.as_ref(), &parent_id).await
                                 }) {
+                                    // A reopen's successor forks the conversation the
+                                    // resolution closed, so the node resumes with its
+                                    // context; with no native handle to fork, it is
+                                    // seeded from the closed session instead.
+                                    let continues_closed_work =
+                                        crate::sessions::queries::continues_closed_work(&parent);
+                                    let fork_source = parent
+                                        .backend_id
+                                        .clone()
+                                        .filter(|_| continues_closed_work)
+                                        .filter(|_| parent.backend == session.backend);
                                     // A provider change seeds its successor here, at its
                                     // first launch. An operator Compact seeds its own
                                     // launch, and lands here only if that launch failed
                                     // after the rotation committed; recomposing is what
                                     // keeps the successor from starting with no context.
-                                    if matches!(
-                                        parent.terminal_reason.as_deref(),
-                                        Some("provider_change" | "operator_compact")
-                                    ) {
+                                    if let Some(source_backend_id) = fork_source {
+                                        session_start = crate::backends::SessionStart::Fork {
+                                            session_id: session.id.clone(),
+                                            source_backend_id,
+                                        };
+                                    } else if continues_closed_work
+                                        || matches!(
+                                            parent.terminal_reason.as_deref(),
+                                            Some("provider_change" | "operator_compact")
+                                        )
+                                    {
                                         let seed_content =
                                             compose_forced_reseed(orch, &owning_db, &job, &parent)?
                                                 .framed()
                                                 .to_string();
+                                        if continues_closed_work {
+                                            // No rotation wrote this seam's marker:
+                                            // the reopen's rotation carries none.
+                                            session_boundary =
+                                                Some(SessionBoundary::digest_reseed(
+                                                    session.backend.clone(),
+                                                    seed_content.len(),
+                                                ));
+                                        } else {
+                                            resumes_provider_change = true;
+                                        }
                                         reseed_outcome = Some(ReseedOutcome {
                                             new_session_id: session.id.clone(),
                                             seed_content,
                                         });
-                                        resumes_provider_change = true;
                                     }
                                 }
                             }
@@ -5727,6 +5814,88 @@ mod tests {
             Some("complete"),
             "a refused launch never writes the job running"
         );
+    }
+
+    /// A cancelled job seeded with the shape older builds left behind: its
+    /// current session still `open`, with `session_status`/`terminal_reason`
+    /// overriding that when given.
+    async fn cancelled_job(
+        file: &str,
+        session_status: &str,
+        terminal_reason: Option<&str>,
+    ) -> (Orchestrator, Arc<crate::storage::LocalDb>) {
+        let orch = test_orchestrator(migrated_test_db(file).await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,merged_at,created_at,updated_at) VALUES('i','p',1,'I','merged','merged','none',1,1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,current_session_id,created_at,updated_at) VALUES('j','p','i','cancelled','s',1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at) VALUES('t','s','j',1,'interrupted','initial',1,2,2);",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO sessions(id,job_id,backend,status,terminal_reason,sequence,created_at,updated_at)
+             VALUES('s','j','claude',?1,?2,1,1,1)",
+            params![session_status, terminal_reason],
+        )
+        .await
+        .unwrap();
+        (orch, db)
+    }
+
+    /// The funnel's Running write refuses Cancelled to Running, but a failed
+    /// write there is only logged, so a cancelled job holding an open session
+    /// used to launch anyway. The shared predicate refuses it first, and nothing
+    /// is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_job_with_an_open_session_is_refused_before_any_write() {
+        let (orch, db) = cancelled_job("cancelled-open-session-refusal", "open", None).await;
+
+        let error = super::continue_job_impl(&orch, "j", Some("carry on"), None, None)
+            .expect_err("a cancelled job takes no turn");
+        assert_eq!(error, super::CANCELLED_JOB_REFUSAL);
+
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE job_id = 'j'", ())
+                .await
+                .unwrap(),
+            Some(1),
+            "no follow-up turn is written for a refused launch"
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM runs WHERE job_id = 'j'", ())
+                .await
+                .unwrap(),
+            Some(0),
+            "no run is launched"
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT status FROM jobs WHERE id = 'j'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cancelled"),
+            "the job stays cancelled"
+        );
+    }
+
+    /// A cancelled job whose session a merge closed answers with the merge's
+    /// next step, not the bare cancelled text.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_job_on_a_merge_closed_session_gets_the_reopen_text() {
+        let (orch, _db) = cancelled_job(
+            "cancelled-merged-session-refusal",
+            "closed",
+            Some("issue_merged"),
+        )
+        .await;
+
+        let error = super::continue_job_impl(&orch, "j", Some("carry on"), None, None)
+            .expect_err("a cancelled job takes no turn");
+        assert!(error.contains("has been merged"), "{error}");
+        assert!(error.contains("reopen the issue"), "{error}");
     }
 
     /// cairn/4978: a Claude session whose first launch was rejected at init

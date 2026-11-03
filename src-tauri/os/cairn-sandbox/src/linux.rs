@@ -365,6 +365,63 @@ mod tests {
         }
     }
 
+    /// A host spawn's `$TMPDIR` is its own directory under Cairn's scratch
+    /// root: the ruleset grants that directory and never the root.
+    #[test]
+    fn a_granted_tmpdir_under_the_scratch_root_is_a_rule_and_the_root_is_not() {
+        let root = cairn_common::scratch::scratch_root();
+        let own = root.join("P.1.1.builder");
+        let mut policy = SandboxPolicy::for_run(Path::new("/work/wt"), &[], Vec::new());
+        policy.grant_tmpdir(&own);
+        let (writable, resolvable) = rule_paths(&policy);
+        assert!(writable.contains(&own));
+        assert!(resolvable.contains(&own));
+        assert!(!writable.contains(&root));
+        assert!(!resolvable.contains(&root));
+    }
+
+    /// Live, through the same `install_pre_exec` a batch gets: the granted
+    /// directory takes a `mkdir` and its sibling under the root refuses one.
+    /// Not skipped without Landlock: the fence fails closed there, and so does
+    /// this.
+    #[test]
+    fn a_granted_tmpdir_is_writable_live_and_its_sibling_is_refused() {
+        let wt = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("scratch");
+        let own = root.join("P.1.1.builder");
+        std::fs::create_dir_all(&own).unwrap();
+        let mut policy = SandboxPolicy {
+            worktree: wt.path().to_path_buf(),
+            writable_extra: Vec::new(),
+            deny_read: Vec::new(),
+            writable_regex: Vec::new(),
+            worktree_writable: true,
+            socket_resolvable: Vec::new(),
+            violation_tag: crate::ViolationTag::fresh(),
+            reach: Default::default(),
+        };
+        policy.grant_tmpdir(&own);
+        let mkdir = |dir: &Path| {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args(["-c", &format!("mkdir '{}'", dir.display())]);
+            install_pre_exec(&mut command, &policy);
+            command.output().unwrap()
+        };
+
+        let inside = own.join("x");
+        assert!(mkdir(&inside).status.success());
+        assert!(inside.is_dir());
+
+        let sibling = root.join("sibling");
+        let refused = mkdir(&sibling);
+        assert!(!refused.status.success());
+        assert!(
+            !sibling.exists(),
+            "a sibling under the scratch root is refused"
+        );
+    }
+
     #[test]
     fn a_page_call_policy_describes_its_read_and_network_scope() {
         let policy = SandboxPolicy::for_page_call(

@@ -105,6 +105,44 @@ pub struct RowWriteOrigin {
     pub appearance: crate::identity::AppearanceSnapshot,
 }
 
+/// The payload key a callback sender stamps with what kind of caller it is.
+///
+/// Descriptive, never authority: any HTTP caller can set it, so nothing that
+/// grants standing may read it. The values in use are `cli` (a standalone
+/// `cairn` CLI or shell invocation), `page` (a page's bridged read), and
+/// [`MODEL_FACING_ORIGIN`].
+pub const CALLBACK_ORIGIN_KEY: &str = "_cairn_origin";
+
+/// The origin an edge stamps on a call whose result it composes into a model's
+/// context as a tool result: the `cairn-cmd` MCP tools and the in-process
+/// HTTP-loop backend.
+///
+/// The host's per-turn context bookkeeping (the `[duplicate call]` stub, the
+/// session affordance collapse, the poll nudges) and tool-boundary delivery of
+/// the run's queued steers, side-channel notices and attention pushes apply
+/// only to calls that carry it. Every other caller under the same run
+/// (`@cairn/sdk` in a procedure or service, a `run` item's inline code, the
+/// CLI) shares the run's `CAIRN_RUN_ID` but hands its result to a program,
+/// which must get the real body, must not move the model's bookkeeping, and
+/// must not claim a delivery it has no model to show.
+///
+/// Absence is not free: an unmarked model-facing call also defers its run's
+/// queued deliveries to the end of the turn, which for Codex (no hook surface)
+/// means mid-turn steers stop arriving. Every model-facing edge must therefore
+/// stamp every verb it dispatches.
+pub const MODEL_FACING_ORIGIN: &str = "model";
+
+/// Stamp `payload` with `origin` under [`CALLBACK_ORIGIN_KEY`]. A non-object
+/// payload has no key to carry it and is left unchanged.
+pub fn stamp_callback_origin(payload: &mut serde_json::Value, origin: &str) {
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            CALLBACK_ORIGIN_KEY.to_string(),
+            serde_json::Value::String(origin.to_string()),
+        );
+    }
+}
+
 impl CallbackRequest {
     /// The operator's row write this request carries, if any.
     pub fn row_write_origin(&self) -> Option<&RowWriteOrigin> {
@@ -112,6 +150,15 @@ impl CallbackRequest {
             Some(DispatchOrigin::RowWrite(origin)) => Some(&**origin),
             None => None,
         }
+    }
+
+    /// Whether this call's result is composed into a model's context (see
+    /// [`MODEL_FACING_ORIGIN`]).
+    pub fn is_model_facing(&self) -> bool {
+        self.payload
+            .get(CALLBACK_ORIGIN_KEY)
+            .and_then(serde_json::Value::as_str)
+            == Some(MODEL_FACING_ORIGIN)
     }
 }
 
@@ -141,6 +188,28 @@ pub struct CallbackResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_model_facing_stamp_makes_a_request_model_facing() {
+        let request = |payload: serde_json::Value| CallbackRequest {
+            tool: "read_batch".to_string(),
+            payload,
+            ..Default::default()
+        };
+        let mut payload = serde_json::json!({"paths": ["file:a"]});
+        assert!(!request(payload.clone()).is_model_facing());
+
+        stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
+        assert_eq!(payload[CALLBACK_ORIGIN_KEY], MODEL_FACING_ORIGIN);
+        assert!(request(payload.clone()).is_model_facing());
+
+        stamp_callback_origin(&mut payload, "cli");
+        assert!(!request(payload).is_model_facing());
+
+        let mut not_an_object = serde_json::json!(["file:a"]);
+        stamp_callback_origin(&mut not_an_object, MODEL_FACING_ORIGIN);
+        assert_eq!(not_an_object, serde_json::json!(["file:a"]));
+    }
 
     /// The origin grants owner standing, so no JSON body may carry one: not
     /// under its own name, and not under any spelling a deserializer might

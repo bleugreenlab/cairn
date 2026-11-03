@@ -62,6 +62,11 @@ pub fn run_grammar_refusal(raw: &Value) -> Option<String> {
     };
     let mut findings = Vec::new();
     for (key, value) in call {
+        // The sender's stamp of what kind of caller it is: envelope metadata,
+        // not a grammar key, so it is accepted here and taught nowhere.
+        if key == crate::protocol::CALLBACK_ORIGIN_KEY {
+            continue;
+        }
         if !RUN_CALL_KEYS.contains(&key.as_str()) {
             findings.push(call_key_finding(key, value));
         }
@@ -391,6 +396,26 @@ mod tests {
                 .contains("unknown key `commands[0].payload.argsJson`; did you mean `args_json`?"),
             "{refusal}"
         );
+    }
+
+    /// A model-facing edge stamps its run calls with the callback origin, and
+    /// the host gates tool-boundary delivery on it, so the stamp must pass the
+    /// front door. It is a call-level envelope key only: inside an item it is as
+    /// foreign as any other unknown key.
+    #[test]
+    fn the_callback_origin_is_accepted_beside_commands_and_nowhere_else() {
+        let stamped = json!({"commands": [{"command": "true"}], "_cairn_origin": "model"});
+        assert_eq!(run_grammar_refusal(&stamped), None);
+
+        let in_item = json!({"commands": [{"command": "true", "_cairn_origin": "model"}]});
+        let refusal = run_grammar_refusal(&in_item).expect("refused");
+        assert!(
+            refusal.contains("unknown key `commands[0]._cairn_origin`"),
+            "{refusal}"
+        );
+
+        let in_payload = json!({"commands": [{"target": "cairn://mcp/s/t", "payload": {"_cairn_origin": "model"}}]});
+        assert!(run_grammar_refusal(&in_payload).is_some());
     }
 
     #[test]
