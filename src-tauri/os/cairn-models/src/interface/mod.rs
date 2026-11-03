@@ -716,6 +716,183 @@ impl Catalog {
         self.ranked(&query).map(|mut offers| offers.remove(0))
     }
 
+    /// The one offer an edit pinning `query.requested` to an agent names,
+    /// spelled as its provider spells it: what a stored launch fact must be,
+    /// since a launch hands it to the provider verbatim.
+    ///
+    /// The name resolves as [`Self::offer_for`] resolves an exact model, with
+    /// the differences an edit needs. A name is required, since an edit never
+    /// takes the best offer. A `provider/native-id` name selects that
+    /// provider's offer even when `query.provider` names another: the
+    /// qualifier is what the editor wrote, `query.provider` only the provider
+    /// the edit was made under. A name that reaches no offer exactly reaches
+    /// the one it matches ignoring ASCII case, so `Opus` pins Claude's `opus`;
+    /// a name several offers match only by case is refused naming each. And a
+    /// name nothing offers is refused naming what the provider `query` narrows
+    /// to does offer for the verb.
+    pub fn pinned_offer(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
+        let verb = query.verb;
+        let Some(requested) = query
+            .requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(NoOffer {
+                verb,
+                requested: None,
+                detail: Some("an edit names the model it pins".to_string()),
+                ambiguous: false,
+            });
+        };
+        let models = self.models();
+        let (qualifier, native) = self.qualified_by(requested);
+        let exact = OfferQuery {
+            requested: Some(requested),
+            provider: match qualifier {
+                Some(key)
+                    if models
+                        .iter()
+                        .flat_map(|model| &model.offers)
+                        .any(|offer| offer.provider == key && offer.model == native) =>
+                {
+                    Some(key)
+                }
+                _ => query.provider,
+            },
+            ..query
+        };
+        if !exact_offers(&models, &exact, requested, qualifier, native)
+            .0
+            .is_empty()
+        {
+            return self.offer_for(exact);
+        }
+
+        // Every spelling that matches ignoring case, each of which matches
+        // exactly. A qualified spelling selects its own provider, so only the
+        // bare ones are narrowed.
+        let mut spellings: Vec<String> = Vec::new();
+        {
+            let mut spell = |name: &str| {
+                if name.eq_ignore_ascii_case(requested)
+                    && !spellings.iter().any(|seen| seen == name)
+                {
+                    spellings.push(name.to_string());
+                }
+            };
+            for model in &models {
+                for offer in &model.offers {
+                    spell(&format!("{}/{}", offer.provider, offer.model));
+                }
+                let admitted: Vec<&CatalogOffer> = model
+                    .offers
+                    .iter()
+                    .filter(|offer| query.admits_offer(offer))
+                    .collect();
+                if admitted.is_empty() {
+                    continue;
+                }
+                spell(&model.catalog_id);
+                for alias in &model.aliases {
+                    spell(alias);
+                }
+                for offer in admitted {
+                    spell(&offer.model);
+                }
+            }
+        }
+
+        let mut pinned: Vec<SelectedOffer> = Vec::new();
+        let mut refused: Option<NoOffer> = None;
+        for spelling in &spellings {
+            match self.pinned_offer(OfferQuery {
+                requested: Some(spelling),
+                ..query
+            }) {
+                Ok(offer) => {
+                    if !pinned.contains(&offer) {
+                        pinned.push(offer);
+                    }
+                }
+                // That spelling already names more than one provider's offer:
+                // refused naming the qualified form of each, under the name
+                // the editor wrote.
+                Err(refusal) if refusal.ambiguous => {
+                    let spelled = OfferQuery {
+                        requested: Some(spelling),
+                        ..query
+                    };
+                    let (qualifier, native) = self.qualified_by(spelling);
+                    let (_, capable) = exact_offers(&models, &spelled, spelling, qualifier, native);
+                    return Err(NoOffer {
+                        requested: Some(requested.to_string()),
+                        detail: ambiguity(requested, &capable).or(refusal.detail),
+                        ..refusal
+                    });
+                }
+                Err(refusal) => {
+                    refused.get_or_insert(refusal);
+                }
+            }
+        }
+        match pinned.len() {
+            0 => Err(refused.unwrap_or_else(|| self.unoffered(&exact, requested))),
+            1 => Ok(pinned.remove(0)),
+            _ => {
+                let detail = ambiguity(requested, &pinned).unwrap_or_else(|| {
+                    let named: Vec<String> = pinned
+                        .iter()
+                        .map(|offer| format!("{}/{}", offer.provider, offer.model))
+                        .collect();
+                    format!(
+                        "'{requested}' matches {} only by case: name one",
+                        named.join(" and ")
+                    )
+                });
+                Err(NoOffer {
+                    verb,
+                    requested: Some(requested.to_string()),
+                    detail: Some(detail),
+                    ambiguous: true,
+                })
+            }
+        }
+    }
+
+    /// The refusal of a pin nothing offers, naming what the provider `query`
+    /// narrows to offers for its verb, so the editor sees what to write.
+    fn unoffered(&self, query: &OfferQuery<'_>, requested: &str) -> NoOffer {
+        /// Enough to recognise the model meant; a large provider's full list
+        /// is the catalog's to show.
+        const SHOWN: usize = 12;
+        let mut detail = format!("no installed provider offers '{requested}'");
+        if let Some(provider) = query.provider {
+            let offers = self.candidates(&OfferQuery {
+                requested: None,
+                ..*query
+            });
+            let names = self.request_names(&offers);
+            if !names.is_empty() {
+                detail.push_str(&format!(
+                    "; {provider} offers {}",
+                    names[..names.len().min(SHOWN)].join(", ")
+                ));
+                if names.len() > SHOWN {
+                    detail.push_str(&format!(
+                        " and {} more (cairn://models/catalog lists them)",
+                        names.len() - SHOWN
+                    ));
+                }
+            }
+        }
+        NoOffer {
+            verb: query.verb,
+            requested: Some(requested.to_string()),
+            detail: Some(detail),
+            ambiguous: false,
+        }
+    }
+
     /// The best offer for `query` that `admit` accepts, with what `admit`
     /// returned for it: the request-aware walk a verb with per-request
     /// capabilities (an image's mask, a voice's streaming) selects with.
@@ -1625,6 +1802,125 @@ mod tests {
                 .provider,
             "openrouter"
         );
+    }
+
+    fn pin(
+        catalog: &Catalog,
+        requested: &str,
+        provider: Option<&str>,
+    ) -> Result<(String, String), NoOffer> {
+        catalog
+            .pinned_offer(OfferQuery {
+                requested: Some(requested),
+                provider,
+                ..OfferQuery::new(VerbKind::Session)
+            })
+            .map(|offer| (offer.provider, offer.model))
+    }
+
+    /// A Claude subscription beside one chat model two providers offer, merged
+    /// on the upstream slug: OpenRouter's lowercase id and Cairn inference's
+    /// real name.
+    fn pinnable() -> Catalog {
+        const QWEN_CHAT: &str = "qwen/qwen3.6-35b-a3b";
+        Catalog {
+            providers: vec![
+                conversing(provider("claude", Some(claude_models()))),
+                conversing(provider(
+                    "openrouter",
+                    Some(vec![model(QWEN_CHAT, Some(QWEN_CHAT))]),
+                )),
+                conversing(provider(
+                    "inference",
+                    Some(vec![model("Qwen/Qwen3.6-35B-A3B", Some(QWEN_CHAT))]),
+                )),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_pin_is_stored_as_its_provider_spells_it() {
+        let catalog = pinnable();
+        let claude = |model: &str| Ok(("claude".to_string(), model.to_string()));
+        // Display case reaches the alias the CLI is sent.
+        assert_eq!(pin(&catalog, "Opus", Some("claude")), claude("opus"));
+        assert_eq!(pin(&catalog, " SONNET ", None), claude("sonnet"));
+        assert_eq!(pin(&catalog, "Claude/Haiku", None), claude("haiku"));
+        assert_eq!(pin(&catalog, "opus", Some("claude")), claude("opus"));
+
+        // A qualifier selects its provider's offer and stores the native id,
+        // even when the edit was made under another provider.
+        assert_eq!(
+            pin(
+                &catalog,
+                "openrouter/qwen/qwen3.6-35b-a3b",
+                Some("inference")
+            ),
+            Ok(("openrouter".into(), "qwen/qwen3.6-35b-a3b".into()))
+        );
+        assert_eq!(
+            pin(&catalog, "inference/Qwen/Qwen3.6-35B-A3B", None),
+            Ok(("inference".into(), "Qwen/Qwen3.6-35B-A3B".into()))
+        );
+        // A bare id is narrowed by the provider the edit was made under.
+        assert_eq!(
+            pin(&catalog, "Qwen/Qwen3.6-35B-A3B", Some("inference")),
+            Ok(("inference".into(), "Qwen/Qwen3.6-35B-A3B".into()))
+        );
+    }
+
+    #[test]
+    fn a_pin_two_providers_offer_is_refused_naming_each() {
+        let catalog = pinnable();
+        let expected = "'Qwen/Qwen3.6-35B-A3B' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one.";
+        let refusal = pin(&catalog, "Qwen/Qwen3.6-35B-A3B", None).unwrap_err();
+        assert!(refusal.ambiguous);
+        assert_eq!(refusal.to_string(), expected);
+        // Reached only by case, it is refused the same way, under the name
+        // the editor wrote.
+        let refusal = pin(&catalog, "QWEN/QWEN3.6-35B-A3B", None).unwrap_err();
+        assert!(refusal.ambiguous);
+        assert_eq!(
+            refusal.to_string(),
+            expected.replacen("Qwen/Qwen3.6-35B-A3B", "QWEN/QWEN3.6-35B-A3B", 1)
+        );
+
+        // Two models that differ only by case are two models.
+        let cased = Catalog {
+            providers: vec![
+                conversing(custom("acc_a", &["Jev-1"])),
+                conversing(custom("acc_b", &["jev-1"])),
+            ],
+        };
+        let refusal = pin(&cased, "JEV-1", None).unwrap_err();
+        assert!(refusal.ambiguous);
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("'JEV-1' is offered by custom:acc_a (custom:acc_a/Jev-1) and custom:acc_b (custom:acc_b/jev-1): name one")
+        );
+        assert_eq!(
+            pin(&cased, "jev-1", None),
+            Ok(("custom:acc_b".into(), "jev-1".into()))
+        );
+    }
+
+    #[test]
+    fn a_pin_nothing_offers_is_refused_naming_the_providers_offers() {
+        let catalog = pinnable();
+        let refusal = pin(&catalog, "opus-9", Some("claude")).unwrap_err();
+        assert!(!refusal.ambiguous);
+        assert_eq!(
+            refusal.to_string(),
+            "No session-capable model serves 'opus-9': no installed provider offers 'opus-9'; claude offers haiku, sonnet, opus, fable. To fix it, install or configure a provider in Settings → Providers."
+        );
+        assert_eq!(
+            pin(&catalog, "opus-9", None).unwrap_err().detail.as_deref(),
+            Some("no installed provider offers 'opus-9'")
+        );
+        // A provider that does not offer the name refuses it, though another
+        // provider does.
+        assert!(pin(&catalog, "opus", Some("openrouter")).is_err());
+        assert!(pin(&catalog, "  ", Some("claude")).is_err());
     }
 
     /// An offer that cannot serve the verb is no choice, so a name another

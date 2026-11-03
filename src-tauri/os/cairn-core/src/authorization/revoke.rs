@@ -16,6 +16,8 @@
 use cairn_common::authorization::{AuthorityGrant, AuthorityLifetime};
 use cairn_common::identity::PrincipalRef;
 
+use crate::mcp::types::McpCallbackRequest;
+use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 
 /// Where an agent is sent to have a grant it does not hold revoked. Named
@@ -131,6 +133,22 @@ pub struct Revoker {
 }
 
 impl Revoker {
+    /// Who `request` revokes as: its authenticated run, the thread that run
+    /// acts for (as a queue grant binds it), or the verified actor a row-write
+    /// origin carries. A request with none is a caller with no run and holds
+    /// nothing.
+    pub async fn resolve(orch: &Orchestrator, request: &McpCallbackRequest) -> Self {
+        match super::resolve_actor(orch, request).await {
+            Some(actor) => Revoker {
+                run_id: actor.principal.run_id,
+                node_uri: actor.principal.node_uri,
+                actor: actor.principal.actor,
+                acting_thread: crate::resources::mutations::asking_thread_id(orch, request).await,
+            },
+            None => Revoker::default(),
+        }
+    }
+
     /// The revoker as the grant's `revoked_by` records it.
     pub fn label(&self) -> String {
         match (&self.node_uri, &self.run_id, &self.actor) {

@@ -1099,6 +1099,19 @@ pub(super) async fn dispatch(
                                 })
                         })
                         .transpose()?;
+                    // The payload names only the model, so no provider narrows
+                    // it: a name two providers offer is refused naming each,
+                    // never settled by guessing from its spelling.
+                    let model = match model {
+                        Some(model) => Some(
+                            crate::threads::crud::resolve_thread_model(
+                                orch, &db, &thread.id, None, model,
+                            )
+                            .await
+                            .map_err(|e| build_failure(index, item, e.to_string()))?,
+                        ),
+                        None => None,
+                    };
                     let patched = if dry_run {
                         format!("Would patch thread {project}/{name}")
                     } else {
@@ -1126,16 +1139,7 @@ pub(super) async fn dispatch(
                                     .and_then(|v| v.as_str())
                                     .map(|value| Some(value.to_string())),
                                 status,
-                                // The payload names only the model; the provider
-                                // it resolves to is derived the single canonical
-                                // way, the same one turn start uses to decide
-                                // whether the live session still matches.
-                                model: model.map(|model| {
-                                    cairn_db::models::ModelSelection::new(
-                                        crate::backends::resolved_backend_for_model(model),
-                                        model.into(),
-                                    )
-                                }),
+                                model,
                             },
                         )
                         .await

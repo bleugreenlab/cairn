@@ -562,7 +562,7 @@ const MODELS_CLIENT_NAME: KeySpec = KeySpec::new(
 const MODELS_CLIENT_REMOTE: KeySpec = KeySpec::new(
     "remote",
     KeyType::Bool,
-    "true grants the client use of the workspace's OpenRouter account (a standing grant bound to the client); false, the default, keeps it to Cairn's own inference deployments",
+    "true grants the client use of the workspace's OpenRouter account (a standing grant bound to the client); false, the default, keeps it to Cairn's own inference deployments. On a client, false revokes the grants the client holds, so only the client itself may write it; the operator revokes them at Settings → Grants",
 );
 const MODELS_CLIENT_IMPORT: KeySpec = KeySpec::new(
     "import",
@@ -577,7 +577,7 @@ const MODELS_CLIENT_ORIGIN: KeySpec = KeySpec::new(
 const MODELS_CLIENT_REVOKE: KeySpec = KeySpec::new(
     "revoke",
     KeyType::Bool,
-    "true revokes the key and every remote grant bound to it",
+    "the operator's alone, and refused here for every caller: revoking cuts off the key and every grant bound to it, and a write here cannot prove it comes from the operator, who revokes a client at Settings → Served API in the Cairn desktop app",
 );
 
 pub(crate) const MODELS_CLIENTS_CONTRACT: ResourceContract = ResourceContract {
@@ -603,7 +603,7 @@ pub(crate) const MODELS_CLIENT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsClient,
     uri_template: "cairn://models/clients/{id}",
     name: "Served API client",
-    description: "One outside client of the served API, by its immutable id: its name, key provenance and hint, whether it is live, its remote grants, and its recent requests. Patch {remote:true|false} to grant or withdraw use of the workspace's OpenRouter account, or {revoke:true} to revoke the key with its grants.",
+    description: "One outside client of the served API, by its immutable id: its name, key provenance and hint, whether it is live, its remote grants, and its recent requests. Patch {remote:true} to grant use of the workspace's OpenRouter account (it asks the operator when an agent writes it). Withdrawing remote use revokes grants the client holds, and revoking the client cuts it off, so they are not an agent's to do: the operator revokes a client at Settings → Served API and a client's grants at Settings → Grants in the Cairn desktop app.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "every served-API client", kind: ResourceKind::ModelsClients, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
@@ -611,7 +611,7 @@ pub(crate) const MODELS_CLIENT_CONTRACT: ResourceContract = ResourceContract {
         mode: ChangeMode::Patch,
         required: &[],
         optional: &[MODELS_CLIENT_REMOTE, MODELS_CLIENT_REVOKE],
-        label: "grant or withdraw remote use, or revoke the key",
+        label: "grant remote use (withdrawing it, and revoking the key, are refused to all but the client and the operator)",
         example: r#"write({changes:[{target:"cairn://models/clients/CLIENT_ID",mode:"patch",payload:{remote:true}}]})"#,
     }],
 };

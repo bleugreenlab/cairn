@@ -13,6 +13,7 @@ use cairn_common::authorization::{
     AuthorityProvenance,
 };
 use cairn_core::internal::authorization::{self, normalize, GrantIssue, WORKSPACE_ID};
+use cairn_core::internal::orchestrator::served_api::clients;
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 use serde_json::json;
@@ -269,4 +270,93 @@ async fn the_operator_revokes_any_grant_once() {
             .unwrap_err(),
         authorization::revoke::OperatorRevokeRefusal::NotFound
     );
+}
+
+/// A served-API client with a standing remote grant bound to it.
+async fn client_with_remote_use(
+    db: &LocalDb,
+) -> (
+    cairn_db::storage::served_api::ServedApiClient,
+    AuthorityGrant,
+) {
+    let (client, _key) = clients::mint(db, "dig").await.unwrap();
+    let grant = clients::grant_remote(
+        db,
+        &client,
+        "openrouter",
+        "acc_or",
+        AuthorityProvenance {
+            issuer: "served_api_client".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    (client, grant)
+}
+
+async fn patch_client(
+    orch: &cairn_core::internal::orchestrator::Orchestrator,
+    client_id: &str,
+    run: Option<&str>,
+    payload: serde_json::Value,
+) -> String {
+    common::change_resource_as_run(
+        orch,
+        json!([{
+            "target": format!("cairn://models/clients/{client_id}"),
+            "mode": "patch",
+            "payload": payload
+        }]),
+        run,
+    )
+    .await
+}
+
+/// Revoking a served-API client strips the grants it holds, so it is the
+/// operator's alone, and no write to `cairn://models/clients` can prove it
+/// comes from the operator: an agent run and a run-less caller are both
+/// refused and sent to the operator's page, and nothing is revoked.
+#[tokio::test]
+async fn no_caller_revokes_a_served_api_client_through_the_resource() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    two_runs(&db).await;
+    let orch = common::orchestrator(&temp, db.clone());
+    let (client, grant) = client_with_remote_use(&db).await;
+
+    for caller in [Some("run-1"), None] {
+        let result = patch_client(&orch, &client.id, caller, json!({"revoke": true})).await;
+        assert!(result.contains("Refused"), "{caller:?}: {result}");
+        assert!(
+            result.contains("Settings → Served API"),
+            "{caller:?}: {result}"
+        );
+    }
+    let after = clients::find(&db, &client.id).await.unwrap().unwrap();
+    assert_eq!(after.revoked_at, None, "the client is still live");
+    assert!(!revoked(&db, &grant).await, "its grant is still active");
+}
+
+/// Withdrawing a client's remote use revokes grants the client holds, so it
+/// follows the holder rule: neither an agent run nor a run-less caller holds
+/// them, and both are told whose they are and where the operator revokes them.
+#[tokio::test]
+async fn withdrawing_a_clients_remote_use_follows_the_holder_rule() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    two_runs(&db).await;
+    let orch = common::orchestrator(&temp, db.clone());
+    let (client, grant) = client_with_remote_use(&db).await;
+
+    for caller in [Some("run-1"), None] {
+        let result = patch_client(&orch, &client.id, caller, json!({"remote": false})).await;
+        assert!(
+            result.contains("Withdrawing client dig's remote use"),
+            "{caller:?}: {result}"
+        );
+        assert!(result.contains(&client.id), "names the holder: {result}");
+        assert!(result.contains("Settings → Grants"), "{caller:?}: {result}");
+    }
+    assert!(!revoked(&db, &grant).await, "nothing was revoked");
 }

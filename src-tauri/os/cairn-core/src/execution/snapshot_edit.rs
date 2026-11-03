@@ -59,6 +59,28 @@ pub async fn update_execution_agent(
     // within. A job that already launched keeps the selection it stored.
     let mut normalized_snapshot = agent_snapshot;
 
+    // A pin the edit changes is stored as the catalog spells it, which is what
+    // its jobs will be launched with. One the edit keeps is not a model edit,
+    // and is not resolved again: a prompt edit must not be refused because the
+    // agent's provider has since stopped listing its model.
+    let stored_selection = snapshot
+        .agents
+        .get(agent_id)
+        .and_then(|agent| agent.selection.as_ref());
+    let edited_pin = normalized_snapshot
+        .selection
+        .as_ref()
+        .filter(|selection| stored_selection != Some(*selection));
+    if let Some(selection) = edited_pin {
+        let resolved = crate::execution::provider_change::resolve_model_edit(
+            orch,
+            Some(snapshot.trigger_context.project_id.as_str()),
+            Some(selection.backend.as_str()),
+            selection.model.as_str(),
+        )?;
+        normalized_snapshot.selection = Some(resolved);
+    }
+
     // This is the one door an agent snapshot is edited through, so it is the one
     // place that can honestly say an edit happened. The stamp is what tells a
     // long-lived host (a thread session) that this snapshot is now customized
@@ -464,15 +486,11 @@ mod tests {
         .unwrap()
     }
 
-    /// A job that has not opened a session yet carries a NULL
-    /// `current_session_id`. A model-carrying edit must treat that as "no session
-    /// to rotate": write the job's model and succeed. Reading the column as
-    /// required TEXT failed the edit after the snapshot had already been written.
-    #[tokio::test]
-    async fn a_model_edit_lands_on_a_job_that_has_no_session_yet() {
-        let orch = orchestrator().await;
+    /// One execution whose `builder` agent and pending, session-less job both
+    /// run `model`.
+    async fn seed(orch: &Orchestrator, model: &str) {
         let db = &orch.db.local;
-        db.execute_script(
+        db.execute_script(&format!(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1);
              INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
@@ -482,16 +500,115 @@ mod tests {
              INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, agent_config_id,
                                status, model, current_session_id, created_at, updated_at, uri_segment)
                VALUES ('job-1','exec-1','issue-1','proj-1','Builder','builder',
-                       'pending','claude-old',NULL,1,1,'builder');",
-        )
+                       'pending','{model}',NULL,1,1,'builder');"
+        ))
         .await
         .unwrap();
         db.execute(
             "UPDATE executions SET snapshot = ?1 WHERE id = 'exec-1'",
-            params![snapshot_json(builder("claude-old"))],
+            params![snapshot_json(builder(model))],
         )
         .await
         .unwrap();
+    }
+
+    async fn stored_builder(db: &LocalDb) -> AgentSnapshot {
+        let stored = db
+            .query_opt_text("SELECT snapshot FROM executions WHERE id = 'exec-1'", ())
+            .await
+            .unwrap()
+            .unwrap();
+        crate::config::snapshot_migrate::load(&stored)
+            .unwrap()
+            .agents["builder"]
+            .clone()
+    }
+
+    async fn job_model(db: &LocalDb) -> Option<String> {
+        db.query_opt_text("SELECT model FROM jobs WHERE id = 'job-1'", ())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_model_edit_stores_the_catalogs_spelling_and_refuses_what_it_lacks() {
+        let orch = orchestrator().await;
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        seed(&orch, "claude-old").await;
+        let db = &orch.db.local;
+
+        update_execution_agent(&orch, "exec-1", "builder", builder("Opus"), None)
+            .await
+            .unwrap();
+        let opus = ModelSelection::new("claude", Model::new(Model::OPUS));
+        assert_eq!(stored_builder(db).await.selection, Some(opus.clone()));
+        assert_eq!(job_model(db).await.as_deref(), Some(Model::OPUS));
+
+        // A qualified id under the Claude provider moves the pin to the
+        // provider it names, as that provider spells the model.
+        let qwen = "openrouter/qwen/qwen3.6-35b-a3b";
+        update_execution_agent(&orch, "exec-1", "builder", builder(qwen), None)
+            .await
+            .unwrap();
+        let selection = stored_builder(db).await.selection.unwrap();
+        assert_eq!(
+            (selection.backend.as_str(), selection.model.as_str()),
+            (
+                "openrouter",
+                crate::execution::provider_change::tests::QWEN_SLUG
+            )
+        );
+        assert_eq!(
+            job_model(db).await.as_deref(),
+            Some(crate::execution::provider_change::tests::QWEN_SLUG)
+        );
+
+        update_execution_agent(&orch, "exec-1", "builder", builder(Model::OPUS), None)
+            .await
+            .unwrap();
+        let refusal = update_execution_agent(&orch, "exec-1", "builder", builder("opus-9"), None)
+            .await
+            .unwrap_err();
+        assert!(refusal.contains("claude offers"), "{refusal}");
+        assert_eq!(
+            stored_builder(db).await.selection,
+            Some(opus),
+            "a refused edit leaves the snapshot as it was"
+        );
+        assert_eq!(job_model(db).await.as_deref(), Some(Model::OPUS));
+    }
+
+    /// An edit that keeps the agent's model is not a model edit, so it lands
+    /// though no installed provider offers that model any more.
+    #[tokio::test]
+    async fn an_edit_that_keeps_the_model_does_not_resolve_it_again() {
+        let orch = orchestrator().await;
+        seed(&orch, "claude-old").await;
+        let mut edited = builder("claude-old");
+        edited.prompt = "a new prompt".to_string();
+        update_execution_agent(&orch, "exec-1", "builder", edited, None)
+            .await
+            .unwrap();
+        let stored = stored_builder(&orch.db.local).await;
+        assert_eq!(stored.prompt, "a new prompt");
+        assert_eq!(
+            stored
+                .selection
+                .map(|selection| selection.model.to_string()),
+            Some("claude-old".to_string())
+        );
+    }
+
+    /// A job that has not opened a session yet carries a NULL
+    /// `current_session_id`. A model-carrying edit must treat that as "no session
+    /// to rotate": write the job's model and succeed. Reading the column as
+    /// required TEXT failed the edit after the snapshot had already been written.
+    #[tokio::test]
+    async fn a_model_edit_lands_on_a_job_that_has_no_session_yet() {
+        let orch = orchestrator().await;
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        seed(&orch, "claude-old").await;
+        let db = &orch.db.local;
 
         update_execution_agent(
             &orch,

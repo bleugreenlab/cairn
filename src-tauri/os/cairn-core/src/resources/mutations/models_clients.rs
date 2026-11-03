@@ -3,16 +3,24 @@
 //!
 //! Minting, importing and granting remote use expand who may spend this
 //! workspace's models, so they cross the `servedApi` settings boundary and ask
-//! the operator when an agent writes them. Withdrawing remote use and revoking
-//! a key only narrow authority and are direct.
+//! the operator when an agent writes them.
+//!
+//! Withdrawing remote use and revoking a key only narrow authority, but they
+//! take it from another principal, the client. Withdrawing remote use revokes
+//! grants the client holds, so it follows the holder rule every grant revoke
+//! does (`authorization::revoke`). Revoking the client is the operator's
+//! alone and is refused here for every caller: nothing that arrives over the
+//! agent callback can prove it comes from the operator, so the operator's door
+//! is `revoke_served_api_client`, behind Settings → Served API.
 
 use cairn_common::authorization::{
-    ActDigest, AuthorityDecision, AuthorityProvenance, AuthorityRequest,
+    ActDigest, AuthorityDecision, AuthorityGrant, AuthorityProvenance, AuthorityRequest,
 };
 use cairn_common::uri::{parse_uri, CairnResource};
 use serde_json::Value;
 
 use super::{build_failure, ResourceMutationResult};
+use crate::authorization::revoke::{check_holder, Revoker};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::served_api::clients::{self, ImportedKey};
 use crate::orchestrator::Orchestrator;
@@ -223,7 +231,13 @@ pub(super) async fn dispatch(
     };
     let fail = |error: String| build_failure(index, item, error);
     let change = change.map_err(fail)?;
+    if let ClientChange::Revoke { id } = &change {
+        return Err(fail(revoke_refusal(id)));
+    }
     if dry_run {
+        if let ClientChange::SetRemote { id, remote: false } = &change {
+            withdrawal(orch, request, id).await.map_err(fail)?;
+        }
         return Ok(Some(match change.authority() {
             Some(authority) => format!(
                 "Would {} (scope {})",
@@ -327,44 +341,73 @@ pub(super) async fn dispatch(
                     .join(", ")
             )
         }
-        ClientChange::SetRemote { id, remote } => {
+        ClientChange::SetRemote { id, remote: true } => {
             let client = live_client(orch, &id).await.map_err(fail)?;
-            if remote {
-                let account = remote_account(orch).map_err(fail)?;
-                let grant =
-                    clients::grant_remote(db, &client, "openrouter", &account, provenance(request))
-                        .await
-                        .map_err(fail)?;
-                format!(
-                    "Client {} may use OpenRouter account {account} (grant {}).",
-                    client.name, grant.id
-                )
-            } else {
-                let grants = clients::remote_grants(db, &client).await.map_err(fail)?;
-                for grant in &grants {
-                    crate::authorization::revoke_grant(db, &grant.id, Some("served_api_client"))
-                        .await
-                        .map_err(fail)?;
-                }
-                format!(
-                    "Client {} is local-only ({} grant(s) revoked).",
-                    client.name,
-                    grants.len()
-                )
-            }
-        }
-        ClientChange::Revoke { id } => {
-            let client = live_client(orch, &id).await.map_err(fail)?;
-            clients::revoke(db, &client, "served_api_client")
-                .await
-                .map_err(fail)?;
+            let account = remote_account(orch).map_err(fail)?;
+            let grant =
+                clients::grant_remote(db, &client, "openrouter", &account, provenance(request))
+                    .await
+                    .map_err(fail)?;
             format!(
-                "Revoked client {}'s key and its remote grants.",
-                client.name
+                "Client {} may use OpenRouter account {account} (grant {}).",
+                client.name, grant.id
             )
         }
+        ClientChange::SetRemote { id, remote: false } => {
+            let (client, grants, revoker) = withdrawal(orch, request, &id).await.map_err(fail)?;
+            for grant in &grants {
+                crate::authorization::revoke_grant(db, &grant.id, Some(&revoker.label()))
+                    .await
+                    .map_err(fail)?;
+            }
+            format!(
+                "Client {} is local-only ({} grant(s) revoked).",
+                client.name,
+                grants.len()
+            )
+        }
+        ClientChange::Revoke { id } => return Err(fail(revoke_refusal(&id))),
     };
     Ok(Some(summary))
+}
+
+fn revoke_refusal(id: &str) -> String {
+    format!(
+        "Refused: revoking served-API client '{id}' cuts off its key and revokes the grants it \
+         holds, so only the operator may do it, at {}. A write to cairn://models/clients cannot \
+         prove it comes from the operator.",
+        clients::OPERATOR_CLIENT_SURFACE
+    )
+}
+
+/// The live client `id`, the remote grants withdrawing its remote use would
+/// revoke, and who is revoking them, once the caller is shown to hold every
+/// one of those grants. They are bound to the client, so in practice only the
+/// client itself holds them; the operator revokes them at Settings → Grants.
+async fn withdrawal(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    id: &str,
+) -> Result<
+    (
+        cairn_db::storage::served_api::ServedApiClient,
+        Vec<AuthorityGrant>,
+        Revoker,
+    ),
+    String,
+> {
+    let client = live_client(orch, id).await?;
+    let grants = clients::remote_grants(&orch.db.local, &client).await?;
+    let revoker = Revoker::resolve(orch, request).await;
+    for grant in &grants {
+        check_holder(&grant.id, grant, &revoker).map_err(|refusal| {
+            format!(
+                "Withdrawing client {}'s remote use revokes the grants it holds. {refusal}",
+                client.name
+            )
+        })?;
+    }
+    Ok((client, grants, revoker))
 }
 
 async fn live_client(

@@ -30,8 +30,22 @@ fn from_row(row: &cairn_db::turso::Row) -> DbResult<Thread> {
 pub async fn update_with_lifecycle(
     orch: &crate::orchestrator::Orchestrator,
     db: &LocalDb,
-    input: UpdateThread,
+    mut input: UpdateThread,
 ) -> Result<ThreadUpdate, CairnError> {
+    // Resolved before anything is written, so a refused model leaves the
+    // thread's other fields unedited too.
+    if let Some(requested) = input.model.take() {
+        input.model = Some(
+            resolve_thread_model(
+                orch,
+                db,
+                &input.id,
+                Some(requested.backend.as_str()),
+                requested.model.as_str(),
+            )
+            .await?,
+        );
+    }
     let selection = input.model.clone();
     let outcome = update(db, input).await?;
     // Closing a thread closes its node's scratch everywhere and removes its
@@ -87,6 +101,45 @@ pub async fn update_with_lifecycle(
         .map_err(CairnError::Internal)?;
     }
     Ok(outcome)
+}
+
+/// A thread model edit as the catalog resolves it
+/// ([`crate::execution::provider_change::resolve_model_edit`]), narrowed by
+/// `provider` when the model is bare.
+///
+/// A thread's session job stores only the model's name, and every turn infers
+/// its provider from that name ([`crate::backends::resolved_backend_for_model`])
+/// unless the thread's agent snapshot pins that same model with its provider.
+/// An offer on a provider the name does not imply would be moved off it by
+/// the next turn, so it is refused here, pointing at the agent editor, whose
+/// selection carries the provider.
+pub(crate) async fn resolve_thread_model(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &LocalDb,
+    thread_id: &str,
+    provider: Option<&str>,
+    requested: &str,
+) -> Result<crate::models::ModelSelection, CairnError> {
+    let project_id = get(db, thread_id).await?.map(|thread| thread.project_id);
+    let resolved = crate::execution::provider_change::resolve_model_edit(
+        orch,
+        project_id.as_deref(),
+        provider,
+        requested,
+    )
+    .map_err(CairnError::Internal)?;
+    let inferred = crate::backends::resolved_backend_for_model(resolved.model.as_str());
+    if inferred != resolved.backend {
+        return Err(CairnError::Internal(format!(
+            "'{requested}' resolves to {provider}'s '{native}', but a thread's model edit stores \
+             only the model's name, from which each turn infers {inferred}; pin a {provider} \
+             model in the thread's agent editor, whose selection carries the provider",
+            requested = requested.trim(),
+            provider = resolved.backend,
+            native = resolved.model,
+        )));
+    }
+    Ok(resolved)
 }
 
 async fn get_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Option<Thread>> {
@@ -890,6 +943,94 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stamped, (Some("gpt-5.6-sol".into()), "codex".into()));
+    }
+
+    /// A thread model edit stores the offer as the catalog spells it, and
+    /// refuses one the session job's model name could not carry.
+    #[tokio::test]
+    async fn a_thread_model_edit_is_resolved_through_the_catalog() {
+        use crate::models::{Model, ModelSelection};
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
+        let search = std::sync::Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep())
+                .unwrap(),
+        );
+        let orch = crate::orchestrator::OrchestratorBuilder::new(
+            std::sync::Arc::new(crate::db::DbState::new(std::sync::Arc::new(local), search)),
+            std::sync::Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        crate::execution::provider_change::tests::seed_edit_catalog(&orch);
+        let db = &orch.db.local;
+        seed_project(db, "project-a").await;
+        let thread = create(db, input("project-a", "roadmap")).await.unwrap();
+        let edit = |backend: &str, model: &str| UpdateThread {
+            id: thread.id.clone(),
+            name: None,
+            jurisdiction: None,
+            definition: None,
+            status: None,
+            model: Some(ModelSelection::new(backend, Model::new(model))),
+        };
+        let session_model = || async {
+            db.query_one(
+                &format!(
+                    "SELECT j.model FROM jobs j WHERE j.thread_id = ?1 AND {}",
+                    crate::threads::SESSION_JOB_SHAPE
+                ),
+                params![thread.id.clone()],
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+        };
+
+        update_with_lifecycle(&orch, db, edit("claude", "Opus"))
+            .await
+            .unwrap();
+        assert_eq!(session_model().await.as_deref(), Some(Model::OPUS));
+
+        // Cairn inference's offer is real, but its name reads as OpenRouter's
+        // to the turn that would launch it.
+        let refusal =
+            update_with_lifecycle(&orch, db, edit("claude", "inference/Qwen/Qwen3.6-35B-A3B"))
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            refusal.contains("from which each turn infers openrouter")
+                && refusal.contains("agent editor"),
+            "{refusal}"
+        );
+        // The agent-facing patch names no provider, so a bare id two
+        // providers offer is refused naming each.
+        let refusal = resolve_thread_model(
+            &orch,
+            db,
+            &thread.id,
+            None,
+            crate::execution::provider_change::tests::QWEN_LOCAL,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refusal.contains("inference/Qwen/Qwen3.6-35B-A3B")
+                && refusal.contains("openrouter/qwen/qwen3.6-35b-a3b"),
+            "{refusal}"
+        );
+        assert!(update_with_lifecycle(&orch, db, edit("claude", "opus-9"))
+            .await
+            .is_err());
+        assert_eq!(
+            session_model().await.as_deref(),
+            Some(Model::OPUS),
+            "a refused edit leaves the session job's model as it was"
+        );
     }
 
     /// Changing a live thread's model lands on the same column creation writes,

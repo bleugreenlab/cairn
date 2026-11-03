@@ -7,7 +7,14 @@
 //! bgllm's scheme, so a key imported by hash keeps working unchanged. Local
 //! models need only a live key. A remote provider needs a standing grant on
 //! that provider's account bound to the client's principal.
+//!
+//! Revoking a client is the operator's alone ([`revoke_as_operator`]): it cuts
+//! the client off and revokes the grants it holds, which is undoing the
+//! operator's decision for another principal. No write over the agent
+//! callback can prove it comes from the operator, so the operator's door is
+//! the `revoke_served_api_client` invoke behind [`OPERATOR_CLIENT_SURFACE`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_common::authorization::{
@@ -32,6 +39,9 @@ pub const API_ISSUER: &str = "cairn-api";
 pub const MODELS_SERVICE: &str = "models";
 /// The prefix of a key Cairn mints.
 pub const KEY_PREFIX: &str = "cak-";
+/// Where the operator lists and revokes served-API clients. Named once so the
+/// refusal, the affordance and the page cannot drift apart.
+pub const OPERATOR_CLIENT_SURFACE: &str = "Settings → Served API in the Cairn desktop app";
 
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
@@ -266,15 +276,141 @@ pub async fn import(
     Ok(clients)
 }
 
-/// Revoke `client`'s key and every remote grant bound to it.
+/// Revoke `client`'s key and every remote grant bound to it, recording `by`.
+/// The key's revoke is conditional on the client being live, and the grants
+/// are revoked only by the call that won it, so of two racing revokes one
+/// revokes and the other is told `false` having changed nothing.
 pub async fn revoke(db: &LocalDb, client: &ServedApiClient, by: &str) -> Result<bool, String> {
     let revoked = store::revoke_served_api_client(db, &client.id, now_secs(), by)
         .await
         .map_err(|error| format!("could not revoke the client: {error}"))?;
+    if !revoked {
+        return Ok(false);
+    }
     for grant in remote_grants(db, client).await? {
         authorization::revoke_grant(db, &grant.id, Some(by)).await?;
     }
-    Ok(revoked)
+    Ok(true)
+}
+
+/// One client as the operator's Settings → Served API page lists it. A key
+/// hash is never part of it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSummary {
+    pub id: String,
+    pub name: String,
+    /// `minted`, or `imported:<origin>`.
+    pub source: String,
+    /// The last four characters of a key Cairn minted.
+    pub key_hint: Option<String>,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+    pub revoked_by: Option<String>,
+    /// The scope of each live grant that lets the client use a remote
+    /// provider; empty when it is local-only.
+    pub remote: Vec<String>,
+    /// Epoch seconds of its last request through the served API.
+    pub last_request_at: Option<i64>,
+}
+
+/// Each client's last request, epoch seconds by client id.
+async fn last_requests(db: &LocalDb) -> Result<HashMap<String, i64>, String> {
+    Ok(store::last_model_request_by_client(db)
+        .await
+        .map_err(|error| format!("could not read served-API requests: {error}"))?
+        .into_iter()
+        .map(|(id, ms)| (id, ms / 1000))
+        .collect())
+}
+
+async fn summary(
+    db: &LocalDb,
+    client: &ServedApiClient,
+    last: &HashMap<String, i64>,
+) -> Result<ClientSummary, String> {
+    Ok(ClientSummary {
+        id: client.id.clone(),
+        name: client.name.clone(),
+        source: client.source.clone(),
+        key_hint: client.key_hint.clone(),
+        created_at: client.created_at,
+        revoked_at: client.revoked_at,
+        revoked_by: client.revoked_by.clone(),
+        remote: remote_grants(db, client)
+            .await?
+            .iter()
+            .map(|grant| grant.scope.shorthand())
+            .collect(),
+        last_request_at: last.get(&client.id).copied(),
+    })
+}
+
+/// Every client, revoked ones included, as the operator's page lists them.
+pub async fn summaries(db: &LocalDb) -> Result<Vec<ClientSummary>, String> {
+    let last = last_requests(db).await?;
+    let mut out = Vec::new();
+    for client in list(db).await? {
+        out.push(summary(db, &client, &last).await?);
+    }
+    Ok(out)
+}
+
+/// Why the operator's client revoke did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientRevokeRefusal {
+    NotFound,
+    /// Revoked before the operator asked, or by a revoke that won the race.
+    AlreadyRevoked,
+    Storage(String),
+}
+
+impl std::fmt::Display for ClientRevokeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientRevokeRefusal::NotFound => write!(f, "No served-API client has that id."),
+            ClientRevokeRefusal::AlreadyRevoked => write!(
+                f,
+                "That client is already revoked, so there is nothing to revoke."
+            ),
+            ClientRevokeRefusal::Storage(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// The operator's revoke of client `id`: its key and every grant bound to it.
+/// The client is re-read first, so one revoked since the page was drawn is
+/// reported rather than revoked again. `operator` is the label the runner
+/// derived from the verified invoke identity, never a name the caller
+/// supplied.
+pub async fn revoke_as_operator(
+    db: &LocalDb,
+    id: &str,
+    operator: &str,
+) -> Result<ClientSummary, ClientRevokeRefusal> {
+    let client = find(db, id)
+        .await
+        .map_err(ClientRevokeRefusal::Storage)?
+        .ok_or(ClientRevokeRefusal::NotFound)?;
+    if client.revoked_at.is_some() {
+        return Err(ClientRevokeRefusal::AlreadyRevoked);
+    }
+    if !revoke(db, &client, operator)
+        .await
+        .map_err(ClientRevokeRefusal::Storage)?
+    {
+        return Err(ClientRevokeRefusal::AlreadyRevoked);
+    }
+    let client = find(db, id)
+        .await
+        .map_err(ClientRevokeRefusal::Storage)?
+        .ok_or(ClientRevokeRefusal::NotFound)?;
+    let last = last_requests(db)
+        .await
+        .map_err(ClientRevokeRefusal::Storage)?;
+    summary(db, &client, &last)
+        .await
+        .map_err(ClientRevokeRefusal::Storage)
 }
 
 /// The authority remote use spends: running on `provider`'s `account_id`.
@@ -469,6 +605,79 @@ mod tests {
         // Revoking the client revokes its grant.
         revoke(&db, &dig, "operator").await.unwrap();
         assert!(remote_grants(&db, &dig).await.unwrap().is_empty());
+    }
+
+    fn provenance() -> AuthorityProvenance {
+        AuthorityProvenance {
+            issuer: "served_api_client".into(),
+            decision_actor: None,
+            appearance_snapshot: None,
+            approver: None,
+            request_uri: None,
+            node_uri: None,
+            rationale: None,
+        }
+    }
+
+    /// The operator's revoke cuts off the key and its grants once, records the
+    /// label it was handed, and reports a client revoked since or never there.
+    #[tokio::test]
+    async fn the_operator_revokes_a_client_and_its_grants_once() {
+        let db = Arc::new(crate::storage::migrated_test_db("served-api-op-revoke.db").await);
+        let (dig, key) = mint(&db, "dig").await.unwrap();
+        let grant = grant_remote(&db, &dig, "openrouter", "acc_or", provenance())
+            .await
+            .unwrap();
+
+        let listed = summaries(&db).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].remote, vec![grant.scope.shorthand()]);
+        assert_eq!(listed[0].revoked_at, None);
+
+        let after = revoke_as_operator(&db, &dig.id, "the desktop operator")
+            .await
+            .unwrap();
+        assert!(after.revoked_at.is_some());
+        assert_eq!(after.revoked_by.as_deref(), Some("the desktop operator"));
+        assert!(after.remote.is_empty(), "its grants went with it");
+        assert!(authenticate(&db, &key).await.unwrap().is_none());
+        let grant = authorization::get_grant(&db, &grant.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(grant.revoked_at.is_some());
+
+        assert_eq!(
+            revoke_as_operator(&db, &dig.id, "the desktop operator").await,
+            Err(ClientRevokeRefusal::AlreadyRevoked)
+        );
+        assert_eq!(
+            revoke_as_operator(&db, "cli_nobody", "the desktop operator").await,
+            Err(ClientRevokeRefusal::NotFound)
+        );
+    }
+
+    /// A revoke that loses the race to another changes nothing: the grants are
+    /// the winner's to revoke, under the winner's name.
+    #[tokio::test]
+    async fn a_revoke_of_a_client_no_longer_live_revokes_nothing() {
+        let db = Arc::new(crate::storage::migrated_test_db("served-api-lost-race.db").await);
+        let (dig, _) = mint(&db, "dig").await.unwrap();
+        // The stale copy a loser would hold, read before the winner revoked.
+        let stale = dig.clone();
+        store::revoke_served_api_client(&db, &dig.id, 1, "winner")
+            .await
+            .unwrap();
+        let grant = grant_remote(&db, &dig, "openrouter", "acc_or", provenance())
+            .await
+            .unwrap();
+
+        assert!(!revoke(&db, &stale, "loser").await.unwrap());
+        let grant = authorization::get_grant(&db, &grant.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.revoked_at, None, "the loser revoked nothing");
     }
 
     #[tokio::test]

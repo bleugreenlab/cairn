@@ -129,7 +129,7 @@ fn excluded(orch: &Orchestrator, request: &McpCallbackRequest) -> Option<NoAsker
 /// The thread a queue grant would bind for `request`, by id: what holds an
 /// `ActingThread` grant when it is revoked (cairn/5998). The same exclusions
 /// as [`asker`], then the run's own job's thread.
-pub(super) async fn asking_thread_id(
+pub(crate) async fn asking_thread_id(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Option<String> {

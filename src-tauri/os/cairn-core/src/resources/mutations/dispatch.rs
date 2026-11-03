@@ -38,7 +38,7 @@ mod progress;
 mod projects;
 mod prompts;
 mod queue;
-pub(crate) use queue::{authorize_start_now, queue_authority};
+pub(crate) use queue::{asking_thread_id, authorize_start_now, queue_authority};
 mod rebase;
 mod recipes;
 mod repls;

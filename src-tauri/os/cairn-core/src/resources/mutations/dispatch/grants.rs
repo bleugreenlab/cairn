@@ -4,8 +4,10 @@
 //! by id, and history that points at a row someone removed is not an audit
 //! trail. A revoked grant stays readable and simply stops authorizing.
 //!
-//! A caller here revokes only a grant it holds (`authorization::revoke`). The
-//! operator revokes any grant, but not through this resource: a write here
+//! A caller here revokes only a grant it holds (`authorization::revoke`), as
+//! `Revoker::resolve` names it: its authenticated run, the thread that run
+//! acts for (as a queue grant binds it), or the verified actor a row-write
+//! origin carries. The operator revokes any grant, but not through this resource: a write here
 //! cannot prove it comes from the operator, so the operator's door is the
 //! `revoke_authority_grant` invoke behind Settings → Grants.
 
@@ -46,7 +48,7 @@ pub(super) async fn dispatch(
             let Some(grant) = grant else {
                 return Ok(Some(format!("Authority grant '{id}' does not exist")));
             };
-            let revoker = revoker(orch, request).await;
+            let revoker = Revoker::resolve(orch, request).await;
             check_holder(id, &grant, &revoker)
                 .map_err(|refusal| build_failure(index, item, refusal))?;
             if dry_run {
@@ -73,20 +75,4 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
-}
-
-/// Who this request revokes as: its authenticated run, the thread that run
-/// acts for (as a queue grant binds it), or the verified actor a row-write
-/// origin carries. A request with none is a caller with no run and holds
-/// nothing.
-async fn revoker(orch: &Orchestrator, request: &McpCallbackRequest) -> Revoker {
-    match crate::authorization::resolve_actor(orch, request).await {
-        Some(actor) => Revoker {
-            run_id: actor.principal.run_id,
-            node_uri: actor.principal.node_uri,
-            actor: actor.principal.actor,
-            acting_thread: super::queue::asking_thread_id(orch, request).await,
-        },
-        None => Revoker::default(),
-    }
 }

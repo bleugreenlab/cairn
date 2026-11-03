@@ -626,6 +626,12 @@ mod tests {
             // the token in the loopback request header. Its test names the
             // header only to assert it is sent.
             "src-tauri/src/commands/grants.rs",
+            // Served-API client revocation (Settings -> Served API): the same
+            // shape as `grants.rs`. Routed through `operator_target` with no
+            // peer, it names only `invoke_as_operator`, forwards the client id
+            // unchanged, and returns only the runner's payload. Its test names
+            // the header only to assert it is sent.
+            "src-tauri/src/commands/served_api.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

@@ -13,10 +13,66 @@
 //! whereas a half-applied model change is recoverable by nothing, and the
 //! teardown used to sit between the session read and the swap it invalidates.
 
-use crate::models::SessionStatus;
+use cairn_models::interface::{ModelScope, Models, OfferQuery};
+use cairn_models::types::catalog::VerbKind;
+
+use crate::models::{Model, ModelSelection, SessionStatus};
 use crate::orchestrator::Orchestrator;
 use crate::sessions::queries::RotationCommit;
 use crate::storage::LocalDb;
+
+/// The selection a model edit stores for `requested`: the session offer the
+/// catalog resolves it to, with the native id and provider as the catalog
+/// spells them ([`cairn_models::interface::Catalog::pinned_offer`]). A launch
+/// hands the stored model to its provider verbatim, and a CLI that tolerates
+/// `Opus` for `opus` would otherwise let whatever was typed become the job's
+/// launch fact.
+///
+/// `provider` is the provider the edit was made under and narrows a bare
+/// name; a `provider/model` name selects its own. An edit pins one concrete
+/// model, so a pool is refused: choosing within pools is the agent's
+/// allotment, edited through its snapshot's `models`.
+pub fn resolve_model_edit(
+    orch: &Orchestrator,
+    project_id: Option<&str>,
+    provider: Option<&str>,
+    requested: &str,
+) -> Result<ModelSelection, String> {
+    let scope = ModelScope {
+        project_id: project_id.filter(|id| !id.is_empty()).map(str::to_string),
+    };
+    let catalog = orch
+        .catalog(&scope)
+        .map_err(|error| format!("the model catalog is unavailable: {error}"))?;
+    let refusal = match catalog.pinned_offer(OfferQuery {
+        requested: Some(requested),
+        provider,
+        ..OfferQuery::new(VerbKind::Session)
+    }) {
+        Ok(offer) => return Ok(ModelSelection::new(offer.provider, Model::new(offer.model))),
+        Err(refusal) => refusal,
+    };
+    let name = requested.trim();
+    let pool = orch
+        .effective_models(scope.project_id.as_deref())
+        .or_else(|_| orch.effective_models(None))
+        .ok()
+        .and_then(|models| {
+            [Some(name), name.split_once('/').map(|(_, rest)| rest)]
+                .into_iter()
+                .flatten()
+                .find(|id| models.pool(id).is_some())
+                .map(str::to_string)
+        });
+    Err(match pool {
+        Some(pool) => format!(
+            "'{name}' names the pool '{pool}', and a model edit pins one model: name it as \
+             provider/model (for example claude/opus), or edit the agent's allotment \
+             (snapshot: {{models: [...]}}) to have it select within pools"
+        ),
+        None => refusal.to_string(),
+    })
+}
 
 /// Apply the provider-change lifecycle for `job_id` when its open session is on
 /// another backend. Returns whether a rotation was performed.
@@ -25,7 +81,8 @@ use crate::storage::LocalDb;
 /// writes it. `jobs.model` is the authoritative launch fact — a host agent
 /// snapshot's `selection` is DERIVED from it and re-resolves every turn — so
 /// keeping the write here, beside the session change it must agree with, is what
-/// stops the two from being separately committable.
+/// stops the two from being separately committable. A newly edited model comes
+/// here as [`resolve_model_edit`] spelled it, never as it was typed.
 pub async fn apply_for_job(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -136,4 +193,130 @@ async fn set_job_model(db: &LocalDb, job_id: &str, model: Option<&str>) -> Resul
     })
     .await
     .map_err(|error| format!("Failed to update the job's model: {error}"))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+    use cairn_models::types::catalog::{
+        claude_models, DiscoveredModel, ProviderModelCatalog, ServedVerb, Wire,
+    };
+    use std::sync::Arc;
+
+    pub(crate) const QWEN_SLUG: &str = "qwen/qwen3.6-35b-a3b";
+    pub(crate) const QWEN_LOCAL: &str = "Qwen/Qwen3.6-35B-A3B";
+
+    fn chat(id: &str, slug: &str) -> DiscoveredModel {
+        let mut model = claude_models().remove(0);
+        model.id = id.to_string();
+        model.model = id.to_string();
+        model.display_name = id.to_string();
+        model.canonical_slug = Some(slug.to_string());
+        model.serves = Some(ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        model
+    }
+
+    /// Claude's aliases, and one chat model OpenRouter offers by its slug and
+    /// Cairn inference by its real name, the two merged on that slug.
+    pub(crate) fn seed_edit_catalog(orch: &Orchestrator) {
+        for (backend, models) in [
+            ("claude", claude_models()),
+            ("openrouter", vec![chat(QWEN_SLUG, QWEN_SLUG)]),
+            ("inference", vec![chat(QWEN_LOCAL, QWEN_SLUG)]),
+        ] {
+            orch.seed_model_catalog_for_test(ProviderModelCatalog {
+                backend: backend.to_string(),
+                models,
+                options: Vec::new(),
+                refreshed_at: Some(1),
+                error: None,
+            });
+        }
+    }
+
+    async fn orchestrator() -> Orchestrator {
+        let local =
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("t.db"))
+                .await
+                .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        seed_edit_catalog(&orch);
+        orch
+    }
+
+    fn pinned(backend: &str, model: &str) -> Result<ModelSelection, String> {
+        Ok(ModelSelection::new(backend, Model::new(model)))
+    }
+
+    #[tokio::test]
+    async fn a_model_edit_stores_the_offer_as_the_catalog_spells_it() {
+        let orch = orchestrator().await;
+        let resolve = |provider: Option<&str>, requested: &str| {
+            resolve_model_edit(&orch, None, provider, requested)
+        };
+
+        assert_eq!(resolve(Some("claude"), "Opus"), pinned("claude", "opus"));
+        assert_eq!(resolve(None, "Opus"), pinned("claude", "opus"));
+        assert_eq!(
+            resolve(Some("claude"), "sonnet"),
+            pinned("claude", "sonnet")
+        );
+        // A qualified id stores the native id and its provider, whatever
+        // provider the edit was made under.
+        assert_eq!(
+            resolve(Some("claude"), "openrouter/qwen/qwen3.6-35b-a3b"),
+            pinned("openrouter", QWEN_SLUG)
+        );
+        assert_eq!(
+            resolve(None, "inference/Qwen/Qwen3.6-35B-A3B"),
+            pinned("inference", QWEN_LOCAL)
+        );
+        // A bare id is narrowed by the provider the edit was made under.
+        assert_eq!(
+            resolve(Some("inference"), QWEN_LOCAL),
+            pinned("inference", QWEN_LOCAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_edit_refuses_what_it_cannot_pin() {
+        let orch = orchestrator().await;
+        let resolve = |provider: Option<&str>, requested: &str| {
+            resolve_model_edit(&orch, None, provider, requested).unwrap_err()
+        };
+
+        let unoffered = resolve(Some("claude"), "opus-9");
+        assert!(
+            unoffered.contains(
+                "no installed provider offers 'opus-9'; claude offers haiku, sonnet, opus, fable"
+            ),
+            "{unoffered}"
+        );
+        let ambiguous = resolve(None, QWEN_LOCAL);
+        assert_eq!(
+            ambiguous,
+            "'Qwen/Qwen3.6-35B-A3B' is offered by inference (inference/Qwen/Qwen3.6-35B-A3B) and openrouter (openrouter/qwen/qwen3.6-35b-a3b): name one."
+        );
+        // A pool is the allotment's vocabulary, never a pin.
+        let pool = orch.effective_models(None).unwrap().pools[0].id.clone();
+        for requested in [pool.clone(), format!("claude/{pool}")] {
+            let refusal = resolve(Some("claude"), &requested);
+            assert!(
+                refusal.contains(&format!("names the pool '{pool}'"))
+                    && refusal.contains("snapshot: {models: [...]}"),
+                "{refusal}"
+            );
+        }
+    }
 }
