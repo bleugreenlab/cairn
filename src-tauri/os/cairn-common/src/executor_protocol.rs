@@ -5452,6 +5452,14 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/5917 does not move the number. The executor exports `SHLVL=1` into
+/// every cell command's environment, composed beside `PATH` from the
+/// executor's own facts, and drops a launch-declared `SHLVL` as it drops a
+/// declared `PATH`. Nothing crosses the boundary that did not before: no
+/// frame, variant or field changes, and a runner talking to an older executor
+/// gets nothing wrong; that executor's commands start without a shell level,
+/// as they always have.
+///
 /// cairn/5872 does not move the number. A claim at a commit git refuses to check
 /// out on the executor's platform (a tracked path its `verify_path` rejects,
 /// such as a colon on NTFS) answers the existing
