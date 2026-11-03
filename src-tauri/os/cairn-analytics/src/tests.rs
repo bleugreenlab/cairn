@@ -1679,10 +1679,16 @@ async fn model_role_economics_uses_real_metered_cost() {
     .await;
 
     // The price table genuinely returns $0 for this model.
-    assert_eq!(
-        pricing::cost_usd("openrouter", Some("z-ai/glm"), 1000, 0, 0, 1000),
-        0.0
-    );
+    let usage = pricing::TieredUsage {
+        all: pricing::Components {
+            input: 1000,
+            cache_read: 0,
+            cache_create: 0,
+            output: 1000,
+        },
+        long_prompt: pricing::Components::default(),
+    };
+    assert_eq!(pricing::cost_usd(Some("z-ai/glm"), &usage), 0.0);
 
     let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
         .await
@@ -1734,12 +1740,8 @@ async fn model_role_economics_costs_match_the_shared_rule() {
     let mut total = 0.0;
     for row in &rows {
         let expected = crate::cost::exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );
@@ -1973,6 +1975,16 @@ async fn oracle_db() -> LocalDb {
              VALUES ('sp2', 'jp2', 'claude', 'open', 1, 1, 1);
             INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
              VALUES ('rp2', 'p2', 'jp2', 'exited', 'sp2', 1, 1);
+
+            -- claude (p1, claude-haiku-5-5, explore): one request at exactly the
+            -- long-prompt threshold and one over it, so the long-prompt
+            -- components the rollup splits out are non-zero and must match.
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jh', 'p1', 'running', 'claude-haiku-5-5', 'explore', 'explore', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sh', 'jh', 'claude', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('rh', 'p1', 'jh', 'exited', 'sh', 1, 1);
             ",
         )
         .await
@@ -2160,6 +2172,40 @@ async fn oracle_db() -> LocalDb {
         None,
     )
     .await;
+    // p1 claude haiku 5.5: h1 (day1) a 100,000-token prompt, short; h2 (day2) a
+    // 100,001-token prompt, long.
+    ins_ev(
+        &db,
+        "h1",
+        "rh",
+        "sh",
+        1,
+        "assistant",
+        DAY1,
+        1_000,
+        99_000,
+        0,
+        500,
+        0,
+        None,
+    )
+    .await;
+    ins_ev(
+        &db,
+        "h2",
+        "rh",
+        "sh",
+        2,
+        "assistant",
+        DAY2,
+        1,
+        90_000,
+        10_000,
+        500,
+        0,
+        None,
+    )
+    .await;
 
     // Merge requests for tokens_per_loc: jc opened day1, jo opened day2.
     db.execute_script(
@@ -2232,10 +2278,7 @@ fn assert_cost_components_eq(
         assert_eq!(a.bucket_start, b.bucket_start, "{ctx}");
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.backend, b.backend, "{ctx}");
-        assert_eq!(a.input, b.input, "{ctx}");
-        assert_eq!(a.cache_read, b.cache_read, "{ctx}");
-        assert_eq!(a.cache_create, b.cache_create, "{ctx}");
-        assert_eq!(a.output, b.output, "{ctx}");
+        assert_eq!(a.usage, b.usage, "{ctx}");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
         assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
@@ -2271,9 +2314,8 @@ fn assert_provider_eq(
     live: Vec<queries::ProviderModelComponentRow>,
     ctx: &str,
 ) {
-    let key = |r: &queries::ProviderModelComponentRow| {
-        (r.model.clone().unwrap_or_default(), r.backend.clone())
-    };
+    // One backend per call, so the model alone keys a row.
+    let key = |r: &queries::ProviderModelComponentRow| r.model.clone().unwrap_or_default();
     let mut r = rollup;
     let mut l = live;
     r.sort_by_key(key);
@@ -2285,11 +2327,7 @@ fn assert_provider_eq(
     );
     for (a, b) in r.iter().zip(l.iter()) {
         assert_eq!(a.model, b.model, "{ctx}");
-        assert_eq!(a.backend, b.backend, "{ctx}");
-        assert_eq!(a.input, b.input, "{ctx}");
-        assert_eq!(a.cache_read, b.cache_read, "{ctx}");
-        assert_eq!(a.cache_create, b.cache_create, "{ctx}");
-        assert_eq!(a.output, b.output, "{ctx}");
+        assert_eq!(a.usage, b.usage, "{ctx}");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert_eq!(a.runs, b.runs, "{ctx}");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
@@ -2302,11 +2340,13 @@ fn assert_granular_eq(
     live: Vec<queries::GranularRow>,
     ctx: &str,
 ) {
+    // Rows are grouped per backend too, but carry no backend; the fixture's two
+    // (sonnet, builder) groups, on claude and openrouter, differ in billable.
     let key = |r: &queries::GranularRow| {
         (
             r.model.clone().unwrap_or_default(),
             r.agent_config_id.clone().unwrap_or_default(),
-            r.backend.clone(),
+            r.billable,
         )
     };
     let mut r = rollup;
@@ -2321,11 +2361,7 @@ fn assert_granular_eq(
     for (a, b) in r.iter().zip(l.iter()) {
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.agent_config_id, b.agent_config_id, "{ctx}");
-        assert_eq!(a.backend, b.backend, "{ctx}");
-        assert_eq!(a.input, b.input, "{ctx}");
-        assert_eq!(a.cache_read, b.cache_read, "{ctx}");
-        assert_eq!(a.cache_create, b.cache_create, "{ctx}");
-        assert_eq!(a.output, b.output, "{ctx}");
+        assert_eq!(a.usage, b.usage, "{ctx}");
         assert_eq!(a.thinking, b.thinking, "{ctx}");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert_eq!(a.runs, b.runs, "{ctx}");
@@ -2364,20 +2400,20 @@ fn assert_loc_eq(rollup: Vec<queries::LocRow>, live: Vec<queries::LocRow>, ctx: 
         assert_eq!(a.lines, b.lines, "{ctx}");
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.node_name, b.node_name, "{ctx}");
-        assert_eq!(a.backend, b.backend, "{ctx}");
-        assert_eq!(a.input, b.input, "{ctx}");
-        assert_eq!(a.cache_read, b.cache_read, "{ctx}");
-        assert_eq!(a.cache_create, b.cache_create, "{ctx}");
-        assert_eq!(a.output, b.output, "{ctx}");
+        assert_eq!(a.usage, b.usage, "{ctx}");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
         assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
     }
 }
 
-/// A stable snapshot of the rollup table (floats stringified for `Eq`).
-async fn dump_rollup(db: &LocalDb) -> Vec<(String, i64, i64, String, i64)> {
+/// A stable snapshot of the rollup table (floats stringified for `Eq`), with
+/// the long-prompt components as one `input/cache_read/cache_create/output`
+/// string.
+async fn dump_rollup(db: &LocalDb) -> Vec<(String, i64, i64, String, i64, String)> {
     db.query_all(
-        "SELECT id, billable_tokens, token_event_count, exact_cost, exact_cost_count
+        "SELECT id, billable_tokens, token_event_count, exact_cost, exact_cost_count,
+                long_input_tokens, long_cache_read_tokens, long_cache_create_tokens,
+                long_output_tokens
              FROM token_rollup ORDER BY id",
         (),
         |row| {
@@ -2387,6 +2423,13 @@ async fn dump_rollup(db: &LocalDb) -> Vec<(String, i64, i64, String, i64)> {
                 row.i64(2)?,
                 format!("{:.6}", row.opt_f64(3)?.unwrap_or(0.0)),
                 row.i64(4)?,
+                format!(
+                    "{}/{}/{}/{}",
+                    row.i64(5)?,
+                    row.i64(6)?,
+                    row.i64(7)?,
+                    row.i64(8)?
+                ),
             ))
         },
     )
@@ -2663,6 +2706,7 @@ async fn per_event_rollup_matches_refold() {
     seed_run(&db, "a", "claude", "claude-sonnet-4-5").await;
     seed_run(&db, "b", "codex", "gpt-5").await;
     seed_run(&db, "c", "openrouter", "sonnet").await;
+    seed_run(&db, "d", "claude", "haiku").await;
 
     let events = [
         ev_insert(
@@ -2753,6 +2797,36 @@ async fn per_event_rollup_matches_refold() {
             0,
             Some(0.42),
         ),
+        // A long-prompt request and a short one in the same hour row: the
+        // per-event increments must split them exactly as the fold does.
+        ev_insert(
+            "d1",
+            "run-d",
+            "sess-d",
+            1,
+            "assistant",
+            100,
+            5,
+            150_000,
+            0,
+            20,
+            0,
+            None,
+        ),
+        ev_insert(
+            "d2",
+            "run-d",
+            "sess-d",
+            2,
+            "assistant",
+            120,
+            50,
+            1_000,
+            0,
+            20,
+            0,
+            None,
+        ),
     ];
     for ev in events {
         seam_insert(&db, ev).await;
@@ -2772,6 +2846,93 @@ async fn per_event_rollup_matches_refold() {
         dump_rollup(&db).await,
         "per-event rollup must equal a full re-fold"
     );
+}
+
+/// Haiku 5.5 bills each request at its own prompt-length tier. A run with one
+/// request at exactly 100k prompt tokens (still short) and one just over is
+/// priced at each request's tier, whether the rollup was built by the
+/// per-event insert seam or by a full re-fold, for the alias and the dated
+/// name alike.
+#[tokio::test]
+async fn haiku_five_five_prices_each_request_at_its_prompt_tier() {
+    // Short: 1000 * $0.10 + 99,000 * $0.01 + 500 * $0.50, per million.
+    let short_cost = (100.0 + 990.0 + 250.0) / 1e6;
+    // Long: 1 * $0.50 + 90,000 * $0.05 + 10,000 * $0.625 + 500 * $2.50.
+    let long_cost = (0.5 + 4_500.0 + 6_250.0 + 1_250.0) / 1e6;
+    let ts = JAN_2025 as i32;
+    for model in ["haiku", "claude-haiku-5-5"] {
+        let db = cost_db().await;
+        seed_run(&db, "hk", "claude", model).await;
+        let short = (1_000, 99_000, 0, 500);
+        let long = (1, 90_000, 10_000, 500);
+        for (seq, (input, cread, ccreate, output)) in [(1, short), (2, long)] {
+            let id = format!("hk{seq}");
+            seam_insert(
+                &db,
+                ev_insert(
+                    &id,
+                    "run-hk",
+                    "sess-hk",
+                    seq,
+                    "assistant",
+                    ts + seq,
+                    input,
+                    cread,
+                    ccreate,
+                    output,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+        }
+
+        for source in ["per-event seam", "re-fold"] {
+            if source == "re-fold" {
+                queries::fold_token_rollup(&db).await.unwrap();
+            }
+            let ctx = format!("{model} via {source}");
+            let rows = queries::cost_components(
+                &db,
+                &Scope::default(),
+                &TimeRange::default(),
+                Bucket::Day,
+            )
+            .await
+            .unwrap();
+            assert_eq!(rows.len(), 1, "{ctx}: {rows:#?}");
+            assert_eq!(
+                rows[0].usage.long_prompt,
+                pricing::Components {
+                    input: 1,
+                    cache_read: 90_000,
+                    cache_create: 10_000,
+                    output: 500,
+                },
+                "{ctx}: only the over-100k request is long"
+            );
+
+            let total: f64 =
+                cost_timeseries(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|p| p.cost_usd)
+                    .sum();
+            assert!(
+                (total - (short_cost + long_cost)).abs() < 1e-12,
+                "{ctx}: cost {total}"
+            );
+            let economics = model_role_economics(&db, &Scope::default(), &TimeRange::default())
+                .await
+                .unwrap();
+            let by_model = econ(&economics.by_model, model).cost_usd;
+            assert!(
+                (by_model - (short_cost + long_cost)).abs() < 1e-12,
+                "{ctx}: economics cost {by_model}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

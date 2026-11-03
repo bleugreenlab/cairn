@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use cairn_db::storage::{DbResult, LocalDb};
 
-use super::pricing;
+use super::pricing::{self, TieredUsage};
 use super::queries;
 use super::subscriptions;
 use super::types::{
@@ -17,33 +17,24 @@ use super::types::{
 /// when any event in the group reported one, else the price-table estimate. The
 /// price table returns ~$0 for many metered (OpenRouter) models, so a real cost
 /// is always preferred when present. Every $-valued analytic routes through this.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn exact_or_priced(
-    backend: &str,
     model: Option<&str>,
-    input: i64,
-    cache_read: i64,
-    cache_create: i64,
-    output: i64,
+    usage: &TieredUsage,
     exact_cost: f64,
     exact_cost_count: i64,
 ) -> f64 {
     if exact_cost_count > 0 {
         exact_cost
     } else {
-        pricing::cost_usd(backend, model, input, cache_read, cache_create, output)
+        pricing::cost_usd(model, usage)
     }
 }
 
 /// The cost of one (bucket, model, backend) group via [`exact_or_priced`].
 fn group_cost(row: &queries::CostComponentRow) -> f64 {
     exact_or_priced(
-        &row.backend,
         row.model.as_deref(),
-        row.input,
-        row.cache_read,
-        row.cache_create,
-        row.output,
+        &row.usage,
         row.exact_cost,
         row.exact_cost_count,
     )
@@ -135,12 +126,8 @@ pub async fn cost_by_project(
     let mut by_project: HashMap<String, (String, f64, i64)> = HashMap::new();
     for row in &rows {
         let cost = exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );
@@ -190,12 +177,8 @@ pub async fn provider_model_costs(
         .into_iter()
         .map(|row| {
             let cost_usd = exact_or_priced(
-                &row.backend,
                 row.model.as_deref(),
-                row.input,
-                row.cache_read,
-                row.cache_create,
-                row.output,
+                &row.usage,
                 row.exact_cost,
                 row.exact_cost_count,
             );
@@ -341,23 +324,16 @@ pub async fn effective_cost(
     for row in &scoped_rows {
         // Split list price into input/output sides by calling the linear pricing
         // function once per side: input_list + output_list == the full cost.
-        let input_list = pricing::cost_usd(
-            &row.backend,
-            row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            0,
-        );
-        let output_list =
-            pricing::cost_usd(&row.backend, row.model.as_deref(), 0, 0, 0, row.output);
+        let model = row.model.as_deref();
+        let input_list = pricing::cost_usd(model, &row.usage.input_side());
+        let output_list = pricing::cost_usd(model, &row.usage.output_side());
         let entry = fine
             .entry((row.bucket_start, row.backend.clone()))
             .or_default();
         entry.cost += group_cost(row);
         entry.billable += row.billable;
-        entry.input_tokens += row.input + row.cache_read + row.cache_create;
-        entry.output_tokens += row.output;
+        entry.input_tokens += row.usage.all.prompt();
+        entry.output_tokens += row.usage.all.output;
         entry.input_list += input_list;
         entry.output_list += output_list;
     }

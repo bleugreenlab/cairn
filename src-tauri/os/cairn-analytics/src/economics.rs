@@ -33,10 +33,10 @@ impl Acc {
         self.billable += row.billable;
         self.cost += cost;
         self.runs += row.runs;
-        self.input += row.input;
-        self.cache_read += row.cache_read;
-        self.cache_create += row.cache_create;
-        self.output += row.output;
+        self.input += row.usage.all.input;
+        self.cache_read += row.usage.all.cache_read;
+        self.cache_create += row.usage.all.cache_create;
+        self.output += row.usage.all.output;
         self.thinking += row.thinking;
     }
 }
@@ -151,12 +151,8 @@ pub async fn model_role_economics(
         // Without the exact-cost preference the table reads ~$0 for metered
         // providers (OpenRouter, z-ai, deepseek) whose price table is empty.
         let cost = exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );
@@ -201,12 +197,8 @@ pub async fn merged_pr_economics(
     let mut by_role: HashMap<String, PrAcc> = HashMap::new();
     for row in &rows {
         let cost = exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );
@@ -243,12 +235,8 @@ pub async fn merged_pr_cost_trend(
     let mut buckets: HashMap<i64, (i64, f64, i64, i64)> = HashMap::new();
     for row in &rows {
         let cost = exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );

@@ -47,12 +47,8 @@ pub async fn tokens_per_loc(
                 0.0
             };
             let cost_usd = exact_or_priced(
-                &r.backend,
                 r.model.as_deref(),
-                r.input,
-                r.cache_read,
-                r.cache_create,
-                r.output,
+                &r.usage,
                 r.exact_cost,
                 r.exact_cost_count,
             );
@@ -106,15 +102,11 @@ pub async fn tokens_by_model_timeseries(
                 cost_usd: 0.0,
             });
         entry.billable_tokens += row.billable;
-        entry.input_tokens += row.input + row.cache_read + row.cache_create;
-        entry.output_tokens += row.output;
+        entry.input_tokens += row.usage.all.prompt();
+        entry.output_tokens += row.usage.all.output;
         entry.cost_usd += exact_or_priced(
-            &row.backend,
             row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
+            &row.usage,
             row.exact_cost,
             row.exact_cost_count,
         );

@@ -1,6 +1,6 @@
 //! SQL for Tier A token-economics analytics.
 //!
-//! Everything hangs off the [`TOKEN_EVENTS_CTE`]: one row per top-level turn
+//! Everything hangs off the [`token_events_cte`]: one row per top-level turn
 //! event carrying its billable token total, broken out by component, with
 //! project / model / role / backend joined in. Codex bills `result%` events;
 //! Claude and OpenRouter bill `assistant` events. Every backend stores disjoint
@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cairn_db::turso::{params, Value};
 
+use super::pricing::{Components, TieredUsage, LONG_PROMPT_TOKENS};
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};
 use cairn_db::models::Event;
@@ -55,6 +56,60 @@ const BILLABLE_TOTAL: &str = "COALESCE(e.input_tokens, 0)
             + COALESCE(e.cache_create_tokens, 0)
             + COALESCE(e.cache_read_tokens, 0)
             + COALESCE(e.output_tokens, 0)";
+
+/// Whether one event's prompt (input + cache reads + cache writes) is over
+/// [`LONG_PROMPT_TOKENS`], so a model with a long-prompt tier bills it there.
+/// The threshold is the price table's; see `pricing`'s module doc.
+fn long_prompt_predicate() -> String {
+    format!(
+        "(COALESCE(e.input_tokens, 0) + COALESCE(e.cache_read_tokens, 0)
+            + COALESCE(e.cache_create_tokens, 0)) > {LONG_PROMPT_TOKENS}"
+    )
+}
+
+/// The priced-usage measures as (`token_rollup` column, read alias), in the
+/// order [`usage_at`] reads them: the four components, then the part of each
+/// from long-prompt requests. The `token_events` test oracle carries the same
+/// column names.
+const USAGE_MEASURES: [(&str, &str); 8] = [
+    ("input_tokens", "input"),
+    ("cache_read_tokens", "cache_read"),
+    ("cache_create_tokens", "cache_create"),
+    ("output_tokens", "output"),
+    ("long_input_tokens", "long_input"),
+    ("long_cache_read_tokens", "long_cache_read"),
+    ("long_cache_create_tokens", "long_cache_create"),
+    ("long_output_tokens", "long_output"),
+];
+
+/// A comma-separated select list with one item per [`USAGE_MEASURES`] entry,
+/// rendered from its (column, alias) pair.
+fn usage_select(item: impl Fn(&str, &str) -> String) -> String {
+    USAGE_MEASURES
+        .iter()
+        .map(|(column, alias)| item(column, alias))
+        .collect::<Vec<_>>()
+        .join(",\n                   ")
+}
+
+/// Read the [`USAGE_MEASURES`] columns, in order, starting at index `at`.
+fn usage_at(row: &impl RowExt, at: usize) -> DbResult<TieredUsage> {
+    let col = |i: usize| row.i64(at + i);
+    Ok(TieredUsage {
+        all: Components {
+            input: col(0)?,
+            cache_read: col(1)?,
+            cache_create: col(2)?,
+            output: col(3)?,
+        },
+        long_prompt: Components {
+            input: col(4)?,
+            cache_read: col(5)?,
+            cache_create: col(6)?,
+            output: col(7)?,
+        },
+    })
+}
 
 /// Runs whose newest rollup-relevant event (a billable token event for either
 /// backend rule, or any event carrying a real `cost_usd`) is past the rollup
@@ -106,14 +161,17 @@ fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
 /// settlement event is not itself a billable token event. The synthetic `id`
 /// is unique per grouped row because all of its components are functionally
 /// determined by the run (fixed at `?1`) plus the grouped hour/session/model/
-/// backend/agent dimensions.
+/// backend/agent dimensions. The `long_*` measures repeat the four components
+/// over only the billable events whose own prompt is long, which is what lets
+/// pricing bill each request at its prompt-length tier after summing.
 fn rollup_insert_sql() -> String {
     format!(
         "INSERT INTO token_rollup (
             id, bucket_start, project_id, run_id, session_id, job_id, node_name, model,
             agent_config_id, backend, input_tokens, cache_read_tokens,
             cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
-            token_event_count, exact_cost, exact_cost_count
+            token_event_count, exact_cost, exact_cost_count, long_input_tokens,
+            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
@@ -136,7 +194,11 @@ fn rollup_insert_sql() -> String {
             SUM(CASE WHEN {billable} THEN {billable_total} ELSE 0 END),
             SUM(CASE WHEN {billable} THEN 1 ELSE 0 END) AS token_event_count,
             COALESCE(SUM(e.cost_usd), 0.0) AS exact_cost,
-            SUM(CASE WHEN e.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS exact_cost_count
+            SUM(CASE WHEN e.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS exact_cost_count,
+            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.input_tokens, 0) ELSE 0 END),
+            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END),
+            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END),
+            SUM(CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END)
         FROM events e
         LEFT JOIN runs r ON r.id = e.run_id
         LEFT JOIN sessions s ON s.id = e.session_id
@@ -155,6 +217,7 @@ fn rollup_insert_sql() -> String {
         backend = BACKEND_EXPR,
         billable = BILLABLE_PREDICATE,
         billable_total = BILLABLE_TOTAL,
+        long = long_prompt_predicate(),
     )
 }
 
@@ -245,7 +308,8 @@ fn token_rollup_event_upsert_sql() -> String {
             id, bucket_start, project_id, run_id, session_id, job_id, node_name, model,
             agent_config_id, backend, input_tokens, cache_read_tokens,
             cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
-            token_event_count, exact_cost, exact_cost_count
+            token_event_count, exact_cost, exact_cost_count, long_input_tokens,
+            long_cache_read_tokens, long_cache_create_tokens, long_output_tokens
         )
         SELECT
             CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
@@ -268,7 +332,11 @@ fn token_rollup_event_upsert_sql() -> String {
             CASE WHEN {billable} THEN {billable_total} ELSE 0 END,
             CASE WHEN {billable} THEN 1 ELSE 0 END,
             COALESCE(e.cost_usd, 0.0),
-            CASE WHEN e.cost_usd IS NOT NULL THEN 1 ELSE 0 END
+            CASE WHEN e.cost_usd IS NOT NULL THEN 1 ELSE 0 END,
+            CASE WHEN {billable} AND {long} THEN COALESCE(e.input_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} AND {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} AND {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END
         FROM events e
         LEFT JOIN runs r ON r.id = e.run_id
         LEFT JOIN sessions s ON s.id = e.session_id
@@ -284,10 +352,16 @@ fn token_rollup_event_upsert_sql() -> String {
             billable_tokens = billable_tokens + excluded.billable_tokens,
             token_event_count = token_event_count + excluded.token_event_count,
             exact_cost = exact_cost + excluded.exact_cost,
-            exact_cost_count = exact_cost_count + excluded.exact_cost_count",
+            exact_cost_count = exact_cost_count + excluded.exact_cost_count,
+            long_input_tokens = long_input_tokens + excluded.long_input_tokens,
+            long_cache_read_tokens = long_cache_read_tokens + excluded.long_cache_read_tokens,
+            long_cache_create_tokens =
+                long_cache_create_tokens + excluded.long_cache_create_tokens,
+            long_output_tokens = long_output_tokens + excluded.long_output_tokens",
         backend = BACKEND_EXPR,
         billable = BILLABLE_PREDICATE,
         billable_total = BILLABLE_TOTAL,
+        long = long_prompt_predicate(),
     )
 }
 
@@ -386,7 +460,9 @@ pub(crate) const TOOL_RESULT_UPDATE_SQL: &str =
 /// proven equal to (no longer a production read path). One row per billable
 /// top-level turn event, referenced as `te` by every `*_live` query.
 #[cfg(test)]
-const TOKEN_EVENTS_CTE: &str = "\
+fn token_events_cte() -> String {
+    format!(
+        "\
 token_events AS (
     SELECT
         e.run_id AS run_id,
@@ -405,7 +481,13 @@ token_events AS (
         COALESCE(e.cache_read_tokens, 0) AS cache_read_tokens,
         COALESCE(e.cache_create_tokens, 0) AS cache_create_tokens,
         COALESCE(e.output_tokens, 0) AS output_tokens,
-        COALESCE(e.thinking_tokens, 0) AS thinking_tokens
+        COALESCE(e.thinking_tokens, 0) AS thinking_tokens,
+        CASE WHEN {long} THEN COALESCE(e.input_tokens, 0) ELSE 0 END AS long_input_tokens,
+        CASE WHEN {long} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END
+            AS long_cache_read_tokens,
+        CASE WHEN {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END
+            AS long_cache_create_tokens,
+        CASE WHEN {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END AS long_output_tokens
     FROM events e
     LEFT JOIN runs r ON r.id = e.run_id
     LEFT JOIN sessions s ON s.id = e.session_id
@@ -417,7 +499,10 @@ token_events AS (
         OR (LOWER(COALESCE(s.backend, 'claude')) <> 'codex'
                 AND e.event_type = 'assistant')
       )
-)";
+)",
+        long = long_prompt_predicate(),
+    )
+}
 
 /// Scope/range predicate over the `token_events` alias `te` (the `#[cfg(test)]`
 /// oracle).
@@ -504,7 +589,7 @@ pub(crate) async fn avg_tokens_per_session_live(
         FROM sessions_agg
         GROUP BY bucket_start
         ORDER BY bucket_start",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
         filter = SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
@@ -527,15 +612,25 @@ pub(crate) struct LocRow {
     pub lines: i64,
     pub model: Option<String>,
     pub node_name: Option<String>,
-    pub backend: String,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     /// Sum of real `events.cost_usd` for this job (0 when none reported).
     pub exact_cost: f64,
     /// Count of this job's events that carried a real `cost_usd`.
     pub exact_cost_count: i64,
+}
+
+fn loc_row(row: &impl RowExt) -> DbResult<LocRow> {
+    Ok(LocRow {
+        job_id: row.text(0)?,
+        ts: row.i64(1)?,
+        billable: row.i64(2)?,
+        lines: row.i64(3)?,
+        model: row.opt_text(4)?,
+        node_name: row.opt_text(5)?,
+        usage: usage_at(row, 6)?,
+        exact_cost: row.opt_f64(14)?.unwrap_or(0.0),
+        exact_cost_count: row.i64(15)?,
+    })
 }
 
 pub(crate) async fn tokens_per_loc(
@@ -551,16 +646,13 @@ pub(crate) async fn tokens_per_loc(
     //
     // No day range on `token_rollup` here: the range applies to `mr.opened_at`,
     // and a job's whole billable total is attributed to its merge request.
-    let sql = "WITH job_tokens AS (
+    let sql = format!(
+        "WITH job_tokens AS (
             SELECT tr.job_id AS job_id,
                    SUM(tr.billable_tokens) AS billable,
-                   SUM(tr.input_tokens) AS input,
-                   SUM(tr.cache_read_tokens) AS cache_read,
-                   SUM(tr.cache_create_tokens) AS cache_create,
-                   SUM(tr.output_tokens) AS output,
+                   {usage},
                    MAX(tr.model) AS model,
-                   MAX(tr.node_name) AS node_name,
-                   MAX(tr.backend) AS backend
+                   MAX(tr.node_name) AS node_name
             FROM token_rollup tr
             WHERE tr.job_id IS NOT NULL AND tr.token_event_count > 0
               AND (?1 IS NULL OR tr.project_id = ?1)
@@ -590,11 +682,7 @@ pub(crate) async fn tokens_per_loc(
                END AS lines_changed,
                jt.model,
                jt.node_name,
-               jt.backend,
-               jt.input,
-               jt.cache_read,
-               jt.cache_create,
-               jt.output,
+               {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
                COALESCE(jc.exact_cost_count, 0)
         FROM job_tokens jt
@@ -608,25 +696,12 @@ pub(crate) async fn tokens_per_loc(
                END) > 0
           AND (?2 IS NULL OR mr.opened_at >= ?2)
           AND (?3 IS NULL OR mr.opened_at < ?3)
-        ORDER BY mr.opened_at";
-    db.query_all(sql, scope_range_params(scope, range), |row| {
-        Ok(LocRow {
-            job_id: row.text(0)?,
-            ts: row.i64(1)?,
-            billable: row.i64(2)?,
-            lines: row.i64(3)?,
-            model: row.opt_text(4)?,
-            node_name: row.opt_text(5)?,
-            backend: row.text(6)?,
-            input: row.i64(7)?,
-            cache_read: row.i64(8)?,
-            cache_create: row.i64(9)?,
-            output: row.i64(10)?,
-            exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(12)?,
-        })
-    })
-    .await
+        ORDER BY mr.opened_at",
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("jt.{alias}")),
+    );
+    db.query_all(sql, scope_range_params(scope, range), loc_row)
+        .await
 }
 
 /// Event-scan oracle for [`tokens_per_loc`].
@@ -651,13 +726,9 @@ pub(crate) async fn tokens_per_loc_live(
         job_tokens AS (
             SELECT te.job_id AS job_id,
                    SUM(te.billable_tokens) AS billable,
-                   SUM(te.input_tokens) AS input,
-                   SUM(te.cache_read_tokens) AS cache_read,
-                   SUM(te.cache_create_tokens) AS cache_create,
-                   SUM(te.output_tokens) AS output,
+                   {usage},
                    MAX(te.model) AS model,
-                   MAX(te.node_name) AS node_name,
-                   MAX(te.backend) AS backend
+                   MAX(te.node_name) AS node_name
             FROM token_events te
             WHERE te.job_id IS NOT NULL
               AND (?1 IS NULL OR te.project_id = ?1)
@@ -679,11 +750,7 @@ pub(crate) async fn tokens_per_loc_live(
                END AS lines_changed,
                jt.model,
                jt.node_name,
-               jt.backend,
-               jt.input,
-               jt.cache_read,
-               jt.cache_create,
-               jt.output,
+               {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
                COALESCE(jc.exact_cost_count, 0)
         FROM job_tokens jt
@@ -698,26 +765,12 @@ pub(crate) async fn tokens_per_loc_live(
           AND (?2 IS NULL OR mr.opened_at >= ?2)
           AND (?3 IS NULL OR mr.opened_at < ?3)
         ORDER BY mr.opened_at",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
+        usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("jt.{alias}")),
     );
-    db.query_all(sql, scope_range_params(scope, range), |row| {
-        Ok(LocRow {
-            job_id: row.text(0)?,
-            ts: row.i64(1)?,
-            billable: row.i64(2)?,
-            lines: row.i64(3)?,
-            model: row.opt_text(4)?,
-            node_name: row.opt_text(5)?,
-            backend: row.text(6)?,
-            input: row.i64(7)?,
-            cache_read: row.i64(8)?,
-            cache_create: row.i64(9)?,
-            output: row.i64(10)?,
-            exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(12)?,
-        })
-    })
-    .await
+    db.query_all(sql, scope_range_params(scope, range), loc_row)
+        .await
 }
 
 /// Token components for one (bucket, model, backend) group, plus any real
@@ -731,15 +784,24 @@ pub(crate) struct CostComponentRow {
     pub bucket_start: i64,
     pub model: Option<String>,
     pub backend: String,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub billable: i64,
     /// Sum of real `events.cost_usd` for this group (0 when none reported).
     pub exact_cost: f64,
     /// Count of events in this group that carried a real `cost_usd`.
     pub exact_cost_count: i64,
+}
+
+fn cost_component_row(row: &impl RowExt) -> DbResult<CostComponentRow> {
+    Ok(CostComponentRow {
+        bucket_start: row.i64(0)?,
+        model: row.opt_text(1)?,
+        backend: row.text(2)?,
+        usage: usage_at(row, 3)?,
+        billable: row.i64(11)?,
+        exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
+        exact_cost_count: row.i64(13)?,
+    })
 }
 
 pub(crate) async fn cost_components(
@@ -754,10 +816,7 @@ pub(crate) async fn cost_components(
             SELECT {bucket_expr} AS bucket_start,
                    tr.model AS model,
                    tr.backend AS backend,
-                   SUM(tr.input_tokens) AS input,
-                   SUM(tr.cache_read_tokens) AS cache_read,
-                   SUM(tr.cache_create_tokens) AS cache_create,
-                   SUM(tr.output_tokens) AS output,
+                   {usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND {filter}
@@ -776,10 +835,7 @@ pub(crate) async fn cost_components(
         SELECT tok.bucket_start,
                tok.model,
                tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
                COALESCE(cost.exact_count, 0)
@@ -791,21 +847,14 @@ pub(crate) async fn cost_components(
         ORDER BY tok.bucket_start",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
-    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
-        Ok(CostComponentRow {
-            bucket_start: row.i64(0)?,
-            model: row.opt_text(1)?,
-            backend: row.text(2)?,
-            input: row.i64(3)?,
-            cache_read: row.i64(4)?,
-            cache_create: row.i64(5)?,
-            output: row.i64(6)?,
-            billable: row.i64(7)?,
-            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(9)?,
-        })
-    })
+    db.query_all(
+        sql,
+        scope_range_params_doubled(scope, range),
+        cost_component_row,
+    )
     .await
 }
 
@@ -839,10 +888,7 @@ pub(crate) async fn cost_components_live(
             SELECT {tok_bucket} AS bucket_start,
                    te.model AS model,
                    te.backend AS backend,
-                   SUM(te.input_tokens) AS input,
-                   SUM(te.cache_read_tokens) AS cache_read,
-                   SUM(te.cache_create_tokens) AS cache_create,
-                   SUM(te.output_tokens) AS output,
+                   {usage},
                    SUM(te.billable_tokens) AS billable
             FROM token_events te
             WHERE {filter}
@@ -861,10 +907,7 @@ pub(crate) async fn cost_components_live(
         SELECT tok.bucket_start,
                tok.model,
                tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
                COALESCE(cost.exact_count, 0)
@@ -874,24 +917,17 @@ pub(crate) async fn cost_components_live(
            AND IFNULL(cost.model, '') = IFNULL(tok.model, '')
            AND cost.backend = tok.backend
         ORDER BY tok.bucket_start",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
-    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
-        Ok(CostComponentRow {
-            bucket_start: row.i64(0)?,
-            model: row.opt_text(1)?,
-            backend: row.text(2)?,
-            input: row.i64(3)?,
-            cache_read: row.i64(4)?,
-            cache_create: row.i64(5)?,
-            output: row.i64(6)?,
-            billable: row.i64(7)?,
-            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(9)?,
-        })
-    })
+    db.query_all(
+        sql,
+        scope_range_params_doubled(scope, range),
+        cost_component_row,
+    )
     .await
 }
 
@@ -902,17 +938,24 @@ pub(crate) async fn cost_components_live(
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderModelComponentRow {
     pub model: Option<String>,
-    pub backend: String,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub billable: i64,
     pub runs: i64,
     /// Sum of real `events.cost_usd` for this model (0 when none reported).
     pub exact_cost: f64,
     /// Count of events for this model that carried a real `cost_usd`.
     pub exact_cost_count: i64,
+}
+
+fn provider_model_row(row: &impl RowExt) -> DbResult<ProviderModelComponentRow> {
+    Ok(ProviderModelComponentRow {
+        model: row.opt_text(0)?,
+        usage: usage_at(row, 1)?,
+        billable: row.i64(9)?,
+        runs: row.i64(10)?,
+        exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
+        exact_cost_count: row.i64(12)?,
+    })
 }
 
 /// Per-model billable token totals and real metered cost for one backend over a
@@ -930,10 +973,7 @@ pub(crate) async fn provider_model_components(
         "WITH tok AS (
             SELECT tr.model AS model,
                    tr.backend AS backend,
-                   SUM(tr.input_tokens) AS input,
-                   SUM(tr.cache_read_tokens) AS cache_read,
-                   SUM(tr.cache_create_tokens) AS cache_create,
-                   SUM(tr.output_tokens) AS output,
+                   {usage},
                    SUM(tr.billable_tokens) AS billable,
                    COUNT(DISTINCT tr.run_id) AS runs
             FROM token_rollup tr
@@ -950,11 +990,7 @@ pub(crate) async fn provider_model_components(
             GROUP BY tr.model, tr.backend
         )
         SELECT tok.model,
-               tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
@@ -965,24 +1001,12 @@ pub(crate) async fn provider_model_components(
            AND cost.backend = tok.backend",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
     let mut params = scope_range_params_doubled(scope, range);
     params.push(Value::Text(backend.to_string()));
-    db.query_all(sql, params, |row| {
-        Ok(ProviderModelComponentRow {
-            model: row.opt_text(0)?,
-            backend: row.text(1)?,
-            input: row.i64(2)?,
-            cache_read: row.i64(3)?,
-            cache_create: row.i64(4)?,
-            output: row.i64(5)?,
-            billable: row.i64(6)?,
-            runs: row.i64(7)?,
-            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(9)?,
-        })
-    })
-    .await
+    db.query_all(sql, params, provider_model_row).await
 }
 
 /// Event-scan oracle for [`provider_model_components`].
@@ -1010,10 +1034,7 @@ pub(crate) async fn provider_model_components_live(
         tok AS (
             SELECT te.model AS model,
                    te.backend AS backend,
-                   SUM(te.input_tokens) AS input,
-                   SUM(te.cache_read_tokens) AS cache_read,
-                   SUM(te.cache_create_tokens) AS cache_create,
-                   SUM(te.output_tokens) AS output,
+                   {usage},
                    SUM(te.billable_tokens) AS billable,
                    COUNT(DISTINCT te.run_id) AS runs
             FROM token_events te
@@ -1030,11 +1051,7 @@ pub(crate) async fn provider_model_components_live(
             GROUP BY ce.model, ce.backend
         )
         SELECT tok.model,
-               tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
@@ -1043,27 +1060,15 @@ pub(crate) async fn provider_model_components_live(
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
            AND cost.backend = tok.backend",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
     let mut params = scope_range_params_doubled(scope, range);
     params.push(Value::Text(backend.to_string()));
-    db.query_all(sql, params, |row| {
-        Ok(ProviderModelComponentRow {
-            model: row.opt_text(0)?,
-            backend: row.text(1)?,
-            input: row.i64(2)?,
-            cache_read: row.i64(3)?,
-            cache_create: row.i64(4)?,
-            output: row.i64(5)?,
-            billable: row.i64(6)?,
-            runs: row.i64(7)?,
-            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(9)?,
-        })
-    })
-    .await
+    db.query_all(sql, params, provider_model_row).await
 }
 
 /// Token components for one (model, role, backend) group. Aggregated into
@@ -1073,11 +1078,7 @@ pub(crate) async fn provider_model_components_live(
 pub(crate) struct GranularRow {
     pub model: Option<String>,
     pub agent_config_id: Option<String>,
-    pub backend: String,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub thinking: i64,
     pub billable: i64,
     pub runs: i64,
@@ -1087,6 +1088,19 @@ pub(crate) struct GranularRow {
     pub exact_cost: f64,
     /// Count of events contributing to `exact_cost`.
     pub exact_cost_count: i64,
+}
+
+fn granular_row(row: &impl RowExt) -> DbResult<GranularRow> {
+    Ok(GranularRow {
+        model: row.opt_text(0)?,
+        agent_config_id: row.opt_text(1)?,
+        usage: usage_at(row, 2)?,
+        thinking: row.i64(10)?,
+        billable: row.i64(11)?,
+        runs: row.i64(12)?,
+        exact_cost: row.opt_f64(13)?.unwrap_or(0.0),
+        exact_cost_count: row.i64(14)?,
+    })
 }
 
 pub(crate) async fn economics_granular(
@@ -1108,10 +1122,7 @@ pub(crate) async fn economics_granular(
             SELECT tr.model AS model,
                    tr.agent_config_id AS agent_config_id,
                    tr.backend AS backend,
-                   SUM(tr.input_tokens) AS input,
-                   SUM(tr.cache_read_tokens) AS cache_read,
-                   SUM(tr.cache_create_tokens) AS cache_create,
-                   SUM(tr.output_tokens) AS output,
+                   {usage},
                    SUM(tr.thinking_tokens) AS thinking,
                    SUM(tr.billable_tokens) AS billable,
                    COUNT(DISTINCT tr.run_id) AS runs
@@ -1131,11 +1142,7 @@ pub(crate) async fn economics_granular(
         )
         SELECT tok.model,
                tok.agent_config_id,
-               tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.thinking,
                tok.billable,
                tok.runs,
@@ -1148,24 +1155,11 @@ pub(crate) async fn economics_granular(
            AND cost.backend = tok.backend",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
-    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
-        Ok(GranularRow {
-            model: row.opt_text(0)?,
-            agent_config_id: row.opt_text(1)?,
-            backend: row.text(2)?,
-            input: row.i64(3)?,
-            cache_read: row.i64(4)?,
-            cache_create: row.i64(5)?,
-            output: row.i64(6)?,
-            thinking: row.i64(7)?,
-            billable: row.i64(8)?,
-            runs: row.i64(9)?,
-            exact_cost: row.opt_f64(10)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(11)?,
-        })
-    })
-    .await
+    db.query_all(sql, scope_range_params_doubled(scope, range), granular_row)
+        .await
 }
 
 /// Event-scan oracle for [`economics_granular`].
@@ -1212,10 +1206,7 @@ pub(crate) async fn economics_granular_live(
             SELECT te.model AS model,
                    te.agent_config_id AS agent_config_id,
                    te.backend AS backend,
-                   SUM(te.input_tokens) AS input,
-                   SUM(te.cache_read_tokens) AS cache_read,
-                   SUM(te.cache_create_tokens) AS cache_create,
-                   SUM(te.output_tokens) AS output,
+                   {usage},
                    SUM(te.thinking_tokens) AS thinking,
                    SUM(te.billable_tokens) AS billable,
                    COUNT(DISTINCT te.run_id) AS runs
@@ -1225,11 +1216,7 @@ pub(crate) async fn economics_granular_live(
         )
         SELECT tok.model,
                tok.agent_config_id,
-               tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.thinking,
                tok.billable,
                tok.runs,
@@ -1240,27 +1227,14 @@ pub(crate) async fn economics_granular_live(
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
            AND IFNULL(cost.agent_config_id, '') = IFNULL(tok.agent_config_id, '')
            AND cost.backend = tok.backend",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
-    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
-        Ok(GranularRow {
-            model: row.opt_text(0)?,
-            agent_config_id: row.opt_text(1)?,
-            backend: row.text(2)?,
-            input: row.i64(3)?,
-            cache_read: row.i64(4)?,
-            cache_create: row.i64(5)?,
-            output: row.i64(6)?,
-            thinking: row.i64(7)?,
-            billable: row.i64(8)?,
-            runs: row.i64(9)?,
-            exact_cost: row.opt_f64(10)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(11)?,
-        })
-    })
-    .await
+    db.query_all(sql, scope_range_params_doubled(scope, range), granular_row)
+        .await
 }
 
 // --- Tier B: tool-invocation rollup (backfill + read queries) ---
@@ -2009,7 +1983,7 @@ pub(crate) async fn token_components_live(
         WHERE {filter}
         GROUP BY bucket_start
         ORDER BY bucket_start",
-        cte = TOKEN_EVENTS_CTE,
+        cte = token_events_cte(),
         filter = SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
@@ -2035,11 +2009,7 @@ pub(crate) struct ProjectCostComponentRow {
     pub project_id: String,
     pub project_name: String,
     pub model: Option<String>,
-    pub backend: String,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
     pub exact_cost_count: i64,
@@ -2055,10 +2025,7 @@ pub(crate) async fn cost_by_project(
             SELECT tr.project_id AS project_id,
                    tr.model AS model,
                    tr.backend AS backend,
-                   SUM(tr.input_tokens) AS input,
-                   SUM(tr.cache_read_tokens) AS cache_read,
-                   SUM(tr.cache_create_tokens) AS cache_create,
-                   SUM(tr.output_tokens) AS output,
+                   {usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND tr.project_id IS NOT NULL AND {filter}
@@ -2077,11 +2044,7 @@ pub(crate) async fn cost_by_project(
         SELECT tok.project_id,
                COALESCE(p.name, tok.project_id) AS project_name,
                tok.model,
-               tok.backend,
-               tok.input,
-               tok.cache_read,
-               tok.cache_create,
-               tok.output,
+               {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
                COALESCE(cost.exact_count, 0)
@@ -2094,20 +2057,18 @@ pub(crate) async fn cost_by_project(
         ORDER BY tok.project_id",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
     );
     db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
         Ok(ProjectCostComponentRow {
             project_id: row.text(0)?,
             project_name: row.text(1)?,
             model: row.opt_text(2)?,
-            backend: row.text(3)?,
-            input: row.i64(4)?,
-            cache_read: row.i64(5)?,
-            cache_create: row.i64(6)?,
-            output: row.i64(7)?,
-            billable: row.i64(8)?,
-            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(10)?,
+            usage: usage_at(row, 3)?,
+            billable: row.i64(11)?,
+            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(13)?,
         })
     })
     .await
@@ -2226,15 +2187,14 @@ pub(crate) async fn usage_heatmap(
 /// Per-job token/cost fold plus per-job line counts, shared by the merged-PR
 /// economics and cost-trend queries. Bound param `?1` scopes the project (NULL
 /// disables). `output` is an alias, not a keyword, matching `tokens_per_loc`.
-const MERGED_PR_CTES: &str = "job_tokens AS (
+fn merged_pr_ctes() -> String {
+    format!(
+        "job_tokens AS (
         SELECT tr.job_id AS job_id,
                MAX(tr.model) AS model,
                MAX(tr.agent_config_id) AS agent_config_id,
                MAX(tr.backend) AS backend,
-               SUM(tr.input_tokens) AS input,
-               SUM(tr.cache_read_tokens) AS cache_read,
-               SUM(tr.cache_create_tokens) AS cache_create,
-               SUM(tr.output_tokens) AS output,
+               {usage},
                SUM(tr.billable_tokens) AS billable,
                SUM(tr.exact_cost) AS exact_cost,
                SUM(tr.exact_cost_count) AS exact_cost_count
@@ -2246,7 +2206,15 @@ const MERGED_PR_CTES: &str = "job_tokens AS (
     job_lines AS (
         SELECT job_id, SUM(COALESCE(additions, 0) + COALESCE(deletions, 0)) AS lines
         FROM file_changes GROUP BY job_id
-    )";
+    )",
+        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+    )
+}
+
+/// The merged-PR queries' sum of each job's [`USAGE_MEASURES`] over a group.
+fn merged_pr_usage_sums() -> String {
+    usage_select(|_, alias| format!("SUM(jt.{alias})"))
+}
 
 /// Lines shipped for a merged PR: GitHub-synced `additions + deletions` when
 /// present, else the local `file_changes` rollup (`jl.lines`). Mirrors
@@ -2262,12 +2230,8 @@ const MERGED_PR_LINES_EXPR: &str = "CASE
 pub(crate) struct MergedPrEconRow {
     pub model: Option<String>,
     pub agent_config_id: Option<String>,
-    pub backend: String,
     pub pr_count: i64,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
     pub exact_cost_count: i64,
@@ -2285,10 +2249,10 @@ pub(crate) async fn merged_pr_economics_rows(
 ) -> DbResult<Vec<MergedPrEconRow>> {
     let sql = format!(
         "WITH {ctes}
-        SELECT jt.model, jt.agent_config_id, jt.backend,
+        SELECT jt.model, jt.agent_config_id,
                COUNT(*) AS pr_count,
-               SUM(jt.input), SUM(jt.cache_read), SUM(jt.cache_create),
-               SUM(jt.output), SUM(jt.billable),
+               {usage},
+               SUM(jt.billable),
                SUM(jt.exact_cost), SUM(jt.exact_cost_count),
                SUM({lines})
         FROM job_tokens jt
@@ -2298,23 +2262,20 @@ pub(crate) async fn merged_pr_economics_rows(
         WHERE (?2 IS NULL OR mr.merged_at >= ?2)
           AND (?3 IS NULL OR mr.merged_at < ?3)
         GROUP BY jt.model, jt.agent_config_id, jt.backend",
-        ctes = MERGED_PR_CTES,
+        ctes = merged_pr_ctes(),
+        usage = merged_pr_usage_sums(),
         lines = MERGED_PR_LINES_EXPR,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(MergedPrEconRow {
             model: row.opt_text(0)?,
             agent_config_id: row.opt_text(1)?,
-            backend: row.text(2)?,
-            pr_count: row.i64(3)?,
-            input: row.i64(4)?,
-            cache_read: row.i64(5)?,
-            cache_create: row.i64(6)?,
-            output: row.i64(7)?,
-            billable: row.i64(8)?,
-            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(10)?,
-            lines: row.opt_i64(11)?.unwrap_or(0),
+            pr_count: row.i64(2)?,
+            usage: usage_at(row, 3)?,
+            billable: row.i64(11)?,
+            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(13)?,
+            lines: row.opt_i64(14)?.unwrap_or(0),
         })
     })
     .await
@@ -2326,12 +2287,8 @@ pub(crate) async fn merged_pr_economics_rows(
 pub(crate) struct PrCostTrendRow {
     pub bucket_start: i64,
     pub model: Option<String>,
-    pub backend: String,
     pub pr_count: i64,
-    pub input: i64,
-    pub cache_read: i64,
-    pub cache_create: i64,
-    pub output: i64,
+    pub usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
     pub exact_cost_count: i64,
@@ -2349,10 +2306,10 @@ pub(crate) async fn merged_pr_cost_trend_rows(
     let bucket_expr = bucket.bucket_expr("mr.merged_at");
     let sql = format!(
         "WITH {ctes}
-        SELECT {bucket_expr} AS bucket_start, jt.model, jt.backend,
+        SELECT {bucket_expr} AS bucket_start, jt.model,
                COUNT(*) AS pr_count,
-               SUM(jt.input), SUM(jt.cache_read), SUM(jt.cache_create),
-               SUM(jt.output), SUM(jt.billable),
+               {usage},
+               SUM(jt.billable),
                SUM(jt.exact_cost), SUM(jt.exact_cost_count),
                SUM({lines})
         FROM job_tokens jt
@@ -2363,23 +2320,20 @@ pub(crate) async fn merged_pr_cost_trend_rows(
           AND (?3 IS NULL OR mr.merged_at < ?3)
         GROUP BY bucket_start, jt.model, jt.backend
         ORDER BY bucket_start",
-        ctes = MERGED_PR_CTES,
+        ctes = merged_pr_ctes(),
+        usage = merged_pr_usage_sums(),
         lines = MERGED_PR_LINES_EXPR,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(PrCostTrendRow {
             bucket_start: row.i64(0)?,
             model: row.opt_text(1)?,
-            backend: row.text(2)?,
-            pr_count: row.i64(3)?,
-            input: row.i64(4)?,
-            cache_read: row.i64(5)?,
-            cache_create: row.i64(6)?,
-            output: row.i64(7)?,
-            billable: row.i64(8)?,
-            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(10)?,
-            lines: row.opt_i64(11)?.unwrap_or(0),
+            pr_count: row.i64(2)?,
+            usage: usage_at(row, 3)?,
+            billable: row.i64(11)?,
+            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(13)?,
+            lines: row.opt_i64(14)?.unwrap_or(0),
         })
     })
     .await
