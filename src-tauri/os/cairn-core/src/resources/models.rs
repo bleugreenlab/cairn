@@ -399,14 +399,15 @@ pub(crate) fn render_decide(facet: &dyn Models) -> String {
         return out;
     }
     out.push_str("## Offers that serve decide\n\n");
-    for offer in offers {
+    let names = catalog.request_names(&offers);
+    for (offer, name) in offers.iter().zip(names) {
         let measured = offer
             .measured_by()
             .map_or("nothing", |method| method.as_str());
         let _ = writeln!(
             out,
-            "- `{}` on `{}` — measured by {measured}, over `{}`",
-            offer.model, offer.provider, offer.served.wire
+            "- `{name}` on `{}` — measured by {measured}, over `{}`",
+            offer.provider, offer.served.wire
         );
     }
     out.push_str("\nA logprobs offer not yet seen to answer is asked one probe question before its first decision. Each offer in full: `cairn://models/catalog?serves=decide`.\n");
@@ -435,17 +436,14 @@ pub(crate) fn render_embed(facet: &dyn Models) -> String {
         );
         return out;
     }
-    out.push_str("## Offers that serve embed\n\nEach gives its native width, the other widths it can return, how it tells documents from queries, and its batch limits. A request over the limits is split into consecutive requests and joined in order.\n\n");
-    for offer in offers {
+    out.push_str("## Offers that serve embed\n\nEach is named as `model` takes it, qualified as `provider/model` where another provider offers the same model; it gives its native width, the other widths it can return, how it tells documents from queries, and its batch limits. A request over the limits is split into consecutive requests and joined in order.\n\n");
+    let names = catalog.request_names(&offers);
+    for (offer, name) in offers.iter().zip(names) {
         let declared = match &offer.served.verb {
             Verb::Embed(capabilities) => capabilities.summary(),
             _ => "declares nothing".to_string(),
         };
-        let _ = writeln!(
-            out,
-            "- `{}` on `{}` — {declared}",
-            offer.model, offer.provider
-        );
+        let _ = writeln!(out, "- `{name}` on `{}` — {declared}", offer.provider);
     }
     out.push_str("\nEach offer in full: `cairn://models/catalog?serves=embed`.\n");
     out
@@ -512,7 +510,8 @@ pub(crate) fn render_media(
         return out;
     }
     let _ = writeln!(out, "## Offers that serve {}\n", verb.as_str());
-    for offer in offers {
+    let names = catalog.request_names(&offers);
+    for (offer, name) in offers.iter().zip(names) {
         let declared = match &offer.served.verb {
             Verb::Image(capabilities) => capabilities.summary(),
             Verb::Speak(capabilities) => capabilities.to_string(),
@@ -520,8 +519,8 @@ pub(crate) fn render_media(
         };
         let _ = writeln!(
             out,
-            "- `{}` on `{}` ({}) — {declared}",
-            offer.model, offer.provider, offer.served.wire
+            "- `{name}` on `{}` ({}) — {declared}",
+            offer.provider, offer.served.wire
         );
     }
     let _ = writeln!(

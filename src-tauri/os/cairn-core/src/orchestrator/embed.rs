@@ -482,6 +482,7 @@ impl Orchestrator {
                     verb: VerbKind::Embed,
                     requested: None,
                     detail: None,
+                    ambiguous: false,
                 };
                 format!("{lead}. {nothing}")
             } else {
@@ -509,7 +510,7 @@ impl Orchestrator {
             return Err(match error {
                 EmbedError::NoOffer(mut refusal) => {
                     let offers = embed_offers_named(&catalog);
-                    if !offers.is_empty() {
+                    if !offers.is_empty() && !refusal.ambiguous {
                         let suffix = format!("offers that serve embed: {offers}");
                         refusal.detail = Some(match refusal.detail.take() {
                             Some(detail) => format!("{detail}; {suffix}"),

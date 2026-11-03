@@ -221,7 +221,7 @@ fn select(
         .is_some_and(|requested| !requested.trim().is_empty());
     let offer = catalog.offer_for(query).map_err(|mut refusal| {
         let alternatives = alternatives(catalog, questions);
-        if named && !alternatives.is_empty() {
+        if named && !alternatives.is_empty() && !refusal.ambiguous {
             let suffix = format!("offers that serve decide: {alternatives}");
             refusal.detail = Some(match refusal.detail.take() {
                 Some(detail) => format!("{detail}; {suffix}"),
@@ -600,6 +600,7 @@ impl Orchestrator {
                 verb: VerbKind::Decide,
                 requested: None,
                 detail: None,
+                ambiguous: false,
             };
             format!("{lead}. {nothing}")
         } else {

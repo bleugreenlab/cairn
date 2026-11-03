@@ -158,6 +158,7 @@ impl CatalogProvider {
             verb,
             requested: Some(model.to_string()),
             detail: Some(detail),
+            ambiguous: false,
         })
     }
 
@@ -427,10 +428,17 @@ pub struct NoOffer {
     /// Why the request found nothing, when there is more to say than that
     /// nothing is configured.
     pub detail: Option<String>,
+    /// The name reached offers on more than one provider, and `detail` names
+    /// the qualified form of each: the fix is to name one, not to install
+    /// anything.
+    pub ambiguous: bool,
 }
 
 impl fmt::Display for NoOffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (true, Some(detail)) = (self.ambiguous, &self.detail) {
+            return write!(f, "{detail}.");
+        }
         let capable = capable(self.verb);
         match (&self.requested, &self.detail) {
             (Some(requested), _) => write!(f, "No {capable} model serves '{requested}'")?,
@@ -500,6 +508,84 @@ fn preference(served: &ServedVerb) -> u8 {
         },
         Verb::Complete | Verb::Session | Verb::Image(_) | Verb::Embed(_) => 0,
     }
+}
+
+/// The offers of every model `requested` names exactly, as `query` admits
+/// them, and those of them that serve its verb, best first. `qualifier` and
+/// `native` are `requested` split at an installed provider's key.
+///
+/// `provider/native-id` names that provider's offer of that native id, the
+/// form refusals and listings name offers in. The native id may itself hold a
+/// slash (`openrouter/typesafe/jev-1.14`), and a model with a canonical slug
+/// has a catalog id that is neither, so this is matched on the offer rather
+/// than the catalog id. Anything else names a model by its catalog id, an
+/// alias, or an offer's native id, and reaches every offer of that model: a
+/// local profile's upstream slug merges its offer with a remote one's.
+fn exact_offers(
+    models: &[CatalogModel],
+    query: &OfferQuery<'_>,
+    requested: &str,
+    qualifier: Option<&str>,
+    native: &str,
+) -> (Vec<CatalogOffer>, Vec<SelectedOffer>) {
+    let names_offer = |offer: &CatalogOffer| {
+        qualifier.is_some_and(|key| offer.provider == key && offer.model == native)
+    };
+    let qualified = models
+        .iter()
+        .flat_map(|model| &model.offers)
+        .any(names_offer);
+    let matching: Vec<CatalogOffer> = models
+        .iter()
+        .filter(|model| {
+            qualified
+                || model.catalog_id == requested
+                || model.aliases.iter().any(|alias| alias == requested)
+                || model.offers.iter().any(|offer| offer.model == requested)
+        })
+        .flat_map(|model| model.offers.iter().cloned())
+        .filter(|offer| !qualified || names_offer(offer))
+        .filter(|offer| query.admits_offer(offer))
+        .collect();
+    let mut capable: Vec<SelectedOffer> = matching
+        .iter()
+        .filter_map(|offer| offer.selected(query.verb))
+        .collect();
+    capable.sort_by_key(|offer| preference(&offer.served));
+    (matching, capable)
+}
+
+/// Why `requested` names no one offer, when the offers it reaches for a verb
+/// are on more than one provider: each provider with the qualified names that
+/// reach its offers alone. Only offers that serve the verb count, since one
+/// that cannot is no choice.
+fn ambiguity(requested: &str, capable: &[SelectedOffer]) -> Option<String> {
+    let mut providers: Vec<&str> = capable
+        .iter()
+        .map(|offer| offer.provider.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    if providers.len() < 2 {
+        return None;
+    }
+    let named: Vec<String> = providers
+        .iter()
+        .map(|provider| {
+            let mut names: Vec<String> = capable
+                .iter()
+                .filter(|offer| offer.provider == *provider)
+                .map(|offer| format!("{provider}/{}", offer.model))
+                .collect();
+            names.dedup();
+            format!("{provider} ({})", names.join(", "))
+        })
+        .collect();
+    let (last, rest) = named.split_last()?;
+    Some(format!(
+        "'{requested}' is offered by {} and {last}: name one",
+        rest.join(", ")
+    ))
 }
 
 /// The best way `serves` serves `verb`, when it does: the first of the best
@@ -692,8 +778,10 @@ impl Catalog {
     /// verb, the best wire first and then the tier's default provider.
     /// Anything else is an exact model, matched by native id, catalog id,
     /// alias, or `provider/native-id`. A selection that lands only on offers that do not serve the
-    /// verb is refused, never served by something that does. `provider` and
-    /// `account` narrow every branch.
+    /// verb is refused, never served by something that does, and an
+    /// unqualified one that lands on offers serving the verb on more than one
+    /// provider is refused naming each `provider/native-id`, never decided
+    /// for the caller. `provider` and `account` narrow every branch.
     pub fn offer_for(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
         self.ranked(&query).map(|mut offers| offers.remove(0))
     }
@@ -751,6 +839,7 @@ impl Catalog {
             verb: query.verb,
             requested: requested.map(str::to_string),
             detail: Some(detail),
+            ambiguous: false,
         })
     }
 
@@ -768,6 +857,7 @@ impl Catalog {
             verb,
             requested: requested.map(str::to_string),
             detail,
+            ambiguous: false,
         };
         let Some(requested) = requested else {
             return Some(self.candidates(&query))
@@ -801,16 +891,7 @@ impl Catalog {
                 });
         };
 
-        let (qualifier, tier) = match requested.split_once('/') {
-            Some((provider, tier))
-                if self
-                    .installed()
-                    .any(|candidate| candidate.descriptor.key.as_ref() == provider) =>
-            {
-                (Some(provider), tier)
-            }
-            _ => (None, requested),
-        };
+        let (qualifier, tier) = self.qualified_by(requested);
         let bindings: Vec<(&CatalogProvider, &TierBinding)> = self
             .installed()
             .filter(|provider| {
@@ -870,61 +951,85 @@ impl Catalog {
             });
         }
 
-        // `provider/native-id` names that provider's offer of that native id,
-        // the form refusals and listings name offers in. The native id may
-        // itself hold a slash (`openrouter/typesafe/jev-1.14`), and a model
-        // with a canonical slug has a catalog id that is neither, so this is
-        // matched on the offer rather than the catalog id.
-        let names_offer = |offer: &CatalogOffer| {
-            qualifier.is_some_and(|key| offer.provider == key && offer.model == tier)
-        };
-        let models = self.models();
-        let qualified = models
-            .iter()
-            .flat_map(|model| &model.offers)
-            .any(names_offer);
-        let matching: Vec<CatalogOffer> = models
-            .into_iter()
-            .filter(|model| {
-                qualified
-                    || model.catalog_id == requested
-                    || model.aliases.iter().any(|alias| alias == requested)
-                    || model.offers.iter().any(|offer| offer.model == requested)
-            })
-            .flat_map(|model| model.offers)
-            .filter(|offer| !qualified || names_offer(offer))
-            .filter(|offer| query.admits_offer(offer))
-            .collect();
+        let (matching, capable) = exact_offers(&self.models(), &query, requested, qualifier, tier);
         if matching.is_empty() {
             return Err(refuse(Some(format!(
                 "no installed provider offers '{requested}'"
             ))));
         }
-        let mut capable: Vec<SelectedOffer> = matching
+        if capable.is_empty() {
+            let mut providers: Vec<&str> = matching
+                .iter()
+                .map(|offer| offer.provider.as_str())
+                .collect();
+            providers.dedup();
+            return Err(refuse(Some(format!(
+                "'{requested}' is offered only by {}, which {}{}",
+                providers.join(", "),
+                cannot(verb),
+                self.observed_unable(
+                    verb,
+                    matching
+                        .iter()
+                        .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
+                )
+            ))));
+        }
+        // An exact model is never chosen between providers: the same name on
+        // two providers may be two servings (another quantization, another
+        // pooling), whose answers and vectors differ. Ranking them is model
+        // selection, which belongs to tiers.
+        if let Some(detail) = ambiguity(requested, &capable) {
+            return Err(NoOffer {
+                verb,
+                requested: Some(requested.to_string()),
+                detail: Some(detail),
+                ambiguous: true,
+            });
+        }
+        Ok(capable)
+    }
+
+    /// `requested` split at the installed provider key before its first `/`:
+    /// that key and the rest, or no key and all of it.
+    fn qualified_by<'r>(&self, requested: &'r str) -> (Option<&'r str>, &'r str) {
+        match requested.split_once('/') {
+            Some((provider, rest))
+                if self
+                    .installed()
+                    .any(|candidate| candidate.descriptor.key.as_ref() == provider) =>
+            {
+                (Some(provider), rest)
+            }
+            _ => (None, requested),
+        }
+    }
+
+    /// The name a caller writes to reach each of `offers` for the verb it
+    /// serves: its native id where that reaches it and nothing else, else
+    /// `provider/native-id`. Listings name offers this way, so the name a
+    /// reader copies is never one the doors refuse as ambiguous.
+    pub fn request_names(&self, offers: &[SelectedOffer]) -> Vec<String> {
+        let models = self.models();
+        offers
             .iter()
-            .filter_map(|offer| offer.selected(verb))
-            .collect();
-        capable.sort_by_key(|offer| preference(&offer.served));
-        Some(capable)
-            .filter(|capable| !capable.is_empty())
-            .ok_or_else(|| {
-                let mut providers: Vec<&str> = matching
-                    .iter()
-                    .map(|offer| offer.provider.as_str())
-                    .collect();
-                providers.dedup();
-                refuse(Some(format!(
-                    "'{requested}' is offered only by {}, which {}{}",
-                    providers.join(", "),
-                    cannot(verb),
-                    self.observed_unable(
-                        verb,
-                        matching
-                            .iter()
-                            .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
-                    )
-                )))
+            .map(|offer| {
+                let name = offer.model.as_str();
+                let alone = self.qualified_by(name).0.is_none() && {
+                    let query = OfferQuery::new(offer.served.verb.kind());
+                    let (_, capable) = exact_offers(&models, &query, name, None, name);
+                    ambiguity(name, &capable).is_none()
+                        && capable.first().is_some_and(|first| {
+                            first.provider == offer.provider && first.model == offer.model
+                        })
+                };
+                if alone {
+                    offer.model.clone()
+                } else {
+                    format!("{}/{}", offer.provider, offer.model)
+                }
             })
+            .collect()
     }
 
     /// Every offer `query` admits that serves its verb, best first.
@@ -1360,16 +1465,21 @@ mod tests {
             }
         );
         assert_eq!(selected.measured_by(), Some(MeasuredBy::Native));
-        // The canonical slug still selects it, and the bare native id is
-        // offered by both providers.
+        // The canonical slug still selects it; the bare native id is offered
+        // by both providers, so it names neither.
         assert_eq!(
             decide(&catalog, Some("typesafe/jev-1.14-20261014"))
                 .unwrap()
                 .provider,
             "openrouter"
         );
+        let refusal = decide(&catalog, Some("typesafe/jev-1.14")).unwrap_err();
         assert_eq!(
-            decide(&catalog, Some("typesafe/jev-1.14"))
+            refusal.detail.as_deref(),
+            Some("'typesafe/jev-1.14' is offered by custom:acc_gateway (custom:acc_gateway/typesafe/jev-1.14) and openrouter (openrouter/typesafe/jev-1.14): name one")
+        );
+        assert_eq!(
+            decide(&catalog, Some("custom:acc_gateway/typesafe/jev-1.14"))
                 .unwrap()
                 .provider,
             "custom:acc_gateway"
@@ -1555,8 +1665,11 @@ mod tests {
                 account,
             })
         };
+        // Both offer `qwen3`, so the bare id names neither; a qualifier or the
+        // provider narrowing picks one.
+        assert!(complete(None, None, Some("qwen3")).unwrap_err().ambiguous);
         assert_eq!(
-            complete(None, None, Some("qwen3")).unwrap().provider,
+            complete(None, None, Some("ollama/qwen3")).unwrap().provider,
             "ollama"
         );
         assert_eq!(
@@ -1578,6 +1691,159 @@ mod tests {
             complete(None, Some("high"), None).unwrap().provider,
             "openrouter"
         );
+    }
+
+    const QWEN_EMBED: &str = "Qwen/Qwen3-Embedding-4B";
+    const QWEN_SLUG: &str = "qwen/qwen3-embedding-4b";
+
+    /// A model whose own declaration is that it embeds, and nothing else.
+    fn embedder(id: &str, slug: Option<&str>) -> DiscoveredModel {
+        let mut embedder = model(id, slug);
+        embedder.serves = Some(vec![ServedVerb {
+            verb: Verb::Embed(
+                cairn_models_types::embedding::EmbeddingCapabilities::cairn_gateway(),
+            ),
+            wire: Wire::OpenAiEmbeddings,
+        }]);
+        embedder
+    }
+
+    /// The live workspace's two Qwen3-Embedding-4B offers: OpenRouter's, and
+    /// Cairn inference's under its real name, merged on the upstream slug the
+    /// inference profile declares. OpenRouter comes first in provider order,
+    /// so it was the one silently chosen.
+    fn two_embedders() -> Catalog {
+        Catalog {
+            providers: vec![
+                provider(
+                    "openrouter",
+                    Some(vec![
+                        embedder(QWEN_SLUG, Some(QWEN_SLUG)),
+                        embedder(
+                            "openai/text-embedding-3-small",
+                            Some("openai/text-embedding-3-small"),
+                        ),
+                    ]),
+                    vec![],
+                ),
+                provider(
+                    "inference",
+                    Some(vec![embedder(QWEN_EMBED, Some(QWEN_SLUG))]),
+                    vec![],
+                ),
+            ],
+        }
+    }
+
+    fn embed_offer(catalog: &Catalog, requested: &str) -> Result<SelectedOffer, NoOffer> {
+        catalog.offer_for(OfferQuery {
+            requested: Some(requested),
+            ..OfferQuery::new(VerbKind::Embed)
+        })
+    }
+
+    #[test]
+    fn an_unqualified_model_two_providers_offer_is_refused_naming_each() {
+        let catalog = two_embedders();
+        assert_eq!(
+            catalog.models().len(),
+            2,
+            "the two Qwen offers share an entry"
+        );
+        for requested in [QWEN_EMBED, QWEN_SLUG] {
+            let refusal = embed_offer(&catalog, requested).unwrap_err();
+            assert!(refusal.ambiguous, "{requested}");
+            assert_eq!(
+                refusal.to_string(),
+                format!("'{requested}' is offered by inference (inference/Qwen/Qwen3-Embedding-4B) and openrouter (openrouter/qwen/qwen3-embedding-4b): name one.")
+            );
+            // The request-aware walk refuses it the same way.
+            assert!(
+                catalog
+                    .admitting_offer(
+                        OfferQuery {
+                            requested: Some(requested),
+                            ..OfferQuery::new(VerbKind::Embed)
+                        },
+                        |_| Ok::<_, &str>(())
+                    )
+                    .unwrap_err()
+                    .ambiguous
+            );
+        }
+
+        // Each qualified form selects its provider's offer.
+        let local = embed_offer(&catalog, "inference/Qwen/Qwen3-Embedding-4B").unwrap();
+        assert_eq!(
+            (local.provider.as_str(), local.model.as_str()),
+            ("inference", QWEN_EMBED)
+        );
+        let remote = embed_offer(&catalog, "openrouter/qwen/qwen3-embedding-4b").unwrap();
+        assert_eq!(
+            (remote.provider.as_str(), remote.model.as_str()),
+            ("openrouter", QWEN_SLUG)
+        );
+        // So does narrowing to one provider.
+        let narrowed = catalog
+            .offer_for(OfferQuery {
+                requested: Some(QWEN_EMBED),
+                provider: Some("inference"),
+                ..OfferQuery::new(VerbKind::Embed)
+            })
+            .unwrap();
+        assert_eq!(narrowed.provider, "inference");
+
+        // A model one provider offers still resolves unqualified.
+        assert_eq!(
+            embed_offer(&catalog, "openai/text-embedding-3-small")
+                .unwrap()
+                .provider,
+            "openrouter"
+        );
+    }
+
+    /// An offer that cannot serve the verb is no choice, so a name another
+    /// provider offers only for some other verb is not ambiguous for this one.
+    #[test]
+    fn only_offers_serving_the_verb_make_a_name_ambiguous() {
+        let mut catalog = two_embedders();
+        let inference = &mut catalog.providers[1].models.as_mut().unwrap().models[0];
+        inference
+            .serves
+            .as_mut()
+            .unwrap()
+            .extend(ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        let offer = catalog
+            .offer_for(OfferQuery {
+                requested: Some(QWEN_SLUG),
+                ..OfferQuery::new(VerbKind::Complete)
+            })
+            .unwrap();
+        assert_eq!(
+            (offer.provider.as_str(), offer.model.as_str()),
+            ("inference", QWEN_EMBED)
+        );
+        assert!(embed_offer(&catalog, QWEN_SLUG).unwrap_err().ambiguous);
+    }
+
+    /// Listings name each offer as the doors take it: bare where that reaches
+    /// it alone, qualified where another provider offers the same model.
+    #[test]
+    fn listings_qualify_a_model_more_than_one_provider_offers() {
+        let catalog = two_embedders();
+        let offers = catalog.offers_serving(VerbKind::Embed);
+        let names = catalog.request_names(&offers);
+        assert_eq!(
+            names,
+            [
+                "openrouter/qwen/qwen3-embedding-4b",
+                "inference/Qwen/Qwen3-Embedding-4B",
+                "openai/text-embedding-3-small",
+            ]
+        );
+        for (offer, name) in offers.iter().zip(&names) {
+            assert_eq!(&embed_offer(&catalog, name).unwrap(), offer, "{name}");
+        }
     }
 
     #[test]

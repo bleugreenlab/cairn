@@ -200,6 +200,7 @@ impl Orchestrator {
                     verb: VerbKind::Complete,
                     requested: None,
                     detail: None,
+                    ambiguous: false,
                 };
                 format!("{lead}. {nothing}")
             } else {
@@ -213,7 +214,7 @@ impl Orchestrator {
             })
             .map_err(|mut refusal| {
                 let offers = complete_offers_named(&catalog);
-                if !offers.is_empty() {
+                if !offers.is_empty() && !refusal.ambiguous {
                     let suffix = format!("offers that serve complete: {offers}");
                     refusal.detail = Some(match refusal.detail.take() {
                         Some(detail) => format!("{detail}; {suffix}"),
