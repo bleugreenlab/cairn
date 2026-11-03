@@ -535,8 +535,13 @@ pub struct LogicalHeadPublication {
 /// every publication refuses, never a silently dropped commit.
 ///
 /// `observed` is every target the caller read: one commit for an ordinary
-/// bookmark, several for a conflicted name. Callable from any context, async
-/// included: the transaction runs on its own thread.
+/// bookmark, several for a conflicted name.
+///
+/// Synchronous, like the jj CLI calls beside it. The repository load and the
+/// transaction are jj-lib futures that need no tokio reactor (jj-lib drives
+/// them with a plain executor itself), so they run on the calling thread: no
+/// runtime is built, so none can nest inside the caller's, and no thread is
+/// spawned for a worker to park on while it joins.
 pub fn repoint_bookmark_if_unchanged(
     repository_path: &Path,
     bookmark: &str,
@@ -544,24 +549,13 @@ pub fn repoint_bookmark_if_unchanged(
     target: &str,
     description: &str,
 ) -> Result<(), String> {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| format!("start bookmark re-point runtime: {error}"))?
-                    .block_on(repoint_bookmark_if_unchanged_inner(
-                        repository_path,
-                        bookmark,
-                        observed,
-                        target,
-                        description,
-                    ))
-            })
-            .join()
-            .map_err(|_| "bookmark re-point worker panicked".to_string())?
-    })
+    futures::executor::block_on(repoint_bookmark_if_unchanged_inner(
+        repository_path,
+        bookmark,
+        observed,
+        target,
+        description,
+    ))
 }
 
 async fn repoint_bookmark_if_unchanged_inner(

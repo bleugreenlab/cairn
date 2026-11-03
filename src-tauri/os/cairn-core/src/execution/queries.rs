@@ -107,20 +107,12 @@ fn load_census(
     })
 }
 
-/// The same off-runtime execution the shadowed queries use: these are called
-/// from synchronous command handlers that may already sit inside a runtime.
+/// These are called from synchronous command handlers that may already sit on
+/// a runtime worker, so they cross through the one sync-to-async bridge.
 fn block_on<T, Fut>(future: Fut) -> Result<T, String>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to start query database runtime: {e}"))?
-            .block_on(future)
-    })
-    .join()
-    .map_err(|_| "Execution gate census query panicked".to_string())?
+    crate::storage::run_db_blocking(move || future)
 }

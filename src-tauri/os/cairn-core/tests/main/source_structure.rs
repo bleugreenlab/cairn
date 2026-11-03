@@ -121,60 +121,12 @@ fn the_vcs_backend_never_resolves_seal_ownership_at_call_time() {
 /// The functions a hand-rolled runtime bridge may still live in, with why:
 /// `(path under src-tauri, function, reason)`. Every entry must still have the
 /// shape, so converting or deleting one fails the test until its entry goes.
-const RUNTIME_BRIDGES_ALLOWED: &[(&str, &str, &str)] = &[
-    (
-        "os/cairn-db/src/storage/blocking.rs",
-        "run_db_blocking",
-        "the one sanctioned bridge: on a multi-thread runtime it hands the worker's queue off \
+const RUNTIME_BRIDGES_ALLOWED: &[(&str, &str, &str)] = &[(
+    "os/cairn-db/src/storage/blocking.rs",
+    "run_db_blocking",
+    "the one sanctioned bridge: on a multi-thread runtime it hands the worker's queue off \
          with block_in_place before it joins (cairn/5788)",
-    ),
-    (
-        "os/cairn-core/src/execution/jobs/mod.rs",
-        "run_db",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-core/src/execution/jobs/mod.rs",
-        "run_db_borrowed",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-core/src/execution/queries.rs",
-        "block_on",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-session/src/runs/queries.rs",
-        "run_query_db",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-session/src/runs/queries.rs",
-        "run_query_db_scoped",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-workflow/src/queries.rs",
-        "run_query_db",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-attention/src/wakes/routing.rs",
-        "route_wake_sync",
-        "cairn/5858",
-    ),
-    (
-        "os/cairn-core/src/mcp/handlers/terminal.rs",
-        "finalize_terminal_by_session_id",
-        "cairn/5858 (found by this guard after that census)",
-    ),
-    (
-        "os/cairn-vcs/src/lib.rs",
-        "repoint_bookmark_if_unchanged",
-        "jj-lib futures are not Send, so the transaction runs on a thread of its own; it parks \
-         its caller for the transaction (cairn/5858, found by this guard after that census)",
-    ),
-];
+)];
 
 /// The name a line declares a function by, if it does.
 fn declared_fn(line: &str) -> Option<&str> {
@@ -266,8 +218,8 @@ fn hand_rolled_runtime_bridges(files: &[(PathBuf, String)]) -> Vec<(String, Stri
 /// is the one sanctioned bridge (cairn/5788).
 ///
 /// Sites are classified by their shape, never by whether they look for an
-/// ambient runtime first: that check is how cairn/5788's sweep missed the ones
-/// still allowlisted. The allowlist is checked for staleness, so it only
+/// ambient runtime first: that check is how cairn/5788's sweep missed nine of
+/// them (cairn/5858). The allowlist is checked for staleness, so it only
 /// shrinks.
 #[test]
 fn no_production_code_hand_rolls_a_runtime_bridge() {

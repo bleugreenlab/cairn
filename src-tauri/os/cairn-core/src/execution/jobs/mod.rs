@@ -511,50 +511,17 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to start database runtime: {}", e))?
-            .block_on(future)
-    })
-    .join()
-    .map_err(|payload| {
-        format!(
-            "Database task panicked: {}",
-            crate::storage::panic_message(&*payload)
-        )
-    })?
+    crate::storage::run_db_blocking(move || future)
 }
 
-/// [`run_db`] for a future that BORROWS its inputs.
-///
-/// The scoped thread keeps the borrow alive across the join, which a `'static`
-/// spawn cannot, so a synchronous caller holding `&Orchestrator` can drive async
-/// database work without cloning the world. The thread itself is there for the
-/// same reason as in [`run_db`]: a fresh current-thread runtime must not be
-/// built inside an existing one.
+/// [`run_db`] for a future that BORROWS its inputs, so a synchronous caller
+/// holding `&Orchestrator` can drive async database work without cloning the
+/// world: the bridge's scoped thread keeps the borrow alive across its join.
 fn run_db_borrowed<T>(future: impl Future<Output = Result<T, String>> + Send) -> Result<T, String>
 where
     T: Send,
 {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to start database runtime: {}", e))?
-                    .block_on(future)
-            })
-            .join()
-            .map_err(|payload| {
-                format!(
-                    "Database task panicked: {}",
-                    crate::storage::panic_message(&*payload)
-                )
-            })?
-    })
+    crate::storage::run_db_blocking(move || future)
 }
 
 fn db_error(context: &str, error: DbError) -> String {

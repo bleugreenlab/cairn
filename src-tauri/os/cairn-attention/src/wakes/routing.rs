@@ -46,23 +46,7 @@ pub fn route_wake_sync(
     event: WakeEvent,
 ) -> Result<WakeRouteAction, String> {
     let runtime = runtime.clone();
-    std::thread::scope(|scope| {
-        scope
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to start database runtime: {e}"))?
-                    .block_on(async move { route_wake(&runtime, event).await })
-            })
-            .join()
-            .map_err(|payload| {
-                format!(
-                    "Database task panicked: {}",
-                    crate::storage::panic_message(&*payload)
-                )
-            })?
-    })
+    crate::storage::run_db_blocking(move || async move { route_wake(&runtime, event).await })
 }
 
 /// Route one external wake through the subscription registry.

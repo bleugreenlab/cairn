@@ -2425,17 +2425,7 @@ pub fn finalize_terminal_by_session_id(
     orch: &Orchestrator,
     session_id: &str,
 ) -> Result<(), String> {
-    let orch = orch.clone();
-    let session_id = session_id.to_string();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        runtime.block_on(stop_terminal_by_session(&orch, &session_id))
-    })
-    .join()
-    .map_err(|_| "terminal finalize thread panicked".to_string())?
+    crate::storage::run_db_blocking(|| stop_terminal_by_session(orch, session_id))
 }
 
 /// Settle a running terminal whose process Cairn has proven gone although its

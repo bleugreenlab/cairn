@@ -762,46 +762,27 @@ pub fn reconcile_stale_runs_inner(
     outcome
 }
 
+/// Drive a run query from synchronous code through the one sync-to-async
+/// bridge. The query's own `CairnError` rides through the bridge untouched;
+/// only the bridge's failures (no runtime, a panic) become `Internal`.
 pub fn run_query_db<T, Fut>(future: Fut) -> Result<T, CairnError>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, CairnError>> + Send + 'static,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                CairnError::Internal(format!("Failed to start run database runtime: {e}"))
-            })?
-            .block_on(future)
-    })
-    .join()
-    .map_err(|_| CairnError::Internal("Run database task panicked".to_string()))?
+    run_query_db_scoped(move || future)
 }
 
-/// [`run_query_db`] for work that borrows from its caller. A scoped thread joins
-/// before the borrow can end, which a detached `thread::spawn` cannot promise.
+/// [`run_query_db`] for work that borrows from its caller: the bridge's scoped
+/// thread joins before the borrow can end.
 fn run_query_db_scoped<T, F, Fut>(build: F) -> Result<T, CairnError>
 where
     T: Send,
     F: FnOnce() -> Fut + Send,
     Fut: Future<Output = Result<T, CairnError>>,
 {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        CairnError::Internal(format!("Failed to start run database runtime: {e}"))
-                    })?
-                    .block_on(build())
-            })
-            .join()
-            .map_err(|_| CairnError::Internal("Run database task panicked".to_string()))?
-    })
+    cairn_db::storage::run_db_blocking(move || async move { Ok(build().await) })
+        .map_err(CairnError::Internal)?
 }
 
 /// `sql` is built from [`RUN_COLUMNS`] by every caller — it is a `String`, not a

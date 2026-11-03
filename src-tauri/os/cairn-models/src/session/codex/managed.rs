@@ -925,12 +925,26 @@ const USER_AGENT: &str = concat!("cairn-managed-codex/", env!("CARGO_PKG_VERSION
 
 /// Run `work` on its own thread: a `reqwest::blocking` client must never be
 /// built or dropped on a tokio worker, and callers here may be on one.
+///
+/// A worker of a multi-thread runtime hands its queue off with
+/// `block_in_place` before it joins, as `cairn_db::storage::run_db_blocking`
+/// does, so a download costs the runtime one thread rather than one worker for
+/// its whole length. `block_in_place` panics on a current-thread runtime, so
+/// that flavor and plain threads join directly.
 fn off_runtime<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
-    std::thread::spawn(work)
-        .join()
-        .map_err(|_| "the download thread panicked".to_string())?
+    let run = move || {
+        std::thread::spawn(work)
+            .join()
+            .map_err(|_| "the download thread panicked".to_string())?
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(run)
+        }
+        _ => run(),
+    }
 }
 
 /// Downloads over HTTPS.
@@ -1030,6 +1044,47 @@ pub(crate) mod tests {
     use super::*;
     use crate::session::codex::pin::SUPPORTED_TARGETS;
     use std::collections::{BTreeMap, HashMap};
+
+    /// With one worker, a plain spawn-and-join from a runtime task would park
+    /// the only worker with its core, and no timer or other task would run
+    /// until the download returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_download_from_a_worker_leaves_the_runtime_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        // Spawned, not awaited in the test body: the body runs inside
+        // `block_on`, not on the worker this needs to occupy.
+        let ticked_during_call = tokio::spawn(async move {
+            off_runtime(move || {
+                let before = ticks.load(Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(ticks.load(Ordering::SeqCst) - before)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        ticker.abort();
+        assert!(
+            ticked_during_call > 0,
+            "the runtime's other tasks must keep running while a worker waits on a download"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_from_a_current_thread_runtime_joins_directly() {
+        assert_eq!(off_runtime(|| Ok(7)), Ok(7));
+    }
 
     fn target() -> &'static str {
         pin::host_target().unwrap_or(SUPPORTED_TARGETS[3])

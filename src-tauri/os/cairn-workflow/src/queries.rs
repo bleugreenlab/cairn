@@ -455,20 +455,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Failed to start query database runtime: {}", e))?
-            .block_on(future)
-    })
-    .join()
-    .map_err(|payload| {
-        format!(
-            "Query database task panicked: {}",
-            crate::storage::panic_message(&*payload)
-        )
-    })?
+    crate::storage::run_db_blocking(move || future)
 }
 
 async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Vec<DbJob>, String> {
