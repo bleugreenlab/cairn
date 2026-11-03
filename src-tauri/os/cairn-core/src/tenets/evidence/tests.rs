@@ -1256,13 +1256,15 @@ async fn the_wake_fires_once_from_the_owner_of_the_newest_contradiction_after_it
     assert_eq!(sent.len(), 1);
     assert_eq!(
         sent[0],
-        "Tenet #12 is contradicted by concluded work (weight 1.64, threshold 1.2).\n\n\
+        "The evidence judge reads concluded work as contradicting tenet #12 (weight 1.64, threshold 1.2).\n\n\
          #12 \u{2014} Artifacts go through the store\n\
          Contradicting evidence since approval:\n\
          - contradicts cairn://p/prj/5012 (0.86, 2025-10-09)\n\
          - contradicts cairn://p/prj/5013 (0.78, 2025-10-09)\n\
          Full record: cairn://p/prj/tenets/12\n\n\
-         judge: supersede (propose a successor with supersedes:12) or correct course"
+         judge: if the work contradicts the tenet, supersede it (propose a successor with \
+         supersedes:12) or correct course; if the judge misread the work, dismiss the row \
+         (patch this tenet with dismiss:{source, reason})"
     );
     assert_eq!(
         alerted_at(&db, &tenet).await,
@@ -1335,6 +1337,84 @@ async fn a_second_wake_needs_contradictions_the_first_did_not_count() {
         .unwrap_or_else(|| panic!("no second wake: {sent:?}"));
     assert!(lists(second, "3") && lists(second, "4"), "{second}");
     assert!(!lists(second, "1") && !lists(second, "2"), "{second}");
+}
+
+/// The contradictions the next wake would count for `tenet`.
+async fn counted(db: &LocalDb, tenet: &str) -> Vec<wake::Contradiction> {
+    let tenet = tenet.to_string();
+    db.read(move |conn| {
+        let tenet = tenet.clone();
+        Box::pin(async move { wake::unconsumed_conn(conn, &tenet).await })
+    })
+    .await
+    .unwrap()
+}
+
+async fn dismiss_as_proposer(db: &LocalDb, number: i64, source: &str) -> Dismissed {
+    dismiss(
+        db,
+        &CapturingEmitter::new(),
+        T0,
+        "p",
+        number,
+        "t-design",
+        Dismissal {
+            source_uri: source.into(),
+            reason: "the judge misread routine work".into(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_dismissed_contradiction_carries_no_weight_and_is_never_consumed() {
+    let db = fixture("evidence-dismissed.db").await;
+    let tenet = approve(&db, 1, "t-design", "Rule").await;
+    contradiction(&db, &tenet, "cairn://p/prj/1", 0.9, T0, A).await;
+    contradiction(&db, &tenet, "cairn://p/prj/2", 0.9, T0, A).await;
+    let now = T0 + DAY;
+    let fake = Fake::new(A, now, &db);
+    assert!(wake::weight(&counted(&db, &tenet).await, now) >= WAKE_THRESHOLD);
+
+    let dismissed = dismiss_as_proposer(&db, 1, "cairn://p/prj/2").await;
+    assert!(!dismissed.already_counted);
+    let left = counted(&db, &tenet).await;
+    assert_eq!(
+        left.iter()
+            .map(|row| row.source_uri.as_str())
+            .collect::<Vec<_>>(),
+        ["cairn://p/prj/1"],
+        "a dismissed row leaves the unconsumed set"
+    );
+    assert!((wake::weight(&left, now) - decayed(0.9, T0, now)).abs() < 1e-9);
+    assert_eq!(
+        wake::recheck_contradictions(&fake).await,
+        0,
+        "what is left weighs less than the threshold"
+    );
+    assert!(messages(&db).await.is_empty());
+
+    contradiction(&db, &tenet, "cairn://p/prj/3", 0.9, T0, A).await;
+    assert_eq!(wake::recheck_contradictions(&fake).await, 1);
+    let sent = messages(&db).await;
+    assert!(
+        lists(&sent[0], "1") && lists(&sent[0], "3") && !lists(&sent[0], "2"),
+        "{}",
+        sent[0]
+    );
+    assert!(consumed_by(&db, "cairn://p/prj/1").await.is_some());
+    assert_eq!(
+        consumed_by(&db, "cairn://p/prj/2").await,
+        None,
+        "a dismissed row is not consumed"
+    );
+
+    // Dismissing a row a wake already counted does not retract that wake.
+    let late = dismiss_as_proposer(&db, 1, "cairn://p/prj/3").await;
+    assert!(late.already_counted);
+    assert!(consumed_by(&db, "cairn://p/prj/3").await.is_some());
+    assert_eq!(messages(&db).await.len(), 1);
 }
 
 #[tokio::test]

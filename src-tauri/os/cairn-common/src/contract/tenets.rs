@@ -22,6 +22,11 @@ const TENET_WITHDRAW: KeySpec = KeySpec::new(
     KeyType::Bool,
     "true; the proposing thread only, while the tenet awaits a verdict",
 );
+const TENET_DISMISS: KeySpec = KeySpec::new(
+    "dismiss",
+    KeyType::Object,
+    "{source, reason}: record that the evidence row from source (its URI, as the Evidence section lists it) misreads the work, and why the tenet stands; the proposing thread only, once per row. The row stays on the record with your reason, and a dismissed contradiction no longer counts toward the contradiction wake",
+);
 const TENET_VERDICT: KeySpec = KeySpec::new(
     "verdict",
     KeyType::Str,
@@ -64,7 +69,7 @@ pub(crate) const PROJECT_TENET_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectTenet,
     uri_template: "cairn://p/{project}/tenets/{number}",
     name: "Tenet",
-    description: "One tenet by number (a migrated ruling's slug is an alias): its statement and rationale, the verdict and who gave it, what it supersedes or was superseded by, and what it gates. Immutable: withdraw and propose again, or propose a successor with supersedes",
+    description: "One tenet by number (a migrated ruling's slug is an alias): its statement and rationale, the verdict and who gave it, what it supersedes or was superseded by, what it gates, and the evidence judged against it. Immutable: withdraw and propose again, or propose a successor with supersedes; the proposing thread may dismiss an evidence row that misreads the work",
     read_projections: &[ProjectionSpec { key: "format", values: "json for the full projection" }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
@@ -75,6 +80,13 @@ pub(crate) const PROJECT_TENET_CONTRACT: ResourceContract = ResourceContract {
             optional: &[],
             label: "withdraw an unanswered proposal (proposing thread only)",
             example: "write({changes:[{target:\"cairn:@/tenets/3\",mode:\"patch\",payload:{withdraw:true}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[TENET_DISMISS],
+            optional: &[],
+            label: "dismiss an evidence row that misreads the work: judged, the tenet stands (proposing thread only)",
+            example: "write({changes:[{target:\"cairn:@/tenets/1144\",mode:\"patch\",payload:{dismiss:{source:\"cairn://p/cairn/5984\",reason:\"conditional tenet; the repo is still private (cairn/4801), so guard refreshes are what it expects\"}}}]})",
         },
         MutationSpec {
             mode: ChangeMode::Patch,

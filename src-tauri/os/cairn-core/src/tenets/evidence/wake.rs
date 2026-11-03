@@ -1,6 +1,8 @@
 //! The contradiction wake: when the decayed weight of a tenet's contradictions
 //! that no wake has counted yet crosses [`WAKE_THRESHOLD`], its proposing
-//! thread is woken once to supersede it or correct course.
+//! thread is woken once to supersede it, correct course, or dismiss a row that
+//! misreads the work. A dismissed row ([`super::dismissal`]) is neither counted
+//! nor consumed.
 //!
 //! Eligibility is per row, never a timestamp edge. A wake consumes exactly the
 //! rows it counted and listed, stamping each one's `consumed_by_wake` with the
@@ -79,13 +81,19 @@ fn wake_id(tenet_id: &str, rows: &[Contradiction]) -> String {
     )
 }
 
-/// The tenet's contradictions no wake has consumed yet, oldest first.
-async fn unconsumed_conn(conn: &Connection, tenet_id: &str) -> DbResult<Vec<Contradiction>> {
+/// The tenet's contradictions no wake has consumed yet and its thread has not
+/// dismissed, oldest first. The predicate is spelled as the
+/// `tenet_evidence_unconsumed` partial index spells it.
+pub(super) async fn unconsumed_conn(
+    conn: &Connection,
+    tenet_id: &str,
+) -> DbResult<Vec<Contradiction>> {
     let mut rows = conn
         .query(
             "SELECT id, source_uri, confidence, owner_device_id, evaluated_at
              FROM tenet_evidence
              WHERE tenet_id = ?1 AND sign = 'contradicts' AND consumed_by_wake IS NULL
+               AND dismissed_at IS NULL
              ORDER BY evaluated_at, id",
             params![tenet_id],
         )
@@ -143,7 +151,7 @@ pub async fn recheck_contradictions(deps: &dyn EvidenceDeps) -> usize {
                 "SELECT DISTINCT t.id
                  FROM tenets t JOIN tenet_evidence e ON e.tenet_id = t.id
                  WHERE t.status = 'approved' AND e.sign = 'contradicts'
-                   AND e.consumed_by_wake IS NULL",
+                   AND e.consumed_by_wake IS NULL AND e.dismissed_at IS NULL",
                 (),
                 |row| row.text(0),
             )
@@ -310,7 +318,10 @@ async fn fire_conn(
     Ok(Some((job_id, tenet.project_id)))
 }
 
-/// The wake's text. It lists exactly the rows the wake consumes: on a later
+/// The wake's text. It presents each verdict as the judge's reading, never as
+/// fact, and asks the thread to judge it: the judge is often wrong about a
+/// contradiction, so the thread must not be told the work contradicts the
+/// tenet. It lists exactly the rows the wake consumes: on a later
 /// wake that is everything the last alert did not count, which can include a
 /// contradiction dated before that alert if it replicated in after it.
 fn message(
@@ -323,7 +334,7 @@ fn message(
     let number = tenet.number;
     let text = &tenet.statement;
     let mut out = format!(
-        "Tenet #{number} is contradicted by concluded work (weight {:.2}, threshold {WAKE_THRESHOLD}).\n\n#{number} \u{2014} {text}\n",
+        "The evidence judge reads concluded work as contradicting tenet #{number} (weight {:.2}, threshold {WAKE_THRESHOLD}).\n\n#{number} \u{2014} {text}\n",
         weight(contradictions, now)
     );
     match last_alerted {
@@ -342,7 +353,7 @@ fn message(
         ));
     }
     out.push_str(&format!(
-        "Full record: {}\n\njudge: supersede (propose a successor with supersedes:{number}) or correct course",
+        "Full record: {}\n\njudge: if the work contradicts the tenet, supersede it (propose a successor with supersedes:{number}) or correct course; if the judge misread the work, dismiss the row (patch this tenet with dismiss:{{source, reason}})",
         crate::tenets::tenet_uri(project_key, number)
     ));
     out

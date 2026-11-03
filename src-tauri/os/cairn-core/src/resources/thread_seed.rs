@@ -1607,11 +1607,16 @@ fn render_tenet_entry(view: &TenetView, from_thread: Option<&str>) -> String {
             .take(3)
             .map(|evidence| {
                 format!(
-                    "{} {} ({:.2}, {})",
+                    "{} {} ({:.2}, {}{})",
                     evidence.sign,
                     evidence.source_uri,
                     evidence.confidence,
-                    crate::tenets::evidence::utc_date(evidence.evaluated_at, "%m-%d")
+                    crate::tenets::evidence::utc_date(evidence.evaluated_at, "%m-%d"),
+                    if evidence.dismissal.is_some() {
+                        ", dismissed"
+                    } else {
+                        ""
+                    }
                 )
             })
             .collect::<Vec<_>>()
@@ -4422,6 +4427,7 @@ mod tests {
             confidence: 0.82,
             measured_by: Some("logprobs".into()),
             evaluated_at: at,
+            dismissal: None,
         });
         view
     }

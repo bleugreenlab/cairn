@@ -14,6 +14,9 @@
 //! thread withdrawing an unanswered proposal, the operator answering one, and a
 //! later approved tenet superseding an earlier approved one. There is no
 //! revise: a changed mind is a withdrawal and a new proposal, or a successor.
+//! The proposing thread may also dismiss an evidence row that misreads the work
+//! (`evidence::dismissal`), which records its judgment beside the row and
+//! leaves the tenet itself untouched.
 //!
 //! This module is the only writer of the `tenets` table. Every write emits a
 //! `db-change` for `tenets` and, when it can change what a held execution's
@@ -42,7 +45,7 @@ pub use policy::{
 };
 pub use read::{
     for_thread, get, list, pending_count, resolve_number, status_filter, thread_named,
-    TenetEvidence, TenetFilter, TenetGate, TenetView,
+    EvidenceDismissal, TenetEvidence, TenetFilter, TenetGate, TenetView,
 };
 pub(crate) use read::{lookup_conn, TenetLookup};
 pub use ruling_import::{import_database, import_thread_rulings, ImportReport, ProjectImport};

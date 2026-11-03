@@ -3817,6 +3817,116 @@ async fn editing_an_answered_tenet_points_at_a_successor() {
     );
 }
 
+/// The proposing thread dismisses an evidence row through a tenet patch. The
+/// refusals that are the domain's live in `tenets::tests`; this checks the
+/// payload's shape and the summary the thread reads back.
+#[tokio::test]
+async fn a_thread_dismisses_evidence_on_its_tenet_through_a_patch() {
+    let orch = seeded_orch().await;
+    let (issue_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &issue_id).await;
+    let (_, _, run) = seed_thread_session_run(&orch, &project_id, "design").await;
+    apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets",
+            ChangeMode::Append,
+            serde_json::json!({"statement": "S."}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap();
+    crate::tenets::answer(
+        &orch.db.local,
+        orch.services.emitter.as_ref(),
+        5,
+        &project_id,
+        1,
+        crate::tenets::Answer {
+            verdict: crate::tenets::Verdict::Yes,
+            comment: None,
+            principal: cairn_common::identity::PrincipalRef::Machine {
+                device_id: "dev".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let tenet_id = crate::tenets::get(&orch.db.local, &project_id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .row
+        .id;
+    orch.db
+        .local
+        .execute_script(&format!(
+            "INSERT INTO tenet_evidence_events (id, project_id, source_uri, source_kind, dedupe_key,
+                 owner_device_id, text, created_at)
+               VALUES ('ev-5984', '{project_id}', 'cairn://p/cairn/5984', 'issue_resolution',
+                 'k-5984', 'd', 'work', 1);
+             INSERT INTO tenet_evidence (id, project_id, tenet_id, event_id, source_uri, sign,
+                 confidence, model, owner_device_id, evaluated_at)
+               VALUES ('e-5984', '{project_id}', '{tenet_id}', 'ev-5984', 'cairn://p/cairn/5984',
+                 'contradicts', 0.7, 'm', 'd', 1);"
+        ))
+        .await
+        .unwrap();
+
+    let misshapen = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets/1",
+            ChangeMode::Patch,
+            serde_json::json!({"dismiss": {"source": "cairn://p/cairn/5984", "why": "x"}}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        misshapen
+            .error
+            .contains("payload.dismiss must be {source, reason}"),
+        "{}",
+        misshapen.error
+    );
+    let both = tenet_item(
+        "cairn://p/cairn/tenets/1",
+        ChangeMode::Patch,
+        serde_json::json!({"withdraw": true, "dismiss": {"source": "cairn://p/cairn/5984", "reason": "x"}}),
+    );
+    assert!(apply_as_run(&orch, &both, &run).await.is_err());
+
+    let dismissed = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets/1",
+            ChangeMode::Patch,
+            serde_json::json!({"dismiss": {
+                "source": "cairn://p/cairn/5984",
+                "reason": "routine guard refresh while the condition has not fired",
+            }}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dismissed.contains(
+            "Dismissed the contradicts evidence from cairn://p/cairn/5984 on tenet cairn://p/cairn/tenets/1"
+        ) && dismissed.contains("no longer counts toward a contradiction wake"),
+        "{dismissed}"
+    );
+    let read = crate::resources::tenets::read_entity(&orch.db.local, "cairn", "1", &[]).await;
+    assert!(
+        read.contains("0 supports · 1 contradicts (1 dismissed)")
+            && read.contains("dismissed by cairn/design "),
+        "{read}"
+    );
+}
+
 /// A terminal wake binds the terminal its ref names. The node and the project
 /// both own a running `dev`: a project ref subscribes to the project terminal's
 /// canonical URI, which is the key its exit and output are routed by, and a

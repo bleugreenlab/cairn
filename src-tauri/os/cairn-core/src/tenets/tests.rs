@@ -408,6 +408,235 @@ async fn only_the_proposing_thread_withdraws_and_only_before_a_verdict() {
     assert!(after_verdict.contains("supersedes: 2"), "{after_verdict}");
 }
 
+/// 2026-11-03 12:00 UTC.
+const NOV_3: i64 = 1_793_707_200;
+const STILL_PRIVATE: &str = "conditional tenet; the repo is still private";
+
+/// Record `sign` evidence on tenet `number` from `source`, as the judge does.
+async fn judged(db: &LocalDb, number: i64, source: &str, sign: &str, confidence: f64) {
+    let tenet_id = view(db, number).await.row.id;
+    let event = format!("event-{source}");
+    db.execute(
+        "INSERT INTO tenet_evidence_events (id, project_id, source_uri, source_kind, dedupe_key,
+             owner_device_id, text, state, created_at)
+         VALUES (?1, 'p', ?2, 'issue_resolution', ?1, 'device', 'work', 'done', 1)",
+        cairn_db::turso::params![event.as_str(), source],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO tenet_evidence (id, project_id, tenet_id, event_id, source_uri, sign,
+             confidence, measured_by, model, owner_device_id, evaluated_at)
+         VALUES (?1, 'p', ?2, ?3, ?4, ?5, ?6, 'native', 'm', 'device', ?7)",
+        cairn_db::turso::params![
+            format!("evidence-{source}"),
+            tenet_id.as_str(),
+            event.as_str(),
+            source,
+            sign,
+            confidence,
+            NOV_3
+        ],
+    )
+    .await
+    .unwrap();
+}
+
+/// An approved #1 with two contradictions and one support.
+async fn judged_tenet(name: &str) -> LocalDb {
+    let db = fixture(name).await;
+    let tenet = propose_ok(
+        &db,
+        &design(),
+        proposal("If the repo opens, the mirror guard retires."),
+    )
+    .await;
+    answer_with(&db, tenet.number, by(Verdict::Yes, human()))
+        .await
+        .unwrap();
+    judged(&db, 1, "cairn://p/prj/5314", "contradicts", 0.71).await;
+    judged(&db, 1, "cairn://p/prj/5984", "contradicts", 0.70).await;
+    judged(&db, 1, "cairn://p/prj/4801", "supports", 0.9).await;
+    db
+}
+
+async fn dismiss_as(
+    db: &LocalDb,
+    number: i64,
+    thread: &str,
+    source: &str,
+    reason: &str,
+) -> Result<evidence::Dismissed, String> {
+    evidence::dismiss(
+        db,
+        &CapturingEmitter::new(),
+        NOV_3,
+        PROJECT,
+        number,
+        thread,
+        evidence::Dismissal {
+            source_uri: source.into(),
+            reason: reason.into(),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn only_the_proposing_thread_dismisses_evidence_once_and_with_a_reason() {
+    let db = judged_tenet("tenets-dismiss.db").await;
+    let source = "cairn://p/prj/5984";
+
+    let foreign = dismiss_as(&db, 1, CHANNELS, source, STILL_PRIVATE)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        foreign,
+        "only the thread that proposed tenet #1 can dismiss its evidence"
+    );
+    let blank = dismiss_as(&db, 1, DESIGN, source, " \n ")
+        .await
+        .unwrap_err();
+    assert_eq!(blank, evidence::dismissal::EMPTY_REASON_REFUSAL);
+    let unknown = dismiss_as(&db, 1, DESIGN, "cairn://p/prj/9999", STILL_PRIVATE)
+        .await
+        .unwrap_err();
+    assert!(
+        unknown.contains("no evidence from cairn://p/prj/9999")
+            && unknown.contains("cairn://p/prj/5984")
+            && unknown.contains("cairn://p/prj/5314")
+            && unknown.contains("cairn://p/prj/4801"),
+        "an unknown source names the tenet's sources: {unknown}"
+    );
+    let missing = dismiss_as(&db, 9, DESIGN, source, STILL_PRIVATE)
+        .await
+        .unwrap_err();
+    assert_eq!(missing, "no tenet #9 in this project");
+    assert!(
+        view(&db, 1)
+            .await
+            .evidence
+            .iter()
+            .all(|row| row.dismissal.is_none()),
+        "a refusal records nothing"
+    );
+
+    let dismissed = dismiss_as(&db, 1, DESIGN, source, STILL_PRIVATE)
+        .await
+        .unwrap();
+    assert_eq!(
+        dismissed,
+        evidence::Dismissed {
+            number: 1,
+            source_uri: source.into(),
+            sign: "contradicts".into(),
+            already_counted: false,
+        }
+    );
+
+    let again = dismiss_as(&db, 1, DESIGN, source, "a second opinion")
+        .await
+        .unwrap_err();
+    assert!(
+        again.contains(&format!(
+            "already dismissed by prj/design on 2026-11-03: {STILL_PRIVATE}"
+        )),
+        "a repeat quotes the standing dismissal: {again}"
+    );
+
+    // The row stays, keeps its sign, and carries the first dismissal only.
+    let evidence = view(&db, 1).await.evidence;
+    assert_eq!(evidence.len(), 3);
+    let row = evidence
+        .iter()
+        .find(|row| row.source_uri == source)
+        .unwrap();
+    assert_eq!(row.sign, "contradicts");
+    assert_eq!(
+        row.dismissal,
+        Some(EvidenceDismissal {
+            at: NOV_3,
+            by_thread_id: DESIGN.into(),
+            by: "prj/design".into(),
+            reason: STILL_PRIVATE.into(),
+        })
+    );
+    assert_eq!(
+        evidence
+            .iter()
+            .filter(|row| row.dismissal.is_some())
+            .count(),
+        1
+    );
+
+    // A supporting row may be dismissed too: the judge misread either way.
+    let support = dismiss_as(&db, 1, DESIGN, "cairn://p/prj/4801", "unrelated work")
+        .await
+        .unwrap();
+    assert_eq!(support.sign, "supports");
+}
+
+#[tokio::test]
+async fn a_dismissed_row_reads_with_who_dismissed_it_when_and_why() {
+    let db = judged_tenet("tenets-dismiss-read.db").await;
+    dismiss_as(
+        &db,
+        1,
+        DESIGN,
+        "cairn://p/prj/5984",
+        "conditional tenet;\nthe repo is still private",
+    )
+    .await
+    .unwrap();
+
+    let read = crate::resources::tenets::read_entity(&db, "prj", "1", &[]).await;
+    assert!(
+        read.contains("1 supports · 2 contradicts (1 dismissed)\n"),
+        "{read}"
+    );
+    assert!(
+        read.contains(
+            "- contradicts cairn://p/prj/5984 (0.70 native, 2026-11-03) · dismissed by prj/design 2026-11-03: conditional tenet; the repo is still private\n"
+        ),
+        "the dismissed line names who, when, and why, on one line: {read}"
+    );
+    assert!(
+        read.contains("- contradicts cairn://p/prj/5314 (0.71 native, 2026-11-03)\n"),
+        "an undismissed row reads as before: {read}"
+    );
+
+    let json = crate::resources::tenets::read_entity(
+        &db,
+        "prj",
+        "1",
+        &[cairn_common::query::QueryParam {
+            key: "format".into(),
+            value: "json".into(),
+        }],
+    )
+    .await;
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let row = |source: &str| {
+        json["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["sourceUri"] == source)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(
+        row("cairn://p/prj/5984")["dismissal"],
+        serde_json::json!({
+            "at": NOV_3,
+            "byThreadId": DESIGN,
+            "by": "prj/design",
+            "reason": "conditional tenet;\nthe repo is still private",
+        })
+    );
+    assert!(row("cairn://p/prj/5314")["dismissal"].is_null());
+}
+
 /// A successor replaces its predecessor only when the successor is approved.
 #[tokio::test]
 async fn supersession_applies_only_on_approval() {

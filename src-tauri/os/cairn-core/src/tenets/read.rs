@@ -166,6 +166,21 @@ pub struct TenetEvidence {
     /// `None` for a row written before evidence was judged through `decide`.
     pub measured_by: Option<String>,
     pub evaluated_at: i64,
+    /// The proposing thread's judgment that this row misreads the work, when
+    /// it made one. The row and its sign stand either way.
+    pub dismissal: Option<EvidenceDismissal>,
+}
+
+/// A proposing thread's dismissal of one evidence row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceDismissal {
+    pub at: i64,
+    pub by_thread_id: String,
+    /// `project/name` of the dismissing thread, or its id when the thread row
+    /// is gone.
+    pub by: String,
+    pub reason: String,
 }
 
 impl TenetEvidence {
@@ -363,7 +378,12 @@ async fn project_views(
         }
     }
     let gates = gates_by_tenet(db, project_id).await?;
-    let mut evidence = evidence_by_tenet(db, project_id).await?;
+    let mut evidence =
+        evidence_by_tenet(db, project_id, |thread_id| match threads.get(thread_id) {
+            Some(name) => format!("{}/{name}", facts.key),
+            None => thread_id.to_string(),
+        })
+        .await?;
     let policy_label = release_label(facts.release);
 
     Ok(rows
@@ -395,17 +415,26 @@ async fn project_views(
 }
 
 /// Every evidence row in the project, keyed by tenet id, newest first.
+/// `thread_label` names a dismissing thread.
 async fn evidence_by_tenet(
     db: &LocalDb,
     project_id: &str,
+    thread_label: impl Fn(&str) -> String,
 ) -> Result<HashMap<String, Vec<TenetEvidence>>, String> {
     let rows = db
         .query_all(
-            "SELECT tenet_id, source_uri, sign, confidence, measured_by, evaluated_at
+            "SELECT tenet_id, source_uri, sign, confidence, measured_by, evaluated_at,
+                    dismissed_at, dismissed_by_thread_id, dismissed_reason
              FROM tenet_evidence WHERE project_id = ?1
              ORDER BY evaluated_at DESC, id",
             (project_id.to_string(),),
             |row| {
+                let dismissed = match (row.opt_i64(6)?, row.opt_text(7)?, row.opt_text(8)?) {
+                    (Some(at), Some(by_thread_id), Some(reason)) => {
+                        Some((at, by_thread_id, reason))
+                    }
+                    _ => None,
+                };
                 Ok((
                     row.text(0)?,
                     TenetEvidence {
@@ -414,12 +443,23 @@ async fn evidence_by_tenet(
                         confidence: row.f64(3)?,
                         measured_by: row.opt_text(4)?,
                         evaluated_at: row.i64(5)?,
+                        dismissal: None,
                     },
+                    dismissed,
                 ))
             },
         )
         .await
         .map_err(|error| format!("Failed to read tenet evidence: {error}"))?;
+    let rows = rows.into_iter().map(|(tenet, mut item, dismissed)| {
+        item.dismissal = dismissed.map(|(at, by_thread_id, reason)| EvidenceDismissal {
+            at,
+            by: thread_label(&by_thread_id),
+            by_thread_id,
+            reason,
+        });
+        (tenet, item)
+    });
     let mut out: HashMap<String, Vec<TenetEvidence>> = HashMap::new();
     for (tenet, item) in rows {
         out.entry(tenet).or_default().push(item);

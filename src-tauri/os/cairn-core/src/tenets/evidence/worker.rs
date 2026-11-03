@@ -247,7 +247,7 @@ pub async fn process(deps: &dyn EvidenceDeps, db: &LocalDb, event: &PendingEvent
     match settled {
         Ok(processed) => {
             if matches!(processed, Processed::Done(count) if count > 0) {
-                super::emit_evidence_changed(deps.emitter());
+                super::emit_evidence_changed(deps.emitter(), "insert");
             }
             processed
         }

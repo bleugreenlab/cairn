@@ -10,7 +10,9 @@
 //! is no fallback to a model reporting its own certainty.
 //! When the decayed weight of a tenet's contradictions that no wake has counted
 //! yet crosses a threshold, the thread that proposed it is woken to supersede
-//! it or correct course, and that wake consumes exactly the rows it counted.
+//! it, correct course, or dismiss a row that misreads the work, and that wake
+//! consumes exactly the rows it counted. A dismissed contradiction no longer
+//! counts ([`dismissal`]).
 //!
 //! Both tables replicate to team replicas, where a compare-and-swap is atomic
 //! only on one machine. So nothing here races across machines: an event is
@@ -20,8 +22,11 @@
 //! replica. Row ids derive from each row's logical key, so a residual double
 //! write is a primary-key upsert on replay rather than a unique-key error.
 //!
-//! Agents never write evidence; this module is its only writer.
+//! Agents never write evidence; this module is its only writer. The one thing
+//! an agent records on a row is the proposing thread's dismissal, beside the
+//! judge's verdict and never in place of it.
 
+pub mod dismissal;
 pub mod events;
 pub mod judge;
 pub mod vectors;
@@ -33,6 +38,7 @@ mod tests;
 
 use std::time::Duration;
 
+pub use dismissal::{dismiss, Dismissal, Dismissed};
 pub use vectors::tenet_embed_text;
 pub use worker::spawn;
 
@@ -100,10 +106,10 @@ pub(crate) fn utc_date(at: i64, format: &str) -> String {
 }
 
 /// Announce a change to the evidence table to the desktop.
-pub(crate) fn emit_evidence_changed(emitter: &dyn crate::services::EventEmitter) {
+pub(crate) fn emit_evidence_changed(emitter: &dyn crate::services::EventEmitter, action: &str) {
     if let Err(error) = emitter.emit(
         "db-change",
-        serde_json::json!({"table": EVIDENCE_TABLE, "action": "insert"}),
+        serde_json::json!({"table": EVIDENCE_TABLE, "action": action}),
     ) {
         tracing::warn!(%error, "failed to emit tenet_evidence db-change notification");
     }

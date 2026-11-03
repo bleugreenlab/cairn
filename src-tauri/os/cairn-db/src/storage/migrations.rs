@@ -3398,7 +3398,13 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     },
     RekeyTableManifest {
         table: "tenet_evidence",
-        id_columns: &["id", "project_id", "tenet_id", "event_id"],
+        id_columns: &[
+            "id",
+            "project_id",
+            "tenet_id",
+            "event_id",
+            "dismissed_by_thread_id",
+        ],
     },
     RekeyTableManifest {
         table: "tenet_evidence_events",

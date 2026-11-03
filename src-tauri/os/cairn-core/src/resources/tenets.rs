@@ -319,26 +319,52 @@ fn render_entity(view: &TenetView) -> String {
     if view.evidence.is_empty() {
         out.push_str("None recorded. Evidence is gathered automatically; agents never write it.\n");
     } else {
-        let count = |sign: &str| {
-            view.evidence
-                .iter()
-                .filter(|evidence| evidence.sign == sign)
-                .count()
-        };
         out.push_str(&format!(
-            "{} supports · {} contradicts\n\n",
-            count("supports"),
-            count("contradicts")
+            "{} · {}\n\n",
+            evidence_count(view, "supports"),
+            evidence_count(view, "contradicts")
         ));
     }
     for evidence in &view.evidence {
+        let date = |at| crate::tenets::evidence::utc_date(at, "%Y-%m-%d");
+        let dismissed = match &evidence.dismissal {
+            Some(dismissal) => format!(
+                " · dismissed by {} {}: {}",
+                dismissal.by,
+                date(dismissal.at),
+                one_line(&dismissal.reason)
+            ),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "- {} {} ({}, {})\n",
+            "- {} {} ({}, {}){dismissed}\n",
             evidence.sign,
             evidence.source_uri,
             evidence.measurement(),
-            crate::tenets::evidence::utc_date(evidence.evaluated_at, "%Y-%m-%d")
+            date(evidence.evaluated_at)
         ));
     }
     out
+}
+
+/// `2 contradicts`, or `2 contradicts (1 dismissed)` when the proposing
+/// thread dismissed any of them.
+fn evidence_count(view: &TenetView, sign: &str) -> String {
+    let rows = || {
+        view.evidence
+            .iter()
+            .filter(|evidence| evidence.sign == sign)
+    };
+    let dismissed = rows()
+        .filter(|evidence| evidence.dismissal.is_some())
+        .count();
+    match dismissed {
+        0 => format!("{} {sign}", rows().count()),
+        n => format!("{} {sign} ({n} dismissed)", rows().count()),
+    }
+}
+
+/// `text` on one line, so a multi-line reason stays inside its list item.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }

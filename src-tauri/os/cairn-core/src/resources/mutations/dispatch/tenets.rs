@@ -1,4 +1,5 @@
-//! Tenet mutations: a thread proposes and withdraws; nothing here answers.
+//! Tenet mutations: a thread proposes, withdraws, and dismisses evidence that
+//! misreads the work; nothing here answers.
 //!
 //! A resource write carries no verified operator credential, and a request
 //! with no run identity is indistinguishable from an agent shell that dropped
@@ -15,7 +16,7 @@ use cairn_common::uri::{build_project_tenets_uri, CairnResource};
 
 /// Payload keys a tenet patch may carry. Anything else is an attempt to edit
 /// the tenet, which is refused as such rather than as an unknown key.
-const PATCH_KEYS: &[&str] = &["withdraw", "verdict", "comment"];
+const PATCH_KEYS: &[&str] = &["withdraw", "dismiss", "verdict", "comment"];
 
 /// The proposing run: its authenticated principal and its thread lineage, in
 /// the database that owns `project`.
@@ -32,7 +33,7 @@ async fn proposer(
             build_failure(
                 index,
                 item,
-                format!("proposing or withdrawing a tenet is a thread's act and needs its authenticated run: {error}"),
+                format!("proposing or withdrawing a tenet, or dismissing its evidence, is a thread's act and needs its authenticated run: {error}"),
             )
         })?;
     let (principal, _) = agent
@@ -49,7 +50,7 @@ async fn proposer(
         return Err(build_failure(
             index,
             item,
-            "a thread proposes and withdraws tenets in its own project only",
+            "a thread proposes, withdraws, and dismisses evidence on tenets in its own project only",
         ));
     }
     Ok((proposer, db, project_id))
@@ -97,6 +98,93 @@ fn proposal(
         supersedes,
         origin: TenetOrigin::Standing,
     })
+}
+
+/// `payload.dismiss` as a dismissal. Whether its reason says anything is the
+/// domain's refusal, so every caller hears the same one.
+fn dismissal(
+    index: usize,
+    item: &ChangeItem,
+    value: &serde_json::Value,
+) -> ResourceMutationResult<crate::tenets::evidence::Dismissal> {
+    const SHAPE: &str = "payload.dismiss must be {source, reason}: the evidence row's source URI as the tenet's Evidence section lists it, and why the tenet stands";
+    let map = value
+        .as_object()
+        .ok_or_else(|| build_failure(index, item, SHAPE))?;
+    if map.keys().any(|key| key != "source" && key != "reason") {
+        return Err(build_failure(index, item, SHAPE));
+    }
+    let text = |key: &str| {
+        map.get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| build_failure(index, item, SHAPE))
+    };
+    Ok(crate::tenets::evidence::Dismissal {
+        source_uri: text("source")?,
+        reason: text("reason")?,
+    })
+}
+
+async fn tenet_number(
+    db: &crate::storage::LocalDb,
+    project_id: &str,
+    key: &str,
+    index: usize,
+    item: &ChangeItem,
+) -> ResourceMutationResult<i64> {
+    crate::tenets::resolve_number(db, project_id, key)
+        .await
+        .map_err(|error| build_failure(index, item, error))?
+        .ok_or_else(|| build_failure(index, item, format!("no tenet `{key}` in this project")))
+}
+
+/// The proposing thread's `dismiss` of one evidence row.
+#[allow(clippy::too_many_arguments)]
+async fn dismiss(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    index: usize,
+    item: &ChangeItem,
+    dry_run: bool,
+    project: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> ResourceMutationResult<String> {
+    let dismissal = dismissal(index, item, value)?;
+    if dry_run {
+        return Ok(format!(
+            "Would dismiss the evidence from {} on tenet {}/{key}",
+            dismissal.source_uri.trim(),
+            build_project_tenets_uri(project)
+        ));
+    }
+    let (proposer, db, project_id) = proposer(orch, request, project, index, item).await?;
+    let number = tenet_number(&db, &project_id, key, index, item).await?;
+    let dismissed = crate::tenets::evidence::dismiss(
+        &db,
+        orch.services.emitter.as_ref(),
+        orch.services.clock.now(),
+        &project_id,
+        number,
+        &proposer.thread_id,
+        dismissal,
+    )
+    .await
+    .map_err(|error| build_failure(index, item, error))?;
+    let effect = match (dismissed.sign.as_str(), dismissed.already_counted) {
+        ("contradicts", false) => "it no longer counts toward a contradiction wake",
+        ("contradicts", true) => {
+            "the wake that already counted it stands; it counts toward no later one"
+        }
+        _ => "it carried no wake weight; the dismissal records that the judge misread",
+    };
+    Ok(format!(
+        "Dismissed the {} evidence from {} on tenet {}: it stays on the record with your reason, and {effect}.",
+        dismissed.sign,
+        dismissed.source_uri,
+        crate::tenets::tenet_uri(project, dismissed.number)
+    ))
 }
 
 fn verdict_refusal(project: &str, key: &str) -> String {
@@ -203,11 +291,23 @@ pub(super) async fn dispatch(
             if payload.get("verdict").is_some() {
                 return Err(build_failure(index, item, verdict_refusal(project, key)));
             }
+            if let Some(value) = payload.get("dismiss") {
+                if payload.get("withdraw").is_some() {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "withdraw and dismiss are separate acts; send each in its own patch",
+                    ));
+                }
+                let summary =
+                    dismiss(orch, request, index, item, dry_run, project, key, value).await?;
+                return Ok(Some(summary));
+            }
             if payload.get("withdraw").and_then(|value| value.as_bool()) != Some(true) {
                 return Err(build_failure(
                     index,
                     item,
-                    "payload.withdraw must be true; a tenet is otherwise immutable",
+                    "payload.withdraw must be true, or payload.dismiss {source, reason} names an evidence row that misreads the work; a tenet is otherwise immutable",
                 ));
             }
             if dry_run {
@@ -218,12 +318,7 @@ pub(super) async fn dispatch(
             } else {
                 let (proposer, db, project_id) =
                     proposer(orch, request, project, index, item).await?;
-                let number = crate::tenets::resolve_number(&db, &project_id, key)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?
-                    .ok_or_else(|| {
-                        build_failure(index, item, format!("no tenet `{key}` in this project"))
-                    })?;
+                let number = tenet_number(&db, &project_id, key, index, item).await?;
                 let tenet = crate::tenets::withdraw(
                     &db,
                     orch.services.emitter.as_ref(),
