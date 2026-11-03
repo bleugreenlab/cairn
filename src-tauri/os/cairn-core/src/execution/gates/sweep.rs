@@ -123,16 +123,32 @@ pub enum ReleaseCause {
 }
 
 /// How much of a hold an override skips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverrideScope {
     /// The authored `after:` gates only: an agent's or a caller's
     /// `{release:true}`. The execution queue's caps still apply, because a cap
     /// governs what a thread starts itself (tenet 1319): a thread must not be
     /// able to release its own way past its cap.
     AuthoredGates,
-    /// Every gate, the caps included: the operator's Start now, with a
-    /// principal the invoke's credentials proved.
-    Everything,
+    /// Every gate, the caps included: a Start now, on the operator's
+    /// authority (`by`).
+    Everything { by: CapSkipAuthority },
+}
+
+/// Whose authority a start past every cap rests on. Only the operator's: either
+/// their own Start now, or a grant they gave a thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapSkipAuthority {
+    /// The operator's own Start now, with a principal the invoke's
+    /// credentials proved.
+    Operator,
+    /// A thread's `{start_now:true}`, allowed by a grant the operator gave it.
+    /// `decision` is the authorization journal's id for the decision that
+    /// cited the grant, so the start can be traced to it.
+    Granted {
+        thread: String,
+        decision: Option<String>,
+    },
 }
 
 /// What a release attempt did.
@@ -745,7 +761,7 @@ async fn record_outcome(
 
 /// Release a held execution: the second half of a launch, applied to the row
 /// that already exists. The execution queue's caps are decided here too,
-/// unless the cause is the operator's [`OverrideScope::Everything`].
+/// unless the cause is a Start now ([`OverrideScope::Everything`]).
 pub async fn release(
     orch: &Orchestrator,
     execution_id: &str,
@@ -890,8 +906,8 @@ pub(crate) enum ConnRelease {
 /// `admission` is the execution queue's decision, taken under the admission
 /// lock the caller holds. A release records its lane's turn with the stamp
 /// that decision minted (`rotation::record_turn_conn`), after the guarded
-/// update, so a caller that lost the race records nothing. Unless the cause is the operator's
-/// [`OverrideScope::Everything`], a blocking cap is written as (or kept as) a
+/// update, so a caller that lost the race records nothing. Unless the cause is
+/// a Start now ([`OverrideScope::Everything`]), a blocking cap is written as (or kept as) a
 /// capacity gate row in THIS transaction and the execution stays held, so a
 /// held execution is never left without the rows that hold it. A cap that no
 /// longer blocks is marked cleared but not latched: a free slot can be taken
@@ -941,7 +957,7 @@ pub(crate) async fn release_conn(
     let skips_caps = matches!(
         cause,
         ReleaseCause::Override {
-            scope: OverrideScope::Everything,
+            scope: OverrideScope::Everything { .. },
             ..
         }
     );
@@ -1017,22 +1033,23 @@ pub(crate) async fn release_conn(
     let override_json = match cause {
         ReleaseCause::Override {
             principal,
-            scope: OverrideScope::Everything,
+            scope: OverrideScope::Everything { by },
         } => {
             let skipped: Vec<&str> = admission
                 .blocks
                 .iter()
                 .map(CapacityHoldExt::skipped_label)
                 .collect();
-            Some(
-                serde_json::json!({
-                    "principal": principal,
-                    "at": now,
-                    "operator": true,
-                    "skipped": skipped,
-                })
-                .to_string(),
-            )
+            let mut record = serde_json::json!({
+                "principal": principal,
+                "at": now,
+                "operator": matches!(by, CapSkipAuthority::Operator),
+                "skipped": skipped,
+            });
+            if let CapSkipAuthority::Granted { thread, decision } = by {
+                record["granted"] = serde_json::json!({ "thread": thread, "decision": decision });
+            }
+            Some(record.to_string())
         }
         ReleaseCause::Override { principal, .. } => {
             Some(serde_json::json!({ "principal": principal, "at": now }).to_string())

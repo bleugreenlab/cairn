@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 use super::capacity::tests::{add_issue, add_started, add_thread, caps, full_fleet, is_held};
 use super::capacity::{fleet_order, queue_view, QueueSnapshot, Start};
-use super::reorder::{move_held_execution, order_thread_queue_conn};
+use super::reorder::order_thread_queue_conn;
+use super::reorder::tests::operator_move;
 use super::sweep::tests::{attach_team, count, env, execution, file, now, restarted, Env};
 use super::sweep::{evaluate_execution, sweep, sweep_at};
 use crate::execution::recipe::{LaunchIntent, QueuePlace};
@@ -241,7 +242,7 @@ async fn a_threads_own_order_holds_inside_its_lane() {
 #[tokio::test]
 async fn an_operator_pinned_row_releases_at_its_pinned_position() {
     let Lanes { env, a, .. } = lanes("rotation-pinned.db", (8, 3, 1), 50).await;
-    let moved = move_held_execution(&env.orch, &a[6], 5).await.unwrap();
+    let moved = operator_move(&env.orch, &a[6], 5).await.unwrap();
     assert_eq!(moved.position, 5);
     let page = view_ids(&env).await;
     assert_eq!(page[4], a[6]);
@@ -274,7 +275,7 @@ async fn an_operator_pinned_row_releases_at_its_pinned_position() {
     assert_eq!(released, page[..5]);
 
     let fourth = view_ids(&env).await[3].clone();
-    move_held_execution(&env.orch, &fourth, 1).await.unwrap();
+    operator_move(&env.orch, &fourth, 1).await.unwrap();
     assert_eq!(view_ids(&env).await[0], fourth);
     assert_eq!(release_one(&env, &[&env.db], &running).await, fourth);
 }
@@ -344,7 +345,7 @@ async fn mixed(name: &str) -> (Env, Arc<LocalDb>) {
     sweep_at(&env.orch, now()).await.unwrap();
     let page = view_ids(&env).await;
     assert_eq!(page.len(), 9, "{page:?}");
-    move_held_execution(&env.orch, &page[6], 3).await.unwrap();
+    operator_move(&env.orch, &page[6], 3).await.unwrap();
     (env, team)
 }
 

@@ -218,6 +218,10 @@ pub fn build_project_codemap_uri(project: &str) -> String {
     format!("{}/codemap", build_project_uri(project))
 }
 
+pub fn build_project_queue_uri(project: &str) -> String {
+    format!("{}/queue", build_project_uri(project))
+}
+
 pub fn build_project_map_uri(project: &str) -> String {
     format!("{}/map", build_project_uri(project))
 }
@@ -1109,6 +1113,7 @@ impl CairnResource {
             Self::ProjectTenet { project, key } => build_project_tenet_uri(project, key),
             Self::ProjectPages { project } => build_project_pages_uri(project),
             Self::ProjectCodemap { project } => build_project_codemap_uri(project),
+            Self::ProjectQueue { project } => build_project_queue_uri(project),
             Self::ProjectMap { project } => build_project_map_uri(project),
             Self::ProjectHome { project } => build_project_home_uri(project),
             Self::ProjectCheckResults { project, revision } => {

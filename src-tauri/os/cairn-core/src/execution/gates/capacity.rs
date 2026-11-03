@@ -201,10 +201,11 @@ pub enum AdmissionSite {
     Release,
     /// A gate patch removing the last authored gate, which releases.
     GatePatch,
-    /// The operator moving one held execution to a new place in the fleet
-    /// order (`reorder::move_held_execution`), which may renumber keys in
-    /// several databases: no decision may read a half-renumbered line.
-    OperatorMove,
+    /// The operator, or a thread under the operator's grant, moving held
+    /// executions to new places in the fleet order
+    /// (`reorder::move_held_execution`), which may renumber keys in several
+    /// databases: no decision may read a half-renumbered line.
+    QueueMove,
 }
 
 impl AdmissionSite {
@@ -213,7 +214,7 @@ impl AdmissionSite {
         AdmissionSite::SweepPass,
         AdmissionSite::Release,
         AdmissionSite::GatePatch,
-        AdmissionSite::OperatorMove,
+        AdmissionSite::QueueMove,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -222,7 +223,7 @@ impl AdmissionSite {
             AdmissionSite::SweepPass => "sweep_pass",
             AdmissionSite::Release => "release",
             AdmissionSite::GatePatch => "gate_patch",
-            AdmissionSite::OperatorMove => "operator_move",
+            AdmissionSite::QueueMove => "queue_move",
         }
     }
 
@@ -469,15 +470,13 @@ impl Drop for AdmissionGuard {
 }
 
 /// A fresh decision stored over a row that already has a place, carrying that
-/// place, who placed it there, and whether the operator pinned it, so
-/// re-deciding a hold neither churns its row between sweeps nor forgets a
-/// reorder.
+/// place, who placed it there, and who pinned it, so re-deciding a hold
+/// neither churns its row between sweeps nor forgets a reorder.
 pub(crate) fn carry_queue_facts(fact: &str, prior: Option<&str>, hold: &CapacityHold) -> String {
     let mut hold = hold.clone();
     let prior = prior.and_then(|detail| decode_hold(fact, detail));
     hold.set_place(prior.as_ref().and_then(CapacityHold::place));
-    hold.set_pinned(prior.as_ref().is_some_and(CapacityHold::pinned));
-    hold.set_frozen(prior.as_ref().is_some_and(CapacityHold::frozen));
+    hold.set_pin(prior.as_ref().and_then(CapacityHold::pin).cloned());
     hold.set_placed_by(
         prior
             .as_ref()
@@ -773,7 +772,7 @@ pub(super) const CAPACITY_ROWS_SQL: &str = concat!(
     " THEN 1 ELSE 0 END,
             i.parent_thread_id, ",
     cairn_db::queue_lane_sql!(),
-    ", COALESCE(json_extract(g.detail, '$.pinned'), 0)
+    ", CASE WHEN json_extract(g.detail, '$.pin') IS NOT NULL THEN 1 ELSE 0 END
        FROM execution_gates g
        JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
        LEFT JOIN issues i ON i.id = e.issue_id
@@ -798,8 +797,8 @@ struct CapacityRow {
     in_line: bool,
     thread_id: Option<String>,
     lane: String,
-    /// The operator's move (or a freeze behind one) put it in the ordered
-    /// prefix.
+    /// A fleet move (the operator's or a granted thread's, or a freeze
+    /// behind one) put it in the ordered prefix: its hold carries a `pin`.
     pinned: bool,
 }
 
@@ -1231,8 +1230,7 @@ impl QueueSnapshot {
                 unplaced: self.load.waiting_for_machine,
                 place: None,
                 placed_by: None,
-                pinned: false,
-                frozen: false,
+                pin: None,
             });
         }
         let thread = start.issue_id.and_then(|issue_id| {
@@ -1257,8 +1255,7 @@ impl QueueSnapshot {
                     limit: self.thread_limit,
                     place: None,
                     placed_by: None,
-                    pinned: false,
-                    frozen: false,
+                    pin: None,
                 });
             }
         }
@@ -1676,13 +1673,13 @@ pub(crate) use cap_held_sql;
 
 /// Execution `e`'s lane and whether it is pinned, as two columns: the facts
 /// the release order reads beyond its key. Pinned is any unlatched capacity
-/// row carrying `pinned`, as `CAPACITY_ROWS_SQL` reads it row by row.
+/// row whose hold carries a `pin`, as `CAPACITY_ROWS_SQL` reads it row by row.
 macro_rules! queue_pin_sql {
     () => {
         concat!(
             cairn_db::queue_lane_sql!(),
             ", EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
-                   AND g.satisfied_at IS NULL AND json_extract(g.detail, '$.pinned') = 1 AND ",
+                   AND g.satisfied_at IS NULL AND json_extract(g.detail, '$.pin') IS NOT NULL AND ",
             cairn_db::capacity_gate_sql!(),
             ")"
         )
@@ -2576,7 +2573,9 @@ pub(crate) mod tests {
             &id,
             ReleaseCause::Override {
                 principal: operator(),
-                scope: OverrideScope::Everything,
+                scope: OverrideScope::Everything {
+                    by: crate::execution::gates::sweep::CapSkipAuthority::Operator,
+                },
             },
         )
         .await
@@ -3374,8 +3373,7 @@ pub(crate) mod tests {
             unplaced: 2,
             place: None,
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         };
         let stored = encode_hold(&CapacityHold::Fleet {
             running: 7,
@@ -3383,8 +3381,7 @@ pub(crate) mod tests {
             unplaced: 0,
             place: Some(3),
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         });
         assert_eq!(
             stored,
@@ -3399,8 +3396,7 @@ pub(crate) mod tests {
                 unplaced: 2,
                 place: Some(3),
                 placed_by: None,
-                pinned: false,
-                frozen: false,
+                pin: None,
             })
         );
         let placed = encode_hold(&CapacityHold::Fleet {
@@ -3409,8 +3405,7 @@ pub(crate) mod tests {
             unplaced: 0,
             place: Some(1),
             placed_by: Some("harness".to_string()),
-            pinned: false,
-            frozen: false,
+            pin: None,
         });
         assert_eq!(
             placed,
@@ -3426,16 +3421,23 @@ pub(crate) mod tests {
             "a re-decision keeps the thread's reorder"
         );
         let mut pinned = decode_hold(FLEET_SLOT_FACT, &placed).unwrap();
-        pinned.set_pinned(true);
+        let by_judgment = crate::models::Pin::placed(crate::models::PinBy::Thread {
+            thread: "judgment".to_string(),
+        });
+        pinned.set_pin(Some(by_judgment.clone()));
         let pinned = encode_hold(&pinned);
-        assert!(pinned.ends_with(r#","pinned":true}"#), "{pinned}");
         assert!(
+            pinned.ends_with(r#","pin":{"by":"thread","thread":"judgment"}}"#),
+            "{pinned}"
+        );
+        assert_eq!(
             decode_hold(
                 FLEET_SLOT_FACT,
                 &carry_queue_facts(FLEET_SLOT_FACT, Some(&pinned), &decided)
             )
-            .is_some_and(|hold| hold.pinned()),
-            "a re-decision keeps the operator's pin"
+            .and_then(|hold| hold.pin().cloned()),
+            Some(by_judgment),
+            "a re-decision keeps who pinned it"
         );
         assert_eq!(
             decode_hold(
@@ -3464,8 +3466,7 @@ pub(crate) mod tests {
             limit: 2,
             place: Some(1),
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         };
         assert_eq!(
             decode_hold(THREAD_FOCUS_FACT, &encode_hold(&thread)),

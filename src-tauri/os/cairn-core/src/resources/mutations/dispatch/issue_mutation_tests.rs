@@ -2682,6 +2682,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         // including attachments — was going unchecked.
         K::ThreadBranches => "cairn://p/cairn/harness/branches",
         K::ThreadQueue => "cairn://p/cairn/harness/queue",
+        K::ProjectQueue => "cairn://p/cairn/queue",
         K::ThreadBranch => "cairn://p/cairn/harness/branches/1",
         K::ThreadDb => "cairn://p/cairn/harness/db",
         K::ThreadDbSchema => "cairn://p/cairn/harness/db/schema",

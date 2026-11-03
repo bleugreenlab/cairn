@@ -148,6 +148,22 @@ pub fn classify(scope: &AuthorityScope, owned_by_actor: bool) -> AuthorityPolicy
             AuthorityPolicy::RequiresApproval(AuthorityReason::ExternalAccountWrite)
         }
 
+        // ── The execution queue ─────────────────────────────────────────────────────
+        // A thread ordering its own children works in places its work already
+        // holds and never reaches here. Moving held work across the fleet's
+        // order changes when OTHER threads' work starts, even when the row
+        // moved is the thread's own: the blast radius is everyone it passes.
+        (AuthorityPlace::ExecutionQueue { .. }, AuthorityAction::Write) => {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueReorderAcrossThreads)
+        }
+        // Starting held work past every cap. The caps constrain what a thread
+        // starts itself (tenet 1319), so a thread skipping them is exactly
+        // the expansion they exist to prevent, and only the operator's
+        // approval may allow it.
+        (AuthorityPlace::ExecutionQueue { .. }, AuthorityAction::Run) => {
+            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
+        }
+
         // ── Everything else ─────────────────────────────────────────────
         // Ordinary work stays direct: project reads, writes, and runs; project
         // settings and project MCP configuration under the project's own
@@ -291,6 +307,41 @@ mod tests {
             AuthorityAction::Write,
         );
         assert_eq!(classify(&project, false), AuthorityPolicy::Direct);
+    }
+
+    #[test]
+    fn moving_or_starting_queued_work_requires_approval() {
+        let queue = AuthorityPlace::ExecutionQueue {
+            workspace_id: "default".to_string(),
+        };
+        assert_eq!(
+            classify(
+                &AuthorityScope::new(queue.clone(), AuthorityAction::Write),
+                false
+            ),
+            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueReorderAcrossThreads)
+        );
+        assert_eq!(
+            classify(
+                &AuthorityScope::new(queue.clone(), AuthorityAction::Run),
+                false
+            ),
+            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueStartNow)
+        );
+        // Ownership does not make either direct: a thread's own row still
+        // passes other threads' work.
+        assert_eq!(
+            classify(
+                &AuthorityScope::new(queue.clone(), AuthorityAction::Write),
+                true
+            ),
+            AuthorityPolicy::RequiresApproval(AuthorityReason::QueueReorderAcrossThreads)
+        );
+        // Reading the queue exercises no authority.
+        assert_eq!(
+            classify(&AuthorityScope::new(queue, AuthorityAction::Read), false),
+            AuthorityPolicy::Direct
+        );
     }
 
     #[test]

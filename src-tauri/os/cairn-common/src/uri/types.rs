@@ -176,6 +176,12 @@ pub enum CairnResource {
     ProjectMap {
         project: String,
     },
+    /// The workspace's execution queue (every cap-held execution, in the
+    /// fleet's release order), addressed from a project, whose issue numbers a
+    /// write resolves.
+    ProjectQueue {
+        project: String,
+    },
     /// A bounded merged conversation projection across a project's threads.
     ProjectHome {
         project: String,
@@ -1132,6 +1138,7 @@ impl CairnResource {
             Self::ProjectPages { .. } => ResourceKind::ProjectPages,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,
+            Self::ProjectQueue { .. } => ResourceKind::ProjectQueue,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectVcsDiff { .. } => ResourceKind::ProjectVcsDiff,

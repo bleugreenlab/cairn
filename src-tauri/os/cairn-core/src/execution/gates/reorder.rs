@@ -22,11 +22,12 @@
 //! held on one cap and one held only on the other compare by whichever key
 //! each has; their caps decide them separately, so no release depends on it.
 //!
-//! A PINNED row (its execution was moved by [`move_held_execution`], or frozen
-//! ahead of such a move) sits out of every rotation: the thread's order
-//! applies within the places its other children hold, and the pinned place
-//! survives. An `order` that lists a pinned child is refused by name, saying
-//! which pin it is: `203's place is the operator's` for one the operator
+//! A PINNED row (its execution was moved by [`move_held_execution`], by the
+//! operator or by a thread holding the operator's grant, or frozen ahead of
+//! such a move) sits out of every rotation: the thread's order applies within
+//! the places its other children hold, and the pinned place survives. An
+//! `order` that lists a pinned child is refused by name, saying whose pin it
+//! is: `203's place is the operator's` (or `judgment's`) for one a move
 //! placed, `203 is held at its place ahead of an operator move until it
 //! starts` for one only frozen. A pin ends when its execution is released and
 //! its rows latch.
@@ -43,14 +44,16 @@
 //! rotates inside its own insert transaction, which already holds the lock;
 //! the rotation adds statements to that transaction, not an acquisition.
 //!
-//! ## The operator's fleet move
+//! ## The fleet move
 //!
 //! The queue page lists every cap-held execution in the release order
 //! (`capacity::fleet_order`, the lanes in rotation behind a pinned prefix;
 //! see `rotation`), and the operator may move one of them to any position,
-//! across threads ([`move_held_execution`]). Pinned rows are an ordered
-//! prefix ahead of the rotation, ordered by key among themselves, so a move
-//! of X to position N:
+//! across threads ([`move_held_execution`]). A thread may make the same move
+//! through `cairn://p/<project>/queue` once the operator grants it
+//! (cairn/5942); it is the same function with a [`QueueMover::Thread`], and
+//! its pins name the thread. Pinned rows are an ordered prefix ahead of the
+//! rotation, ordered by key among themselves, so a move of X to position N:
 //!
 //! 1. reads the order `L`, takes X out, and puts it back at N to get `L'`;
 //! 2. pins EVERY row at positions 1..=N of `L'`: the pins already there, X,
@@ -81,9 +84,11 @@
 //! are still pinned, so it stays in the prefix, at the prefix's back.
 //!
 //! Unlike a rotation, a move takes the admission lock
-//! (`AdmissionSite::OperatorMove`): a renumber spans databases, and no
-//! admission decision may read a line half shifted. The lock is taken before
-//! any write and let go before the places are renumbered. A database failing
+//! (`AdmissionSite::QueueMove`), once for all the moves one call makes: a key
+//! renumber spans databases, and no admission decision may read a line half
+//! shifted. The lock is taken before any write and covers every key write and
+//! renumber; it is let go before the places (`Queued · 3rd`) are refreshed
+//! and the changes are announced. A database failing
 //! between two shifts can leave the cross-database order skewed by one shift;
 //! database writes fail here only when the database itself is failing, and
 //! the error reaches the operator. Caps are counts the keys cannot change, so
@@ -101,7 +106,7 @@ use super::capacity::{
     capacity_fact, decode_hold, encode_hold, fleet_order, AdmissionSite, FleetOrdered,
     CAPACITY_FACTS, FLEET_SLOT_FACT, THREAD_FOCUS_FACT,
 };
-use crate::models::CapacityHold;
+use crate::models::{CapacityHold, Pin, PinBy, PinKind};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -153,31 +158,38 @@ impl ThreadQueued {
             .find_map(|row| row.hold.as_ref().and_then(CapacityHold::placed_by))
     }
 
-    /// Whether it is in the queue's pinned prefix, so its thread's order does
-    /// not move it.
-    pub fn pinned(&self) -> bool {
+    /// Who fixed its place, when a fleet move did.
+    pub fn pin(&self) -> Option<&Pin> {
         self.holds
             .iter()
             .chain(&self.dormant)
-            .any(QueuedHold::pinned)
-    }
-
-    /// Whether its pin is only a freeze: an operator move landed behind it,
-    /// and nobody placed it where it stands.
-    pub fn frozen(&self) -> bool {
-        self.pinned()
-            && self
-                .holds
-                .iter()
-                .chain(&self.dormant)
-                .filter(|row| row.pinned())
-                .all(|row| row.hold.as_ref().is_some_and(CapacityHold::frozen))
+            .find_map(|row| row.hold.as_ref().and_then(CapacityHold::pin))
     }
 }
 
 impl QueuedHold {
     fn pinned(&self) -> bool {
         self.hold.as_ref().is_some_and(CapacityHold::pinned)
+    }
+
+    fn operator_pinned(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(CapacityHold::operator_pinned)
+    }
+}
+
+/// Why a thread's own `order` may not list a pinned child: whose place it is.
+fn pin_refusal(number: i64, pin: &Pin) -> String {
+    match (pin.kind, &pin.by) {
+        (PinKind::Placed, PinBy::Operator) => format!("{number}'s place is the operator's"),
+        (PinKind::Placed, PinBy::Thread { thread }) => format!("{number}'s place is {thread}'s"),
+        (PinKind::Frozen, PinBy::Operator) => {
+            format!("{number} is held at its place ahead of an operator move until it starts")
+        }
+        (PinKind::Frozen, PinBy::Thread { thread }) => {
+            format!("{number} is held at its place ahead of {thread}'s move until it starts")
+        }
     }
 }
 
@@ -458,12 +470,8 @@ pub(crate) async fn resolve_order_conn(
             refusals.push(format!("{number} has no cap-held execution ({why})"));
             continue;
         }
-        if let Some(pinned) = queued.iter().find(|queued| queued.pinned()) {
-            refusals.push(if pinned.frozen() {
-                format!("{number} is held at its place ahead of an operator move until it starts")
-            } else {
-                format!("{number}'s place is the operator's")
-            });
+        if let Some(pin) = queued.iter().find_map(|queued| queued.pin()) {
+            refusals.push(pin_refusal(number, pin));
             continue;
         }
         front.extend(queued.iter().map(|queued| queued.execution_id.clone()));
@@ -563,7 +571,7 @@ pub async fn operator_order_thread_queue(
     order: &[serde_json::Value],
 ) -> Result<String, String> {
     let (db, _, target) = queue_thread(orch, project, thread).await?;
-    order_thread_queue(orch, &db, &target, order, OPERATOR).await
+    order_thread_queue(orch, &db, &target, order, QueueMover::Operator.name()).await
 }
 
 /// `Ordered harness's queue: 5841 (fleet 3rd, thread 1st), 5829 (thread 2nd)`.
@@ -587,11 +595,37 @@ fn ordered_summary(thread: &str, listed: &[i64], queue: &[ThreadQueued]) -> Stri
 }
 
 // ---------------------------------------------------------------------------
-// The operator's fleet move
+// The fleet move
 // ---------------------------------------------------------------------------
 
-/// Who an operator move records as having placed a hold ahead.
-const OPERATOR: &str = "the operator";
+/// Who moves held work in the fleet's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueMover {
+    /// The operator, proven by the invoke's credentials. Outranks every pin.
+    Operator,
+    /// A thread acting under the operator's grant (cairn/5942). It never
+    /// displaces a row the operator pinned.
+    Thread { name: String },
+}
+
+impl QueueMover {
+    fn pin_by(&self) -> PinBy {
+        match self {
+            QueueMover::Operator => PinBy::Operator,
+            QueueMover::Thread { name } => PinBy::Thread {
+                thread: name.clone(),
+            },
+        }
+    }
+
+    /// `the operator`, or the thread's name: what `placed_by` records.
+    pub fn name(&self) -> &str {
+        match self {
+            QueueMover::Operator => "the operator",
+            QueueMover::Thread { name } => name,
+        }
+    }
+}
 
 const NOT_QUEUED: &str = "That execution is not queued: it started, or it waits on its own gates.";
 
@@ -599,13 +633,163 @@ const NOT_QUEUED: &str = "That execution is not queued: it started, or it waits 
 /// One shift opens a gap of a million, so a second is already unexpected.
 const MOVE_ATTEMPTS: usize = 3;
 
-/// What the operator's move did.
+/// What one move did.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FleetMove {
     /// Whether anything was written: false when it already stood there.
     pub moved: bool,
     /// Its 1-based place in the fleet's order afterwards.
     pub position: usize,
+}
+
+/// One move as the line stood when it was planned: what it moves, from
+/// where, to where, and whose work it passes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedMove {
+    /// `cairn/5901`, or the execution id when it has no issue.
+    pub label: String,
+    pub title: Option<String>,
+    /// Its 1-based place before this move, after the moves listed before it.
+    pub from: usize,
+    pub to: usize,
+    /// The threads of the rows it passes, other than its own, in line order:
+    /// whose work starts later (or sooner) because of it. `unthreaded work`
+    /// for rows with no thread.
+    pub passes: Vec<String>,
+}
+
+/// `cairn/5901`, or the execution id for work with no issue.
+fn row_label(entry: &FleetOrdered) -> String {
+    match (&entry.queued.project_key, entry.queued.issue_number) {
+        (Some(project), Some(number)) => {
+            format!("{}/{number}", cairn_common::uri::canonical_project(project))
+        }
+        _ => entry.queued.execution_id.clone(),
+    }
+}
+
+/// Validate `moves` (execution id, 1-based position, applied in order) against
+/// the line `order` and plan them. Every offending entry is named. With a
+/// thread mover, also refuse when the moves would change the place of any
+/// row the operator pinned, or move one: the operator outranks a granted
+/// thread. A key renumber keeps every place, so it is never displacement.
+pub(crate) fn plan_on(
+    order: &[FleetOrdered],
+    holds: &HashMap<String, Vec<QueuedHold>>,
+    moves: &[(String, usize)],
+    mover: &QueueMover,
+) -> Result<Vec<PlannedMove>, Vec<String>> {
+    let mut refusals = Vec::new();
+    let mut seen = HashSet::new();
+    for (execution_id, position) in moves {
+        let index = order
+            .iter()
+            .position(|entry| &entry.queued.execution_id == execution_id);
+        let Some(index) = index else {
+            refusals.push(NOT_QUEUED.to_string());
+            continue;
+        };
+        if !seen.insert(execution_id.as_str()) {
+            refusals.push(format!("{} is listed twice.", row_label(&order[index])));
+            continue;
+        }
+        if *position == 0 || *position > order.len() {
+            refusals.push(format!(
+                "Position {position} is outside the queue ({} queued).",
+                order.len()
+            ));
+        }
+    }
+    if !refusals.is_empty() {
+        return Err(refusals);
+    }
+
+    let mut line: Vec<usize> = (0..order.len()).collect();
+    let mut planned = Vec::new();
+    for (execution_id, position) in moves {
+        let Some(from) = line
+            .iter()
+            .position(|index| &order[*index].queued.execution_id == execution_id)
+        else {
+            continue;
+        };
+        let to = position - 1;
+        let moved = &order[line[from]];
+        let passed = if to < from {
+            &line[to..from]
+        } else {
+            &line[from + 1..=to]
+        };
+        let mut passes: Vec<String> = Vec::new();
+        for index in passed {
+            let entry = &order[*index];
+            if entry.queued.thread_id.is_some() && entry.queued.thread_id == moved.queued.thread_id
+            {
+                continue;
+            }
+            let thread = entry
+                .queued
+                .thread_name
+                .clone()
+                .unwrap_or_else(|| "unthreaded work".to_string());
+            if !passes.contains(&thread) {
+                passes.push(thread);
+            }
+        }
+        planned.push(PlannedMove {
+            label: row_label(moved),
+            title: moved.queued.issue_title.clone(),
+            from: from + 1,
+            to: *position,
+            passes,
+        });
+        let index = line.remove(from);
+        line.insert(to, index);
+    }
+
+    if let QueueMover::Thread { .. } = mover {
+        let operator_pinned = |entry: &FleetOrdered| {
+            holds
+                .get(&entry.queued.execution_id)
+                .is_some_and(|rows| rows.iter().any(QueuedHold::operator_pinned))
+        };
+        for (before, entry) in order.iter().enumerate() {
+            if !operator_pinned(entry) {
+                continue;
+            }
+            let moved = moves.iter().any(|(id, _)| id == &entry.queued.execution_id);
+            let after = line.iter().position(|index| *index == before);
+            if moved || after != Some(before) {
+                refusals.push(format!(
+                    "{} (fleet {}) was placed by the operator",
+                    row_label(entry),
+                    super::census::ordinal(before + 1)
+                ));
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(vec![format!(
+                "A granted move never changes the place of work the operator placed, and this \
+                 one would: {}. Nothing moved.",
+                refusals.join("; ")
+            )]);
+        }
+    }
+    Ok(planned)
+}
+
+/// [`plan_on`] against the fleet's line as it reads now, without the
+/// admission lock: the early check a request runs before it asks the
+/// operator, so no one is asked about a move that would be refused. The move
+/// itself re-plans under the lock.
+pub(crate) async fn plan_moves(
+    orch: &Orchestrator,
+    moves: &[(String, usize)],
+    mover: &QueueMover,
+) -> Result<Vec<PlannedMove>, String> {
+    let order = fleet_order(orch).await?;
+    let holds = capacity_holds(&order).await?;
+    plan_on(&order, &holds, moves, mover).map_err(|refusals| refusals.join(" "))
 }
 
 /// Every unlatched capacity row in one database, blocking or dormant. Read
@@ -759,26 +943,40 @@ async fn keys_in_range(db: &LocalDb, first: i64, last: i64) -> Result<BTreeSet<i
     .map_err(|error| format!("failed to read the queue: {error}"))
 }
 
-/// Move held execution `execution_id` to `position` (1-based) in the fleet's
-/// order, as the operator's drag on the queue page does: across threads, or
-/// within one. The position is resolved against the queue as it stands now,
-/// so a move to the front or the back is exact even from a stale page. A
-/// refusal changes nothing. The caller has proven the operator; see the
-/// module doc for what the move writes and why it takes the admission lock.
+/// Move held executions to new places in the fleet's order, each
+/// `(execution_id, position)` (1-based) in turn, as the operator's drag on
+/// the queue page does: across threads, or within one. Each position is
+/// resolved against the queue as the earlier moves left it, so a move to the
+/// front or the back is exact even from a stale page. Every move is planned
+/// before any is written, under ONE admission-lock acquisition, and a refusal
+/// of any entry changes nothing. The caller has proven `mover`: the
+/// operator's credentials, or a thread's grant; see the module doc for what
+/// the move writes, how a thread's move ranks below the operator's, and why
+/// it takes the admission lock. Answers one [`FleetMove`] per move.
 pub async fn move_held_execution(
     orch: &Orchestrator,
-    execution_id: &str,
-    position: usize,
-) -> Result<FleetMove, String> {
+    moves: &[(String, usize)],
+    mover: QueueMover,
+) -> Result<Vec<FleetMove>, String> {
+    let subject = format!(
+        "{} moves {}",
+        mover.name(),
+        moves
+            .first()
+            .map(|(id, _)| id.as_str())
+            .unwrap_or("nothing")
+    );
+    let mut touched: Vec<(Arc<LocalDb>, String)> = Vec::new();
     let guard = orch
         .admission_lock
-        .acquire(AdmissionSite::OperatorMove, execution_id)
+        .acquire(AdmissionSite::QueueMove, subject)
         .await
         .map_err(|busy| busy.to_string())?;
-    let moved = move_under_lock(orch, execution_id, position).await;
+    let moved = moves_under_lock(orch, moves, &mover, &mut touched).await;
     drop(guard);
-    let (outcome, touched) = moved?;
-    if outcome.moved {
+    // A database failing partway through still leaves rows that moved, so
+    // their places and changes go out whatever the result.
+    if !touched.is_empty() {
         super::capacity::refresh_places(orch, None).await?;
     }
     for (db, execution_id) in touched {
@@ -787,17 +985,40 @@ pub async fn move_held_execution(
                 .await;
         let _ = orch.services.emitter.emit("db-change", change);
     }
-    Ok(outcome)
+    moved
 }
 
-/// The move's reads and writes, holding the admission lock. Returns what it
-/// did and every execution whose rows it wrote or shifted.
+/// Every move's plan and writes, holding the admission lock. The plan is the
+/// authoritative check (the one a request ran before asking the operator saw
+/// the line without the lock).
+async fn moves_under_lock(
+    orch: &Orchestrator,
+    moves: &[(String, usize)],
+    mover: &QueueMover,
+    touched: &mut Vec<(Arc<LocalDb>, String)>,
+) -> Result<Vec<FleetMove>, String> {
+    if moves.is_empty() {
+        return Err("Nothing to move.".to_string());
+    }
+    let order = fleet_order(orch).await?;
+    let holds = capacity_holds(&order).await?;
+    plan_on(&order, &holds, moves, mover).map_err(|refusals| refusals.join(" "))?;
+    let mut outcomes = Vec::new();
+    for (execution_id, position) in moves {
+        outcomes.push(move_under_lock(orch, execution_id, *position, mover, touched).await?);
+    }
+    Ok(outcomes)
+}
+
+/// One move's reads and writes, holding the admission lock. Records every
+/// execution whose rows it wrote or shifted in `touched`.
 async fn move_under_lock(
     orch: &Orchestrator,
     execution_id: &str,
     position: usize,
-) -> Result<(FleetMove, Vec<(Arc<LocalDb>, String)>), String> {
-    let mut touched: Vec<(Arc<LocalDb>, String)> = Vec::new();
+    mover: &QueueMover,
+    touched: &mut Vec<(Arc<LocalDb>, String)>,
+) -> Result<FleetMove, String> {
     for _ in 0..MOVE_ATTEMPTS {
         let order = fleet_order(orch).await?;
         let Some(from) = order
@@ -813,13 +1034,10 @@ async fn move_under_lock(
             ));
         }
         if position == from + 1 {
-            return Ok((
-                FleetMove {
-                    moved: false,
-                    position,
-                },
-                touched,
-            ));
+            return Ok(FleetMove {
+                moved: false,
+                position,
+            });
         }
         let holds = capacity_holds(&order).await?;
         let mut line: Vec<&FleetOrdered> = order.iter().collect();
@@ -949,8 +1167,8 @@ async fn move_under_lock(
         }
 
         // Each database's writes in one transaction. Only the moved
-        // execution is placed by the operator; a row ahead of it is frozen
-        // where the page showed it and keeps who placed it, if anyone did.
+        // execution is placed by the mover; a row ahead of it that no move
+        // placed is frozen where the page showed it, by the mover's move.
         type Write = (String, Option<i64>, Option<String>);
         let mut writes: Vec<(&FleetOrdered, Vec<Write>)> = Vec::new();
         for entry in line[..position]
@@ -968,15 +1186,19 @@ async fn move_under_lock(
                 let key = assigned.get(&row.gate_id).copied();
                 let detail = row.hold.as_ref().and_then(|hold| {
                     let mut next = hold.clone();
-                    next.set_pinned(true);
                     if is_x {
-                        // Its place is a position in the prefix, not a key
-                        // going down: the operator placed it, wherever its
-                        // keys landed.
-                        next.set_frozen(false);
-                        next.set_placed_by(Some(OPERATOR.to_string()));
+                        // The mover's pin replaces any earlier one: an
+                        // operator move takes over a thread's pin, and a
+                        // thread never reaches a row the operator pinned
+                        // (`plan_on` refused it). Its place is a position in
+                        // the prefix, wherever its keys landed.
+                        next.set_pin(Some(Pin::placed(mover.pin_by())));
+                        next.set_placed_by(Some(mover.name().to_string()));
                     } else if !hold.pinned() {
-                        next.set_frozen(true);
+                        next.set_pin(Some(Pin {
+                            by: mover.pin_by(),
+                            kind: PinKind::Frozen,
+                        }));
                     }
                     (&next != hold).then(|| encode_hold(&next))
                 });
@@ -1025,13 +1247,10 @@ async fn move_under_lock(
             .iter()
             .position(|entry| entry.queued.execution_id == execution_id)
             .map_or(position, |index| index + 1);
-        return Ok((
-            FleetMove {
-                moved,
-                position: landed,
-            },
-            touched,
-        ));
+        return Ok(FleetMove {
+            moved,
+            position: landed,
+        });
     }
     Err("The queue could not make room to move it; its order is unchanged.".to_string())
 }
@@ -1056,7 +1275,7 @@ pub(crate) fn places_phrase(queued: &ThreadQueued, separator: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1076,9 +1295,9 @@ mod tests {
 
     /// Every capacity row: (execution, fact) -> (gate id, queue key, detail,
     /// created_at).
-    type Rows = BTreeMap<(String, String), (String, i64, Option<String>, i64)>;
+    pub(crate) type Rows = BTreeMap<(String, String), (String, i64, Option<String>, i64)>;
 
-    async fn rows(env: &Env) -> Rows {
+    pub(crate) async fn rows(env: &Env) -> Rows {
         env.db
             .read(|conn| {
                 Box::pin(async move {
@@ -1114,7 +1333,7 @@ mod tests {
         row(rows, id, fact).1
     }
 
-    fn hold(rows: &Rows, id: &str, fact: &str) -> CapacityHold {
+    pub(crate) fn hold(rows: &Rows, id: &str, fact: &str) -> CapacityHold {
         decode_hold(fact, row(rows, id, fact).2.as_deref().unwrap()).unwrap()
     }
 
@@ -1122,7 +1341,7 @@ mod tests {
         hold(rows, id, fact).place()
     }
 
-    fn placed_by(rows: &Rows, id: &str, fact: &str) -> Option<String> {
+    pub(crate) fn placed_by(rows: &Rows, id: &str, fact: &str) -> Option<String> {
         hold(rows, id, fact).placed_by().map(str::to_string)
     }
 
@@ -1151,19 +1370,19 @@ mod tests {
             .unwrap()
     }
 
-    struct World {
-        env: Env,
-        a1: String,
-        a2: String,
-        a3: String,
-        b1: String,
+    pub(crate) struct World {
+        pub(crate) env: Env,
+        pub(crate) a1: String,
+        pub(crate) a2: String,
+        pub(crate) a3: String,
+        pub(crate) b1: String,
     }
 
     /// A full fleet. Thread alpha holds a1 < a2 < a3 (issues 201-203), and
     /// beta's b1 (issue 301) is held on the fleet between a1 and a2. With
     /// `thread_capped`, alpha's own focus cap (one open child, 150) holds its
     /// three as well. The sweep has numbered every place.
-    async fn world(name: &str, thread_capped: bool) -> World {
+    pub(crate) async fn world(name: &str, thread_capped: bool) -> World {
         let env = env(name).await;
         caps(&env, 6, if thread_capped { 1 } else { 50 });
         full_fleet(&env).await;
@@ -1195,7 +1414,12 @@ mod tests {
     }
 
     /// A thread job (or, with `parent`, a task under one) and its live run.
-    async fn thread_run(env: &Env, run: &str, thread: Option<&str>, parent: Option<&str>) {
+    pub(crate) async fn thread_run(
+        env: &Env,
+        run: &str,
+        thread: Option<&str>,
+        parent: Option<&str>,
+    ) {
         let job = format!("job-{run}");
         let thread = thread
             .map(|thread| format!("'{thread}'"))
@@ -1219,7 +1443,7 @@ mod tests {
             .unwrap();
     }
 
-    fn request(run: Option<&str>) -> McpCallbackRequest {
+    pub(crate) fn request(run: Option<&str>) -> McpCallbackRequest {
         McpCallbackRequest {
             answer_bound_ms: None,
             cwd: "/".to_string(),
@@ -1232,7 +1456,7 @@ mod tests {
         }
     }
 
-    async fn write(
+    pub(crate) async fn write(
         env: &Env,
         run: Option<&str>,
         target: &str,
@@ -1931,7 +2155,7 @@ mod tests {
     // -- the operator's fleet move ----------------------------------------------
 
     /// The queue page's order: every cap-held execution, the fleet's order.
-    async fn view_ids(env: &Env) -> Vec<String> {
+    pub(crate) async fn view_ids(env: &Env) -> Vec<String> {
         queue_view(&env.orch)
             .await
             .unwrap()
@@ -1941,11 +2165,26 @@ mod tests {
             .collect()
     }
 
-    fn ids(list: &[&String]) -> Vec<String> {
+    pub(crate) fn ids(list: &[&String]) -> Vec<String> {
         list.iter().map(|id| id.to_string()).collect()
     }
 
-    async fn complete(env: &Env, job: &str) {
+    /// One move by the operator, as the queue page's drag makes it.
+    pub(crate) async fn operator_move(
+        orch: &crate::orchestrator::Orchestrator,
+        execution_id: &str,
+        position: usize,
+    ) -> Result<FleetMove, String> {
+        move_held_execution(
+            orch,
+            &[(execution_id.to_string(), position)],
+            QueueMover::Operator,
+        )
+        .await
+        .map(|mut moved| moved.remove(0))
+    }
+
+    pub(crate) async fn complete(env: &Env, job: &str) {
         env.db
             .execute(
                 format!("UPDATE jobs SET status = 'complete' WHERE id = '{job}'"),
@@ -1970,7 +2209,7 @@ mod tests {
         );
         let before = rows(&w.env).await;
 
-        let moved = move_held_execution(&w.env.orch, &a4, 1).await.unwrap();
+        let moved = operator_move(&w.env.orch, &a4, 1).await.unwrap();
         assert_eq!(
             moved,
             FleetMove {
@@ -2011,7 +2250,7 @@ mod tests {
             w.env
                 .orch
                 .admission_lock
-                .acquisitions(AdmissionSite::OperatorMove),
+                .acquisitions(AdmissionSite::QueueMove),
             1,
             "the move took the lock under its own site"
         );
@@ -2060,6 +2299,209 @@ mod tests {
         }
     }
 
+    /// A granted thread's move releases next, exactly once under racing sweeps
+    /// and evaluations, as the operator's does: the mover changes who the pin
+    /// names, nothing about the release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_granted_move_releases_next_exactly_once_under_racing_sweeps() {
+        let w = world("granted-move-race.db", false).await;
+        file(&w.env, 204, json!([])).await.unwrap();
+        let a4 = execution(&w.env, 204).await.0;
+        sweep_at(&w.env.orch, now()).await.unwrap();
+
+        let moved = move_held_execution(
+            &w.env.orch,
+            &[(a4.clone(), 1)],
+            QueueMover::Thread {
+                name: "beta".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            moved,
+            vec![FleetMove {
+                moved: true,
+                position: 1
+            }]
+        );
+        // The line the operator's same move leaves: a4's lane spent a turn,
+        // so beta's b1 comes next.
+        assert_eq!(
+            view_ids(&w.env).await,
+            ids(&[&a4, &w.b1, &w.a1, &w.a2, &w.a3])
+        );
+        let after = rows(&w.env).await;
+        assert_eq!(
+            hold(&after, &a4, FLEET).pin(),
+            Some(&Pin::placed(PinBy::Thread {
+                thread: "beta".to_string()
+            }))
+        );
+        assert_eq!(placed_by(&after, &a4, FLEET).as_deref(), Some("beta"));
+        assert!(detail(&w.env, &a4).await.ends_with("placed ahead by beta"));
+        assert_eq!(
+            w.env
+                .orch
+                .admission_lock
+                .acquisitions(AdmissionSite::QueueMove),
+            1
+        );
+
+        complete(&w.env, "sj100").await;
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let orch = w.env.orch.clone();
+            handles.push(tokio::spawn(
+                async move { sweep(&orch).await.unwrap().released },
+            ));
+        }
+        for _ in 0..2 {
+            let (orch, id) = (w.env.orch.clone(), a4.clone());
+            handles.push(tokio::spawn(async move {
+                if evaluate_execution(&orch, &id).await.unwrap().released {
+                    vec![id]
+                } else {
+                    Vec::new()
+                }
+            }));
+        }
+        let mut released = Vec::new();
+        for handle in handles {
+            released.extend(handle.await.unwrap());
+        }
+        assert_eq!(
+            released,
+            vec![a4.clone()],
+            "exactly one release, of the moved"
+        );
+        assert_eq!(
+            count(
+                &w.env,
+                &format!(
+                    "SELECT COUNT(*) - COUNT(DISTINCT recipe_node_id) FROM jobs
+                      WHERE execution_id = '{a4}'"
+                )
+            )
+            .await,
+            0,
+            "one job set"
+        );
+    }
+
+    /// A thread's order refuses a child another thread placed by grant, naming
+    /// whose place it is, and otherwise leaves that row where it was put.
+    #[tokio::test]
+    async fn a_thread_order_leaves_an_agent_pinned_row_and_names_its_pinner() {
+        let w = world("order-agent-pin.db", true).await;
+        move_held_execution(
+            &w.env.orch,
+            &[(w.a3.clone(), 1)],
+            QueueMover::Thread {
+                name: "beta".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let placed = rows(&w.env).await;
+
+        let refused = order(&w.env, json!([203]), "alpha").await.unwrap_err();
+        assert_eq!(refused, vec!["203's place is beta's"]);
+        assert_eq!(
+            rows(&w.env).await,
+            placed,
+            "a refused order changes nothing"
+        );
+
+        order(&w.env, json!([202, 201]), "alpha").await.unwrap();
+        let after = rows(&w.env).await;
+        for fact in [FLEET, THREAD] {
+            assert_eq!(key(&after, &w.a3, fact), key(&placed, &w.a3, fact));
+            assert_eq!(placed_by(&after, &w.a3, fact).as_deref(), Some("beta"));
+        }
+    }
+
+    /// The two placed refusals and the two frozen ones read who holds the place.
+    #[test]
+    fn a_pin_refusal_names_its_pinner_and_its_kind() {
+        let thread = PinBy::Thread {
+            thread: "judgment".to_string(),
+        };
+        assert_eq!(
+            pin_refusal(203, &Pin::placed(PinBy::Operator)),
+            "203's place is the operator's"
+        );
+        assert_eq!(
+            pin_refusal(203, &Pin::placed(thread.clone())),
+            "203's place is judgment's"
+        );
+        let frozen = |by| Pin {
+            by,
+            kind: PinKind::Frozen,
+        };
+        assert_eq!(
+            pin_refusal(203, &frozen(PinBy::Operator)),
+            "203 is held at its place ahead of an operator move until it starts"
+        );
+        assert_eq!(
+            pin_refusal(203, &frozen(thread)),
+            "203 is held at its place ahead of judgment's move until it starts"
+        );
+    }
+
+    /// The operator outranks a thread: an operator move takes a thread's pin
+    /// over, after which no thread may move that row or move others past it.
+    #[tokio::test]
+    async fn an_operator_move_overrides_an_agent_pin() {
+        let w = world("operator-over-agent.db", false).await;
+        let alpha = || QueueMover::Thread {
+            name: "alpha".to_string(),
+        };
+        move_held_execution(&w.env.orch, &[(w.a3.clone(), 1)], alpha())
+            .await
+            .unwrap();
+        // Behind alpha's pin beta came next, so the operator's move of a3 to
+        // 2nd freezes b1 at 1st, in the operator's name.
+        operator_move(&w.env.orch, &w.a3, 2).await.unwrap();
+        let after = rows(&w.env).await;
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.b1, &w.a3, &w.a1, &w.a2]));
+        assert_eq!(
+            hold(&after, &w.a3, FLEET).pin(),
+            Some(&Pin::placed(PinBy::Operator))
+        );
+        assert_eq!(
+            hold(&after, &w.b1, FLEET).pin(),
+            Some(&Pin {
+                by: PinBy::Operator,
+                kind: PinKind::Frozen,
+            })
+        );
+
+        let moved_it = move_held_execution(&w.env.orch, &[(w.a3.clone(), 1)], alpha())
+            .await
+            .unwrap_err();
+        assert!(
+            moved_it.contains("prj/203 (fleet 2nd) was placed by the operator"),
+            "{moved_it}"
+        );
+        let passed_it = move_held_execution(&w.env.orch, &[(w.a2.clone(), 1)], alpha())
+            .await
+            .unwrap_err();
+        assert!(
+            passed_it.contains("prj/203 (fleet 2nd) was placed by the operator"),
+            "{passed_it}"
+        );
+        // Behind the operator's row, a thread's move changes no operator place.
+        move_held_execution(&w.env.orch, &[(w.a2.clone(), 3)], alpha())
+            .await
+            .unwrap();
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.b1, &w.a3, &w.a2, &w.a1]));
+        assert_eq!(
+            hold(&rows(&w.env).await, &w.a3, FLEET).pin(),
+            Some(&Pin::placed(PinBy::Operator))
+        );
+    }
+
     /// The operator moved a3 to the front; alpha then orders its own queue.
     /// a3 keeps its keys and its place, alpha's order permutes a1 and a2
     /// among their own keys, and an order naming a3 is refused. Behind the
@@ -2067,7 +2509,7 @@ mod tests {
     #[tokio::test]
     async fn an_operator_placement_survives_a_later_thread_reorder() {
         let w = world("move-survives-order.db", true).await;
-        move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
+        operator_move(&w.env.orch, &w.a3, 1).await.unwrap();
         let placed = rows(&w.env).await;
         assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a1, &w.a2]));
 
@@ -2159,7 +2601,7 @@ mod tests {
         use crate::execution::gates::sweep::tests::resolve_issue;
         let w = world("move-within-thread.db", true).await;
         let before = rows(&w.env).await;
-        move_held_execution(&w.env.orch, &w.a3, 1).await.unwrap();
+        operator_move(&w.env.orch, &w.a3, 1).await.unwrap();
         let after = rows(&w.env).await;
         assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a1, &w.a2]));
         assert_eq!(queue_ids(&w.env).await, ids(&[&w.a3, &w.a1, &w.a2]));
@@ -2207,8 +2649,8 @@ mod tests {
                 .unwrap();
         }
         // b1 to the front, then a1 ahead of it: two pins, keys base, base+1.
-        move_held_execution(&w.env.orch, &w.b1, 1).await.unwrap();
-        move_held_execution(&w.env.orch, &w.a1, 1).await.unwrap();
+        operator_move(&w.env.orch, &w.b1, 1).await.unwrap();
+        operator_move(&w.env.orch, &w.a1, 1).await.unwrap();
         assert_eq!(
             view_ids(&w.env).await,
             ids(&[&w.a1, &w.b1, &w.a2, &w.a3, &a4])
@@ -2220,7 +2662,7 @@ mod tests {
             "no room between the pins"
         );
 
-        let moved = move_held_execution(&w.env.orch, &a4, 2).await.unwrap();
+        let moved = operator_move(&w.env.orch, &a4, 2).await.unwrap();
         assert_eq!(moved.position, 2);
         assert_eq!(
             view_ids(&w.env).await,
@@ -2258,15 +2700,13 @@ mod tests {
     async fn a_move_that_cannot_apply_changes_nothing() {
         let w = world("move-refusals.db", false).await;
         let before = rows(&w.env).await;
-        let refused = move_held_execution(&w.env.orch, "se100", 1)
-            .await
-            .unwrap_err();
+        let refused = operator_move(&w.env.orch, "se100", 1).await.unwrap_err();
         assert_eq!(
             refused,
             "That execution is not queued: it started, or it waits on its own gates."
         );
         for position in [0, 5, 99] {
-            let refused = move_held_execution(&w.env.orch, &w.a2, position)
+            let refused = operator_move(&w.env.orch, &w.a2, position)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -2275,7 +2715,7 @@ mod tests {
             );
         }
         assert_eq!(
-            move_held_execution(&w.env.orch, &w.a2, 3).await.unwrap(),
+            operator_move(&w.env.orch, &w.a2, 3).await.unwrap(),
             FleetMove {
                 moved: false,
                 position: 3
@@ -2395,14 +2835,103 @@ mod tests {
         assert_eq!(view_ids(&env).await.len(), 20);
 
         let started = std::time::Instant::now();
-        move_held_execution(&env.orch, &held[19], 1).await.unwrap();
+        operator_move(&env.orch, &held[19], 1).await.unwrap();
         let took = started.elapsed();
         println!("one move over 2,000 snapshots took {took:?}");
         assert_eq!(view_ids(&env).await[0], held[19]);
         assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+
+        // A granted thread's move plans the displacement check under the same
+        // lock, so it pays one more read of the line; the bound is the same.
+        let started = std::time::Instant::now();
+        move_held_execution(
+            &env.orch,
+            &[(held[18].clone(), 2)],
+            QueueMover::Thread {
+                name: "alpha".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let took = started.elapsed();
+        println!("one granted move over 2,000 snapshots took {took:?}");
+        assert_eq!(view_ids(&env).await[1], held[18]);
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
     }
 
     // -- the migration ----------------------------------------------------------
+
+    /// Every pin written before holds named their pinner was the operator's,
+    /// so the rewrite names the operator, drops the bare flags, keeps a
+    /// frozen row frozen (cairn/5943), and leaves an unpinned hold and an
+    /// authored gate exactly as they were.
+    #[tokio::test]
+    async fn the_pin_migration_names_the_operator_on_every_old_pin() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let temp = tempfile::tempdir().unwrap();
+        let db = Arc::new(LocalDb::open(temp.path().join("pin.db")).await.unwrap());
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.name() != "execution_hold_pin")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(before.len() + 1, TURSO_MIGRATIONS.len());
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            r#"INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES('p', 'default', 'P', 'prj', '/tmp/p', 1, 1);
+               INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq)
+                 VALUES('e1', 'r', 'p', 'held', 1, 1);
+               INSERT INTO execution_gates(id, execution_id, seq, predicate_json, last_outcome, created_at, detail)
+                 VALUES('pinned', 'e1', 1000, '{"fact":"fleet_slot"}', 'no_evidence', 1,
+                        '{"cap":"fleet","running":6,"limit":6,"unplaced":0,"place":1,"placedBy":"the operator","pinned":true}'),
+                       ('frozen', 'e1', 999, '{"fact":"fleet_slot"}', 'no_evidence', 1,
+                        '{"cap":"fleet","running":6,"limit":6,"unplaced":0,"place":1,"pinned":true,"frozen":true}'),
+                       ('plain', 'e1', 1001, '{"fact":"thread_focus"}', 'no_evidence', 1,
+                        '{"cap":"thread","thread":"alpha","open":[1],"limit":1,"place":2}'),
+                       ('authored', 'e1', 0, '{"fact":"issue_resolution"}', NULL, 1, NULL);"#,
+        )
+        .await
+        .unwrap();
+        let plain_before = db
+            .query_opt_text("SELECT detail FROM execution_gates WHERE id = 'plain'", ())
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let detail = |id: &'static str| {
+            let db = db.clone();
+            async move {
+                db.query_opt_text(
+                    "SELECT detail FROM execution_gates WHERE id = ?1",
+                    (id.to_string(),),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let pinned = detail("pinned").await.unwrap();
+        assert!(!pinned.contains("\"pinned\""), "{pinned}");
+        let hold = decode_hold(FLEET_SLOT_FACT, &pinned).unwrap();
+        assert_eq!(hold.pin(), Some(&Pin::placed(PinBy::Operator)));
+        assert_eq!(hold.placed_by(), Some("the operator"));
+        let frozen = detail("frozen").await.unwrap();
+        assert!(
+            !frozen.contains("\"pinned\"") && !frozen.contains("\"frozen\":"),
+            "{frozen}"
+        );
+        assert_eq!(
+            decode_hold(FLEET_SLOT_FACT, &frozen).unwrap().pin(),
+            Some(&Pin {
+                by: PinBy::Operator,
+                kind: PinKind::Frozen,
+            })
+        );
+        assert_eq!(detail("plain").await, plain_before);
+        assert_eq!(detail("authored").await, None);
+    }
 
     /// The backfill gives every capacity row a distinct key on its second's
     /// scale, breaking ties as the sweep did: issue number, none last.

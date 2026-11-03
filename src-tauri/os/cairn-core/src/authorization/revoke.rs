@@ -32,6 +32,14 @@ pub enum GrantHolder {
     },
     /// A standing grant bound to one actor, such as a served-API client.
     Actor(PrincipalRef),
+    /// A grant an `ActingThread` constraint binds to one thread (an
+    /// execution-queue grant), by thread id: the thread holds it whatever its
+    /// lifetime, and a once, turn or session one is also held by the run it
+    /// was minted for.
+    Thread {
+        thread_id: String,
+        run_id: Option<String>,
+    },
     /// A standing grant with no principal, or a grant naming no one to hold
     /// it. It is workspace-wide, so it is nobody's but the operator's.
     Operator,
@@ -44,6 +52,22 @@ impl GrantHolder {
     /// operator chose "always"), not a binding: a standing grant answers for
     /// every run, so that run does not hold it.
     pub fn of(grant: &AuthorityGrant) -> Self {
+        if let Some(thread_id) = grant.constraints.acting_thread() {
+            let run_id = match &grant.lifetime {
+                AuthorityLifetime::Standing => None,
+                AuthorityLifetime::Once { .. }
+                | AuthorityLifetime::Turn { .. }
+                | AuthorityLifetime::Session { .. } => grant
+                    .principal
+                    .run_id
+                    .clone()
+                    .filter(|run_id| !run_id.is_empty()),
+            };
+            return GrantHolder::Thread {
+                thread_id: thread_id.to_string(),
+                run_id,
+            };
+        }
         match &grant.lifetime {
             AuthorityLifetime::Standing => match &grant.principal.actor {
                 Some(actor) => GrantHolder::Actor(actor.clone()),
@@ -73,6 +97,7 @@ impl GrantHolder {
                 node_uri: None,
             } => format!("run {run_id}"),
             GrantHolder::Actor(actor) => describe_principal(actor),
+            GrantHolder::Thread { thread_id, .. } => format!("thread {thread_id}"),
             GrantHolder::Operator => "the operator (a workspace-wide standing grant)".to_string(),
         }
     }
@@ -101,6 +126,8 @@ pub struct Revoker {
     pub run_id: Option<String>,
     pub node_uri: Option<String>,
     pub actor: Option<PrincipalRef>,
+    /// The thread the run acts for, resolved as a queue request resolves it.
+    pub acting_thread: Option<String>,
 }
 
 impl Revoker {
@@ -121,6 +148,12 @@ impl Revoker {
         match holder {
             GrantHolder::Run { run_id, .. } => self.run_id.as_deref() == Some(run_id.as_str()),
             GrantHolder::Actor(actor) => self.actor.as_ref() == Some(actor),
+            GrantHolder::Thread { thread_id, run_id } => {
+                self.acting_thread.as_ref() == Some(thread_id)
+                    || run_id
+                        .as_deref()
+                        .is_some_and(|run_id| self.run_id.as_deref() == Some(run_id))
+            }
             GrantHolder::Operator => false,
         }
     }
@@ -215,8 +248,8 @@ pub async fn revoke_as_operator(
 mod tests {
     use super::*;
     use cairn_common::authorization::{
-        AuthorityAction, AuthorityAudience, AuthorityConstraintSet, AuthorityPlace,
-        AuthorityPrincipal, AuthorityProvenance, AuthorityScope,
+        AuthorityAction, AuthorityAudience, AuthorityConstraint, AuthorityConstraintSet,
+        AuthorityPlace, AuthorityPrincipal, AuthorityProvenance, AuthorityScope,
     };
 
     fn grant(lifetime: AuthorityLifetime, principal: AuthorityPrincipal) -> AuthorityGrant {
@@ -257,6 +290,46 @@ mod tests {
             run_id: Some(run.into()),
             node_uri: Some(format!("cairn://p/demo/1/1/{run}")),
             actor: None,
+            acting_thread: None,
+        }
+    }
+
+    fn thread_run(run: &str, thread: &str) -> Revoker {
+        Revoker {
+            acting_thread: Some(thread.into()),
+            ..self::run(run)
+        }
+    }
+
+    fn thread_bound(lifetime: AuthorityLifetime, thread: &str) -> AuthorityGrant {
+        let mut grant = grant(lifetime, run_principal("run-a"));
+        grant.constraints = AuthorityConstraintSet::new(vec![AuthorityConstraint::ActingThread {
+            thread_id: thread.into(),
+        }]);
+        grant
+    }
+
+    /// A queue grant is the thread's, whatever its lifetime: any run acting
+    /// for that thread revokes it, another thread's run is refused and told
+    /// whose it is, and an anchored one is still its own run's.
+    #[test]
+    fn a_thread_bound_grant_is_its_threads() {
+        for lifetime in anchored().into_iter().chain([AuthorityLifetime::Standing]) {
+            let anchored = !matches!(lifetime, AuthorityLifetime::Standing);
+            let grant = thread_bound(lifetime, "t-judgment");
+            assert_eq!(
+                check_holder("g", &grant, &thread_run("run-z", "t-judgment")),
+                Ok(())
+            );
+            let refusal = check_holder("g", &grant, &thread_run("run-b", "t-ui")).unwrap_err();
+            assert!(refusal.contains("held by thread t-judgment"), "{refusal}");
+            assert!(refusal.contains(OPERATOR_REVOKE_SURFACE), "{refusal}");
+            assert_eq!(
+                check_holder("g", &grant, &run("run-a")).is_ok(),
+                anchored,
+                "a standing grant's run is provenance, not a holder"
+            );
+            assert!(check_holder("g", &grant, &Revoker::default()).is_err());
         }
     }
 

@@ -24,6 +24,7 @@ impl CairnResource {
             | ProjectTenet { project, .. }
             | ProjectPages { project, .. }
             | ProjectCodemap { project, .. }
+            | ProjectQueue { project, .. }
             | ProjectMap { project, .. }
             | ProjectHome { project, .. }
             | ProjectCheckResults { project, .. }
@@ -330,6 +331,7 @@ impl CairnResource {
             | Self::PostComment { .. }
             | Self::ProjectPosts { .. }
             | Self::ProjectCodemap { .. }
+            | Self::ProjectQueue { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }
             | Self::ProjectMessages { .. }
@@ -475,6 +477,7 @@ impl CairnResource {
             | Self::ProjectTenet { project, .. }
             | Self::ProjectPages { project }
             | Self::ProjectCodemap { project }
+            | Self::ProjectQueue { project }
             | Self::ProjectMap { project }
             | Self::ProjectHome { project }
             | Self::ProjectCheckResults { project, .. }
@@ -735,6 +738,7 @@ impl CairnResource {
             | Self::ProjectTenet { .. }
             | Self::ProjectPages { .. }
             | Self::ProjectCodemap { .. }
+            | Self::ProjectQueue { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }
             | Self::ProjectCheckResults { .. }

@@ -139,6 +139,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     pages::NODE_PAGE_LOG_CONTRACT,
     posts::HOME_FEED_CONTRACT,
     projects::PROJECT_CODEMAP_CONTRACT,
+    projects::PROJECT_QUEUE_CONTRACT,
     projects::PROJECT_MAP_CONTRACT,
     projects::PROJECT_HOME_CONTRACT,
     projects::PROJECT_CHECK_RESULTS_CONTRACT,

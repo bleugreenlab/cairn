@@ -37,6 +37,8 @@ mod posts;
 mod progress;
 mod projects;
 mod prompts;
+mod queue;
+pub(crate) use queue::{authorize_start_now, queue_authority};
 mod rebase;
 mod recipes;
 mod repls;
@@ -55,6 +57,8 @@ mod wakes;
 mod issue_mutation_tests;
 #[cfg(test)]
 mod models_account_tests;
+#[cfg(test)]
+mod queue_authority_tests;
 #[cfg(test)]
 mod resource_gate_tests;
 #[cfg(test)]
@@ -427,6 +431,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         off_frame(|| executions::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    {
+        summary
+    } else if let Some(summary) =
+        off_frame(|| queue::dispatch(orch, request, index, item, dry_run, &resource)).await?
     {
         summary
     } else if let Some(summary) =

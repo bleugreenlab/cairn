@@ -5,6 +5,8 @@
 //! authorize. So a grant renders its normalized scope (never a paraphrase) and
 //! its status, and drilling into one shows the decisions that cited it.
 
+use std::collections::HashMap;
+
 use cairn_common::authorization::{AuthorityGrant, AuthorityLifetime};
 use cairn_db::storage::authority::AuthorizationEventRecord;
 
@@ -20,44 +22,6 @@ fn render_uuid_id(id: &str) -> String {
 
 fn grant_uri_id(id: &str) -> String {
     render_uuid_id(id).replace(' ', "-")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{grant_uri_id, render_uuid_id, stored_grant_id};
-
-    const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
-
-    #[test]
-    fn grant_uuid_renders_as_sixteen_unigram_words() {
-        let rendered = render_uuid_id(UUID);
-        assert_eq!(rendered.split_whitespace().count(), 16);
-        assert_eq!(stored_grant_id(&rendered), UUID);
-    }
-
-    #[test]
-    fn grant_member_segment_is_uri_safe_and_resolves_to_storage_id() {
-        let segment = grant_uri_id(UUID);
-        assert!(!segment.contains(char::is_whitespace));
-        assert_eq!(segment.split('-').count(), 16);
-        assert_eq!(stored_grant_id(&segment), UUID);
-    }
-
-    #[test]
-    fn grant_lookup_accepts_recovered_words_and_legacy_uuid() {
-        let rendered = render_uuid_id(UUID);
-        assert_eq!(
-            stored_grant_id(&rendered.to_uppercase().replace(' ', "-")),
-            UUID
-        );
-        assert_eq!(stored_grant_id(UUID), UUID);
-    }
-
-    #[test]
-    fn historical_non_uuid_ids_remain_addressable() {
-        assert_eq!(render_uuid_id("legacy-grant"), "legacy-grant");
-        assert_eq!(stored_grant_id("legacy-grant"), "legacy-grant");
-    }
 }
 
 pub(crate) fn stored_grant_id(id: &str) -> String {
@@ -82,7 +46,50 @@ fn lifetime_label(lifetime: &AuthorityLifetime) -> String {
     }
 }
 
-fn constraint_labels(grant: &AuthorityGrant) -> String {
+/// The names of the threads the grants' `ActingThread` constraints bind, by
+/// id, for display only: matching compares ids. A thread this database does
+/// not hold (a team replica's) is shown by its id.
+async fn thread_names(db: &LocalDb, grants: &[&AuthorityGrant]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for grant in grants {
+        for constraint in &grant.constraints.constraints {
+            let cairn_common::authorization::AuthorityConstraint::ActingThread { thread_id } =
+                constraint
+            else {
+                continue;
+            };
+            if names.contains_key(thread_id) {
+                continue;
+            }
+            if let Ok(Some(name)) = db
+                .query_opt_text(
+                    "SELECT name FROM threads WHERE id = ?1",
+                    (thread_id.clone(),),
+                )
+                .await
+            {
+                names.insert(thread_id.clone(), name);
+            }
+        }
+    }
+    names
+}
+
+/// `for thread judgment`, when the grant is bound to a thread.
+fn bound_thread(grant: &AuthorityGrant, names: &HashMap<String, String>) -> Option<String> {
+    grant
+        .constraints
+        .constraints
+        .iter()
+        .find_map(|constraint| match constraint {
+            cairn_common::authorization::AuthorityConstraint::ActingThread { thread_id } => Some(
+                format!("for thread {}", names.get(thread_id).unwrap_or(thread_id)),
+            ),
+            _ => None,
+        })
+}
+
+fn constraint_labels(grant: &AuthorityGrant, names: &HashMap<String, String>) -> String {
     if grant.constraints.constraints.is_empty() {
         return "none (covers the whole scope)".to_string();
     }
@@ -109,6 +116,9 @@ fn constraint_labels(grant: &AuthorityGrant) -> String {
             cairn_common::authorization::AuthorityConstraint::McpConfig { fingerprint } => {
                 format!("exact MCP configuration {}", fingerprint.short())
             }
+            cairn_common::authorization::AuthorityConstraint::ActingThread { thread_id } => {
+                format!("for thread {}", names.get(thread_id).unwrap_or(thread_id))
+            }
             // The digest, never the act's content: a settings value can carry
             // a credential.
             cairn_common::authorization::AuthorityConstraint::ExactAct { digest } => {
@@ -119,11 +129,14 @@ fn constraint_labels(grant: &AuthorityGrant) -> String {
         .join("; ")
 }
 
-fn render_grant_row(grant: &AuthorityGrant, at: i64) -> String {
+fn render_grant_row(grant: &AuthorityGrant, at: i64, names: &HashMap<String, String>) -> String {
     let id = render_uuid_id(&grant.id);
     let uri_id = grant_uri_id(&grant.id);
+    let bound = bound_thread(grant, names)
+        .map(|bound| format!(" {bound}"))
+        .unwrap_or_default();
     format!(
-        "- `{}` — {} ({}) · [{}](cairn://grants/{})",
+        "- `{}`{bound} — {} ({}) · [{}](cairn://grants/{})",
         grant.scope.shorthand(),
         grant.status(at),
         lifetime_label(&grant.lifetime),
@@ -215,13 +228,14 @@ pub async fn read_grants(db: &LocalDb) -> String {
     }
 
     let (active, spent): (Vec<_>, Vec<_>) = grants.iter().partition(|grant| !grant.is_spent(at));
+    let names = thread_names(db, &grants.iter().collect::<Vec<_>>()).await;
 
     out.push_str(&format!("## Active ({})\n\n", active.len()));
     if active.is_empty() {
         out.push_str("None.\n");
     } else {
         for grant in &active {
-            out.push_str(&render_grant_row(grant, at));
+            out.push_str(&render_grant_row(grant, at, &names));
             out.push('\n');
         }
     }
@@ -229,7 +243,7 @@ pub async fn read_grants(db: &LocalDb) -> String {
     if !spent.is_empty() {
         out.push_str(&format!("\n## Spent ({})\n\n", spent.len()));
         for grant in &spent {
-            out.push_str(&render_grant_row(grant, at));
+            out.push_str(&render_grant_row(grant, at, &names));
             out.push('\n');
         }
     }
@@ -466,7 +480,11 @@ pub async fn read_grant(db: &LocalDb, id: &str) -> String {
         "- Lifetime: {}\n",
         lifetime_label(&grant.lifetime)
     ));
-    out.push_str(&format!("- Constraints: {}\n", constraint_labels(&grant)));
+    let names = thread_names(db, &[&grant]).await;
+    out.push_str(&format!(
+        "- Constraints: {}\n",
+        constraint_labels(&grant, &names)
+    ));
     out.push_str(&format!(
         "- Audience: workspace {}\n",
         grant.audience.workspace_id
@@ -521,4 +539,42 @@ pub async fn read_grant(db: &LocalDb, id: &str) -> String {
         Err(error) => out.push_str(&format!("\nCould not read decisions: {error}\n")),
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grant_uri_id, render_uuid_id, stored_grant_id};
+
+    const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn grant_uuid_renders_as_sixteen_unigram_words() {
+        let rendered = render_uuid_id(UUID);
+        assert_eq!(rendered.split_whitespace().count(), 16);
+        assert_eq!(stored_grant_id(&rendered), UUID);
+    }
+
+    #[test]
+    fn grant_member_segment_is_uri_safe_and_resolves_to_storage_id() {
+        let segment = grant_uri_id(UUID);
+        assert!(!segment.contains(char::is_whitespace));
+        assert_eq!(segment.split('-').count(), 16);
+        assert_eq!(stored_grant_id(&segment), UUID);
+    }
+
+    #[test]
+    fn grant_lookup_accepts_recovered_words_and_legacy_uuid() {
+        let rendered = render_uuid_id(UUID);
+        assert_eq!(
+            stored_grant_id(&rendered.to_uppercase().replace(' ', "-")),
+            UUID
+        );
+        assert_eq!(stored_grant_id(UUID), UUID);
+    }
+
+    #[test]
+    fn historical_non_uuid_ids_remain_addressable() {
+        assert_eq!(render_uuid_id("legacy-grant"), "legacy-grant");
+        assert_eq!(stored_grant_id("legacy-grant"), "legacy-grant");
+    }
 }

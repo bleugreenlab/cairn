@@ -2374,6 +2374,13 @@ async fn render_resource_body(
         CairnResource::ProjectMap { project } => {
             super::project_map::read_project_map(orch, db, &project, &params).await
         }
+        CairnResource::ProjectQueue { project } => {
+            if let Some(error) = reject_query_params("execution queue", &params) {
+                error
+            } else {
+                super::queue::read_project_queue(orch, &project).await
+            }
+        }
         CairnResource::ProjectHome { project } => {
             super::home::read_project_home(db, &project, &params).await
         }

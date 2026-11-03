@@ -465,11 +465,22 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
             required: &[KeySpec::new(
                 "release",
                 KeyType::Bool,
-                "true starts a HELD execution now, without waiting for its gates; recorded as an override with the acting principal",
+                "true starts a HELD execution now, without waiting for its after: gates (the queue's caps still apply); recorded as an override with the acting principal",
             )],
             optional: &[],
             label: "release held execution early",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{release:true}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[KeySpec::new(
+                "start_now",
+                KeyType::Bool,
+                "true starts it at once past the fleet cap and its thread's focus cap. Asks the operator with an authority card unless this thread holds a grant; the start is recorded as an override naming the thread",
+            )],
+            optional: &[],
+            label: "start a held execution now, over every cap (asks the operator)",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/SEQ\",mode:\"patch\",payload:{start_now:true}}]})",
         },
         MutationSpec {
             mode: ChangeMode::Patch,

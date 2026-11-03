@@ -3170,13 +3170,7 @@ async fn record_resume_error(
     let _ = orch.services.emitter.emit("db-change", change);
 }
 
-/// Mint the grant an allowed authority request earns.
-///
-/// The anchors come from the request row and the resume state, never from the
-/// answering surface: a `turn` grant anchors to the turn the run will CONTINUE
-/// in (an approval that expired the instant the agent resumed would authorize
-/// nothing), and a `session` grant anchors to the run's durable session so it
-/// survives a runner restart.
+/// Journal an operator's refusal of an authority request.
 async fn journal_permission_authority_refusal(
     orch: &Orchestrator,
     record: &PermissionRequestRecord,
@@ -3210,6 +3204,13 @@ async fn journal_permission_authority_refusal(
     }
 }
 
+/// Mint the grant an allowed authority request earns.
+///
+/// The anchors come from the request row and the resume state, never from the
+/// answering surface: a `turn` grant anchors to the turn the run will CONTINUE
+/// in (an approval that expired the instant the agent resumed would authorize
+/// nothing), and a `session` grant anchors to the run's durable session so it
+/// survives a runner restart.
 async fn mint_authority_grant(
     orch: &Orchestrator,
     record: &PermissionRequestRecord,
@@ -3268,6 +3269,14 @@ async fn mint_authority_grant(
         },
         constraints,
     };
+    mint_issued_grant(orch, issue).await
+}
+
+/// Persist an issued grant (the tail of [`mint_authority_grant`]).
+async fn mint_issued_grant(
+    orch: &Orchestrator,
+    issue: crate::authorization::GrantIssue,
+) -> Result<(), String> {
     // Grants live in the private database on every path, so what enforcement
     // reads is what the grant list shows and what revocation reaches.
     //

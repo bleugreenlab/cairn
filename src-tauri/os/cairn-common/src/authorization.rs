@@ -27,10 +27,12 @@
 //!
 //! # What v1 enforces
 //!
-//! Three places are wired to policy: [`AuthorityPlace::WorkspaceSettings`],
+//! Four places are wired to policy: [`AuthorityPlace::WorkspaceSettings`],
 //! [`AuthorityPlace::Tool`] with [`ToolKind::McpServer`] at workspace scope,
-//! and [`AuthorityPlace::ExternalAccount`] with [`AuthorityAction::Write`],
-//! which spending a subscription account's usage-reset credit reaches. The
+//! [`AuthorityPlace::ExternalAccount`] with [`AuthorityAction::Write`], which
+//! spending a subscription account's usage-reset credit reaches, and
+//! [`AuthorityPlace::ExecutionQueue`], where a thread moves other threads'
+//! held work (`Write`) or starts its own past every cap (`Run`). The
 //! remaining places and actions exist so the follow-on adapters named in
 //! [`FOLLOW_ON_ADAPTERS`] normalize into this vocabulary rather than inventing
 //! parallel names later; they carry no enforcement today.
@@ -46,6 +48,11 @@ use serde::{Deserialize, Serialize};
 /// MCP tool mutation. Refusing v1 on load is the point rather than a cost: a v1
 /// grant names a server without naming what runs under that name, so honouring
 /// one would let a stale approval authorize an arbitrary command.
+///
+/// A new constraint variant does not bump it: the constraint enum is tagged
+/// and denies unknown fields, so a build that predates a variant already
+/// refuses a grant carrying one. [`AuthorityConstraint::ActingThread`] was
+/// added that way. Bump only when an existing encoding changes meaning.
 ///
 /// [`AuthorityConstraint::ExactAct`] did not bump it. What it changes is the
 /// meaning of one lifetime, `Once`, so its floor lives in the matcher
@@ -143,6 +150,10 @@ pub enum AuthorityPlace {
     HostPath { canonical_path: String },
     /// A canonical `cairn://` resource. Not wired in v1.
     Resource { canonical_uri: String },
+    /// The workspace's execution queue: the fleet's release order and its
+    /// caps, which span every project database. `Write` reorders that line
+    /// across threads; `Run` starts held work past every cap.
+    ExecutionQueue { workspace_id: String },
 }
 
 /// What operation is performed at a place.
@@ -253,6 +264,9 @@ impl AuthorityScope {
             AuthorityPlace::Resource { canonical_uri } => {
                 format!("resource/{}", shorthand_segment(canonical_uri))
             }
+            AuthorityPlace::ExecutionQueue { workspace_id } => {
+                format!("workspace/{}/queue", shorthand_segment(workspace_id))
+            }
         };
         format!("{place}:{}", self.action.as_str())
     }
@@ -269,6 +283,7 @@ impl AuthorityScope {
             AuthorityPlace::ExternalAccount { .. } => "external_account",
             AuthorityPlace::HostPath { .. } => "host_path",
             AuthorityPlace::Resource { .. } => "resource",
+            AuthorityPlace::ExecutionQueue { .. } => "execution_queue",
         }
     }
 }
@@ -499,6 +514,11 @@ pub struct AuthorityFacts {
     /// (for a delete, the entry it would remove).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_config: Option<McpConfigFingerprint>,
+    /// The id of the thread the asking run acts for, resolved from the run's
+    /// own job (never from anything the run wrote). Set on an execution-queue
+    /// request, where a grant is bound to one thread.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acting_thread: Option<String>,
     /// The one concrete act this request performs, which a `Once` grant binds
     /// to. See [`ActDigest`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,6 +557,12 @@ impl AuthorityRequest {
         self
     }
 
+    /// Attach the thread the asking run acts for.
+    pub fn with_acting_thread(mut self, thread_id: impl Into<String>) -> Self {
+        self.facts.acting_thread = Some(thread_id.into());
+        self
+    }
+
     /// Attach the identity of the concrete act.
     pub fn with_act(mut self, act: ActDigest) -> Self {
         self.facts.act = Some(act);
@@ -560,6 +586,17 @@ impl AuthorityRequest {
                 AuthorityAction::Write
             )
         )
+    }
+
+    /// Whether this request acts on the execution queue, and therefore may
+    /// only be authorized by a grant bound to the thread asking.
+    ///
+    /// A thread is not a principal yet: a standing grant otherwise binds to
+    /// no one, and "let judgment reorder the fleet" must not become "let any
+    /// run reorder the fleet". The [`AuthorityConstraint::ActingThread`]
+    /// constraint carries that binding until a thread principal exists.
+    pub fn requires_thread_binding(&self) -> bool {
+        matches!(self.scope.place, AuthorityPlace::ExecutionQueue { .. })
     }
 }
 
@@ -588,6 +625,12 @@ pub enum AuthorityConstraint {
     /// configuration, enabled state, scope, or server name all change the
     /// digest and re-prompt.
     McpConfig { fingerprint: McpConfigFingerprint },
+    /// Only a request from a run acting for this thread (by id).
+    ///
+    /// The operator approves a queue act for the thread named on the card,
+    /// so the approval must not answer for another thread that asks for the
+    /// same scope, whatever its lifetime.
+    ActingThread { thread_id: String },
     /// Only this exact act.
     ///
     /// Attached to `Once` grants only. A card shows one act, and Once answers
@@ -618,6 +661,14 @@ impl AuthorityConstraint {
                 // constraint exists to prevent.
                 request.facts.mcp_config.as_ref() == Some(fingerprint)
             }
+            AuthorityConstraint::ActingThread { thread_id } => {
+                if !request.requires_thread_binding() {
+                    return true;
+                }
+                // A request that names no thread matches no thread: an absent
+                // fact is never a wildcard.
+                request.facts.acting_thread.as_ref() == Some(thread_id)
+            }
             // An act is never vacuous: a request that cannot name its act is
             // not the act the operator approved.
             AuthorityConstraint::ExactAct { digest } => request.facts.act.as_ref() == Some(digest),
@@ -626,6 +677,10 @@ impl AuthorityConstraint {
 
     fn is_mcp_config(&self) -> bool {
         matches!(self, AuthorityConstraint::McpConfig { .. })
+    }
+
+    fn is_acting_thread(&self) -> bool {
+        matches!(self, AuthorityConstraint::ActingThread { .. })
     }
 
     fn is_exact_act(&self) -> bool {
@@ -669,6 +724,9 @@ impl AuthorityConstraintSet {
     ///   does not also approve removing it;
     /// - for an MCP write, the configuration identity, so the approval covers
     ///   that server and not merely its name;
+    /// - for an execution-queue act, the thread that asked, whatever the
+    ///   lifetime: a standing approval is "let judgment do this", never "let
+    ///   any run do this";
     /// - for `Once`, the act itself, so the single use is spent only by the act
     ///   the card described.
     ///
@@ -689,6 +747,12 @@ impl AuthorityConstraintSet {
             })?;
             constraints.push(AuthorityConstraint::McpConfig { fingerprint });
         }
+        if request.requires_thread_binding() {
+            let thread_id = request.facts.acting_thread.clone().ok_or_else(|| {
+                "this queue approval does not name the thread it would authorize".to_string()
+            })?;
+            constraints.push(AuthorityConstraint::ActingThread { thread_id });
+        }
         if lifetime == AuthorityLifetimeKind::Once {
             let digest = request.facts.act.clone().ok_or_else(|| {
                 "this approval does not name the exact act it would authorize once".to_string()
@@ -696,6 +760,16 @@ impl AuthorityConstraintSet {
             constraints.push(AuthorityConstraint::ExactAct { digest });
         }
         Ok(Self::new(constraints))
+    }
+
+    /// The thread an `ActingThread` constraint binds, if the set has one.
+    pub fn acting_thread(&self) -> Option<&str> {
+        self.constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                AuthorityConstraint::ActingThread { thread_id } => Some(thread_id.as_str()),
+                _ => None,
+            })
     }
 
     /// Whether the set binds one exact act.
@@ -730,6 +804,17 @@ impl AuthorityConstraintSet {
                 .constraints
                 .iter()
                 .any(AuthorityConstraint::is_mcp_config)
+        {
+            return false;
+        }
+        // The same floor for the execution queue: a grant that names no
+        // thread says nothing about who may move or start work, so it
+        // authorizes no queue act at all.
+        if request.requires_thread_binding()
+            && !self
+                .constraints
+                .iter()
+                .any(AuthorityConstraint::is_acting_thread)
         {
             return false;
         }
@@ -1166,6 +1251,13 @@ pub enum AuthorityReason {
     /// An outside client of Cairn's served API spending a remote provider's
     /// account. Only a standing grant bound to that client allows it.
     ServedApiRemoteUse,
+    /// A thread moving held work across threads in the fleet's release order.
+    /// It changes when other threads' work starts, which is beyond what a
+    /// thread's own order (its own children, in its own places) may do.
+    QueueReorderAcrossThreads,
+    /// A thread starting held work past every cap. The caps constrain what a
+    /// thread starts itself (tenet 1319), so only the operator may skip them.
+    QueueStartNow,
     /// Within the actor's established authority; no blast radius expansion.
     WithinExistingAuthority,
     /// Structurally invalid or an invariant violation. Approval cannot legalize
@@ -1183,6 +1275,8 @@ impl AuthorityReason {
             AuthorityReason::WorkspaceToolCapability => "workspace_tool_capability",
             AuthorityReason::ExternalAccountWrite => "external_account_write",
             AuthorityReason::ServedApiRemoteUse => "served_api_remote_use",
+            AuthorityReason::QueueReorderAcrossThreads => "queue_reorder_across_threads",
+            AuthorityReason::QueueStartNow => "queue_start_now",
             AuthorityReason::WithinExistingAuthority => "within_existing_authority",
             AuthorityReason::StructurallyInvalid => "structurally_invalid",
         }
@@ -2066,6 +2160,22 @@ mod mcp_constraint_tests {
     }
 
     #[test]
+    fn a_thread_constraint_says_nothing_about_an_mcp_write() {
+        let constraints = AuthorityConstraintSet::new(vec![
+            AuthorityConstraint::MutationModes {
+                modes: vec![AuthorityMutation::Create],
+            },
+            AuthorityConstraint::McpConfig {
+                fingerprint: fingerprint("config-a"),
+            },
+            AuthorityConstraint::ActingThread {
+                thread_id: "t-judgment".to_string(),
+            },
+        ]);
+        assert!(constraints.covers(&mcp_write(AuthorityMutation::Create, Some("config-a"))));
+    }
+
+    #[test]
     fn a_fingerprint_round_trips_and_shows_only_its_digest() {
         let constraints = bound("deadbeefcafebabe0123", AuthorityMutation::Create);
         let json = serde_json::to_string(&constraints).unwrap();
@@ -2074,5 +2184,121 @@ mod mcp_constraint_tests {
             fingerprint("deadbeefcafebabe0123").short(),
             "sha256:v1:deadbeefcafe"
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_constraint_tests {
+    use super::*;
+
+    fn queue(action: AuthorityAction, thread: Option<&str>) -> AuthorityRequest {
+        let request = AuthorityRequest::new(
+            AuthorityScope::new(
+                AuthorityPlace::ExecutionQueue {
+                    workspace_id: "default".to_string(),
+                },
+                action,
+            ),
+            AuthorityMutation::Update,
+            "move cairn/5901 to fleet 1st".to_string(),
+        );
+        match thread {
+            Some(thread) => request.with_acting_thread(thread),
+            None => request,
+        }
+    }
+
+    fn bound(thread: &str) -> AuthorityConstraintSet {
+        AuthorityConstraintSet::new(vec![
+            AuthorityConstraint::MutationModes {
+                modes: vec![AuthorityMutation::Update],
+            },
+            AuthorityConstraint::ActingThread {
+                thread_id: thread.to_string(),
+            },
+        ])
+    }
+
+    #[test]
+    fn the_queue_place_has_its_own_shorthand_and_kind() {
+        let scope = queue(AuthorityAction::Write, None).scope;
+        assert_eq!(scope.shorthand(), "workspace/default/queue:write");
+        assert_eq!(scope.place_kind(), "execution_queue");
+        assert_eq!(
+            queue(AuthorityAction::Run, None).scope.shorthand(),
+            "workspace/default/queue:run"
+        );
+    }
+
+    #[test]
+    fn the_grant_bound_to_a_thread_covers_that_threads_request() {
+        for action in [AuthorityAction::Write, AuthorityAction::Run] {
+            assert!(bound("t-judgment").covers(&queue(action, Some("t-judgment"))));
+        }
+    }
+
+    #[test]
+    fn an_unbound_grant_never_covers_a_queue_request() {
+        // The structural floor: a grant that names no thread, minted by a
+        // path that forgot the binding, authorizes nothing here.
+        let request = queue(AuthorityAction::Write, Some("t-judgment"));
+        assert!(!AuthorityConstraintSet::default().covers(&request));
+        let mode_only = AuthorityConstraintSet::new(vec![AuthorityConstraint::MutationModes {
+            modes: vec![AuthorityMutation::Update],
+        }]);
+        assert!(!mode_only.covers(&request));
+    }
+
+    #[test]
+    fn another_threads_id_does_not_match() {
+        assert!(!bound("t-judgment").covers(&queue(AuthorityAction::Write, Some("t-ui"))));
+        assert!(!bound("t-judgment").covers(&queue(AuthorityAction::Run, Some("t-ui"))));
+    }
+
+    #[test]
+    fn a_request_that_names_no_thread_matches_nothing() {
+        assert!(!bound("t-judgment").covers(&queue(AuthorityAction::Write, None)));
+    }
+
+    #[test]
+    fn the_thread_constraint_is_vacuous_on_other_places() {
+        let settings = AuthorityRequest::new(
+            AuthorityScope::new(
+                AuthorityPlace::WorkspaceSettings {
+                    workspace_id: "default".to_string(),
+                    section: "backends".to_string(),
+                },
+                AuthorityAction::Write,
+            ),
+            AuthorityMutation::Update,
+            "change workspace settings section 'backends'".to_string(),
+        );
+        assert!(!settings.requires_thread_binding());
+        assert!(bound("t-judgment").covers(&settings));
+    }
+
+    #[test]
+    fn the_thread_constraint_and_fact_round_trip() {
+        let constraints = bound("t-judgment");
+        let json = serde_json::to_string(&constraints).unwrap();
+        assert!(json.contains("\"constraint\":\"acting_thread\""), "{json}");
+        assert_eq!(AuthorityConstraintSet::parse(&json).unwrap(), constraints);
+
+        let request = queue(AuthorityAction::Run, Some("t-judgment"));
+        let json = serde_json::to_string(&request).unwrap();
+        let back: AuthorityRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, request);
+        // A request without the fact keeps today's encoding.
+        let settings_facts = serde_json::to_value(AuthorityFacts::default()).unwrap();
+        assert_eq!(settings_facts, serde_json::json!({}));
+    }
+
+    #[test]
+    fn the_queue_reasons_have_stable_codes() {
+        assert_eq!(
+            AuthorityReason::QueueReorderAcrossThreads.as_str(),
+            "queue_reorder_across_threads"
+        );
+        assert_eq!(AuthorityReason::QueueStartNow.as_str(), "queue_start_now");
     }
 }

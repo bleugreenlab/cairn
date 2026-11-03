@@ -116,12 +116,13 @@ pub enum GateEvidenceState {
 /// words on every surface. `place` is the execution's place in line on this
 /// cap, `None` until the queue has numbered it. `placed_by` names who moved
 /// this hold ahead of where it was filed: a thread's own reorder (cairn/5848)
-/// or `the operator`'s fleet move (cairn/5895), `None` for a hold in the place
-/// it was filed into. `pinned` puts this hold in the queue's ordered prefix
-/// ahead of the rotation, so a thread's own order no longer moves it; it ends
-/// when the hold latches. `frozen` says the pin is not anyone's placement: an
-/// operator move landed behind this hold, and pinned it where the page showed
-/// it (cairn/5943).
+/// or a fleet move by `the operator` (cairn/5895) or by a granted thread
+/// (cairn/5942), `None` for a hold in the place it was filed into. `pin` says
+/// who fixed this hold's place with a fleet move ([`Pin`]), so a thread's own
+/// order no longer moves it; it ends when the hold latches. A pinned hold is
+/// in the queue's ordered prefix ahead of the rotation (cairn/5943), placed by
+/// its mover or, `kind: Frozen`, held where it stood when a move landed
+/// behind it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "cap", rename_all = "camelCase")]
 pub enum CapacityHold {
@@ -136,10 +137,8 @@ pub enum CapacityHold {
         place: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placed_by: Option<String>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        pinned: bool,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        frozen: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin: Option<Pin>,
     },
     /// The thread focus cap: the thread's open children, by issue number,
     /// against its limit.
@@ -152,11 +151,79 @@ pub enum CapacityHold {
         place: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placed_by: Option<String>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        pinned: bool,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        frozen: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pin: Option<Pin>,
     },
+}
+
+/// Who fixed a held execution's place in the fleet's order, and how.
+///
+/// A pin is written by a fleet move (`execution::gates::reorder`), whoever
+/// makes it. It keeps the row out of its thread's own order, and it ranks:
+/// the operator outranks a thread, so a granted thread's move never displaces
+/// a row the operator pinned, while an operator move overwrites a thread's
+/// pin. In JSON, `{"by":"operator"}`, `{"by":"thread","thread":"judgment"}`,
+/// or with `"kind":"frozen"` for a row pinned only because a move landed
+/// behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    #[serde(flatten)]
+    pub by: PinBy,
+    #[serde(default, skip_serializing_if = "PinKind::is_placed")]
+    pub kind: PinKind,
+}
+
+impl Pin {
+    /// A row its mover deliberately placed.
+    pub fn placed(by: PinBy) -> Self {
+        Self {
+            by,
+            kind: PinKind::Placed,
+        }
+    }
+
+    /// Whether the operator's move set it, placed or frozen.
+    pub fn is_operator(&self) -> bool {
+        matches!(self.by, PinBy::Operator)
+    }
+}
+
+/// Who made the move that pinned a row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "by", rename_all = "camelCase")]
+pub enum PinBy {
+    /// The operator, from the queue page.
+    Operator,
+    /// A thread holding the operator's grant to move work across threads.
+    Thread { thread: String },
+}
+
+impl PinBy {
+    /// `the operator`, or the thread's name: who a place line says placed it.
+    pub fn name(&self) -> &str {
+        match self {
+            PinBy::Operator => "the operator",
+            PinBy::Thread { thread } => thread,
+        }
+    }
+}
+
+/// Why a row is pinned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PinKind {
+    /// Its mover put it here.
+    #[default]
+    Placed,
+    /// It holds the place it had when a move landed behind it, so that move's
+    /// position stays exact; it was never itself moved.
+    Frozen,
+}
+
+impl PinKind {
+    fn is_placed(&self) -> bool {
+        matches!(self, PinKind::Placed)
+    }
 }
 
 impl CapacityHold {
@@ -184,28 +251,27 @@ impl CapacityHold {
         }
     }
 
+    pub fn pin(&self) -> Option<&Pin> {
+        match self {
+            Self::Fleet { pin, .. } | Self::Thread { pin, .. } => pin.as_ref(),
+        }
+    }
+
+    pub fn set_pin(&mut self, to: Option<Pin>) {
+        match self {
+            Self::Fleet { pin, .. } | Self::Thread { pin, .. } => *pin = to,
+        }
+    }
+
+    /// Whether a fleet move fixed its place, so its thread's order leaves it.
     pub fn pinned(&self) -> bool {
-        match self {
-            Self::Fleet { pinned, .. } | Self::Thread { pinned, .. } => *pinned,
-        }
+        self.pin().is_some()
     }
 
-    pub fn set_pinned(&mut self, to: bool) {
-        match self {
-            Self::Fleet { pinned, .. } | Self::Thread { pinned, .. } => *pinned = to,
-        }
-    }
-
-    pub fn frozen(&self) -> bool {
-        match self {
-            Self::Fleet { frozen, .. } | Self::Thread { frozen, .. } => *frozen,
-        }
-    }
-
-    pub fn set_frozen(&mut self, to: bool) {
-        match self {
-            Self::Fleet { frozen, .. } | Self::Thread { frozen, .. } => *frozen = to,
-        }
+    /// Whether the operator's move fixed its place: a place no granted
+    /// thread's move may displace.
+    pub fn operator_pinned(&self) -> bool {
+        self.pin().is_some_and(Pin::is_operator)
     }
 }
 
@@ -243,6 +309,21 @@ pub struct ReleaseOverride {
     /// The capacity caps the start skipped (`fleet`, `thread`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
+    /// A thread's Start now under a grant the operator gave it, rather than
+    /// the operator's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted: Option<GrantedStart>,
+}
+
+/// The grant a thread's Start now rested on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantedStart {
+    /// The thread that started it.
+    pub thread: String,
+    /// The authorization journal's decision id, which cites the grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
 }
 
 /// An execution's `after:` gates, rendered for display.
@@ -693,5 +774,74 @@ mod tests {
         let t: TriggerType = serde_json::from_str("\"skill_called\"").unwrap();
         assert_eq!(t, TriggerType::SkillCalled);
         assert_eq!(serde_json::to_string(&t).unwrap(), "\"skill_called\"");
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    fn fleet(pin: Option<Pin>) -> CapacityHold {
+        CapacityHold::Fleet {
+            running: 6,
+            limit: 6,
+            unplaced: 0,
+            place: Some(1),
+            placed_by: None,
+            pin,
+        }
+    }
+
+    #[test]
+    fn a_pin_reads_as_who_placed_it() {
+        let operator = serde_json::to_value(fleet(Some(Pin::placed(PinBy::Operator)))).unwrap();
+        assert_eq!(operator["pin"], serde_json::json!({"by": "operator"}));
+        let thread = serde_json::to_value(fleet(Some(Pin::placed(PinBy::Thread {
+            thread: "judgment".to_string(),
+        }))))
+        .unwrap();
+        assert_eq!(
+            thread["pin"],
+            serde_json::json!({"by": "thread", "thread": "judgment"})
+        );
+        let frozen = Pin {
+            by: PinBy::Operator,
+            kind: PinKind::Frozen,
+        };
+        assert_eq!(
+            serde_json::to_value(fleet(Some(frozen)))
+                .unwrap()
+                .get("pin")
+                .cloned(),
+            Some(serde_json::json!({"by": "operator", "kind": "frozen"}))
+        );
+        assert!(serde_json::to_value(fleet(None))
+            .unwrap()
+            .get("pin")
+            .is_none());
+    }
+
+    #[test]
+    fn every_pin_round_trips_and_ranks() {
+        for pin in [
+            Pin::placed(PinBy::Operator),
+            Pin::placed(PinBy::Thread {
+                thread: "judgment".to_string(),
+            }),
+            Pin {
+                by: PinBy::Thread {
+                    thread: "ui".to_string(),
+                },
+                kind: PinKind::Frozen,
+            },
+        ] {
+            let hold = fleet(Some(pin.clone()));
+            let back: CapacityHold =
+                serde_json::from_str(&serde_json::to_string(&hold).unwrap()).unwrap();
+            assert_eq!(back, hold);
+            assert!(back.pinned());
+            assert_eq!(back.operator_pinned(), pin.is_operator());
+        }
+        assert!(!fleet(None).pinned());
     }
 }

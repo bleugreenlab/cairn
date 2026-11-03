@@ -426,6 +426,9 @@ fn held_filing_summary(
 pub(crate) enum GatePatch {
     /// `{release: true}`: start now, recording who decided not to wait.
     Release,
+    /// `{start_now: true}`: start now past every cap, the queue's included,
+    /// on a grant the operator gave the asking thread (cairn/5942).
+    StartNow,
     /// `{after: [...]}`: the full replacement gate list.
     Replace(Vec<crate::routes::TriggerClause>),
 }
@@ -463,8 +466,9 @@ pub(crate) async fn patch_execution_gates(
             }
             let principal = acting_principal(orch, request).await;
             // Skips the authored `after:` gates only: a cap governs what a
-            // thread starts itself (tenet 1319), so a release written through
-            // a resource never skips one, whoever writes it.
+            // thread starts itself (tenet 1319), so `release:true` never skips
+            // one, whoever writes it. Skipping the caps is `start_now:true`,
+            // which only the operator's approval allows.
             let outcome = crate::execution::gates::sweep::release(
                 orch,
                 &execution_id,
@@ -499,6 +503,70 @@ pub(crate) async fn patch_execution_gates(
                 }
                 crate::execution::gates::sweep::ReleaseOutcome::NotHeld => Err(format!(
                     "{label} was released by someone else first; it is already running"
+                )),
+            }
+        }
+        GatePatch::StartNow => {
+            use crate::execution::gates::sweep;
+            if dry_run {
+                return Ok(format!(
+                    "Would start {label} now, past every cap (asks the operator unless this \
+                     thread holds a grant)"
+                ));
+            }
+            let granted = crate::resources::mutations::authorize_start_now(
+                orch,
+                request,
+                project_key,
+                number,
+                exec_seq,
+            )
+            .await?;
+            let principal = acting_principal(orch, request).await;
+            let thread = granted.thread.clone();
+            let outcome = sweep::release(
+                orch,
+                &execution_id,
+                sweep::ReleaseCause::Override {
+                    principal,
+                    scope: sweep::OverrideScope::Everything {
+                        by: sweep::CapSkipAuthority::Granted {
+                            thread: granted.thread,
+                            decision: granted.decision,
+                        },
+                    },
+                },
+            )
+            .await?;
+            match outcome {
+                sweep::ReleaseOutcome::Released => {
+                    let ids = vec![execution_id.clone()];
+                    let census = owning_db
+                        .read(move |conn| {
+                            let ids = ids.clone();
+                            Box::pin(async move {
+                                crate::execution::gates::census::census_for_executions_conn(
+                                    conn, &ids,
+                                )
+                                .await
+                            })
+                        })
+                        .await
+                        .ok()
+                        .and_then(|mut found| found.remove(&execution_id));
+                    let line = census
+                        .map(|census| format!(": {}", census.summary))
+                        .unwrap_or_default();
+                    Ok(format!(
+                        "Started {label} now under the operator's grant{line}. Recorded as an \
+                         override by {thread}."
+                    ))
+                }
+                sweep::ReleaseOutcome::NotHeld => Err(format!(
+                    "{label} was released by someone else first; it is already running"
+                )),
+                sweep::ReleaseOutcome::HeldByCap(_) => Err(format!(
+                    "a granted start of {label} was held by a cap it should have skipped"
                 )),
             }
         }
@@ -712,7 +780,7 @@ async fn load_agent_snapshot(
 }
 
 /// Resolve `execution_id` for `(project_key, number, exec_seq)`.
-async fn resolve_execution_id(
+pub(crate) async fn resolve_execution_id(
     db: &LocalDb,
     project_key: &str,
     number: i32,

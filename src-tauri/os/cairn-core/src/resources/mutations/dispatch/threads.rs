@@ -140,6 +140,15 @@ async fn acting_thread_id(
             .ok()
             .map(|thread| thread.id);
     }
+    run_thread_id(orch, request).await
+}
+
+/// The thread that owns the asking run's own job, resolved from the run's
+/// context (never from anything the request body says).
+pub(super) async fn run_thread_id(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Option<String> {
     let (context, context_db) =
         crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
             .await
@@ -243,6 +252,44 @@ pub(super) async fn issue_parent_thread(
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+/// The thread a write acts for, by id and name, if it acts for one.
+pub(super) async fn acting_thread(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project: &str,
+) -> Option<(String, String)> {
+    let (db, project_id) = project_id(orch, project).await.ok()?;
+    let acting = acting_thread_id(orch, request, project, &db, &project_id).await?;
+    // The asking thread may live in another project (a thread in A moving B's
+    // queued issues), so its name is looked up wherever the thread is, not in
+    // the target's list. The id is what a grant matches; the name is display.
+    let mut name = None;
+    for db in orch.db.all_dbs().await {
+        if let Ok(Some(found)) = db
+            .query_opt_text("SELECT name FROM threads WHERE id = ?1", (acting.clone(),))
+            .await
+        {
+            name = Some(found);
+            break;
+        }
+    }
+    let name = name.unwrap_or_else(|| acting.clone());
+    Some((acting, name))
+}
+
+/// The title of issue `number` of `project`, for a prompt's summary.
+pub(super) async fn issue_title(orch: &Orchestrator, project: &str, number: i32) -> Option<String> {
+    let db = orch.db.for_project(project).await;
+    db.query_opt_text(
+        "SELECT i.title FROM issues i JOIN projects p ON p.id = i.project_id
+          WHERE p.key = ?1 AND i.number = ?2",
+        (cairn_common::uri::canonical_project(project), number),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 /// The name of the thread a write acts in, if it acts in one.

@@ -323,6 +323,9 @@ pub fn census_with(
                 .collect();
             // A thread's own reorder moved it ahead (cairn/5848): said once,
             // on hover, never on the terse line.
+            // `placed_by` names a deliberate placement only: a row a fleet move
+            // froze (`Pin{kind: Frozen}`, cairn/5943) keeps whatever placer it
+            // already had, and the move records itself on the moved row alone.
             if let Some(by) = unmet_caps
                 .iter()
                 .find_map(|entry| entry.hold.as_ref().and_then(CapacityHold::placed_by))
@@ -410,15 +413,23 @@ fn summarize(
         };
     }
     match release_override {
-        Some(release) if release.operator => {
-            let skipped = match release.skipped.as_slice() {
-                [] => String::new(),
-                [one] => format!(", skipping the {one} cap"),
-                many => format!(", skipping the {} caps", many.join(" and ")),
-            };
+        Some(release) if release.granted.is_some() => {
+            let thread = release
+                .granted
+                .as_ref()
+                .map(|granted| granted.thread.as_str())
+                .unwrap_or_default();
             format!(
-                "started now by the operator ({}){skipped}",
-                release.principal
+                "started now by {thread} under the operator's grant ({}){}",
+                release.principal,
+                skipped_phrase(&release.skipped)
+            )
+        }
+        Some(release) if release.operator => {
+            format!(
+                "started now by the operator ({}){}",
+                release.principal,
+                skipped_phrase(&release.skipped)
             )
         }
         Some(release) if waiting.is_empty() => {
@@ -430,6 +441,15 @@ fn summarize(
             waiting.join("; ")
         ),
         None => "released: every gate met".to_string(),
+    }
+}
+
+/// `, skipping the fleet and thread caps`: what a Start now skipped.
+fn skipped_phrase(skipped: &[String]) -> String {
+    match skipped {
+        [] => String::new(),
+        [one] => format!(", skipping the {one} cap"),
+        many => format!(", skipping the {} caps", many.join(" and ")),
     }
 }
 
@@ -472,6 +492,9 @@ fn parse_release_override(json: &str) -> ReleaseOverride {
                     .collect()
             })
             .unwrap_or_default(),
+        granted: value
+            .get("granted")
+            .and_then(|granted| serde_json::from_value(granted.clone()).ok()),
     }
 }
 
@@ -1260,6 +1283,7 @@ mod tests {
                 at: Some(10),
                 operator: false,
                 skipped: Vec::new(),
+                granted: None,
             })
         );
         assert_eq!(
@@ -1303,8 +1327,7 @@ mod tests {
             unplaced: 1,
             place: Some(3),
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         };
         let thread = CapacityHold::Thread {
             thread: "harness".into(),
@@ -1312,8 +1335,7 @@ mod tests {
             limit: 5,
             place: Some(1),
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         };
         let fleet_gate = capacity_gate("gf", FLEET_SLOT_FACT, 1000, Some(&fleet));
         let thread_gate = capacity_gate("gt", THREAD_FOCUS_FACT, 1001, Some(&thread));
@@ -1384,8 +1406,7 @@ mod tests {
             unplaced: 0,
             place: None,
             placed_by: None,
-            pinned: false,
-            frozen: false,
+            pin: None,
         };
         let fresh = read(&[capacity_gate(
             "gn",

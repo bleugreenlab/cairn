@@ -1007,14 +1007,22 @@ async fn handle_write_attempt(
         // be attributable to someone, so a request with no resolvable run is
         // refused rather than written.
         let Some(actor) = crate::authorization::resolve_actor(orch, request).await else {
-            let index = authority_requests[0].0;
-            return deny(
-                index,
-                "Denied: changing workspace settings or workspace MCP servers is a named \
-                 authority boundary and requires an authenticated run to adjudicate. Use \
-                 scope:\"project\" for the project's own .cairn/config.yaml."
+            let (index, first) = &authority_requests[0];
+            let message = match first {
+                // A queue act is a thread's to ask for; the operator's own
+                // move and Start now are on the queue page.
+                Ok(first) if first.requires_thread_binding() => format!(
+                    "Denied: to {} is a named authority boundary, and only a run acting for a \
+                     thread can ask the operator for it. The operator moves held work and starts \
+                     it now from Settings → Queue.",
+                    first.summary
+                ),
+                _ => "Denied: changing workspace settings or workspace MCP servers is a named \
+                     authority boundary and requires an authenticated run to adjudicate. Use \
+                     scope:\"project\" for the project's own .cairn/config.yaml."
                     .to_string(),
-            );
+            };
+            return deny(*index, message);
         };
         // The fence policy answers only "is there anyone to ask". An
         // unresolvable policy is not evidence that nobody is there — a run

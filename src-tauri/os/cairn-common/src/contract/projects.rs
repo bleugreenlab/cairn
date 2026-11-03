@@ -100,6 +100,34 @@ pub(crate) const PROJECT_CODEMAP_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const PROJECT_QUEUE_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectQueue,
+    uri_template: "cairn://p/{project}/queue",
+    name: "Execution queue",
+    description: "The fleet's execution queue: every execution the caps hold, across every project and thread in the workspace, in the order the fleet releases them (the same list as Settings → Queue). Each row shows its place, its issue (project-qualified), its thread, and who placed it there when someone moved it (`placed by the operator`, `placed by judgment`). Issue numbers in a write resolve in this project. Patching it moves held work to a new place in the fleet's release order, across threads. That asks the operator with an authority card unless this thread holds a grant (cairn://grants). A granted move pins the row so its thread's own order leaves it, and never displaces a row the operator placed. To order only your own thread's children, patch `<thread>/queue` instead; that needs no grant.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[],
+        optional: &[
+            KeySpec::new(
+                "move",
+                KeyType::Object,
+                "{issue:N | execution:ID, position:K}: move one held execution to fleet place K (1-based). Exactly one of move and order",
+            ),
+            KeySpec::new(
+                "order",
+                KeyType::Array,
+                "issue numbers (or {execution:ID}) that take fleet places 1…n in this order. Exactly one of move and order",
+            ),
+        ],
+        label: "move held work across threads (asks the operator unless granted)",
+        example: "write({changes:[{target:\"cairn:@/queue\",mode:\"patch\",payload:{move:{issue:5901,position:1}}}]}) | write({changes:[{target:\"cairn:@/queue\",mode:\"patch\",payload:{order:[5901,5903]}}]})",
+    }],
+};
+
 pub(crate) const PROJECT_HOME_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ProjectHome,
     uri_template: "cairn://p/{project}/home",

@@ -546,6 +546,12 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "map"] => Some(CairnResource::ProjectMap {
             project: canonical_project(project),
         }),
+        // Must precede the thread arm below: a literal `queue` segment names
+        // the fleet's queue, not a thread of that name (a thread's own queue
+        // is `{project}/{thread}/queue`).
+        [PROJECT_SCOPE, project, "queue"] => Some(CairnResource::ProjectQueue {
+            project: canonical_project(project),
+        }),
         [PROJECT_SCOPE, project, "home"] => Some(CairnResource::ProjectHome {
             project: canonical_project(project),
         }),

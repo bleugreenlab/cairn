@@ -35,6 +35,7 @@ pub(crate) mod posts;
 mod progress;
 mod project;
 mod project_map;
+mod queue;
 mod read;
 #[cfg(test)]
 mod read_contract_tests;

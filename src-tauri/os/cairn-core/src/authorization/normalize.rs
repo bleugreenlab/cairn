@@ -283,6 +283,135 @@ pub fn usage_reset_spend(
     }))
 }
 
+/// The execution queue's one place in this workspace.
+fn execution_queue(workspace_id: &str, action: AuthorityAction) -> AuthorityScope {
+    AuthorityScope::new(
+        AuthorityPlace::ExecutionQueue {
+            workspace_id: workspace_id.to_string(),
+        },
+        action,
+    )
+}
+
+/// `cairn://p/<project>/queue` patch by a thread → `ExecutionQueue + Write`,
+/// bound to the thread asking.
+///
+/// `thread_id` is the asking run's own thread, resolved from its job, and is
+/// what a grant matches. The summary names every move, where it lands, and
+/// whose work it passes, from the line as it read when the request was
+/// derived; it is descriptive only, so live places in it are safe. The act a
+/// once grant binds is `moves` alone, the resolved inputs: each moved
+/// execution and the position it asked for, never the live places in `plan`.
+pub(crate) fn queue_move_request(
+    workspace_id: &str,
+    thread_id: &str,
+    thread_name: &str,
+    moves: &[(String, usize)],
+    plan: &[crate::execution::gates::reorder::PlannedMove],
+) -> AuthorityRequest {
+    use crate::execution::gates::census::ordinal;
+    let phrases: Vec<String> = plan
+        .iter()
+        .map(|planned| {
+            let what = match &planned.title {
+                Some(title) => format!("{} '{title}'", planned.label),
+                None => planned.label.clone(),
+            };
+            if planned.from == planned.to {
+                return format!("keep {what} at fleet {}", ordinal(planned.to));
+            }
+            let passing = match planned.passes.as_slice() {
+                [] => String::new(),
+                threads => format!(
+                    ", {} work from {}",
+                    if planned.to < planned.from {
+                        "ahead of"
+                    } else {
+                        "behind"
+                    },
+                    join_and(threads)
+                ),
+            };
+            format!(
+                "move {what} from fleet {} to {}{passing}",
+                ordinal(planned.from),
+                ordinal(planned.to)
+            )
+        })
+        .collect();
+    AuthorityRequest::new(
+        execution_queue(workspace_id, AuthorityAction::Write),
+        AuthorityMutation::Update,
+        format!("{} ({thread_name} asks)", phrases.join("; ")),
+    )
+    .with_acting_thread(thread_id)
+    .with_act(ActDigest::of("queue.move", |encoder| {
+        let executions: Vec<String> = moves.iter().map(|(id, _)| id.clone()).collect();
+        let positions: Vec<String> = moves.iter().map(|(_, at)| at.to_string()).collect();
+        encoder.sequence("executions", &executions);
+        encoder.sequence("positions", &positions);
+    }))
+}
+
+/// A held execution's `{start_now:true}` by a thread → `ExecutionQueue +
+/// Run`, bound to the thread asking.
+///
+/// Always the boundary, whether or not a cap holds the execution right now,
+/// because the act is "skip every cap". The summary names what starts, the
+/// caps it skips with their stored counts, and what a standing grant would
+/// let the thread do.
+pub(crate) fn start_now_request(
+    workspace_id: &str,
+    thread_id: &str,
+    thread_name: &str,
+    execution_id: &str,
+    execution: &str,
+    holds: &[crate::models::CapacityHold],
+) -> AuthorityRequest {
+    let caps: Vec<String> = holds
+        .iter()
+        .map(|hold| match hold {
+            crate::models::CapacityHold::Fleet { running, limit, .. } => {
+                format!("the fleet cap ({running}/{limit} running)")
+            }
+            crate::models::CapacityHold::Thread {
+                thread,
+                open,
+                limit,
+                ..
+            } => format!(
+                "{thread}'s focus cap ({} of {limit} children open)",
+                open.len()
+            ),
+        })
+        .collect();
+    let skipping = match caps.as_slice() {
+        [] => "; no cap holds it at this moment, but a start now skips every cap".to_string(),
+        caps => format!(", skipping {}", join_and(caps)),
+    };
+    AuthorityRequest::new(
+        execution_queue(workspace_id, AuthorityAction::Run),
+        AuthorityMutation::Update,
+        format!(
+            "start {execution} now{skipping} ({thread_name} asks). A standing grant lets \
+             {thread_name} start its held work past every cap whenever it asks."
+        ),
+    )
+    .with_acting_thread(thread_id)
+    .with_act(ActDigest::of("queue.start_now", |encoder| {
+        encoder.field("execution", execution_id);
+    }))
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +497,99 @@ mod tests {
             new.summary
         );
         assert!(again.summary.contains("acc_1"), "{}", again.summary);
+    }
+
+    /// A queue act names one workspace place per action, bound to the asking
+    /// thread, and its summary says what moves and whose work it passes.
+    #[test]
+    fn a_queue_move_names_the_move_and_whose_work_it_passes() {
+        use crate::execution::gates::reorder::PlannedMove;
+        let plan = [PlannedMove {
+            label: "cairn/5901".to_string(),
+            title: Some("Fix the thing".to_string()),
+            from: 14,
+            to: 1,
+            passes: vec!["harness".to_string(), "ui".to_string()],
+        }];
+        let request = |moves: &[(&str, usize)], plan: &[PlannedMove]| {
+            let moves: Vec<(String, usize)> =
+                moves.iter().map(|(id, at)| (id.to_string(), *at)).collect();
+            queue_move_request("default", "t-judgment", "judgment", &moves, plan)
+        };
+        let asked = request(&[("e-5901", 1)], &plan);
+        assert_eq!(asked.scope.shorthand(), "workspace/default/queue:write");
+        assert_eq!(asked.facts.acting_thread.as_deref(), Some("t-judgment"));
+        assert_eq!(
+            asked.summary,
+            "move cairn/5901 'Fix the thing' from fleet 14th to 1st, ahead of work from \
+             harness and ui (judgment asks)"
+        );
+
+        // The act is the resolved move set. The live places it passes are not
+        // part of it, and a different execution, place, or order is a
+        // different act.
+        let act = |moves: &[(&str, usize)], plan: &[PlannedMove]| request(moves, plan).facts.act;
+        assert!(asked.facts.act.is_some());
+        assert_eq!(act(&[("e-5901", 1)], &[]), asked.facts.act);
+        assert_ne!(act(&[("e-5902", 1)], &plan), asked.facts.act);
+        assert_ne!(act(&[("e-5901", 2)], &plan), asked.facts.act);
+        assert_ne!(
+            act(&[("a", 1), ("b", 2)], &[]),
+            act(&[("b", 1), ("a", 2)], &[])
+        );
+    }
+
+    #[test]
+    fn a_start_now_names_the_caps_it_skips_and_what_standing_means() {
+        use crate::models::CapacityHold;
+        let holds = [
+            CapacityHold::Fleet {
+                running: 41,
+                limit: 40,
+                unplaced: 0,
+                place: Some(3),
+                placed_by: None,
+                pin: None,
+            },
+            CapacityHold::Thread {
+                thread: "judgment".to_string(),
+                open: vec![1, 2, 3, 4, 5],
+                limit: 4,
+                place: Some(1),
+                placed_by: None,
+                pin: None,
+            },
+        ];
+        let request = start_now_request(
+            "default",
+            "t-judgment",
+            "judgment",
+            "e-5901-2",
+            "execution 2 on cairn/5901",
+            &holds,
+        );
+        assert_eq!(request.scope.shorthand(), "workspace/default/queue:run");
+        assert_eq!(request.facts.acting_thread.as_deref(), Some("t-judgment"));
+        for part in [
+            "start execution 2 on cairn/5901 now",
+            "the fleet cap (41/40 running)",
+            "judgment's focus cap (5 of 4 children open)",
+            "A standing grant lets judgment start its held work past every cap",
+        ] {
+            assert!(request.summary.contains(part), "{}", request.summary);
+        }
+        let unheld = start_now_request("default", "t", "judgment", "e-5901-2", "x", &[]);
+        assert!(
+            unheld.summary.contains("no cap holds it at this moment"),
+            "{}",
+            unheld.summary
+        );
+        assert_eq!(unheld.scope, request.scope);
+        // The act is the execution, not the caps that hold it right now.
+        assert!(request.facts.act.is_some());
+        assert_eq!(unheld.facts.act, request.facts.act);
+        let other = start_now_request("default", "t", "judgment", "e-5902-1", "x", &[]);
+        assert_ne!(other.facts.act, request.facts.act);
     }
 
     /// Every request that can raise a card names its act, and two different

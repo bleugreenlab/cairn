@@ -75,15 +75,17 @@ pub(super) async fn dispatch(
     Ok(Some(summary))
 }
 
-/// Who this request revokes as: its authenticated run, or the verified actor
-/// a row-write origin carries. A request with neither is a caller with no run
-/// and holds nothing.
+/// Who this request revokes as: its authenticated run, the thread that run
+/// acts for (as a queue grant binds it), or the verified actor a row-write
+/// origin carries. A request with none is a caller with no run and holds
+/// nothing.
 async fn revoker(orch: &Orchestrator, request: &McpCallbackRequest) -> Revoker {
     match crate::authorization::resolve_actor(orch, request).await {
         Some(actor) => Revoker {
             run_id: actor.principal.run_id,
             node_uri: actor.principal.node_uri,
             actor: actor.principal.actor,
+            acting_thread: super::queue::asking_thread_id(orch, request).await,
         },
         None => Revoker::default(),
     }

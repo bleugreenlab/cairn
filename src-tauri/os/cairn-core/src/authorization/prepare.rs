@@ -107,6 +107,13 @@ pub async fn prepare_batch(
                 },
             ));
         }
+        // Moving held work across threads, or starting it past every cap, is
+        // the operator's to approve; a thread asks with a card.
+        if let Some(outcome) =
+            crate::resources::mutations::queue_authority(orch, request, item).await
+        {
+            prepared.push((index, outcome));
+        }
         for request in crate::resources::mutations::workspace_settings_authority(item) {
             prepared.push((
                 index,

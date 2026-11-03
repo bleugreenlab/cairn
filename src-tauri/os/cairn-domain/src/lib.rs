@@ -81,8 +81,9 @@ pub use job::{Job, JobStatus};
 pub use execution::{
     CapacityHold, ConditionEvaluation, ConditionOutcome, Execution, ExecutionDetail,
     ExecutionFilters, ExecutionGate, ExecutionGateCensus, ExecutionLifecycle, ExecutionListItem,
-    ExecutionListResult, ExecutionStatus, GateCensusEntry, GateEvidenceState, HeldExecution,
-    Initiator, ReleaseOverride, TriggerType, TriggeredExecution,
+    ExecutionListResult, ExecutionStatus, GateCensusEntry, GateEvidenceState, GrantedStart,
+    HeldExecution, Initiator, Pin, PinBy, PinKind, ReleaseOverride, TriggerType,
+    TriggeredExecution,
 };
 
 // Run types

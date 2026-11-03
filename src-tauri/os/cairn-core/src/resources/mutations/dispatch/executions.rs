@@ -262,30 +262,46 @@ pub(super) fn parse_after_clauses(
     Ok(clauses)
 }
 
-/// The gate half of an execution patch: `{release: true}` or `{after: [...]}`,
-/// one at a time, and never mixed with a snapshot edit or a re-evaluation, so a
-/// write cannot half-apply.
+/// The gate half of an execution patch: `{release: true}`, `{start_now: true}`
+/// or `{after: [...]}`, one at a time, and never mixed with a snapshot edit or
+/// a re-evaluation, so a write cannot half-apply.
 fn parse_gate_patch(
     index: usize,
     item: &ChangeItem,
     payload: &serde_json::Value,
 ) -> ResourceMutationResult<Option<executions::GatePatch>> {
     let release = payload.get("release");
+    let start_now = payload.get("start_now");
     let after = payload.get("after");
-    if release.is_none() && after.is_none() {
+    if release.is_none() && start_now.is_none() && after.is_none() {
         return Ok(None);
     }
+    let gate_keys = [release, start_now, after]
+        .iter()
+        .filter(|key| key.is_some())
+        .count();
     if ["agent", "snapshot", "reevaluate"]
         .iter()
         .any(|key| payload.get(key).is_some())
-        || (release.is_some() && after.is_some())
+        || gate_keys > 1
     {
         return Err(build_failure(
             index,
             item,
-            "payload.release and payload.after each stand alone: send {release:true} to start a \
-             held execution now, or {after:[...]} to replace its gates, in separate changes",
+            "payload.release, payload.start_now and payload.after each stand alone: send \
+             {release:true} to release its after: gates, {start_now:true} to start it past every \
+             cap, or {after:[...]} to replace its gates, in separate changes",
         ));
+    }
+    if let Some(start_now) = start_now {
+        return match start_now {
+            serde_json::Value::Bool(true) => Ok(Some(executions::GatePatch::StartNow)),
+            _ => Err(build_failure(
+                index,
+                item,
+                "payload.start_now must be true; to keep an execution held, omit it",
+            )),
+        };
     }
     if let Some(release) = release {
         return match release {

@@ -105,6 +105,7 @@ resource_samples! {
     ProjectTenet { project: project(), key: "3".to_string() } => Parser,
     ProjectPages { project: project() } => Parser,
     ProjectCodemap { project: project() } => Parser,
+    ProjectQueue { project: project() } => Parser,
     ProjectMap { project: project() } => Parser,
     ProjectHome { project: project() } => Parser,
     ProjectCheckResults { project: project(), revision: "main".to_string() } => Parser,
