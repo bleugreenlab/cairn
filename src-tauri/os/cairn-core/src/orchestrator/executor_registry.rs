@@ -108,6 +108,7 @@ mod tests {
                 build_prerequisites: None,
                 containment: None,
                 page_call_programs: None,
+                github_credential: None,
             },
             current_load: 1,
             warm_roots: vec![cairn_common::executor_protocol::VerifiedWarmRoot {

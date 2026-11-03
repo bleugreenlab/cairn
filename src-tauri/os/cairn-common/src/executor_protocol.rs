@@ -6635,6 +6635,26 @@ pub struct LearnedResourceEstimate {
 /// npm and its cells keep the host's, exactly as before; an older runner
 /// selects no npm, and a newer executor's npm probe says so. The toolchain
 /// identity does not grow: npm's version is a function of the Node pin.
+///
+/// cairn/5873 does not move the number. [`ProjectPlacementRequirements`]
+/// gains a defaulted `capabilities` list ([`ProjectCapability`], so far only
+/// `github-credential`), which only the runner's placement reads; an older
+/// executor ignores the key in a `CellRequest`, and an older runner sends
+/// none. Nothing an older peer does with it is wrong: the requirement gates
+/// placement on the runner, and a machine that has not measured the
+/// capability is gated by nothing, so an executor that predates the
+/// measurement is placed exactly as it was before this change.
+/// [`ExecutorCapabilities`] gains a defaulted `githubCredential`
+/// ([`GithubCredentialEvidence`]), which an older executor never sends and
+/// the runner then reads as unmeasured; an older runner ignores the key.
+/// `Ready` gains a defaulted `githubProbeRepositories`, which an older
+/// executor ignores, probing nothing, and an older runner never sends, so a
+/// newer executor probes for a credential without checking it against a
+/// repository. [`PlacementRejectionReason::GithubCredentialMissing`] is
+/// produced and rendered on the runner only; no executor decodes a placement
+/// rejection. Such a machine's credential-less fetch is still stored as
+/// `infrastructure` naming it, by the runner's classifier, so its lane
+/// re-places.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -7798,6 +7818,61 @@ pub struct ExecutorCapabilities {
     /// page calls or has not probed yet; absence places no page-call batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_call_programs: Option<Vec<PageCallProgramEvidence>>,
+    /// Whether this machine's executor account can authenticate to
+    /// github.com, as its last probe measured. Absent from an executor that
+    /// predates the probe, which reads as unmeasured and gates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_credential: Option<GithubCredentialEvidence>,
+}
+
+/// What the executor's GitHub credential probe measured: whether git, run as
+/// the executor account with the environment its cells get and with every
+/// prompt disabled, gets a credential for github.com, and whether a private
+/// repository the runner named accepts it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubCredentialEvidence {
+    pub state: GithubCredentialState,
+    pub measured_at_unix_ms: u64,
+    /// The repositories the probe checked the credential against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probed_repositories: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GithubCredentialState {
+    /// git gets a credential for github.com. `verified_against` names the
+    /// repository that accepted it, when the probe had one to check;
+    /// `note` says why a check that was attempted did not settle it (the
+    /// network was down, the probe timed out).
+    #[serde(rename_all = "camelCase")]
+    Available {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verified_against: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// git gets no credential for github.com, or github.com refuses the one
+    /// it gets. Placement refuses this machine work whose project requires
+    /// [`ProjectCapability::GithubCredential`].
+    Absent { reason: String },
+    /// The probe could not tell (git is not installed, github.com is
+    /// rewritten to SSH and no repository was named to check). Gates nothing.
+    Unmeasured { reason: String },
+}
+
+impl GithubCredentialEvidence {
+    /// Why this machine cannot fetch from github.com, when it has measured
+    /// that it cannot.
+    pub fn absent_reason(&self) -> Option<&str> {
+        match &self.state {
+            GithubCredentialState::Absent { reason } => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// One program a page-call probe ran under the page-call policy.
@@ -8409,6 +8484,48 @@ pub struct ProjectPlacementRequirements {
     /// runs that setup. Empty when the request runs no setup at all.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub setup_identity: String,
+    /// Machine capabilities the project's work needs whether or not setup
+    /// runs: what its `.cairn/config.yaml` declares under `requires`, together
+    /// with what the runner has learned from its failures. A machine that has
+    /// measured itself without one is refused by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<ProjectCapability>,
+}
+
+/// A machine capability a project can require, beyond the toolchains its
+/// commands invoke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectCapability {
+    /// The executor's account can authenticate to github.com, so a build that
+    /// fetches a private GitHub repository (a cargo git dependency, a private
+    /// npm package) can fetch it. Measured per machine as
+    /// [`GithubCredentialEvidence`].
+    GithubCredential,
+}
+
+impl ProjectCapability {
+    pub const ALL: &'static [ProjectCapability] = &[ProjectCapability::GithubCredential];
+
+    /// The name a project config and the executors page use.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ProjectCapability::GithubCredential => "github-credential",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|capability| capability.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for ProjectCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ProjectPlacementRequirements {
@@ -8424,6 +8541,7 @@ impl ProjectPlacementRequirements {
         self.setup_toolchains.is_empty()
             && self.prerequisite_scripts.is_empty()
             && self.setup_identity.is_empty()
+            && self.capabilities.is_empty()
     }
 }
 
@@ -16295,6 +16413,12 @@ pub enum PlacementRejectionReason {
         missing: Vec<String>,
         advertised: Vec<String>,
     },
+    /// The project requires [`ProjectCapability::GithubCredential`] (declared,
+    /// or learned from a fetch that failed for want of one) and this machine
+    /// measured that it has no usable GitHub credential. Like a missing setup
+    /// toolchain, a fact about the machine and the project, so it holds for
+    /// pinned work too: that work would fail at its first fetch.
+    GithubCredentialMissing { project_id: String, reason: String },
     /// This machine already failed to prepare a cell for this project because
     /// a setup command was not found, on the environment it still advertises.
     /// Cleared when the machine re-attaches with changed evidence or an
@@ -16488,6 +16612,9 @@ impl PlacementRejectionReason {
             } => format!(
                 "in line: this machine provisions one cell of project {project_id} at a time, and request {ahead_request_id}, waiting since {}, is ahead of this one for it",
                 describe_age(*ahead_waiting_since_unix_ms)
+            ),
+            Self::GithubCredentialMissing { reason, .. } => format!(
+                "has no GitHub credential and this project fetches a private repository ({reason})"
             ),
             Self::PreparationToolchainMissing {
                 project_id,
@@ -18187,6 +18314,12 @@ pub enum ExecutorMessage {
         /// socket, and an orch with no remote fleet binds no listener at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         listener: Option<ExecutorListenerAdvertisement>,
+        /// Private GitHub repositories the projects this machine serves are
+        /// known to fetch, for the executor's GitHub credential probe to check
+        /// its credential against. Empty when no served project needs one;
+        /// an executor that predates the probe ignores it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        github_probe_repositories: Vec<String>,
     },
     ObjectChannelUpdated {
         credential: ObjectChannelCredential,
@@ -19101,6 +19234,7 @@ mod tests {
                     endpoints: vec!["wss://runner.example:3850/api/executor".into()],
                     cert_sha256: vec!["a".repeat(64)],
                 }),
+                github_probe_repositories: vec!["https://github.com/bleugreen/tm-cards".into()],
             },
             ExecutorMessage::ObjectChannelUpdated {
                 credential: ObjectChannelCredential {
@@ -20196,6 +20330,7 @@ mod tests {
                 toolchain_detection: None,
                 build_prerequisites: None,
                 page_call_programs: None,
+                github_credential: None,
             },
             current_load: 1,
             warm_roots: vec![VerifiedWarmRoot {

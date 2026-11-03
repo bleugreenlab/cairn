@@ -2094,6 +2094,11 @@ async fn render_resource_body(
                         captured_at,
                         warming_up,
                     );
+                    rendered.push_str(&crate::resources::executors::render_project_requirements(
+                        &orch.fleet.declared_project_capabilities(),
+                        &orch.fleet.learned_project_requirements(),
+                        captured_at,
+                    ));
                     rendered.push_str(&crate::resources::executors::render_blocked_questions(
                         &orch.fleet.blocked_questions(None, captured_at),
                         orch.fleet.purpose_debt_journal_error().as_deref(),

@@ -103,6 +103,13 @@ pub struct ProjectSettingsFile {
     /// machines. See docs/execution-fabric.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<ScratchSettings>,
+    /// Machine capabilities every batch, check and session in the project
+    /// needs, beyond the toolchains its commands name: a machine that has
+    /// measured itself without one is refused by name. Not part of any check's
+    /// identity, since it changes where work runs and not what a verdict means.
+    /// See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires: Option<Vec<cairn_common::executor_protocol::ProjectCapability>>,
 }
 
 /// The `scratch` section of `.cairn/config.yaml`.
@@ -327,6 +334,8 @@ struct LegacyProjectSettingsFile {
     pin_bumps: Option<BTreeMap<String, PinBumpSpec>>,
     #[serde(default)]
     scratch: Option<ScratchSettings>,
+    #[serde(default)]
+    requires: Option<Vec<cairn_common::executor_protocol::ProjectCapability>>,
 }
 
 /// Legacy terminal command with persistent field
@@ -620,6 +629,7 @@ fn parse_project_settings_under(
         landing: legacy.landing,
         pin_bumps: legacy.pin_bumps,
         scratch: legacy.scratch,
+        requires: legacy.requires,
     };
 
     if let Some(policy) = &mut settings.contextual_packages {
@@ -675,6 +685,12 @@ pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::Termina
 pub struct ExecutionProjectPolicy {
     pub setup_commands: Vec<String>,
     pub populate: PopulateConfig,
+    /// The capabilities `requires` declares that this build knows. A name it
+    /// does not know is left out here rather than refused: placement cannot
+    /// honour a requirement it cannot measure, and refusing it would refuse
+    /// every execution in the project. The settings parser refuses it, naming
+    /// the accepted values, so the config does not land that way.
+    pub requires: Vec<cairn_common::executor_protocol::ProjectCapability>,
 }
 
 /// The keys of `.cairn/config.yaml` that [`ExecutionProjectPolicy`] is read
@@ -686,6 +702,8 @@ struct ExecutionPolicySection {
     setup_commands: Option<Vec<String>>,
     #[serde(default)]
     materialization: Option<MaterializationSettings>,
+    #[serde(default)]
+    requires: Option<Vec<String>>,
 }
 
 pub fn load_execution_project_policy(
@@ -728,6 +746,12 @@ fn execution_project_policy_from(
     Ok(ExecutionProjectPolicy {
         setup_commands: section.setup_commands.unwrap_or_default(),
         populate: section.materialization.unwrap_or_default().populate,
+        requires: section
+            .requires
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| cairn_common::executor_protocol::ProjectCapability::parse(name))
+            .collect(),
     })
 }
 
@@ -1436,6 +1460,37 @@ mod tests {
         assert_eq!(
             reloaded.setup_commands,
             Some(vec!["bun install".to_string()])
+        );
+    }
+
+    #[test]
+    fn requires_declares_machine_capabilities_strictly_for_settings_and_tolerantly_for_placement() {
+        use cairn_common::executor_protocol::ProjectCapability;
+        let (parsed, _) = parse_project_settings("requires: [github-credential]\n").unwrap();
+        assert_eq!(
+            parsed.requires,
+            Some(vec![ProjectCapability::GithubCredential])
+        );
+        let error = parse_project_settings("requires: [gpu]\n")
+            .expect_err("an unknown capability is refused");
+        assert!(
+            error.contains("gpu") && error.contains("github-credential"),
+            "{error}"
+        );
+
+        let path = Path::new(".cairn/config.yaml");
+        let policy = execution_project_policy_from(
+            path,
+            b"setupCommands: [bun install]\nrequires: [github-credential]\n",
+        )
+        .unwrap();
+        assert_eq!(policy.requires, [ProjectCapability::GithubCredential]);
+        let policy =
+            execution_project_policy_from(path, b"requires: [gpu, github-credential]\n").unwrap();
+        assert_eq!(
+            policy.requires,
+            [ProjectCapability::GithubCredential],
+            "placement keeps what it knows rather than refusing the project"
         );
     }
 

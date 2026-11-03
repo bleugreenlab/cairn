@@ -383,8 +383,12 @@ pub fn build_prerequisite_script(os: &str) -> Option<&'static str> {
 /// declares.
 pub fn project_placement_requirements(
     setup_commands: &[String],
+    capabilities: &[crate::executor_protocol::ProjectCapability],
     project_root: &std::path::Path,
 ) -> crate::executor_protocol::ProjectPlacementRequirements {
+    let mut capabilities = capabilities.to_vec();
+    capabilities.sort();
+    capabilities.dedup();
     crate::executor_protocol::ProjectPlacementRequirements {
         setup_toolchains: setup_toolchain_requirements(setup_commands),
         setup_identity: setup_identity(setup_commands),
@@ -393,6 +397,7 @@ pub fn project_placement_requirements(
             .filter(|(_, path)| project_root.join(path).is_file())
             .map(|(_, path)| path.to_string())
             .collect(),
+        capabilities,
     }
 }
 

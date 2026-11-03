@@ -1703,7 +1703,7 @@ impl CadenceVerdict {
 /// zero tests is never one, whatever its exit code (rulings 695/706): an empty
 /// or unknown selection is the absence of a verdict, not a green.
 fn classify_row(row: CadenceRow) -> CadenceVerdict {
-    if let Some(cause) = host_ended_compile_cause(&row) {
+    if let Some(cause) = host_ended_compile_cause(&row).or_else(|| credential_fetch_cause(&row)) {
         return CadenceVerdict::Death {
             row: Some(row),
             cause,
@@ -1743,7 +1743,7 @@ fn classify_row(row: CadenceRow) -> CadenceVerdict {
 /// before it finished measuring, is stored as incomplete, and a green beside it
 /// is not one.
 fn classify_exit_row(row: CadenceRow) -> CadenceVerdict {
-    if let Some(cause) = host_ended_compile_cause(&row) {
+    if let Some(cause) = host_ended_compile_cause(&row).or_else(|| credential_fetch_cause(&row)) {
         return CadenceVerdict::Death {
             row: Some(row),
             cause,
@@ -1795,6 +1795,26 @@ fn host_ended_compile_cause(row: &CadenceRow) -> Option<String> {
             "infrastructure: the host's storage failed ({error}){krate}, so the run exited {exit} without a verdict on the tree. The error is the operating system's, not a compiler error about the code, so the tree is not implicated and there is no compile error to match against a break on main"
         ),
     })
+}
+
+/// A stored row whose run died fetching a git dependency it had no credential
+/// for, read from its tail with the same matcher the store's classifier and
+/// the executor's GitHub probe use. Such a run never reached the tree.
+fn credential_fetch_cause(row: &CadenceRow) -> Option<String> {
+    if row.verdict_passed || row.failed() > 0 {
+        return None;
+    }
+    let failure = cairn_common::git_credential::credential_failure(&row.output_tail)?;
+    let what = failure
+        .repository
+        .as_ref()
+        .map(|repository| format!("git dependency `{repository}`"))
+        .unwrap_or_else(|| "a git dependency".to_string());
+    let host = failure.host.as_deref().unwrap_or("its host");
+    Some(format!(
+        "infrastructure: fetching {what} failed for want of a credential for {host}, so the run exited {} without a verdict on the tree. The machine has no usable credential; the tree is not implicated and there is no error to match against a break on main",
+        row.exit_code
+    ))
 }
 
 /// A lane that ended without a result while this runner was stopping was
@@ -6383,6 +6403,32 @@ mod tests {
         assert!(matches!(
             classify_row(compile_row("io", &io)),
             CadenceVerdict::Death { cause, .. } if cause.contains("(Input/output error)")
+        ));
+    }
+
+    /// cairn/5873: tm/230's lane, dead at cargo's fetch of a private git
+    /// dependency on a machine with no credential, is reported as a death
+    /// naming the repository, and a genuinely missing revision is not.
+    #[test]
+    fn a_dependency_fetch_without_a_credential_is_a_death_that_names_the_repository() {
+        use crate::execution::checks::git_credential_fetch_specimens::{wrapped, TM_230_TAIL};
+        let verdict = classify_row(compile_row("fetch", TM_230_TAIL));
+        let CadenceVerdict::Death {
+            row: Some(_),
+            cause,
+        } = &verdict
+        else {
+            panic!("a credential-less fetch is a death that keeps its row: {verdict:?}");
+        };
+        assert!(
+            cause.starts_with(
+                "infrastructure: fetching git dependency `https://github.com/bleugreen/tm-cards` failed for want of a credential for github.com"
+            ),
+            "{cause}"
+        );
+        assert!(!matches!(
+            classify_row(compile_row("pin", &wrapped(""))),
+            CadenceVerdict::Death { .. }
         ));
     }
 

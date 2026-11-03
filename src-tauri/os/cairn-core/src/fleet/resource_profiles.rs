@@ -1658,6 +1658,7 @@ mod tests {
             build_prerequisites: None,
             containment: None,
             page_call_programs: None,
+            github_credential: None,
         }
     }
 

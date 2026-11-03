@@ -2617,6 +2617,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "executor_preparation_refusals",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // A capability a project's work was seen to need on one of this
+    // installation's machines. Its evidence names those machines.
+    (
+        "project_learned_requirements",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // Work this runner granted to one of its own machines and has not yet seen
     // end. Names executor identities that mean nothing on another install.
     (

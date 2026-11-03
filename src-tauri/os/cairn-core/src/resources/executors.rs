@@ -139,6 +139,7 @@ use cairn_common::executor_protocol::{
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
 use crate::fleet::pools::{derive_pools, FAST_LINK_FLOOR_GBPS};
+use cairn_common::executor_protocol::ProjectCapability;
 use cairn_common::executor_protocol::{HostHealth, Interconnect};
 
 /// The runner's own abnormal restart, when it had one.
@@ -397,6 +398,10 @@ pub(crate) fn render_executors(
         if let Some(summary) = build_prerequisite_summary(capabilities) {
             out.push_str(&format!("- Build prerequisites: {summary}\n"));
         }
+        out.push_str(&format!(
+            "- GitHub: {}\n",
+            github_credential_summary(capabilities, executor.captured_at_unix_ms)
+        ));
         for eligibility in &executor.project_eligibility {
             if let Some(why) = ineligibility_summary(&eligibility.refusals) {
                 out.push_str(&format!(
@@ -1042,6 +1047,18 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         list_or(&capabilities.toolchains, "none advertised")
     ));
     out.push_str(&render_toolchain_probes(capabilities));
+    out.push_str(&format!(
+        "- GitHub: {}\n",
+        github_credential_summary(capabilities, executor.captured_at_unix_ms)
+    ));
+    if let Some(evidence) = &capabilities.github_credential {
+        if !evidence.probed_repositories.is_empty() {
+            out.push_str(&format!(
+                "  - Probed against: {}\n",
+                evidence.probed_repositories.join(", ")
+            ));
+        }
+    }
     out.push_str(&render_build_prerequisites(capabilities));
     out.push_str(&render_project_eligibility(&executor.project_eligibility));
     out.push_str(&render_containment(capabilities, executor.colocated));
@@ -4522,6 +4539,94 @@ fn render_project_eligibility(
     out
 }
 
+/// Whether a machine can authenticate to github.com, as its probe last
+/// measured, in one line: `available as bleugreen (verified against
+/// https://github.com/bleugreen/tm-cards, 12m ago)`, `no credential (…)`,
+/// or `unmeasured (…)`.
+fn github_credential_summary(
+    capabilities: &ExecutorCapabilities,
+    captured_at_unix_ms: u64,
+) -> String {
+    use cairn_common::executor_protocol::GithubCredentialState;
+    let Some(evidence) = &capabilities.github_credential else {
+        return "unmeasured (this executor has not reported a probe; an executor build that \
+                predates the probe never will)"
+            .to_string();
+    };
+    let measured = age(captured_at_unix_ms.saturating_sub(evidence.measured_at_unix_ms));
+    match &evidence.state {
+        GithubCredentialState::Available {
+            account,
+            verified_against,
+            note,
+        } => {
+            let account = account
+                .as_ref()
+                .map(|account| format!(" as {account}"))
+                .unwrap_or_default();
+            let checked = match (verified_against, note) {
+                (Some(repository), _) => format!("verified against {repository}, {measured}"),
+                (None, Some(note)) => format!("{}, {measured}", one_line(note)),
+                (None, None) => format!("a credential helper answers, {measured}"),
+            };
+            format!("available{account} ({checked})")
+        }
+        GithubCredentialState::Absent { reason } => {
+            format!("no credential ({}, {measured})", one_line(reason))
+        }
+        GithubCredentialState::Unmeasured { reason } => {
+            format!("unmeasured ({}, {measured})", one_line(reason))
+        }
+    }
+}
+
+/// The fleet page's account of what each project needs of a machine beyond
+/// its toolchains: what its config declares under `requires`, and what the
+/// runner learned from a run that failed for want of a capability, with that
+/// run's evidence. Empty when no project needs anything.
+pub(crate) fn render_project_requirements(
+    declared: &[(String, Vec<ProjectCapability>)],
+    learned: &[crate::fleet::learned_requirements::LearnedRequirement],
+    captured_at_unix_ms: u64,
+) -> String {
+    let mut lines = Vec::new();
+    for requirement in learned {
+        let repository = requirement
+            .evidence_repository
+            .as_ref()
+            .map(|repository| format!("; {repository}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "- {}: {} (learned {} from check observation {} on {}{repository})",
+            requirement.project_id,
+            requirement.capability,
+            age(captured_at_unix_ms.saturating_sub(requirement.first_learned_at_ms)),
+            requirement.observation_id,
+            requirement.executor_id,
+        ));
+    }
+    for (project_id, capabilities) in declared {
+        for capability in capabilities {
+            let also_learned = learned.iter().any(|requirement| {
+                &requirement.project_id == project_id && requirement.capability == *capability
+            });
+            if !also_learned {
+                lines.push(format!(
+                    "- {project_id}: {capability} (declared in .cairn/config.yaml)"
+                ));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.sort();
+    format!(
+        "## Project requirements\n\nWhat each project's work needs of a machine beyond its toolchains. A machine that measured itself without one is not eligible for that project; one that has not measured is.\n\n{}\n\n",
+        lines.join("\n")
+    )
+}
+
 /// A project's refusals as the listing's one line, or `None` when eligible.
 fn ineligibility_summary(refusals: &[PlacementRejectionReason]) -> Option<String> {
     let parts: Vec<String> = refusals
@@ -4535,6 +4640,10 @@ fn ineligibility_summary(refusals: &[PlacementRejectionReason]) -> Option<String
             }
             PlacementRejectionReason::BuildPrerequisitesMissing { .. } => {
                 "work requiring the rust toolchain (build prerequisites MISSING)".to_string()
+            }
+            PlacementRejectionReason::GithubCredentialMissing { .. } => {
+                "it fetches a private GitHub repository and this machine has no credential"
+                    .to_string()
             }
             other => other.describe(),
         })
@@ -6631,6 +6740,7 @@ mod tests {
                         build_prerequisites: None,
                         containment: None,
                         page_call_programs: None,
+                        github_credential: None,
                     },
                     current_load: 0,
                     warm_roots: Vec::new(),
@@ -6948,6 +7058,97 @@ mod tests {
             rendered.contains("- Build prerequisites: MISSING — Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev — Provision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh\n"),
             "{rendered}"
         );
+    }
+
+    /// cairn/5873: each machine says whether it can authenticate to GitHub, in
+    /// all three states, on the listing and its own page, and the fleet page
+    /// names what each project needs with the evidence for a learned need.
+    #[test]
+    fn each_machine_says_whether_it_can_authenticate_to_github() {
+        use cairn_common::executor_protocol::{GithubCredentialEvidence, GithubCredentialState};
+        let tm_cards = "https://github.com/bleugreen/tm-cards";
+        let measured = |name: &str, state: Option<GithubCredentialState>| {
+            let mut executor = inspection(name, false);
+            executor.captured_at_unix_ms = CAPTURED_AT;
+            executor.health.advertisement.capabilities.github_credential =
+                state.map(|state| GithubCredentialEvidence {
+                    state,
+                    measured_at_unix_ms: CAPTURED_AT - 12 * 60_000,
+                    probed_repositories: vec![tm_cards.into()],
+                });
+            executor
+        };
+        let ub = measured(
+            "bgsrv-ub",
+            Some(GithubCredentialState::Available {
+                account: Some("bleugreen".into()),
+                verified_against: Some(tm_cards.into()),
+                note: None,
+            }),
+        );
+        let sp1 = measured(
+            "bginf-sp1",
+            Some(GithubCredentialState::Absent {
+                reason: "no credential helper answers for https://github.com: fatal: could not read Username for 'https://github.com': terminal prompts disabled".into(),
+            }),
+        );
+        let mac = measured(
+            "bgsrv-mac",
+            Some(GithubCredentialState::Unmeasured {
+                reason: "git not found".into(),
+            }),
+        );
+        let old = measured("fedora", None);
+        let listed = render_executors(
+            &[ub.clone(), sp1.clone(), mac, old],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        for line in [
+            format!("- GitHub: available as bleugreen (verified against {tm_cards}, 12m ago)\n"),
+            "- GitHub: no credential (no credential helper answers for https://github.com: fatal: could not read Username for 'https://github.com': terminal prompts disabled, 12m ago)\n".to_string(),
+            "- GitHub: unmeasured (git not found, 12m ago)\n".to_string(),
+            "- GitHub: unmeasured (this executor has not reported a probe; an executor build that predates the probe never will)\n".to_string(),
+        ] {
+            assert!(listed.contains(&line), "{line}\n{listed}");
+        }
+        let page = render_executor(&sp1);
+        assert!(page.contains("- GitHub: no credential ("), "{page}");
+        assert!(
+            page.contains(&format!("  - Probed against: {tm_cards}\n")),
+            "{page}"
+        );
+
+        let learned = crate::fleet::learned_requirements::LearnedRequirement {
+            project_id: "tm".into(),
+            capability: ProjectCapability::GithubCredential,
+            evidence_repository: Some(tm_cards.into()),
+            executor_id: "bginf-sp1".into(),
+            observation_id: "96e4e69d".into(),
+            first_learned_at_ms: CAPTURED_AT - 10 * 60_000,
+            last_seen_at_ms: CAPTURED_AT,
+        };
+        let requirements = render_project_requirements(
+            &[("cairn".into(), vec![ProjectCapability::GithubCredential])],
+            &[learned],
+            CAPTURED_AT,
+        );
+        assert!(
+            requirements.starts_with("## Project requirements\n"),
+            "{requirements}"
+        );
+        assert!(
+            requirements.contains(&format!("- tm: github-credential (learned 10m ago from check observation 96e4e69d on bginf-sp1; {tm_cards})\n")),
+            "{requirements}"
+        );
+        assert!(
+            requirements.contains("- cairn: github-credential (declared in .cairn/config.yaml)"),
+            "{requirements}"
+        );
+        assert_eq!(render_project_requirements(&[], &[], CAPTURED_AT), "");
     }
 
     /// A machine that cannot prepare a project's cells reads as that, not as a

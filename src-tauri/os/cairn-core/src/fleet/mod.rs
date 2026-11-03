@@ -8,6 +8,7 @@ mod coalescing;
 pub(crate) mod decline_condition;
 pub mod desktop;
 pub(crate) mod inference;
+pub(crate) mod learned_requirements;
 pub mod link_clock;
 pub mod load;
 pub mod management;
@@ -85,8 +86,8 @@ pub use cairn_common::executor_protocol::{
     ActiveCellRequest, CellExecutionMeta, CellOutcome, CellPriority, CellRequest,
     CellUnavailableReason, CommandResourceIdentity, ExecutingCellRequest, FleetSnapshot,
     MutationDelta, MutationPolicy, PersistentCellLifecycle, PersistentCellState,
-    PlacementWorkClass, ProjectPlacementRequirements, QueuedCellRequest, ResourceReservation,
-    ResourceReservationSource,
+    PlacementWorkClass, ProjectCapability, ProjectPlacementRequirements, QueuedCellRequest,
+    ResourceReservation, ResourceReservationSource,
 };
 use cairn_common::toolchain_requirements::project_placement_requirements;
 use cairn_platform::stack::off_frame;
@@ -1466,6 +1467,10 @@ pub struct Fleet {
     /// One lock over the held refusals and the ordered writer that persists
     /// them; absent a store (a bare `Fleet::default()`), memory only.
     preparation_refusals: Arc<Mutex<preparation::PreparationRefusals>>,
+    /// Capabilities each project's work was learned to need from a run that
+    /// failed for want of one; stamped onto every request beside what the
+    /// project declares. See [`learned_requirements`].
+    learned_requirements: learned_requirements::LearnedRequirements,
     /// Each project's placement requirements as its most recent preparation on
     /// this runner resolved them, for the synchronous decisions that have no
     /// request to read them from: whether a job's home can still prepare its
@@ -2888,6 +2893,134 @@ impl Fleet {
         );
     }
 
+    /// Give learned project requirements a durable store, and adopt what it
+    /// holds. Like the preparation store, optional by construction: a bare
+    /// `Fleet::default()` learns in memory only.
+    pub(crate) fn attach_learned_requirements_store(&self, db: Arc<crate::storage::LocalDb>) {
+        let learned = self.learned_requirements.clone();
+        crate::orchestrator::spawn_onto(
+            tokio::runtime::Handle::try_current().ok().as_ref(),
+            async move {
+                if let Err(error) = learned.attach(db).await {
+                    log::warn!("{error}");
+                }
+            },
+            || {
+                log::error!(
+                    "learned project requirement store could not start; requirements learned \
+                     from now on hold until this runner restarts"
+                )
+            },
+        );
+    }
+
+    /// Record that `project_id`'s work needs `capability`, as
+    /// `observation_id` on `executor_id` showed, so placement requires it of
+    /// every machine from now on.
+    pub(crate) async fn learn_project_requirement(
+        &self,
+        project_id: &str,
+        capability: ProjectCapability,
+        evidence_repository: Option<String>,
+        executor_id: &str,
+        observation_id: &str,
+    ) {
+        let is_new = !self
+            .learned_requirements
+            .capabilities(project_id)
+            .contains(&capability);
+        if let Err(error) = self
+            .learned_requirements
+            .learn(
+                project_id,
+                capability,
+                evidence_repository,
+                executor_id,
+                observation_id,
+                unix_time_ms(),
+            )
+            .await
+        {
+            log::warn!("{error}");
+        }
+        if is_new {
+            log::info!(
+                "project {project_id} now requires {capability}: learned from check observation \
+                 {observation_id} on executor {executor_id}"
+            );
+        }
+    }
+
+    /// A project's placement requirements for a caller asking the eligibility
+    /// question before a request exists: what its checkout at `project_path`
+    /// declares, with the capabilities this runner learned it needs, which is
+    /// the set preparation stamps on its requests. So the machines a check
+    /// lane's scopes, occupancy and wait count are the ones it can be placed on.
+    pub(crate) fn project_requirements_at(
+        &self,
+        project_id: &str,
+        project_path: &Path,
+    ) -> ProjectPlacementRequirements {
+        let mut requirements = declared_project_requirements_at(project_path);
+        requirements
+            .capabilities
+            .extend(self.learned_requirements.capabilities(project_id));
+        requirements.capabilities.sort();
+        requirements.capabilities.dedup();
+        requirements
+    }
+
+    /// Every requirement this runner has learned, by project.
+    pub fn learned_project_requirements(&self) -> Vec<learned_requirements::LearnedRequirement> {
+        self.learned_requirements.all()
+    }
+
+    /// The capabilities each project's config declares under `requires`, as
+    /// its most recent preparation on this runner read them.
+    pub fn declared_project_capabilities(&self) -> Vec<(String, Vec<ProjectCapability>)> {
+        let learned = self.learned_requirements.all();
+        let mut declared: Vec<(String, Vec<ProjectCapability>)> = self
+            .known_project_requirements
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(project_id, requirements)| {
+                // What preparation stamped is declared and learned together;
+                // a learned capability is rendered with its evidence instead.
+                let only_declared = requirements
+                    .capabilities
+                    .iter()
+                    .copied()
+                    .filter(|capability| {
+                        !learned.iter().any(|requirement| {
+                            &requirement.project_id == project_id
+                                && requirement.capability == *capability
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (project_id.clone(), only_declared)
+            })
+            .filter(|(_, capabilities)| !capabilities.is_empty())
+            .collect();
+        declared.sort();
+        declared
+    }
+
+    /// The private GitHub repositories a machine's GitHub credential probe
+    /// checks its credential against: the repository each failing fetch
+    /// named, for the projects the machine serves that were learned to need
+    /// a credential. At most [`GITHUB_PROBE_REPOSITORY_LIMIT`], since each is
+    /// a network round trip on every probe.
+    pub fn github_probe_repositories(&self, executor_id: &str) -> Vec<String> {
+        let served = self
+            .lock_connections()
+            .get(executor_id)
+            .filter(|entry| !entry.colocated)
+            .map(|entry| entry.advertisement.capabilities.projects_served.clone())
+            .unwrap_or_default();
+        github_probe_repositories(&self.learned_requirements.all(), &served)
+    }
+
     /// Resolves once every preparation write made so far has been applied,
     /// failing if any of them failed or the writer has stopped.
     #[cfg(test)]
@@ -3862,6 +3995,7 @@ impl Fleet {
                 // until the machine speaks for itself.
                 containment: None,
                 page_call_programs: None,
+                github_credential: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),
@@ -12081,7 +12215,12 @@ impl Fleet {
                     reason: CellUnavailableReason::Preparation,
                     diagnostic: project_config_refusal(&error),
                 })?;
-        self.stamp_project_requirements(request, &project_policy.setup_commands, project_path);
+        self.stamp_project_requirements(
+            request,
+            &project_policy.setup_commands,
+            &project_policy.requires,
+            project_path,
+        );
         self.note_colocated_population(&request.project_id, !project_policy.populate.is_empty());
         Ok(PreparedExecution {
             cell_client_env: cell_build_service_env(orch, &request.repository),
@@ -12114,13 +12253,21 @@ impl Fleet {
         &self,
         request: &mut CellRequest,
         setup_commands: &[String],
+        declared: &[ProjectCapability],
         project_path: &str,
     ) {
+        // Declared and learned capabilities hold whether or not setup runs:
+        // a build fetches its dependencies in a live checkout too.
+        let mut capabilities = declared.to_vec();
+        capabilities.extend(self.learned_requirements.capabilities(&request.project_id));
         // A live checkout is never prepared, so it is held to nothing the
         // setup needs; what its checkout declares about building still holds.
         if runs_project_setup(&request.repository) {
-            *request.project_requirements =
-                project_placement_requirements(setup_commands, Path::new(project_path));
+            *request.project_requirements = project_placement_requirements(
+                setup_commands,
+                &capabilities,
+                Path::new(project_path),
+            );
             self.known_project_requirements.lock().unwrap().insert(
                 request.project_id.clone(),
                 (*request.project_requirements).clone(),
@@ -12130,9 +12277,11 @@ impl Fleet {
                 &request.project_requirements.setup_identity,
             );
         } else {
+            let declared =
+                project_placement_requirements(&[], &capabilities, Path::new(project_path));
             *request.project_requirements = ProjectPlacementRequirements {
-                prerequisite_scripts: project_placement_requirements(&[], Path::new(project_path))
-                    .prerequisite_scripts,
+                prerequisite_scripts: declared.prerequisite_scripts,
+                capabilities: declared.capabilities,
                 ..ProjectPlacementRequirements::default()
             };
         }
@@ -14501,9 +14650,11 @@ pub(crate) fn project_config_refusal(error: &str) -> String {
 /// declares them, for a caller asking the eligibility question before a
 /// request exists. A policy that cannot be read requires nothing here: the
 /// request itself is refused at preparation with that error.
-pub(crate) fn project_requirements_at(project_path: &Path) -> ProjectPlacementRequirements {
+fn declared_project_requirements_at(project_path: &Path) -> ProjectPlacementRequirements {
     crate::config::project_settings::load_execution_project_policy(project_path)
-        .map(|policy| project_placement_requirements(&policy.setup_commands, project_path))
+        .map(|policy| {
+            project_placement_requirements(&policy.setup_commands, &policy.requires, project_path)
+        })
         .unwrap_or_default()
 }
 
@@ -14735,6 +14886,14 @@ fn candidate_rejection(
         // so this holds whatever the work itself asked for — and for a pin as
         // well: pinned work would fail at preparation, and a refusal that
         // names the cause is the better answer.
+        Some(reason)
+    } else if let Some(reason) = github_credential_deficiency(
+        &entry.advertisement.capabilities,
+        scope.project_id,
+        scope.project_requirements,
+    ) {
+        // Not exempt for a pin either, for the same reason: pinned work would
+        // fail at its first private fetch.
         Some(reason)
     } else if let Some(refusal) = applicable_refusal(
         entry,
@@ -15115,6 +15274,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         }
         PlacementRejectionReason::PreparationRefused { .. } => "preparationRefused",
         PlacementRejectionReason::BuildPrerequisitesMissing { .. } => "buildPrerequisitesMissing",
+        PlacementRejectionReason::GithubCredentialMissing { .. } => "githubCredentialMissing",
     };
     kind.to_string()
 }
@@ -15139,7 +15299,8 @@ fn placement_rejection_log_level(rejection: &PlacementRejection) -> log::Level {
         // at WARN when it was recorded, and the placement record keeps it.
         PlacementRejectionReason::PreparationToolchainMissing { .. }
         | PlacementRejectionReason::PreparationRefused { .. }
-        | PlacementRejectionReason::BuildPrerequisitesMissing { .. } => log::Level::Info,
+        | PlacementRejectionReason::BuildPrerequisitesMissing { .. }
+        | PlacementRejectionReason::GithubCredentialMissing { .. } => log::Level::Info,
         _ => log::Level::Warn,
     }
 }
@@ -17798,6 +17959,30 @@ fn serves_project(entry: &ExecutorConnectionState, project_id: &str) -> bool {
         )
 }
 
+/// The most repositories one GitHub credential probe checks.
+pub const GITHUB_PROBE_REPOSITORY_LIMIT: usize = 4;
+
+fn github_probe_repositories(
+    learned: &[learned_requirements::LearnedRequirement],
+    projects_served: &[String],
+) -> Vec<String> {
+    let mut repositories: Vec<String> = Vec::new();
+    for requirement in learned {
+        let Some(repository) = requirement.evidence_repository.as_ref() else {
+            continue;
+        };
+        if requirement.capability == ProjectCapability::GithubCredential
+            && projects_serve(projects_served, &requirement.project_id)
+            && cairn_common::git_credential::url_host(repository).as_deref() == Some("github.com")
+            && !repositories.contains(repository)
+        {
+            repositories.push(repository.clone());
+        }
+    }
+    repositories.truncate(GITHUB_PROBE_REPOSITORY_LIMIT);
+    repositories
+}
+
 fn projects_serve(projects_served: &[String], project_id: &str) -> bool {
     projects_served.is_empty() || projects_served.iter().any(|project| project == project_id)
 }
@@ -17835,6 +18020,29 @@ fn setup_toolchain_deficiency(
         project_id: project_id.to_string(),
         missing,
         advertised: capabilities.toolchains.clone(),
+    })
+}
+
+/// Work refused on a machine that measured itself without a usable GitHub
+/// credential, when the project requires one. A machine that has not measured
+/// (an older executor, or a probe that could not tell) is not refused: the
+/// gate turns on for each machine as it measures, and the check classifier
+/// stores an unmeasured machine's credential-less fetch as infrastructure.
+fn github_credential_deficiency(
+    capabilities: &ExecutorCapabilities,
+    project_id: &str,
+    requirements: &ProjectPlacementRequirements,
+) -> Option<PlacementRejectionReason> {
+    if !requirements
+        .capabilities
+        .contains(&ProjectCapability::GithubCredential)
+    {
+        return None;
+    }
+    let reason = capabilities.github_credential.as_ref()?.absent_reason()?;
+    Some(PlacementRejectionReason::GithubCredentialMissing {
+        project_id: project_id.to_string(),
+        reason: reason.to_string(),
     })
 }
 
@@ -17910,6 +18118,11 @@ fn project_eligibility(
             let mut refusals: Vec<PlacementRejectionReason> =
                 setup_toolchain_deficiency(capabilities, project_id, &requirements)
                     .into_iter()
+                    .chain(github_credential_deficiency(
+                        capabilities,
+                        project_id,
+                        &requirements,
+                    ))
                     .collect();
             if let Some(refusal) = entry
                 .preparation_refusals
@@ -19275,6 +19488,7 @@ mod tests {
         AllocatorState, LivenessRefreshBlocked, LivenessRefreshPhase, RemoteConnectionPhase,
         LIVENESS_REFRESH_BOUND_MS,
     };
+    use cairn_common::executor_protocol::{GithubCredentialEvidence, GithubCredentialState};
 
     struct TestListenerRotationControl {
         regenerate_at: AtomicU64,
@@ -21496,6 +21710,7 @@ mod tests {
             build_prerequisites: None,
             containment: None,
             page_call_programs: None,
+            github_credential: None,
         }
     }
 
@@ -21629,6 +21844,7 @@ mod tests {
             build_prerequisites: None,
             containment,
             page_call_programs: None,
+            github_credential: None,
         }
     }
 
@@ -24475,6 +24691,7 @@ mod tests {
                         build_prerequisites: None,
                         containment: None,
                         page_call_programs: None,
+                        github_credential: None,
                     },
                     current_load: load,
                     warm_roots: warm
@@ -25969,6 +26186,7 @@ mod tests {
                     build_prerequisites: None,
                     containment: None,
                     page_call_programs: None,
+                    github_credential: None,
                 },
             ),
             None,
@@ -31237,6 +31455,7 @@ mod tests {
         setup_toolchains: Vec::new(),
         prerequisite_scripts: Vec::new(),
         setup_identity: String::new(),
+        capabilities: Vec::new(),
     };
 
     fn forecast_repository() -> RepositoryLocator {
@@ -39035,6 +39254,7 @@ mod tests {
             setup_toolchains: setup_toolchains.iter().map(|t| t.to_string()).collect(),
             prerequisite_scripts: scripts.iter().map(|s| s.to_string()).collect(),
             setup_identity: SETUP.into(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -39436,6 +39656,180 @@ mod tests {
         assert!(pool.lock_connections()["bbs"]
             .preparation_refusals
             .is_empty());
+    }
+
+    fn github(entry: &mut ExecutorConnectionState, state: Option<GithubCredentialState>) {
+        entry.advertisement.capabilities.github_credential =
+            state.map(|state| GithubCredentialEvidence {
+                state,
+                measured_at_unix_ms: NOW,
+                probed_repositories: Vec::new(),
+            });
+    }
+
+    fn needs_github() -> ProjectPlacementRequirements {
+        ProjectPlacementRequirements {
+            capabilities: vec![ProjectCapability::GithubCredential],
+            ..ProjectPlacementRequirements::default()
+        }
+    }
+
+    /// cairn/5873's specimen: a project whose build fetches a private GitHub
+    /// repository is never placed on a machine that measured itself without a
+    /// credential, and the refusal names the machine and why. A machine that
+    /// has one, or has not measured, still takes the work, and a project that
+    /// requires nothing is unaffected.
+    #[test]
+    fn a_project_that_needs_github_is_never_placed_where_no_credential_was_measured() {
+        let no_helper = "no credential helper answers for https://github.com";
+        let (sp1_id, mut sp1) = fleet_entry("bginf-sp1", "linux", 0, &[]);
+        let (ub_id, mut ub) = fleet_entry("bgsrv-ub", "linux", 3, &[]);
+        advertising(&mut sp1, &[]);
+        advertising(&mut ub, &[]);
+        measured(&mut sp1, 0.0, 14_000_000_000, 80_000_000_000);
+        measured(&mut ub, 0.95, 2_000_000_000, 8_000_000_000);
+        github(
+            &mut sp1,
+            Some(GithubCredentialState::Absent {
+                reason: no_helper.into(),
+            }),
+        );
+        github(
+            &mut ub,
+            Some(GithubCredentialState::Available {
+                account: Some("bleugreen".into()),
+                verified_against: Some("https://github.com/bleugreen/tm-cards".into()),
+                note: None,
+            }),
+        );
+        let connections = HashMap::from([(sp1_id.clone(), sp1.clone()), (ub_id, ub)]);
+        let mut request = spillable_request();
+        assert_eq!(
+            chosen(&place(&connections, &request).unwrap()).executor_id,
+            "bginf-sp1",
+            "the counterfactual: a project that requires nothing takes the idle machine"
+        );
+
+        request.project_requirements = needs_github().into();
+        let draft = place(&connections, &request).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "bgsrv-ub");
+        let rejection = rejection_for(&draft, "bginf-sp1");
+        assert_eq!(
+            rejection,
+            &PlacementRejectionReason::GithubCredentialMissing {
+                project_id: "p".into(),
+                reason: no_helper.into(),
+            }
+        );
+        assert_eq!(
+            rejection.describe(),
+            format!(
+                "has no GitHub credential and this project fetches a private repository ({no_helper})"
+            )
+        );
+
+        // Pinned work is refused too: it would fail at its first fetch.
+        let mut pinned = request.clone();
+        pinned.executor = Some(ExecutorSelector {
+            name: Some("bginf-sp1".into()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            candidate_rejection(&sp1, PlacementScope::of(&pinned), NOW),
+            Some(PlacementRejectionReason::GithubCredentialMissing { .. })
+        ));
+
+        // A live checkout fetches too, and preparation stamps the capability
+        // on it (see the stamping test), so it is held to it.
+        let mut live = request.clone();
+        live.repository = live_checkout();
+        assert!(matches!(
+            candidate_rejection(&sp1, PlacementScope::of(&live), NOW),
+            Some(PlacementRejectionReason::GithubCredentialMissing { .. })
+        ));
+
+        // Unmeasured gates nothing: an executor too old to probe, or a probe
+        // that could not tell.
+        for state in [
+            None,
+            Some(GithubCredentialState::Unmeasured {
+                reason: "git not found".into(),
+            }),
+        ] {
+            let mut unmeasured = sp1.clone();
+            github(&mut unmeasured, state);
+            assert!(!matches!(
+                candidate_rejection(&unmeasured, PlacementScope::of(&request), NOW),
+                Some(PlacementRejectionReason::GithubCredentialMissing { .. })
+            ));
+        }
+        assert!(!matches!(
+            candidate_rejection(&sp1, PlacementScope::of(&spillable_request()), NOW),
+            Some(PlacementRejectionReason::GithubCredentialMissing { .. })
+        ));
+    }
+
+    /// Preparation stamps a project's declared and learned capabilities onto
+    /// every request, a live checkout's included, since a build fetches its
+    /// dependencies whether or not setup runs.
+    #[tokio::test]
+    async fn preparation_stamps_declared_and_learned_capabilities_on_every_checkout() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        let pool = Fleet::default();
+        let mut managed = spillable_request();
+        pool.stamp_project_requirements(&mut managed, &[], &[], path);
+        assert!(managed.project_requirements.capabilities.is_empty());
+
+        pool.stamp_project_requirements(
+            &mut managed,
+            &[],
+            &[ProjectCapability::GithubCredential],
+            path,
+        );
+        assert_eq!(
+            managed.project_requirements.capabilities,
+            [ProjectCapability::GithubCredential],
+            "declared"
+        );
+
+        pool.learn_project_requirement(
+            &managed.project_id.clone(),
+            ProjectCapability::GithubCredential,
+            Some("https://github.com/bleugreen/tm-cards".into()),
+            "bginf-sp1",
+            "96e4e69d",
+        )
+        .await;
+        let mut live = spillable_request();
+        live.repository = live_checkout();
+        pool.stamp_project_requirements(&mut live, &[], &[], path);
+        assert_eq!(
+            live.project_requirements.capabilities,
+            [ProjectCapability::GithubCredential],
+            "learned, on a live checkout"
+        );
+        pool.stamp_project_requirements(
+            &mut managed,
+            &[],
+            &[ProjectCapability::GithubCredential],
+            path,
+        );
+        assert_eq!(
+            managed.project_requirements.capabilities,
+            [ProjectCapability::GithubCredential],
+            "declared and learned, once"
+        );
+        assert_eq!(
+            github_probe_repositories(&pool.learned_project_requirements(), &[]),
+            ["https://github.com/bleugreen/tm-cards"],
+            "the learned repository is what the probe checks"
+        );
+        assert!(
+            github_probe_repositories(&pool.learned_project_requirements(), &["other".into()])
+                .is_empty(),
+            "a machine that does not serve the project probes nothing for it"
+        );
     }
 
     /// The setup-toolchain gate is about preparation, so it does not apply to

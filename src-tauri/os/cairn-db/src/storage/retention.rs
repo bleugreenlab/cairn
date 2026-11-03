@@ -520,6 +520,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     keep("job_presence", SMALL),
     keep("landing_allocations", SMALL),
     keep("pending_injections", SMALL),
+    keep("project_learned_requirements", SMALL),
     keep("purpose_debts", SMALL),
     keep("ref_store_maintenance", SMALL),
     keep("resource_surfacings", SMALL),

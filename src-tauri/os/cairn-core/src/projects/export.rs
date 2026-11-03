@@ -129,6 +129,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     export_only("held_publications", "project_id = ?1"),
     export_only("ingress_endpoints", "project_id = ?1"),
     export_only("ingress_events", "project_id = ?1"),
+    export_only("project_learned_requirements", "project_id = ?1"),
     export_only("ref_store_maintenance", "project_id = ?1"),
     export_only("ref_store_samples", "project_id = ?1"),
     export_only("route_firings", "project_id = ?1"),

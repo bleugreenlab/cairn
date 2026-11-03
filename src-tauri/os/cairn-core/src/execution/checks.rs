@@ -98,7 +98,9 @@ use crate::execution::wire::{
 use crate::fleet::{CellOutcome, CellPriority, CellRequest, MutationPolicy};
 #[cfg(test)]
 use cairn_common::executor_protocol::{CellCommandClass, ResourceReservationSource};
-use cairn_common::executor_protocol::{ExecutorSelector, PlacementMobility, RepositoryLocator};
+use cairn_common::executor_protocol::{
+    ExecutorSelector, PlacementMobility, ProjectCapability, RepositoryLocator,
+};
 use cairn_platform::stack::off_frame;
 use cairn_vcs::PublicationIdentity;
 
@@ -225,9 +227,12 @@ fn attach_executor_provenance(
     let Some(classification) = classification.as_mut() else {
         return;
     };
+    // Every kind that is a fact about the machine rather than the tree names
+    // the machine, so the reader knows where to look.
     if matches!(
         classification.kind,
-        CheckFailureKind::Environment
+        CheckFailureKind::Infrastructure
+            | CheckFailureKind::Environment
             | CheckFailureKind::Unclassified
             | CheckFailureKind::Selection
             | CheckFailureKind::Prerequisite
@@ -235,9 +240,27 @@ fn attach_executor_provenance(
         if let Some(executor_id) = executor_id.filter(|id| !id.is_empty()) {
             classification
                 .reason
-                .push_str(&format!(" on executor `{executor_id}`"));
+                .push_str(&format!("{EXECUTOR_PROVENANCE} `{executor_id}`"));
         }
     }
+}
+
+/// What [`attach_executor_provenance`] appends before the machine's name.
+const EXECUTOR_PROVENANCE: &str = " on executor";
+
+/// A reason without the machine [`attach_executor_provenance`] named. The lane
+/// breaker signs how a run failed, and the same deterministic failure on two
+/// machines must sign the same, or it never reaches the breaker's bound.
+fn without_executor_provenance(reason: &str) -> &str {
+    reason
+        .rsplit_once(EXECUTOR_PROVENANCE)
+        .filter(|(_, machine)| {
+            machine
+                .strip_prefix(" `")
+                .and_then(|rest| rest.strip_suffix('`'))
+                .is_some_and(|name| !name.contains('`'))
+        })
+        .map_or(reason, |(reason, _)| reason)
 }
 
 /// The base-relative inputs a check script needs, carried in the request itself.
@@ -3199,8 +3222,9 @@ pub(crate) async fn plan_infra_scopes(
     };
     // The same requirements preparation stamps on the request, so the machines
     // these scopes count are the machines the lane can actually be placed on.
-    let project_requirements =
-        crate::fleet::project_requirements_at(std::path::Path::new(inputs.repository));
+    let project_requirements = orch
+        .fleet
+        .project_requirements_at(inputs.project_id, std::path::Path::new(inputs.repository));
     placements
         .iter()
         .map(|placement| {
@@ -3273,7 +3297,9 @@ pub(crate) fn review_placement_occupancy(
         repository_id: project_id.to_string(),
         absolute_path: repository.to_string(),
     };
-    let project_requirements = crate::fleet::project_requirements_at(Path::new(repository));
+    let project_requirements = orch
+        .fleet
+        .project_requirements_at(project_id, Path::new(repository));
     orch.fleet.occupancy_for(crate::fleet::PlacementScope {
         project_id,
         repository: &locator,
@@ -3477,8 +3503,9 @@ impl CheckPatience {
         };
         // Scoped by the avoid set as well as the selector: a group must never be
         // told it is waiting on machines that could not take it anyway.
-        let project_requirements =
-            crate::fleet::project_requirements_at(std::path::Path::new(&batch.repository));
+        let project_requirements = orch
+            .fleet
+            .project_requirements_at(&batch.project_id, std::path::Path::new(&batch.repository));
         GroupWait::from_occupancy(orch.fleet.occupancy_for(crate::fleet::PlacementScope {
             project_id: &batch.project_id,
             repository: &repository,
@@ -5720,6 +5747,18 @@ struct FailureClassification {
     /// artifact. This is deliberately separate from the broad infrastructure
     /// bucket so only this reviewed failure shape can trigger an uncached rerun.
     cache_corruption: bool,
+    /// A capability the failure shows the project's work needs of a machine,
+    /// which the runner records so placement requires it from now on.
+    implied_requirement: Option<ImpliedRequirement>,
+}
+
+/// What a classified failure says the project needs of the machines it runs
+/// on, beyond what it declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImpliedRequirement {
+    capability: ProjectCapability,
+    /// The repository the failing fetch named, when it named one.
+    repository: Option<String>,
 }
 
 /// What a failure signature is computed over besides the kind and exit code:
@@ -5752,7 +5791,10 @@ fn failure_cause_and_evidence(
         .evidence_line
         .and_then(|index| output.lines().nth(index))
         .unwrap_or_default();
-    (classification.reason.clone(), evidence.to_string())
+    (
+        without_executor_provenance(&classification.reason).to_string(),
+        evidence.to_string(),
+    )
 }
 
 /// Name the way a failing check DIED when the death is not an ordinary test
@@ -5776,6 +5818,7 @@ fn classify_check_failure(
             reason: "Cairn: check process failed to spawn".to_string(),
             evidence_line: None,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     if timed_out {
@@ -5784,6 +5827,7 @@ fn classify_check_failure(
             reason: "Cairn: check exceeded its timeout budget".to_string(),
             evidence_line: None,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     if exit_code.is_none() {
@@ -5792,6 +5836,7 @@ fn classify_check_failure(
             reason: "Cairn: check process died without an exit code".to_string(),
             evidence_line: None,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     // Named failure sites — failing assertions, or files that failed to collect
@@ -5916,6 +5961,7 @@ fn classify_check_failure(
             reason: "Cairn: sccache cache-read corruption matched reviewed evidence".to_string(),
             evidence_line: Some(evidence_line),
             cache_corruption: true,
+            implied_requirement: None,
         });
     }
     if let Some(evidence_line) = handoff_refused {
@@ -5926,6 +5972,7 @@ fn classify_check_failure(
                 .to_string(),
             evidence_line: Some(evidence_line),
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     if let Some((evidence_line, kind)) = producer_failure {
@@ -5948,6 +5995,24 @@ fn classify_check_failure(
             reason: reason.to_string(),
             evidence_line: Some(evidence_line),
             cache_corruption: false,
+            implied_requirement: None,
+        });
+    }
+    // A git dependency the machine could not authenticate to fetch exits as a
+    // build failure, and cargo words it as a bad pin. The cause is the
+    // machine's missing credential, which the same tree fetches fine elsewhere.
+    if let Some(failure) =
+        cairn_common::git_credential::credential_failure_in(lines.iter().copied())
+    {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Infrastructure,
+            reason: credential_fetch_reason(&failure, output),
+            evidence_line: Some(failure.line_index),
+            cache_corruption: false,
+            implied_requirement: failure.is_github().then(|| ImpliedRequirement {
+                capability: ProjectCapability::GithubCredential,
+                repository: failure.repository.clone(),
+            }),
         });
     }
     // A compile the host ended exits as a build failure (cargo's 101), but the
@@ -5963,6 +6028,7 @@ fn classify_check_failure(
             ),
             evidence_line: Some(ended.evidence_line),
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     if let Some(evidence_line) = explicit_infrastructure
@@ -5979,6 +6045,7 @@ fn classify_check_failure(
                     .to_string(),
             evidence_line: Some(evidence_line),
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
 
@@ -5997,6 +6064,7 @@ fn classify_check_failure(
             ),
             evidence_line: None,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
 
@@ -6028,6 +6096,7 @@ fn classify_check_failure(
             reason,
             evidence_line: unhandled,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
 
@@ -6042,9 +6111,42 @@ fn classify_check_failure(
                 .to_string(),
             evidence_line: None,
             cache_corruption: false,
+            implied_requirement: None,
         });
     }
     None
+}
+
+/// Why a credential-less dependency fetch is not a verdict on the tree, in
+/// words that point the reader at the machine rather than at the pin.
+fn credential_fetch_reason(
+    failure: &cairn_common::git_credential::CredentialFailure,
+    output: &str,
+) -> String {
+    const LINE_CHARS: usize = 200;
+    let what = match (&failure.repository, &failure.host) {
+        (Some(repository), _) => format!("fetching git dependency `{repository}`"),
+        (None, Some(host)) => format!("fetching a git dependency from `{host}`"),
+        (None, None) => "fetching a git dependency".to_string(),
+    };
+    let line: String = failure.line.chars().take(LINE_CHARS).collect();
+    let reported_as_missing_revision = output.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("revision ") && line.ends_with(" not found")
+    });
+    let disguise = if reported_as_missing_revision {
+        "; cargo reports this as 'revision … not found', but the pin was never checked"
+    } else {
+        ""
+    };
+    let credential = match failure.host.as_deref() {
+        Some("github.com") | None => "GitHub".to_string(),
+        Some(host) => format!("`{host}`"),
+    };
+    format!(
+        "Cairn: {what} failed for want of a credential (`{line}`){disguise}. This machine has \
+         no usable {credential} credential, so this run is not a verdict on the tree"
+    )
 }
 
 /// The termination signal a shell exit status of 128 + N reports, for the
@@ -6217,6 +6319,89 @@ pub(crate) mod host_ended_compile_specimens {
 
     /// A compile the tree failed: a coded diagnostic with its location.
     pub(crate) const COMPILE_ERROR_TAIL: &str = "error[E0425]: cannot find value `turn_id` in this scope\n   --> os/cairn-core/src/lib.rs:7:9\nerror: could not compile `cairn-core` (lib) due to 1 previous error";
+}
+
+/// Git dependency fetches that failed for want of a credential, shared by the
+/// classifier's tests so every signature is held to the same assertions.
+#[cfg(test)]
+pub(crate) mod git_credential_fetch_specimens {
+    /// Observation 96e4e69d-a1b9-44d3-86b6-cc6e08412e57's `output_tail`
+    /// verbatim (tm/230, rust-test on bginf-sp1 at `b7ec03c0`): cargo fetching
+    /// the private `tm-cards` dependency on a machine with no credential
+    /// helper, which cargo words as a missing revision.
+    pub(crate) const TM_230_TAIL: &str = "stderr:\n\
+        fatal: could not read Username for 'https://github.com': No such device or address\n\
+        fatal: could not read Username for 'https://github.com': No such device or address\n\
+        fatal: could not read Username for 'https://github.com': No such device or address\n\
+        fatal: could not read Username for 'https://github.com': No such device or address\n\
+        error: failed to get `tm-cards` as a dependency of package `tm-board v0.1.0 (/home/dev/.cairn-exec/build-slots/tm/slot-3/crates/tm-board)`\n\
+        \n\
+        Caused by:\n\
+        \x20 failed to load source for dependency `tm-cards`\n\
+        \n\
+        Caused by:\n\
+        \x20 unable to update https://github.com/bleugreen/tm-cards?rev=3ef623eea69d3605f15c4b75a46f83a2922138ed#3ef623ee\n\
+        \n\
+        Caused by:\n\
+        \x20 failed to fetch into: /home/dev/.cargo/git/db/tm-cards-979544f55ddc4498\n\
+        \n\
+        Caused by:\n\
+        \x20 revision 3ef623eea69d3605f15c4b75a46f83a2922138ed not found\n\
+        \n\
+        Caused by:\n\
+        \x20 process didn't exit successfully: `git fetch --no-tags --quiet --force --update-head-ok 'https://github.com/bleugreen/tm-cards' '+3ef623eea69d3605f15c4b75a46f83a2922138ed:refs/commit/3ef623eea69d3605f15c4b75a46f83a2922138ed'` (exit status: 128)\n\
+        \n\
+        \n\
+        Exit code: 101";
+
+    /// Cargo's chain around a git failure, with `{auth}` where git's own lines
+    /// go. Without an auth line it is a genuinely missing revision.
+    const CARGO_CHAIN: &str = "{auth}\n\
+        error: failed to get `tm-cards` as a dependency of package `tm-board v0.1.0`\n\
+        \n\
+        Caused by:\n\
+        \x20 failed to load source for dependency `tm-cards`\n\
+        \n\
+        Caused by:\n\
+        \x20 unable to update https://github.com/bleugreen/tm-cards?rev=3ef623ee#3ef623ee\n\
+        \n\
+        Caused by:\n\
+        \x20 revision 3ef623ee not found\n\
+        \n\
+        Caused by:\n\
+        \x20 process didn't exit successfully: `git fetch --no-tags --quiet --force --update-head-ok 'https://github.com/bleugreen/tm-cards' '+3ef623ee:refs/commit/3ef623ee'` (exit status: 128)";
+
+    pub(crate) fn wrapped(auth: &str) -> String {
+        CARGO_CHAIN.replace("{auth}", auth)
+    }
+
+    /// git's auth lines, each to be wrapped in [`wrapped`].
+    pub(crate) const AUTH_LINES: &[&str] = &[
+        "remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/bleugreen/tm-cards/'",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+        "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.",
+    ];
+
+    /// Cargo's libgit2 fetcher, which reports the refusal itself.
+    pub(crate) const LIBGIT2_TAIL: &str = "error: failed to get `tm-cards` as a dependency of package `tm-board v0.1.0`\n\
+        \n\
+        Caused by:\n\
+        \x20 failed to load source for dependency `tm-cards`\n\
+        \n\
+        Caused by:\n\
+        \x20 unable to update https://github.com/bleugreen/tm-cards?rev=3ef623ee#3ef623ee\n\
+        \n\
+        Caused by:\n\
+        \x20 failed to authenticate when downloading repository\n\
+        \n\
+        \x20 * attempted to find username/password via git's `credential.helper` support, but failed";
+
+    /// The same failure against a host that is not GitHub.
+    pub(crate) const GITLAB_TAIL: &str = "fatal: could not read Username for 'https://gitlab.example.com': No such device or address\n\
+        error: failed to get `widgets` as a dependency of package `tm-board v0.1.0`\n\
+        \n\
+        Caused by:\n\
+        \x20 unable to update https://gitlab.example.com/acme/widgets?rev=9a1b#9a1b";
 }
 
 /// Compose the `output_tail` a check row stores, within [`OUTPUT_TAIL_CHARS`]:
@@ -9660,6 +9845,7 @@ where
                             .to_string(),
                         evidence_line: None,
                         cache_corruption: false,
+                        implied_requirement: None,
                     })
                 } else {
                     classify_check_failure(
@@ -9972,6 +10158,29 @@ where
                         (recorded, true, not_recorded)
                     }
                 };
+
+                // A failure that shows the project needs a capability of its
+                // machines teaches placement to require it, so the lane re-arms
+                // somewhere that has it rather than back on this machine.
+                if let (true, Some(orch), Some(implied), Some(meta), Some(recorded)) = (
+                    published_here,
+                    diagnostic_orch,
+                    classification
+                        .as_ref()
+                        .and_then(|classification| classification.implied_requirement.clone()),
+                    provenance.as_ref(),
+                    recorded.as_ref(),
+                ) {
+                    orch.fleet
+                        .learn_project_requirement(
+                            project_id,
+                            implied.capability,
+                            implied.repository,
+                            &meta.executor_id,
+                            &recorded.id,
+                        )
+                        .await;
+                }
 
                 // The bound may have just been reached by the store above. Claim the
                 // ONE escalation this triple is allowed and, if we won it, put the
@@ -16448,6 +16657,230 @@ cairn-common = { path = "../cairn-common" }
                 (ended.by, ended.krate),
                 "{stored}"
             );
+        }
+    }
+
+    /// cairn/5873: cargo fetching a private git dependency on a machine with no
+    /// credential exits 101 and words it as a missing revision. It is stored as
+    /// `infrastructure` naming the machine and the missing credential, never
+    /// reused, charged to the machine, and kept off the wake path.
+    #[test]
+    fn a_dependency_fetch_without_a_credential_is_stored_as_infrastructure_naming_the_machine() {
+        use super::git_credential_fetch_specimens::*;
+        let command = "cargo test --workspace";
+        let mut specimens: Vec<(String, &str)> = vec![
+            (
+                TM_230_TAIL.to_string(),
+                "fatal: could not read Username for 'https://github.com'",
+            ),
+            (
+                LIBGIT2_TAIL.to_string(),
+                "failed to authenticate when downloading repository",
+            ),
+        ];
+        for auth in AUTH_LINES {
+            specimens.push((
+                wrapped(auth),
+                auth.lines()
+                    .find(|l| l.contains("fatal:") || l.contains("publickey"))
+                    .unwrap(),
+            ));
+        }
+        for (output, evidence) in &specimens {
+            let mut classification =
+                classify_check_failure(command, Some(101), false, false, None, output);
+            attach_executor_provenance(&mut classification, Some("bginf-sp1"));
+            let classification = classification.unwrap_or_else(|| panic!("{output}"));
+            assert_eq!(
+                classification.kind,
+                CheckFailureKind::Infrastructure,
+                "{output}"
+            );
+            let reason = &classification.reason;
+            assert!(reason.contains("credential"), "{reason}");
+            assert!(
+                reason.contains("`https://github.com/bleugreen/tm-cards`"),
+                "the reason names the repository: {reason}"
+            );
+            assert!(reason.contains("no usable GitHub credential"), "{reason}");
+            assert!(reason.contains("not a verdict on the tree"), "{reason}");
+            assert!(reason.ends_with(" on executor `bginf-sp1`"), "{reason}");
+            let line = output
+                .lines()
+                .nth(classification.evidence_line.expect("evidence is cited"))
+                .unwrap();
+            assert!(line.contains(evidence), "{line}");
+            assert!(!check_reuse_decision(command, Some(classification.kind), None).reusable);
+            assert!(
+                !classification.kind.is_verdict_about_the_code(),
+                "an infrastructure row never wakes the builder as a red"
+            );
+            assert_eq!(
+                classification.implied_requirement,
+                Some(ImpliedRequirement {
+                    capability: ProjectCapability::GithubCredential,
+                    repository: Some("https://github.com/bleugreen/tm-cards".to_string()),
+                }),
+                "a github.com refusal teaches placement the project needs a credential"
+            );
+            assert_eq!(
+                infra_repair_domain(None, Some(classification.kind)),
+                InfraRepairDomain::Environment,
+                "the failure is charged to the machine, not the head"
+            );
+        }
+        let tm =
+            classify_check_failure(command, Some(101), false, false, None, TM_230_TAIL).unwrap();
+        assert_eq!(
+            TM_230_TAIL.lines().nth(tm.evidence_line.unwrap()),
+            Some("fatal: could not read Username for 'https://github.com': No such device or address"),
+            "the evidence is the first of git's lines"
+        );
+        assert!(
+            tm.reason
+                .contains("cargo reports this as 'revision … not found'"),
+            "{}",
+            tm.reason
+        );
+
+        let gitlab = classify_check_failure(command, Some(101), false, false, None, GITLAB_TAIL)
+            .expect("another host's refusal is still the machine's");
+        assert_eq!(gitlab.kind, CheckFailureKind::Infrastructure);
+        assert!(
+            gitlab
+                .reason
+                .contains("no usable `gitlab.example.com` credential"),
+            "{}",
+            gitlab.reason
+        );
+        assert_eq!(
+            gitlab.implied_requirement, None,
+            "no capability measures another host's credential"
+        );
+    }
+
+    /// Output that merely mentions git's words, a test that failed for its own
+    /// reasons, a compile error, and a genuinely missing revision all keep the
+    /// classification they had.
+    #[test]
+    fn credential_lookalikes_keep_their_classification() {
+        use super::git_credential_fetch_specimens::*;
+        use super::host_ended_compile_specimens::COMPILE_ERROR_TAIL;
+        let command = "cargo test --workspace";
+        let classify = |output: &str| {
+            classify_check_failure(command, Some(101), false, false, None, output)
+                .map(|classification| classification.kind)
+        };
+        assert_eq!(
+            classify(
+                "test git::fatal_could_not_read_username_for_https_github_com ... ok\n\
+                 test git::reads_auth ... FAILED\n\
+                 fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+            ),
+            None,
+            "a named failing test that prints git's line is the test's red"
+        );
+        assert_eq!(
+            classify(
+                "test fatal: could not read Username for 'https://github.com' ... ok\nerror: test failed"
+            ),
+            None,
+            "a passing row that names git's line is blanked before the scan"
+        );
+        // Compiler diagnostics echo source lines, and this suite's own
+        // fixtures are such lines: a build broken beside them is the tree's.
+        let rustc = format!(
+            "error[E0308]: mismatched types\n    --> os/cairn-core/src/execution/checks.rs:6287:9\n     |\n6287 | {}\n     |         ^^^^^ expected `&str`, found `()`\nerror: could not compile `cairn-core` (lib test) due to 1 previous error",
+            TM_230_TAIL.lines().nth(1).unwrap()
+        );
+        assert_eq!(
+            classify(&rustc),
+            None,
+            "a rustc diagnostic quoting a fixture"
+        );
+        let clippy = "error: this could be simplified\n   --> src/git_credential.rs:12:5\n   |\n12 |     \"git@github.com: Permission denied (publickey).\\nfatal: Could not read from remote repository.\",\n13 |     \"  failed to authenticate when downloading repository\",\nerror: could not compile `cairn-common` (lib) due to 1 previous error";
+        assert_eq!(
+            classify_check_failure("bun run check:rust", Some(101), false, false, None, clippy)
+                .map(|classification| classification.kind),
+            None,
+            "a clippy diagnostic quoting a fixture"
+        );
+        assert_eq!(
+            classify(COMPILE_ERROR_TAIL),
+            None,
+            "a compile error is the tree's red"
+        );
+        assert_eq!(
+            classify(&wrapped("")),
+            None,
+            "a revision missing with no auth line is a bad pin, the tree's red"
+        );
+    }
+
+    /// The lane breaker groups infrastructure reds by their failure signature,
+    /// so the same red on two machines must sign the same though its stored
+    /// reason names each machine.
+    #[test]
+    fn one_infrastructure_red_on_two_machines_signs_the_same() {
+        use super::git_credential_fetch_specimens::TM_230_TAIL;
+        use super::host_ended_compile_specimens::KILLED_RMCP_TAIL;
+        for output in [TM_230_TAIL, KILLED_RMCP_TAIL] {
+            let signature = |executor: &str| {
+                let mut classification =
+                    classify_check_failure("cargo test", Some(101), false, false, None, output);
+                attach_executor_provenance(&mut classification, Some(executor));
+                let classification = classification.unwrap();
+                assert!(classification.reason.ends_with(&format!("`{executor}`")));
+                let (cause, evidence) =
+                    failure_cause_and_evidence(None, Some(&classification), output);
+                crate::execution::lane_breaker::failure_signature(
+                    classification.kind.as_str(),
+                    &cause,
+                    101,
+                    &evidence,
+                )
+            };
+            assert_eq!(signature("bginf-sp1"), signature("bginf-sp2"), "{output}");
+        }
+        assert_eq!(
+            without_executor_provenance("Cairn: x on executor `bginf-sp1`"),
+            "Cairn: x"
+        );
+        assert_eq!(
+            without_executor_provenance("Cairn: ran on executor nodes"),
+            "Cairn: ran on executor nodes"
+        );
+    }
+
+    /// The classifier stores `infrastructure` for a credential failure exactly
+    /// when the shared matcher the executor's GitHub probe reads `git ls-remote`
+    /// with holds over the output, so the two cannot disagree about what a
+    /// credential failure looks like.
+    #[test]
+    fn the_classifier_and_the_github_probe_share_one_credential_matcher() {
+        use super::git_credential_fetch_specimens::*;
+        let command = "cargo build";
+        let mut outputs = vec![
+            TM_230_TAIL.to_string(),
+            LIBGIT2_TAIL.to_string(),
+            GITLAB_TAIL.to_string(),
+            wrapped(""),
+            "dev@bginf-sp1: Permission denied (publickey).".to_string(),
+            String::new(),
+        ];
+        outputs.extend(AUTH_LINES.iter().map(|auth| wrapped(auth)));
+        for output in &outputs {
+            let matched = cairn_common::git_credential::credential_failure(output);
+            let classification =
+                classify_check_failure(command, Some(101), false, false, None, output);
+            assert_eq!(
+                classification.as_ref().map(|c| c.kind),
+                matched.as_ref().map(|_| CheckFailureKind::Infrastructure),
+                "{output}"
+            );
+            if let (Some(matched), Some(classification)) = (matched, classification) {
+                assert_eq!(classification.evidence_line, Some(matched.line_index));
+            }
         }
     }
 

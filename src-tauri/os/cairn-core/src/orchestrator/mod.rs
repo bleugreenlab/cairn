@@ -741,6 +741,9 @@ impl OrchestratorBuilder {
         // Machines that could not prepare a project's cells stay excluded for
         // that project across a runner restart, until their evidence changes.
         fleet.attach_preparation_store(self.db.local.clone());
+        // Capabilities a project was learned to need keep it off machines
+        // without them across a restart.
+        fleet.attach_learned_requirements_store(self.db.local.clone());
         // Work granted to a machine before a restart is still running there.
         // Its debts reload before any purpose item is admitted, so nothing
         // dispatches beside one.
@@ -4431,6 +4434,7 @@ mod tests {
                     build_prerequisites: None,
                     containment: None,
                     page_call_programs: None,
+                    github_credential: None,
                 },
                 current_load: 0,
                 warm_roots: Vec::new(),

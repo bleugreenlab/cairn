@@ -17,6 +17,7 @@ pub mod executor_generation;
 pub mod executor_paths;
 pub mod executor_protocol;
 pub mod executor_protocol_ledger;
+pub mod git_credential;
 pub mod identity;
 pub mod ids;
 pub mod imports;

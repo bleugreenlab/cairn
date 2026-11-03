@@ -366,6 +366,7 @@ fn test_executor_advertisement(
             build_prerequisites: None,
             containment: None,
             page_call_programs: None,
+            github_credential: None,
         },
         current_load: 0,
         warm_roots: pool.map(ExecutorPool::warm_roots).unwrap_or_default(),
