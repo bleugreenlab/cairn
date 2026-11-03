@@ -6372,6 +6372,80 @@ mod tests {
         assert_eq!(hot_source, "obs-2");
     }
 
+    #[tokio::test]
+    async fn a_red_evaluations_result_stays_readable_after_a_later_green_on_its_key() {
+        // The hot row holds only the latest evaluation of a key, its
+        // `target_results_json` included. What each evaluation's structured
+        // result said is its observation and per-test rows, which a later green
+        // on the same key must leave readable.
+        let db = cache_db().await;
+        let mut red = observation("obs-red", "commit-1", "env-a");
+        red.exit_code = 1;
+        red.verdict = "failed".to_string();
+        red.complete = false;
+        red.selection = Some("full".to_string());
+        red.reusable = false;
+        red.non_reusable_reason = Some("incomplete result".to_string());
+        red.tests = vec![CheckTestResultRow {
+            test_id: "src/a.test.ts > a breaks".to_string(),
+            status: "failed".to_string(),
+            duration_ms: Some(3),
+            attempt_count: Some(1),
+            failure_excerpt: Some("AssertionError: expected 1 to be 2".to_string()),
+            skip_reason: None,
+            declaration_source: None,
+            flaky: false,
+            started_offset_ms: None,
+        }];
+        record_fresh_check_observation(db.clone(), red).unwrap();
+        let mut green = observation("obs-green", "commit-1", "env-a");
+        green.ran_at = 200;
+        record_fresh_check_observation(db.clone(), green).unwrap();
+
+        let hot_source = db
+            .query_one(
+                "SELECT source_observation_id FROM check_result_cache
+                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hot_source, "obs-green");
+        let (verdict, complete, selection, test_id, status, excerpt) = db
+            .query_one(
+                "SELECT o.verdict, o.complete, o.selection, t.test_id, t.status, t.failure_excerpt
+                   FROM check_result_observations o
+                   JOIN check_test_results t ON t.observation_id = o.id
+                  WHERE o.id = 'obs-red'",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.i64(1)?,
+                        row.opt_text(2)?,
+                        row.text(3)?,
+                        row.text(4)?,
+                        row.opt_text(5)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (verdict.as_str(), complete, selection.as_deref()),
+            ("failed", 0, Some("full"))
+        );
+        assert_eq!(
+            (test_id.as_str(), status.as_str(), excerpt.as_deref()),
+            (
+                "src/a.test.ts > a breaks",
+                "failed",
+                Some("AssertionError: expected 1 to be 2")
+            )
+        );
+    }
+
     /// An attempt at `commit` in `environment` that ended without a verdict,
     /// written the way the run path writes an infrastructure death: its
     /// immutable observation, and its head-scoped infrastructure row.

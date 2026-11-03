@@ -865,7 +865,6 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
     let count = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     let passed = count("numPassedTests") as usize;
     let failed = count("numFailedTests") as usize;
-    let skipped = (count("numPendingTests") + count("numTodoTests")) as usize;
 
     let empty = Vec::new();
     let files = value
@@ -881,6 +880,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
     let mut failures = Vec::new();
     let mut tests = Vec::new();
     let mut suite_failures = 0usize;
+    let mut unfinished = false;
     for file in files {
         let mut assertion_failed = false;
         for a in file
@@ -908,7 +908,16 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
             let canonical_status = match status {
                 "passed" => "passed",
                 "failed" => "failed",
-                "pending" | "todo" | "skipped" => "skipped",
+                "todo" | "skipped" => "skipped",
+                // Vitest's `pending` is a test still `run` or `queued`, or one
+                // that never got a result: it never finished, because its worker
+                // died or the run stopped around it. A declared skip is
+                // `skipped`. Same rule as `VITEST_STATUS` in
+                // scripts/lib/structured-test-result.ts.
+                "pending" => {
+                    unfinished = true;
+                    continue;
+                }
                 _ => continue,
             };
             tests.push(CheckTestResult {
@@ -952,9 +961,12 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         }
     }
 
+    // Counted from the rows: vitest's `numPendingTests` folds tests that never
+    // finished in with declared skips.
+    let skipped = tests.iter().filter(|test| test.status == "skipped").count();
     Some(ParsedCheckResult {
         schema_version: 1,
-        complete: tests.len() == passed + failed + skipped,
+        complete: !unfinished && tests.len() == passed + failed + skipped,
         selection: "unknown".to_string(),
         tests,
         undeclared_skips: 0,
@@ -1975,6 +1987,28 @@ test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
             message.contains("imported from 'src/components/FileTabView.test.tsx'"),
             "paths quoted inside the message are stripped too: {message}"
         );
+    }
+
+    #[test]
+    fn a_vitest_test_that_never_finished_is_not_a_skip() {
+        // Vitest 4.0.17's report for a file whose forks worker was killed under
+        // its only test, beside a declared skip: the file reads passed, the
+        // killed test `pending`, and `numPendingTests` counts both.
+        let output = concat!(
+            "{\"numTotalTestSuites\":1,\"numPassedTests\":0,\"numFailedTests\":0,",
+            "\"numPendingTests\":2,\"numTodoTests\":0,\"success\":true,\"testResults\":[",
+            "{\"name\":\"/slot/scripts/c.test.ts\",\"status\":\"passed\",\"assertionResults\":[",
+            "{\"fullName\":\"kills its worker\",\"status\":\"pending\",\"failureMessages\":[]},",
+            "{\"fullName\":\"declared skip\",\"status\":\"skipped\",\"failureMessages\":[]}",
+            "]}]}"
+        );
+        let r = parse_check_output("bunx vitest run --reporter=json", output).unwrap();
+        assert_eq!(r.skipped, 1);
+        assert_eq!(
+            r.tests.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["declared skip"]
+        );
+        assert!(!r.complete);
     }
 
     #[test]

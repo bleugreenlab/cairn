@@ -22475,6 +22475,37 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
     }
 
     #[test]
+    fn a_shard_whose_report_never_arrived_is_a_runner_error_not_a_zero_failure_red() {
+        // What scripts/test-frontend.ts hands back when a shard's vitest process
+        // died before writing its JSON report (and so before printing its FAIL
+        // block): an incomplete result naming no failure, and a tail that says
+        // which shard reported nothing. Captured from a constructed run.
+        let result = r#"{"schemaVersion":1,"parser":"vitest","complete":false,"selection":"full","tests":[{"id":"scripts/b.test.ts > leaks a rejection","status":"passed","attempts":1,"retried":false,"flaky":false}],"undeclaredSkips":0}"#;
+        let output = format!(
+            "{RESULT_ARTIFACT_JSON_MARKER}{result}\nstderr:\n\n\u{274c} frontend tests failed\n\n\
+             \x20  no failing test was named \u{2014} a shard failed to collect, matched\n\
+             \x20  no tests, or errored outside a test body. Rerun and read its output.\n\n\
+             \x20  shard scripts 1/1 wrote no readable JSON report; its other tests have no result rows.\n\n\
+             \x20  rerun: bun run test:frontend scripts/b.test.ts scripts/e.test.ts\n\n\
+             error: script \"test:frontend:scoped\" exited with code 1\n\nExit code: 1"
+        );
+        let parsed = parse_check_output(FRONTEND_COMMAND, &output).expect("the runner's result");
+        assert!(!parsed.complete);
+        assert_eq!((parsed.failed, parsed.suite_failures), (0, 0));
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed),
+            &output,
+        )
+        .expect("a red with nothing named is not an ordinary failure");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+        assert!(classification.kind.is_infrastructure());
+    }
+
+    #[test]
     fn vitest_exiting_without_a_report_is_named_a_runner_error() {
         // No JSON object at all: Vitest died loading its config or its deps, so
         // nothing was ever collected. Left unclassified this renders as a bare
