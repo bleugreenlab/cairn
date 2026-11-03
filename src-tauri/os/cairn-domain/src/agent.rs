@@ -2,7 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::common::{Model, ModelSelection, RuntimeExtras};
+use super::allotment::AllotmentEntry;
+use super::common::{ModelSelection, RuntimeExtras};
 use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
 use super::recipe::ConfirmPolicy;
 
@@ -44,8 +45,10 @@ pub struct AgentConfig {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    #[serde(alias = "model")]
-    pub tier: Option<Model>,
+    /// The pools and models this agent selects within; empty means the
+    /// workspace's default allotment.
+    #[serde(default)]
+    pub models: Vec<AllotmentEntry>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub created_at: i32,
@@ -56,22 +59,17 @@ pub struct AgentConfig {
     pub skills: Option<Vec<String>>,
     /// Worktree fence behavior for sandbox escapes.
     pub fence: Option<Fence>,
-    /// Preferred backend to use when multiple providers are available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
     /// Optional lucide icon name (kebab-case) giving the agent a compact visual
     /// identity. `None`/absent means no icon (a `Bot` fallback renders in the UI).
     #[serde(default)]
     pub icon: Option<String>,
-    /// Resolved atomic backend+model selection carried from the execution
-    /// snapshot to session start. When set, the runtime uses it verbatim and
-    /// never re-resolves a tier. `None` only for authoring/display configs that
-    /// never run a session.
+    /// The backend+model this agent's job runs on: its launch pin, or the
+    /// selection stored on the job when it launched. The runtime uses it
+    /// verbatim. `None` for authoring/display configs that never run a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
-    /// Backend-specific runtime parameters (effort, thinking) resolved early and
-    /// carried to session start instead of being recomputed.
+    /// Backend-specific runtime parameters (effort, thinking) that go with
+    /// `selection`, carried to session start instead of being recomputed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras: Option<RuntimeExtras>,
 }
@@ -85,8 +83,8 @@ pub struct CreateAgentConfig {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    #[serde(alias = "model")]
-    pub tier: Option<Model>,
+    #[serde(default)]
+    pub models: Vec<AllotmentEntry>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub disallowed_tools: Option<Vec<String>>,
@@ -96,8 +94,6 @@ pub struct CreateAgentConfig {
     pub sandbox: Option<LegacySandbox>,
     #[serde(default, skip_serializing)]
     pub on_escape: Option<LegacyOnEscape>,
-    #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
     #[serde(default)]
     pub icon: Option<String>,
 }
@@ -110,8 +106,7 @@ pub struct UpdateAgentConfig {
     pub description: Option<String>,
     pub prompt: Option<String>,
     pub tools: Option<Vec<String>>,
-    #[serde(alias = "model")]
-    pub tier: Option<Option<Model>>,
+    pub models: Option<Vec<AllotmentEntry>>,
     pub disallowed_tools: Option<Option<Vec<String>>>,
     pub skills: Option<Option<Vec<String>>>,
     /// New scope: workspace_id = Some("default") for workspace, None for project
@@ -119,7 +114,5 @@ pub struct UpdateAgentConfig {
     /// New scope: project_id = Some(id) for project, None for workspace
     pub project_id: Option<Option<String>>,
     pub fence: Option<Option<Fence>>,
-    #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<Option<String>>,
     pub icon: Option<Option<String>>,
 }

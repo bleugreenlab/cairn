@@ -9626,7 +9626,7 @@ mod decide_door_tests {
         std::fs::create_dir_all(&responses).unwrap();
         std::fs::write(
             responses.join("slow.md"),
-            format!("---\nname: Slow\ndescription: a reasoning call\nmodel: qwen3\nbackend: {key}\ntimeout: 300s\n---\nLabel this."),
+            format!("---\nname: Slow\ndescription: a reasoning call\nmodels: [{key}/qwen3]\ntimeout: 300s\n---\nLabel this."),
         )
         .unwrap();
 
@@ -9718,7 +9718,7 @@ mod host_batch_tests {
         std::fs::create_dir_all(&responses).unwrap();
         std::fs::write(
             responses.join("slow.md"),
-            "---\nname: Slow\ndescription: a reasoning call\nmodel: test-model\nbackend: openrouter\ntimeout: 300s\n---\nLabel this.",
+            "---\nname: Slow\ndescription: a reasoning call\nmodels: [openrouter/test-model]\ntimeout: 300s\n---\nLabel this.",
         )
         .unwrap();
         orch

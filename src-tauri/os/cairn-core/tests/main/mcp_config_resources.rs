@@ -155,14 +155,19 @@ async fn agent_workspace_create_read_patch_delete_roundtrip() {
                 "description": "Helps with deploys",
                 "prompt": "# Deploy\n\nDo the thing.",
                 "tools": ["Read", "Grep"],
-                "tier": "sonnet"
+                "models": ["md"]
             }
         }]),
     )
     .await;
     assert!(created.contains("\"applied\""), "create: {created}");
     let file = cfg.join("agents/deploy-helper.md");
-    assert!(file.exists(), "agent file should exist");
+    assert!(file.exists(), "agent file should exist: {created}");
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        written.contains("models:") && written.contains("md"),
+        "allotment: {written}"
+    );
 
     let item = read(&orch, "cairn://agents/deploy-helper").await;
     assert!(item.contains("Helps with deploys"), "read: {item}");

@@ -1364,6 +1364,13 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
             .response_model_availability(&orch, None, model)
             .unwrap_or_else(|error| panic!("{key}: {error}"));
     }
+    orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
+        backend: "claude".into(),
+        models: cairn_models::types::catalog::claude_models(),
+        options: Vec::new(),
+        refreshed_at: Some(1),
+        error: None,
+    });
     let capabilities = crate::responses::model_capabilities(&orch, None, None, None);
     let claude = capabilities
         .backends
@@ -1374,7 +1381,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
     assert!(claude
         .selections
         .iter()
-        .any(|selection| selection.kind == "tier" && selection.runnable));
+        .any(|selection| selection.kind == "model" && selection.runnable));
 
     // Claude: text, and a schema's structured output as the answer.
     let plain = complete_on(&orch, "claude", one_shot_request("haiku", None))
@@ -1567,7 +1574,7 @@ async fn a_refused_claude_one_shot_names_the_account_it_ran_on() {
     assert_eq!(hold.detail, TERMS_SENTENCE);
 
     let definition = crate::responses::parse_definition(
-        "---\nname: Refused\ndescription: a refused response\nmodel: haiku\nbackend: claude\ntimeout: 30s\n---\nSay hi",
+        "---\nname: Refused\ndescription: a refused response\nmodels: [claude/haiku]\ntimeout: 30s\n---\nSay hi",
     )
     .unwrap();
     let refused = crate::responses::invoke_definition(
@@ -1841,7 +1848,10 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
     );
     // Admission probes it, and the probe rides the wire the offer declares.
     let pinned = DecisionNode {
-        model: Some("gemma4-26b".into()),
+        models: Some(vec![cairn_config::allotment::AllotmentEntry::parse(
+            &format!("{spark_key}/gemma4-26b"),
+        )
+        .unwrap()]),
         ..decision.clone()
     };
     assert!(

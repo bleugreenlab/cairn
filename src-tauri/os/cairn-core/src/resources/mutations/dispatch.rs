@@ -192,6 +192,9 @@ fn gate_resource_change(
         return Err(build_failure(index, item, refusal));
     }
     let kind = resource.kind();
+    if let Some(refusal) = retired_model_keys_refusal(kind, item.payload.as_ref()) {
+        return Err(build_failure(index, item, refusal));
+    }
     if kind == ResourceKind::IssueExecutions && item.mode == ChangeMode::Append {
         if let Some(refusal) =
             crate::tenets::filing_tenet_keys_refusal(item.payload.as_ref(), "payload.")
@@ -249,6 +252,45 @@ fn gate_resource_change(
         error.push_str(&render_alternatives(&candidates, spec));
     }
     Err(build_failure(index, item, error))
+}
+
+/// Every resource whose writes choose a model through `models`, the allotment.
+const ALLOTMENT_KINDS: &[ResourceKind] = &[
+    ResourceKind::NodeTasks,
+    ResourceKind::NodeCalls,
+    ResourceKind::Agents,
+    ResourceKind::Agent,
+    ResourceKind::ProjectAgents,
+    ResourceKind::ProjectAgent,
+    ResourceKind::Responses,
+    ResourceKind::Response,
+    ResourceKind::ProjectResponses,
+    ResourceKind::ProjectResponse,
+];
+
+/// The refusal for a write that still names a model key `models` retired.
+///
+/// The contract no longer declares these keys, so without this the gate would
+/// refuse them as merely unknown; a caller still sending `tier` believes it is
+/// choosing a model, and is told what replaced it instead.
+fn retired_model_keys_refusal(
+    kind: ResourceKind,
+    payload: Option<&serde_json::Value>,
+) -> Option<String> {
+    let payload = payload?;
+    if ALLOTMENT_KINDS.contains(&kind) {
+        return crate::mcp::types::model_keys_problem(payload);
+    }
+    match kind {
+        ResourceKind::IssueExecutions => payload
+            .get("backend")
+            .map(|_| executions::RETIRED_EXECUTION_BACKEND.to_string()),
+        ResourceKind::Settings => payload
+            .as_object()?
+            .keys()
+            .find_map(|key| super::settings::retired_settings_key(key)),
+        _ => None,
+    }
 }
 
 /// Every mutation this resource declares for `mode`. More than one means the
@@ -588,4 +630,66 @@ fn wants_return_content(target: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{retired_model_keys_refusal, ALLOTMENT_KINDS};
+    use cairn_common::contract::{contract_for, ResourceKind};
+    use serde_json::json;
+
+    /// Each retired model key is refused with what replaced it, on every
+    /// resource that took it, while `models` itself passes.
+    #[test]
+    fn a_retired_model_key_is_refused_with_its_replacement() {
+        for kind in ALLOTMENT_KINDS {
+            for key in ["tier", "model", "backend", "backendPreference"] {
+                let refusal = retired_model_keys_refusal(*kind, Some(&json!({key: "lg"})))
+                    .unwrap_or_else(|| panic!("{kind:?} refuses {key}"));
+                assert!(refusal.contains("models"), "{kind:?} {key}: {refusal}");
+            }
+            assert_eq!(
+                retired_model_keys_refusal(*kind, Some(&json!({"models": ["lg"]}))),
+                None
+            );
+        }
+        let execution = retired_model_keys_refusal(
+            ResourceKind::IssueExecutions,
+            Some(&json!({"recipe": "build", "backend": "codex"})),
+        )
+        .unwrap();
+        assert!(execution.contains("overrides.agents"), "{execution}");
+        for key in ["tierDefaults", "tiers", "backends"] {
+            let settings =
+                retired_model_keys_refusal(ResourceKind::Settings, Some(&json!({key: {}})))
+                    .unwrap_or_else(|| panic!("settings refuses {key}"));
+            assert!(settings.contains("cairn://models/ladder"), "{settings}");
+        }
+        assert_eq!(
+            retired_model_keys_refusal(ResourceKind::Settings, Some(&json!({"models": {}}))),
+            None
+        );
+    }
+
+    /// What the gate refuses as retired, no contract still advertises, so the
+    /// affordance block never teaches a key the write would refuse.
+    #[test]
+    fn no_contract_still_declares_a_retired_model_key() {
+        let declared = |kind: ResourceKind, key: &str| {
+            contract_for(kind)
+                .is_some_and(|contract| contract.mutations.iter().any(|spec| spec.accepts_key(key)))
+        };
+        for kind in ALLOTMENT_KINDS {
+            for key in ["tier", "model", "backend", "backendPreference"] {
+                assert!(!declared(*kind, key), "{kind:?} still declares {key}");
+            }
+        }
+        assert!(!declared(ResourceKind::IssueExecutions, "backend"));
+        for key in ["tierDefaults", "tiers", "backends"] {
+            assert!(
+                !declared(ResourceKind::Settings, key),
+                "settings declares {key}"
+            );
+        }
+    }
 }

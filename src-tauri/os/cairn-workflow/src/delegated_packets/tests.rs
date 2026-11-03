@@ -65,8 +65,7 @@ fn packet(id: &str, status: DelegatedStatus, job: Option<&str>) -> DelegatedWork
         materialized_node_ids: vec![],
         result_artifact_job_id: job.map(str::to_string),
         task_index: Some(0),
-        tier_override: None,
-        backend_preference: None,
+        models: None,
         background: false,
         created_at: 7,
     }

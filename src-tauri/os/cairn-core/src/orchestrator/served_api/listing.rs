@@ -162,7 +162,6 @@ machines: []
                     refreshed_at: Some(1),
                     error: None,
                 }),
-                tiers: Vec::new(),
                 serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
                 unable: Vec::new(),
             }],

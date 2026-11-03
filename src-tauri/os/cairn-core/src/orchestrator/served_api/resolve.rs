@@ -233,7 +233,6 @@ mod tests {
                 refreshed_at: Some(1),
                 error: None,
             }),
-            tiers: Vec::new(),
             serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
             unable: Vec::new(),
         }
@@ -245,10 +244,9 @@ mod tests {
 
     /// The lab as the catalog sees it: DeepSeek on the Sparks and the halo
     /// embedder under their real names, and OpenRouter serving the same
-    /// DeepSeek under a dated canonical slug plus a model only it has, with a
-    /// tier named `big` bound on it.
+    /// DeepSeek under a dated canonical slug plus a model only it has.
     fn lab() -> Catalog {
-        let mut openrouter = provider(
+        let openrouter = provider(
             "openrouter",
             vec![
                 discovered(
@@ -259,12 +257,6 @@ mod tests {
                 discovered("anthropic/claude-sonnet-4.5", None, false),
             ],
         );
-        openrouter.tiers = vec![cairn_models::interface::TierBinding {
-            tier: "big".into(),
-            model: "anthropic/claude-sonnet-4.5".into(),
-            options: Default::default(),
-            is_tier_default: true,
-        }];
         Catalog {
             providers: vec![
                 provider(

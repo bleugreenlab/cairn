@@ -45,6 +45,7 @@ pub mod inference_verify;
 pub(crate) mod landing;
 pub mod lifecycle;
 pub mod model_defaults;
+pub mod model_selection;
 pub mod models;
 pub mod object_plane;
 pub mod parent_wake;
@@ -5104,6 +5105,7 @@ mod tests {
             ProviderModelCatalog {
                 backend: "codex".to_string(),
                 models: vec![DiscoveredModel {
+                    maker: None,
                     id: "gpt-5".to_string(),
                     model: "gpt-5".to_string(),
                     display_name: "GPT-5".to_string(),
@@ -5449,6 +5451,7 @@ mod tests {
             ProviderModelCatalog {
                 backend: "openrouter".to_string(),
                 models: vec![DiscoveredModel {
+                    maker: None,
                     id: "anthropic/claude-sonnet-4.5".to_string(),
                     model: "anthropic/claude-sonnet-4.5".to_string(),
                     display_name: "Claude Sonnet 4.5".to_string(),

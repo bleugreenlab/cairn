@@ -6,6 +6,11 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
 
+/// The refusal for an execution start that still names an execution-wide
+/// provider: each node selects within its own allotment, so the way to run an
+/// agent on one provider is to name that provider's model for it.
+pub(super) const RETIRED_EXECUTION_BACKEND: &str = "payload.backend was retired: each node now selects a model within its allotment. To run an agent on one provider, name its model: overrides.agents.<agent>.models: [provider/model]; see docs/backends.md#model-selection";
+
 /// `place`, on a filing: `"head"` asks for the head of the issue's thread's
 /// own queue; absent queues it behind what is already held.
 pub(super) fn parse_place(
@@ -41,12 +46,6 @@ pub(super) async fn dispatch(
             let recipe = match item.payload.as_ref().and_then(|p| p.get("recipe")) {
                 Some(value) => Some(value.as_str().ok_or_else(|| {
                     build_failure(index, item, "payload.recipe must be a string")
-                })?),
-                None => None,
-            };
-            let backend = match item.payload.as_ref().and_then(|p| p.get("backend")) {
-                Some(value) => Some(value.as_str().ok_or_else(|| {
-                    build_failure(index, item, "payload.backend must be a string")
                 })?),
                 None => None,
             };
@@ -152,7 +151,6 @@ pub(super) async fn dispatch(
                     project,
                     *number,
                     recipe,
-                    backend,
                     branch_target,
                     continuity,
                     overrides,

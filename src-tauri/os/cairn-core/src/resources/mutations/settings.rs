@@ -41,9 +41,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "seedBudgetTokens",
     "seedEras",
     "externalReplies",
-    "tierDefaults",
-    "tiers",
-    "backends",
+    "models",
     "enabledProviders",
     "decisionModel",
     "imageModel",
@@ -107,6 +105,17 @@ pub(crate) fn workspace_settings_authority(
         .collect()
 }
 
+/// The refusal for a key of the tier grid that `models` replaced.
+pub(crate) fn retired_settings_key(key: &str) -> Option<String> {
+    matches!(key, "tierDefaults" | "tiers" | "backends").then(|| {
+        format!(
+            "`{key}` was retired: the tier grid became model pools and a capability ladder. \
+             Patch `models` instead; its current value is at cairn://models/ladder. See \
+             docs/backends.md#model-selection"
+        )
+    })
+}
+
 /// Reject out-of-scope settings keys before the authority gate raises a card for
 /// a write that cannot land anyway.
 ///
@@ -127,6 +136,9 @@ fn validate_settings_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(),
             }
             "systemPrompt" | "autoStartJobs" => {
                 return Err(format!("'{key}' is deprecated and not writable"))
+            }
+            retired if retired_settings_key(retired).is_some() => {
+                return Err(retired_settings_key(retired).unwrap_or_default())
             }
             other if spec.is_some_and(|spec| spec.accepts_key(other)) => {}
             other => {
@@ -552,7 +564,11 @@ mod tests {
     #[test]
     fn accepts_known_pref_and_section_keys() {
         assert!(validate(&["mergeType", "gitIdentities", "keybinds", "buildServices"]).is_ok());
-        assert!(validate(&["tierDefaults", "tiers", "backends", "accounts"]).is_ok());
+        assert!(validate(&["models", "accounts"]).is_ok());
+        for key in ["tierDefaults", "tiers", "backends"] {
+            let refused = validate(&[key]).unwrap_err();
+            assert!(refused.contains("Patch `models`"), "{key}: {refused}");
+        }
     }
 
     #[test]
@@ -707,14 +723,14 @@ mod tests {
         let item = ChangeItem {
             target: "cairn://settings".to_string(),
             mode: ChangeMode::Patch,
-            payload: Some(serde_json::json!({"keybinds": {}, "backends": {}})),
+            payload: Some(serde_json::json!({"keybinds": {}, "models": {}})),
         };
         let scopes: Vec<String> = workspace_settings_authority(&item)
             .into_iter()
             .map(|request| request.unwrap().scope.shorthand())
             .collect();
         assert_eq!(scopes.len(), 2);
-        assert!(scopes.contains(&"workspace/default/settings/backends:write".to_string()));
+        assert!(scopes.contains(&"workspace/default/settings/models:write".to_string()));
         assert!(scopes.contains(&"workspace/default/settings/keybinds:write".to_string()));
     }
 

@@ -387,6 +387,7 @@ fn model(
     let upstream = upstream.as_deref().unwrap_or(&id);
     let tokenizer = tokenizer_for(&backend_key, &id, Some(upstream));
     DiscoveredModel {
+        maker: None,
         id: id.clone(),
         model: id.clone(),
         display_name: id,

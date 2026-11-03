@@ -104,6 +104,83 @@ pub struct ProviderDescriptor {
     /// Extra search terms for the Add-provider catalog, beyond the display name
     /// and key (which are always searched).
     pub keywords: &'static [&'static str],
+    /// The lab that trains every model this provider serves, for a provider
+    /// that serves only one lab's models (Claude is Anthropic, Codex is
+    /// OpenAI). `None` for a provider fronting several labs, whose discovery
+    /// names each model's maker instead ([`DiscoveredModel::maker`]).
+    pub maker: Option<Cow<'static, str>>,
+    /// How this provider's models take reasoning effort.
+    pub effort: EffortVocabulary,
+}
+
+/// How one provider's models take reasoning effort: where a model's ordered
+/// levels come from, and which values the provider's effort slot accepts that
+/// are modes rather than levels.
+///
+/// Levels belong to a model on a provider. The same word means different
+/// things on different models, so nothing here is compared across providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EffortVocabulary {
+    /// Whether a discovered model's own `supported_reasoning_efforts` are its
+    /// scale. When false, every model takes [`Self::levels`].
+    pub per_model: bool,
+    /// The levels, lowest first, for a model discovery has not listed (or for
+    /// every model, when [`Self::per_model`] is false). Empty means such a
+    /// model takes no effort.
+    pub levels: &'static [&'static str],
+    /// Values the provider accepts in its effort slot that change what kind of
+    /// run it is rather than how hard it thinks. They are never on a scale.
+    pub modes: &'static [&'static str],
+}
+
+impl EffortVocabulary {
+    /// A provider whose models take no reasoning effort.
+    pub const NONE: Self = Self {
+        per_model: false,
+        levels: &[],
+        modes: &[],
+    };
+    /// A provider whose discovery lists each model's levels, with no fallback.
+    pub const DISCOVERED: Self = Self {
+        per_model: true,
+        levels: &[],
+        modes: &[],
+    };
+}
+
+/// Claude's `--effort` levels. `max` is accepted by the CLI but is a subagent
+/// mode, not a level, so it is outside the scale.
+pub const CLAUDE_EFFORT: EffortVocabulary = EffortVocabulary {
+    per_model: false,
+    levels: &["low", "medium", "high", "xhigh"],
+    modes: &["max"],
+};
+
+/// Codex lists each model's levels in its model listing; this is the scale for
+/// a model the listing has not reported.
+pub const CODEX_EFFORT: EffortVocabulary = EffortVocabulary {
+    per_model: true,
+    levels: &["low", "medium", "high", "xhigh"],
+    modes: &[],
+};
+
+/// OpenCode Go publishes each model's levels on models.dev; this is the union
+/// it publishes, for a model with no metadata. Kimi's `max` is a level here.
+pub const OPENCODE_EFFORT: EffortVocabulary = EffortVocabulary {
+    per_model: true,
+    levels: &["none", "low", "high", "max"],
+    modes: &[],
+};
+
+/// The lab that trained an OpenRouter model, from its id's prefix
+/// (`anthropic/claude-sonnet-4.5` and its `~anthropic/...` alias are
+/// Anthropic's). OpenRouter's own routers (`openrouter/auto`) have none: they
+/// pick a lab per request.
+pub fn openrouter_maker(id: &str) -> Option<String> {
+    let (prefix, rest) = id.trim_start_matches('~').split_once('/')?;
+    (!prefix.is_empty() && !rest.is_empty() && prefix != "openrouter")
+        .then(|| prefix.to_ascii_lowercase())
 }
 
 /// Every provider Cairn ships, in product order.
@@ -120,6 +197,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: true,
         built_in: false,
         keywords: &["claude", "anthropic", "opus", "sonnet", "haiku"],
+        maker: Some(Cow::Borrowed("anthropic")),
+        effort: CLAUDE_EFFORT,
     },
     ProviderDescriptor {
         key: Cow::Borrowed("codex"),
@@ -133,6 +212,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: true,
         built_in: false,
         keywords: &["codex", "openai", "chatgpt", "gpt"],
+        maker: Some(Cow::Borrowed("openai")),
+        effort: CODEX_EFFORT,
     },
     ProviderDescriptor {
         key: Cow::Borrowed("openrouter"),
@@ -146,6 +227,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: false,
         built_in: false,
         keywords: &["openrouter", "router", "metered"],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     },
     ProviderDescriptor {
         key: Cow::Borrowed(OPENCODE_BACKEND_KEY),
@@ -159,6 +242,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: false,
         built_in: false,
         keywords: &["opencode", "zen", "go", "deepseek", "kimi", "glm"],
+        maker: None,
+        effort: OPENCODE_EFFORT,
     },
     ProviderDescriptor {
         key: Cow::Borrowed(TYPESAFE_BACKEND_KEY),
@@ -172,6 +257,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: false,
         built_in: false,
         keywords: &["typesafe", "jev", "decisions", "system one"],
+        maker: None,
+        effort: EffortVocabulary::NONE,
     },
     ProviderDescriptor {
         key: Cow::Borrowed("ollama"),
@@ -185,6 +272,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         supports_mcp_install: false,
         built_in: false,
         keywords: &["ollama", "local", "self-hosted", "private"],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     },
     ProviderDescriptor {
         key: Cow::Borrowed(ACTUAL_BACKEND_KEY),
@@ -205,6 +294,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
             "cluster",
             "self-hosted",
         ],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     },
     ProviderDescriptor {
         key: Cow::Borrowed(INFERENCE_BACKEND_KEY),
@@ -226,6 +317,8 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
             "vllm",
             "self-hosted",
         ],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     },
 ];
 
@@ -315,6 +408,8 @@ pub fn custom_descriptor(provider: &CustomProvider) -> ProviderDescriptor {
         supports_mcp_install: false,
         built_in: false,
         keywords: &[],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     }
 }
 
@@ -337,6 +432,8 @@ pub fn cairn_gateway_descriptor() -> ProviderDescriptor {
         supports_mcp_install: false,
         built_in: true,
         keywords: &[],
+        maker: None,
+        effort: EffortVocabulary::NONE,
     }
 }
 
@@ -359,6 +456,8 @@ pub fn unknown_descriptor(key: &str) -> ProviderDescriptor {
         supports_mcp_install: false,
         built_in: false,
         keywords: &[],
+        maker: None,
+        effort: EffortVocabulary::DISCOVERED,
     }
 }
 
@@ -887,6 +986,11 @@ pub struct DiscoveredModel {
     /// budgets for it use the backend's estimating meter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokenizer: Option<crate::tokenizers::TokenizerRef>,
+    /// The lab that trained this model, when discovery could tell. Not the
+    /// route: Claude through OpenRouter is still Anthropic's. `None` falls back
+    /// to the provider's [`ProviderDescriptor::maker`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1045,6 +1149,7 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
     ]
     .into_iter()
     .map(|(alias, description, is_default)| DiscoveredModel {
+        maker: None,
         id: alias.to_string(),
         model: alias.to_string(),
         display_name: alias.to_string(),

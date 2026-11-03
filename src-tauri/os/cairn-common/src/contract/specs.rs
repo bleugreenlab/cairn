@@ -254,7 +254,7 @@ pub(crate) const AFTER_GATES: KeySpec = KeySpec::new(
 pub(crate) const LAUNCH_OVERRIDES: KeySpec = KeySpec::new(
     "overrides",
     KeyType::Object,
-    "ad-hoc adjustments to THIS launch only, never to the recipe others run. `without:[node,...]` removes nodes and splices their edges through, e.g. {without:[\"review\"]} to skip review on a tiny fix; `nodes:{node:{agent}}` rebinds one node to a different agent and re-resolves its snapshot from that agent's config, e.g. {nodes:{\"builder\":{\"agent\":\"coordinator\"}}}; `agents:{agentId:{...}}` merges agent-snapshot fields (prompt, tier, backend, selection, tools, disallowedTools, skills, extras, description) using the same grammar as the post-create snapshot patch. Address a node by its name or by the agent id it runs — recipe-file node ids are not stable and a token matching no node is refused, never skipped. Removing the trigger, the last agent node, or anything that would strand a node from the trigger is refused; a fence is not settable here",
+    "ad-hoc adjustments to THIS launch only, never to the recipe others run. `without:[node,...]` removes nodes and splices their edges through, e.g. {without:[\"review\"]} to skip review on a tiny fix; `nodes:{node:{agent}}` rebinds one node to a different agent and re-resolves its snapshot from that agent's config, e.g. {nodes:{\"builder\":{\"agent\":\"coordinator\"}}}; `agents:{agentId:{...}}` merges agent-snapshot fields (prompt, models, selection, tools, disallowedTools, skills, extras, description), e.g. {agents:{\"builder\":{\"models\":[\"lg\"]}}} to give this launch's builder the lg pool, using the same grammar as the post-create snapshot patch. Address a node by its name or by the agent id it runs — recipe-file node ids are not stable and a token matching no node is refused, never skipped. Removing the trigger, the last agent node, or anything that would strand a node from the trigger is refused; a fence is not settable here",
 );
 pub(crate) const PARENT: KeySpec = KeySpec::new(
     "parent",
@@ -479,13 +479,11 @@ pub(crate) const AGENT_PROMPT: KeySpec = KeySpec::new(
 );
 pub(crate) const AGENT_TOOLS: KeySpec =
     KeySpec::new("tools", KeyType::Array, "tool names; at least one required");
-pub(crate) const AGENT_TIER: KeySpec = KeySpec::with_aliases(
-    "tier",
-    &["model"],
-    KeyType::Str,
-    "sm|md|lg preset or a model name",
+pub(crate) const AGENT_MODELS: KeySpec = KeySpec::new(
+    "models",
+    KeyType::Array,
+    "the allotment a node running this agent selects its model within: pool ids (sm, md, lg as cairn://models/ladder defines them) and provider/model pairs, e.g. [lg] or [claude/opus]; omitted means the workspace default",
 );
-pub(crate) const AGENT_BACKEND: KeySpec = KeySpec::new("backend", KeyType::Str, "claude|codex");
 pub(crate) const AGENT_FENCE: KeySpec =
     KeySpec::new("fence", KeyType::Str, "deny | ask (default) | allow");
 pub(crate) const AGENT_DISALLOWED: KeySpec = KeySpec::with_aliases(
@@ -836,23 +834,20 @@ pub(crate) const TASK_MESSAGES_RELATED: &[RelatedSpec] = &[RelatedSpec {
 }];
 
 // --- workspace settings (cairn://settings patch) ---
-pub(crate) const SETTINGS_TIER_DEFAULTS: KeySpec = KeySpec::new(
-    "tierDefaults",
+pub(crate) const SETTINGS_MODELS: KeySpec = KeySpec::new(
+    "models",
     KeyType::Object,
-    "tier -> default backend, e.g. {lg: claude, sm: codex}",
+    "pools, ladder and defaultModels, replaced whole: {pools: [{id, description, band: {min}} | {id, description, members: [provider/model]}], ladder: [{model: provider/model, level, effort, options}], defaultModels: [md]}; read the current value at cairn://models/ladder",
 );
-pub(crate) const SETTINGS_TIERS: KeySpec = KeySpec::new("tiers", KeyType::Array, "tier ordering");
-pub(crate) const SETTINGS_BACKENDS: KeySpec =
-    KeySpec::new("backends", KeyType::Object, "backend -> tier -> preset map");
 pub(crate) const SETTINGS_ENABLED_PROVIDERS: KeySpec = KeySpec::new(
     "enabledProviders",
     KeyType::Array,
-    "providers installed in this workspace, e.g. [claude, openrouter]; refused when it would strand a tier default or call routing",
+    "providers installed in this workspace, e.g. [claude, openrouter]; refused when it would strand call routing",
 );
 pub(crate) const SETTINGS_DECISION_MODEL: KeySpec = KeySpec::new(
     "decisionModel",
     KeyType::Str,
-    "model or tier a decision node naming none is answered by; null returns it to the catalog's choice",
+    "the pool or provider/model a decision node naming no models is answered within; null returns it to the catalog's choice",
 );
 pub(crate) const SETTINGS_IMAGE_MODEL: KeySpec = KeySpec::new(
     "imageModel",
@@ -1001,7 +996,7 @@ pub(crate) const SETTINGS_OPENROUTER_ROUTING: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_ROUTE_CALLS_VIA_OPENROUTER: KeySpec = KeySpec::new(
     "routeCallsViaOpenRouter",
     KeyType::Bool,
-    "route tier-based ephemeral calls through OpenRouter instead of the native backend",
+    "select ephemeral calls among the OpenRouter models their allotment holds, instead of a native backend; a call whose allotment holds none is refused",
 );
 pub(crate) const SETTINGS_PRIVATE_DEDICATED_PROCESS_CAPACITY: KeySpec = KeySpec::new(
     "privateDedicatedProcessCapacity",

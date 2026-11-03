@@ -251,6 +251,7 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
     merged
         .into_iter()
         .map(|(tag, entry)| DiscoveredModel {
+            maker: None,
             serves: served(&tag, &entry),
             // A GGUF conversion carries its own vocabulary, not guaranteed
             // identical to the repository's tokenizer.json, so no pin applies.

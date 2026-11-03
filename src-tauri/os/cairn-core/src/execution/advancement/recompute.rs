@@ -127,6 +127,8 @@ mod artifact_present_tests {
             parent_id: None,
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
+                models: None,
+                constraints: Default::default(),
                 agent_config_id: Some("builder".to_string()),
                 output_schema: Some(SchemaConfig {
                     name: "create-pr".to_string(),
@@ -169,7 +171,6 @@ mod artifact_present_tests {
         serde_json::to_string(&ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -187,7 +188,6 @@ mod artifact_present_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         })
@@ -207,6 +207,8 @@ mod artifact_present_tests {
             parent_id: None,
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
+                models: None,
+                constraints: Default::default(),
                 agent_config_id: Some("coordinator".to_string()),
                 output_schema: None,
                 git_config: None,
@@ -221,7 +223,6 @@ mod artifact_present_tests {
         serde_json::to_string(&ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
                 name: "Recipe".to_string(),
@@ -239,7 +240,6 @@ mod artifact_present_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         })
@@ -256,7 +256,6 @@ mod artifact_present_tests {
         ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: recipe.id.clone(),
                 name: recipe.name.clone(),
@@ -274,7 +273,6 @@ mod artifact_present_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         }
@@ -890,6 +888,8 @@ mod port_gate_tests {
             parent_id: None,
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
+                models: None,
+                constraints: Default::default(),
                 agent_config_id: Some(id.to_string()),
                 output_schema: None,
                 git_config: None,
@@ -943,7 +943,6 @@ mod port_gate_tests {
         let snap = ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -970,7 +969,6 @@ mod port_gate_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         };
@@ -1105,7 +1103,6 @@ mod port_gate_tests {
         let snap = ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "R".to_string(),
@@ -1123,7 +1120,6 @@ mod port_gate_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         };
@@ -1139,8 +1135,7 @@ mod port_gate_tests {
                 output_contract: contract,
                 result_artifact_job_id: "j-call",
                 task_index: Some(0),
-                tier_override: None,
-                backend_preference: None,
+                models: None,
                 background: false,
             },
         );
@@ -1294,7 +1289,6 @@ mod warm_provider_run_tests {
             snapshot: ExecutionSnapshot {
                 continuity: Default::default(),
                 branch_target: Default::default(),
-                model_routing: None,
                 recipe: RecipeSnapshot {
                     id: recipe.id.clone(),
                     name: recipe.name.clone(),
@@ -1312,7 +1306,6 @@ mod warm_provider_run_tests {
                     event_payload: None,
                     initiated_via: None,
                 },
-                presets: None,
                 inline_delegated_packets: vec![],
                 created_at: 1,
             },

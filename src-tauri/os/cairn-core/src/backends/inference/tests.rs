@@ -108,7 +108,6 @@ fn provider_of(served: &[ServedModel]) -> CatalogProvider {
             refreshed_at: None,
             error: None,
         }),
-        tiers: vec![],
         serves: provider_serves(),
         unable: unable(served),
     }

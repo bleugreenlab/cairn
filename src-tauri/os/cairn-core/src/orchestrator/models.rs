@@ -3,11 +3,11 @@
 //! Every method is composed from the same orchestrator functions the Settings →
 //! Providers page calls: `provider_catalog` (the page's provider tabs and
 //! Add-provider list), the discovered `model_catalog`, `list_accounts`,
-//! `provider_usage_pool` (the provider card), and the effective presets (the
-//! tier matrix). So `cairn://models/*` shows what the page shows by construction,
+//! and `provider_usage_pool` (the provider card). So `cairn://models/*` shows
+//! what the page shows by construction,
 //! and the parity tests below pin it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cairn_models::complete::HttpComplete;
@@ -26,14 +26,12 @@ use cairn_db::turso::params;
 use cairn_models::accounts::AccountInfo;
 use cairn_models::interface::{
     Catalog, CatalogProvider, ListedProvider, ModelScope, Models, SessionState, SessionView,
-    TierBinding, LOCAL_HOST,
+    LOCAL_HOST,
 };
 use cairn_models::types::catalog::{self, ServedVerb, CLAUDE_FAMILY_BACKEND};
 use cairn_models::types::pool::ProviderPoolSnapshot;
-use serde_json::Value;
 
 use super::Orchestrator;
-use crate::config::presets::{load_effective_presets, resolve_runtime_selection, PresetsConfig};
 use crate::db::DbState;
 use crate::storage::RowExt;
 
@@ -145,55 +143,6 @@ impl Orchestrator {
     }
 }
 
-impl Orchestrator {
-    /// The presets a scope resolves against: the workspace's, plus the
-    /// project's overrides when the scope names one.
-    fn models_presets(&self, scope: &ModelScope) -> Result<PresetsConfig, String> {
-        let project_path = scope
-            .project_id
-            .as_deref()
-            .map(|project_id| self.project_path(project_id))
-            .transpose()?;
-        Ok(load_effective_presets(
-            &self.config_dir,
-            project_path.as_deref(),
-        ))
-    }
-}
-
-/// The tiers bound on `provider`, in the workspace's tier order.
-///
-/// Whether a binding is the tier's default is asked of resolution itself, so
-/// this can never claim a default that an unqualified tier reference would not
-/// actually land on.
-fn tier_bindings(provider: &str, presets: &PresetsConfig) -> Vec<TierBinding> {
-    presets
-        .tiers
-        .iter()
-        .filter_map(|tier| {
-            let preset = presets.backends.get(provider)?.get(tier)?;
-            let options: BTreeMap<String, Value> = preset
-                .options
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key.clone(),
-                        serde_json::to_value(value).unwrap_or(Value::Null),
-                    )
-                })
-                .collect();
-            let is_tier_default = resolve_runtime_selection(Some(tier), None, presets)
-                .is_ok_and(|(selection, _)| selection.backend == provider);
-            Some(TierBinding {
-                tier: tier.clone(),
-                model: preset.model.as_str().to_string(),
-                options,
-                is_tier_default,
-            })
-        })
-        .collect()
-}
-
 /// What the database knows about a live run: which session it is, when it
 /// started, and the node it belongs to. The provider, account, and backend
 /// session id come from the live handle's launch facts instead.
@@ -264,17 +213,9 @@ impl Orchestrator {
     /// says which), because a session can launch on a provider the workspace
     /// has not installed; installation policy is enforced elsewhere.
     pub(crate) fn catalog_provider(&self, key: &str, project_id: Option<&str>) -> CatalogProvider {
-        let scope = ModelScope {
-            project_id: project_id.map(str::to_string),
-        };
-        // A project the config cannot place still has the workspace's tiers.
-        let presets = self
-            .models_presets(&scope)
-            .unwrap_or_else(|_| load_effective_presets(&self.config_dir, None));
         self.provider_record(
             key,
             project_id,
-            &presets,
             &self.provider_catalog(),
             self.provider_installed(key),
         )
@@ -352,7 +293,6 @@ impl Orchestrator {
         &self,
         key: &str,
         project_id: Option<&str>,
-        presets: &PresetsConfig,
         descriptors: &[cairn_models::types::catalog::ProviderDescriptor],
         installed: bool,
     ) -> CatalogProvider {
@@ -364,7 +304,6 @@ impl Orchestrator {
                 .unwrap_or_else(|| catalog::unknown_descriptor(key)),
             installed,
             models: self.provider_models(key),
-            tiers: tier_bindings(key, presets),
             serves: self.provider_serves(key, project_id),
             unable: {
                 let mut unable = self.decision_observations.unable(key);
@@ -379,21 +318,12 @@ impl Orchestrator {
 
 impl Models for Orchestrator {
     fn catalog(&self, scope: &ModelScope) -> Result<Catalog, String> {
-        let presets = self.models_presets(scope)?;
         let descriptors = self.provider_catalog();
         let enabled = self.installed_providers();
 
         let mut providers: Vec<CatalogProvider> = enabled
             .iter()
-            .map(|key| {
-                self.provider_record(
-                    key,
-                    scope.project_id.as_deref(),
-                    &presets,
-                    &descriptors,
-                    true,
-                )
-            })
+            .map(|key| self.provider_record(key, scope.project_id.as_deref(), &descriptors, true))
             .collect();
         providers.extend(self.embed_gateway_provider());
         providers.extend(
@@ -404,7 +334,6 @@ impl Models for Orchestrator {
                     descriptor,
                     installed: false,
                     models: None,
-                    tiers: Vec::new(),
                     serves: Vec::new(),
                     unable: Vec::new(),
                 }),
@@ -753,7 +682,7 @@ pub(crate) mod tests {
         orch
     }
 
-    fn json<T: serde::Serialize>(value: &T) -> Value {
+    fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
         serde_json::to_value(value).unwrap()
     }
 
@@ -814,28 +743,6 @@ pub(crate) mod tests {
             cairn_models::types::catalog::VerbKind::Session
         ));
 
-        // Tier bindings: the page's matrix, from the same effective presets.
-        let presets = orch.models_presets(&scope).unwrap();
-        let claude = catalog
-            .installed()
-            .find(|provider| provider.descriptor.key == "claude")
-            .unwrap();
-        let matrix: Vec<(String, String)> = presets
-            .tiers
-            .iter()
-            .filter_map(|tier| {
-                let preset = presets.backends.get("claude")?.get(tier)?;
-                Some((tier.clone(), preset.model.as_str().to_string()))
-            })
-            .collect();
-        let bound: Vec<(String, String)> = claude
-            .tiers
-            .iter()
-            .map(|binding| (binding.tier.clone(), binding.model.clone()))
-            .collect();
-        assert!(!bound.is_empty());
-        assert_eq!(bound, matrix);
-
         // Accounts and usage: the page's commands, unchanged.
         assert_eq!(
             json(&orch.accounts(&scope).unwrap()),
@@ -850,41 +757,6 @@ pub(crate) mod tests {
         let claude_pool = orch.usage(&scope, Some("claude")).unwrap();
         assert_eq!(claude_pool[0].families[0].remaining_percent, 64.0);
         assert!(orch.usage(&scope, Some("openrouter")).is_err());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn every_catalog_binding_is_what_resolution_returns() {
-        let orch = seeded_orchestrator().await;
-        let scope = ModelScope::workspace();
-        let catalog = orch.catalog(&scope).unwrap();
-        let presets = orch.models_presets(&scope).unwrap();
-        let mut checked = 0;
-        for provider in catalog.installed() {
-            let key = provider.descriptor.key.as_ref();
-            for binding in &provider.tiers {
-                let reference = format!("{key}/{}", binding.tier);
-                let (selection, _) = resolve_runtime_selection(Some(&reference), None, &presets)
-                    .unwrap_or_else(|error| panic!("{reference} does not resolve: {error}"));
-                assert_eq!(selection.backend, key, "{reference}");
-                assert_eq!(selection.model.as_str(), binding.model, "{reference}");
-                if binding.is_tier_default {
-                    let (unqualified, _) =
-                        resolve_runtime_selection(Some(&binding.tier), None, &presets).unwrap();
-                    assert_eq!(unqualified.backend, key, "{}", binding.tier);
-                }
-                checked += 1;
-            }
-        }
-        assert!(checked > 0, "the seeded workspace binds tiers");
-        // Each tier has exactly one default among installed providers.
-        for tier in &presets.tiers {
-            let defaults = catalog
-                .installed()
-                .flat_map(|provider| provider.tiers.iter())
-                .filter(|binding| &binding.tier == tier && binding.is_tier_default)
-                .count();
-            assert!(defaults <= 1, "{tier} has {defaults} defaults");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -299,6 +299,7 @@ fn finish_model_discovery(
         .data
         .into_iter()
         .map(|model| DiscoveredModel {
+            maker: None,
             id: model.id,
             display_name: if model.display_name.trim().is_empty() {
                 model.model.clone()

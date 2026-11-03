@@ -138,11 +138,9 @@ pub(crate) async fn read_agent(
     if !agent.description.is_empty() {
         out.push_str(&format!("{}\n\n", agent.description));
     }
-    if let Some(tier) = &agent.tier {
-        out.push_str(&format!("- tier: {}\n", tier));
-    }
-    if let Some(backend) = &agent.backend_preference {
-        out.push_str(&format!("- backend: {}\n", backend));
+    if !agent.models.is_empty() {
+        let entries: Vec<String> = agent.models.iter().map(ToString::to_string).collect();
+        out.push_str(&format!("- models: [{}]\n", entries.join(", ")));
     }
     out.push_str(&format!("- tools: {}\n", agent.tools.join(", ")));
     if let Some(skills) = agent.skills.as_ref().filter(|s| !s.is_empty()) {

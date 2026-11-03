@@ -40,9 +40,6 @@ nodes:
               agent:
                 description: Agent config ID to execute this task (e.g. 'build', 'explore')
                 type: string
-              backend:
-                description: Optional backend selection for this task
-                type: string
               dependencies:
                 description: Task IDs that must complete before this task can start
                 items:
@@ -54,9 +51,11 @@ nodes:
               prompt:
                 description: Detailed instructions for the agent
                 type: string
-              tier:
-                description: Optional capability tier override (e.g. 'sm', 'md', 'lg')
-                type: string
+              models:
+                description: Optional allotment replacing the agent's, as pools and provider/model pairs (e.g. ['lg'] or ['claude/opus'])
+                items:
+                  type: string
+                type: array
               title:
                 description: Short description for timeline display
                 type: string

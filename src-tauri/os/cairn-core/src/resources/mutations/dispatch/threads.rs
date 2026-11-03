@@ -9,6 +9,7 @@ use cairn_common::uri::CairnResource;
 use cairn_db::models::CreateThread;
 
 use crate::resources::db_rows::{self, PayloadUse, TableShape};
+use crate::threads::crud::by_name as thread_by_name;
 use crate::threads::db_store::{
     apply_write, police, split_write_sql, RowAction, RowKey, RowTarget, WriteScope, WriteStatement,
 };
@@ -167,8 +168,8 @@ pub(super) async fn queue_orderer(
     project: &str,
     thread: &str,
 ) -> Result<QueueOrderer, String> {
-    let (db, project_id) = project_id(orch, project).await?;
-    let target = thread_by_name(&db, &project_id, thread).await?;
+    let (db, project_id, target) =
+        crate::execution::gates::reorder::queue_thread(orch, project, thread).await?;
     let no_run = request
         .run_id
         .as_deref()
@@ -260,33 +261,6 @@ pub(super) async fn acting_thread_name(
         .map(|thread| thread.name)
 }
 
-/// `Ordered harness's queue: 5841 (fleet 3rd, thread 1st), 5829 (thread 2nd)`.
-fn ordered_summary(
-    thread: &str,
-    listed: &[i64],
-    queue: &[crate::execution::gates::reorder::ThreadQueued],
-) -> String {
-    let (front, rest): (Vec<_>, Vec<_>) = queue
-        .iter()
-        .partition(|queued| listed.contains(&queued.issue_number));
-    let named: Vec<String> = front
-        .iter()
-        .map(|queued| {
-            let places = crate::execution::gates::reorder::places_phrase(queued, ", ");
-            format!("{} ({places})", queued.issue_number)
-        })
-        .collect();
-    let mut summary = format!("Ordered {thread}'s queue: {}", named.join(", "));
-    if !rest.is_empty() {
-        summary.push_str(&format!(
-            "; {} more behind them in their current order",
-            rest.len()
-        ));
-    }
-    summary.push('.');
-    summary
-}
-
 /// A structured row write's payload: a column map, absent meaning empty.
 fn row_payload(item: &ChangeItem) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     match item.payload.as_ref() {
@@ -343,19 +317,6 @@ async fn project_id(
     Ok((db, id))
 }
 
-async fn thread_by_name(
-    db: &cairn_db::storage::LocalDb,
-    project_id: &str,
-    name: &str,
-) -> Result<cairn_db::models::Thread, String> {
-    crate::threads::crud::list(db, project_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|thread| thread.name == name)
-        .ok_or_else(|| format!("Thread '{name}' not found"))
-}
-
 // A thread has exactly one identifier: `name`. A payload still naming the
 // retired `title` is refused by the contract gate, whose rejection enumerates
 // the accepted keys and so points at `name` — no local check needed.
@@ -394,53 +355,11 @@ pub(super) async fn dispatch(
                     serde_json::Value::from(order.clone())
                 )
             } else {
-                let (thread_id, thread_name) = (target.id.clone(), target.name.clone());
-                let entries = order.clone();
-                let outcome = db
-                    .write(move |conn| {
-                        let (thread_id, thread_name) = (thread_id.clone(), thread_name.clone());
-                        let (entries, placed_by) = (entries.clone(), placed_by.clone());
-                        Box::pin(async move {
-                            crate::execution::gates::reorder::order_thread_queue_conn(
-                                conn,
-                                &thread_id,
-                                &thread_name,
-                                &entries,
-                                &placed_by,
-                            )
-                            .await
-                        })
-                    })
-                    .await
-                    .map_err(|error| build_failure(index, item, error.to_string()))?;
-                let rotation = match outcome {
-                    Ok(rotation) => rotation,
-                    Err(refusals) => {
-                        let lines: Vec<String> = refusals
-                            .iter()
-                            .map(|refusal| format!("- {refusal}"))
-                            .collect();
-                        return Err(build_failure(
-                            index,
-                            item,
-                            format!(
-                                "{thread}'s queue was not ordered:\n{}\nNothing changed.",
-                                lines.join("\n")
-                            ),
-                        ));
-                    }
-                };
-                for execution_id in &rotation.moved {
-                    let change = crate::notify::execution_gates_db_change_for_execution(
-                        &db,
-                        execution_id,
-                        "update",
-                    )
-                    .await;
-                    let _ = orch.services.emitter.emit("db-change", change);
-                }
-                let listed: Vec<i64> = order.iter().filter_map(serde_json::Value::as_i64).collect();
-                ordered_summary(thread, &listed, &rotation.queue)
+                crate::execution::gates::reorder::order_thread_queue(
+                    orch, &db, &target, &order, &placed_by,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (CairnResource::ThreadBranches { project, thread }, ChangeMode::Append) => {

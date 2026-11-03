@@ -2070,6 +2070,14 @@ async fn render_resource_body(
             }
         }
         CairnResource::ModelsUsage => crate::resources::models::render_usage(orch, &params),
+        CairnResource::ModelsLadder => {
+            crate::resources::models::render_ladder(&params, || orch.models_ladder(None))
+        }
+        CairnResource::ModelsSelection => {
+            crate::resources::models::render_selection(&params, |allotment, verb| {
+                orch.preview_selection(None, allotment.as_deref(), verb)
+            })
+        }
         CairnResource::ModelsEmbeddings => {
             crate::resources::models::render_embeddings(&orch.embedding_status().await, &params)
         }

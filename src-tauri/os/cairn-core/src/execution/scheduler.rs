@@ -589,7 +589,6 @@ async fn fire_scheduled_recipe(
         None,
         None,
         None,
-        None,
         TriggerType::Schedule,
         // The scheduler just created this issue, so there is no prior attempt to
         // supersede; `NewAttempt` is a no-op on a fresh issue's lineage.
@@ -838,7 +837,7 @@ edges:
 "#;
 
     const BUILD_AGENT_MD: &str =
-        "---\nname: Build\ndescription: builds\ntools: mcp__cairn__read\ntier: md\n---\nDo work.\n";
+        "---\nname: Build\ndescription: builds\ntools: mcp__cairn__read\nmodels: [md]\n---\nDo work.\n";
 
     fn orchestrator_with_config(db: LocalDb, config_dir: PathBuf) -> Orchestrator {
         use crate::db::DbState;

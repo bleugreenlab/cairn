@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::allotment::{retired_model_key, AllotmentEntry, NodeConstraints};
 use crate::decision::{DecisionNode, DecisionQuestion, Thresholds};
 
 use super::{
@@ -137,6 +138,13 @@ pub struct NodeFileConfig {
     /// Worktree mode: "own" (default), "inherit", or "none"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_mode: Option<BranchMode>,
+    /// The node's allotment: an agent node's replacement for its agent's, or
+    /// the allotment a decision node is answered from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<AllotmentEntry>>,
+    /// What an agent node's selection reads from upstream agent nodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<NodeConstraints>,
 
     // Action config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,8 +186,9 @@ pub struct NodeFileConfig {
     // Decision config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub questions: Option<Vec<DecisionQuestion>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    /// Read only to refuse it by name: `models` replaced it.
+    #[serde(default, skip_serializing)]
+    pub model: Option<serde_yaml::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thresholds: Option<Thresholds>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,7 +255,15 @@ impl From<Recipe> for RecipeFile {
                     .parent_id
                     .as_ref()
                     .and_then(|pid| id_map.get(pid).cloned());
-                RecipeFileNode::from_node(node, readable_id, readable_parent)
+                let mut file_node = RecipeFileNode::from_node(node, readable_id, readable_parent);
+                if let Some(constraints) = file_node
+                    .config
+                    .as_mut()
+                    .and_then(|config| config.constraints.as_mut())
+                {
+                    remap_constraints(constraints, &id_map);
+                }
+                file_node
             })
             .collect();
 
@@ -337,6 +354,8 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
     // Agent config
     if let Some(ac) = &node.agent_config {
         config.agent = ac.agent_config_id.clone();
+        config.models = ac.models.clone();
+        config.constraints = (!ac.constraints.is_empty()).then(|| ac.constraints.clone());
         config.output_schema = ac.output_schema.clone();
         // Export branch_mode if non-default
         if let Some(ref gc) = ac.git_config {
@@ -395,7 +414,7 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
     // Decision config
     if let Some(dc) = &node.decision_config {
         config.questions = Some(dc.questions.clone());
-        config.model = dc.model.clone();
+        config.models = dc.models.clone();
         if !dc.thresholds.is_empty() {
             config.thresholds = Some(dc.thresholds);
         }
@@ -425,16 +444,20 @@ impl RecipeFile {
     /// Handles legacy migration: if a top-level `context` field exists and the trigger
     /// node has no scope, the context value is copied into the trigger node's scope.
     pub fn into_recipe(self, workspace_id: Option<String>, project_id: Option<String>) -> Recipe {
-        let mut id_map: HashMap<String, String> = HashMap::new();
         let legacy_context = self.context.clone();
 
-        // Generate new IDs for all nodes
+        // Every new id is minted before any node converts, so a reference to a
+        // node later in the file (a parent, a constraint) remaps too.
+        let id_map: HashMap<String, String> = self
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), Uuid::new_v4().to_string()))
+            .collect();
         let mut nodes: Vec<RecipeNode> = self
             .nodes
             .into_iter()
             .map(|n| {
-                let new_id = Uuid::new_v4().to_string();
-                id_map.insert(n.id.clone(), new_id.clone());
+                let new_id = id_map[&n.id].clone();
                 n.into_node(new_id, &id_map)
             })
             .collect();
@@ -727,6 +750,7 @@ impl RecipeFile {
         }
 
         errors.extend(self.decision_errors());
+        errors.extend(self.selection_errors());
 
         // Declaring the `base` branch target means an execution may be launched
         // with every `pr` node pruned from the snapshot. Pruning a node that
@@ -795,12 +819,12 @@ impl RecipeFileNode {
             return Some(DecisionNode::port_choice(
                 config.question.as_deref().unwrap_or_default(),
                 config.ports.as_deref().unwrap_or_default(),
-                config.model,
+                config.models,
             ));
         }
         (self.node_type == RecipeNodeType::Decision).then(|| DecisionNode {
             questions: config.questions.unwrap_or_default(),
-            model: config.model,
+            models: config.models,
             thresholds: config.thresholds.unwrap_or_default(),
         })
     }
@@ -826,6 +850,8 @@ impl RecipeFileNode {
         let agent_config = if config.agent.is_some()
             || config.output_schema.is_some()
             || config.branch_mode.is_some()
+            || config.models.is_some()
+            || config.constraints.is_some()
         {
             // Only create agent config for agent nodes
             if self.node_type == RecipeNodeType::Agent {
@@ -841,8 +867,12 @@ impl RecipeFileNode {
                 } else {
                     None
                 };
+                let mut constraints = config.constraints.clone().unwrap_or_default();
+                remap_constraints(&mut constraints, id_map);
                 Some(AgentNodeConfig {
                     agent_config_id: config.agent,
+                    models: config.models.clone(),
+                    constraints,
                     output_schema: config.output_schema.clone(),
                     git_config,
                 })
@@ -954,6 +984,21 @@ fn parse_position(s: &str) -> NodePosition {
     }
 }
 
+/// Point a node's constraints at the ids its references were renamed to.
+fn remap_constraints(constraints: &mut NodeConstraints, id_map: &HashMap<String, String>) {
+    for reference in [
+        &mut constraints.same_band_as,
+        &mut constraints.different_maker_from,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(renamed) = id_map.get(reference.as_str()) {
+            *reference = renamed.clone();
+        }
+    }
+}
+
 /// Parse "node-id@handle" format, returning (node_id, Some(handle)) or (node_id, None)
 fn parse_node_handle(s: &str) -> (&str, Option<&str>) {
     match s.rsplit_once('@') {
@@ -1061,6 +1106,69 @@ impl RecipeFile {
         errors
     }
 
+    /// Every problem with how this recipe's nodes name models: a retired
+    /// `model` key, an empty allotment, and a constraint naming anything but
+    /// an agent node upstream of the constrained one. A constraint reads the
+    /// referenced node's stored selection at launch, so a node that is not
+    /// upstream would have chosen nothing yet.
+    pub fn selection_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for node in &self.nodes {
+            let Some(config) = &node.config else {
+                continue;
+            };
+            if config.model.is_some() {
+                if let Some(instruction) = retired_model_key("model") {
+                    errors.push(format!("Node '{}': {instruction}", node.name));
+                }
+            }
+            if config.models.as_ref().is_some_and(Vec::is_empty) {
+                errors.push(format!(
+                    "Node '{}': `models` is empty; name at least one pool or provider/model, or omit the key",
+                    node.name
+                ));
+            }
+            let Some(constraints) = &config.constraints else {
+                continue;
+            };
+            if node.node_type != RecipeNodeType::Agent {
+                errors.push(format!(
+                    "Node '{}': only an agent node takes constraints",
+                    node.name
+                ));
+                continue;
+            }
+            let upstream = self.upstream_of(&node.id);
+            let is_upstream_agent = |id: &str| {
+                upstream.contains(id)
+                    && self
+                        .nodes
+                        .iter()
+                        .any(|other| other.id == id && other.node_type == RecipeNodeType::Agent)
+            };
+            if let Err(error) = constraints.check_references(&node.id, is_upstream_agent) {
+                errors.push(error);
+            }
+        }
+        errors
+    }
+
+    /// Every node an edge path of either kind leads from to `node_id`.
+    fn upstream_of(&self, node_id: &str) -> HashSet<String> {
+        let mut seen = HashSet::new();
+        let mut frontier = vec![node_id.to_string()];
+        while let Some(current) = frontier.pop() {
+            for edge in &self.edges {
+                let (source, _) = parse_node_handle(&edge.from);
+                let (target, _) = parse_node_handle(&edge.to);
+                if target == current && seen.insert(source.to_string()) {
+                    frontier.push(source.to_string());
+                }
+            }
+        }
+        seen
+    }
+
     /// Rewrite the recipe editor's legacy `port-<name>` handles on edges
     /// leaving a condition or decision node to the port itself
     /// ([`legacy_port_handle`]). Applied on every parse, so validation and
@@ -1154,6 +1262,8 @@ mod tests {
                     trigger_config: None,
                     agent_config: Some(AgentNodeConfig {
                         agent_config_id: Some("plan".to_string()),
+                        models: None,
+                        constraints: Default::default(),
                         output_schema: None,
                         git_config: None,
                     }),
@@ -1423,7 +1533,7 @@ nodes:
     config:
       conditionType: ai
       question: Does the issue touch the database?
-      model: sm
+      models: [sm]
       ports: [yes, no]
       onError: block
 edges:
@@ -1525,7 +1635,10 @@ edges:
         assert!(node.condition_config.is_none());
         let decision = node.decision_config.as_ref().unwrap();
         assert_eq!(decision.ports(), vec!["yes", "no"]);
-        assert_eq!(decision.model.as_deref(), Some("sm"));
+        assert_eq!(
+            decision.models,
+            Some(vec![AllotmentEntry::Pool("sm".into())])
+        );
         assert_eq!(
             decision.questions[0].instructions,
             "Does the issue touch the database?"

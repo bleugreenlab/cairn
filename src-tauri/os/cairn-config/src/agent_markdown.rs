@@ -3,6 +3,7 @@
 //! This module handles parsing agent markdown files for import/export.
 //! Supports Claude Code-compatible format.
 
+use crate::allotment::{parse_allotment, retired_model_key, AllotmentEntry};
 use crate::models::{Fence, LegacyOnEscape, LegacySandbox};
 use serde::{Deserialize, Serialize};
 
@@ -23,9 +24,17 @@ pub struct AgentFrontmatter {
     /// the loader must accept what the form writes rather than reject it.
     #[serde(default, deserialize_with = "deserialize_tools")]
     tools: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "model")]
-    pub tier: Option<String>,
+    /// The pools and `provider/model` pairs this agent selects within.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<String>>,
+    /// Retired model keys, read only so a file still naming one is refused
+    /// with the instruction rather than run on the workspace default.
+    #[serde(default, skip_serializing)]
+    tier: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    model: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing, alias = "backendPreference")]
+    backend: Option<serde_yaml::Value>,
     /// Worktree fence behavior for sandbox escapes.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,10 +54,6 @@ pub struct AgentFrontmatter {
     /// Skills to inject into the prompt
     #[serde(skip_serializing_if = "Option::is_none")]
     skills: Option<Vec<String>>,
-    /// Preferred backend when multiple providers are available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "backend", alias = "backendPreference")]
-    backend_preference: Option<String>,
     /// Optional lucide icon name (kebab-case, e.g. `hammer`) giving the agent a
     /// compact visual identity. Absent means no icon (a `Bot` fallback renders).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,12 +121,12 @@ pub struct ParsedAgent {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    pub tier: Option<String>,
+    /// Empty when the file names no `models`: the workspace default applies.
+    pub models: Vec<AllotmentEntry>,
     pub fence: Option<Fence>,
     pub hooks: Option<serde_json::Value>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
-    pub backend_preference: Option<String>,
     pub icon: Option<String>,
     pub bundles: Vec<String>,
     pub seed_budget_tokens: Option<i32>,
@@ -148,7 +153,7 @@ fn slugify(name: &str) -> String {
 /// name: Agent Name
 /// description: Description
 /// tools: Read, Grep, Glob
-/// model: sonnet
+/// models: [md]
 /// onEscape: allow
 /// ---
 ///
@@ -171,6 +176,19 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
     if frontmatter.description.is_empty() {
         return Err("Agent description cannot be empty".to_string());
     }
+    for (key, present) in [
+        ("tier", frontmatter.tier.is_some()),
+        ("model", frontmatter.model.is_some()),
+        ("backend", frontmatter.backend.is_some()),
+    ] {
+        if let Some(instruction) = present.then(|| retired_model_key(key)).flatten() {
+            return Err(instruction);
+        }
+    }
+    let models = match &frontmatter.models {
+        Some(raw) => parse_allotment(raw)?,
+        None => Vec::new(),
+    };
 
     // Parse tools from comma-separated string. An empty list is valid: it means
     // "the default surface" (the three core verbs are ensured at runtime). The UI
@@ -207,12 +225,11 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         description: frontmatter.description,
         prompt,
         tools,
-        tier: frontmatter.tier,
+        models,
         fence,
         hooks: frontmatter.hooks,
         disallowed_tools: frontmatter.disallowed_tools,
         skills: frontmatter.skills,
-        backend_preference: frontmatter.backend_preference,
         icon: frontmatter.icon,
         bundles: frontmatter.bundles,
         seed_budget_tokens: frontmatter.seed_budget_tokens,
@@ -227,13 +244,12 @@ pub struct AgentExportData<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub tools: &'a [String],
-    pub tier: Option<&'a str>,
+    pub models: &'a [AllotmentEntry],
     pub prompt: &'a str,
     pub fence: Option<Fence>,
     pub disallowed_tools: Option<&'a [String]>,
     pub skills: Option<&'a [String]>,
     pub hooks: Option<&'a serde_json::Value>,
-    pub backend_preference: Option<&'a str>,
     /// Optional lucide icon name; an `icon:` line is emitted only when set.
     pub icon: Option<&'a str>,
     pub bundles: &'a [String],
@@ -248,13 +264,12 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         name,
         description,
         tools,
-        tier,
+        models,
         prompt,
         fence,
         disallowed_tools,
         skills,
         hooks,
-        backend_preference,
         icon,
         bundles,
         seed_budget_tokens,
@@ -275,12 +290,9 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         frontmatter.push_str(&format!("bundles: [{}]\n", bundles.join(", ")));
     }
 
-    if let Some(t) = tier {
-        frontmatter.push_str(&format!("tier: {}\n", t));
-    }
-
-    if let Some(b) = backend_preference {
-        frontmatter.push_str(&format!("backend: {}\n", b));
+    if !models.is_empty() {
+        let entries: Vec<String> = models.iter().map(ToString::to_string).collect();
+        frontmatter.push_str(&format!("models: [{}]\n", entries.join(", ")));
     }
     if let Some(value) = seed_budget_tokens {
         frontmatter.push_str(&format!("seedBudgetTokens: {value}\n"));
@@ -352,36 +364,51 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_tools_roundtrips_through_writer_and_loader() {
-        // Mirrors exactly what the Settings agent form writes: no tools (the form
-        // has no tools editor and passes `tools: []`) plus a custom tier. This is
-        // the save/load asymmetry from CAIRN-1656 — the written file must reload.
-        let markdown = agent_to_markdown(AgentExportData {
-            id: "my-agent",
-            name: "My Agent",
+    /// An export with every optional field unset, for tests to override.
+    fn export<'a>(name: &'a str, tools: &'a [String], prompt: &'a str) -> AgentExportData<'a> {
+        AgentExportData {
+            id: "agent",
+            name,
             description: "desc",
-            tools: &[],
-            tier: Some("xl"),
-            prompt: "prompt",
+            tools,
+            models: &[],
+            prompt,
             fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,
-            backend_preference: None,
             icon: None,
             bundles: &[],
             seed_budget_tokens: None,
             seed_eras: None,
+        }
+    }
+
+    #[test]
+    fn empty_tools_roundtrips_through_writer_and_loader() {
+        // Mirrors exactly what the Settings agent form writes: no tools (the form
+        // has no tools editor and passes `tools: []`) plus an allotment. This is
+        // the save/load asymmetry from CAIRN-1656 — the written file must reload.
+        let models = vec![
+            AllotmentEntry::Pool("lg".into()),
+            AllotmentEntry::parse("claude/fable").unwrap(),
+        ];
+        let markdown = agent_to_markdown(AgentExportData {
+            models: &models,
+            ..export("My Agent", &[], "prompt")
         });
         assert!(
             !markdown.contains("tools:"),
             "empty tools should omit the line, got:\n{markdown}"
         );
+        assert!(
+            markdown.contains("models: [lg, claude/fable]"),
+            "{markdown}"
+        );
         let parsed = parse_agent_markdown(&markdown).expect("empty-tools agent must reload");
         assert_eq!(parsed.name, "My Agent");
         assert!(parsed.tools.is_empty());
-        assert_eq!(parsed.tier.as_deref(), Some("xl"));
+        assert_eq!(parsed.models, models);
     }
 
     #[test]
@@ -389,7 +416,7 @@ mod tests {
         // Pre-fix files written by the old writer carry a bare `tools:` line,
         // which YAML parses as null. The loader must recover them, not reject.
         let content =
-            "---\nname: Legacy\ndescription: legacy agent\ntools: \ntier: xl\n---\n\nprompt";
+            "---\nname: Legacy\ndescription: legacy agent\ntools: \nmodels: [md]\n---\n\nprompt";
         let parsed = parse_agent_markdown(content).expect("null tools must parse");
         assert_eq!(parsed.name, "Legacy");
         assert!(parsed.tools.is_empty());
@@ -400,6 +427,7 @@ mod tests {
         let content = "---\nname: NoTools\ndescription: no tools field\n---\n\nprompt";
         let parsed = parse_agent_markdown(content).expect("missing tools must parse");
         assert!(parsed.tools.is_empty());
+        assert!(parsed.models.is_empty(), "no models means the default");
     }
 
     #[test]
@@ -411,13 +439,46 @@ mod tests {
         assert_eq!(parsed.prompt, "Prompt");
     }
 
+    /// A file still naming a retired model key is refused with the
+    /// instruction, never run on the workspace default in silence.
+    #[test]
+    fn retired_model_keys_are_refused_with_the_instruction() {
+        for (line, key) in [
+            ("tier: lg", "`tier:`"),
+            ("model: sonnet", "`model:`"),
+            ("backend: codex", "`backend:`"),
+            ("backendPreference: codex", "`backend:`"),
+        ] {
+            let content = format!("---\nname: Old\ndescription: old agent\n{line}\n---\n\nprompt");
+            let error = parse_agent_markdown(&content).unwrap_err();
+            assert!(error.contains(key), "{line}: {error}");
+            assert!(error.contains("models: ["), "{line}: {error}");
+            assert!(
+                error.contains("docs/backends.md#model-selection"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_or_malformed_allotment_is_refused() {
+        let empty = "---\nname: A\ndescription: d\nmodels: []\n---\n\np";
+        assert!(parse_agent_markdown(empty)
+            .unwrap_err()
+            .contains("`models` is empty"));
+        let malformed = "---\nname: A\ndescription: d\nmodels: [claude/]\n---\n\np";
+        assert!(parse_agent_markdown(malformed)
+            .unwrap_err()
+            .contains("not provider/model"));
+    }
+
     #[test]
     fn test_parse_claude_code_format() {
         let content = r#"---
 name: Test Agent
 description: A test agent
 tools: Read, Grep, Glob
-model: sonnet
+models: [sm, codex/gpt-5.6-luna]
 permissionMode: plan
 ---
 
@@ -426,15 +487,18 @@ permissionMode: plan
 This is the agent's system prompt.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(agent.name, "Test Agent");
         assert_eq!(agent.id, "test-agent");
         assert!(agent.id_generated);
         assert_eq!(agent.tools.len(), 3);
-        assert_eq!(agent.tier, Some("sonnet".to_string()));
+        assert_eq!(
+            agent.models,
+            vec![
+                AllotmentEntry::Pool("sm".into()),
+                AllotmentEntry::parse("codex/gpt-5.6-luna").unwrap()
+            ]
+        );
         assert!(agent.prompt.contains("# Test Prompt"));
     }
 
@@ -448,7 +512,6 @@ runMode: plan
 tools:
   - Read
   - Glob
-model: sonnet
 version: 0.5.0
 ---
 
@@ -457,15 +520,11 @@ version: 0.5.0
 This is the agent's system prompt.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(agent.id, "test-agent");
         assert!(!agent.id_generated);
         assert_eq!(agent.name, "Test Agent");
         assert_eq!(agent.tools.len(), 2);
-        assert_eq!(agent.tier, Some("sonnet".to_string()));
     }
 
     #[test]
@@ -479,10 +538,7 @@ tools: Read, Write, Edit
 Prompt
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(agent.tools, vec!["Read", "Write", "Edit"]);
     }
 
@@ -497,37 +553,33 @@ Prompt
     #[test]
     fn test_parse_missing_frontmatter() {
         let content = "# Just a prompt\n\nNo frontmatter here";
-        let result = parse_agent_markdown(content);
-        assert!(result.is_err());
+        assert!(parse_agent_markdown(content).is_err());
     }
 
     #[test]
     fn test_agent_to_markdown() {
         let tools = vec!["Read".to_string(), "Grep".to_string()];
+        let models = vec![AllotmentEntry::Pool("md".into())];
         let markdown = agent_to_markdown(AgentExportData {
-            id: "test-agent",
-            name: "Test Agent",
             description: "A test agent",
-            tools: &tools,
-            tier: Some("sonnet"),
-            prompt: "# Test Prompt\n\nThis is the prompt.",
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
-            hooks: None,
-            backend_preference: None,
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
+            models: &models,
+            ..export("Test Agent", &tools, "# Test Prompt\n\nThis is the prompt.")
         });
 
         assert!(markdown.contains("name: Test Agent"));
         assert!(markdown.contains("tools: Read, Grep"));
-        assert!(markdown.contains("tier: sonnet"));
+        assert!(markdown.contains("models: [md]"));
+        assert!(!markdown.contains("tier:"));
+        assert!(!markdown.contains("backend:"));
         assert!(!markdown.contains("permissionMode"));
         assert!(markdown.contains("# Test Prompt"));
         assert!(!markdown.contains("id:")); // ID not exported
+    }
+
+    #[test]
+    fn no_models_line_without_an_allotment() {
+        let markdown = agent_to_markdown(export("Plain", &[], "Do stuff."));
+        assert!(!markdown.contains("models:"), "{markdown}");
     }
 
     #[test]
@@ -536,21 +588,11 @@ Prompt
         let disallowed = vec!["Bash".to_string(), "WebFetch".to_string()];
         let skills = vec!["api-conventions".to_string(), "error-handling".to_string()];
         let markdown = agent_to_markdown(AgentExportData {
-            id: "planner",
-            name: "Planner",
             description: "Creates plans",
-            tools: &tools,
-            tier: None,
-            prompt: "Plan stuff.",
             fence: Some(Fence::Allow),
             disallowed_tools: Some(&disallowed),
             skills: Some(&skills),
-            hooks: None,
-            backend_preference: None,
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
+            ..export("Planner", &tools, "Plan stuff.")
         });
 
         assert!(markdown.contains("disallowedTools:"));
@@ -575,10 +617,7 @@ onEscape: allow
 Prompt
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(agent.fence, Some(Fence::Allow));
     }
 
@@ -615,10 +654,7 @@ disallowedTools:
 Plan stuff.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(
             agent.disallowed_tools,
             Some(vec!["Bash".to_string(), "WebFetch".to_string()])
@@ -639,10 +675,7 @@ skills:
 Build stuff.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(
             agent.skills,
             Some(vec![
@@ -663,10 +696,7 @@ tools: Read
 Read stuff.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert_eq!(agent.disallowed_tools, None);
         assert_eq!(agent.skills, None);
     }
@@ -688,94 +718,18 @@ hooks:
 Build stuff.
 "#;
 
-        let result = parse_agent_markdown(content);
-        assert!(result.is_ok());
-
-        let agent = result.unwrap();
+        let agent = parse_agent_markdown(content).unwrap();
         assert!(agent.hooks.is_some());
 
         // Export and verify hooks are preserved
         let markdown = agent_to_markdown(AgentExportData {
-            id: "builder",
-            name: &agent.name,
             description: &agent.description,
-            tools: &agent.tools,
-            tier: None,
-            prompt: &agent.prompt,
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
             hooks: agent.hooks.as_ref(),
-            backend_preference: None,
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
+            ..export(&agent.name, &agent.tools, &agent.prompt)
         });
 
         assert!(markdown.contains("hooks:"));
         assert!(markdown.contains("PreToolUse"));
-    }
-
-    #[test]
-    fn test_backend_preference_roundtrip() {
-        let content = r#"---
-name: Codex Builder
-description: Builds with Codex
-tools: Read, Write
-backend: codex
----
-
-Build with Codex.
-"#;
-
-        let agent = parse_agent_markdown(content).unwrap();
-        assert_eq!(agent.backend_preference.as_deref(), Some("codex"));
-
-        // Export and verify backend preference is preserved
-        let markdown = agent_to_markdown(AgentExportData {
-            id: "codex-builder",
-            name: &agent.name,
-            description: &agent.description,
-            tools: &agent.tools,
-            tier: None,
-            prompt: &agent.prompt,
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
-            hooks: None,
-            backend_preference: agent.backend_preference.as_deref(),
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
-        });
-
-        assert!(markdown.contains("backend: codex"));
-    }
-
-    #[test]
-    fn test_backend_preference_omitted_when_absent() {
-        let markdown = agent_to_markdown(AgentExportData {
-            id: "plain",
-            name: "Plain",
-            description: "No backend preference",
-            tools: &["Read".to_string()],
-            tier: Some("sonnet"),
-            prompt: "Do stuff.",
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
-            hooks: None,
-            backend_preference: None,
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
-        });
-
-        assert!(!markdown.contains("backendPreference"));
-        assert!(!markdown.contains("backend:"));
     }
 
     #[test]
@@ -795,21 +749,10 @@ Build stuff.
 
         // Export and verify the icon line is preserved, then re-parse.
         let markdown = agent_to_markdown(AgentExportData {
-            id: "builder",
-            name: &agent.name,
             description: &agent.description,
-            tools: &agent.tools,
-            tier: None,
-            prompt: &agent.prompt,
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
-            hooks: None,
-            backend_preference: None,
             icon: agent.icon.as_deref(),
             bundles: &agent.bundles,
-            seed_budget_tokens: None,
-            seed_eras: None,
+            ..export(&agent.name, &agent.tools, &agent.prompt)
         });
 
         assert!(markdown.contains("icon: hammer"));
@@ -821,23 +764,8 @@ Build stuff.
     fn test_icon_omitted_when_absent() {
         // An agent with no icon must not emit an `icon:` line and must reload
         // with `icon == None` — no save/load asymmetry for the optional field.
-        let markdown = agent_to_markdown(AgentExportData {
-            id: "plain",
-            name: "Plain",
-            description: "No icon",
-            tools: &["Read".to_string()],
-            tier: None,
-            prompt: "Do stuff.",
-            fence: None,
-            disallowed_tools: None,
-            skills: None,
-            hooks: None,
-            backend_preference: None,
-            icon: None,
-            bundles: &[],
-            seed_budget_tokens: None,
-            seed_eras: None,
-        });
+        let tools = ["Read".to_string()];
+        let markdown = agent_to_markdown(export("Plain", &tools, "Do stuff."));
 
         assert!(!markdown.contains("icon:"));
         let parsed = parse_agent_markdown(&markdown).unwrap();

@@ -193,7 +193,7 @@ impl Orchestrator {
             .map(str::trim)
             .filter(|model| !model.is_empty())
         else {
-            let lead = "Name the model to complete with (a catalog id, provider/model, or provider/tier): this door never chooses one";
+            let lead = "Name the model to complete with (a catalog id or provider/model): this door never chooses one";
             let offers = complete_offers_named(&catalog);
             return Err(if offers.is_empty() {
                 let nothing = NoOffer {
@@ -246,10 +246,16 @@ impl Orchestrator {
         let definition = ResponseDefinition {
             name: "models-complete".to_string(),
             description: String::new(),
-            tier: None,
-            model: Some(offer.model.clone()),
-            backend: Some(offer.provider.clone()),
+            models: Some(vec![cairn_config::allotment::AllotmentEntry::Model(
+                crate::models::ModelSelection::new(
+                    offer.provider.clone(),
+                    Model::new(&offer.model),
+                ),
+            )]),
             options: request.options.clone(),
+            tier: None,
+            model: None,
+            backend: None,
             variables: Vec::new(),
             output: request
                 .output
@@ -508,6 +514,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_door_refuses_naming_the_fix_and_sends_nothing() {
         let (orch, sent, _) = workspace(Vec::new()).await;
+        orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
+            backend: "claude".into(),
+            models: cairn_models::types::catalog::claude_models(),
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
         // The workspace's default providers are offered too, ahead of the hub.
         let serving = "offers that serve complete: claude/";
         for (args, expected) in [

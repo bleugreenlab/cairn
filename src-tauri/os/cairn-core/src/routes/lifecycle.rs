@@ -9,8 +9,8 @@ const ATTENTION_QUEUE: usize = 256;
 /// Every spelling by which a predicate can name one of the issue's labels.
 ///
 /// A label reference is its slug id or its display name everywhere else a label
-/// is named — the label sink resolves either (`labels::attach`), and so does
-/// model routing (`config::model_routing`). Predicate matching, by contrast, is
+/// is named — the label sink resolves either (`labels::attach`). Predicate
+/// matching, by contrast, is
 /// plain value equality, so the fact has to carry both spellings for either to
 /// match: the route editor picks display names out of the workspace vocabulary,
 /// while a hand-written route tends to spell a label by its slug.

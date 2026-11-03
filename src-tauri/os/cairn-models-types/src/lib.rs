@@ -15,6 +15,7 @@ pub mod pool;
 pub mod provider_id;
 pub mod speech;
 pub mod subscription;
+pub mod supply;
 pub mod tokenizers;
 pub mod usage;
 

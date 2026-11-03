@@ -112,14 +112,9 @@ pub(crate) const NODE_TASKS_CONTRACT: ResourceContract =
             optional: &[
                 KeySpec::new("prompt", KeyType::Str, ""),
                 KeySpec::new(
-                    "tier",
-                    KeyType::Str,
-                    "sm|md|lg preset, or a model name; defaults to the parent's",
-                ),
-                KeySpec::new(
-                    "backend",
-                    KeyType::Str,
-                    "claude|codex; defaults to the parent's",
+                    "models",
+                    KeyType::Array,
+                    "the allotment the task selects its model within, replacing its agent's: pool ids and provider/model pairs, e.g. [lg] or [claude/opus]; defaults to the agent's",
                 ),
                 KeySpec::new(
                     "session",
@@ -166,14 +161,9 @@ pub(crate) const NODE_CALLS_CONTRACT: ResourceContract = ResourceContract {
                 "inherit (default; the caller's branch) | none (no repository access)",
             ),
             KeySpec::new(
-                "tier",
-                KeyType::Str,
-                "sm|md|lg preset, or a model name; defaults to the parent's",
-            ),
-            KeySpec::new(
-                "backend",
-                KeyType::Str,
-                "claude|codex; defaults to the parent's",
+                "models",
+                KeyType::Array,
+                "the allotment the call selects its model within, replacing its agent's: pool ids and provider/model pairs, e.g. [sm] or [claude/haiku]; defaults to the agent's",
             ),
             KeySpec::new("label", KeyType::Str, "durable workflow tag"),
             KeySpec::new("phase", KeyType::Str, "durable workflow phase tag"),

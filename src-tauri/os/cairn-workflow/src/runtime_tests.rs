@@ -377,11 +377,16 @@ async fn stored_decisions(db: &LocalDb) -> Vec<Option<Decision>> {
     .collect()
 }
 
+fn pool(id: &str) -> Option<Vec<crate::models::allotment::AllotmentEntry>> {
+    Some(vec![crate::models::allotment::AllotmentEntry::Pool(
+        id.to_string(),
+    )])
+}
+
 #[tokio::test]
 async fn a_decision_node_routes_on_the_pick_and_records_the_answer() {
     let (runtime, host, _dir) = fixture(true).await;
-    let definition =
-        DecisionNode::port_choice("Does it touch the database?", &ports(), Some("sm".into()));
+    let definition = DecisionNode::port_choice("Does it touch the database?", &ports(), pool("sm"));
     seed_condition(&host, decision_node(definition.clone())).await;
     *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
 
@@ -428,7 +433,7 @@ async fn a_frozen_ai_condition_is_asked_as_a_decision() {
 
     assert_eq!(
         host.condition_requests.lock().unwrap()[0].decision,
-        DecisionNode::port_choice("Does it touch the database?", &ports(), Some("md".into()))
+        DecisionNode::port_choice("Does it touch the database?", &ports(), pool("md"))
     );
     assert_eq!(*host.calls.lock().unwrap(), ["condition", "agent"]);
 }

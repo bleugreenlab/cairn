@@ -1371,6 +1371,9 @@ pub struct QueuedExecution {
     pub issue_id: Option<String>,
     pub issue_number: Option<i64>,
     pub issue_title: Option<String>,
+    /// Its issue's thread, when it has one: what a thread's own queue filters
+    /// this view by.
+    pub thread_id: Option<String>,
     pub thread_name: Option<String>,
     pub seq: Option<i64>,
     pub held_since: i64,
@@ -1445,8 +1448,6 @@ pub(crate) struct FleetOrdered {
     pub key: i64,
     pub db_index: usize,
     pub db: Arc<LocalDb>,
-    /// Its issue's thread, when it has one.
-    pub thread_id: Option<String>,
     /// As the page lists it, its census not yet read.
     pub queued: QueuedExecution,
 }
@@ -1466,7 +1467,6 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
                     while let Some(row) = rows.next().await? {
                         out.push((
                             row.opt_i64(9)?.unwrap_or(0),
-                            row.opt_text(10)?,
                             QueuedExecution {
                                 execution_id: row.text(0)?,
                                 issue_id: row.opt_text(1)?,
@@ -1475,6 +1475,7 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
                                 issue_title: row.opt_text(4)?,
                                 project_id: row.opt_text(5)?,
                                 project_key: row.opt_text(6)?,
+                                thread_id: row.opt_text(10)?,
                                 thread_name: row.opt_text(7)?,
                                 held_since: row.opt_i64(8)?.unwrap_or(0),
                                 census: None,
@@ -1486,16 +1487,12 @@ pub(crate) async fn fleet_order(orch: &Orchestrator) -> Result<Vec<FleetOrdered>
             })
             .await
             .map_err(|error| format!("failed to list the execution queue: {error}"))?;
-        held.extend(
-            rows.into_iter()
-                .map(|(key, thread_id, queued)| FleetOrdered {
-                    key,
-                    db_index,
-                    db: db.clone(),
-                    thread_id,
-                    queued,
-                }),
-        );
+        held.extend(rows.into_iter().map(|(key, queued)| FleetOrdered {
+            key,
+            db_index,
+            db: db.clone(),
+            queued,
+        }));
     }
     held.sort_by(|a, b| {
         (a.key, a.db_index, &a.queued.execution_id).cmp(&(
@@ -1784,7 +1781,6 @@ pub(crate) mod tests {
             &format!("si{number}"),
             Some("memory-triage"),
             "p",
-            None,
             None,
             None,
             None,

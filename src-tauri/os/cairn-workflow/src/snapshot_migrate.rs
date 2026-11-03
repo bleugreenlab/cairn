@@ -1,17 +1,15 @@
-//! Read-time migration of stored execution snapshots into their resolved,
-//! atomic runtime form.
+//! Read-time migration of stored execution snapshots into their current form.
 //!
 //! Pre-resolve-early snapshots stored a flat `model`/`resolvedBackend` per agent
-//! plus a frozen `presets` matrix; the runtime reads a single atomic
-//! `selection` and `extras`. Migrating on read folds the legacy shape forward
-//! exactly once so every load site sees the resolved representation.
-//!
-//! The workflow engine resolves stored snapshots using `cairn-config` provider
-//! and preset rules. All workflow snapshot loads use this migration path.
+//! plus a frozen `presets` matrix and the agent's authored `tier`; the runtime
+//! reads a single atomic `selection` and `extras`. Migrating on read folds the
+//! legacy shape forward exactly once so every load site sees the current
+//! representation. All workflow snapshot loads use this migration path.
 
-use crate::models::{DelegatedWorkPacket, ExecutionSnapshot, Fence, Model, ModelSelection};
-use cairn_config::presets::{resolve_selection_with_provenance, PresetsConfig};
+use crate::models::allotment::AllotmentEntry;
+use crate::models::{DelegatedWorkPacket, ExecutionSnapshot, Fence, ModelSelection, Preset};
 use cairn_models_types::catalog as providers;
+use serde_json::Value;
 
 /// Deserialize a stored snapshot JSON string, applying resolve-early migration.
 ///
@@ -22,6 +20,7 @@ pub fn load(json: &str) -> Result<ExecutionSnapshot, String> {
     let mut value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
     migrate_ai_conditions(&mut value);
+    migrate_frozen_presets(&mut value);
     let mut snapshot: ExecutionSnapshot = serde_json::from_value(value)
         .map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
     migrate_on_read(&mut snapshot);
@@ -74,10 +73,14 @@ fn migrate_ai_conditions(snapshot: &mut serde_json::Value) {
                     .collect()
             })
             .unwrap_or_default();
+        // The condition named a tier; a bare tier name is the pool it became.
+        let models = text("model")
+            .filter(|model| !model.trim().is_empty() && !model.contains('/'))
+            .map(|pool| vec![AllotmentEntry::Pool(pool)]);
         let decision = DecisionNode::port_choice(
             text("question").as_deref().unwrap_or_default(),
             &ports,
-            text("model"),
+            models,
         );
         if let Some(object) = node.as_object_mut() {
             object.remove("conditionConfig");
@@ -104,25 +107,69 @@ pub fn migrate_packet_on_read(packet: &mut DelegatedWorkPacket) {
     packet.ownership.on_escape = None;
 }
 
-/// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen `presets`)
-/// into the atomic `selection` + `extras` representation, once.
+/// Recover, from a frozen `presets` matrix, what each agent's authored `tier`
+/// resolved to when the snapshot was written: its `extras`, and the backend a
+/// flat legacy `model` cannot name by itself. Then drop the matrix.
 ///
-/// Recovers exactly what the runtime used to recompute: the backend prefers the
-/// stored `resolved_backend`, else derives from the model, else asks the frozen
-/// preset matrix which backend served THIS agent's authored tier; extras come
-/// from that same frozen resolution. Clears the legacy fields and the frozen
-/// presets afterward so the atomic field is the single representation going
-/// forward.
-///
-/// The last-resort backend is a per-agent question, not a config-global one. The
-/// legacy shape's single `activeBackend` was only ever the right answer because
-/// every tier resolved through it; rehydrating the frozen matrix (see
-/// `PresetsConfig::from(&SnapshotPresets)`) restates that as a per-tier default,
-/// and resolving the agent's own tier against it gives the same answer wherever
-/// the old fallback was correct and a better one where the tier was pinned
-/// elsewhere.
+/// The frozen shape predates per-tier defaults: every tier resolved through
+/// its single `activeBackend`, unless the tier was qualified (`codex/lg`).
+fn migrate_frozen_presets(snapshot: &mut Value) {
+    let Some(presets) = snapshot
+        .as_object_mut()
+        .and_then(|object| object.remove("presets"))
+        .filter(|presets| !presets.is_null())
+    else {
+        return;
+    };
+    let active = presets.get("activeBackend").and_then(Value::as_str);
+    let Some(agents) = snapshot.get_mut("agents").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for agent in agents.values_mut() {
+        let Some(agent) = agent.as_object_mut() else {
+            continue;
+        };
+        let Some(tier) = agent.get("tier").and_then(Value::as_str) else {
+            continue;
+        };
+        let (backend, tier) = match tier.split_once('/') {
+            Some((backend, tier)) => (backend, tier),
+            None => match active {
+                Some(active) => (active, tier),
+                None => continue,
+            },
+        };
+        let Some(preset) = presets
+            .pointer(&format!("/backends/{backend}/{tier}"))
+            .and_then(|preset| serde_json::from_value::<Preset>(preset.clone()).ok())
+        else {
+            continue;
+        };
+        let backend = backend.to_string();
+        if !agent.contains_key("extras") {
+            if let Ok(extras) = serde_json::to_value(preset.to_extras()) {
+                agent.insert("extras".into(), extras);
+            }
+        }
+        let model_names_its_backend = agent
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| providers::backend_for_model(model).is_some());
+        if !agent.contains_key("selection")
+            && !agent.contains_key("resolvedBackend")
+            && !model_names_its_backend
+        {
+            agent.insert("resolvedBackend".into(), Value::String(backend));
+        }
+    }
+}
+
+/// Fold legacy per-agent flat `model`/`resolved_backend` into the atomic
+/// `selection`, once: the backend prefers the stored (or recovered)
+/// `resolved_backend`, else derives from the model, else Claude. Clears the
+/// legacy fields afterward so the atomic field is the single representation
+/// going forward.
 fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
-    let frozen = snapshot.presets.as_ref().map(PresetsConfig::from);
     for packet in &mut snapshot.inline_delegated_packets {
         migrate_packet_on_read(packet);
     }
@@ -134,42 +181,19 @@ fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
         agent.sandbox = None;
         agent.on_escape = None;
 
-        // What the frozen matrix says this agent's authored tier resolved to.
-        // Computed once and consulted by both the backend fallback and extras.
-        let frozen_resolution = frozen.as_ref().and_then(|presets| {
-            resolve_selection_with_provenance(
-                agent.tier.as_ref().map(Model::as_str),
-                agent.backend_preference.as_deref(),
-                None,
-                presets,
-            )
-            .ok()
-        });
-
         if agent.selection.is_none() {
             if let Some(model) = agent.model.clone() {
                 let backend = agent
                     .resolved_backend
                     .clone()
                     .or_else(|| providers::backend_for_model(model.as_str()).map(str::to_string))
-                    .or_else(|| {
-                        frozen_resolution
-                            .as_ref()
-                            .map(|resolved| resolved.selection.backend.clone())
-                    })
                     .unwrap_or_else(|| "claude".to_string());
                 agent.selection = Some(ModelSelection { backend, model });
-            }
-        }
-        if agent.extras.is_none() {
-            if let Some(resolved) = frozen_resolution {
-                agent.extras = Some(resolved.extras);
             }
         }
         agent.model = None;
         agent.resolved_backend = None;
     }
-    snapshot.presets = None;
 }
 
 #[cfg(test)]
@@ -219,15 +243,55 @@ mod tests {
             agent.extras.as_ref().unwrap().reasoning_effort.as_deref(),
             Some("high")
         );
-        assert!(snapshot.presets.is_none());
         assert!(agent.model.is_none());
         assert!(agent.resolved_backend.is_none());
+        assert!(
+            agent.models.is_empty(),
+            "the frozen tier is not an allotment"
+        );
 
         // Re-serialize: nested selection present, no presets, no flat model.
         let reserialized = snapshot.to_json().unwrap();
         assert!(reserialized.contains("\"selection\""));
         assert!(!reserialized.contains("\"presets\""));
         assert!(!reserialized.contains("resolvedBackend"));
+        assert!(!reserialized.contains("\"tier\""));
+    }
+
+    /// A flat model no backend recognizes takes the backend its frozen tier
+    /// resolved through, qualified or by the single active backend.
+    #[test]
+    fn a_frozen_tier_names_the_backend_a_custom_model_cannot() {
+        let json = r#"{
+            "recipe": {"id": "r-1", "name": "R", "description": null,
+                       "trigger": "manual", "nodes": [], "edges": []},
+            "agents": {
+                "plan": {"id": "plan", "name": "P", "description": "", "prompt": "p",
+                         "tools": [], "tier": "lg", "model": "my-local-model"},
+                "build": {"id": "build", "name": "B", "description": "", "prompt": "p",
+                          "tools": [], "tier": "codex/md", "model": "my-codex-model"}
+            },
+            "skills": {},
+            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
+            "presets": {
+                "activeBackend": "ollama",
+                "tiers": ["sm", "md", "lg"],
+                "backends": {
+                    "ollama": {"lg": {"model": "my-local-model"}},
+                    "codex": {"md": {"model": "my-codex-model", "options": {"reasoningEffort": "low"}}}
+                }
+            },
+            "createdAt": 1
+        }"#;
+        let snapshot = load(json).unwrap();
+        let plan = snapshot.agents["plan"].selection.as_ref().unwrap();
+        assert_eq!(plan.backend, "ollama");
+        let build = &snapshot.agents["build"];
+        assert_eq!(build.selection.as_ref().unwrap().backend, "codex");
+        assert_eq!(
+            build.extras.as_ref().unwrap().reasoning_effort.as_deref(),
+            Some("low")
+        );
     }
 
     /// An ancient snapshot with `presets: null` still loads; backend is derived

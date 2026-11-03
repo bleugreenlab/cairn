@@ -125,6 +125,7 @@ pub fn discovered_model(
             .collect(),
     });
     DiscoveredModel {
+        maker: None,
         id: model.id.clone(),
         model: model.id.clone(),
         display_name: model.name.clone().unwrap_or_else(|| model.id.clone()),

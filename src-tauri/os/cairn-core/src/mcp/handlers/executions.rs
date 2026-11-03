@@ -57,7 +57,6 @@ pub(crate) async fn start_execution_from_collection(
     project_key: &str,
     number: i32,
     recipe: Option<&str>,
-    backend: Option<&str>,
     branch_target: Option<crate::models::BranchTarget>,
     continuity: Option<crate::models::Continuity>,
     overrides: Option<crate::models::LaunchDeltas>,
@@ -102,7 +101,6 @@ pub(crate) async fn start_execution_from_collection(
         &issue_id,
         recipe,
         &project_id,
-        backend,
         Some("external"),
         branch_target,
         continuity,
@@ -753,8 +751,7 @@ mod snapshot_edit_guard_tests {
             description: String::new(),
             prompt: prompt.to_string(),
             tools: vec![],
-            tier: None,
-            backend_preference: None,
+            models: Vec::new(),
             // Concrete selection so the canonical pipeline stores verbatim and
             // skips preset resolution (no config files needed in tests).
             selection: Some(ModelSelection {

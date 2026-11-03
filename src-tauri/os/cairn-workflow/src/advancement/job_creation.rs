@@ -204,30 +204,34 @@ async fn insert_job_for_node_conn(
     let requested_forked_session = delegated_packet
         .map(|packet| packet.session.mode == DelegatedSessionMode::Fork)
         .unwrap_or(false);
-    let parent_backend = if let Some(packet) = delegated_packet {
-        let mut rows = conn
-            .query(
-                "SELECT model FROM jobs WHERE id = ?1",
-                (packet.parent_job_id.as_str(),),
-            )
-            .await?;
-        rows.next()
-            .await?
-            .map(|row| row.opt_text(0))
-            .transpose()?
-            .flatten()
-            .as_deref()
-            .and_then(cairn_models_types::catalog::backend_for_model)
-            .map(str::to_string)
-    } else {
-        None
+    // The session a fork-mode task forks: its parent's current one.
+    let parent_session = match delegated_packet.filter(|_| requested_forked_session) {
+        Some(packet) => {
+            let mut rows = conn
+                .query(
+                    "SELECT s.id, s.backend FROM jobs j
+                     JOIN sessions s ON s.id = j.current_session_id
+                     WHERE j.id = ?1",
+                    (packet.parent_job_id.as_str(),),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
+                .transpose()?
+        }
+        None => None,
     };
     let child_backend = backend_for_job_session(snapshot, agent_config_id, model_str.as_deref());
-    let create_forked_session = requested_forked_session
-        && parent_backend
-            .as_deref()
-            .map(|backend| backend == child_backend)
-            .unwrap_or(false);
+    // An unpinned task has not chosen a model yet. It selects at its own
+    // launch, and a forked session keeps that selection to the provider the
+    // fork lives on (`select_job_model` in cairn-core), so the fork always
+    // holds. Only a pin on another provider cannot continue the session.
+    let create_forked_session = match (&parent_session, model_str.is_some()) {
+        (Some((_, parent_backend)), true) => *parent_backend == child_backend,
+        (Some(_), false) => true,
+        (None, _) => false,
+    };
     let session_id = (!create_forked_session).then(|| ids::mint_session_id().into_string());
 
     let uri_segment = if let Some(parent_job_id) = parent_job_id {
@@ -313,58 +317,25 @@ async fn insert_job_for_node_conn(
     )
     .await?;
 
-    if create_forked_session {
-        let packet = delegated_packet.expect("delegated fork packet must exist");
-        let mut parent_rows = conn
-            .query(
-                "SELECT current_session_id FROM jobs WHERE id = ?1",
-                (packet.parent_job_id.as_str(),),
-            )
-            .await?;
-        let parent_session_id = parent_rows
-            .next()
-            .await?
-            .map(|row| row.opt_text(0))
-            .transpose()?
-            .flatten();
-
-        if let Some(source_session_id) = parent_session_id {
-            let (source_backend, source_sequence) =
-                load_session_backend_sequence_conn(conn, &source_session_id).await?;
-            let forked_session_id = ids::mint_session_id().into_string();
-            insert_session_conn(
-                conn,
-                &forked_session_id,
-                Some(&job_id),
-                &source_backend,
-                Some(&source_session_id),
-                source_sequence + 1,
-                now,
-            )
-            .await?;
-            conn.execute(
-                "UPDATE jobs SET current_session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![forked_session_id.as_str(), now, job_id.as_str()],
-            )
-            .await?;
-        } else {
-            let fallback_session_id = ids::mint_session_id().into_string();
-            insert_session_conn(
-                conn,
-                &fallback_session_id,
-                Some(&job_id),
-                &child_backend,
-                None,
-                1,
-                now,
-            )
-            .await?;
-            conn.execute(
-                "UPDATE jobs SET current_session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![fallback_session_id.as_str(), now, job_id.as_str()],
-            )
-            .await?;
-        }
+    if let (true, Some((source_session_id, _))) = (create_forked_session, &parent_session) {
+        let (source_backend, source_sequence) =
+            load_session_backend_sequence_conn(conn, source_session_id).await?;
+        let forked_session_id = ids::mint_session_id().into_string();
+        insert_session_conn(
+            conn,
+            &forked_session_id,
+            Some(&job_id),
+            &source_backend,
+            Some(source_session_id),
+            source_sequence + 1,
+            now,
+        )
+        .await?;
+        conn.execute(
+            "UPDATE jobs SET current_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![forked_session_id.as_str(), now, job_id.as_str()],
+        )
+        .await?;
     } else {
         let session_id = session_id.ok_or_else(|| db_internal("Missing generated session id"))?;
         insert_session_conn(
@@ -438,7 +409,6 @@ fn backend_for_job_session(
     let agent = agent_config_id.and_then(|id| snapshot.agents.get(id));
     cairn_config::providers::effective_backend_name(
         agent.and_then(|agent| agent.selection.as_ref()),
-        agent.and_then(|agent| agent.backend_preference.as_deref()),
         model,
     )
     .unwrap_or_else(|| "claude".to_string())
@@ -496,6 +466,122 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("job-creation-test.db").await
+    }
+
+    /// A `session: fork` task forks its parent's session whatever provider that
+    /// session is on. An unpinned task has not chosen a model at creation; it
+    /// selects at its own launch within the fork's provider.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unpinned_fork_task_forks_its_parents_session_on_any_provider() {
+        use crate::models::{
+            DelegatedOutputContract, DelegatedOwnershipScope, DelegatedSessionStrategy,
+            DelegatedStatus, DelegatedWorkPacket, DelegationOrigin, OutputSchema,
+        };
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                let snapshot = serde_json::json!({
+                    "recipe": {
+                        "id": "r", "name": "R", "description": null, "trigger": "manual",
+                        "nodes": [{
+                            "id": "task-1", "nodeType": "agent", "name": "map",
+                            "position": {"x": 0.0, "y": 0.0},
+                            "agentConfig": {"agentConfigId": "Explore"}
+                        }],
+                        "edges": []
+                    },
+                    "agents": {}, "skills": {},
+                    "triggerContext": {"projectId": "proj-1", "triggerType": "manual"},
+                    "createdAt": 1
+                });
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, project_id, status, started_at, snapshot)
+                     VALUES ('e', 'r', 'proj-1', 'running', 1, ?1)",
+                    (snapshot.to_string(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, project_id, status, current_session_id, model, created_at, updated_at)
+                     VALUES ('j-parent', 'proj-1', 'running', 'ps', 'gpt-5.6-sol', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at, backend_id)
+                     VALUES ('ps', 'j-parent', 'codex', 'open', 3, 1, 1, 'thread-1')",
+                    (),
+                )
+                .await?;
+                let packet = DelegatedWorkPacket {
+                    id: "pk".to_string(),
+                    parent_job_id: "j-parent".to_string(),
+                    parent_turn_id: None,
+                    parent_tool_use_id: None,
+                    origin: DelegationOrigin::TaskTool,
+                    title: "map".to_string(),
+                    problem_statement: Some("map it".to_string()),
+                    prompt_digest: None,
+                    agent_config_id: "Explore".to_string(),
+                    ownership: DelegatedOwnershipScope {
+                        cwd: "/tmp".to_string(),
+                        fence: None,
+                        sandbox: None,
+                        on_escape: None,
+                    },
+                    session: DelegatedSessionStrategy {
+                        mode: DelegatedSessionMode::Fork,
+                    },
+                    acceptance: Vec::new(),
+                    output_contract: DelegatedOutputContract {
+                        schema_type: OutputSchema::Preset("return".to_string()),
+                        tool_name: None,
+                        description: None,
+                    },
+                    status: DelegatedStatus::Materialized,
+                    materialized_node_ids: vec!["task-1".to_string()],
+                    result_artifact_job_id: None,
+                    task_index: Some(0),
+                    models: None,
+                    background: false,
+                    created_at: 1,
+                };
+                crate::delegated_packets::insert(conn, "e", &packet).await?;
+
+                let snapshot = load_execution_snapshot_conn(conn, "e").await?;
+                let nodes = snapshot_nodes_to_db(&snapshot);
+                let job = insert_job_for_node_conn(
+                    conn,
+                    "e",
+                    "",
+                    "proj-1",
+                    &nodes[0],
+                    Some("Explore"),
+                    None,
+                    2,
+                    &snapshot,
+                )
+                .await?;
+                let mut rows = conn
+                    .query(
+                        "SELECT s.parent_session_id, s.backend FROM jobs j
+                         JOIN sessions s ON s.id = j.current_session_id WHERE j.id = ?1",
+                        (job.id.as_str(),),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("the task has a session");
+                assert_eq!(row.opt_text(0)?.as_deref(), Some("ps"));
+                assert_eq!(row.text(1)?, "codex");
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

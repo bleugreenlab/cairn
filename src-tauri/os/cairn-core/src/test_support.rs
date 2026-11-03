@@ -146,6 +146,8 @@ pub(crate) fn shipping_execution_snapshot_json(issue_id: &str, project_id: &str)
         "Builder",
         RecipeNodeType::Agent,
         Some(AgentNodeConfig {
+            models: None,
+            constraints: Default::default(),
             agent_config_id: Some("builder".to_string()),
             output_schema: Some(SchemaConfig {
                 name: "create-pr".to_string(),
@@ -161,7 +163,6 @@ pub(crate) fn shipping_execution_snapshot_json(issue_id: &str, project_id: &str)
     serde_json::to_string(&ExecutionSnapshot {
         continuity: Default::default(),
         branch_target: Default::default(),
-        model_routing: None,
         recipe: RecipeSnapshot {
             id: "recipe".to_string(),
             name: "Recipe".to_string(),
@@ -179,7 +180,6 @@ pub(crate) fn shipping_execution_snapshot_json(issue_id: &str, project_id: &str)
             event_payload: None,
             initiated_via: None,
         },
-        presets: None,
         inline_delegated_packets: vec![],
         created_at: 1,
     })

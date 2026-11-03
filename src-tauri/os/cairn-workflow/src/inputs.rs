@@ -1074,6 +1074,8 @@ mod port_model_tests {
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
                 agent_config_id: Some(id.to_string()),
+                models: None,
+                constraints: Default::default(),
                 output_schema: None,
                 git_config: None,
             }),
@@ -1163,7 +1165,6 @@ mod port_model_tests {
         ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -1181,7 +1182,6 @@ mod port_model_tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         }
@@ -1435,6 +1435,8 @@ mod port_model_tests {
         let mut planner = agent("planner");
         planner.agent_config = Some(AgentNodeConfig {
             agent_config_id: Some("planner".to_string()),
+            models: None,
+            constraints: Default::default(),
             output_schema: Some(SchemaConfig {
                 name: "plan".to_string(),
                 schema: Some(serde_json::json!({"type": "object"})),

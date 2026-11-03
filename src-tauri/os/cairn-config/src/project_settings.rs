@@ -68,20 +68,21 @@ pub struct ProjectSettingsFile {
     pub references: Option<Vec<ProjectReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialization: Option<MaterializationSettings>,
-    /// Project-level overrides of which backend serves each tier by default,
-    /// merged tier by tier over the workspace bindings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The retired tier grid overrides (`tierDefaults`, a legacy global
+    /// `activeBackend`, `backends` cells). Read only, as input to the
+    /// in-memory conversion into a `models` overlay
+    /// ([`convert_project_tiers`]). Cairn never rewrites a project's file to
+    /// remove them: a save leaves them where they are.
+    #[serde(default, skip_serializing)]
     pub tier_defaults: Option<HashMap<String, String>>,
-    /// Legacy project-level global default provider. It said "every tier in this
-    /// project runs on this backend", so it loads as exactly that before any
-    /// `tierDefaults` entry refines it. Read-only: nothing writes this key, but
-    /// a project config is version-controlled by its own repository, so a value
-    /// already committed there is preserved rather than silently deleted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub active_backend: Option<String>,
-    /// Project-level preset overrides (deep-merged with workspace)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// Pools and ladder entries this project adds to or replaces in the
+    /// workspace's: pools merge by id, ladder entries by model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<crate::allotment::ModelsOverlay>,
     /// Project-level external MCP servers (overlay workspace set; project wins
     /// on key collision).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,6 +325,8 @@ struct LegacyProjectSettingsFile {
     active_backend: Option<String>,
     #[serde(default)]
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    #[serde(default)]
+    models: Option<crate::allotment::ModelsOverlay>,
     #[serde(default)]
     mcp_servers: Option<HashMap<String, cairn_packs::server_config::McpServerConfig>>,
     #[serde(default)]
@@ -624,6 +627,7 @@ fn parse_project_settings_under(
         tier_defaults: legacy.tier_defaults,
         active_backend: legacy.active_backend,
         backends: legacy.backends,
+        models: legacy.models,
         mcp_servers: legacy.mcp_servers,
         contextual_packages: legacy.contextual_packages,
         landing: legacy.landing,
@@ -958,9 +962,9 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "defaultBranch",
     "references",
     "worktree",
-    "tierDefaults",
-    "activeBackend",
-    "backends",
+    // The retired tier keys are deliberately unmanaged: a save leaves them as
+    // the user wrote them, and they convert in memory on every read.
+    "models",
     "mcpServers",
     "contextualPackages",
     "landing",
@@ -1025,6 +1029,7 @@ fn mutate_project_settings_inner<T>(
         path: path.clone(),
         source: error.to_string(),
     })?;
+    let had_tier_grid = settings.has_tier_grid();
     let value = mutate(&mut settings).map_err(|source| ProjectConfigError::Mutation {
         path: path.clone(),
         source,
@@ -1033,8 +1038,11 @@ fn mutate_project_settings_inner<T>(
         path: path.clone(),
         source: error.to_string(),
     })?;
+    // The tier grid is read but never written, so clearing it leaves the
+    // rendered value unchanged; the file still has to lose those keys.
+    let retired_tier_grid = had_tier_grid && !settings.has_tier_grid();
 
-    if before == after && migration == ProjectConfigMigration::Current {
+    if before == after && migration == ProjectConfigMigration::Current && !retired_tier_grid {
         return Ok(value);
     }
 
@@ -1200,6 +1208,64 @@ fn rollback_project_config(
         ));
     }
     Ok(())
+}
+
+impl ProjectSettingsFile {
+    /// Whether this file still carries any of the retired tier grid keys.
+    pub fn has_tier_grid(&self) -> bool {
+        self.tier_defaults.is_some() || self.active_backend.is_some() || self.backends.is_some()
+    }
+}
+
+/// A project's tier overrides (`tierDefaults`, a legacy `activeBackend`,
+/// `backends` cells) converted into a `models` overlay over the workspace's
+/// conversion, with the notes the project's grid adds. `None` when the project
+/// overrides no part of the grid.
+///
+/// The project's effective grid is the workspace's with the overrides merged
+/// the way the tier resolver merged them: `activeBackend` first as every
+/// tier's default, then `tierDefaults` tier by tier, then `backends` cell by
+/// cell. Both grids are converted and the overlay is their difference, so the
+/// workspace's pools with this overlay laid over them are exactly the
+/// project's grid converted.
+pub fn convert_project_tiers(
+    file: &ProjectSettingsFile,
+    workspace: &crate::settings::LegacyGrid,
+    enabled: &[String],
+    position: crate::allotment::PositionFn<'_>,
+) -> Option<(crate::allotment::ModelsOverlay, Vec<String>)> {
+    if !file.has_tier_grid() {
+        return None;
+    }
+    let mut project = workspace.clone();
+    if let Some(backend) = file.legacy_active_backend() {
+        project.tier_defaults =
+            crate::legacy_presets::tier_defaults_from_single_backend(backend, &project.tiers);
+    }
+    if let Some(tier_defaults) = &file.tier_defaults {
+        for (tier, backend) in tier_defaults {
+            project.tier_defaults.insert(tier.clone(), backend.clone());
+        }
+    }
+    if let Some(backends) = &file.backends {
+        for (backend, cells) in backends {
+            let entry = project.backends.entry(backend.clone()).or_default();
+            for (tier, preset) in cells {
+                entry.insert(tier.clone(), preset.clone());
+            }
+        }
+    }
+    let base = crate::allotment::convert_tiers(&workspace.as_tiers(), enabled, None, position);
+    let target = crate::allotment::convert_tiers(&project.as_tiers(), enabled, None, position);
+    let notes = target
+        .notes
+        .into_iter()
+        .filter(|note| !base.notes.contains(note))
+        .collect();
+    Some((
+        crate::allotment::ModelsOverlay::between(&base.models, &target.models),
+        notes,
+    ))
 }
 
 /// Test helper for exercising complete typed replacements through the transaction.
@@ -2883,5 +2949,114 @@ activeBackend: codex
             std::fs::read_to_string(config_path).unwrap(),
             "defaultBranch: app\n"
         );
+    }
+
+    // === A project's tier overrides converted to a `models` overlay ===
+
+    fn position(
+        selection: &crate::models::ModelSelection,
+        level: &str,
+    ) -> crate::allotment::EffortPlacement {
+        use crate::allotment::EffortPlacement;
+        let levels: &[&str] = match selection.backend.as_str() {
+            "claude" | "codex" => &["low", "medium", "high", "xhigh"],
+            _ => return EffortPlacement::ScaleUnknown,
+        };
+        match levels.iter().position(|known| *known == level) {
+            Some(index) => EffortPlacement::At((index as f64 + 0.5) / levels.len() as f64),
+            None => EffortPlacement::NotALevel,
+        }
+    }
+
+    fn workspace() -> crate::settings::LegacyGrid {
+        crate::settings::SettingsFile::default().legacy_grid()
+    }
+
+    fn installed() -> Vec<String> {
+        vec!["claude".to_string(), "codex".to_string()]
+    }
+
+    fn lg_of(models: &crate::allotment::ModelsConfig) -> Vec<String> {
+        models
+            .expand(&[crate::allotment::AllotmentEntry::Pool("lg".into())])
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|candidate| crate::allotment::model_ref(&candidate.model))
+            .collect()
+    }
+
+    fn write_project_config(project_path: &Path, content: &str) -> PathBuf {
+        let path = get_project_config_path(project_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// The workspace's pools with the project's overlay laid over them are
+    /// the project's own grid converted: its replaced cell is in, the cell it
+    /// replaced is off the ladder.
+    #[test]
+    fn a_project_cell_override_becomes_an_overlay_that_replaces_the_cell() {
+        let file: ProjectSettingsFile = serde_yaml::from_str(
+            "backends:\n  codex:\n    lg: {model: gpt-5.5, options: {reasoningEffort: high}}\n",
+        )
+        .unwrap();
+        let (overlay, _) =
+            convert_project_tiers(&file, &workspace(), &installed(), &position).unwrap();
+        let mut effective = crate::settings::convert_settings_tiers(
+            &crate::settings::SettingsFile::default(),
+            &installed(),
+            &position,
+        )
+        .models;
+        assert_eq!(lg_of(&effective), ["claude/opus", "codex/gpt-5.6-sol"]);
+        effective.overlay(&overlay);
+        assert_eq!(lg_of(&effective), ["claude/opus", "codex/gpt-5.5"]);
+        assert!(overlay.pools.is_empty());
+        assert_eq!(overlay.default_models, None);
+    }
+
+    #[test]
+    fn a_project_that_overrides_nothing_converts_to_nothing() {
+        let file: ProjectSettingsFile = serde_yaml::from_str("defaultBranch: main\n").unwrap();
+        assert!(convert_project_tiers(&file, &workspace(), &installed(), &position).is_none());
+        // A default alone moves no model: every installed cell is a candidate.
+        let file: ProjectSettingsFile = serde_yaml::from_str("activeBackend: codex\n").unwrap();
+        let (overlay, notes) =
+            convert_project_tiers(&file, &workspace(), &installed(), &position).unwrap();
+        assert!(overlay.is_empty(), "{overlay:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("lg defaulted to codex")),
+            "{notes:?}"
+        );
+    }
+
+    /// A save of other project settings leaves the retired tier keys exactly
+    /// as the user wrote them: they still convert in memory on every read, and
+    /// dropping them on save would lose the project's model choices.
+    #[test]
+    fn a_project_save_keeps_its_retired_tier_keys() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        let path = write_project_config(
+            temp.path(),
+            "# project\ndefaultBranch: main\ntierDefaults: {lg: codex}\nbackends:\n  codex:\n    lg: {model: gpt-5.5}\n",
+        );
+        mutate_project_settings(temp.path(), |settings| {
+            settings.default_branch = Some("develop".to_string());
+            Ok(())
+        })
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("defaultBranch: develop"), "{written}");
+        assert!(written.contains("tierDefaults: {lg: codex}"), "{written}");
+        assert!(written.contains("model: gpt-5.5"), "{written}");
+        assert!(!written.contains("models:"), "{written}");
+        let file = load_project_settings_read_only(temp.path());
+        assert!(file.has_tier_grid());
+        assert!(convert_project_tiers(&file, &workspace(), &installed(), &position).is_some());
     }
 }

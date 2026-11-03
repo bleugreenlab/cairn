@@ -83,7 +83,7 @@ fn saved_discovery_selection(
 ) -> Option<ResponseModelSelection> {
     discovery_error.map(|reason| ResponseModelSelection {
         kind: "model".into(),
-        value: model.into(),
+        value: format!("{backend}/{model}"),
         label: format!("Exact · {model}"),
         backend: backend.into(),
         model: model.into(),
@@ -122,15 +122,15 @@ pub struct ResponseModelSelection {
     pub unavailable_reason: Option<String>,
 }
 
-/// Backend-owned response capability projected with the effective presets and
-/// discovered models that can be authored in this scope.
-pub fn model_capabilities(
+/// The discovered models a response in this scope can name, each with whether
+/// it can complete now: what [`validate_runnable_model`] checks a named model
+/// against. Pools are offered by the ladder (`cairn://models/ladder`), not here.
+pub(crate) fn model_capabilities(
     orch: &Orchestrator,
     project_id: Option<&str>,
-    project_path: Option<&std::path::Path>,
+    _project_path: Option<&std::path::Path>,
     saved: Option<&ResponseDefinition>,
 ) -> ResponseModelCapabilities {
-    let presets = crate::config::presets::load_effective_presets(&orch.config_dir, project_path);
     let catalog = orch.get_model_catalog();
     let mut backends = Vec::new();
     // Enabled, not supported: a response is authored to run next, so it may
@@ -149,38 +149,6 @@ pub fn model_capabilities(
         let completes = |model: &str| provider.admit(model, VerbKind::Complete).map(|_| ());
         let availability = backend.response_completion_availability(orch, project_id);
         let mut selections = Vec::new();
-        if let Some(backend_presets) = presets.backends.get(backend_name) {
-            for tier in &presets.tiers {
-                if let Some(preset) = backend_presets.get(tier) {
-                    // A tier bound to a model that cannot complete stays
-                    // listed, refused with why, rather than silently replaced.
-                    let model_availability = completes(preset.model.as_str())
-                        .map_err(|refusal| refusal.to_string())
-                        .and_then(|()| {
-                            backend.response_model_availability(
-                                orch,
-                                project_id,
-                                preset.model.as_str(),
-                            )
-                        });
-                    let legacy_values = crate::config::presets::resolve_preset(tier, &presets)
-                        .ok()
-                        .filter(|resolved| resolved.backend == backend_name)
-                        .map(|_| vec![tier.clone()])
-                        .unwrap_or_default();
-                    selections.push(ResponseModelSelection {
-                        kind: "tier".into(),
-                        value: format!("{backend_name}/{tier}"),
-                        label: format!("{} · {}", tier.to_uppercase(), preset.model),
-                        backend: backend_name.into(),
-                        model: preset.model.to_string(),
-                        legacy_values,
-                        runnable: availability.is_ok() && model_availability.is_ok(),
-                        unavailable_reason: model_availability.err(),
-                    });
-                }
-            }
-        }
         if let Some(entry) = catalog
             .iter()
             .find(|entry| entry.backend == backend_name && entry.error.is_none())
@@ -194,7 +162,7 @@ pub fn model_capabilities(
                     backend.response_model_availability(orch, project_id, &model.model);
                 selections.push(ResponseModelSelection {
                     kind: "model".into(),
-                    value: model.model.clone(),
+                    value: format!("{backend_name}/{}", model.model),
                     label: format!("Exact · {}", model.display_name),
                     backend: backend_name.into(),
                     model: model.model.clone(),
@@ -205,8 +173,9 @@ pub fn model_capabilities(
             }
         }
         if let Some(saved_model) = saved
-            .filter(|definition| definition.backend.as_deref() == Some(backend_name))
-            .and_then(|definition| definition.model.as_deref())
+            .and_then(ResponseDefinition::named_model)
+            .filter(|named| named.backend == backend_name)
+            .map(|named| named.model.as_str())
         {
             let already_represented = selections
                 .iter()
@@ -225,7 +194,7 @@ pub fn model_capabilities(
                     // naming the model and what it serves instead.
                     selections.push(ResponseModelSelection {
                         kind: "model".into(),
-                        value: saved_model.into(),
+                        value: format!("{backend_name}/{saved_model}"),
                         label: format!("Exact · {saved_model}"),
                         backend: backend_name.into(),
                         model: saved_model.into(),
@@ -258,6 +227,12 @@ pub fn validate_runnable_model(
     project_id: Option<&str>,
     project_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    // A response naming exactly one model is held to the discovery catalog:
+    // it is authored to run that model, and the catalog says whether it can.
+    // Any other allotment is runnable when selection can place it now.
+    if definition.named_model().is_none() {
+        return select_response_model(orch, definition, project_id).map(|_| ());
+    }
     let capabilities = model_capabilities(orch, project_id, project_path, Some(definition));
     if is_offered_model_selection(definition, &capabilities) {
         Ok(())
@@ -267,22 +242,39 @@ pub fn validate_runnable_model(
     }
 }
 
-/// Whether `selection`, offered by `backend`, is the one `definition` authored.
+/// The model `definition` completes on now: its allotment, else the
+/// workspace default, selected on the Complete verb.
+fn select_response_model(
+    orch: &Orchestrator,
+    definition: &ResponseDefinition,
+    project_id: Option<&str>,
+) -> Result<crate::execution::model_selection::SelectionRecord, String> {
+    let allotment = match &definition.models {
+        Some(models) => models.clone(),
+        None => orch.effective_models(project_id)?.default_models,
+    };
+    orch.select_models(
+        project_id,
+        &allotment,
+        VerbKind::Complete,
+        &Default::default(),
+        Default::default(),
+    )
+    .map_err(String::from)
+}
+
+/// Whether `selection`, offered by `backend`, is the one model `definition`
+/// names.
 fn selects(
     definition: &ResponseDefinition,
     backend: &str,
     selection: &ResponseModelSelection,
 ) -> bool {
-    if let Some(model) = &definition.model {
-        definition.backend.as_deref() == Some(backend)
+    definition.named_model().is_some_and(|named| {
+        named.backend == backend
             && selection.kind == "model"
-            && selection.model == *model
-    } else {
-        let tier = definition.tier.as_deref().unwrap_or("sm");
-        selection.kind == "tier"
-            && (selection.value == tier
-                || selection.legacy_values.iter().any(|legacy| legacy == tier))
-    }
+            && selection.model == named.model.as_str()
+    })
 }
 
 fn is_offered_model_selection(
@@ -1009,45 +1001,42 @@ async fn complete_definition_with_executor(
     definition: &ResponseDefinition,
     args: &Value,
     project_id: Option<&str>,
-    project_path: Option<&std::path::Path>,
+    _project_path: Option<&std::path::Path>,
     bound: Option<&InvocationBound>,
     interrupt: Option<&InvocationInterrupt>,
     executor: CompletionExecutor,
 ) -> Result<CompletionAttempt, ResponseError> {
     let rendered = definition.render(args).map_err(classify_render_error)?;
-    let (model, extras, backend_name) = if let Some(model) = &definition.model {
-        let preset = Preset {
-            model: Model::new(model),
-            options: definition.options.clone(),
-        };
-        (
-            preset.model.clone(),
-            preset.to_extras(),
-            definition.backend.clone().expect("validated exact pin"),
-        )
-    } else {
-        let presets =
-            crate::config::presets::load_effective_presets(&orch.config_dir, project_path);
-        let tier = definition.tier.as_deref().unwrap_or("sm");
-        match crate::config::presets::resolve_preset(tier, &presets) {
-            Ok(preset) => (preset.model, preset.extras, preset.backend),
-            // No enabled provider serves the tier: a refusal, returned as an
-            // attempt so the caller journals it under the authored tier.
-            Err(error) => {
-                return Ok(CompletionAttempt {
-                    rendered,
-                    model: Model::new(tier),
-                    backend: crate::config::presets::parse_tier_ref(tier)
-                        .0
-                        .unwrap_or_default()
-                        .to_string(),
-                    result: Err(ResponseError::BackendUnavailable(format!(
-                        "no enabled provider serves the '{tier}' tier ({error})"
-                    ))
-                    .into()),
-                    detached: None,
-                })
+    let (model, extras, backend_name) = match select_response_model(orch, definition, project_id) {
+        Ok(record) => {
+            // The definition's own options apply over the selected effort.
+            let authored = Preset {
+                model: record.chosen.model.clone(),
+                options: definition.options.clone(),
             }
+            .to_extras();
+            let extras = crate::models::RuntimeExtras {
+                max_thinking_tokens: authored
+                    .max_thinking_tokens
+                    .or(record.extras.max_thinking_tokens),
+                reasoning_effort: authored.reasoning_effort.or(record.extras.reasoning_effort),
+                service_tier: authored.service_tier.or(record.extras.service_tier),
+            };
+            (record.chosen.model, extras, record.chosen.backend)
+        }
+        // Nothing in the allotment can complete now: a refusal, returned as
+        // an attempt so the caller journals it under the authored allotment.
+        Err(error) => {
+            return Ok(CompletionAttempt {
+                rendered,
+                model: Model::new(definition.allotment_label()),
+                backend: definition
+                    .named_model()
+                    .map(|named| named.backend.clone())
+                    .unwrap_or_default(),
+                result: Err(ResponseError::BackendUnavailable(error).into()),
+                detached: None,
+            })
         }
     };
     let output_schema = definition
@@ -1322,14 +1311,21 @@ fn map_completion_error(error: CompletionError) -> ResponseError {
 pub struct ResponseDefinition {
     pub name: String,
     pub description: String,
-    #[serde(default)]
-    pub tier: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub backend: Option<String>,
+    /// The pools and `provider/model` pairs the response completes within.
+    /// Absent: the workspace's default allotment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
+    /// Launch options applied over the selected model's effort.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub options: HashMap<String, PresetOptionValue>,
+    /// Retired model keys, read only so a definition still naming one is
+    /// refused with the instruction rather than run on the default.
+    #[serde(default, skip_serializing)]
+    pub tier: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    pub model: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing)]
+    pub backend: Option<serde_yaml::Value>,
     #[serde(default)]
     pub variables: Vec<ResponseVariable>,
     #[serde(default)]
@@ -1422,6 +1418,26 @@ pub fn parse_definition(markdown: &str) -> Result<ResponseDefinition, String> {
 }
 
 impl ResponseDefinition {
+    /// The one model this response names, when its allotment is exactly that.
+    pub fn named_model(&self) -> Option<&crate::models::ModelSelection> {
+        match self.models.as_deref() {
+            Some([cairn_config::allotment::AllotmentEntry::Model(selection)]) => Some(selection),
+            _ => None,
+        }
+    }
+
+    /// The authored allotment as one string, for a refusal's journal entry.
+    fn allotment_label(&self) -> String {
+        match &self.models {
+            Some(models) => models
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => "default".to_string(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("Response name cannot be empty".into());
@@ -1432,14 +1448,23 @@ impl ResponseDefinition {
         if self.template.trim().is_empty() {
             return Err("Response template cannot be empty".into());
         }
-        if self.model.is_some() && self.tier.is_some() {
-            return Err("Response must declare either 'model' or 'tier', not both".into());
+        for (key, present) in [
+            ("tier", self.tier.is_some()),
+            ("model", self.model.is_some()),
+            ("backend", self.backend.is_some()),
+        ] {
+            if let Some(instruction) = present
+                .then(|| cairn_config::allotment::retired_model_key(key))
+                .flatten()
+            {
+                return Err(instruction);
+            }
         }
-        if self.model.is_some() && self.backend.is_none() {
-            return Err("Response with an exact 'model' pin must declare 'backend'".into());
-        }
-        if self.model.is_none() && self.backend.is_some() {
-            return Err("Response 'backend' is only valid with an exact 'model' pin".into());
+        if self.models.as_ref().is_some_and(Vec::is_empty) {
+            return Err(
+                "`models` is empty; name at least one pool or provider/model, or omit it to use the workspace default"
+                    .into(),
+            );
         }
         if self.timeout > MAX_RESPONSE_TIMEOUT {
             return Err(format!(
@@ -1687,21 +1712,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_keep_canonical_tiers_when_providers_are_unavailable() {
+    async fn an_unavailable_providers_selections_are_never_runnable() {
         let orch = test_orchestrator().await;
         let capabilities = model_capabilities(&orch, None, None, None);
-        let selections: Vec<_> = capabilities
-            .backends
-            .iter()
-            .flat_map(|backend| backend.selections.iter())
-            .collect();
-
-        assert!(selections
-            .iter()
-            .any(|selection| selection.value == "openrouter/md"));
-        assert!(selections.iter().any(|selection| {
-            selection.kind == "tier" && selection.legacy_values.iter().any(|value| value == "md")
-        }));
         assert!(capabilities
             .backends
             .iter()
@@ -1812,7 +1825,7 @@ mod tests {
 
     fn image_pinned() -> ResponseDefinition {
         parse_definition(&format!(
-            "---\nname: Image pinned\ndescription: pinned to an image model\nmodel: {}\nbackend: codex\n---\nSay hi",
+            "---\nname: Image pinned\ndescription: pinned to an image model\nmodels: [codex/{}]\n---\nSay hi",
             cairn_models::image::codex::CODEX_IMAGE_MODEL
         ))
         .unwrap()
@@ -1824,49 +1837,6 @@ mod tests {
             text.contains(&format!("'{model}' on codex serves only image")),
             "{text}"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_tier_bound_to_an_image_model_is_listed_unrunnable_with_why() {
-        for discovered in [true, false] {
-            a_tier_bound_to_an_image_model_is_unrunnable(discovered).await;
-        }
-    }
-
-    async fn a_tier_bound_to_an_image_model_is_unrunnable(discovered: bool) {
-        let orch = codex_image_orchestrator_discovered(discovered).await;
-        let mut backends = orch.get_settings().backends;
-        backends.entry("codex".to_string()).or_default().insert(
-            "lg".to_string(),
-            Preset {
-                model: Model::new(cairn_models::image::codex::CODEX_IMAGE_MODEL),
-                options: Default::default(),
-            },
-        );
-        orch.update_settings(crate::models::UpdateSettings {
-            backends: Some(backends),
-            ..Default::default()
-        })
-        .unwrap();
-
-        let capabilities = model_capabilities(&orch, None, None, None);
-        let codex = capabilities
-            .backends
-            .iter()
-            .find(|backend| backend.backend == "codex")
-            .unwrap();
-        assert!(codex.runnable, "{:?}", codex.unavailable_reason);
-        let lg = codex
-            .selections
-            .iter()
-            .find(|selection| selection.value == "codex/lg")
-            .unwrap();
-        assert!(!lg.runnable);
-        assert_names_the_image_model(lg.unavailable_reason.as_deref().unwrap());
-        assert!(codex
-            .selections
-            .iter()
-            .all(|selection| selection.kind != "model"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1889,14 +1859,12 @@ mod tests {
         .await
         .unwrap_err();
         match &refused {
-            ResponseError::Unserved(text) => {
-                assert!(
-                    text.starts_with("No completion-capable model serves"),
-                    "{text}"
-                );
+            // Selection refuses it before any launch, naming why.
+            ResponseError::BackendUnavailable(text) => {
+                assert!(text.contains("can run complete"), "{text}");
                 assert_names_the_image_model(text);
             }
-            other => panic!("expected the launch door's refusal, got {other:?}"),
+            other => panic!("expected selection's refusal, got {other:?}"),
         }
         let journal = crate::storage::list_response_invocations(
             &orch.db.local,
@@ -1914,7 +1882,7 @@ mod tests {
         let selection =
             saved_discovery_selection("openrouter", "saved/model", Some("catalog offline"))
                 .unwrap();
-        assert_eq!(selection.value, "saved/model");
+        assert_eq!(selection.value, "openrouter/saved/model");
         assert!(!selection.runnable);
         assert_eq!(
             selection.unavailable_reason.as_deref(),
@@ -2064,7 +2032,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let captured_for_backend = captured.clone();
         let definition = parse_definition(
-            "---\nname: Draft\ndescription: draft response\nmodel: test-model\nbackend: openrouter\ntimeout: 7s\nvariables:\n  - name: subject\n    required: true\noutput:\n  type: object\n  required: [answer]\n  properties:\n    answer: { type: string }\n---\nDraft {{subject}}",
+            "---\nname: Draft\ndescription: draft response\nmodels: [openrouter/test-model]\ntimeout: 7s\nvariables:\n  - name: subject\n    required: true\noutput:\n  type: object\n  required: [answer]\n  properties:\n    answer: { type: string }\n---\nDraft {{subject}}",
         )
         .unwrap();
 
@@ -2131,7 +2099,7 @@ mod tests {
 
     fn pinned(timeout_secs: u64) -> ResponseDefinition {
         parse_definition(&format!(
-            "---\nname: Pinned\ndescription: pinned response\nmodel: test-model\nbackend: openrouter\ntimeout: {timeout_secs}s\n---\nAnswer"
+            "---\nname: Pinned\ndescription: pinned response\nmodels: [openrouter/test-model]\ntimeout: {timeout_secs}s\n---\nAnswer"
         ))
         .unwrap()
     }
@@ -2198,7 +2166,7 @@ mod tests {
         assert_eq!(ceiling, 6 * 60 * 60);
         assert_eq!(pinned(ceiling).timeout, MAX_RESPONSE_TIMEOUT);
         let error = parse_definition(&format!(
-            "---\nname: Pinned\ndescription: pinned response\nmodel: test-model\nbackend: openrouter\ntimeout: {}s\n---\nAnswer",
+            "---\nname: Pinned\ndescription: pinned response\nmodels: [openrouter/test-model]\ntimeout: {}s\n---\nAnswer",
             ceiling + 1
         ))
         .unwrap_err();
@@ -2299,7 +2267,7 @@ mod tests {
         for (id, prompt) in [("tail-answered", "Answer"), ("tail-detached", "Detach")] {
             std::fs::write(
                 responses.join(format!("{id}.md")),
-                format!("---\nname: Tail\ndescription: tail\nmodel: test-model\nbackend: openrouter\ntimeout: 300s\n---\n{prompt}"),
+                format!("---\nname: Tail\ndescription: tail\nmodels: [openrouter/test-model]\ntimeout: 300s\n---\n{prompt}"),
             )
             .unwrap();
         }
@@ -2479,10 +2447,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unresolvable_tier_is_a_journalable_refusal() {
+    async fn an_unselectable_allotment_is_a_journalable_refusal() {
         let orch = test_orchestrator().await;
         let mut definition = definition();
-        definition.tier = Some("ghost/sm".into());
+        definition.models = Some(vec![cairn_config::allotment::AllotmentEntry::parse(
+            "ghost/sm",
+        )
+        .unwrap()]);
         let attempt = complete_definition_with_executor(
             &orch,
             &definition,
@@ -2491,7 +2462,7 @@ mod tests {
             None,
             None,
             None,
-            Arc::new(|_, _, _| panic!("an unresolved tier must not reach a backend")),
+            Arc::new(|_, _, _| panic!("an unselected allotment must not reach a backend")),
         )
         .await
         .expect("a refusal is an attempt, so invoke journals it");
@@ -2503,7 +2474,7 @@ mod tests {
             Err(AttemptFailure {
                 error: ResponseError::BackendUnavailable(reason),
                 account_id: None,
-            }) if reason.contains("'ghost/sm' tier")
+            }) if reason.contains("ghost")
         ));
     }
 
@@ -2518,12 +2489,12 @@ mod tests {
         std::fs::create_dir_all(&responses).unwrap();
         std::fs::write(
             responses.join("refused.md"),
-            "---\nname: Refused\ndescription: refused\nmodel: test-model\nbackend: openrouter\ntimeout: 30s\n---\nAnswer",
+            "---\nname: Refused\ndescription: refused\nmodels: [openrouter/test-model]\ntimeout: 30s\n---\nAnswer",
         )
         .unwrap();
         std::fs::write(
             responses.join("unserved.md"),
-            "---\nname: Unserved\ndescription: unserved\ntier: ghost/sm\ntimeout: 30s\n---\nAnswer",
+            "---\nname: Unserved\ndescription: unserved\nmodels: [ghost/sm]\ntimeout: 30s\n---\nAnswer",
         )
         .unwrap();
         test_completion::install(
@@ -2579,7 +2550,7 @@ mod tests {
     async fn a_retry_fails_on_the_account_it_ran_on() {
         let orch = test_orchestrator().await;
         let definition = parse_definition(
-            "---\nname: Retry\ndescription: retry\nmodel: test-model\nbackend: openrouter\ntimeout: 30s\noutput:\n  type: object\n  required: [answer]\n  properties:\n    answer: { type: string }\n---\nAnswer",
+            "---\nname: Retry\ndescription: retry\nmodels: [openrouter/test-model]\ntimeout: 30s\noutput:\n  type: object\n  required: [answer]\n  properties:\n    answer: { type: string }\n---\nAnswer",
         )
         .unwrap();
         let off_contract = |account: &str| CompletionOutcome {
@@ -2709,22 +2680,27 @@ mod tests {
     }
 
     #[test]
-    fn validates_exact_model_pins_and_defaults_to_sm_tier() {
-        let defaulted = definition();
-        assert_eq!(defaulted.tier.as_deref().unwrap_or("sm"), "sm");
-        assert!(parse_definition(
-            "---\nname: Test\ndescription: test\nmodel: exact\ntier: sm\nbackend: openrouter\n---\nprompt"
-        ).unwrap_err().contains("either 'model' or 'tier'"));
-        assert!(
-            parse_definition("---\nname: Test\ndescription: test\nmodel: exact\n---\nprompt")
-                .unwrap_err()
-                .contains("must declare 'backend'")
-        );
+    fn names_its_allotment_and_refuses_the_retired_model_keys() {
+        assert_eq!(definition().models, None, "the workspace default");
+        for key in ["tier: sm", "model: exact", "backend: openrouter"] {
+            let refused = parse_definition(&format!(
+                "---\nname: Test\ndescription: test\n{key}\n---\nprompt"
+            ))
+            .unwrap_err();
+            assert!(refused.contains("models: ["), "{key}: {refused}");
+        }
         let pinned = parse_definition(
-            "---\nname: Test\ndescription: test\nmodel: exact\nbackend: openrouter\noptions:\n  reasoningEffort: low\n---\nprompt"
+            "---\nname: Test\ndescription: test\nmodels: [openrouter/exact]\noptions:\n  reasoningEffort: low\n---\nprompt"
         ).unwrap();
+        let named: Vec<String> = pinned
+            .models
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(named, ["openrouter/exact"]);
         let preset = Preset {
-            model: Model::new(pinned.model.unwrap()),
+            model: Model::new("exact"),
             options: pinned.options,
         };
         assert_eq!(preset.to_extras().reasoning_effort.as_deref(), Some("low"));
@@ -2738,41 +2714,33 @@ mod tests {
                 label: "OpenRouter".into(),
                 runnable: true,
                 unavailable_reason: None,
-                selections: vec![
-                    ResponseModelSelection {
-                        kind: "tier".into(),
-                        value: "openrouter/sm".into(),
-                        label: "SM".into(),
-                        backend: "openrouter".into(),
-                        model: "openrouter/auto".into(),
-                        legacy_values: vec!["sm".into()],
-                        runnable: true,
-                        unavailable_reason: None,
-                    },
-                    ResponseModelSelection {
-                        kind: "model".into(),
-                        value: "openrouter/auto".into(),
-                        label: "Exact".into(),
-                        backend: "openrouter".into(),
-                        model: "openrouter/auto".into(),
-                        legacy_values: vec![],
-                        runnable: true,
-                        unavailable_reason: None,
-                    },
-                ],
+                selections: vec![ResponseModelSelection {
+                    kind: "model".into(),
+                    value: "openrouter/auto".into(),
+                    label: "Exact".into(),
+                    backend: "openrouter".into(),
+                    model: "openrouter/auto".into(),
+                    legacy_values: vec![],
+                    runnable: true,
+                    unavailable_reason: None,
+                }],
             }],
         };
-        let mut authored = definition();
-        authored.tier = Some("sm".into());
+        let naming = |model: &str| {
+            let mut authored = definition();
+            authored.models = Some(vec![
+                cairn_config::allotment::AllotmentEntry::parse(model).unwrap()
+            ]);
+            authored
+        };
+        let authored = naming("openrouter/openrouter/auto");
         assert!(is_offered_model_selection(&authored, &capabilities));
-        authored.tier = Some("ghost/sm".into());
-        assert!(!is_offered_model_selection(&authored, &capabilities));
-        authored.tier = None;
-        authored.backend = Some("openrouter".into());
-        authored.model = Some("openrouter/auto".into());
-        assert!(is_offered_model_selection(&authored, &capabilities));
+        assert!(!is_offered_model_selection(
+            &naming("ghost/openrouter/auto"),
+            &capabilities
+        ));
         let mut unavailable = capabilities.clone();
-        unavailable.backends[0].selections[1].runnable = false;
+        unavailable.backends[0].selections[0].runnable = false;
         assert!(!is_offered_model_selection(&authored, &unavailable));
     }
 }

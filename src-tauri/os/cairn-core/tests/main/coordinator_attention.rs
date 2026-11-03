@@ -224,6 +224,8 @@ fn agent_node(id: &str) -> RecipeNode {
         trigger_config: None,
         agent_config: Some(AgentNodeConfig {
             agent_config_id: Some(id.to_string()),
+            models: None,
+            constraints: Default::default(),
             output_schema: None,
             git_config: None,
         }),

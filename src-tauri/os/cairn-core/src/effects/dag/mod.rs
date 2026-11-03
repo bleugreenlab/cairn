@@ -316,6 +316,8 @@ mod tests {
             parent_id: None,
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
+                models: None,
+                constraints: Default::default(),
                 agent_config_id: Some("builder".to_string()),
                 output_schema: None,
                 git_config: None,
@@ -338,7 +340,6 @@ mod tests {
         let snap = ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Recipe".to_string(),
@@ -356,7 +357,6 @@ mod tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 1,
         };

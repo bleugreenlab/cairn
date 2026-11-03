@@ -305,6 +305,7 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
     };
 
     DiscoveredModel {
+        maker: maker(id),
         id: id.to_string(),
         model: id.to_string(),
         display_name: metadata.name.clone().unwrap_or_else(|| id.to_string()),
@@ -348,6 +349,7 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
 /// which endpoint would serve it or how much context it has.
 fn unpublished_model(id: &str) -> DiscoveredModel {
     DiscoveredModel {
+        maker: maker(id),
         id: id.to_string(),
         model: id.to_string(),
         display_name: id.to_string(),
@@ -372,6 +374,28 @@ fn unpublished_model(id: &str) -> DiscoveredModel {
         // exact (provider, model) pairs can select a tokenizer.
         tokenizer: tokenizer_for(OPENCODE_BACKEND_KEY, id, None),
     }
+}
+
+/// The lab behind each model family Go serves, keyed by id prefix and spelled
+/// as OpenRouter spells the same labs, so a maker constraint compares a Go
+/// model with an OpenRouter one. Neither Go's listing nor models.dev names a
+/// model's owner, so this table is the only source; a family missing from it
+/// has no maker, which a constraint treats as unproven.
+const MAKERS: &[(&str, &str)] = &[
+    ("glm", "z-ai"),
+    ("kimi", "moonshotai"),
+    ("mimo", "xiaomi"),
+    ("deepseek", "deepseek"),
+    ("qwen", "qwen"),
+    ("minimax", "minimax"),
+];
+
+fn maker(id: &str) -> Option<String> {
+    let id = id.to_ascii_lowercase();
+    MAKERS
+        .iter()
+        .find(|(prefix, _)| id.starts_with(prefix))
+        .map(|(_, maker)| maker.to_string())
 }
 
 fn unservable_note(description: Option<&str>) -> String {

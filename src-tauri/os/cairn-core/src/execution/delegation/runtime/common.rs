@@ -254,16 +254,6 @@ pub(super) async fn persist_task_packet(
         Some(current) => resolve_delegated_wait_anchor(&db, &current).await,
         None => None,
     };
-    let parent_backend = select_optional_text(
-        &db,
-        "SELECT model FROM jobs WHERE id = ?1",
-        &parent_ctx.job_id,
-    )
-    .await
-    .ok()
-    .flatten()
-    .as_deref()
-    .and_then(crate::backends::backend_for_model);
     let session = payload.session.into();
 
     let output_contract = crate::execution::delegation::resolve_delegated_output_contract(
@@ -285,8 +275,7 @@ pub(super) async fn persist_task_packet(
             output_contract,
             session,
             task_index: payload.task_index,
-            tier_override: payload.tier.as_deref(),
-            backend_preference: payload.backend_preference.as_deref().or(parent_backend),
+            models: payload.models.as_deref(),
             background,
         },
     );
@@ -316,7 +305,7 @@ pub(super) async fn persist_call_packet(
     output_contract: crate::models::DelegatedOutputContract,
     result_artifact_job_id: &str,
     parent_tool_use_id: Option<&str>,
-    tier_override: Option<&str>,
+    models: Option<&[cairn_config::allotment::AllotmentEntry]>,
     task_index: Option<i32>,
     background: bool,
 ) -> Result<crate::models::DelegatedWorkPacket, String> {
@@ -337,16 +326,6 @@ pub(super) async fn persist_call_packet(
         Some(current) => resolve_delegated_wait_anchor(&db, &current).await,
         None => None,
     };
-    let parent_backend = select_optional_text(
-        &db,
-        "SELECT model FROM jobs WHERE id = ?1",
-        &parent_ctx.job_id,
-    )
-    .await
-    .ok()
-    .flatten()
-    .as_deref()
-    .and_then(crate::backends::backend_for_model);
 
     let packet = create_call_packet(CreateCallPacketInput {
         parent_job_id: &parent_ctx.job_id,
@@ -359,8 +338,7 @@ pub(super) async fn persist_call_packet(
         output_contract,
         result_artifact_job_id,
         task_index,
-        tier_override,
-        backend_preference: parent_backend,
+        models,
         background,
     });
 

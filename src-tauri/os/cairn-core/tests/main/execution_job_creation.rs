@@ -25,6 +25,8 @@ fn node(id: &str, node_type: RecipeNodeType, agent_config_id: Option<&str>) -> R
         trigger_config: None,
         agent_config: agent_config_id.map(|id| AgentNodeConfig {
             agent_config_id: Some(id.to_string()),
+            models: None,
+            constraints: Default::default(),
             output_schema: None,
             git_config: None,
         }),
@@ -41,6 +43,8 @@ fn inherited_agent(id: &str, agent_config_id: &str) -> RecipeNode {
     RecipeNode {
         agent_config: Some(AgentNodeConfig {
             agent_config_id: Some(agent_config_id.to_string()),
+            models: None,
+            constraints: Default::default(),
             output_schema: None,
             git_config: Some(AgentGitConfig {
                 require_parent_head: false,
@@ -154,8 +158,7 @@ fn delegated_packet(parent_job_id: &str, agent_node_id: &str) -> DelegatedWorkPa
         materialized_node_ids: vec![agent_node_id.to_string()],
         result_artifact_job_id: None,
         task_index: Some(0),
-        tier_override: None,
-        backend_preference: None,
+        models: None,
         background: false,
         created_at: 1,
     }

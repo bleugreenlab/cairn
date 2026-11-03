@@ -1014,13 +1014,14 @@ pub struct RetiredLogin {
     pub retired_at: i64,
 }
 
-/// Headroom assumed for a managed account Cairn has no usage snapshot for.
-/// Full, so an account that just signed in competes normally instead of
-/// being sorted below every account with a measured window.
-const UNKNOWN_HEADROOM: f64 = 100.0;
-/// Lowest-priority score for an account whose measured windows have rolled over.
-/// It remains eligible as a bounded re-probe, but any current positive capacity wins.
-const STALE_REPROBE_HEADROOM: f64 = 0.0;
+/// One routed account and what running on it costs now.
+#[derive(Debug, Clone)]
+pub struct RoutedCost<'a> {
+    pub account: &'a ProviderAccount,
+    pub cost: cairn_models_types::supply::Cost,
+    /// Assignments since its snapshot.
+    pub burst: usize,
+}
 /// A provider whose subscription logins Cairn routes sessions across by
 /// remaining usage.
 ///
@@ -1581,43 +1582,79 @@ impl CredentialStore {
             });
         }
 
-        self.routed_candidates(provider, project_id)
+        self.routed_account_costs(
+            provider,
+            project_id,
+            excluded_id,
+            requested_model,
+            assignments,
+            now,
+        )
+        .into_iter()
+        .next()
+        .map(|routed| routed.account)
+    }
+
+    /// Every Automatic candidate that can serve `requested_model` now, with
+    /// what it costs, cheapest first: by [`Cost::compare`], then fewest
+    /// assignments since its snapshot (so equal accounts share a burst), then
+    /// `sort_order`. [`Self::select_routed_account`] takes the first, and the
+    /// supply ranking reads the same list, so the account a selection's
+    /// provenance names is the account the session runs on.
+    ///
+    /// [`Cost::compare`]: cairn_models_types::supply::Cost::compare
+    pub fn routed_account_costs(
+        &self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+        excluded_id: Option<&str>,
+        requested_model: Option<&str>,
+        assignments: &[(String, i64)],
+        now: i64,
+    ) -> Vec<RoutedCost<'_>> {
+        let mut ranked: Vec<RoutedCost<'_>> = self
+            .routed_candidates(provider, project_id)
             .filter(|account| excluded_id != Some(account.id.as_str()))
             // The provider refuses every renewal past the deadline, so a
             // launch on it would die at spawn rather than fall to the next.
             .filter(|account| !account.sign_in_lapsed(now))
             .filter_map(|account| {
-                let (headroom, since) = match account.health.as_ref() {
-                    Some(health) => {
-                        if health.is_blocked(now) {
-                            return None;
-                        }
-                        match health.live_headroom(requested_model, now) {
-                            // No live window means the prior measurement has rolled
-                            // over. Keep the account eligible for a bounded re-probe,
-                            // but rank current measured capacity ahead of stale evidence.
-                            None => (STALE_REPROBE_HEADROOM, health.captured_at),
-                            Some(tightest) if tightest <= 0.0 => return None,
-                            Some(tightest) => (tightest, health.captured_at),
-                        }
-                    }
-                    None => (UNKNOWN_HEADROOM, account.created_at),
-                };
+                let health = account.health.as_ref();
+                if health.is_some_and(|health| health.is_blocked(now)) {
+                    return None;
+                }
+                let cost = cairn_models_types::supply::account_cost(
+                    health.map(|health| (health.windows.as_slice(), health.captured_at)),
+                    requested_model,
+                    now,
+                )?;
+                let since = health.map_or(account.created_at, |health| health.captured_at);
                 let burst = assignments
                     .iter()
                     .filter(|(id, created_at)| id == &account.id && *created_at >= since)
                     .count();
-                Some((account, headroom, burst))
+                Some(RoutedCost {
+                    account,
+                    cost,
+                    burst,
+                })
             })
-            .max_by(
-                |(left, left_headroom, left_burst), (right, right_headroom, right_burst)| {
-                    left_headroom
-                        .total_cmp(right_headroom)
-                        .then_with(|| right_burst.cmp(left_burst))
-                        .then_with(|| right.sort_order.cmp(&left.sort_order))
-                },
-            )
-            .map(|(account, _, _)| account)
+            .collect();
+        ranked.sort_by(|left, right| {
+            left.cost
+                .compare(&right.cost)
+                .then_with(|| left.burst.cmp(&right.burst))
+                .then_with(|| left.account.sort_order.cmp(&right.account.sort_order))
+        });
+        ranked
+    }
+
+    /// Whether `project_id`'s scope holds any subscription login Automatic
+    /// routing would choose among for `provider`, usable now or not.
+    pub fn routes_any(&self, provider: RoutedProvider, project_id: Option<&str>) -> bool {
+        self.routed_candidates(provider, project_id)
+            .next()
+            .is_some()
     }
 
     /// The subscription accounts Automatic routing chooses among.

@@ -1762,7 +1762,7 @@ mod tests {
     fn affordance_for_models_sessions_names_the_task_door() {
         let output = affordance_for_kind(ResourceKind::ModelsSessions);
         assert!(output.contains(
-            "- [start a session: delegate a task (choose its provider and model with backend/tier)](cairn://p/{project}/{number}/{exec}/{node}/tasks):"
+            "- [start a session: delegate a task (choose its model with models)](cairn://p/{project}/{number}/{exec}/{node}/tasks):"
         ));
         // The resource itself still creates nothing.
         assert!(!output.contains("(cairn://models/sessions)"));

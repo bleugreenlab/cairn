@@ -1,54 +1,26 @@
 use super::*;
 
+/// Put the delegated agent's definition in the snapshot, once. A packet's own
+/// allotment rides on the node it materializes into, so the shared agent
+/// snapshot is never rewritten for one task.
 fn ensure_agent_snapshot(
     snapshot: &mut ExecutionSnapshot,
     agent_id: &str,
-    tier_override: Option<&str>,
-    backend_preference: Option<&str>,
     config_dir: &Path,
     project_path: Option<&Path>,
-    presets: &PresetsConfig,
 ) -> Result<(), String> {
-    match snapshot.agents.entry(agent_id.to_string()) {
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            // Resolve-early + loud: a missing or unresolvable agent fails
-            // materialization visibly rather than degrading to a placeholder.
-            let mut file_agent = config_agents::get_agent(config_dir, entry.key(), project_path)
-                .map_err(|e| format!("Failed to load agent '{agent_id}': {e}"))?
-                .ok_or_else(|| {
-                    format!("Agent config not found during delegation expansion: {agent_id}")
-                })?;
-            if backend_preference.is_some() {
-                file_agent.backend_preference = backend_preference.map(str::to_string);
-            }
-            let override_sel =
-                tier_override.map(|tier| LaunchSelectionOverride::Tier(tier.to_string()));
-            let agent_snapshot =
-                resolve_agent_snapshot(&file_agent, override_sel.as_ref(), presets)?;
-            entry.insert(agent_snapshot);
-        }
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            if tier_override.is_some() || backend_preference.is_some() {
-                let agent = entry.get_mut();
-                let authored_tier =
-                    tier_override.or_else(|| agent.tier.as_ref().map(Model::as_str));
-                let authored_backend = backend_preference.or(agent.backend_preference.as_deref());
-                let (selection, extras) =
-                    resolve_runtime_selection(authored_tier, authored_backend, presets)?;
-                if let Some(tier) = tier_override {
-                    agent.tier = Some(Model::new(cairn_config::presets::normalize_tier_selection(
-                        tier, presets,
-                    )));
-                }
-                if let Some(backend_preference) = backend_preference {
-                    agent.backend_preference = Some(backend_preference.to_string());
-                }
-                agent.selection = Some(selection);
-                agent.extras = Some(extras);
-            }
-        }
+    if let std::collections::hash_map::Entry::Vacant(entry) =
+        snapshot.agents.entry(agent_id.to_string())
+    {
+        // Loud: a missing agent fails materialization visibly rather than
+        // degrading to a placeholder.
+        let file_agent = config_agents::get_agent(config_dir, entry.key(), project_path)
+            .map_err(|e| format!("Failed to load agent '{agent_id}': {e}"))?
+            .ok_or_else(|| {
+                format!("Agent config not found during delegation expansion: {agent_id}")
+            })?;
+        entry.insert(file_agent.snapshot());
     }
-
     Ok(())
 }
 
@@ -101,6 +73,8 @@ fn delegated_agent_node(agent_id: String, packet: &DelegatedWorkPacket) -> Recip
         trigger_config: None,
         agent_config: Some(AgentNodeConfig {
             agent_config_id: Some(packet.agent_config_id.clone()),
+            models: packet.models.clone(),
+            constraints: Default::default(),
             output_schema: Some(schema_config_from_output_contract(&packet.output_contract)),
             git_config: Some(AgentGitConfig {
                 branch_mode: BranchMode::Inherit,
@@ -135,8 +109,6 @@ pub fn expand_delegated_packets(
         return Ok(HashSet::new());
     }
 
-    // Resolve-early: materialize against current effective presets (loud).
-    let presets = load_effective_presets(&runtime.config_dir, project_path.as_deref());
     let mut new_agent_node_ids = HashSet::new();
     let mut materialized = Vec::new();
 
@@ -150,11 +122,8 @@ pub fn expand_delegated_packets(
         ensure_agent_snapshot(
             &mut snapshot,
             &packet_view.agent_config_id,
-            packet_view.tier_override.as_deref(),
-            packet_view.backend_preference.as_deref(),
             &runtime.config_dir,
             project_path.as_deref(),
-            &presets,
         )?;
 
         let trigger_id = format!("delegated-{}-trigger", packet_view.id);

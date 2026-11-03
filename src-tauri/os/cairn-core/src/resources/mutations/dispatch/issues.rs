@@ -469,9 +469,15 @@ fn parse_create_execution_spec(
             }),
         }
     };
+    if obj.contains_key("backend") {
+        return Err(build_failure(
+            index,
+            item,
+            super::executions::RETIRED_EXECUTION_BACKEND.replace("payload.", "payload.execution."),
+        ));
+    }
     Ok(Some(issues::CreateExecutionSpec {
         recipe: str_field("recipe")?,
-        backend: str_field("backend")?,
         overrides: super::executions::parse_launch_overrides(index, item, Some(value)).map_err(
             |mut failure| {
                 // The key is `execution.overrides` here, not the top-level

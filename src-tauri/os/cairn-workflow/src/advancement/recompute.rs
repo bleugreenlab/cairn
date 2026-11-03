@@ -2080,6 +2080,8 @@ mod gate_tests {
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
                 agent_config_id: Some("planner".to_string()),
+                models: None,
+                constraints: Default::default(),
                 output_schema,
                 git_config: None,
             }),

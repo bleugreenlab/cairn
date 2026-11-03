@@ -20,26 +20,21 @@ use cairn_models_types::catalog::resolved_backend_for_model;
 /// model name cannot carry (an Ollama tag, a custom backend; see
 /// [`CLAUDE_FAMILY_BACKEND`]).
 ///
-/// The exception is deliberately narrow. An agent config resolved against
-/// configuration that has since moved — a retuned tier preset, a changed
-/// `active_backend` — carries a selection for a DIFFERENT model than the job
-/// persisted, and letting it name the provider splits the pair: that is
-/// CAIRN-3798, where live Claude `fable` threads were rotated onto Codex, which
-/// then rejected the model outright. An agent's default may choose a model for a
-/// job that has none; it may not reinterpret one the job already has.
+/// The exception is deliberately narrow. An agent config whose selection was
+/// made for a DIFFERENT model than the job persisted must not name the
+/// provider, or it splits the pair: that is CAIRN-3798, where live Claude
+/// `fable` threads were rotated onto Codex, which then rejected the model
+/// outright. An agent's selection may choose a model for a job that has none;
+/// it may not reinterpret one the job already has.
 ///
-/// With no job model the ladder is the agent's own: its atomic selection, then
-/// its authored `backend_preference`. `None` collapses to Claude in
-/// `backend_for_name`.
+/// With no job model the agent's own selection answers. `None` collapses to
+/// Claude in `backend_for_name`.
 pub fn effective_backend_name(
     selection: Option<&crate::models::ModelSelection>,
-    backend_preference: Option<&str>,
     model: Option<&str>,
 ) -> Option<String> {
     let Some(model) = model else {
-        return selection
-            .map(|selection| selection.backend.clone())
-            .or_else(|| backend_preference.map(str::to_string));
+        return selection.map(|selection| selection.backend.clone());
     };
     match selection.filter(|selection| selection.model.as_str() == model) {
         Some(selection) => Some(selection.backend.clone()),
@@ -63,12 +58,8 @@ mod effective_selection_tests {
     #[test]
     fn an_agent_default_never_reinterprets_the_job_model() {
         assert_eq!(
-            effective_backend_name(
-                Some(&selection("codex", "gpt-5.6-sol")),
-                Some("codex"),
-                Some("fable")
-            )
-            .as_deref(),
+            effective_backend_name(Some(&selection("codex", "gpt-5.6-sol")), Some("fable"))
+                .as_deref(),
             Some("claude")
         );
     }
@@ -78,12 +69,8 @@ mod effective_selection_tests {
     #[test]
     fn an_explicit_codex_model_resolves_to_codex() {
         assert_eq!(
-            effective_backend_name(
-                Some(&selection("claude", "fable")),
-                None,
-                Some("gpt-5.6-sol")
-            )
-            .as_deref(),
+            effective_backend_name(Some(&selection("claude", "fable")), Some("gpt-5.6-sol"))
+                .as_deref(),
             Some("codex")
         );
     }
@@ -93,12 +80,8 @@ mod effective_selection_tests {
     #[test]
     fn a_matching_selection_speaks_for_its_model() {
         assert_eq!(
-            effective_backend_name(
-                Some(&selection("ollama", "gemma4:e4b")),
-                None,
-                Some("gemma4:e4b")
-            )
-            .as_deref(),
+            effective_backend_name(Some(&selection("ollama", "gemma4:e4b")), Some("gemma4:e4b"))
+                .as_deref(),
             Some("ollama")
         );
         // An OpenRouter reroute persists the OpenRouter model id, so the pair
@@ -106,7 +89,6 @@ mod effective_selection_tests {
         assert_eq!(
             effective_backend_name(
                 Some(&selection("openrouter", "~anthropic/claude-sonnet-latest")),
-                None,
                 Some("~anthropic/claude-sonnet-latest")
             )
             .as_deref(),
@@ -115,17 +97,13 @@ mod effective_selection_tests {
     }
 
     /// With no model persisted there is nothing to reinterpret, so the agent's
-    /// own ladder answers: its atomic selection, then its authored preference.
+    /// own selection answers.
     #[test]
-    fn without_a_job_model_the_agent_ladder_answers() {
+    fn without_a_job_model_the_agent_selection_answers() {
         assert_eq!(
-            effective_backend_name(Some(&selection("codex", "gpt-5.6-sol")), None, None).as_deref(),
+            effective_backend_name(Some(&selection("codex", "gpt-5.6-sol")), None).as_deref(),
             Some("codex")
         );
-        assert_eq!(
-            effective_backend_name(None, Some("codex"), None).as_deref(),
-            Some("codex")
-        );
-        assert_eq!(effective_backend_name(None, None, None), None);
+        assert_eq!(effective_backend_name(None, None), None);
     }
 }

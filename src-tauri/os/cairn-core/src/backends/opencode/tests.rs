@@ -3,7 +3,6 @@ use super::{OpenCodeBackend, DEFAULT_MODEL, OPENCODE_BACKEND_KEY};
 use crate::agent_process::stdin::MessageContent;
 use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::{AgentBackend, SessionConfig, SessionStart};
-use crate::config::presets::default_presets_config;
 use crate::models::Model;
 use cairn_models::types::catalog::{DiscoveredModel, Modality, ServedVerb, Wire};
 use cairn_models::types::usage::{BillingUnit, Charge};
@@ -487,27 +486,17 @@ fn the_backend_factory_resolves_the_go_key() {
 }
 
 #[test]
-fn default_presets_address_go_models_through_tiers() {
-    // A Go model id carries no provider in its name, so a tier ref is how a Go
-    // model is named to the runtime at all. Every tier must therefore resolve.
-    let config = default_presets_config(None);
-    let presets = config
-        .backends
+fn the_shipped_go_cells_seed_every_pool() {
+    // A fresh workspace's ladder is converted from the shipped cells, so Go
+    // must define one for every pool to be selectable in each.
+    let grid = cairn_config::legacy_presets::default_grid(None);
+    let cells = grid
         .get(OPENCODE_BACKEND_KEY)
-        .expect("Go defines default presets");
-    for tier in ["sm", "md", "lg"] {
-        let preset = presets
-            .get(tier)
-            .unwrap_or_else(|| panic!("Go defines the {tier} tier"));
-        let resolved = crate::config::presets::resolve_preset(
-            &format!("{OPENCODE_BACKEND_KEY}/{tier}"),
-            &config,
-        )
-        .expect("a qualified Go tier resolves");
-        assert_eq!(resolved.backend, OPENCODE_BACKEND_KEY);
-        assert_eq!(resolved.model, preset.model);
+        .expect("Go ships default cells");
+    for pool in cairn_config::legacy_presets::LEGACY_TIERS {
+        assert!(cells.contains_key(*pool), "Go ships a {pool} cell");
     }
-    assert_eq!(presets["md"].model, Model::new(DEFAULT_MODEL));
+    assert_eq!(cells["md"].model, Model::new(DEFAULT_MODEL));
 }
 
 #[test]
@@ -515,8 +504,8 @@ fn no_default_preset_points_at_a_region_gated_model() {
     // DeepSeek's Go models are the cheapest on offer but are served only from
     // China-hosted infrastructure behind a per-workspace opt-in, so a default
     // naming one fails for anyone who has not opted in.
-    let config = default_presets_config(None);
-    for preset in config.backends[OPENCODE_BACKEND_KEY].values() {
+    let grid = cairn_config::legacy_presets::default_grid(None);
+    for preset in grid[OPENCODE_BACKEND_KEY].values() {
         assert!(
             !preset.model.as_str().starts_with("deepseek"),
             "{} is region-gated and cannot be a default",

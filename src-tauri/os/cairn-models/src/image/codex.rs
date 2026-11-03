@@ -73,6 +73,7 @@ pub const CODEX_IMAGE_MODEL: &str = "gpt-image-2";
 /// contain it.
 pub fn discovered_model() -> DiscoveredModel {
     DiscoveredModel {
+        maker: None,
         id: CODEX_IMAGE_MODEL.to_string(),
         model: CODEX_IMAGE_MODEL.to_string(),
         display_name: "GPT Image (Codex)".to_string(),
@@ -821,7 +822,6 @@ mod tests {
                     refreshed_at: Some(1),
                     error: None,
                 }),
-                tiers: Vec::new(),
                 serves: Vec::new(),
                 unable: Vec::new(),
             }],

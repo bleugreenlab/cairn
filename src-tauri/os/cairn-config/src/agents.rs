@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_markdown::{agent_to_markdown, parse_agent_markdown, AgentExportData};
 use crate::agent_pins::{self, AgentPin};
-use crate::models::{Fence, Model};
+use crate::allotment::AllotmentEntry;
+use crate::models::Fence;
 
 use super::{id_from_path, ConfigResult};
 
@@ -22,16 +23,14 @@ pub struct FileAgent {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    #[serde(alias = "model")]
-    pub tier: Option<Model>,
+    /// The pools and models this agent selects within; empty means the
+    /// workspace's default allotment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<AllotmentEntry>,
     pub fence: Option<Fence>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub hooks: Option<serde_json::Value>,
-    /// Preferred backend when multiple providers are available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "backend", alias = "backendPreference")]
-    pub backend_preference: Option<String>,
     /// Optional lucide icon name (kebab-case) for the agent's visual identity.
     #[serde(default)]
     pub icon: Option<String>,
@@ -45,6 +44,58 @@ pub struct FileAgent {
     pub is_project_scoped: bool,
     /// Path to the source file
     pub file_path: PathBuf,
+}
+
+impl FileAgent {
+    /// This agent as the runtime config a job launches with in `project_id`,
+    /// with no model chosen yet.
+    pub fn agent_config(&self, project_id: &str) -> crate::models::AgentConfig {
+        crate::models::AgentConfig {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            prompt: self.prompt.clone(),
+            tools: self.tools.clone(),
+            models: self.models.clone(),
+            workspace_id: (!self.is_project_scoped).then(|| "workspace".to_string()),
+            project_id: self.is_project_scoped.then(|| project_id.to_string()),
+            created_at: 0,
+            updated_at: 0,
+            disallowed_tools: self.disallowed_tools.clone(),
+            skills: self.skills.clone(),
+            fence: self.fence,
+            icon: self.icon.clone(),
+            selection: None,
+            extras: None,
+        }
+    }
+
+    /// This agent as an execution snapshot freezes it: its allotment and
+    /// definition, with no model chosen. A node running it selects at its own
+    /// launch; only an operator's pin sets `selection`.
+    pub fn snapshot(&self) -> crate::models::AgentSnapshot {
+        crate::models::AgentSnapshot {
+            edited_at: None,
+            id: self.id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            prompt: self.prompt.clone(),
+            tools: self.tools.clone(),
+            models: self.models.clone(),
+            selection: None,
+            provider_account: None,
+            disallowed_tools: self.disallowed_tools.clone(),
+            skills: self.skills.clone(),
+            seed_budget_tokens: self.seed_budget_tokens,
+            seed_eras: self.seed_eras,
+            fence: self.fence,
+            sandbox: None,
+            on_escape: None,
+            extras: None,
+            model: None,
+            resolved_backend: None,
+        }
+    }
 }
 
 /// List all agents from files
@@ -121,9 +172,9 @@ pub fn get_agent(
 /// Uses the agent's file_path if set, otherwise determines path from is_project_scoped.
 /// For project-scoped agents without file_path, project_path must be provided.
 ///
-/// For a workspace agent an installed pack ships, the pinnable keys (`backend`,
-/// `icon`, `tier`) are recorded in the pin document rather than the file, and
-/// the file is rewritten only when something else changed. Setting a backend
+/// For a workspace agent an installed pack ships, the pinnable keys (`icon`,
+/// `models`) are recorded in the pin document rather than the file, and the
+/// file is rewritten only when something else changed. Setting an allotment
 /// on a shipped agent therefore leaves its file byte-identical and pack-owned,
 /// and the pin survives both pack updates and a reset to the pack version.
 /// Returns the agent file's path; callers stage [`agent_stage_paths`].
@@ -208,25 +259,22 @@ fn split_pins(desired: &FileAgent, on_disk: &FileAgent) -> (FileAgent, AgentPin)
         }
     }
 
+    // An empty allotment is the absent key: "use the workspace default".
+    let allotment = |agent: &FileAgent| (!agent.models.is_empty()).then(|| agent.models.clone());
+
     let mut file_agent = desired.clone();
-    file_agent.backend_preference = on_disk.backend_preference.clone();
     file_agent.icon = on_disk.icon.clone();
-    file_agent.tier = on_disk.tier.clone();
-    let desired_tier = desired.tier.as_ref().map(ToString::to_string);
-    let file_tier = on_disk.tier.as_ref().map(ToString::to_string);
-    let mut tier_slot = file_tier.clone();
+    file_agent.models = on_disk.models.clone();
+    let file_models = allotment(on_disk);
+    let mut models_slot = file_models.clone();
 
     let pin = AgentPin {
-        backend: pin(
-            &desired.backend_preference,
-            &on_disk.backend_preference,
-            &mut file_agent.backend_preference,
-        ),
         icon: pin(&desired.icon, &on_disk.icon, &mut file_agent.icon),
-        tier: pin(&desired_tier, &file_tier, &mut tier_slot),
+        models: pin(&allotment(desired), &file_models, &mut models_slot),
+        ..AgentPin::default()
     };
-    if tier_slot.is_none() {
-        file_agent.tier = None;
+    if models_slot.is_none() {
+        file_agent.models.clear();
     }
     (file_agent, pin)
 }
@@ -235,18 +283,16 @@ fn split_pins(desired: &FileAgent, on_disk: &FileAgent) -> (FileAgent, AgentPin)
 /// normalize away (surrounding whitespace, an explicit default fence, an empty
 /// versus absent deny-list). Anything this calls different forks a pack file.
 fn same_definition(a: &FileAgent, b: &FileAgent) -> bool {
-    let tier = |agent: &FileAgent| agent.tier.as_ref().map(ToString::to_string);
     let denied = |agent: &FileAgent| agent.disallowed_tools.clone().unwrap_or_default();
     a.name == b.name
         && a.description.trim() == b.description.trim()
         && a.prompt.trim() == b.prompt.trim()
         && a.tools == b.tools
-        && tier(a) == tier(b)
+        && a.models == b.models
         && a.fence.unwrap_or_default() == b.fence.unwrap_or_default()
         && denied(a) == denied(b)
         && a.skills == b.skills
         && a.hooks == b.hooks
-        && a.backend_preference == b.backend_preference
         && a.icon == b.icon
         && a.bundles == b.bundles
         && a.seed_budget_tokens == b.seed_budget_tokens
@@ -290,13 +336,12 @@ fn write_agent_file(path: &Path, agent: &FileAgent) -> Result<(), String> {
         name: &agent.name,
         description: &agent.description,
         tools: &agent.tools,
-        tier: agent.tier.as_ref().map(|m| m.to_string()).as_deref(),
+        models: &agent.models,
         prompt: &agent.prompt,
         fence: agent.fence,
         disallowed_tools: agent.disallowed_tools.as_deref(),
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
-        backend_preference: agent.backend_preference.as_deref(),
         icon: agent.icon.as_deref(),
         bundles: &agent.bundles,
         seed_budget_tokens: agent.seed_budget_tokens,
@@ -417,29 +462,24 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
     };
 
     match parse_agent_markdown(&content) {
-        Ok(parsed) => {
-            let tier: Option<Model> = parsed.tier.and_then(|m| m.parse().ok());
-
-            ConfigResult::Ok(FileAgent {
-                id,
-                name: parsed.name,
-                description: parsed.description,
-                prompt: parsed.prompt,
-                tools: parsed.tools,
-                tier,
-                fence: parsed.fence,
-                disallowed_tools: parsed.disallowed_tools,
-                skills: parsed.skills,
-                hooks: parsed.hooks,
-                backend_preference: parsed.backend_preference,
-                icon: parsed.icon,
-                bundles: parsed.bundles,
-                seed_budget_tokens: parsed.seed_budget_tokens,
-                seed_eras: parsed.seed_eras,
-                is_project_scoped,
-                file_path: path.to_path_buf(),
-            })
-        }
+        Ok(parsed) => ConfigResult::Ok(FileAgent {
+            id,
+            name: parsed.name,
+            description: parsed.description,
+            prompt: parsed.prompt,
+            tools: parsed.tools,
+            models: parsed.models,
+            fence: parsed.fence,
+            disallowed_tools: parsed.disallowed_tools,
+            skills: parsed.skills,
+            hooks: parsed.hooks,
+            icon: parsed.icon,
+            bundles: parsed.bundles,
+            seed_budget_tokens: parsed.seed_budget_tokens,
+            seed_eras: parsed.seed_eras,
+            is_project_scoped,
+            file_path: path.to_path_buf(),
+        }),
         Err(e) => ConfigResult::Err {
             path: path.to_path_buf(),
             error: e,
@@ -524,12 +564,12 @@ mod tests {
             Some("old"),
             "the loader applies pins"
         );
-        agent.backend_preference = Some("claude".into());
+        agent.models = vec![AllotmentEntry::Pool("lg".into())];
         agent.icon = None;
         save_agent(config_dir, &agent, None).unwrap();
 
         let text = std::fs::read_to_string(config_dir.join("agents/mine.md")).unwrap();
-        assert!(text.contains("backend: claude"));
+        assert!(text.contains("models: [lg]"), "{text}");
         assert!(agent_pins::load_pins(config_dir).get("mine").is_none());
         let reloaded = get_agent(config_dir, "mine", None).unwrap().unwrap();
         assert_eq!(reloaded.icon, None);
@@ -546,7 +586,7 @@ description: A test agent
 tools:
   - Read
   - Write
-tier: sonnet
+models: [md, claude/sonnet]
 ---
 
 You are a test agent.
@@ -561,7 +601,13 @@ You are a test agent.
                 assert_eq!(agent.name, "Test Agent");
                 assert_eq!(agent.description, "A test agent");
                 assert_eq!(agent.tools, vec!["Read", "Write"]);
-                assert_eq!(agent.tier, Some(Model::new(Model::SONNET)));
+                assert_eq!(
+                    agent.models,
+                    vec![
+                        AllotmentEntry::Pool("md".into()),
+                        AllotmentEntry::parse("claude/sonnet").unwrap()
+                    ]
+                );
                 assert!(!agent.is_project_scoped);
                 assert!(agent.prompt.contains("test agent"));
             }

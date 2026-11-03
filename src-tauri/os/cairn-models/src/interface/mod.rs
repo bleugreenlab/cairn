@@ -1,8 +1,8 @@
 //! The facet's interface: what the rest of Cairn, and later the served HTTP
 //! API, may ask the cairn-models facet.
 //!
-//! The read side is [`Models`]: which providers and models exist and how tiers
-//! bind to them ([`Catalog`]), which accounts serve them, how much of each
+//! The read side is [`Models`]: which providers and models exist
+//! ([`Catalog`]), which accounts serve them, how much of each
 //! provider is left, and which sessions are live. The `cairn://models/*`
 //! resources render these answers; the served HTTP API will be a second door
 //! onto the same trait.
@@ -21,13 +21,13 @@
 
 pub mod complete;
 pub mod decide;
+pub mod effort;
 pub mod embed;
 pub mod image;
 pub mod relay;
 pub mod session;
 pub mod speak;
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use cairn_credentials::AccountInfo;
@@ -38,12 +38,11 @@ use cairn_models_types::catalog::{
 };
 use cairn_models_types::pool::ProviderPoolSnapshot;
 use serde::Serialize;
-use serde_json::Value;
 
 /// Whose view of the facet a question is asked from.
 ///
 /// `None` is the workspace, which is what Settings → Providers shows. A project
-/// adds its private accounts and its tier overrides.
+/// adds its private accounts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModelScope {
     pub project_id: Option<String>,
@@ -61,7 +60,7 @@ impl ModelScope {
     }
 }
 
-/// Every provider this workspace can name, with its models and tier bindings.
+/// Every provider this workspace can name, with its models.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Catalog {
@@ -75,17 +74,15 @@ pub struct Catalog {
 pub struct CatalogProvider {
     pub descriptor: ProviderDescriptor,
     /// Whether this workspace installed the provider. Only installed providers
-    /// carry models and tier bindings.
+    /// carry models.
     pub installed: bool,
     /// What discovery last found. `None` means discovery never ran; a failed
     /// discovery carries its error and last refresh time inside.
     pub models: Option<ProviderModelCatalog>,
-    /// The tiers bound on this provider, in the workspace's tier order.
-    pub tiers: Vec<TierBinding>,
     /// What this provider serves for any model it routes, each verb with the
     /// wire that carries it. A model whose discovery says what it serves
     /// ([`DiscoveredModel::serves`]) answers for itself; every other model,
-    /// including one a tier is bound to that discovery has not reported,
+    /// including one named on the ladder that discovery has not reported,
     /// serves this.
     pub serves: Vec<ServedVerb>,
     /// Verbs models on this provider were observed unable to serve despite
@@ -186,7 +183,6 @@ impl CatalogProvider {
         ListedProvider {
             descriptor: self.descriptor.clone(),
             installed: self.installed,
-            tiers: self.tiers.clone(),
             serves: self.serves.clone(),
             unable: self.unable.clone(),
             discovered: self.models.as_ref().map_or(0, |found| found.models.len()),
@@ -217,22 +213,6 @@ impl CatalogProvider {
             .models
             .iter()
             .find(|discovered| discovered.model == model || discovered.id == model)
-    }
-
-    /// Whether `account` (when one is asked for) serves `model` here. A model
-    /// that names no serving accounts is served by every account of its
-    /// provider.
-    fn account_serves(&self, model: &str, account: Option<&str>) -> bool {
-        let Some(account) = account else {
-            return true;
-        };
-        self.discovered(model).is_none_or(|discovered| {
-            discovered.serving_account_ids.is_empty()
-                || discovered
-                    .serving_account_ids
-                    .iter()
-                    .any(|id| id == account)
-        })
     }
 }
 
@@ -269,7 +249,6 @@ pub struct ListedOffer {
 pub struct ListedProvider {
     pub descriptor: ProviderDescriptor,
     pub installed: bool,
-    pub tiers: Vec<TierBinding>,
     /// What the provider serves for a model whose discovery declares nothing.
     pub serves: Vec<ServedVerb>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -296,19 +275,6 @@ fn kinds(serves: &[ServedVerb]) -> Vec<VerbKind> {
     kinds
 }
 
-/// One tier as it resolves on one provider.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TierBinding {
-    pub tier: String,
-    pub model: String,
-    /// The preset's options (reasoning effort and the like), as JSON because
-    /// the facet cannot name the configuration crate's value type.
-    pub options: BTreeMap<String, Value>,
-    /// Whether an unqualified reference to this tier lands on this provider.
-    pub is_tier_default: bool,
-}
-
 /// One model across every provider that offers it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -318,8 +284,7 @@ pub struct CatalogModel {
     pub catalog_id: String,
     pub display_name: String,
     pub offers: Vec<CatalogOffer>,
-    /// Tier references bound to this model (`claude/lg`), then native ids that
-    /// differ from the catalog id.
+    /// Native ids that differ from the catalog id.
     pub aliases: Vec<String>,
 }
 
@@ -336,7 +301,7 @@ pub struct CatalogOffer {
     pub pricing: Option<ModelPricing>,
     /// What this offer serves, each verb with its wire. Whether a given
     /// decision was measured natively is recorded on the answer itself, since
-    /// tier resolution picks the offer at run time.
+    /// selection picks the offer at run time.
     pub serves: Vec<ServedVerb>,
     /// The accounts that serve this offer. Empty means every account of its
     /// provider.
@@ -360,8 +325,8 @@ impl CatalogOffer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OfferQuery<'a> {
     pub verb: VerbKind,
-    /// The model or tier an author wrote. Unset, or blank, takes the best
-    /// offer.
+    /// The model an author wrote, or a selection chose. Unset, or blank,
+    /// takes the best offer.
     pub requested: Option<&'a str>,
     /// Only this provider's offers.
     pub provider: Option<&'a str>,
@@ -423,7 +388,7 @@ impl SelectedOffer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoOffer {
     pub verb: VerbKind,
-    /// The model or tier the caller asked for, when it asked for one.
+    /// The model the caller asked for, when it asked for one.
     pub requested: Option<String>,
     /// Why the request found nothing, when there is more to say than that
     /// nothing is configured.
@@ -630,9 +595,7 @@ impl Catalog {
     /// Nothing is merged by guess. Two providers' offers share an entry only
     /// when both report the same canonical slug; the Claude CLI's `opus` stays
     /// `claude/opus`, because the CLI, not Cairn, decides which version it
-    /// means. A model a tier is bound to but discovery has not reported still
-    /// appears, so every binding is visible here. Hidden models (ones the
-    /// provider cannot serve) are left out.
+    /// means. Hidden models (ones the provider cannot serve) are left out.
     pub fn models(&self) -> Vec<CatalogModel> {
         let mut out: Vec<CatalogModel> = Vec::new();
         let mut place =
@@ -665,14 +628,6 @@ impl Catalog {
 
         for provider in self.installed() {
             let key = provider.descriptor.key.as_ref();
-            let tier_refs = |native: &[&str]| -> Vec<String> {
-                provider
-                    .tiers
-                    .iter()
-                    .filter(|binding| native.contains(&binding.model.as_str()))
-                    .map(|binding| format!("{key}/{}", binding.tier))
-                    .collect()
-            };
             let discovered = provider
                 .models
                 .as_ref()
@@ -684,8 +639,7 @@ impl Catalog {
                     .clone()
                     .filter(|slug| !slug.is_empty())
                     .unwrap_or_else(|| format!("{key}/{}", model.model));
-                let mut aliases = tier_refs(&[model.model.as_str(), model.id.as_str()]);
-                aliases.push(model.model.clone());
+                let aliases = vec![model.model.clone()];
                 place(
                     catalog_id,
                     &model.display_name,
@@ -701,37 +655,15 @@ impl Catalog {
                     aliases,
                 );
             }
-            for binding in &provider.tiers {
-                let known = discovered
-                    .iter()
-                    .any(|model| model.model == binding.model || model.id == binding.model);
-                if known {
-                    continue;
-                }
-                place(
-                    format!("{key}/{}", binding.model),
-                    &binding.model,
-                    CatalogOffer {
-                        provider: key.to_string(),
-                        model: binding.model.clone(),
-                        context_window: None,
-                        modalities: None,
-                        pricing: None,
-                        serves: provider.serves_declared(&binding.model, None),
-                        serving_account_ids: Vec::new(),
-                    },
-                    tier_refs(&[binding.model.as_str()]),
-                );
-            }
         }
         out
     }
 
     /// Every offer of the model `name` names exactly: its catalog id, a
     /// provider's native id, or `provider/native-id` for that provider's offer
-    /// alone. Unlike [`Self::offer_for`], a tier is never a name here: tiers
-    /// are Cairn's own vocabulary for its agents, and an outside client that
-    /// sent `big` must not reach whatever a tier called `big` is bound to.
+    /// alone. A pool is never a name here: pools are the workspace's own
+    /// vocabulary for its agents, chosen within by selection, not by the
+    /// catalog.
     pub fn named_offers(&self, name: &str) -> Vec<CatalogOffer> {
         let name = name.trim();
         if name.is_empty() {
@@ -772,13 +704,11 @@ impl Catalog {
 
     /// The offer that serves `query.verb` for what was asked.
     ///
-    /// `requested` is what an author wrote. Unset takes the best offer
-    /// serving the verb ([`Self::offers_serving`]). A tier (`sm`, or
-    /// `provider/sm`) takes that tier's binding on a provider that serves the
-    /// verb, the best wire first and then the tier's default provider.
-    /// Anything else is an exact model, matched by native id, catalog id,
-    /// alias, or `provider/native-id`. A selection that lands only on offers that do not serve the
-    /// verb is refused, never served by something that does, and an
+    /// `requested` is what an author wrote or a selection chose. Unset takes
+    /// the best offer serving the verb ([`Self::offers_serving`]). Anything
+    /// else is an exact model, matched by native id, catalog id, alias, or
+    /// `provider/native-id`. A selection that lands only on offers that do not
+    /// serve the verb is refused, never served by something that does, and an
     /// unqualified one that lands on offers serving the verb on more than one
     /// provider is refused naming each `provider/native-id`, never decided
     /// for the caller. `provider` and `account` narrow every branch.
@@ -792,7 +722,7 @@ impl Catalog {
     ///
     /// It walks the same ranked offers [`Self::offer_for`] would pick from. A
     /// refusal names, three at most, each offer that declined and why; when a
-    /// model or tier was asked for, it also names up to three offers of the
+    /// model was asked for, it also names up to three offers of the
     /// verb that would admit the request.
     pub fn admitting_offer<A, E: fmt::Display>(
         &self,
@@ -891,67 +821,10 @@ impl Catalog {
                 });
         };
 
-        let (qualifier, tier) = self.qualified_by(requested);
-        let bindings: Vec<(&CatalogProvider, &TierBinding)> = self
-            .installed()
-            .filter(|provider| {
-                let key = provider.descriptor.key.as_ref();
-                query.admits_provider(key) && qualifier.is_none_or(|qualifier| qualifier == key)
-            })
-            .flat_map(|provider| {
-                provider
-                    .tiers
-                    .iter()
-                    .filter(|binding| binding.tier == tier)
-                    .map(move |binding| (provider, binding))
-            })
-            .collect();
-        if !bindings.is_empty() {
-            let mut picks: Vec<(SelectedOffer, bool)> = bindings
-                .iter()
-                .filter(|(provider, binding)| {
-                    provider.account_serves(&binding.model, query.account)
-                })
-                .filter_map(|(provider, binding)| {
-                    let offer = SelectedOffer {
-                        provider: provider.descriptor.key.to_string(),
-                        model: binding.model.clone(),
-                        served: best(&provider.serves_for(&binding.model), verb)?,
-                    };
-                    Some((offer, binding.is_tier_default))
-                })
-                .collect();
-            // Stable: provider order survives within each rank.
-            picks.sort_by_key(|(offer, is_tier_default)| {
-                (preference(&offer.served), !is_tier_default)
-            });
-            return Some(
-                picks
-                    .into_iter()
-                    .map(|(offer, _)| offer)
-                    .collect::<Vec<_>>(),
-            )
-            .filter(|picks| !picks.is_empty())
-            .ok_or_else(|| {
-                refuse(Some(format!(
-                    "the '{requested}' tier is bound only on {}, which {}{}",
-                    bindings
-                        .iter()
-                        .map(|(provider, _)| provider.descriptor.key.as_ref())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    cannot(verb),
-                    self.observed_unable(
-                        verb,
-                        bindings.iter().map(|(provider, binding)| {
-                            (provider.descriptor.key.as_ref(), binding.model.as_str())
-                        })
-                    )
-                )))
-            });
-        }
+        let (qualifier, native) = self.qualified_by(requested);
 
-        let (matching, capable) = exact_offers(&self.models(), &query, requested, qualifier, tier);
+        let (matching, capable) =
+            exact_offers(&self.models(), &query, requested, qualifier, native);
         if matching.is_empty() {
             return Err(refuse(Some(format!(
                 "no installed provider offers '{requested}'"
@@ -978,7 +851,7 @@ impl Catalog {
         // An exact model is never chosen between providers: the same name on
         // two providers may be two servings (another quantization, another
         // pooling), whose answers and vectors differ. Ranking them is model
-        // selection, which belongs to tiers.
+        // selection, which belongs to allotments.
         if let Some(detail) = ambiguity(requested, &capable) {
             return Err(NoOffer {
                 verb,
@@ -1183,7 +1056,7 @@ pub struct RequestRecord {
 /// its existing equivalents do (a session stop carries a node stop's
 /// authority), and broader rights become `cairn://grants` scopes.
 pub trait Models: Send + Sync {
-    /// Providers, their discovered models, and how tiers bind to them.
+    /// Providers and their discovered models.
     fn catalog(&self, scope: &ModelScope) -> Result<Catalog, String>;
 
     /// The catalog as hosts list it, narrowed to the models serving `serves`
@@ -1229,20 +1102,7 @@ mod tests {
         model
     }
 
-    fn binding(tier: &str, model: &str) -> TierBinding {
-        TierBinding {
-            tier: tier.to_string(),
-            model: model.to_string(),
-            options: BTreeMap::new(),
-            is_tier_default: true,
-        }
-    }
-
-    fn provider(
-        key: &str,
-        models: Option<Vec<DiscoveredModel>>,
-        tiers: Vec<TierBinding>,
-    ) -> CatalogProvider {
+    fn provider(key: &str, models: Option<Vec<DiscoveredModel>>) -> CatalogProvider {
         CatalogProvider {
             descriptor: descriptor(key).expect("shipped").clone(),
             installed: true,
@@ -1253,7 +1113,6 @@ mod tests {
                 refreshed_at: Some(1),
                 error: None,
             }),
-            tiers,
             serves: Vec::new(),
             unable: Vec::new(),
         }
@@ -1305,7 +1164,7 @@ mod tests {
         }
     }
 
-    fn custom(account: &str, models: &[&str], tiers: Vec<TierBinding>) -> CatalogProvider {
+    fn custom(account: &str, models: &[&str]) -> CatalogProvider {
         let key = cairn_models_types::catalog::custom_key(account);
         CatalogProvider {
             descriptor: cairn_models_types::catalog::custom_descriptor(
@@ -1322,14 +1181,13 @@ mod tests {
                 refreshed_at: Some(1),
                 error: None,
             }),
-            tiers,
             serves: Vec::new(),
             unable: Vec::new(),
         }
     }
 
     #[test]
-    fn a_name_reaches_offers_by_catalog_id_native_id_or_qualifier_but_never_a_tier() {
+    fn a_name_reaches_offers_by_catalog_id_native_id_or_qualifier() {
         let catalog = Catalog {
             providers: vec![
                 provider(
@@ -1338,9 +1196,8 @@ mod tests {
                         "deepseek/deepseek-v4-flash",
                         Some("deepseek/deepseek-v4-flash-20260901"),
                     )]),
-                    vec![binding("big", "deepseek/deepseek-v4-flash")],
                 ),
-                custom("acc_hub", &["deepseek/deepseek-v4-flash"], vec![]),
+                custom("acc_hub", &["deepseek/deepseek-v4-flash"]),
             ],
         };
         let providers = |name: &str| {
@@ -1370,11 +1227,7 @@ mod tests {
 
     fn subscription_only() -> Catalog {
         Catalog {
-            providers: vec![provider(
-                "claude",
-                Some(claude_models()),
-                vec![binding("sm", "haiku"), binding("lg", "opus")],
-            )],
+            providers: vec![provider("claude", Some(claude_models()))],
         }
     }
 
@@ -1382,11 +1235,8 @@ mod tests {
     fn offers_state_what_their_provider_serves() {
         let catalog = Catalog {
             providers: vec![
-                provider("claude", Some(claude_models()), vec![]),
-                deciding(
-                    custom("acc_sparks", &["gemma4-26b"], vec![]),
-                    MeasuredBy::Logprobs,
-                ),
+                provider("claude", Some(claude_models())),
+                deciding(custom("acc_sparks", &["gemma4-26b"]), MeasuredBy::Logprobs),
             ],
         };
         let models = catalog.models();
@@ -1412,12 +1262,9 @@ mod tests {
     fn an_unset_decision_model_takes_a_native_offer_before_a_logprobs_one() {
         let catalog = Catalog {
             providers: vec![
+                deciding(custom("acc_sparks", &["gemma4-26b"]), MeasuredBy::Logprobs),
                 deciding(
-                    custom("acc_sparks", &["gemma4-26b"], vec![]),
-                    MeasuredBy::Logprobs,
-                ),
-                deciding(
-                    custom("acc_gateway", &["typesafe-ai/jev"], vec![]),
+                    custom("acc_gateway", &["typesafe-ai/jev"]),
                     MeasuredBy::Native,
                 ),
             ],
@@ -1446,10 +1293,10 @@ mod tests {
         let catalog = Catalog {
             providers: vec![
                 deciding(
-                    custom("acc_gateway", &["typesafe/jev-1.14"], vec![]),
+                    custom("acc_gateway", &["typesafe/jev-1.14"]),
                     MeasuredBy::Native,
                 ),
-                provider("openrouter", Some(vec![jev]), vec![]),
+                provider("openrouter", Some(vec![jev])),
             ],
         };
         let selected = decide(&catalog, Some("openrouter/typesafe/jev-1.14")).unwrap();
@@ -1500,30 +1347,23 @@ mod tests {
         assert!(text.contains("Settings → Providers"), "{text}");
     }
 
+    /// A pool name is not a model: the catalog knows only models, and a
+    /// qualified name reaches only that provider's offer.
     #[test]
-    fn a_tier_resolves_only_on_providers_that_can_decide() {
+    fn a_pool_name_reaches_no_offer_and_a_qualified_model_only_its_provider() {
         let mut catalog = subscription_only();
-        let refusal = decide(&catalog, Some("sm")).unwrap_err();
-        assert_eq!(
-            refusal.detail.as_deref(),
-            Some("the 'sm' tier is bound only on claude, which cannot answer decisions")
-        );
-
         catalog.providers.push(deciding(
-            custom("acc_sparks", &["qwen3-4b"], vec![binding("sm", "qwen3-4b")]),
+            custom("acc_sparks", &["qwen3-4b"]),
             MeasuredBy::Logprobs,
         ));
         assert_eq!(
-            decide(&catalog, Some("sm")).unwrap(),
-            decision("custom:acc_sparks", "qwen3-4b", MeasuredBy::Logprobs)
+            decide(&catalog, Some("sm")).unwrap_err().detail.as_deref(),
+            Some("no installed provider offers 'sm'")
         );
-        // A qualified tier names its provider and nothing else.
-        assert!(decide(&catalog, Some("claude/sm")).is_err());
+        assert!(decide(&catalog, Some("claude/qwen3-4b")).is_err());
         assert_eq!(
-            decide(&catalog, Some("custom:acc_sparks/sm"))
-                .unwrap()
-                .model,
-            "qwen3-4b"
+            decide(&catalog, Some("custom:acc_sparks/qwen3-4b")).unwrap(),
+            decision("custom:acc_sparks", "qwen3-4b", MeasuredBy::Logprobs)
         );
     }
 
@@ -1547,7 +1387,7 @@ mod tests {
         );
 
         catalog.providers.push(deciding(
-            custom("acc_gateway", &["typesafe-ai/jev"], vec![]),
+            custom("acc_gateway", &["typesafe-ai/jev"]),
             MeasuredBy::Native,
         ));
         assert_eq!(
@@ -1561,11 +1401,7 @@ mod tests {
     #[test]
     fn a_model_observed_unable_to_decide_is_not_offered_and_the_refusal_says_why() {
         let mut sparks = deciding(
-            custom(
-                "acc_sparks",
-                &["qwen3", "gemma4"],
-                vec![binding("sm", "qwen3")],
-            ),
+            custom("acc_sparks", &["qwen3", "gemma4"]),
             MeasuredBy::Logprobs,
         );
         sparks.unable.push(unable("qwen3", "returned no logprobs"));
@@ -1588,14 +1424,11 @@ mod tests {
             Some("every offer that could was seen unable (gemma4 on custom:acc_sparks began 'The' instead of an answer label; qwen3 on custom:acc_sparks returned no logprobs)")
         );
 
-        for requested in ["qwen3", "sm"] {
-            let refusal = decide(&catalog, Some(requested)).unwrap_err();
-            let detail = refusal.detail.unwrap();
-            assert!(
-                detail.ends_with("(qwen3 on custom:acc_sparks returned no logprobs)"),
-                "{detail}"
-            );
-        }
+        let detail = decide(&catalog, Some("qwen3")).unwrap_err().detail.unwrap();
+        assert!(
+            detail.ends_with("(qwen3 on custom:acc_sparks returned no logprobs)"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -1611,7 +1444,6 @@ mod tests {
             providers: vec![conversing(provider(
                 "openrouter",
                 Some(vec![image, chat, responses]),
-                vec![],
             ))],
         };
         let offers = catalog.offers_serving(VerbKind::Complete);
@@ -1643,16 +1475,8 @@ mod tests {
         on_low.serving_account_ids = vec!["low".into()];
         let catalog = Catalog {
             providers: vec![
-                conversing(provider(
-                    "ollama",
-                    Some(vec![on_low]),
-                    vec![binding("sm", "qwen3")],
-                )),
-                conversing(provider(
-                    "openrouter",
-                    Some(vec![model("qwen3", None)]),
-                    vec![],
-                )),
+                conversing(provider("ollama", Some(vec![on_low]))),
+                conversing(provider("openrouter", Some(vec![model("qwen3", None)]))),
             ],
         };
         let complete = |provider: Option<&'static str>,
@@ -1679,13 +1503,12 @@ mod tests {
             "openrouter"
         );
         assert_eq!(
-            complete(Some("ollama"), Some("low"), Some("sm"))
+            complete(Some("ollama"), Some("low"), Some("qwen3"))
                 .unwrap()
                 .model,
             "qwen3"
         );
         assert!(complete(Some("ollama"), Some("high"), Some("qwen3")).is_err());
-        assert!(complete(Some("ollama"), Some("high"), Some("sm")).is_err());
         // An offer that names no serving account is served by every account.
         assert_eq!(
             complete(None, Some("high"), None).unwrap().provider,
@@ -1724,12 +1547,10 @@ mod tests {
                             Some("openai/text-embedding-3-small"),
                         ),
                     ]),
-                    vec![],
                 ),
                 provider(
                     "inference",
                     Some(vec![embedder(QWEN_EMBED, Some(QWEN_SLUG))]),
-                    vec![],
                 ),
             ],
         }
@@ -1852,7 +1673,6 @@ mod tests {
             providers: vec![conversing(provider(
                 "openrouter",
                 Some(vec![model("a", None), model("b", None), model("c", None)]),
-                vec![],
             ))],
         };
         let query = OfferQuery::new(VerbKind::Complete);
@@ -1958,7 +1778,6 @@ mod tests {
                 model("gpt-5.5", None),
                 nothing,
             ]),
-            vec![],
         ));
         assert!(codex.serves("gpt-image-2", VerbKind::Image));
         assert!(!codex.serves("gpt-image-2", VerbKind::Complete));
@@ -1976,11 +1795,7 @@ mod tests {
 
         // OpenCode Go declares nothing provider-wide: a model whose discovery
         // made no claim serves nothing.
-        let go = provider(
-            "opencode-go",
-            Some(vec![model("unpublished", None)]),
-            vec![],
-        );
+        let go = provider("opencode-go", Some(vec![model("unpublished", None)]));
         assert!(!go.serves("unpublished", VerbKind::Session));
         assert!(!go.serves("unpublished", VerbKind::Complete));
     }
@@ -1996,7 +1811,6 @@ mod tests {
                 model("gpt-5.5", None),
                 nothing,
             ]),
-            vec![],
         ));
         codex
             .unable
@@ -2027,7 +1841,7 @@ mod tests {
             Some("'gpt-5.5' on codex reasons before it answers")
         );
 
-        let go = provider("opencode-go", Some(vec![model("listed", None)]), vec![]);
+        let go = provider("opencode-go", Some(vec![model("listed", None)]));
         let refusal = go.admit("glm-9", VerbKind::Session).unwrap_err();
         assert_eq!(refusal.requested.as_deref(), Some("glm-9"));
         assert_eq!(
@@ -2055,7 +1869,6 @@ mod tests {
                 model("gpt-5.5", None),
                 hidden,
             ]),
-            vec![binding("lg", "gpt-5.6-sol"), binding("sm", "gpt-image-2")],
         ));
         codex.unable.push(unable_to_complete(
             "o-reasoner",
@@ -2066,7 +1879,6 @@ mod tests {
         let go = provider(
             "opencode-go",
             Some(vec![model("unpublished", None), published]),
-            vec![],
         );
 
         let catalog = Catalog {
@@ -2152,12 +1964,10 @@ mod tests {
                 provider(
                     "openrouter",
                     Some(vec![model("z-ai/glm-4.6", Some("z-ai/glm-4.6"))]),
-                    vec![],
                 ),
                 provider(
                     "opencode-go",
                     Some(vec![model("glm-4.6", Some("z-ai/glm-4.6"))]),
-                    vec![binding("md", "glm-4.6")],
                 ),
             ],
         };
@@ -2166,27 +1976,23 @@ mod tests {
         let glm = find(&models, "z-ai/glm-4.6");
         let providers: Vec<&str> = glm.offers.iter().map(|o| o.provider.as_str()).collect();
         assert_eq!(providers, vec!["openrouter", "opencode-go"]);
-        // The tier ref and the native id that differs from the slug.
-        assert_eq!(glm.aliases, vec!["opencode-go/md", "glm-4.6"]);
+        // The native id that differs from the slug.
+        assert_eq!(glm.aliases, vec!["glm-4.6"]);
     }
 
     #[test]
     fn a_model_without_a_slug_is_qualified_by_its_provider_and_never_merged() {
         let catalog = Catalog {
             providers: vec![
-                provider(
-                    "claude",
-                    Some(claude_models()),
-                    vec![binding("lg", "opus"), binding("md", "sonnet")],
-                ),
-                provider("ollama", Some(vec![model("opus", None)]), vec![]),
+                provider("claude", Some(claude_models())),
+                provider("ollama", Some(vec![model("opus", None)])),
             ],
         };
         let models = catalog.models();
         let opus = find(&models, "claude/opus");
         assert_eq!(opus.offers.len(), 1);
         assert_eq!(opus.offers[0].context_window, Some(1_000_000));
-        assert_eq!(opus.aliases, vec!["claude/lg", "opus"]);
+        assert_eq!(opus.aliases, vec!["opus"]);
         // Same native id on another provider, no shared slug: its own entry.
         let local = find(&models, "ollama/opus");
         assert_eq!(local.offers[0].provider, "ollama");
@@ -2194,24 +2000,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_model_discovery_has_not_reported_still_appears() {
-        let catalog = Catalog {
-            providers: vec![provider("codex", None, vec![binding("lg", "gpt-5.6-sol")])],
-        };
-        let models = catalog.models();
-        let sol = find(&models, "codex/gpt-5.6-sol");
-        assert_eq!(sol.offers[0].context_window, None);
-        assert_eq!(sol.aliases, vec!["codex/lg"]);
-    }
-
-    #[test]
     fn uninstalled_providers_and_hidden_models_offer_nothing() {
         let mut hidden = model("preview", None);
         hidden.hidden = true;
-        let mut absent = provider("openrouter", Some(vec![model("x/y", None)]), vec![]);
+        let mut absent = provider("openrouter", Some(vec![model("x/y", None)]));
         absent.installed = false;
         let catalog = Catalog {
-            providers: vec![provider("ollama", Some(vec![hidden]), vec![]), absent],
+            providers: vec![provider("ollama", Some(vec![hidden])), absent],
         };
         assert!(catalog.models().is_empty());
     }
@@ -2243,7 +2038,7 @@ mod tests {
     /// A custom provider whose models each serve `speak` over `wire`, with
     /// the capabilities the facet declares for them.
     fn speaking(account: &str, wire: Wire, models: &[&str]) -> CatalogProvider {
-        let mut provider = custom(account, models, vec![]);
+        let mut provider = custom(account, models);
         for model in &mut provider.models.as_mut().expect("discovered").models {
             model.serves = Some(vec![ServedVerb {
                 verb: Verb::Speak(speak::capabilities(wire, &model.model).expect("speaks")),
@@ -2256,7 +2051,7 @@ mod tests {
     fn speech_catalog() -> Catalog {
         Catalog {
             providers: vec![
-                provider("claude", Some(claude_models()), vec![]),
+                provider("claude", Some(claude_models())),
                 speaking("acc_kokoro", Wire::OpenAiSpeech, &["kokoro"]),
                 speaking(
                     "acc_openai",

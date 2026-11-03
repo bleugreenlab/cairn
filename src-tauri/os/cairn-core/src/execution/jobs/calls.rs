@@ -77,72 +77,40 @@ pub(crate) fn prepare_call_run(
             }
             Err(e) => return Err(format!("Failed to load agent config: {}", e)),
         };
-
-        AgentConfig {
-            id: file_agent.id,
-            name: file_agent.name,
-            description: file_agent.description,
-            prompt: file_agent.prompt,
-            tools: file_agent.tools,
-            tier: file_agent.tier,
-            workspace_id: if file_agent.is_project_scoped {
-                None
-            } else {
-                Some("workspace".to_string())
-            },
-            project_id: if file_agent.is_project_scoped {
-                Some(project_id.clone())
-            } else {
-                None
-            },
-            created_at: 0,
-            updated_at: 0,
-            disallowed_tools: file_agent.disallowed_tools,
-            skills: file_agent.skills,
-            fence: file_agent.fence,
-            icon: file_agent.icon,
-            backend_preference: file_agent.backend_preference,
-            selection: None,
-            extras: None,
-        }
+        file_agent.agent_config(&project_id)
     };
 
-    // ---- Mint ids + resolve model selection -----------------------------
+    // ---- Mint ids + select the model ------------------------------------
     let job_id = ids::mint_child(&project_id);
     let run_id = ids::mint_child(&job_id);
     let session_id = ids::mint_session_id().into_string();
     let now = chrono::Utc::now().timestamp() as i32;
 
-    let presets = load_effective_presets(&config_dir, project_path.as_deref());
-    let inherited_backend = parent_job
-        .model
-        .as_ref()
-        .and_then(|model| crate::backends::backend_for_model(model.as_str()));
-    let authored_tier = input
-        .tier
-        .as_deref()
-        .or(agent_config.tier.as_ref().map(Model::as_str));
-    let authored_backend = input
-        .backend_preference
-        .as_deref()
-        .or(agent_config.backend_preference.as_deref())
-        .or(inherited_backend);
-    let (selection, extras) = resolve_runtime_selection(authored_tier, authored_backend, &presets)?;
-    // CAIRN-2550: opt-in re-routing of tier-based calls through OpenRouter's
-    // in-process HTTP loop. Contained entirely in this call path — node/task
-    // sessions never reach prepare_call_run, so they are unaffected. Everything
-    // downstream (admission via `admission_backend_name`, launch via
-    // `start_agent_session`) keys off the atomic `selection.backend` this swaps.
-    let (selection, extras) = maybe_route_call_via_openrouter(
-        orch.get_settings().route_calls_via_openrouter,
-        selection,
-        extras,
-        authored_tier,
-        &presets,
-    )?;
-    let selected_model = Some(selection.model.clone());
-    agent_config.selection = Some(selection);
-    agent_config.extras = Some(extras);
+    let subject = crate::execution::model_selection::SelectionSubject {
+        issue_id: issue_id.clone(),
+        execution_id: execution_id.clone(),
+        node_id: None,
+        job_id: Some(job_id.clone()),
+    };
+    let record = if orch.get_settings().route_calls_via_openrouter {
+        select_call_via_openrouter(
+            orch,
+            &project_id,
+            input.models.as_deref(),
+            &agent_config,
+            subject,
+        )?
+    } else {
+        orch.select_for_agent(
+            &project_id,
+            input.models.as_deref(),
+            &agent_config.models,
+            subject,
+        )?
+    };
+    let selected_model = Some(record.chosen.model.clone());
+    agent_config.selection = Some(record.chosen.clone());
+    agent_config.extras = Some(record.extras.clone());
 
     // A call never owns a checkout. Inherit carries the parent's durable branch;
     // None remains branchless. The session layer creates the job scratch
@@ -192,6 +160,8 @@ pub(crate) fn prepare_call_run(
             now,
         },
     ))?;
+
+    orch.store_job_selection(&job_id, &record)?;
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -587,53 +557,56 @@ fn start_call_admission_heartbeat(orch: &Orchestrator, lease: &crate::storage::A
 fn admission_backend_name(prepared: &PreparedCallRun) -> Option<String> {
     crate::backends::effective_backend_name(
         prepared.agent_config.selection.as_ref(),
-        prepared.agent_config.backend_preference.as_deref(),
         prepared.selected_model.as_ref().map(Model::as_str),
     )
 }
 
-/// Opt-in (CAIRN-2550): when `route_calls_via_openrouter` is enabled, re-resolve a
-/// tier-based ephemeral call's selection against OpenRouter's presets so it runs in
-/// the zero-process in-process HTTP loop instead of the native CLI backend.
+/// Opt-in (CAIRN-2550): when `route_calls_via_openrouter` is enabled, a call
+/// selects among the OpenRouter models its allotment holds, so it runs in the
+/// zero-process in-process HTTP loop instead of a native CLI backend.
 ///
-/// Only *tier refs* are affected. A concrete native model (`is_tier_ref` false) and a
-/// tier-less default both stay native — pinning a concrete model wins over the routing
-/// opt-in. A call whose tier already resolved to OpenRouter is left untouched.
-///
-/// Fail-loud, never a silent native fallback: `resolve_tier_backend` auto-pins a
-/// single-provider tier to its sole provider and falls back to the first defined
-/// provider when the override backend doesn't define the tier, so re-resolving with
-/// an `openrouter` override can silently return a *native* backend when OpenRouter
-/// has no preset for the tier. This asserts the re-resolved backend is actually
-/// OpenRouter and returns an `Err` naming the tier otherwise — silently keeping the
-/// native backend would reintroduce the ~450 MB CLI process the user opted out of.
-fn maybe_route_call_via_openrouter(
-    enabled: bool,
-    selection: crate::models::ModelSelection,
-    extras: crate::models::RuntimeExtras,
-    authored_tier: Option<&str>,
-    presets: &crate::config::presets::PresetsConfig,
-) -> Result<(crate::models::ModelSelection, crate::models::RuntimeExtras), String> {
-    use crate::config::presets::{is_tier_ref, parse_tier_ref};
-    if !enabled || selection.backend == "openrouter" {
-        return Ok((selection, extras));
+/// A call that names one model outright is never moved: a named model is
+/// never substituted. Fail-loud, never a silent native fallback: an allotment
+/// holding no OpenRouter model is refused, because quietly running natively
+/// would reintroduce the ~450 MB CLI process the user opted out of.
+fn select_call_via_openrouter(
+    orch: &Orchestrator,
+    project_id: &str,
+    own: Option<&[cairn_config::allotment::AllotmentEntry]>,
+    agent: &AgentConfig,
+    subject: crate::execution::model_selection::SelectionSubject,
+) -> Result<crate::execution::model_selection::SelectionRecord, String> {
+    use cairn_config::allotment::{model_ref, AllotmentEntry};
+    let models = orch.effective_models(Some(project_id))?;
+    let allotment = crate::execution::model_selection::effective_allotment(
+        own,
+        &agent.models,
+        &models.default_models,
+    );
+    if let [AllotmentEntry::Model(_)] = allotment.as_slice() {
+        return orch.select_for_agent(project_id, Some(&allotment), &agent.models, subject);
     }
-    let tier = match authored_tier {
-        Some(t) if is_tier_ref(t, presets) => t,
-        _ => return Ok((selection, extras)),
-    };
-    // Strip any `backend/` qualifier: re-resolve the bare tier against OpenRouter.
-    let (_, bare_tier) = parse_tier_ref(tier);
-    let (or_selection, or_extras) =
-        resolve_runtime_selection(Some(bare_tier), Some("openrouter"), presets)?;
-    if or_selection.backend != "openrouter" {
+    let routed: Vec<AllotmentEntry> = models
+        .expand(&allotment)?
+        .candidates
+        .into_iter()
+        .filter(|candidate| candidate.model.backend == "openrouter")
+        .map(|candidate| AllotmentEntry::Model(candidate.model))
+        .collect();
+    if routed.is_empty() {
+        let names: Vec<String> = allotment.iter().map(ToString::to_string).collect();
         return Err(format!(
-            "route_calls_via_openrouter is enabled but OpenRouter defines no preset for tier \
-             '{bare_tier}'. Add an OpenRouter preset for that tier or disable the opt-in; \
-             refusing to silently fall back to the native backend."
+            "route_calls_via_openrouter is enabled but [{}] holds no OpenRouter model. Put one on the ladder in those pools, or disable the opt-in; refusing to silently run the call natively.",
+            names.join(", ")
         ));
     }
-    Ok((or_selection, or_extras))
+    let record = orch.select_for_agent(project_id, Some(&routed), &agent.models, subject)?;
+    log::info!(
+        "[select] call routed through OpenRouter: {} ({})",
+        model_ref(&record.chosen),
+        record.provenance
+    );
+    Ok(record)
 }
 
 /// Start the backend session for an admitted call run. The single caller of
@@ -1262,8 +1235,10 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
     // backend while carrying the OpenRouter model id. Rebuild the atomic selection
     // from the stored model so the restart is faithful to what the original call
     // actually resolved to (correct for native calls too).
-    if let Some(selection) = reconstructed_call_selection(job.model.as_deref()) {
-        agent_config.selection = Some(selection);
+    // A call that stored its selection already reads it back through
+    // `load_agent_config`; only a call from before that needs rebuilding.
+    if agent_config.selection.is_none() {
+        agent_config.selection = reconstructed_call_selection(job.model.as_deref());
     }
 
     let run_id = ids::mint_child(call_job_id);
@@ -1550,7 +1525,7 @@ mod admission_backend_tests_support {
                 description: String::new(),
                 prompt: String::new(),
                 tools: Vec::new(),
-                tier: None,
+                models: Vec::new(),
                 workspace_id: None,
                 project_id: None,
                 created_at: 0,
@@ -1558,7 +1533,6 @@ mod admission_backend_tests_support {
                 disallowed_tools: None,
                 skills: None,
                 fence: None,
-                backend_preference: None,
                 icon: None,
                 selection: None,
                 extras: None,
@@ -1584,11 +1558,7 @@ mod admission_backend_tests {
         AgentConfig, ConfirmPolicy, Model, ModelSelection, OutputSchema, OutputSchemaInfo,
     };
 
-    fn prepared(
-        selection: Option<ModelSelection>,
-        backend_pref: Option<&str>,
-        model: Option<&str>,
-    ) -> PreparedCallRun {
+    fn prepared(selection: Option<ModelSelection>, model: Option<&str>) -> PreparedCallRun {
         PreparedCallRun {
             job_id: "j".into(),
             run_id: "r".into(),
@@ -1599,7 +1569,7 @@ mod admission_backend_tests {
                 description: String::new(),
                 prompt: String::new(),
                 tools: Vec::new(),
-                tier: None,
+                models: Vec::new(),
                 workspace_id: None,
                 project_id: None,
                 created_at: 0,
@@ -1607,7 +1577,6 @@ mod admission_backend_tests {
                 disallowed_tools: None,
                 skills: None,
                 fence: None,
-                backend_preference: backend_pref.map(str::to_string),
                 icon: None,
                 selection,
                 extras: None,
@@ -1633,34 +1602,15 @@ mod admission_backend_tests {
     fn selection_backend_wins_over_model_derivation() {
         let p = prepared(
             Some(ModelSelection::new("openrouter", Model::new("gpt-5"))),
-            None,
             Some("gpt-5"),
         );
         assert_eq!(admission_backend_name(&p).as_deref(), Some("openrouter"));
     }
 
-    /// `backend_preference` speaks for a call that has no model of its own.
-    #[test]
-    fn backend_preference_used_when_no_selection_or_model() {
-        let p = prepared(None, Some("codex"), None);
-        assert_eq!(admission_backend_name(&p).as_deref(), Some("codex"));
-    }
-
-    /// A concrete model outranks a bare `backend_preference` that names a
-    /// different provider than the model resolves to. Admission has to charge
-    /// what the launch will spawn, and the launch spawns the model's provider —
-    /// a preference contradicting the model would otherwise charge Codex for a
-    /// process the Claude CLI runs.
-    #[test]
-    fn a_concrete_model_outranks_a_contradicting_preference() {
-        let p = prepared(None, Some("codex"), Some("sonnet"));
-        assert_eq!(admission_backend_name(&p).as_deref(), Some("claude"));
-    }
-
-    /// Model-derivation answers when neither selection nor preference is set.
+    /// Model-derivation answers when no selection is set.
     #[test]
     fn model_derivation_answers_a_bare_config() {
-        let p = prepared(None, None, Some("gpt-5"));
+        let p = prepared(None, Some("gpt-5"));
         assert_eq!(admission_backend_name(&p).as_deref(), Some("codex"));
     }
 
@@ -1668,7 +1618,7 @@ mod admission_backend_tests {
     /// admission and `start_agent_session` charge and launch the same provider.
     #[test]
     fn claude_model_keys_claude() {
-        let p = prepared(None, None, Some("sonnet"));
+        let p = prepared(None, Some("sonnet"));
         assert_eq!(admission_backend_name(&p).as_deref(), Some("claude"));
         assert_eq!(
             crate::backends::backend_for_name(admission_backend_name(&p).as_deref()).name(),
@@ -1680,83 +1630,6 @@ mod admission_backend_tests {
 #[cfg(test)]
 mod route_calls_tests {
     use super::*;
-    use crate::config::presets::default_presets_config;
-    use crate::models::{Model, ModelSelection, RuntimeExtras};
-
-    fn native() -> (ModelSelection, RuntimeExtras) {
-        (
-            ModelSelection::new("claude", Model::new("opus")),
-            RuntimeExtras::default(),
-        )
-    }
-
-    /// Opt-in ON + a tier ref whose active resolution is native: the selection
-    /// swaps to OpenRouter and the tier's OpenRouter preset model, so the call
-    /// takes the in-process loop (admission then charges OpenRouter's InProcess
-    /// capability, since `admission_backend_name` reads `selection.backend`).
-    #[test]
-    fn opt_in_reroutes_tier_based_native_call_to_openrouter() {
-        let cfg = default_presets_config(None);
-        let (sel, ex) = native();
-        let (out, _) = maybe_route_call_via_openrouter(true, sel, ex, Some("md"), &cfg).unwrap();
-        assert_eq!(out.backend, "openrouter");
-        assert_eq!(out.model.as_str(), "~anthropic/claude-sonnet-latest");
-    }
-
-    /// Opt-in ON + a concrete native model (not a tier ref): unchanged. Pinning a
-    /// concrete model wins over the routing opt-in.
-    #[test]
-    fn opt_in_leaves_concrete_native_model_untouched() {
-        let cfg = default_presets_config(None);
-        let (sel, ex) = native();
-        let (out, _) = maybe_route_call_via_openrouter(true, sel, ex, Some("opus"), &cfg).unwrap();
-        assert_eq!(out.backend, "claude");
-        assert_eq!(out.model.as_str(), "opus");
-    }
-
-    /// Opt-in ON + a tier-less call (no authored tier): stays native, since a
-    /// tier-less call resolves to a concrete default model, not a tier ref.
-    #[test]
-    fn opt_in_leaves_tierless_call_native() {
-        let cfg = default_presets_config(None);
-        let (sel, ex) = native();
-        let (out, _) = maybe_route_call_via_openrouter(true, sel, ex, None, &cfg).unwrap();
-        assert_eq!(out.backend, "claude");
-    }
-
-    /// Opt-in OFF: selection is untouched regardless of tier.
-    #[test]
-    fn opt_out_leaves_selection_untouched() {
-        let cfg = default_presets_config(None);
-        let (sel, ex) = native();
-        let (out, _) = maybe_route_call_via_openrouter(false, sel, ex, Some("md"), &cfg).unwrap();
-        assert_eq!(out.backend, "claude");
-    }
-
-    /// A call already resolved to OpenRouter is a no-op (already in-process).
-    #[test]
-    fn already_openrouter_selection_is_noop() {
-        let cfg = default_presets_config(None);
-        let sel = ModelSelection::new("openrouter", Model::new("~openai/gpt-latest"));
-        let (out, _) =
-            maybe_route_call_via_openrouter(true, sel, RuntimeExtras::default(), Some("lg"), &cfg)
-                .unwrap();
-        assert_eq!(out.backend, "openrouter");
-        assert_eq!(out.model.as_str(), "~openai/gpt-latest");
-    }
-
-    /// Opt-in ON + a tier with no OpenRouter preset: fail loud (never a silent
-    /// native fallback that would reintroduce the ~450 MB CLI process).
-    #[test]
-    fn missing_openrouter_preset_for_tier_fails_loud() {
-        let mut cfg = default_presets_config(None);
-        cfg.backends.get_mut("openrouter").unwrap().remove("md");
-        let (sel, ex) = native();
-        let err = maybe_route_call_via_openrouter(true, sel, ex, Some("md"), &cfg)
-            .expect_err("missing openrouter preset must fail loud");
-        assert!(err.contains("no preset for tier 'md'"), "{err}");
-        assert!(err.contains("route_calls_via_openrouter"), "{err}");
-    }
 
     /// Restart must reconstruct an OpenRouter selection from a persisted OpenRouter
     /// model id, so a rerouted call that is restarted stays on OpenRouter rather

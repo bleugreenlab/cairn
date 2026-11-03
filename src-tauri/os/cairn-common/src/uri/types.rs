@@ -1038,6 +1038,10 @@ pub enum CairnResource {
     },
     /// Pooled capacity per installed provider (the provider card).
     ModelsUsage,
+    /// The workspace's pools, bands, and capability ladder.
+    ModelsLadder,
+    /// What an allotment would select now: a preview, nothing stored.
+    ModelsSelection,
     /// The workspace's embedding model and how far history is embedded in it.
     ModelsEmbeddings,
     /// Every live model session on this host.
@@ -1223,6 +1227,8 @@ impl CairnResource {
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,
+            Self::ModelsLadder => ResourceKind::ModelsLadder,
+            Self::ModelsSelection => ResourceKind::ModelsSelection,
             Self::ModelsEmbeddings => ResourceKind::ModelsEmbeddings,
             Self::ModelsSessions => ResourceKind::ModelsSessions,
             Self::ModelsSession { .. } => ResourceKind::ModelsSession,

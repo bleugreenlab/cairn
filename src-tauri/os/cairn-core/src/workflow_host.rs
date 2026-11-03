@@ -27,7 +27,7 @@ pub(crate) fn runtime(orch: &Orchestrator) -> WorkflowRuntime {
 struct CoreWorkflowHost(Orchestrator);
 
 /// The project an execution belongs to, so its decision resolves offers in
-/// that project's scope (its private providers and tier overrides).
+/// that project's scope (its private providers and model pools).
 async fn execution_project(
     orch: &Orchestrator,
     execution_id: &str,

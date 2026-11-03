@@ -168,7 +168,6 @@ fn host_snapshot(tasks: &[Task]) -> String {
     serde_json::to_string(&ExecutionSnapshot {
         continuity: Default::default(),
         branch_target: Default::default(),
-        model_routing: None,
         recipe: RecipeSnapshot {
             id: "host-thread".to_string(),
             name: "Session Host".to_string(),
@@ -186,7 +185,6 @@ fn host_snapshot(tasks: &[Task]) -> String {
             event_payload: None,
             initiated_via: None,
         },
-        presets: None,
         inline_delegated_packets: packets,
         created_at: 0,
     })

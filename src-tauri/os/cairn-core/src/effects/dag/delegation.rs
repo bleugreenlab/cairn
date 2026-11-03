@@ -49,8 +49,7 @@ mod tests {
             materialized_node_ids: vec![node_id.into()],
             result_artifact_job_id: None,
             task_index: Some(7),
-            tier_override: None,
-            backend_preference: None,
+            models: None,
             background: false,
             created_at: 1,
         }
@@ -462,6 +461,8 @@ mod tests {
                 parent_id: None,
                 trigger_config: None,
                 agent_config: Some(AgentNodeConfig {
+                    models: None,
+                    constraints: Default::default(),
                     agent_config_id: Some("pr-review".into()),
                     output_schema: None,
                     git_config: Some(AgentGitConfig {

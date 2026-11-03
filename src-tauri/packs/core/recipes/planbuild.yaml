@@ -73,6 +73,9 @@ nodes:
   config:
     agent: pr-review
     branchMode: inherit
+    constraints:
+      sameBandAs: builder-1
+      differentMakerFrom: builder-1
 edges:
 - from: trigger-1@control-out
   to: planner-1@control-in

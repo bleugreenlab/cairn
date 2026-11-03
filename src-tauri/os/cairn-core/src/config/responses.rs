@@ -177,7 +177,12 @@ mod tests {
     fn bundled_conveyor_parses() {
         let parsed =
             parse_definition(include_str!("../../../../packs/core/responses/conveyor.md")).unwrap();
-        assert_eq!(parsed.tier.as_deref().unwrap_or("sm"), "sm");
+        assert_eq!(
+            parsed.models,
+            Some(vec![cairn_config::allotment::AllotmentEntry::Pool(
+                "sm".into()
+            )])
+        );
         assert!(parsed
             .render(&serde_json::json!({"text":"Dense prose"}))
             .unwrap()

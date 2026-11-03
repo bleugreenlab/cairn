@@ -21,17 +21,13 @@ use crate::checkpoint_cache::normalize_command;
 use crate::db_records::{DbJob, DbRecipeNode};
 use crate::models::{
     AgentGitConfig, AgentNodeConfig, BranchMode, ContextNodeConfig, DelegatedOutputContract,
-    DelegatedStatus, DelegatedWorkPacket, ExecutionSnapshot, Job, Model, NodePosition, RecipeEdge,
+    DelegatedStatus, DelegatedWorkPacket, ExecutionSnapshot, Job, NodePosition, RecipeEdge,
     RecipeEdgeType, RecipeNode, RecipeNodeType, SchemaConfig,
 };
 use crate::runtime::{WorkflowOwner, WorkflowRuntime};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_config::agents as config_agents;
 use cairn_config::derive_unique_task_slug;
-use cairn_config::presets::{
-    load_effective_presets, resolve_agent_snapshot, resolve_runtime_selection,
-    LaunchSelectionOverride, PresetsConfig,
-};
 use cairn_db::turso::params;
 use uuid::Uuid;
 

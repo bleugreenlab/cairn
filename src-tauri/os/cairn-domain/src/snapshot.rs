@@ -6,10 +6,11 @@
 //! - Full audit trail of what configuration was used
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use super::agent::OutputSchema;
-use super::common::{Model, ModelSelection, Preset, RuntimeExtras};
+use super::allotment::AllotmentEntry;
+use super::common::{Model, ModelSelection, RuntimeExtras};
 use super::execution::TriggerType;
 use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
 use super::recipe::{BranchTarget, Continuity, RecipeEdge, RecipeNode, RecipeTrigger};
@@ -74,11 +75,9 @@ pub struct DelegatedWorkPacket {
     pub result_artifact_job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_index: Option<i32>,
+    /// The allotment the spawn asked for, replacing the agent's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier_override: Option<String>,
-    #[serde(rename = "backend", alias = "backendPreference")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_preference: Option<String>,
+    pub models: Option<Vec<AllotmentEntry>>,
     /// Whether the spawning agent requested this packet run in the background
     /// (fire-and-forget). Persisted so the finalize-time resume handler can tell
     /// an intentional background batch (expected: no successor turn) from a
@@ -186,17 +185,14 @@ pub struct AgentSnapshot {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    /// Authored tier default — a pre-fill for edit/re-resolution, not a runtime
-    /// input. The runtime reads `selection`, never this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<Model>,
-    /// Authored backend preference default (pre-fill, not a runtime input).
-    #[serde(rename = "backend", alias = "backendPreference")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend_preference: Option<String>,
-    /// Resolved atomic backend+model selection — the single runtime source of
-    /// truth for what runs where. Populated at resolve-early time and migrated
-    /// on read from the legacy flat `model`/`resolved_backend` for old snapshots.
+    /// The agent's allotment: the pools and models a node running it selects
+    /// within at its own launch. Empty means the workspace's default allotment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<AllotmentEntry>,
+    /// A launch pin: when set, this agent runs exactly this backend+model and
+    /// no selection is made. Set by an operator's concrete choice at launch or
+    /// in the snapshot editor, and on snapshots frozen before selection moved
+    /// to each node's launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
     /// Account policy for the next provider session; absent means automatic.
@@ -219,7 +215,8 @@ pub struct AgentSnapshot {
     pub sandbox: Option<LegacySandbox>,
     #[serde(default, skip_serializing)]
     pub on_escape: Option<LegacyOnEscape>,
-    /// Backend-specific runtime parameters (effort, thinking) resolved early.
+    /// Backend-specific runtime parameters (effort, thinking) that go with a
+    /// pinned `selection`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extras: Option<RuntimeExtras>,
     /// Legacy flat resolved model — deserialize-only input consumed by
@@ -246,15 +243,6 @@ pub struct AgentSnapshot {
     /// is the correct reading for all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<i64>,
-}
-
-/// Frozen preset matrix captured with an execution snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotPresets {
-    pub active_backend: String,
-    pub tiers: Vec<String>,
-    pub backends: HashMap<String, HashMap<String, Preset>>,
 }
 
 /// Snapshot of a skill configuration at execution time
@@ -290,68 +278,6 @@ pub struct TriggerContext {
     pub initiated_via: Option<String>,
 }
 
-/// Why each agent in an execution got the model it got.
-///
-/// Recorded on the snapshot because the snapshot is already the durable record
-/// every job reads from: a routing decision that lived anywhere else would not
-/// survive the config file that produced it. Old snapshots deserialize with
-/// `model_routing: None`, which reads as "this execution predates routing"
-/// rather than "nothing routed it".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelRouting {
-    /// Label slugs the launching issue carried at resolve time, sorted.
-    #[serde(default)]
-    pub labels: Vec<String>,
-    /// The binding table's declared generation, when it had one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<String>,
-    /// How many rules the table carried. Zero means the mechanism ran and
-    /// asserted nothing, which is a different fact from having no table.
-    #[serde(default)]
-    pub rule_count: usize,
-    /// Keyed by agent id. Written as the resolver consults the plan, so an agent
-    /// introduced by a launch-time rebind or graph edit is recorded like any other.
-    #[serde(default)]
-    pub decisions: BTreeMap<String, ModelRoutingDecision>,
-}
-
-/// One agent's routing decision.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelRoutingDecision {
-    pub source: ModelRoutingSource,
-    /// The rule that decided (or, for `DemotionRefused`, the rule that was
-    /// refused).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rule: Option<String>,
-    /// The label slugs that made the rule match.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub matched_labels: Vec<String>,
-    /// The tier the rule named, whether or not it was applied.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
-    /// Always present, always readable by a human. This is the line that answers
-    /// "why this model" when someone reads the execution months later.
-    pub note: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ModelRoutingSource {
-    /// A human pinned this agent at launch; the table was not consulted for it.
-    ExplicitLaunch,
-    /// A rule matched and was applied.
-    LabelBinding,
-    /// No labels, or no rule matched: the agent's own authored tier stands.
-    AgentDefault,
-    /// A rule matched but would have lowered this agent's tier, so it was not
-    /// applied. Whether a rule demotes is agent-relative, so this cannot be
-    /// caught when the table is written -- and refusing the whole launch over one
-    /// broad rule would be worse than recording the refusal here.
-    DemotionRefused,
-}
-
 /// Complete execution snapshot - everything needed to run/display an execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -364,11 +290,6 @@ pub struct ExecutionSnapshot {
     pub skills: HashMap<String, SkillSnapshot>,
     /// Context about what triggered this execution
     pub trigger_context: TriggerContext,
-    /// Legacy frozen preset matrix — deserialize-only input consumed by
-    /// `migrate_on_read` to recover `extras` for pre-resolve-early snapshots.
-    /// Never serialized; no runtime path reads it.
-    #[serde(default, skip_serializing)]
-    pub presets: Option<SnapshotPresets>,
     /// Delegated packets as builds before the `delegated_packets` table wrote
     /// them: inline, where every status change rewrote the whole snapshot
     /// (cairn/5597). Read-only. Nothing appends here; the packet store reads
@@ -392,10 +313,6 @@ pub struct ExecutionSnapshot {
     /// `Auto`.
     #[serde(default)]
     pub continuity: Continuity,
-    /// Why each agent got the model it got. `None` on snapshots frozen before
-    /// label routing existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_routing: Option<ModelRouting>,
     /// When the snapshot was created
     pub created_at: i64,
 }
@@ -413,25 +330,16 @@ pub struct SnapshotOverrides {
     pub agents: Option<HashMap<String, AgentSnapshot>>,
 }
 
-/// Fields whose change invalidates a frozen `selection`.
+/// Fields whose change invalidates a pinned `selection`.
 ///
-/// `selection` is the atomic backend+model pair the runtime actually reads;
-/// `tier` and `backend` are the authored inputs it was resolved from. A patch
-/// that moves an input while leaving the frozen output in place would be
-/// accepted, stored, and then ignored at run time — the caller asking for opus
-/// and getting sonnet, with nothing anywhere reporting a problem. Dropping the
-/// stale `selection` routes the merged snapshot back through the resolver, which
-/// is the same path that produced it in the first place.
-const SELECTION_INPUTS: &[&str] = &["tier", "backend", "backendPreference"];
+/// A pin outranks the allotment, so a patch that moves `models` while leaving
+/// a pin in place would be accepted, stored, and then ignored at launch: the
+/// caller asking for `[lg]` and running the pinned model, with nothing
+/// reporting a problem. Dropping the pin hands the node back to selection.
+const SELECTION_INPUTS: &[&str] = &["models"];
 
 /// Serialized name of [`AgentSnapshot::edited_at`], which no patch may set.
 const EDITED_AT_FIELD: &str = "editedAt";
-
-/// The authored inputs a frozen `selection` is resolved from, for callers that
-/// need to recognize a patch as an explicit model choice rather than merge one.
-pub(crate) fn selection_inputs() -> &'static [&'static str] {
-    SELECTION_INPUTS
-}
 
 /// Shallow-merge a partial agent-snapshot patch over a stored snapshot and
 /// validate the result as a complete [`AgentSnapshot`].
@@ -493,11 +401,9 @@ impl ExecutionSnapshot {
             agents,
             skills,
             trigger_context,
-            presets: None,
             inline_delegated_packets: Vec::new(),
             branch_target: BranchTarget::default(),
             continuity: Continuity::default(),
-            model_routing: None,
             created_at: chrono::Utc::now().timestamp(),
         }
     }
@@ -546,7 +452,6 @@ mod tests {
         let snapshot = ExecutionSnapshot {
             branch_target: Default::default(),
             continuity: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "recipe-1".to_string(),
                 name: "Test Recipe".to_string(),
@@ -564,8 +469,7 @@ mod tests {
                     description: "Builds things".to_string(),
                     prompt: "You are a build agent".to_string(),
                     tools: vec!["Read".to_string(), "Write".to_string()],
-                    tier: Some(Model::new(Model::SONNET)),
-                    backend_preference: None,
+                    models: vec![AllotmentEntry::Pool("md".to_string())],
                     selection: None,
                     provider_account: None,
                     model: Some(Model::new(Model::SONNET)),
@@ -598,7 +502,6 @@ mod tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![DelegatedWorkPacket {
                 id: "pkt-1".to_string(),
                 parent_job_id: "job-1".to_string(),
@@ -626,8 +529,7 @@ mod tests {
                 materialized_node_ids: vec![],
                 result_artifact_job_id: None,
                 task_index: Some(0),
-                tier_override: None,
-                backend_preference: None,
+                models: None,
                 background: false,
                 created_at: 1234567890,
             }],
@@ -752,8 +654,7 @@ mod tests {
             description: "desc".to_string(),
             prompt: "prompt".to_string(),
             tools: vec![],
-            tier: None,
-            backend_preference: None,
+            models: vec![],
             selection: None,
             provider_account: None,
             model: None,
@@ -809,8 +710,7 @@ mod tests {
             description: "desc".to_string(),
             prompt: "prompt".to_string(),
             tools: vec![],
-            tier: None,
-            backend_preference: None,
+            models: vec![],
             selection: None,
             provider_account: None,
             model: None,
@@ -826,6 +726,70 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("extras"));
+    }
+
+    /// A snapshot frozen while agents named a tier, a backend preference, and a
+    /// label-routing record still loads: the retired keys are ignored, the pin
+    /// it resolved to stands, and none of them is written back.
+    #[test]
+    fn a_snapshot_frozen_under_tiers_and_label_routing_still_loads() {
+        let json = r#"{
+            "recipe": {"id": "r-1", "name": "R", "description": null,
+                       "trigger": "manual", "edges": [], "nodes": [
+                {"id": "builder-1", "nodeType": "agent", "name": "Build",
+                 "position": {"x": 0, "y": 0},
+                 "agentConfig": {"agentConfigId": "build", "tier": "lg",
+                                 "backend": "codex", "tierOverride": "md"}}
+            ]},
+            "agents": {"build": {
+                "id": "build", "name": "Build", "description": "", "prompt": "p",
+                "tools": [], "tier": "lg", "backend": "codex",
+                "selection": {"backend": "codex", "model": "gpt-5.6-sol"},
+                "extras": {"reasoningEffort": "high"}
+            }},
+            "skills": {},
+            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
+            "modelRouting": {"labels": ["migration"], "ruleCount": 1, "decisions": {
+                "build": {"source": "labelBinding", "rule": "r", "tier": "lg", "note": "n"}
+            }},
+            "createdAt": 1
+        }"#;
+        let snapshot: ExecutionSnapshot = serde_json::from_str(json).unwrap();
+        let build = &snapshot.agents["build"];
+        assert_eq!(
+            build.selection.as_ref().unwrap().model.as_str(),
+            "gpt-5.6-sol"
+        );
+        assert!(build.models.is_empty());
+        let node = snapshot.recipe.nodes[0].agent_config.as_ref().unwrap();
+        assert_eq!(node.agent_config_id.as_deref(), Some("build"));
+        assert!(node.models.is_none() && node.constraints.is_empty());
+        let written = snapshot.to_json().unwrap();
+        for retired in ["\"tier\"", "tierOverride", "modelRouting"] {
+            assert!(
+                !written.contains(retired),
+                "{retired} was written back: {written}"
+            );
+        }
+        assert!(
+            !written.contains("\"backend\":\"codex\",\"selection"),
+            "{written}"
+        );
+    }
+
+    /// A patch that moves the allotment drops a pin it would otherwise be
+    /// ignored behind.
+    #[test]
+    fn a_patch_to_models_drops_the_pin() {
+        let base: AgentSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "build", "name": "Build", "description": "", "prompt": "", "tools": [],
+            "selection": {"backend": "claude", "model": "sonnet"}
+        }))
+        .unwrap();
+        let patch = serde_json::json!({"models": ["lg"]});
+        let merged = merge_agent_patch(Some(&base), patch.as_object().unwrap()).unwrap();
+        assert!(merged.selection.is_none());
+        assert_eq!(merged.models, vec![AllotmentEntry::Pool("lg".to_string())]);
     }
 
     /// event_payload is omitted from JSON when None (skip_serializing_if).

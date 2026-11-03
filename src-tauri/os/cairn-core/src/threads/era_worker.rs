@@ -249,7 +249,8 @@ fn definition() -> ResponseDefinition {
     ResponseDefinition {
         name: "Thread era summary".into(),
         description: "Summarize one folded span of a durable thread".into(),
-        tier: Some("sm".into()), model: None, backend: None, options: HashMap::new(),
+        models: Some(vec![cairn_config::allotment::AllotmentEntry::Pool("sm".into())]),
+        options: HashMap::new(), tier: None, model: None, backend: None,
         variables: vec![
             ResponseVariable { name: "source".into(), description: None, required: true, default: None, values: vec![] },
             ResponseVariable { name: "children".into(), description: None, required: false, default: Some(json!("None")), values: vec![] },

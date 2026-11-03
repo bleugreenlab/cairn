@@ -385,10 +385,6 @@ fn backend_key_for(prepared: &PreparedJob) -> String {
             .agent_config
             .as_ref()
             .and_then(|config| config.selection.as_ref()),
-        prepared
-            .agent_config
-            .as_ref()
-            .and_then(|config| config.backend_preference.as_deref()),
         prepared.job_model.as_ref().map(Model::as_str),
     )
     .unwrap_or_else(|| crate::backends::CLAUDE_FAMILY_BACKEND.to_string())
@@ -1237,9 +1233,6 @@ fn start_leased_inner(
         agent_config
             .as_ref()
             .and_then(|config| config.selection.as_ref()),
-        agent_config
-            .as_ref()
-            .and_then(|config| config.backend_preference.as_deref()),
         model.as_ref().map(Model::as_str),
     )
     .unwrap_or_else(|| "claude".into());
@@ -4003,7 +3996,7 @@ mod tests {
                     description: String::new(),
                     prompt: String::new(),
                     tools: Vec::new(),
-                    tier: None,
+                    models: Vec::new(),
                     workspace_id: None,
                     project_id: None,
                     created_at: 0,
@@ -4011,7 +4004,6 @@ mod tests {
                     disallowed_tools: None,
                     skills: None,
                     fence: None,
-                    backend_preference: None,
                     icon: None,
                     selection: None,
                     extras: None,

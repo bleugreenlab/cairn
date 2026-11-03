@@ -11,10 +11,6 @@
 //! - [`create_child_task`] — user-initiated sub-agent under a running job.
 
 use crate::agent_process::stream::TranscriptEvent;
-use crate::config::presets::{
-    load_effective_presets, resolve_agent_snapshot, resolve_runtime_selection,
-    spawned_task_backend, LaunchSelectionOverride,
-};
 use crate::config::{self, agents as config_agents, ConfigResult};
 use crate::db_records::{db_job_from_row, DbJob, DbRecipeNode, JOB_COLUMNS};
 use crate::execution::advancement::format_resolved_inputs;
@@ -40,6 +36,7 @@ mod config_loading;
 mod goal_intent;
 mod inputs;
 mod lifecycle;
+mod node_selection;
 mod ordinary_admission;
 mod persistence;
 mod private_lane;
@@ -322,10 +319,9 @@ pub struct CreateChildTaskInput {
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) subagent_type: String,
-    #[serde(alias = "model")]
-    pub(crate) tier: Option<String>,
-    #[serde(rename = "backend", alias = "backendPreference")]
-    pub(crate) backend_preference: Option<String>,
+    /// The task's allotment, replacing its agent's.
+    #[serde(default)]
+    pub(crate) models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
 }
 
 /// The single backend handoff for a prepared ordinary cold launch.
@@ -421,8 +417,8 @@ pub(crate) struct CreateCallRunInput {
     pub(crate) subagent_type: String,
     pub(crate) description: String,
     pub(crate) prompt: String,
-    pub(crate) tier: Option<String>,
-    pub(crate) backend_preference: Option<String>,
+    /// The call's allotment, replacing its agent's.
+    pub(crate) models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
     pub(crate) output_contract: crate::models::DelegatedOutputContract,
     pub(crate) branch_policy: CallBranchPolicy,
     pub(crate) label: Option<String>,

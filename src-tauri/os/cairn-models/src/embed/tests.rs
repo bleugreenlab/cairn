@@ -1113,7 +1113,6 @@ fn provider(account: &str, models: Vec<DiscoveredModel>) -> CatalogProvider {
             error: None,
         }),
         descriptor,
-        tiers: Vec::new(),
         serves: ServedVerb::conversation(Wire::OpenAiChatCompletions),
         unable: Vec::new(),
     }

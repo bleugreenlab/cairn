@@ -30,9 +30,7 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     // destination every future agent can be routed to; removing one takes a
     // destination away from work already configured to use it.
     "enabledProviders",
-    "tierDefaults",
-    "backends",
-    "tiers",
+    "models",
     "decisionModel",
     "imageModel",
     "speechModel",
@@ -189,7 +187,7 @@ mod tests {
     fn capability_bearing_settings_require_approval() {
         for section in [
             "accounts",
-            "backends",
+            "models",
             "buildServices",
             "channels",
             "maxConcurrentExecutions",

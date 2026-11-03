@@ -25,7 +25,7 @@ fn file_agent_to_config(
         description: agent.description,
         prompt: agent.prompt,
         tools: agent.tools,
-        tier: agent.tier,
+        models: agent.models,
         workspace_id,
         project_id,
         created_at: now,
@@ -33,9 +33,8 @@ fn file_agent_to_config(
         disallowed_tools: agent.disallowed_tools,
         skills: agent.skills,
         fence: agent.fence,
-        backend_preference: agent.backend_preference,
         icon: agent.icon,
-        // Authoring/display config: no resolved selection until a launch resolves it.
+        // Authoring/display config: no model is chosen until a job launches.
         selection: None,
         extras: None,
     }
@@ -129,14 +128,13 @@ impl ConfigResource for AgentResource {
             description: input.description,
             prompt: input.prompt,
             tools: input.tools,
-            tier: input.tier,
+            models: input.models,
             fence: input.fence.or_else(|| {
                 Some(crate::models::Fence::from_legacy(
                     input.sandbox,
                     input.on_escape,
                 ))
             }),
-            backend_preference: input.backend_preference,
             disallowed_tools: input.disallowed_tools,
             skills: input.skills,
             hooks: None,
@@ -182,12 +180,8 @@ impl ConfigResource for AgentResource {
                 .unwrap_or_else(|| existing.description.clone()),
             prompt: input.prompt.unwrap_or_else(|| existing.prompt.clone()),
             tools: input.tools.unwrap_or_else(|| existing.tools.clone()),
-            tier: merge_optional(&existing.tier, &input.tier),
+            models: input.models.unwrap_or_else(|| existing.models.clone()),
             fence: merge_optional(&existing.fence, &input.fence),
-            backend_preference: merge_optional(
-                &existing.backend_preference,
-                &input.backend_preference,
-            ),
             disallowed_tools: merge_optional(&existing.disallowed_tools, &input.disallowed_tools),
             skills: merge_optional(&existing.skills, &input.skills),
             hooks: existing.hooks.clone(),
@@ -238,9 +232,8 @@ impl ConfigResource for AgentResource {
             description: source.description.clone(),
             prompt: source.prompt.clone(),
             tools: source.tools.clone(),
-            tier: source.tier.clone(),
+            models: source.models.clone(),
             fence: source.fence,
-            backend_preference: source.backend_preference.clone(),
             disallowed_tools: source.disallowed_tools.clone(),
             skills: source.skills.clone(),
             hooks: source.hooks.clone(),
@@ -413,7 +406,7 @@ mod tests {
             description: "desc".to_string(),
             prompt: "prompt".to_string(),
             tools: vec![],
-            tier: Some(crate::models::Model::new("xl")),
+            models: vec![cairn_config::allotment::AllotmentEntry::Pool("xl".into())],
             workspace_id: Some("default".to_string()),
             project_id: None,
             disallowed_tools: None,
@@ -421,7 +414,6 @@ mod tests {
             fence: None,
             on_escape: None,
             sandbox: None,
-            backend_preference: None,
             icon: None,
         })
         .unwrap();
@@ -440,7 +432,7 @@ mod tests {
     /// tools) plus the one key the user touched.
     fn editor_pin_update(
         agent: &crate::models::AgentConfig,
-        backend: Option<&str>,
+        models: &str,
         icon: Option<&str>,
     ) -> crate::models::UpdateAgentConfig {
         crate::models::UpdateAgentConfig {
@@ -448,24 +440,29 @@ mod tests {
             description: Some(agent.description.trim().to_string()),
             prompt: Some(agent.prompt.trim().to_string()),
             tools: Some(agent.tools.clone()),
-            tier: Some(agent.tier.clone()),
+            models: Some(vec![
+                cairn_config::allotment::AllotmentEntry::parse(models).unwrap()
+            ]),
             disallowed_tools: None,
             skills: None,
             workspace_id: Some(Some("default".to_string())),
             project_id: Some(None),
             fence: Some(Some(agent.fence.unwrap_or_default())),
-            backend_preference: Some(backend.map(str::to_string)),
             icon: Some(icon.map(str::to_string)),
         }
     }
 
-    /// Acceptance for cairn/4993: pinning `backend: claude` / `icon: hammer`
+    fn named(agent: &crate::models::AgentConfig) -> Vec<String> {
+        agent.models.iter().map(ToString::to_string).collect()
+    }
+
+    /// Acceptance for cairn/4993: pinning `models: [claude/opus]` / `icon: hammer`
     /// on the shipped Build agent through the editor leaves `agents/build.md`
     /// byte-identical and pack-owned with the pin in effect, and the next pack
     /// update advances the prompt while the pin holds. A real body edit still
     /// forks, and resetting that fork keeps the pin.
     #[tokio::test]
-    async fn a_pinned_backend_keeps_a_shipped_agent_pack_owned_and_updating() {
+    async fn a_pinned_allotment_keeps_a_shipped_agent_pack_owned_and_updating() {
         use crate::config::pack::{self, lock as pack_lock, PackItemKind};
         use crate::services::{RealFileSystem, RealGitClient};
         use crate::workspace::bundle::sync_workspace_packs;
@@ -484,7 +481,7 @@ mod tests {
             std::fs::write(
                 core.join("agents/build.md"),
                 format!(
-                    "---\nname: Build\nbundles: [coding]\ndescription: Implements features and fixes\ntools: mcp__cairn__read, mcp__cairn__write, mcp__cairn__run\ntier: lg\n---\n\n{prompt}\n"
+                    "---\nname: Build\nbundles: [coding]\ndescription: Implements features and fixes\ntools: mcp__cairn__read, mcp__cairn__write, mcp__cairn__run\nmodels: [lg]\n---\n\n{prompt}\n"
                 ),
             )
             .unwrap();
@@ -510,7 +507,7 @@ mod tests {
         let build = orch.get_agent_config("build", None).unwrap().unwrap();
         orch.update_agent_config(
             "build",
-            editor_pin_update(&build, Some("claude"), Some("hammer")),
+            editor_pin_update(&build, "claude/opus", Some("hammer")),
             None,
             Some("default"),
         )
@@ -518,7 +515,7 @@ mod tests {
 
         assert_eq!(file(), shipped_v1, "a pin must not touch the agent file");
         let pinned = orch.get_agent_config("build", None).unwrap().unwrap();
-        assert_eq!(pinned.backend_preference.as_deref(), Some("claude"));
+        assert_eq!(named(&pinned), ["claude/opus"]);
         assert_eq!(pinned.icon.as_deref(), Some("hammer"));
         sync();
         assert!(!forked(), "the pinned agent stays pack-owned");
@@ -530,15 +527,18 @@ mod tests {
             updated.prompt.contains("Prompt v2."),
             "the pack update lands"
         );
-        assert_eq!(updated.backend_preference.as_deref(), Some("claude"));
+        assert_eq!(named(&updated), ["claude/opus"]);
         assert!(!forked());
 
         // A body edit is a real fork; the pin stays in its own layer.
-        let mut edit = editor_pin_update(&updated, Some("claude"), Some("hammer"));
+        let mut edit = editor_pin_update(&updated, "claude/opus", Some("hammer"));
         edit.prompt = Some("My own prompt.".to_string());
         orch.update_agent_config("build", edit, None, Some("default"))
             .unwrap();
-        assert!(!file().contains("claude"), "pins never land in the file");
+        assert!(
+            !file().contains("claude/opus"),
+            "pins never land in the file"
+        );
         sync();
         assert!(forked());
 
@@ -554,19 +554,19 @@ mod tests {
         sync();
         let reset = orch.get_agent_config("build", None).unwrap().unwrap();
         assert!(reset.prompt.contains("Prompt v2."));
-        assert_eq!(reset.backend_preference.as_deref(), Some("claude"));
+        assert_eq!(named(&reset), ["claude/opus"]);
         assert_eq!(reset.icon.as_deref(), Some("hammer"));
 
         // Choosing the file's own value again un-pins.
         orch.update_agent_config(
             "build",
-            editor_pin_update(&reset, None, None),
+            editor_pin_update(&reset, "lg", None),
             None,
             Some("default"),
         )
         .unwrap();
         let unpinned = orch.get_agent_config("build", None).unwrap().unwrap();
-        assert_eq!(unpinned.backend_preference, None);
+        assert_eq!(named(&unpinned), ["lg"]);
         assert!(cairn_config::agent_pins::load_pins(&home)
             .get("build")
             .is_none());

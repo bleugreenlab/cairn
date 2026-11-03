@@ -521,7 +521,6 @@ mod tests {
         let make_snapshot = |tt: TriggerType| ExecutionSnapshot {
             continuity: Default::default(),
             branch_target: Default::default(),
-            model_routing: None,
             recipe: RecipeSnapshot {
                 id: "r".to_string(),
                 name: "R".to_string(),
@@ -540,7 +539,6 @@ mod tests {
                 event_payload: None,
                 initiated_via: None,
             },
-            presets: None,
             inline_delegated_packets: vec![],
             created_at: 0,
         };

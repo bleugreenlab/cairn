@@ -1032,21 +1032,13 @@ fn render_condition_evaluations(
     output
 }
 
-/// One agent's routing decision, as a line someone reading the execution months
-/// later can act on: what decided, and why.
-fn routing_line(decision: &crate::models::ModelRoutingDecision) -> String {
-    use crate::models::ModelRoutingSource;
-    match decision.source {
-        ModelRoutingSource::LabelBinding => format!(
-            "{} — {}",
-            decision.tier.as_deref().unwrap_or("(unnamed tier)"),
-            decision.note
-        ),
-        ModelRoutingSource::AgentDefault | ModelRoutingSource::DemotionRefused => {
-            format!("agent default — {}", decision.note)
-        }
-        ModelRoutingSource::ExplicitLaunch => decision.note.clone(),
+/// An allotment as one line, the workspace default when it names nothing.
+fn allotment_line(models: &[cairn_config::allotment::AllotmentEntry]) -> String {
+    if models.is_empty() {
+        return "(workspace default)".to_string();
     }
+    let entries: Vec<String> = models.iter().map(ToString::to_string).collect();
+    format!("[{}]", entries.join(", "))
 }
 
 fn render_execution_snapshot(
@@ -1066,14 +1058,25 @@ fn render_execution_snapshot(
     output.push_str(&format!("trigger: {}\n", recipe.trigger));
     output.push_str("nodes:\n");
     for node in &recipe.nodes {
-        let agent = if node.node_type == RecipeNodeType::Agent {
-            node.agent_config
-                .as_ref()
-                .and_then(|c| c.agent_config_id.as_deref())
-                .map(|id| format!(" agent={id}"))
-                .unwrap_or_default()
-        } else {
-            String::new()
+        let agent = match (&node.node_type, &node.agent_config) {
+            (RecipeNodeType::Agent, Some(config)) => {
+                let mut line = config
+                    .agent_config_id
+                    .as_deref()
+                    .map(|id| format!(" agent={id}"))
+                    .unwrap_or_default();
+                if let Some(models) = &config.models {
+                    line.push_str(&format!(" models={}", allotment_line(models)));
+                }
+                if let Some(node) = &config.constraints.same_band_as {
+                    line.push_str(&format!(" sameBandAs={node}"));
+                }
+                if let Some(node) = &config.constraints.different_maker_from {
+                    line.push_str(&format!(" differentMakerFrom={node}"));
+                }
+                line
+            }
+            _ => String::new(),
         };
         output.push_str(&format!(
             "- {} [{:?}] {}{}\n",
@@ -1091,20 +1094,6 @@ fn render_execution_snapshot(
     }
     output.push('\n');
 
-    if let Some(routing) = &snapshot.model_routing {
-        output.push_str("## model routing\n");
-        let labels = if routing.labels.is_empty() {
-            "(none)".to_string()
-        } else {
-            routing.labels.join(", ")
-        };
-        output.push_str(&format!("labels: {labels}\n"));
-        if let Some(generation) = &routing.generation {
-            output.push_str(&format!("generation: {generation}\n"));
-        }
-        output.push_str(&format!("rules: {}\n\n", routing.rule_count));
-    }
-
     output.push_str("## agents\n");
     let mut agent_ids: Vec<&String> = snapshot.agents.keys().collect();
     agent_ids.sort();
@@ -1112,18 +1101,12 @@ fn render_execution_snapshot(
         let agent = &snapshot.agents[agent_id];
         output.push_str(&format!("### {}\n", agent_id));
         output.push_str(&format!("name: {}\n", agent.name));
+        output.push_str(&format!("models: {}\n", allotment_line(&agent.models)));
         let selection = match &agent.selection {
-            Some(sel) => format!("{}/{}", sel.backend, sel.model.as_str()),
-            None => "(unresolved)".to_string(),
+            Some(sel) => format!("pinned to {}/{}", sel.backend, sel.model.as_str()),
+            None => "chosen at each node's launch; read the job for its provenance".to_string(),
         };
         output.push_str(&format!("selection: {}\n", selection));
-        if let Some(decision) = snapshot
-            .model_routing
-            .as_ref()
-            .and_then(|routing| routing.decisions.get(agent_id))
-        {
-            output.push_str(&format!("routing: {}\n", routing_line(decision)));
-        }
         output.push_str(&format!("fence: {:?}\n", agent.fence.unwrap_or_default()));
         output.push_str(&format!("tools: {}\n", agent.tools.len()));
         let skills = match &agent.skills {
@@ -1151,45 +1134,51 @@ fn render_execution_snapshot(
 }
 
 #[cfg(test)]
-mod routing_render_tests {
+mod selection_render_tests {
     use super::*;
     use crate::models::{
-        AgentSnapshot, Model, ModelRouting, ModelRoutingDecision, ModelRoutingSource,
-        ModelSelection, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+        AgentSnapshot, Model, ModelSelection, RecipeSnapshot, RecipeTrigger, TriggerContext,
+        TriggerType,
     };
-    use std::collections::{BTreeMap, HashMap};
+    use cairn_config::allotment::AllotmentEntry;
+    use std::collections::HashMap;
 
-    fn snapshot(routing: Option<ModelRouting>) -> ExecutionSnapshot {
-        let mut agents = HashMap::new();
-        agents.insert(
-            "builder".to_string(),
-            AgentSnapshot {
-                edited_at: None,
-                id: "builder".to_string(),
-                name: "Builder".to_string(),
-                description: String::new(),
-                prompt: String::new(),
-                tools: vec![],
-                tier: None,
-                backend_preference: None,
-                selection: Some(ModelSelection {
-                    backend: "codex".to_string(),
-                    model: Model::new("gpt-5.6-sol"),
-                }),
-                provider_account: None,
-                disallowed_tools: None,
-                skills: None,
-                fence: None,
-                sandbox: None,
-                on_escape: None,
-                model: None,
-                resolved_backend: None,
-                extras: None,
-                seed_budget_tokens: None,
-                seed_eras: None,
-            },
-        );
-        let mut snapshot = ExecutionSnapshot::new(
+    fn agent(id: &str, models: Vec<AllotmentEntry>, pin: Option<ModelSelection>) -> AgentSnapshot {
+        let mut agent: AgentSnapshot = serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "description": "", "prompt": "", "tools": []
+        }))
+        .unwrap();
+        agent.models = models;
+        agent.selection = pin;
+        agent
+    }
+
+    /// Reading an execution says what each agent selects within, and whether
+    /// one was pinned, rather than claiming a model no launch has chosen yet.
+    #[test]
+    fn an_execution_reads_each_agents_allotment_and_pin() {
+        let agents = HashMap::from([
+            (
+                "builder".to_string(),
+                agent(
+                    "builder",
+                    vec![
+                        AllotmentEntry::Pool("md".into()),
+                        AllotmentEntry::Pool("lg".into()),
+                    ],
+                    None,
+                ),
+            ),
+            (
+                "review".to_string(),
+                agent(
+                    "review",
+                    vec![],
+                    Some(ModelSelection::new("codex", Model::new("gpt-5.6-sol"))),
+                ),
+            ),
+        ]);
+        let snapshot = ExecutionSnapshot::new(
             RecipeSnapshot {
                 id: "r".to_string(),
                 name: "Build".to_string(),
@@ -1208,81 +1197,21 @@ mod routing_render_tests {
                 initiated_via: None,
             },
         );
-        snapshot.model_routing = routing;
-        snapshot
-    }
-
-    /// Reading an execution must answer "why this model" without anyone having
-    /// to go find the table that decided it.
-    #[test]
-    fn a_routed_execution_reads_its_labels_generation_and_per_agent_reason() {
-        let rendered = render_execution_snapshot(
-            "cairn",
-            1,
-            1,
-            &snapshot(Some(ModelRouting {
-                labels: vec!["migration".to_string(), "rust".to_string()],
-                generation: Some("gen-0".to_string()),
-                rule_count: 1,
-                decisions: BTreeMap::from([(
-                    "builder".to_string(),
-                    ModelRoutingDecision {
-                        source: ModelRoutingSource::LabelBinding,
-                        rule: Some("migration-builder".to_string()),
-                        matched_labels: vec!["migration".to_string()],
-                        tier: Some("codex/lg".to_string()),
-                        note: "rule 'migration-builder' matched migration".to_string(),
-                    },
-                )]),
-            })),
-        );
-        assert!(rendered.contains("## model routing"), "{rendered}");
-        assert!(rendered.contains("labels: migration, rust"), "{rendered}");
-        assert!(rendered.contains("generation: gen-0"), "{rendered}");
-        assert!(rendered.contains("rules: 1"), "{rendered}");
+        let rendered = render_execution_snapshot("cairn", 1, 1, &snapshot);
+        assert!(rendered.contains("models: [md, lg]"), "{rendered}");
         assert!(
-            rendered
-                .contains("routing: codex/lg \u{2014} rule 'migration-builder' matched migration"),
+            rendered.contains("chosen at each node's launch"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn an_unrouted_agent_reads_as_the_agent_default() {
-        let rendered = render_execution_snapshot(
-            "cairn",
-            1,
-            1,
-            &snapshot(Some(ModelRouting {
-                labels: Vec::new(),
-                generation: None,
-                rule_count: 0,
-                decisions: BTreeMap::from([(
-                    "builder".to_string(),
-                    ModelRoutingDecision {
-                        source: ModelRoutingSource::AgentDefault,
-                        rule: None,
-                        matched_labels: Vec::new(),
-                        tier: None,
-                        note: "no labels on issue".to_string(),
-                    },
-                )]),
-            })),
-        );
-        assert!(rendered.contains("labels: (none)"), "{rendered}");
         assert!(
-            rendered.contains("routing: agent default \u{2014} no labels on issue"),
+            rendered.contains("models: (workspace default)"),
             "{rendered}"
         );
-    }
-
-    /// An execution frozen before routing existed says nothing about it, rather
-    /// than claiming it was routed to its default.
-    #[test]
-    fn a_pre_routing_execution_renders_no_routing_section() {
-        let rendered = render_execution_snapshot("cairn", 1, 1, &snapshot(None));
-        assert!(!rendered.contains("model routing"), "{rendered}");
-        assert!(!rendered.contains("routing:"), "{rendered}");
+        assert!(
+            rendered.contains("pinned to codex/gpt-5.6-sol"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("routing"), "{rendered}");
     }
 }
 
@@ -1506,8 +1435,7 @@ mod execution_snapshot_read_tests {
             description: String::new(),
             prompt: "p".to_string(),
             tools: vec!["read".to_string(), "write".to_string()],
-            tier: None,
-            backend_preference: None,
+            models: Vec::new(),
             selection: Some(ModelSelection {
                 backend: "claude".to_string(),
                 model: Model::new(Model::SONNET),
@@ -1685,7 +1613,7 @@ mod execution_snapshot_read_tests {
         assert!(out.contains("name: My Recipe (r)"), "{out}");
         assert!(out.contains("trigger: manual"), "{out}");
         assert!(out.contains("### builder"), "{out}");
-        assert!(out.contains("selection: claude/sonnet"), "{out}");
+        assert!(out.contains("selection: pinned to claude/sonnet"), "{out}");
         assert!(out.contains("fence: Ask"), "{out}");
         assert!(out.contains("tools: 2"), "{out}");
         assert!(out.contains("- ui: UI Skill"), "{out}");

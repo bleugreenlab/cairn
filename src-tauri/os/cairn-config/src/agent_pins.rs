@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::Model;
+use crate::allotment::AllotmentEntry;
 
 /// File name of the pin document inside the workspace config home.
 pub const AGENT_PINS_FILE: &str = "agent-pins.yaml";
@@ -26,32 +26,47 @@ pub const AGENT_PINS_FILE: &str = "agent-pins.yaml";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AgentPin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<AllotmentEntry>>,
+    /// A tier pin written before `models` existed. Read so the document still
+    /// parses (it denies unknown keys) and so the pin carries over as the
+    /// pool of that name; the next save writes it as `models`.
+    #[serde(default, skip_serializing)]
     pub tier: Option<String>,
+    /// A provider pin written before the backend preference retired. Read so
+    /// the document still parses; it pins nothing and the next save drops it.
+    #[serde(default, skip_serializing)]
+    pub backend: Option<String>,
 }
 
 impl AgentPin {
     pub fn is_empty(&self) -> bool {
-        self.backend.is_none() && self.icon.is_none() && self.tier.is_none()
+        self.icon.is_none() && self.models.is_none()
+    }
+
+    /// Fold the legacy keys forward: a tier pin becomes the pool of that
+    /// name, and a backend pin is dropped.
+    fn migrated(mut self) -> Self {
+        let tier = self.tier.take();
+        self.backend = None;
+        if self.models.is_none() {
+            self.models = tier
+                .as_deref()
+                .map(str::trim)
+                .filter(|tier| !tier.is_empty() && !tier.contains('/'))
+                .map(|tier| vec![AllotmentEntry::Pool(tier.to_string())]);
+        }
+        self
     }
 
     /// Overlay these pins on an agent loaded from its file.
     pub fn apply(&self, agent: &mut crate::agents::FileAgent) {
-        if let Some(backend) = &self.backend {
-            agent.backend_preference = Some(backend.clone());
-        }
         if let Some(icon) = &self.icon {
             agent.icon = Some(icon.clone());
         }
-        if let Some(tier) = self
-            .tier
-            .as_deref()
-            .and_then(|tier| tier.parse::<Model>().ok())
-        {
-            agent.tier = Some(tier);
+        if let Some(models) = &self.models {
+            agent.models = models.clone();
         }
     }
 }
@@ -91,7 +106,15 @@ pub fn load_pins(config_dir: &Path) -> AgentPins {
         return AgentPins::default();
     };
     match serde_yaml::from_str::<Option<AgentPins>>(&text) {
-        Ok(pins) => pins.unwrap_or_default(),
+        Ok(pins) => AgentPins {
+            agents: pins
+                .unwrap_or_default()
+                .agents
+                .into_iter()
+                .map(|(id, pin)| (id, pin.migrated()))
+                .filter(|(_, pin)| !pin.is_empty())
+                .collect(),
+        },
         Err(error) => {
             log::warn!("Ignoring unreadable agent pins at {path:?}: {error}");
             AgentPins::default()
@@ -126,9 +149,9 @@ mod tests {
         pins.set(
             "build",
             AgentPin {
-                backend: Some("claude".into()),
                 icon: Some("hammer".into()),
-                tier: None,
+                models: Some(vec![AllotmentEntry::Pool("lg".into())]),
+                ..AgentPin::default()
             },
         );
         pins.set("explore", AgentPin::default());
@@ -138,9 +161,33 @@ mod tests {
         assert_eq!(read, pins);
         assert!(read.get("explore").is_none());
         assert_eq!(
-            read.get("build").unwrap().backend.as_deref(),
-            Some("claude")
+            read.get("build").unwrap().models,
+            Some(vec![AllotmentEntry::Pool("lg".into())])
         );
+    }
+
+    /// A document written while pins named a tier and a backend still parses:
+    /// the icon survives, the tier carries over as its pool, and the backend
+    /// pins nothing.
+    #[test]
+    fn a_tier_pin_carries_over_and_a_backend_pin_is_dropped() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pins_path(temp.path()),
+            "agents:\n  build:\n    backend: codex\n    icon: hammer\n    tier: lg\n  explore:\n    backend: codex\n",
+        )
+        .unwrap();
+        let pins = load_pins(temp.path());
+        let build = pins.get("build").unwrap();
+        assert_eq!(build.icon.as_deref(), Some("hammer"));
+        assert_eq!(build.models, Some(vec![AllotmentEntry::Pool("lg".into())]));
+        assert!(pins.get("explore").is_none());
+
+        save_pins(temp.path(), &pins).unwrap();
+        let written = std::fs::read_to_string(pins_path(temp.path())).unwrap();
+        assert!(!written.contains("backend"), "{written}");
+        assert!(!written.contains("tier"), "{written}");
+        assert_eq!(load_pins(temp.path()), pins);
     }
 
     #[test]

@@ -1,0 +1,580 @@
+//! Model selection: which model in an allotment a launch runs on, at what
+//! effort, on which account, and why.
+//!
+//! [`select`] is the one entry point. It expands the allotment against the
+//! workspace's pools and ladder, keeps the candidates the catalog serves for
+//! the verb (a filter on `serves`; the launch doors still `admit`), asks the
+//! [`RequirementResolver`] for a capability, places that on a band, applies
+//! node constraints, ranks the band by supply, and sets effort. The result is
+//! a [`SelectionRecord`] stored on the job, so a constrained reviewer reads
+//! its builder's choice and a resumed job never re-selects.
+//!
+//! A model named directly is never replaced: when it is the allotment's only
+//! candidate and cannot be served, the launch is refused naming why.
+
+pub mod constraints;
+pub mod requirement;
+
+use std::cmp::Ordering;
+use std::fmt;
+
+use cairn_config::allotment::{
+    model_ref, AllotmentEntry, Candidate, ExpandedAllotment, ModelsConfig,
+};
+use cairn_models::interface::{Catalog, CatalogProvider};
+use cairn_models::supply::{self, Supply, SupplyAccount, SupplyInputs, SupplyKey};
+use cairn_models::types::catalog::VerbKind;
+use cairn_models::types::supply::CostClass;
+use serde::{Deserialize, Serialize};
+
+use crate::models::{ModelSelection, RuntimeExtras};
+
+pub use constraints::ResolvedConstraints;
+pub use requirement::{
+    Capability, Requirement, RequirementResolver, RequirementSource, TopOfAllotment,
+};
+
+/// One candidate as the selection saw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankedCandidate {
+    /// `provider/model`.
+    pub model: String,
+    pub level: Option<f64>,
+    pub band: Option<String>,
+    pub maker: Option<String>,
+    /// The supply class, absent when the candidate was set aside before
+    /// ranking (outside the band, or excluded by a constraint).
+    pub class: Option<CostClass>,
+    /// What it costs now, or why it was set aside.
+    pub note: String,
+}
+
+/// What a selection chose, and everything that explains it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionRecord {
+    pub allotment: Vec<AllotmentEntry>,
+    pub requirement: Requirement,
+    /// The band the choice came from. `None` when nothing in the allotment
+    /// is on the ladder.
+    pub band: Option<String>,
+    /// The band's members in supply order, then every candidate set aside.
+    pub candidates: Vec<RankedCandidate>,
+    pub chosen: ModelSelection,
+    /// The chosen model's maker, which a `differentMakerFrom` reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<SupplyAccount>,
+    pub extras: RuntimeExtras,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxations: Vec<String>,
+    /// The one line that answers "why this model".
+    pub provenance: String,
+    /// The work this selection was made for, so a later judgment (a rubric,
+    /// an escalation) can replay the same question against it.
+    #[serde(default)]
+    pub subject: SelectionSubject,
+}
+
+/// Where a selection was made. Set by the launch that stores the record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionSubject {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+/// A launch the selection cannot place, said so it can be fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionRefusal {
+    pub message: String,
+}
+
+impl fmt::Display for SelectionRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<SelectionRefusal> for String {
+    fn from(refusal: SelectionRefusal) -> Self {
+        refusal.message
+    }
+}
+
+fn refuse(message: impl Into<String>) -> SelectionRefusal {
+    SelectionRefusal {
+        message: message.into(),
+    }
+}
+
+/// The allotment a node selects within: its own (a recipe node's override, a
+/// spawn's `models`), else its agent's, else the workspace default.
+pub fn effective_allotment(
+    node: Option<&[AllotmentEntry]>,
+    agent: &[AllotmentEntry],
+    default_models: &[AllotmentEntry],
+) -> Vec<AllotmentEntry> {
+    match node {
+        Some(node) if !node.is_empty() => node.to_vec(),
+        _ if !agent.is_empty() => agent.to_vec(),
+        _ => default_models.to_vec(),
+    }
+}
+
+/// What selection reads.
+pub struct SelectionContext<'a> {
+    pub models: &'a ModelsConfig,
+    /// Installed providers first, in the workspace's order.
+    pub catalog: &'a Catalog,
+    pub supply: SupplyInputs<'a>,
+}
+
+impl SelectionContext<'_> {
+    fn provider(&self, key: &str) -> Option<(usize, &CatalogProvider)> {
+        self.catalog
+            .providers
+            .iter()
+            .enumerate()
+            .find(|(_, provider)| provider.installed && provider.descriptor.key == key)
+    }
+}
+
+struct Live<'a> {
+    candidate: &'a Candidate,
+    provider: &'a CatalogProvider,
+    order: usize,
+    maker: Option<String>,
+}
+
+/// Choose the model `allotment` runs `verb` on.
+pub fn select(
+    ctx: &SelectionContext<'_>,
+    allotment: &[AllotmentEntry],
+    verb: VerbKind,
+    constraints: &ResolvedConstraints,
+    resolver: &dyn RequirementResolver,
+) -> Result<SelectionRecord, SelectionRefusal> {
+    let names = allotment
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let expanded = ctx.models.expand(allotment).map_err(refuse)?;
+    if expanded.candidates.is_empty() {
+        return Err(refuse(format!(
+            "[{names}] holds no model: its pools are empty. Add models to them on the Models page, or name a model as provider/model"
+        )));
+    }
+
+    // 1. Keep what the catalog serves for the verb.
+    let mut set_aside: Vec<RankedCandidate> = Vec::new();
+    let mut live: Vec<Live<'_>> = Vec::new();
+    for candidate in &expanded.candidates {
+        let key = candidate.model.backend.as_str();
+        let model = candidate.model.model.as_str();
+        let why = match (ctx.provider(key), &constraints.fork_provider) {
+            (_, Some(fork)) if fork != key => Some(format!(
+                "not on {fork}, where the session this launch forks lives"
+            )),
+            (None, _) => Some(format!("{key} is not installed")),
+            (Some((_, provider)), _) => provider.admit(model, verb).err().map(|refusal| {
+                refusal
+                    .detail
+                    .unwrap_or_else(|| format!("does not serve {}", verb.as_str()))
+            }),
+        };
+        match (why, ctx.provider(key)) {
+            (None, Some((order, provider))) => live.push(Live {
+                candidate,
+                provider,
+                order,
+                maker: provider.maker(model),
+            }),
+            (why, _) => set_aside.push(aside(candidate, None, why.unwrap_or_default())),
+        }
+    }
+    if live.is_empty() {
+        let reasons: Vec<String> = set_aside
+            .iter()
+            .map(|c| format!("{}: {}", c.model, c.note))
+            .collect();
+        if let Some(fork) = &constraints.fork_provider {
+            return Err(refuse(format!(
+                "this launch forks a {fork} session, and [{names}] has no {fork} model that can run {} ({}); add a {fork} model to its models, or start it with a fresh session",
+                verb.as_str(),
+                reasons.join("; ")
+            )));
+        }
+        return Err(refuse(format!(
+            "nothing in [{names}] can run {}: {}",
+            verb.as_str(),
+            reasons.join("; ")
+        )));
+    }
+    let served = ExpandedAllotment {
+        entries: expanded.entries.clone(),
+        candidates: live.iter().map(|l| l.candidate.clone()).collect(),
+        bands: expanded
+            .bands
+            .iter()
+            .filter(|band| {
+                live.iter()
+                    .any(|l| l.candidate.band.as_deref() == Some(&band.id))
+            })
+            .cloned()
+            .collect(),
+    };
+
+    // 2. The requirement, placed on a band.
+    let requirement = resolver.requirement(&served);
+    let mut relaxations: Vec<String> = Vec::new();
+    let mut band: Option<String> = match requirement.capability {
+        Capability::Top => served.top().map(|band| band.id.clone()),
+        Capability::At(x) => served.band_at(x).map(|band| band.id.clone()),
+    };
+    if let Some((node, record)) = &constraints.same_band_as {
+        band = same_band(ctx.models, &served, node, record, &mut relaxations);
+    }
+
+    // 3. A different maker, relaxing the band to find one. When no band of
+    // the allotment holds one, the maker rule gives way and the node selects
+    // as if it were absent: a review by the same lab beats no review, and a
+    // single-maker workspace must still be able to run a constrained recipe.
+    let mut in_band = members(&served, &live, band.as_deref());
+    let mut maker = MakerOutcome::Unconstrained;
+    if let Some((node, record)) = &constraints.different_maker_from {
+        match record.maker.clone() {
+            None => {
+                relaxations.push(format!(
+                    "the maker of {node}'s {} is unknown, so no model can be shown to differ from it",
+                    model_ref(&record.chosen)
+                ));
+            }
+            Some(theirs) => {
+                let differs = |l: &Live<'_>| l.maker.as_deref().is_some_and(|ours| ours != theirs);
+                let here: Vec<&Live<'_>> = in_band.iter().copied().filter(|l| differs(l)).collect();
+                let found = if here.is_empty() {
+                    let tries: Vec<String> = match &band {
+                        Some(from) => served
+                            .relaxations_from(from)
+                            .iter()
+                            .map(|b| b.id.clone())
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    tries.into_iter().find_map(|next| {
+                        let mut members = members(&served, &live, Some(&next));
+                        members.retain(|l| differs(l));
+                        (!members.is_empty()).then_some((Some(next), members))
+                    })
+                } else {
+                    Some((band.clone(), here))
+                };
+                match found {
+                    Some((next, members)) => {
+                        if next != band {
+                            let from = band.as_deref().unwrap_or("top");
+                            relaxations.push(format!(
+                                "band relaxed {from}→{} (no model by a maker other than {theirs} in {from} of [{names}])",
+                                next.as_deref().unwrap_or("top"),
+                            ));
+                            band = next;
+                        }
+                        in_band = members;
+                        for l in &live {
+                            if !differs(l) {
+                                let why = match &l.maker {
+                                    Some(_) => format!("same maker as {node} ({theirs})"),
+                                    None => {
+                                        "maker unknown, so it cannot be shown to differ".to_string()
+                                    }
+                                };
+                                set_aside.push(aside(l.candidate, l.maker.clone(), why));
+                            }
+                        }
+                        maker = MakerOutcome::Differs { node, theirs };
+                    }
+                    None => {
+                        relaxations.push(format!(
+                            "no model from a maker other than {theirs} in [{names}]"
+                        ));
+                        maker = MakerOutcome::Waived { node, theirs };
+                    }
+                }
+            }
+        }
+    }
+    for l in &live {
+        let kept = in_band
+            .iter()
+            .any(|m| m.candidate.model == l.candidate.model);
+        let already = set_aside
+            .iter()
+            .any(|c| c.model == model_ref(&l.candidate.model));
+        if !kept && !already {
+            set_aside.push(aside(
+                l.candidate,
+                l.maker.clone(),
+                "outside the chosen band".to_string(),
+            ));
+        }
+    }
+
+    // 4. Supply, inside the band.
+    let mut ranked: Vec<(&Live<'_>, Result<Supply, String>)> = in_band
+        .iter()
+        .map(|l| {
+            (
+                *l,
+                supply::supply_for(l.provider, l.candidate.model.model.as_str(), &ctx.supply),
+            )
+        })
+        .collect();
+    ranked.sort_by(|(left, ls), (right, rs)| match (ls, rs) {
+        (Ok(ls), Ok(rs)) => supply::compare(&key(left, ls), &key(right, rs)),
+        (Ok(_), Err(_)) => Ordering::Less,
+        (Err(_), Ok(_)) => Ordering::Greater,
+        (Err(_), Err(_)) => left.order.cmp(&right.order),
+    });
+    let sole_named = expanded.candidates.len() == 1 && expanded.candidates[0].named;
+    let (first, first_supply) = &ranked[0];
+    if let (true, Err(why)) = (sole_named, first_supply) {
+        return Err(refuse(format!(
+            "{} cannot run now: {why}. A model named directly is never replaced by another; name a pool or another model beside it",
+            model_ref(&first.candidate.model)
+        )));
+    }
+    let mut candidates: Vec<RankedCandidate> = ranked
+        .iter()
+        .map(|(l, supply)| RankedCandidate {
+            model: model_ref(&l.candidate.model),
+            level: l.candidate.level,
+            band: l.candidate.band.clone(),
+            maker: l.maker.clone(),
+            class: supply.as_ref().ok().map(|s| s.cost.class()),
+            note: match supply {
+                Ok(s) => supply::describe(&l.provider.descriptor.display_name, s),
+                Err(why) => why.clone(),
+            },
+        })
+        .collect();
+    candidates.extend(set_aside);
+
+    // 5. Effort and options.
+    let chosen = first.candidate.model.clone();
+    let rung = first.candidate.rung.as_ref();
+    let mut extras = rung.map(|rung| rung.option_extras()).unwrap_or_default();
+    let mut effort_note: Option<String> = None;
+    match requirement
+        .effort
+        .or_else(|| rung.and_then(|rung| rung.effort))
+    {
+        Some(x) => {
+            if let Some(effort) = first.provider.effort(chosen.model.as_str(), x) {
+                extras.reasoning_effort = effort.reasoning_effort;
+            }
+        }
+        // A word kept from the tier grid is placed now that the catalog may
+        // know the model's scale.
+        None => {
+            if let Some(word) = rung.and_then(|rung| rung.effort_level.as_deref()) {
+                let model = model_ref(&chosen);
+                match first.provider.effort_scale(chosen.model.as_str()) {
+                    Some(scale) if scale.position(word).is_some() => {
+                        extras.reasoning_effort = Some(word.to_string());
+                    }
+                    Some(_) => {
+                        effort_note = Some(format!(
+                            "effort '{word}' is not one of {model}'s levels, so it launches at the provider's default"
+                        ));
+                    }
+                    None => {
+                        effort_note = Some(format!(
+                            "effort '{word}' waits for {model}'s levels to be known, so it launches at the provider's default"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let clause = match first_supply {
+        Ok(s) => supply::describe(&first.provider.descriptor.display_name, s),
+        Err(why) => {
+            format!("{why}; every candidate is out of usage now, so the launch waits for capacity")
+        }
+    };
+    let mut notes = relaxations.clone();
+    let ours = first.maker.as_deref();
+    match maker {
+        MakerOutcome::Unconstrained => {}
+        MakerOutcome::Differs { node, theirs } => notes.push(format!(
+            "maker {} differs from {node}'s {theirs}",
+            ours.unwrap_or("unknown")
+        )),
+        MakerOutcome::Waived { node, theirs } => notes.push(match ours {
+            Some(ours) if ours == theirs => format!("same maker as {node}"),
+            _ => format!("maker unknown, so it may be {node}'s {theirs}"),
+        }),
+    }
+    notes.extend(effort_note);
+    let provenance = supply::provenance_line(
+        &requirement.note,
+        &model_ref(&chosen),
+        extras.reasoning_effort.as_deref(),
+        &clause,
+        &notes,
+    );
+    Ok(SelectionRecord {
+        allotment: allotment.to_vec(),
+        requirement,
+        band,
+        candidates,
+        maker: first.maker.clone(),
+        account: first_supply.as_ref().ok().and_then(|s| s.account.clone()),
+        chosen,
+        extras,
+        relaxations,
+        provenance,
+        subject: SelectionSubject::default(),
+    })
+}
+
+/// The record a pinned job stores: the pin itself, in the band of its ladder
+/// entry (none when it is off the ladder) and with the catalog's maker, so a
+/// constraint naming the job reads what it runs on.
+pub fn pinned(models: &ModelsConfig, catalog: &Catalog, pin: &ModelSelection) -> SelectionRecord {
+    let level = models
+        .rung(pin)
+        .and_then(|rung| rung.level.as_ref())
+        .map(|level| level.value);
+    let band = level
+        .and_then(|level| models.band_of(level))
+        .map(|band| band.id);
+    let maker = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.descriptor.key == pin.backend.as_str())
+        .and_then(|provider| provider.maker(pin.model.as_str()));
+    let reference = model_ref(pin);
+    SelectionRecord {
+        allotment: vec![AllotmentEntry::Model(pin.clone())],
+        requirement: Requirement {
+            capability: Capability::Top,
+            effort: None,
+            source: RequirementSource::Pinned,
+            note: "pinned".to_string(),
+        },
+        band: band.clone(),
+        candidates: vec![RankedCandidate {
+            model: reference.clone(),
+            level,
+            band,
+            maker: maker.clone(),
+            class: None,
+            note: "pinned".to_string(),
+        }],
+        chosen: pin.clone(),
+        maker,
+        account: None,
+        extras: RuntimeExtras::default(),
+        relaxations: Vec::new(),
+        provenance: format!("pinned to {reference}"),
+        subject: SelectionSubject::default(),
+    }
+}
+
+/// What a `differentMakerFrom` did to the choice.
+enum MakerOutcome<'a> {
+    Unconstrained,
+    /// The choice is by another maker than the referenced node's.
+    Differs {
+        node: &'a str,
+        theirs: String,
+    },
+    /// No band of the allotment held another maker, so the rule gave way.
+    Waived {
+        node: &'a str,
+        theirs: String,
+    },
+}
+
+fn key<'a>(live: &'a Live<'_>, supply: &'a Supply) -> SupplyKey<'a> {
+    SupplyKey {
+        supply,
+        level: live.candidate.level,
+        provider_order: live.order,
+        model: live.candidate.model.model.as_str(),
+    }
+}
+
+fn aside(candidate: &Candidate, maker: Option<String>, note: String) -> RankedCandidate {
+    RankedCandidate {
+        model: model_ref(&candidate.model),
+        level: candidate.level,
+        band: candidate.band.clone(),
+        maker,
+        class: None,
+        note,
+    }
+}
+
+fn members<'a, 'b>(
+    served: &ExpandedAllotment,
+    live: &'b [Live<'a>],
+    band: Option<&str>,
+) -> Vec<&'b Live<'a>> {
+    let in_band = served.in_band(band);
+    live.iter()
+        .filter(|l| in_band.iter().any(|c| c.model == l.candidate.model))
+        .collect()
+}
+
+/// The band `record` ran in, or the nearest band of this allotment to it.
+fn same_band(
+    models: &ModelsConfig,
+    served: &ExpandedAllotment,
+    node: &str,
+    record: &SelectionRecord,
+    relaxations: &mut Vec<String>,
+) -> Option<String> {
+    let theirs = record.band.clone().or_else(|| {
+        relaxations.push(format!(
+            "{node}'s {} is off the ladder, so sameBandAs reads it as the top",
+            model_ref(&record.chosen)
+        ));
+        None
+    });
+    let Some(theirs) = theirs else {
+        return served.top().map(|band| band.id.clone());
+    };
+    if served.bands.iter().any(|band| band.id == theirs) {
+        return Some(theirs);
+    }
+    let all = models.bands();
+    let index = all.iter().position(|band| band.id == theirs)?;
+    let above = all[index + 1..].iter();
+    let below = all[..index].iter().rev();
+    let nearest = above
+        .chain(below)
+        .find(|band| served.bands.iter().any(|ours| ours.id == band.id))
+        .map(|band| band.id.clone());
+    if let Some(nearest) = &nearest {
+        relaxations.push(format!(
+            "band relaxed {theirs}→{nearest} (this allotment has no {theirs} model to match {node})"
+        ));
+    }
+    nearest.or_else(|| served.top().map(|band| band.id.clone()))
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -2,13 +2,9 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use std::collections::HashMap;
-
 use cairn_common::logging::LogLevel;
 
-use super::common::{
-    MergeType, Model, Preset, ThinkingDisplayMode, TranscriptDensity, TranscriptTextSize,
-};
+use super::common::{MergeType, Model, ThinkingDisplayMode, TranscriptDensity, TranscriptTextSize};
 
 /// How agent replies to the special `to: "external"` target are handled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,26 +267,23 @@ pub enum OpenRouterSort {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    // === Preset fields ===
-    /// Tier name -> the backend that serves it by default. A tier with no entry
-    /// falls to its first defined provider at resolution time.
-    pub tier_defaults: HashMap<String, String>,
-    pub tiers: Vec<String>,
-    pub backends: HashMap<String, HashMap<String, Preset>>,
+    /// Pools, the capability ladder, and the default allotment. `None` until
+    /// the one-time conversion from the tier grid has written it.
+    #[serde(default)]
+    pub models: Option<crate::allotment::ModelsConfig>,
     /// The providers this workspace has installed, in catalog order.
     ///
     /// Distinct from *supported* (what Cairn ships), *configured* (a credential
     /// exists), and *runnable* (it can serve a request now). Only these get
     /// tabs, model discovery, picker presence, warnings, and routing
     /// participation; an enabled provider stays present while unauthenticated
-    /// or unhealthy. `backends` deliberately keeps presets for providers that
-    /// are not enabled, so removing one and adding it back does not lose the
-    /// workspace's tier assignments.
+    /// or unhealthy. Removing one drops its ladder entries and set-pool
+    /// members.
     #[serde(default)]
     pub enabled_providers: Vec<String>,
-    /// The model or tier a decision node that names none is answered by. A
-    /// node's own `model` wins; `None` leaves the choice to the catalog's best
-    /// decision offer.
+    /// The pool or `provider/model` a decision node that names no `models` is
+    /// answered from. `None` leaves the choice to the catalog's best decision
+    /// offer.
     #[serde(default)]
     pub decision_model: Option<String>,
     /// The image model a request naming none is drawn by. Doors take an
@@ -386,13 +379,12 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
-    // === Preset fields ===
-    pub tier_defaults: Option<HashMap<String, String>>,
-    pub tiers: Option<Vec<String>>,
-    pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// Replace the pools, ladder and default allotment. Refused when it does
+    /// not validate (an unknown pool in `defaultModels`, a level off 0..1).
+    pub models: Option<crate::allotment::ModelsConfig>,
     /// Replace the installed-provider set (adding or removing providers).
-    /// Rejected when it would leave a tier default or call routing pointing at
-    /// a provider the workspace no longer has.
+    /// Rejected when it would leave call routing pointing at a provider the
+    /// workspace no longer has.
     pub enabled_providers: Option<Vec<String>>,
     /// Set the workspace decision default; `null` or blank returns the choice
     /// to the catalog.

@@ -228,8 +228,10 @@ impl AgentBackend for CodexBackend {
                 key: ProviderOptionKey::ReasoningEffort,
                 label: "Effort".to_string(),
                 kind: OptionKind::Enum,
-                choices: ["low", "medium", "high", "xhigh"]
-                    .into_iter()
+                choices: cairn_models::types::catalog::CODEX_EFFORT
+                    .levels
+                    .iter()
+                    .copied()
                     .map(|value| OptionChoice {
                         value: value.to_string(),
                         label: value.to_string(),

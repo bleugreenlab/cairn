@@ -26,7 +26,7 @@ mod issue;
 mod labels;
 mod memories;
 mod messages;
-mod models;
+pub(crate) mod models;
 pub mod mutations;
 mod node;
 pub mod packs;

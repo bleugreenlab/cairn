@@ -1,0 +1,14 @@
+-- lineage: shared
+-- Why a job runs on the model it does: the selection record (allotment,
+-- requirement, band, ranked candidates, chosen model, account, effort, band
+-- relaxations, and the one-line provenance) as JSON. A constrained node reads
+-- its referenced node's record from here, and a resumed job keeps its own
+-- rather than selecting again.
+--
+-- `jobs.model` stays the launch fact; this is its explanation. NULL for a job
+-- launched without a selection (a concrete pin, or one launched before
+-- selection existed).
+--
+-- jobs is a ProjectScoped shared table, so this reaches both lineages; a
+-- plain ADD COLUMN keeps it sync-safe.
+ALTER TABLE jobs ADD COLUMN selection TEXT;

@@ -14,6 +14,7 @@ pub(crate) use runtime::{
 };
 
 use cairn_common::ids;
+use cairn_config::allotment::AllotmentEntry;
 
 use crate::models::{
     DelegatedOutputContract, DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus,
@@ -42,8 +43,8 @@ pub struct DelegatedTaskPayload {
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) subagent_type: String,
-    pub(crate) tier: Option<String>,
-    pub(crate) backend_preference: Option<String>,
+    /// The task's allotment, replacing its agent's.
+    pub(crate) models: Option<Vec<AllotmentEntry>>,
     pub(crate) session: DelegatedTaskSessionMode,
     pub(crate) task_index: Option<i32>,
     /// Optional per-task output schema: a preset name or an inline custom JSON
@@ -94,8 +95,8 @@ pub struct DelegatedCallPayload {
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) subagent_type: String,
-    pub(crate) tier: Option<String>,
-    pub(crate) backend_preference: Option<String>,
+    /// The call's allotment, replacing its agent's.
+    pub(crate) models: Option<Vec<AllotmentEntry>>,
     /// Optional per-call output schema: a preset name or an inline custom JSON
     /// Schema. `None` preserves the default `return` contract.
     pub(crate) output_schema: Option<OutputSchema>,
@@ -162,9 +163,7 @@ pub(crate) struct CreateDelegatedPacketInput<'a> {
     output_contract: DelegatedOutputContract,
     session: DelegatedSessionStrategy,
     task_index: Option<i32>,
-    tier_override: Option<&'a str>,
-    #[allow(dead_code)]
-    pub backend_preference: Option<&'a str>,
+    models: Option<&'a [AllotmentEntry]>,
     /// Fire-and-forget request: the spawning parent does not block or suspend on
     /// this packet. Persisted so the completion-resume handler notifies the
     /// spawner via a push instead of looking for a (nonexistent) successor turn.
@@ -190,8 +189,7 @@ pub(crate) fn create_or_reuse_task_packet(
                 && (packet.prompt_digest.as_deref() == Some(digest.as_str())
                     || packet.problem_statement.as_deref() == Some(input.problem_statement))
                 && packet.task_index == input.task_index
-                && packet.tier_override.as_deref() == input.tier_override
-                && packet.backend_preference.as_deref() == input.backend_preference
+                && packet.models.as_deref() == input.models
                 && packet.session == input.session
         })
         .cloned()
@@ -222,8 +220,7 @@ pub(crate) fn create_or_reuse_task_packet(
         materialized_node_ids: vec![],
         result_artifact_job_id: None,
         task_index: input.task_index,
-        tier_override: input.tier_override.map(str::to_string),
-        backend_preference: input.backend_preference.map(str::to_string),
+        models: input.models.map(<[AllotmentEntry]>::to_vec),
         background: input.background,
         created_at: chrono::Utc::now().timestamp(),
     };
@@ -242,8 +239,7 @@ pub(crate) struct CreateCallPacketInput<'a> {
     /// The call's own job id: the completion-resume path finds this packet by it.
     pub(crate) result_artifact_job_id: &'a str,
     pub(crate) task_index: Option<i32>,
-    pub(crate) tier_override: Option<&'a str>,
-    pub(crate) backend_preference: Option<&'a str>,
+    pub(crate) models: Option<&'a [AllotmentEntry]>,
     pub(crate) background: bool,
 }
 
@@ -281,8 +277,7 @@ pub(crate) fn create_call_packet(input: CreateCallPacketInput<'_>) -> DelegatedW
         materialized_node_ids: vec![],
         result_artifact_job_id: Some(input.result_artifact_job_id.to_string()),
         task_index: input.task_index,
-        tier_override: input.tier_override.map(str::to_string),
-        backend_preference: input.backend_preference.map(str::to_string),
+        models: input.models.map(<[AllotmentEntry]>::to_vec),
         background: input.background,
         created_at: chrono::Utc::now().timestamp(),
     }
@@ -309,8 +304,7 @@ mod call_packet_tests {
             output_contract: contract,
             result_artifact_job_id: "call-job",
             task_index: Some(0),
-            tier_override: None,
-            backend_preference: None,
+            models: None,
             background: false,
         });
 
@@ -336,8 +330,7 @@ mod call_packet_tests {
             output_contract: resolve_delegated_output_contract(None).unwrap(),
             session: DelegatedSessionStrategy::default(),
             task_index: Some(0),
-            tier_override: None,
-            backend_preference: None,
+            models: None,
             background: false,
         }
     }

@@ -89,33 +89,17 @@ pub(crate) async fn collection(
         } else {
             build_response_uri(&x.id)
         };
-        let backend = x.definition.backend.clone().or_else(|| {
-            crate::config::presets::resolve_preset(
-                x.definition.tier.as_deref().unwrap_or("sm"),
-                &crate::config::presets::load_effective_presets(&o.config_dir, path.as_deref()),
-            )
-            .ok()
-            .map(|preset| preset.backend)
-        });
-        let shape = backend
-            .as_deref()
-            .map(|backend| {
+        let shape = x
+            .definition
+            .named_model()
+            .map(|named| {
                 format!(
                     "{:?}",
-                    crate::backends::backend_for_name(Some(backend)).completion_shape()
+                    crate::backends::backend_for_name(Some(&named.backend)).completion_shape()
                 )
             })
-            .unwrap_or_else(|| "Unavailable".into());
-        let selection = x.definition.model.as_deref().map_or_else(
-            || format!("tier {}", x.definition.tier.as_deref().unwrap_or("sm")),
-            |model| {
-                format!(
-                    "{} / {}",
-                    x.definition.backend.as_deref().unwrap_or("?"),
-                    model
-                )
-            },
-        );
+            .unwrap_or_else(|| "selected at invocation".into());
+        let selection = allotment_text(x.definition.models.as_deref());
         out.push_str(&format!(
             "- [{}]({}) [{}] — {} · {} · {} · {} recent invocation(s)\n",
             x.id,
@@ -136,6 +120,21 @@ pub(crate) async fn collection(
     }
     out
 }
+/// A response's allotment as one line.
+fn allotment_text(models: Option<&[cairn_config::allotment::AllotmentEntry]>) -> String {
+    match models {
+        Some(models) => format!(
+            "[{}]",
+            models
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => "the workspace default".to_string(),
+    }
+}
+
 pub(crate) async fn member(
     o: &Orchestrator,
     r: &McpCallbackRequest,
@@ -175,16 +174,7 @@ pub(crate) async fn member(
             .join(", ")
     };
     let output = serde_json::to_string(&d.output).unwrap_or_else(|_| "text".into());
-    let selection = d.model.as_deref().map_or_else(
-        || format!("tier: {}", d.tier.as_deref().unwrap_or("sm")),
-        |model| {
-            format!(
-                "model: {}\n- backend: {}",
-                model,
-                d.backend.as_deref().unwrap_or("?")
-            )
-        },
-    );
+    let selection = format!("models: {}", allotment_text(d.models.as_deref()));
     let mut out=format!("# Response {} — {}\n\n{}\n\n- {}\n- timeout: {}\n- variables: {}\n- output: `{}`\n- few-shot examples: {}\n- history: [{}]({})\n\n## prompt\n\n{}\n\n## recent history\n\n",id,d.name,d.description,selection,format!("{}s",d.timeout.as_secs()),variables,output,d.examples.len(),h,h,d.template);
     let scope_key = history_scope(
         o,

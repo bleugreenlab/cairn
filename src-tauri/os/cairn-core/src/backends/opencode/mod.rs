@@ -460,8 +460,10 @@ impl AgentBackend for OpenCodeBackend {
             key: ProviderOptionKey::ReasoningEffort,
             label: "Effort".to_string(),
             kind: OptionKind::Enum,
-            choices: ["none", "low", "high", "max"]
-                .into_iter()
+            choices: cairn_models::types::catalog::OPENCODE_EFFORT
+                .levels
+                .iter()
+                .copied()
                 .map(|value| OptionChoice {
                     value: value.to_string(),
                     label: value.to_string(),

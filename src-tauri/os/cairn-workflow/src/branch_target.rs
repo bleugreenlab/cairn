@@ -83,6 +83,8 @@ fn transform_for_target(
         }
         let agent_config = node.agent_config.get_or_insert(AgentNodeConfig {
             agent_config_id: None,
+            models: None,
+            constraints: Default::default(),
             output_schema: None,
             git_config: None,
         });

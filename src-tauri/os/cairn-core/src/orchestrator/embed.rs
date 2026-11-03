@@ -227,6 +227,7 @@ impl crate::embeddings::resources::ResourceSource for Orchestrator {
 /// gateway's fixed width. Probed by nothing; present when a token resolves.
 fn cairn_gateway_provider() -> CatalogProvider {
     let model = DiscoveredModel {
+        maker: None,
         id: CAIRN_GATEWAY_EMBED_MODEL.to_string(),
         model: CAIRN_GATEWAY_EMBED_MODEL.to_string(),
         display_name: "Cohere Embed v4".to_string(),
@@ -264,7 +265,6 @@ fn cairn_gateway_provider() -> CatalogProvider {
             refreshed_at: None,
             error: None,
         }),
-        tiers: Vec::new(),
         serves: Vec::new(),
         unable: Vec::new(),
     }

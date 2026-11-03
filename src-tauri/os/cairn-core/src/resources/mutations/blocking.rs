@@ -348,6 +348,12 @@ async fn run_tasks_group(
                 "Task append requires payload with at least subagentType",
             );
         };
+        if let Some(problem) = crate::mcp::types::model_keys_problem(&payload) {
+            return BlockingGroupOutcome::refuse_all(
+                indices,
+                format!("Invalid task append payload: {problem}"),
+            );
+        }
         let task: TaskPayload = match serde_json::from_value(payload) {
             Ok(task) => task,
             Err(e) => {
@@ -435,6 +441,9 @@ async fn run_calls_group(
                 .to_string()
                 .into();
         };
+        if let Some(problem) = crate::mcp::types::model_keys_problem(&payload) {
+            return format!("Invalid call append payload: {problem}").into();
+        }
         let call: CallPayload = match serde_json::from_value(payload) {
             Ok(call) => call,
             Err(e) => return format!("Invalid call append payload: {e}").into(),
@@ -497,8 +506,7 @@ fn delegated_call_payload(call: CallPayload) -> DelegatedCallPayload {
             .subagent_type
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Explore".to_string()),
-        tier: call.tier,
-        backend_preference: call.backend_preference,
+        models: call.models,
         output_schema: call.output_schema,
         branch_policy,
         label: call.label,
@@ -640,8 +648,7 @@ async fn run_cross_node_task_spawn(
             description: task.description.clone(),
             prompt: task.prompt.clone(),
             subagent_type: task.subagent_type.clone(),
-            tier: task.tier.clone(),
-            backend_preference: task.backend_preference.clone(),
+            models: task.models.clone(),
         };
         match crate::execution::jobs::create_child_task(orch, input) {
             Ok(result) => {
@@ -786,8 +793,7 @@ fn delegated_task_payload(task: TaskPayload) -> DelegatedTaskPayload {
         description: task.description,
         prompt: task.prompt,
         subagent_type: task.subagent_type,
-        tier: task.tier,
-        backend_preference: task.backend_preference,
+        models: task.models,
         session,
         task_index: task.task_index,
         output_schema: task.output_schema,
@@ -885,13 +891,47 @@ mod blocking_group_tests {
             description: description.to_string(),
             prompt: prompt.to_string(),
             subagent_type: "Explore".to_string(),
-            tier: None,
-            backend_preference: None,
+            models: None,
             run_in_background: None,
             session: None,
             task_index: None,
             output_schema: None,
         }
+    }
+
+    /// A task or call that still names a retired model key is refused with
+    /// what replaced it, and so is an empty allotment.
+    #[test]
+    fn retired_model_keys_in_a_payload_are_refused_with_the_instruction() {
+        use crate::mcp::types::model_keys_problem;
+        for key in ["tier", "model", "backend", "backendPreference"] {
+            let problem = model_keys_problem(&serde_json::json!({
+                "subagentType": "Explore", "prompt": "p", key: "lg"
+            }))
+            .unwrap_or_else(|| panic!("{key} is refused"));
+            assert!(problem.contains("models: ["), "{key}: {problem}");
+            assert!(
+                problem.contains("docs/backends.md#model-selection"),
+                "{problem}"
+            );
+        }
+        assert!(model_keys_problem(&serde_json::json!({"models": []}))
+            .unwrap()
+            .contains("empty"));
+        assert_eq!(
+            model_keys_problem(&serde_json::json!({"models": ["sm", "claude/opus"]})),
+            None
+        );
+        let task: TaskPayload = serde_json::from_value(serde_json::json!({
+            "description": "d", "prompt": "p", "subagentType": "Explore", "models": ["sm"]
+        }))
+        .unwrap();
+        assert_eq!(
+            delegated_task_payload(task).models,
+            Some(vec![cairn_config::allotment::AllotmentEntry::Pool(
+                "sm".into()
+            )])
+        );
     }
 
     #[test]
@@ -905,8 +945,7 @@ mod blocking_group_tests {
             prompt: prompt.to_string(),
             subagent_type: None,
             description: None,
-            tier: None,
-            backend_preference: None,
+            models: None,
             output_schema: None,
             branch: None,
             label: None,

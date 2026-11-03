@@ -1534,6 +1534,8 @@ impl CairnResource {
             Self::ModelsAccounts => "cairn://models/accounts".to_string(),
             Self::ModelsAccount { id } => format!("cairn://models/accounts/{id}"),
             Self::ModelsUsage => "cairn://models/usage".to_string(),
+            Self::ModelsLadder => "cairn://models/ladder".to_string(),
+            Self::ModelsSelection => "cairn://models/selection".to_string(),
             Self::ModelsEmbeddings => "cairn://models/embeddings".to_string(),
             Self::ModelsSessions => "cairn://models/sessions".to_string(),
             Self::ModelsSession { id } => format!("cairn://models/sessions/{id}"),

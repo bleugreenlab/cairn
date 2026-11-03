@@ -181,7 +181,7 @@ impl ProviderUsageWindow {
     /// The short name of this window's family. A rolling window is named by
     /// its length, because Claude, Codex and OpenCode label the same five hours
     /// three different ways.
-    fn family_name(&self) -> String {
+    pub fn family_name(&self) -> String {
         match (self.scope, self.scope_target.as_deref()) {
             (ProviderUsageScope::Session, _) => "Session".to_string(),
             (ProviderUsageScope::Weekly, None) => "Week".to_string(),

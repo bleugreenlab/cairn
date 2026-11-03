@@ -1,7 +1,42 @@
 use super::*;
 
-/// Load agent config for a job — tries execution snapshot first, falls back to config files.
+/// Load agent config for a job — tries execution snapshot first, falls back to
+/// config files — with the model the job launched on.
+///
+/// A pinned agent carries its pin. Otherwise the model is the selection the
+/// job stored at its launch (`jobs.selection`), with its effort: every turn of
+/// a job runs on the one choice it made, never a fresh one.
 pub(super) fn load_agent_config(
+    orch: &Orchestrator,
+    job: &DbJob,
+    project_path: Option<&Path>,
+) -> Result<Option<AgentConfig>, String> {
+    let Some(mut agent) = load_agent_definition(orch, job, project_path)? else {
+        return Ok(None);
+    };
+    // The stored selection supplies the model when the agent names none, and
+    // its effort and options when the agent's model is the one it chose (a
+    // host snapshot derives its selection from `jobs.model`, which carries no
+    // effort of its own).
+    if let Some(record) = orch.job_selection(&job.id)? {
+        match &agent.selection {
+            None => {
+                agent.selection = Some(record.chosen);
+                agent.extras = Some(record.extras);
+            }
+            Some(selection) if selection.model == record.chosen.model => {
+                agent.selection = Some(record.chosen);
+                if agent.extras.is_none() {
+                    agent.extras = Some(record.extras);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(Some(agent))
+}
+
+fn load_agent_definition(
     orch: &Orchestrator,
     job: &DbJob,
     project_path: Option<&Path>,
@@ -11,8 +46,7 @@ pub(super) fn load_agent_config(
     };
 
     // Try snapshot first (ensures reproducibility for execution-based jobs)
-    let mut snapshot_tier_override: Option<Model> = None;
-    let mut snapshot_backend_preference: Option<String> = None;
+    let mut snapshot_models = None;
     if let Some(exec_id) = &job.execution_id {
         log::info!(
             "load_agent_config: job {} has execution_id={}, trying snapshot for agent '{}'",
@@ -43,9 +77,8 @@ pub(super) fn load_agent_config(
                 return Ok(Some(agent));
             }
             // Snapshot agent has empty prompt — likely a placeholder from executor
-            // expansion. Fall through to config files, but remember overrides.
-            snapshot_tier_override = agent.tier.clone();
-            snapshot_backend_preference = agent.backend_preference.clone();
+            // expansion. Fall through to config files, but keep its allotment.
+            snapshot_models = Some(agent.models.clone()).filter(|models| !models.is_empty());
             log::info!(
                 "load_agent_config: snapshot agent '{}' has empty prompt, falling through to config files",
                 aid
@@ -65,30 +98,21 @@ pub(super) fn load_agent_config(
         );
     }
 
-    // Fall back to config files. Resolve-early: resolve once, against current
-    // effective presets, into a concrete AgentConfig (loud on failure).
+    // Fall back to config files.
     let project_id = &job.project_id;
     let agent = config::get_config_dir().ok().and_then(|cd| {
-        let presets = load_effective_presets(&cd, project_path);
         config_agents::get_agent(&cd, aid, project_path)
             .ok()
             .flatten()
-            .and_then(|mut fa| {
-                if snapshot_backend_preference.is_some() {
-                    fa.backend_preference = snapshot_backend_preference.clone();
-                }
-                let override_sel = snapshot_tier_override
-                    .as_ref()
-                    .map(|m| LaunchSelectionOverride::Tier(m.as_str().to_string()));
-                let snapshot = resolve_agent_snapshot(&fa, override_sel.as_ref(), &presets).ok()?;
-
-                Some(AgentConfig {
+            .map(|fa| {
+                let snapshot = fa.snapshot();
+                AgentConfig {
                     id: snapshot.id,
                     name: snapshot.name,
                     description: snapshot.description,
                     prompt: snapshot.prompt,
                     tools: snapshot.tools,
-                    tier: snapshot.tier,
+                    models: snapshot_models.clone().unwrap_or(snapshot.models),
                     workspace_id: if fa.is_project_scoped {
                         None
                     } else {
@@ -104,11 +128,10 @@ pub(super) fn load_agent_config(
                     disallowed_tools: snapshot.disallowed_tools,
                     skills: snapshot.skills,
                     fence: snapshot.fence,
-                    backend_preference: snapshot.backend_preference,
                     icon: fa.icon.clone(),
                     selection: snapshot.selection,
                     extras: snapshot.extras,
-                })
+                }
             })
     });
 

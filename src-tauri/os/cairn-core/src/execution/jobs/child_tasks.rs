@@ -61,34 +61,7 @@ pub fn create_child_task(
             }
             Err(e) => return Err(format!("Failed to load agent config: {}", e)),
         };
-
-        AgentConfig {
-            id: file_agent.id,
-            name: file_agent.name,
-            description: file_agent.description,
-            prompt: file_agent.prompt,
-            tools: file_agent.tools,
-            tier: file_agent.tier,
-            workspace_id: if file_agent.is_project_scoped {
-                None
-            } else {
-                Some("workspace".to_string())
-            },
-            project_id: if file_agent.is_project_scoped {
-                Some(project_id.clone())
-            } else {
-                None
-            },
-            created_at: 0,
-            updated_at: 0,
-            disallowed_tools: file_agent.disallowed_tools,
-            skills: file_agent.skills,
-            fence: file_agent.fence,
-            icon: file_agent.icon,
-            backend_preference: file_agent.backend_preference,
-            selection: None,
-            extras: None,
-        }
+        file_agent.agent_config(&project_id)
     };
 
     // ---- Create job + run -----------------------------------------------
@@ -97,21 +70,22 @@ pub fn create_child_task(
     let session_id = ids::mint_session_id().into_string();
     let now = chrono::Utc::now().timestamp() as i32;
 
-    let presets = load_effective_presets(&config_dir, project_path.as_deref());
-    let authored_tier = input
-        .tier
-        .as_deref()
-        .or(agent_config.tier.as_ref().map(Model::as_str));
-    let authored_backend = spawned_task_backend(
-        input.backend_preference.as_deref(),
-        agent_config.backend_preference.as_deref(),
-    );
-    // Resolve-early: carry the concrete atomic selection + extras into the child
-    // AgentConfig so the child session never re-resolves a tier.
-    let (selection, extras) = resolve_runtime_selection(authored_tier, authored_backend, &presets)?;
-    let selected_model = Some(selection.model.clone());
-    agent_config.selection = Some(selection);
-    agent_config.extras = Some(extras);
+    // A child task starts now, so it selects now, and the record is stored
+    // with the job below.
+    let record = orch.select_for_agent(
+        &project_id,
+        input.models.as_deref(),
+        &agent_config.models,
+        crate::execution::model_selection::SelectionSubject {
+            issue_id: issue_id.clone(),
+            execution_id: execution_id.clone(),
+            node_id: None,
+            job_id: Some(job_id.clone()),
+        },
+    )?;
+    let selected_model = Some(record.chosen.model.clone());
+    agent_config.selection = Some(record.chosen.clone());
+    agent_config.extras = Some(record.extras.clone());
 
     let branch = parent_job.branch.clone().ok_or_else(|| {
         format!(
@@ -153,6 +127,8 @@ pub fn create_child_task(
             now,
         },
     ))?;
+
+    orch.store_job_selection(&job_id, &record)?;
 
     let turn_id = ids::mint_child(&job_id);
     super::turns::create_initial_turn(orch, &turn_id, &session_id, &job_id)?;

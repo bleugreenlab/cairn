@@ -314,7 +314,37 @@ pub(crate) fn resolve_routed_session_identity(
         let session_id = session_id.to_string();
         move || async move { crate::sessions::queries::get(&db, &session_id).await }
     })?;
-    let selection = match route_session(
+    // A session not yet pinned runs on the account its job's selection ranked
+    // cheapest, so the account its provenance names is the one it uses. The
+    // execution's explicit account is the more specific policy and wins. An
+    // account that became unavailable since selection falls back to routing,
+    // and the job's provenance says so.
+    let mut unavailable = None;
+    if session.account_id.is_none() && snapshot_account_id.is_none() {
+        if let Some((job_id, record, account)) = selected_account(orch, &session, provider)? {
+            match orch.resolve_available_routed_account(
+                provider,
+                project_id,
+                &account.id,
+                requested_model,
+            ) {
+                Some(identity) => {
+                    return persist_routed_account_and_resolve_identity(
+                        orch,
+                        provider,
+                        session_id,
+                        project_id,
+                        requested_model,
+                        None,
+                        account.id,
+                        identity,
+                    )
+                }
+                None => unavailable = Some((job_id, record, account)),
+            }
+        }
+    }
+    let route = route_session(
         orch,
         provider,
         session.account_id.as_deref(),
@@ -322,7 +352,29 @@ pub(crate) fn resolve_routed_session_identity(
         requested_model,
         snapshot_account_id,
         SelectionMode::Serve,
-    )? {
+    )?;
+    if let Some((job_id, mut record, account)) = unavailable {
+        let routed = match &route {
+            SessionRoute::Selected(selection) => selection.account_id.clone(),
+            _ => None,
+        };
+        let note = match routed {
+            Some(routed) => format!(
+                "account {} was unavailable at launch, so the session routed to {routed}",
+                account.label
+            ),
+            None => format!(
+                "account {} was unavailable at launch, so the session routed as usual",
+                account.label
+            ),
+        };
+        log::info!("[select] job {job_id}: {note}");
+        record.provenance.push_str(&format!("; {note}"));
+        if let Err(error) = orch.store_job_selection(&job_id, &record) {
+            log::warn!("could not record the account fallback on job {job_id}: {error}");
+        }
+    }
+    let selection = match route {
         SessionRoute::Pinned(identity) => return Ok(Some(identity)),
         SessionRoute::NoCredential => return Ok(None),
         SessionRoute::Selected(selection) => selection,
@@ -344,6 +396,35 @@ pub(crate) fn resolve_routed_session_identity(
         account_id,
         selection.identity,
     )
+}
+
+/// The account `session`'s job selection named, when that selection chose a
+/// model on `provider`.
+fn selected_account(
+    orch: &Orchestrator,
+    session: &crate::models::Session,
+    provider: crate::credentials::RoutedProvider,
+) -> Result<
+    Option<(
+        String,
+        crate::execution::model_selection::SelectionRecord,
+        cairn_models::supply::SupplyAccount,
+    )>,
+    String,
+> {
+    let Some(job_id) = session.job_id.clone() else {
+        return Ok(None);
+    };
+    let Some(record) = orch.job_selection(&job_id)? else {
+        return Ok(None);
+    };
+    if crate::credentials::RoutedProvider::for_backend(&record.chosen.backend) != Some(provider) {
+        return Ok(None);
+    }
+    Ok(record
+        .account
+        .clone()
+        .map(|account| (job_id, record, account)))
 }
 
 /// Pin the selected account before launch, then authenticate as whatever the
@@ -2338,9 +2419,6 @@ pub fn start_agent_session(
         // not get to reinterpret it (CAIRN-3798).
         let effective_backend_name = backends::effective_backend_name(
             agent_config.as_ref().and_then(|ac| ac.selection.as_ref()),
-            agent_config
-                .as_ref()
-                .and_then(|ac| ac.backend_preference.as_deref()),
             resolved_model.as_ref().map(Model::as_str),
         );
 
@@ -3592,6 +3670,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A new session runs on the account its job's selection named, not the
+    /// one routing would pick on its own; when that account is gone by the
+    /// spawn, routing chooses as it always has and the job's provenance says
+    /// so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_new_session_runs_on_the_account_its_selection_named() {
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('successor', 'j', 'claude', 'open', 2, 1, 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db.clone());
+        let [first, chosen] = ["First", "Chosen by supply"].map(|label| {
+            orch.add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                label.to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap()
+            .id
+        });
+        let store = |account_id: &str, label: &str| {
+            let mut record = crate::execution::model_selection::pinned(
+                &cairn_config::allotment::ModelsConfig::default(),
+                &cairn_models::interface::Catalog {
+                    providers: Vec::new(),
+                },
+                &crate::models::ModelSelection::new("claude", crate::models::Model::new("opus")),
+            );
+            record.provenance = "lg = top of [lg] → claude/opus: chosen".to_string();
+            record.account = Some(cairn_models::supply::SupplyAccount {
+                id: account_id.to_string(),
+                label: label.to_string(),
+            });
+            orch.store_job_selection("j", &record).unwrap();
+        };
+        let resolve = |session: &'static str| {
+            resolve_routed_session_identity(
+                &orch,
+                crate::credentials::RoutedProvider::Claude,
+                session,
+                Some("p"),
+                Some("opus"),
+                None,
+            )
+            .unwrap()
+            .expect("managed identity")
+        };
+        let pin = |session: &'static str| {
+            let db = db.clone();
+            async move {
+                crate::sessions::queries::get(&db, session)
+                    .await
+                    .unwrap()
+                    .account_id
+            }
+        };
+
+        store(&chosen, "Chosen by supply");
+        resolve("sess");
+        assert_eq!(pin("sess").await.as_deref(), Some(chosen.as_str()));
+
+        store("gone", "Gone");
+        resolve("successor");
+        let routed = pin("successor").await.expect("routing pinned an account");
+        assert!(routed == first || routed == chosen, "{routed}");
+        let provenance = orch.job_selection("j").unwrap().unwrap().provenance;
+        assert!(
+            provenance.ends_with(&format!(
+                "; account Gone was unavailable at launch, so the session routed to {routed}"
+            )),
+            "{provenance}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

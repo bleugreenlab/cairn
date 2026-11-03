@@ -1090,9 +1090,9 @@ mod tests {
     #[tokio::test]
     async fn capability_bearing_settings_ask_while_preferences_stay_direct() {
         let actor = actor("authz-settings.db").await;
-        let backends = normalize::workspace_settings_write(WORKSPACE_ID, "backends").unwrap();
+        let models = normalize::workspace_settings_write(WORKSPACE_ID, "models").unwrap();
         assert_eq!(
-            gate(&actor, &backends).await.unwrap(),
+            gate(&actor, &models).await.unwrap(),
             AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
         );
 

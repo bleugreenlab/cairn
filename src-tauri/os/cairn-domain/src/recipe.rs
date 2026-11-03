@@ -488,6 +488,11 @@ pub struct NodeConfig {
     /// Git/worktree configuration for agent nodes
     #[serde(skip_serializing_if = "Option::is_none")]
     git_config: Option<AgentGitConfig>,
+    /// An agent node's allotment override, or a decision node's allotment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    models: Option<Vec<crate::allotment::AllotmentEntry>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    constraints: Option<crate::allotment::NodeConstraints>,
 
     // Action config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,11 +533,9 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     ports: Option<Vec<String>>,
 
-    // Decision config (`model` also carried a legacy `ai` condition's model)
+    // Decision config (its allotment is `models` above)
     #[serde(skip_serializing_if = "Option::is_none")]
     questions: Option<Vec<DecisionQuestion>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thresholds: Option<Thresholds>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -705,6 +708,15 @@ fn is_default_branch_mode(mode: &BranchMode) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct AgentNodeConfig {
     pub agent_config_id: Option<String>,
+    /// This node's allotment, replacing its agent's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<crate::allotment::AllotmentEntry>>,
+    /// What this node's selection reads from upstream nodes' selections.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::allotment::NodeConstraints::is_empty"
+    )]
+    pub constraints: crate::allotment::NodeConstraints,
     /// Output schema attached to agent (docks to right)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<SchemaConfig>,
@@ -987,11 +999,15 @@ impl RecipeNode {
             let agent_config = if cfg.agent_config_id.is_some()
                 || cfg.output_schema.is_some()
                 || cfg.git_config.is_some()
+                || cfg.models.is_some()
+                || cfg.constraints.is_some()
             {
                 // Only create agent config if we have agent-related data
                 if node_type == RecipeNodeType::Agent {
                     Some(AgentNodeConfig {
                         agent_config_id: cfg.agent_config_id,
+                        models: cfg.models.clone(),
+                        constraints: cfg.constraints.clone().unwrap_or_default(),
                         output_schema: cfg.output_schema.clone(),
                         git_config: cfg.git_config,
                     })
@@ -1029,12 +1045,12 @@ impl RecipeNode {
                     DecisionNode::port_choice(
                         cfg.question.as_deref().unwrap_or_default(),
                         cfg.ports.as_deref().unwrap_or_default(),
-                        cfg.model.clone(),
+                        cfg.models.clone(),
                     )
                 } else {
                     DecisionNode {
                         questions: cfg.questions.clone().unwrap_or_default(),
-                        model: cfg.model.clone(),
+                        models: cfg.models.clone(),
                         thresholds: cfg.thresholds.unwrap_or_default(),
                     }
                 })
@@ -1583,7 +1599,7 @@ mod tests {
             serde_json::json!({
                 "conditionType": "ai",
                 "question": "Does it touch the database?",
-                "model": "sm",
+                "models": ["sm"],
                 "ports": ["yes", "no"],
                 "onError": "useDefault",
                 "defaultPort": "no"
@@ -1597,7 +1613,7 @@ mod tests {
             DecisionNode::port_choice(
                 "Does it touch the database?",
                 &["yes".to_string(), "no".to_string()],
-                Some("sm".into())
+                Some(vec![crate::allotment::AllotmentEntry::Pool("sm".into())])
             )
         );
         assert_eq!(decision.ports(), vec!["yes", "no"]);
@@ -1629,14 +1645,20 @@ mod tests {
             serde_json::json!({
                 "questions": [{"name": "route", "instructions": "Ship?", "type": "choice",
                                "options": [{"value": "ship"}, {"value": "hold"}]}],
-                "model": "custom:acc/sm",
+                "models": ["custom:acc/qwen3-4b"],
                 "thresholds": {"native": 0.7}
             }),
         );
         let decision = node.decision_config.clone().unwrap();
         assert_eq!(decision.ports(), vec!["ship", "hold"]);
         assert_eq!(decision.thresholds.native, Some(0.7));
-        assert_eq!(decision.model.as_deref(), Some("custom:acc/sm"));
+        assert_eq!(
+            decision.models,
+            Some(vec![crate::allotment::AllotmentEntry::parse(
+                "custom:acc/qwen3-4b"
+            )
+            .unwrap()])
+        );
         let json = serde_json::to_value(&node).unwrap();
         assert_eq!(json["nodeType"], "decision");
         assert_eq!(json["decisionConfig"]["questions"][0]["type"], "choice");

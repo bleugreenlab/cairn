@@ -51,6 +51,7 @@ pub mod session;
 pub mod sign_in;
 pub mod speak;
 pub mod subscription;
+pub mod supply;
 pub mod tokenizer_store;
 pub mod turn;
 pub mod usage;

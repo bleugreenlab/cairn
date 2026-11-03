@@ -130,27 +130,21 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         "- enabledProviders: {}\n",
         settings.enabled_providers.join(", ")
     ));
-    out.push_str(&format!("- tiers: {}\n", settings.tiers.join(", ")));
-    out.push_str("- tierDefaults:\n");
-    for tier in &settings.tiers {
-        match settings.tier_defaults.get(tier) {
-            Some(backend) => out.push_str(&format!("  - {tier}: `{backend}`\n")),
-            None => out.push_str(&format!("  - {tier}: (first defined provider)\n")),
+    match &settings.models {
+        Some(models) => {
+            let pools: Vec<&str> = models.pools.iter().map(|pool| pool.id.as_str()).collect();
+            let defaults: Vec<String> = models
+                .default_models
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            out.push_str(&format!("- pools: {}\n", pools.join(", ")));
+            out.push_str(&format!("- ladder: {} model(s)\n", models.ladder.len()));
+            out.push_str(&format!("- defaultModels: [{}]\n", defaults.join(", ")));
         }
+        None => out.push_str("- models: not converted yet\n"),
     }
-    out.push('\n');
-    let mut backend_names: Vec<&String> = settings.backends.keys().collect();
-    backend_names.sort();
-    for backend in backend_names {
-        let presets = &settings.backends[backend];
-        out.push_str(&format!("### {backend}\n\n"));
-        for tier in &settings.tiers {
-            if let Some(preset) = presets.get(tier) {
-                out.push_str(&format!("- {}: `{}`\n", tier, preset.model.as_str()));
-            }
-        }
-        out.push('\n');
-    }
+    out.push_str("- The pools, bands and ladder: cairn://models/ladder\n\n");
 
     // --- Model catalog (read-only) ---
     let catalog = orch.get_model_catalog();

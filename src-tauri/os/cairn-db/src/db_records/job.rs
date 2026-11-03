@@ -143,6 +143,96 @@ pub async fn load_live_job_by_execution_node_conn(
         .transpose()
 }
 
+/// The selection record stored on a job (`jobs.selection`, JSON).
+///
+/// Kept out of [`JOB_COLUMNS`]: only selection reads it, and every other job
+/// load would otherwise carry the whole record.
+pub async fn load_job_selection_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT selection FROM jobs WHERE id = ?1", (job_id,))
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
+}
+
+/// Store (or clear) a job's selection record.
+pub async fn set_job_selection_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+    selection: Option<&str>,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE jobs SET selection = ?2 WHERE id = ?1",
+        (job_id, selection),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The selection record of a recipe node's live attempt within an execution,
+/// the same attempt [`load_live_job_by_execution_node_conn`] resolves to.
+pub async fn load_node_selection_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+    recipe_node_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT selection
+             FROM jobs
+             WHERE execution_id = ?1 AND recipe_node_id = ?2 AND status <> 'cancelled'
+             ORDER BY created_at DESC
+             LIMIT 1",
+            (execution_id, recipe_node_id),
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_selection_round_trips_and_a_node_reads_its_live_attempt() {
+        let db = crate::storage::migrated_test_db("job-selection.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO executions(id,recipe_id,project_id,status,started_at) VALUES('x','recipe','p','running',1);
+             INSERT INTO jobs(id,project_id,execution_id,recipe_node_id,status,created_at,updated_at) VALUES('old','p','x','builder-1','cancelled',1,1);
+             INSERT INTO jobs(id,project_id,execution_id,recipe_node_id,status,created_at,updated_at) VALUES('new','p','x','builder-1','completed',2,2);",
+        )
+        .await
+        .unwrap();
+        let (live, cleared) = db
+            .write(|conn| {
+                Box::pin(async move {
+                    set_job_selection_conn(conn, "old", Some(r#"{"stale":true}"#)).await?;
+                    assert_eq!(load_job_selection_conn(conn, "new").await?, None);
+                    set_job_selection_conn(conn, "new", Some(r#"{"chosen":"claude/opus"}"#))
+                        .await?;
+                    let live = load_node_selection_conn(conn, "x", "builder-1").await?;
+                    set_job_selection_conn(conn, "new", None).await?;
+                    let cleared = load_job_selection_conn(conn, "new").await?;
+                    Ok((live, cleared))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(live.as_deref(), Some(r#"{"chosen":"claude/opus"}"#));
+        assert_eq!(cleared, None);
+    }
+}
+
 #[derive(Debug)]
 pub struct NewJob<'a> {
     pub id: &'a str,

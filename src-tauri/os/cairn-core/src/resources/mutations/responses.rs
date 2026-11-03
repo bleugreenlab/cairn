@@ -31,9 +31,7 @@ fn markdown(
     for k in [
         "name",
         "description",
-        "tier",
-        "model",
-        "backend",
+        "models",
         "options",
         "variables",
         "output",

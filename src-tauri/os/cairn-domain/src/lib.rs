@@ -5,6 +5,7 @@
 
 mod action;
 mod agent;
+pub mod allotment;
 mod artifact;
 mod common;
 mod context_tokens;
@@ -148,8 +149,8 @@ pub use workflow::{SaveWorkflowConfig, WorkflowConfig, WorkflowConfigDetail};
 pub use snapshot::{
     merge_agent_patch, AgentSnapshot, DelegatedOutputContract, DelegatedOwnershipScope,
     DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket,
-    DelegationOrigin, ExecutionSnapshot, ModelRouting, ModelRoutingDecision, ModelRoutingSource,
-    RecipeSnapshot, SkillSnapshot, SnapshotOverrides, SnapshotPresets, TriggerContext,
+    DelegationOrigin, ExecutionSnapshot, RecipeSnapshot, SkillSnapshot, SnapshotOverrides,
+    TriggerContext,
 };
 
 // Launch-time snapshot deltas (the agent-side grammar for SnapshotOverrides)

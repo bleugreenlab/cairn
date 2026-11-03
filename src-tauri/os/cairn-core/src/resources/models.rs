@@ -12,8 +12,8 @@
 
 use cairn_common::query::QueryParam;
 use cairn_models::interface::{
-    Catalog, CatalogListing, ListedProvider, ModelScope, Models, SessionState, SessionView,
-    TierBinding,
+    Catalog, CatalogListing, CatalogProvider, ListedProvider, ModelScope, Models, SessionState,
+    SessionView,
 };
 use cairn_models::types::catalog::{
     custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
@@ -38,7 +38,7 @@ use cairn_models::subscription::PendingSignIn;
 const INDEX: &[(&str, &str)] = &[
     (
         "cairn://models/catalog",
-        "installed providers, what model discovery found on each, and how tiers bind to them",
+        "installed providers and what model discovery found on each, with makers and effort scales",
     ),
     (
         "cairn://models/decide",
@@ -59,6 +59,14 @@ const INDEX: &[(&str, &str)] = &[
     (
         "cairn://models/usage",
         "each provider's capacity per account and pooled, as Settings → Analytics shows it",
+    ),
+    (
+        "cairn://models/ladder",
+        "the pools allotments name and the capability ladder they slice",
+    ),
+    (
+        "cairn://models/selection",
+        "what an allotment would run on now, with the one-line why (a preview; ?models=lg,claude/fable)",
     ),
     (
         "cairn://models/embeddings",
@@ -267,27 +275,10 @@ fn heading(descriptor: &ProviderDescriptor) -> String {
     format!("{} (`{}`)", descriptor.display_name, descriptor.key)
 }
 
-fn binding_line(binding: &TierBinding) -> String {
-    let mut line = format!("{} → `{}`", binding.tier, binding.model);
-    if !binding.options.is_empty() {
-        let options: Vec<String> = binding
-            .options
-            .iter()
-            .map(|(key, value)| match value {
-                Value::String(text) => format!("{key}={text}"),
-                other => format!("{key}={other}"),
-            })
-            .collect();
-        let _ = write!(line, " ({})", options.join(", "));
-    }
-    if binding.is_tier_default {
-        line.push_str(" [default]");
-    }
-    line
-}
-
-/// One listed model. Its `serves` is the listing's resolved answer.
-fn model_line(model: &DiscoveredModel) -> String {
+/// One listed model. Its `serves` is the listing's resolved answer; its maker
+/// and effort scale are what `provider` (the catalog's record of the same
+/// provider) answers, which is what selection reads.
+fn model_line(model: &DiscoveredModel, provider: Option<&CatalogProvider>) -> String {
     let mut line = format!("- `{}`", model.model);
     if model.display_name != model.model {
         let _ = write!(line, " {}", model.display_name);
@@ -295,6 +286,12 @@ fn model_line(model: &DiscoveredModel) -> String {
     let mut facts = Vec::new();
     if let Some(window) = model.context_window {
         facts.push(format!("{} context", tokens(window)));
+    }
+    if let Some(maker) = provider.and_then(|provider| provider.maker(&model.model)) {
+        facts.push(format!("by {maker}"));
+    }
+    if let Some(scale) = provider.and_then(|provider| provider.effort_scale(&model.model)) {
+        facts.push(format!("effort {}", scale.levels.join("|")));
     }
     if let Some(price) = model.pricing.as_ref().and_then(pricing) {
         facts.push(price);
@@ -364,6 +361,257 @@ fn sorted_accounts(facet: &dyn Models, scope: &ModelScope) -> Result<Vec<Value>,
         .collect();
     accounts.sort_by_key(|account| account["sortOrder"].as_i64().unwrap_or_default());
     Ok(accounts)
+}
+
+fn level_text(level: f64) -> String {
+    format!("{}", (level * 100.0).round() / 100.0)
+}
+
+/// `cairn://models/ladder`: the view the Models page reads, as text.
+pub(crate) fn render_ladder(
+    params: &[QueryParam],
+    view: impl FnOnce() -> Result<crate::orchestrator::model_selection::LadderView, String>,
+) -> String {
+    use crate::orchestrator::model_selection::LadderRung;
+    const URI: &str = "cairn://models/ladder";
+    if let Some(error) = unsupported(URI, params, &[]) {
+        return error;
+    }
+    let view = match view() {
+        Ok(view) => view,
+        Err(error) => return format!("Could not read the ladder: {error}"),
+    };
+    let mut out = String::from("# Model ladder\n\n");
+    out.push_str("An allotment (`models: [sm, md, lg]`, `models: [lg, claude/fable]`) names pools and models; a launch selects inside it. Band pools are slices of the 0..1 capability ladder below; set pools are hand-picked. Change any of it with a `cairn://settings` patch of `models`.\n");
+    out.push_str("\n## Pools\n\n");
+    for pool in &view.pools {
+        let kind = match (&pool.band, &pool.members) {
+            (Some(band), _) => format!("band {}–{}", level_text(band.min), level_text(band.max)),
+            (None, Some(members)) if members.is_empty() => "set, empty".to_string(),
+            (None, Some(members)) => format!("set [{}]", members.join(", ")),
+            (None, None) => "band (no bounds)".to_string(),
+        };
+        let description = if pool.description.is_empty() {
+            "(no description)"
+        } else {
+            pool.description.as_str()
+        };
+        let _ = writeln!(out, "- `{}` {kind}: {description}", pool.id);
+    }
+    let rung_line = |rung: &LadderRung| {
+        let mut line = format!("- `{}`", rung.model);
+        if let Some(level) = rung.level {
+            let _ = write!(line, " {}", level_text(level));
+            let source = match rung.level_source {
+                Some(cairn_config::allotment::LevelSource::Seeded) => "seeded",
+                Some(cairn_config::allotment::LevelSource::Measured) => "measured",
+                _ => "set",
+            };
+            match &rung.level_from {
+                Some(from) => {
+                    let _ = write!(line, " ({source}: {from})");
+                }
+                None => {
+                    let _ = write!(line, " ({source})");
+                }
+            }
+        }
+        let mut facts: Vec<String> = Vec::new();
+        facts.push(match &rung.maker {
+            Some(maker) => format!("by {maker}"),
+            None => "maker unknown".to_string(),
+        });
+        let scale = rung
+            .effort_scale
+            .iter()
+            .map(|step| step.level.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        match (
+            scale.is_empty(),
+            rung.effort,
+            &rung.effort_level,
+            &rung.effort_word,
+        ) {
+            (false, Some(x), Some(level), _) => {
+                facts.push(format!("effort {} → {level} of {scale}", level_text(x)))
+            }
+            (_, None, Some(level), Some(_)) => {
+                facts.push(format!("effort {level} (kept from the tier grid) of {scale}"))
+            }
+            (_, None, None, Some(word)) => facts.push(format!(
+                "effort '{word}' kept from the tier grid, not one of this model's known levels; it launches at the provider's default"
+            )),
+            (false, None, _, _) => facts.push(format!("effort default of {scale}")),
+            (true, Some(x), _, _) => facts.push(format!(
+                "effort {} (this model takes no effort)",
+                level_text(x)
+            )),
+            _ => {}
+        }
+        for (key, value) in &rung.options {
+            let value = match value {
+                crate::models::PresetOptionValue::Str(value) => value.clone(),
+                crate::models::PresetOptionValue::Bool(value) => value.to_string(),
+                crate::models::PresetOptionValue::Int(value) => value.to_string(),
+            };
+            facts.push(format!("{key} {value}"));
+        }
+        if !rung.pools.is_empty() {
+            facts.push(format!("in {}", rung.pools.join(", ")));
+        }
+        let _ = write!(line, " — {}", facts.join(", "));
+        line
+    };
+    out.push_str("\n## Ladder\n");
+    for band in view.bands.iter().rev() {
+        let _ = writeln!(
+            out,
+            "\n### {} ({}–{})\n",
+            band.id,
+            level_text(band.min),
+            level_text(band.max)
+        );
+        let members: Vec<&LadderRung> = view
+            .rungs
+            .iter()
+            .filter(|rung| rung.band.as_deref() == Some(band.id.as_str()))
+            .collect();
+        if members.is_empty() {
+            out.push_str("Nothing on the ladder here.\n");
+        }
+        for rung in members {
+            out.push_str(&rung_line(rung));
+            out.push('\n');
+        }
+    }
+    let off: Vec<&LadderRung> = view
+        .rungs
+        .iter()
+        .filter(|rung| rung.level.is_none())
+        .collect();
+    if !off.is_empty() {
+        out.push_str("\n### Off the ladder (launch options only; selected only when named or in a set pool)\n\n");
+        for rung in off {
+            out.push_str(&rung_line(rung));
+            out.push('\n');
+        }
+    }
+    out.push_str("\n## Unranked\n\n");
+    if view.unranked.is_empty() {
+        out.push_str("Every served session model on an installed provider is on the ladder.\n");
+    } else {
+        out.push_str("Served session models on installed providers with no level. Named directly, one counts as the top of its allotment.\n\n");
+        for model in &view.unranked {
+            let _ = writeln!(out, "- `{model}`");
+        }
+    }
+    let defaults: Vec<String> = view
+        .default_models
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let _ = writeln!(
+        out,
+        "\nDefault allotment (a definition naming none): [{}]",
+        defaults.join(", ")
+    );
+    if !view.conversion_notes.is_empty() {
+        out.push_str("\n## From the conversion of tiers\n\n");
+        for note in &view.conversion_notes {
+            let _ = writeln!(out, "- {note}");
+        }
+    }
+    out
+}
+
+/// `cairn://models/selection`: what an allotment would run on now.
+/// `preview` is handed the allotment as written (`None` for the workspace
+/// default) and the verb.
+pub(crate) fn render_selection(
+    params: &[QueryParam],
+    preview: impl FnOnce(
+        Option<Vec<String>>,
+        VerbKind,
+    ) -> Result<crate::execution::model_selection::SelectionRecord, String>,
+) -> String {
+    const URI: &str = "cairn://models/selection";
+    if let Some(error) = unsupported(URI, params, &["models", "verb"]) {
+        return error;
+    }
+    let verb = match crate::orchestrator::model_selection::preview_verb(find_query_value(
+        params, "verb",
+    )) {
+        Ok(verb) => verb,
+        Err(error) => return error,
+    };
+    let allotment: Option<Vec<String>> = find_query_value(params, "models").map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    let asked = match &allotment {
+        Some(entries) => format!("[{}]", entries.join(", ")),
+        None => "The workspace's default allotment".to_string(),
+    };
+    let mut out = String::from("# Model selection preview\n\n");
+    let _ = writeln!(
+        out,
+        "{asked} for {}, if it launched now. A preview: nothing is stored, no constraint applies, and usage is what was last measured.\n",
+        verb.as_str()
+    );
+    let record = match preview(allotment, verb) {
+        Ok(record) => record,
+        Err(refusal) => {
+            let _ = writeln!(out, "Refused: {refusal}");
+            return out;
+        }
+    };
+    let _ = writeln!(out, "**{}**\n", record.provenance);
+    let mut chosen = format!(
+        "Chosen: `{}/{}`",
+        record.chosen.backend,
+        record.chosen.model.as_str()
+    );
+    if let Some(effort) = &record.extras.reasoning_effort {
+        let _ = write!(chosen, " @ {effort}");
+    }
+    if let Some(account) = &record.account {
+        let _ = write!(chosen, " on {}", account.label);
+    }
+    if let Some(maker) = &record.maker {
+        let _ = write!(chosen, ", by {maker}");
+    }
+    if let Some(band) = &record.band {
+        let _ = write!(chosen, ", band {band}");
+    }
+    let _ = writeln!(out, "{chosen}");
+    for relaxation in &record.relaxations {
+        let _ = writeln!(out, "Relaxed: {relaxation}");
+    }
+    out.push_str("\n## Candidates\n\nIn supply order, then everything set aside.\n\n");
+    for candidate in &record.candidates {
+        let mut line = format!("- `{}`", candidate.model);
+        if let Some(band) = &candidate.band {
+            let _ = write!(line, " {band}");
+        }
+        if let Some(level) = candidate.level {
+            let _ = write!(line, " {}", level_text(level));
+        }
+        if let Some(maker) = &candidate.maker {
+            let _ = write!(line, ", by {maker}");
+        }
+        let state = if candidate.class.is_some() {
+            ""
+        } else {
+            "set aside: "
+        };
+        let _ = write!(line, " — {state}{}", candidate.note);
+        let _ = writeln!(out, "{line}");
+    }
+    out
 }
 
 pub(crate) fn render_index() -> String {
@@ -630,7 +878,14 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
                 return refusal;
             }
             let accounts = sorted_accounts(facet, &scope).unwrap_or_default();
-            render_providers(&listing, &accounts, only, include_uninstalled)
+            let catalog = facet.catalog(&scope).ok();
+            render_providers(
+                &listing,
+                catalog.as_ref(),
+                &accounts,
+                only,
+                include_uninstalled,
+            )
         }
         // The catalog-id view is the projection offer selection walks.
         Some("models") => {
@@ -653,6 +908,7 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
 
 fn render_providers(
     listing: &CatalogListing,
+    catalog: Option<&Catalog>,
     accounts: &[Value],
     only: Option<&str>,
     include_uninstalled: bool,
@@ -667,7 +923,7 @@ fn render_providers(
     let mut out = String::from("# Model catalog\n\n");
     let _ = writeln!(
         out,
-        "{} installed provider{}, in Settings → Providers order. A tier marked [default] is where an unqualified reference such as `lg` resolves; `provider/tier` (for example `claude/lg`) names the provider outright.",
+        "{} installed provider{}, in Settings → Providers order. Name a model to any verb as `provider/model`; the pools an allotment selects within are at cairn://models/ladder.",
         installed.len(),
         if installed.len() == 1 { "" } else { "s" }
     );
@@ -693,12 +949,6 @@ fn render_providers(
                 "Configured: {configured} account{}",
                 if configured == 1 { "" } else { "s" }
             );
-        }
-        if provider.tiers.is_empty() {
-            out.push_str("Tiers: none bound here\n");
-        } else {
-            let bindings: Vec<String> = provider.tiers.iter().map(binding_line).collect();
-            let _ = writeln!(out, "Tiers: {}", bindings.join(" · "));
         }
         match served(&provider.serves) {
             Some(text) => {
@@ -738,8 +988,14 @@ fn render_providers(
                 if let Some(error) = &models.error {
                     let _ = writeln!(out, "Discovery error: {error}");
                 }
+                let record = catalog.and_then(|catalog| {
+                    catalog
+                        .providers
+                        .iter()
+                        .find(|known| known.descriptor.key == descriptor.key)
+                });
                 for model in &models.models {
-                    out.push_str(&model_line(model));
+                    out.push_str(&model_line(model, record));
                     out.push('\n');
                 }
             }
@@ -1957,8 +2213,6 @@ mod tests {
         let orch = seeded_orchestrator().await;
         let catalog = read(&orch, "cairn://models/catalog").await;
         assert!(catalog.contains("## Anthropic (`claude`)"), "{catalog}");
-        assert!(catalog.contains("lg → `opus`"), "{catalog}");
-        assert!(catalog.contains("[default]"), "{catalog}");
         assert!(catalog.contains("`opus` — 1M context"), "{catalog}");
         assert!(catalog.contains("DGX Spark"), "{catalog}");
         assert!(
@@ -1973,7 +2227,6 @@ mod tests {
 
         let models = read(&orch, "cairn://models/catalog?view=models").await;
         assert!(models.contains("- `claude/opus`"), "{models}");
-        assert!(models.contains("`claude/lg`"), "{models}");
         assert!(models.contains("- `ollama/qwen3:32b`"), "{models}");
 
         let accounts = read(&orch, "cairn://models/accounts").await;

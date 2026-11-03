@@ -447,6 +447,98 @@ pub(crate) async fn order_thread_queue_conn(
     ))
 }
 
+/// A thread's queue as an `order` addresses it, by project key and thread
+/// name: the project's database, the project's id, and the thread.
+pub(crate) async fn queue_thread(
+    orch: &Orchestrator,
+    project: &str,
+    name: &str,
+) -> Result<(Arc<LocalDb>, String, cairn_db::models::Thread), String> {
+    let db = orch.db.for_project(project).await;
+    let project_id = crate::mcp::handlers::run_context::project_id_by_key(&db, project).await?;
+    let thread = crate::threads::crud::by_name(&db, &project_id, name).await?;
+    Ok((db, project_id, thread))
+}
+
+/// Order `thread`'s queue, the one path both the `<thread>/queue {order}`
+/// write and the operator's thread queue popover take: validated and applied
+/// in ONE write transaction ([`order_thread_queue_conn`]), then a db-change
+/// for every execution it moved. Returns what it did, or every offending
+/// entry with nothing changed. The caller has established `placed_by`'s
+/// authority.
+pub(crate) async fn order_thread_queue(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    thread: &cairn_db::models::Thread,
+    order: &[serde_json::Value],
+    placed_by: &str,
+) -> Result<String, String> {
+    let (thread_id, thread_name) = (thread.id.clone(), thread.name.clone());
+    let (entries, by) = (order.to_vec(), placed_by.to_string());
+    let outcome = db
+        .write(move |conn| {
+            let (thread_id, thread_name) = (thread_id.clone(), thread_name.clone());
+            let (entries, by) = (entries.clone(), by.clone());
+            Box::pin(async move {
+                order_thread_queue_conn(conn, &thread_id, &thread_name, &entries, &by).await
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let rotation = outcome.map_err(|refusals| {
+        let lines: Vec<String> = refusals
+            .iter()
+            .map(|refusal| format!("- {refusal}"))
+            .collect();
+        format!(
+            "{}'s queue was not ordered:\n{}\nNothing changed.",
+            thread.name,
+            lines.join("\n")
+        )
+    })?;
+    for execution_id in &rotation.moved {
+        let change =
+            crate::notify::execution_gates_db_change_for_execution(db, execution_id, "update")
+                .await;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    let listed: Vec<i64> = order.iter().filter_map(serde_json::Value::as_i64).collect();
+    Ok(ordered_summary(&thread.name, &listed, &rotation.queue))
+}
+
+/// The operator's order of a thread's queue, from the sidebar's thread queue
+/// popover: the same order a thread gives its own queue, recorded as placed
+/// by the operator. The caller has proven the operator.
+pub async fn operator_order_thread_queue(
+    orch: &Orchestrator,
+    project: &str,
+    thread: &str,
+    order: &[serde_json::Value],
+) -> Result<String, String> {
+    let (db, _, target) = queue_thread(orch, project, thread).await?;
+    order_thread_queue(orch, &db, &target, order, OPERATOR).await
+}
+
+/// `Ordered harness's queue: 5841 (fleet 3rd, thread 1st), 5829 (thread 2nd)`.
+fn ordered_summary(thread: &str, listed: &[i64], queue: &[ThreadQueued]) -> String {
+    let (front, rest): (Vec<_>, Vec<_>) = queue
+        .iter()
+        .partition(|queued| listed.contains(&queued.issue_number));
+    let named: Vec<String> = front
+        .iter()
+        .map(|queued| format!("{} ({})", queued.issue_number, places_phrase(queued, ", ")))
+        .collect();
+    let mut summary = format!("Ordered {thread}'s queue: {}", named.join(", "));
+    if !rest.is_empty() {
+        summary.push_str(&format!(
+            "; {} more behind them in their current order",
+            rest.len()
+        ));
+    }
+    summary.push('.');
+    summary
+}
+
 // ---------------------------------------------------------------------------
 // The operator's fleet move
 // ---------------------------------------------------------------------------
@@ -695,8 +787,8 @@ async fn move_under_lock(
         // nearest sibling above it that still sorts before those.
         let thread_key = |entry: &&FleetOrdered| -> Option<i64> {
             let same_thread = entry.db_index == x.db_index
-                && entry.thread_id.is_some()
-                && entry.thread_id == x.thread_id
+                && entry.queued.thread_id.is_some()
+                && entry.queued.thread_id == x.queued.thread_id
                 && entry.queued.execution_id != execution_id;
             if !same_thread {
                 return None;
@@ -1902,6 +1994,60 @@ mod tests {
 
         let refused = order(&w.env, json!([203]), "alpha").await.unwrap_err();
         assert_eq!(refused, vec!["203's place is the operator's"]);
+        assert_eq!(rows(&w.env).await, after, "a refused order changes nothing");
+    }
+
+    /// The sidebar's thread queue reads the queue view filtered by thread, so
+    /// each row carries its thread. The operator's order from it is the same
+    /// order a `<thread>/queue` write gives: alpha's own places, b1 untouched,
+    /// recorded as the operator's; a refusal names the entry and changes
+    /// nothing.
+    #[tokio::test]
+    async fn the_operators_thread_order_takes_the_threads_own_places() {
+        let w = world("operator-thread-order.db", false).await;
+        let threads: Vec<(String, Option<String>)> = queue_view(&w.env.orch)
+            .await
+            .unwrap()
+            .held
+            .into_iter()
+            .map(|held| (held.execution_id, held.thread_id))
+            .collect();
+        let alpha = Some("ta".to_string());
+        assert_eq!(
+            threads,
+            vec![
+                (w.a1.clone(), alpha.clone()),
+                (w.b1.clone(), Some("tb".to_string())),
+                (w.a2.clone(), alpha.clone()),
+                (w.a3.clone(), alpha),
+            ]
+        );
+
+        let summary = operator_order_thread_queue(&w.env.orch, "prj", "alpha", &[json!(203)])
+            .await
+            .unwrap();
+        assert!(
+            summary.starts_with("Ordered alpha's queue: 203 ("),
+            "{summary}"
+        );
+        assert_eq!(view_ids(&w.env).await, ids(&[&w.a3, &w.b1, &w.a1, &w.a2]));
+        let after = rows(&w.env).await;
+        assert_eq!(
+            placed_by(&after, &w.a3, FLEET).as_deref(),
+            Some("the operator")
+        );
+        assert!(
+            !hold(&after, &w.a3, FLEET).pinned(),
+            "an order pins nothing"
+        );
+
+        let refused = operator_order_thread_queue(&w.env.orch, "prj", "alpha", &[json!(301)])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused,
+            "alpha's queue was not ordered:\n- 301 is not a child of alpha\nNothing changed."
+        );
         assert_eq!(rows(&w.env).await, after, "a refused order changes nothing");
     }
 

@@ -14,7 +14,7 @@ use crate::agents::{agent_to_markdown, parse_agent_markdown, AgentExportData};
 use crate::config::agents::{self as config_agents, FileAgent};
 use crate::config::slugify;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Fence, LegacyOnEscape, LegacySandbox, Model};
+use crate::models::{Fence, LegacyOnEscape, LegacySandbox};
 use crate::orchestrator::Orchestrator;
 
 fn payload_string_array(
@@ -70,14 +70,9 @@ fn apply_fields(agent: &mut FileAgent, payload: &serde_json::Value) -> Result<()
     if let Some(tools) = payload_string_array(payload, "tools", None)? {
         agent.tools = tools;
     }
-    if let Some(tier) = super::payload_str(payload, "tier", &["model"]) {
-        let parsed: Model = tier
-            .parse()
-            .map_err(|e| format!("payload.tier is invalid: {e}"))?;
-        agent.tier = Some(parsed);
-    }
-    if let Some(backend) = super::payload_str(payload, "backend", &[]) {
-        agent.backend_preference = Some(backend.to_string());
+    if let Some(models) = payload_string_array(payload, "models", None)? {
+        agent.models = cairn_config::allotment::parse_allotment(&models)
+            .map_err(|e| format!("payload.models is invalid: {e}"))?;
     }
     if let Some(icon) = super::payload_str(payload, "icon", &[]) {
         agent.icon = Some(icon.to_string());
@@ -115,13 +110,12 @@ fn validate_roundtrip(agent: &FileAgent) -> Result<(), String> {
         name: &agent.name,
         description: &agent.description,
         tools: &agent.tools,
-        tier: agent.tier.as_ref().map(|m| m.to_string()).as_deref(),
+        models: &agent.models,
         prompt: &agent.prompt,
         fence: agent.fence,
         disallowed_tools: agent.disallowed_tools.as_deref(),
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
-        backend_preference: agent.backend_preference.as_deref(),
         icon: agent.icon.as_deref(),
         bundles: &agent.bundles,
         seed_budget_tokens: None,
@@ -175,12 +169,11 @@ pub(super) async fn apply_agent_create(
         description: String::new(),
         prompt: String::new(),
         tools: Vec::new(),
-        tier: None,
+        models: Vec::new(),
         fence: None,
         disallowed_tools: None,
         skills: None,
         hooks: None,
-        backend_preference: None,
         icon: None,
         bundles: Vec::new(),
         is_project_scoped,

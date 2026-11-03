@@ -1581,7 +1581,7 @@ async fn a_page_origin_reaches_only_its_owners_rows_in_the_write_path() {
     for change in [
         // Operator-only: a tenet verdict, a settings section, a recipe.
         json!({"target": "cairn://p/prj/tenets/1", "mode": "patch", "payload": {"verdict": "approved"}}),
-        json!({"target": "cairn://settings", "mode": "patch", "payload": {"backends": {}}}),
+        json!({"target": "cairn://settings", "mode": "patch", "payload": {"models": {}}}),
         json!({"target": "cairn://recipes/build", "mode": "patch", "payload": {"description": "x"}}),
         // Raw SQL, a deictic that would need a run, a file.
         json!({"target": "cairn://p/prj/roadmap/db", "mode": "patch", "payload": {"sql": "DELETE FROM attempts"}}),

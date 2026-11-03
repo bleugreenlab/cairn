@@ -316,6 +316,7 @@ fn merge_targets(
         // chat/completions to every Actual target, so there is no routing
         // decision here for this field to inform.
         .map(|(id, serving_account_ids)| DiscoveredModel {
+            maker: None,
             display_name: display_name_for(&id),
             model: id.clone(),
             description: None,

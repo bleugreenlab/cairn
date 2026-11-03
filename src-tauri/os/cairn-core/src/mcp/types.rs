@@ -104,6 +104,30 @@ pub enum TaskSessionMode {
     Fork,
 }
 
+/// The refusal for a task or call payload that names a retired model key or an
+/// empty allotment, checked before the payload is read so the caller learns
+/// what replaced the key instead of watching it be ignored.
+pub(crate) fn model_keys_problem(payload: &serde_json::Value) -> Option<String> {
+    let object = payload.as_object()?;
+    for key in ["tier", "model", "backend", "backendPreference"] {
+        if object.contains_key(key) {
+            let retired = if key == "backendPreference" {
+                "backend"
+            } else {
+                key
+            };
+            return cairn_config::allotment::retired_model_key(retired);
+        }
+    }
+    match object.get("models") {
+        Some(serde_json::Value::Array(entries)) if entries.is_empty() => Some(
+            "`models` is empty; name at least one pool or provider/model, or omit it to use the agent's allotment"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// Payload for task tool (matches native Task schema)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,10 +138,10 @@ pub struct TaskPayload {
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) subagent_type: String,
-    #[serde(default, alias = "model")]
-    pub(crate) tier: Option<String>,
-    #[serde(default, rename = "backend", alias = "backendPreference")]
-    pub(crate) backend_preference: Option<String>,
+    /// The pools and `provider/model` pairs the task selects within, replacing
+    /// its agent's allotment.
+    #[serde(default)]
+    pub(crate) models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
     /// Fire-and-forget when true: spawn and return the task URI without blocking.
     /// Accepts `runInBackground` (verb schema) or `background` (change-append payload).
     #[serde(default, alias = "background")]
@@ -158,10 +182,10 @@ pub struct CallPayload {
     /// Display title; defaults to the label or a prompt prefix.
     #[serde(default)]
     pub(crate) description: Option<String>,
-    #[serde(default, alias = "model")]
-    pub(crate) tier: Option<String>,
-    #[serde(default, rename = "backend", alias = "backendPreference")]
-    pub(crate) backend_preference: Option<String>,
+    /// The pools and `provider/model` pairs the call selects within, replacing
+    /// its agent's allotment.
+    #[serde(default)]
+    pub(crate) models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
     /// Preset name (string) or an inline custom JSON Schema (object). Absent
     /// preserves the default `return` contract.
     #[serde(default)]

@@ -3017,22 +3017,6 @@ async fn advertised_aliases_are_honored_by_dispatch() {
     }
 }
 
-/// `AGENT_TIER` advertises `model` as an alias for `tier`. Unlike a gate-
-/// checked required key, this optional field deserializes into a struct, so a
-/// missing serde alias would silently drop it rather than erroring. Pin it:
-/// agent frontmatter carrying `model` must populate `tier`.
-#[test]
-fn agent_frontmatter_honors_model_alias_for_tier() {
-    let front: crate::agents::AgentFrontmatter = serde_json::from_value(serde_json::json!({
-        "name": "Demo",
-        "description": "demo agent",
-        "tools": [],
-        "model": "md",
-    }))
-    .expect("frontmatter with model alias should deserialize");
-    assert_eq!(front.tier.as_deref(), Some("md"));
-}
-
 /// Launch overrides are refused at the write, not after the jobs exist. The
 /// preview path never reaches the start, so a refusal that shows up here is one
 /// that lands before an execution row could be created — which is the whole

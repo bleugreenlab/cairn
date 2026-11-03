@@ -1523,7 +1523,12 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         }),
     );
 
-    // ---- Reload job with its durable branch coordinate ------------------
+    // ---- Model ----------------------------------------------------------
+    // Chosen now, at the node's own launch, and stored before the session is
+    // prepared so the session opens on the chosen provider.
+    node_selection::select_job_model(orch, &owning_db, &job, Some(Path::new(&repo_path)))?;
+
+    // ---- Reload job with its durable branch coordinate and model --------
     let job = run_db(load_job(
         owning_db.clone(),
         job_id.to_string(),
@@ -2686,6 +2691,23 @@ fn continue_job_launch_locked(
     // into the agent's tool calls, where it is not. The ensure only fails when it
     // could not establish the invariant; a snapshot that already exists is
     // returned without consulting the agent files at all.
+    // ---- Model ----------------------------------------------------------
+    // A job outside any recipe node (a thread's session job) that has not
+    // chosen a model chooses at its first launch, before the host snapshot
+    // derives its selection from `jobs.model`. A recipe node chose at its
+    // cold start.
+    if job.recipe_node_id.is_none() {
+        node_selection::select_job_model(orch, &owning_db, &job, project_path.as_deref())?;
+    }
+    if job.model.is_none() {
+        job.model = run_db(load_job(
+            owning_db.clone(),
+            job_id.to_string(),
+            "Job not found after selection",
+        ))?
+        .model;
+    }
+
     let step_started = std::time::Instant::now();
     job.execution_id = run_db_borrowed(ensure_host_agent_snapshot(
         orch,
@@ -2720,9 +2742,6 @@ fn continue_job_launch_locked(
     // model edit (CAIRN-3798).
     let desired_backend = crate::backends::effective_backend_name(
         agent_config.as_ref().and_then(|ac| ac.selection.as_ref()),
-        agent_config
-            .as_ref()
-            .and_then(|ac| ac.backend_preference.as_deref()),
         job.model.as_deref(),
     );
 
@@ -8668,11 +8687,8 @@ mod tests {
     fn an_agent_default_does_not_rotate_an_untouched_thread() {
         let thread_agent_default =
             crate::models::ModelSelection::new("codex", crate::models::Model::new("gpt-5.6-sol"));
-        let desired = crate::backends::effective_backend_name(
-            Some(&thread_agent_default),
-            Some("codex"),
-            Some("fable"),
-        );
+        let desired =
+            crate::backends::effective_backend_name(Some(&thread_agent_default), Some("fable"));
         assert_eq!(desired.as_deref(), Some("claude"));
         assert_eq!(
             decide_continue_action(
@@ -8701,7 +8717,6 @@ mod tests {
             crate::models::ModelSelection::new("claude", crate::models::Model::new("fable"));
         let desired = crate::backends::effective_backend_name(
             Some(&thread_agent_default),
-            None,
             Some("gpt-5.6-sol"),
         );
         assert_eq!(desired.as_deref(), Some("codex"));

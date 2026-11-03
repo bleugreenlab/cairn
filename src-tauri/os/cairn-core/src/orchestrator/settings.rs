@@ -86,6 +86,84 @@ impl Orchestrator {
         Ok(migrated)
     }
 
+    /// Convert this workspace's tier grid into pools and a ladder, if it has
+    /// not been converted yet, and log what did not carry over exactly.
+    ///
+    /// Runs at startup after the installed-provider set is recorded, since
+    /// only installed providers' cells become ladder entries. Effort words are
+    /// placed on each model's scale by the catalog, which before discovery
+    /// answers from each provider's static vocabulary. Idempotent: once
+    /// `models` is on disk this never revisits it.
+    pub fn migrate_models(&self) -> Result<Option<Vec<String>>, String> {
+        use cairn_models::interface::Models;
+        let catalog = self.catalog(&cairn_models::interface::ModelScope::default())?;
+        let position = |selection: &crate::models::ModelSelection, level: &str| {
+            super::model_selection::position_in(&catalog, selection, level)
+        };
+        let enabled = self.enabled_providers();
+        let migrated = settings::migrate_models(&self.config_dir, &enabled, &position)?;
+        if let Some(notes) = &migrated {
+            log::info!("Converted this workspace's model tiers to pools and a ladder");
+            for note in notes {
+                log::info!("model tier conversion: {note}");
+            }
+        }
+        // A project's tier overrides convert in memory whenever they are read
+        // (`effective_models_in`), against the workspace grid, which retiring
+        // archives rather than loses. A project's repository is never written
+        // to: these are the notes its conversion would give.
+        let workspace_grid = settings::workspace_legacy_grid(&self.config_dir)?;
+        for (project_id, project_path) in self.local_project_paths() {
+            let file =
+                cairn_config::project_settings::load_project_settings_read_only(&project_path);
+            if file.models.is_some() {
+                continue;
+            }
+            if let Some((_, notes)) = cairn_config::project_settings::convert_project_tiers(
+                &file,
+                &workspace_grid,
+                &enabled,
+                &position,
+            ) {
+                log::info!(
+                    "Project {project_id}'s model tiers convert to a models overlay in memory; its .cairn/config.yaml is left as written"
+                );
+                for note in notes {
+                    log::info!("model tier conversion ({project_id}): {note}");
+                }
+            }
+        }
+        let retired = settings::retire_tier_keys(&self.config_dir)?;
+        if retired {
+            log::info!("Removed the retired tier grid from this workspace's settings");
+        }
+        if migrated.is_some() || retired {
+            let _ = self.services.emitter.emit(
+                "config-changed",
+                serde_json::json!({"entity_type": "settings"}),
+            );
+        }
+        Ok(migrated)
+    }
+
+    /// Every project with a checkout on this machine, by id.
+    fn local_project_paths(&self) -> Vec<(String, std::path::PathBuf)> {
+        let db = self.db.local.clone();
+        let projects = cairn_db::storage::run_db_blocking(move || async move {
+            crate::projects::crud::list_db(&db)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_or_default();
+        projects
+            .into_iter()
+            .filter_map(|project| {
+                let path = self.project_path(&project.id).ok()?;
+                path.exists().then_some((project.id, path))
+            })
+            .collect()
+    }
+
     /// The OS-sandbox read denylist for executor cells: the configured
     /// `sandboxDenyRead` (or the narrow built-in default of external secret
     /// stores), plus the desktop operator credential.

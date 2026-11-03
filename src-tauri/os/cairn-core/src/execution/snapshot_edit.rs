@@ -3,8 +3,8 @@
 //! Both the Tauri `update_execution_agent` command and the
 //! `cairn://p/PROJECT/NUMBER/executions/{seq}` resource patch call
 //! [`update_execution_agent`], so a URI edit and a UI edit are byte-for-byte the
-//! same operation: load the snapshot, resolve-early normalize the agent against
-//! current presets, write it back (plus the model on non-terminal jobs),
+//! same operation: load the snapshot, store the edited agent, write it back
+//! (plus a pinned model on non-terminal jobs),
 //! and propagate fence/model to any live session. The honest timing model: fence
 //! reaches a live session immediately, model and prompt on the next turn.
 //!
@@ -16,12 +16,8 @@
 //! session instead, which discarded a live conversation to deliver something the
 //! resume was already carrying (CAIRN-4618).
 
-use std::path::PathBuf;
-
 use cairn_db::turso::params;
 
-use crate::config::agents::FileAgent;
-use crate::config::presets::{load_effective_presets, resolve_agent_snapshot};
 use crate::models::AgentSnapshot;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -51,45 +47,11 @@ pub async fn update_execution_agent(
 
     let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| format!("Failed to parse snapshot: {e}"))?;
-    let project_path = project_repo_path(db, &snapshot.trigger_context.project_id).await?;
 
-    // Resolve-early against current presets. Composer output that already
-    // carries a concrete selection is stored verbatim; otherwise resolve
-    // once (loud).
-    let mut normalized_snapshot = if agent_snapshot.selection.is_some() {
-        agent_snapshot.clone()
-    } else {
-        let presets = load_effective_presets(&orch.config_dir, project_path.as_deref());
-        resolve_agent_snapshot(
-            &FileAgent {
-                id: agent_snapshot.id.clone(),
-                name: agent_snapshot.name.clone(),
-                description: agent_snapshot.description.clone(),
-                prompt: agent_snapshot.prompt.clone(),
-                tools: agent_snapshot.tools.clone(),
-                tier: agent_snapshot
-                    .tier
-                    .clone()
-                    .or_else(|| agent_snapshot.selection.as_ref().map(|s| s.model.clone())),
-                fence: agent_snapshot.fence,
-                disallowed_tools: agent_snapshot.disallowed_tools.clone(),
-                skills: agent_snapshot.skills.clone(),
-                hooks: None,
-                backend_preference: agent_snapshot.backend_preference.clone(),
-                icon: None,
-                bundles: Vec::new(),
-                is_project_scoped: project_path.is_some(),
-                file_path: PathBuf::new(),
-                seed_budget_tokens: agent_snapshot.seed_budget_tokens,
-                seed_eras: agent_snapshot.seed_eras,
-            },
-            None,
-            &presets,
-        )?
-    };
-    // An agent definition carries no account policy, so re-resolution must not
-    // be allowed to drop the one the edit chose.
-    normalized_snapshot.provider_account = agent_snapshot.provider_account.clone();
+    // The edit is stored as made: a pin runs verbatim on the agent's jobs, and
+    // an allotment is what a node that has not launched yet will select
+    // within. A job that already launched keeps the selection it stored.
+    let mut normalized_snapshot = agent_snapshot;
 
     // This is the one door an agent snapshot is edited through, so it is the one
     // place that can honestly say an edit happened. The stamp is what tells a
@@ -260,16 +222,6 @@ async fn load_execution_snapshot_json(
     .map_err(|e| format!("Failed to load execution: {e}"))
 }
 
-async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<PathBuf>, String> {
-    db.query_opt_text(
-        "SELECT repo_path FROM projects WHERE id = ?1",
-        params![project_id],
-    )
-    .await
-    .map(|path| path.map(PathBuf::from))
-    .map_err(|e| format!("Failed to load project path: {e}"))
-}
-
 /// Persist the edited snapshot itself.
 ///
 /// The per-job model deliberately does NOT travel with this write. Updating
@@ -374,8 +326,7 @@ mod tests {
             description: String::new(),
             prompt: "prompt".to_string(),
             tools: vec![],
-            tier: None,
-            backend_preference: None,
+            models: Vec::new(),
             selection: Some(ModelSelection {
                 backend: "claude".to_string(),
                 model: Model::new(model),

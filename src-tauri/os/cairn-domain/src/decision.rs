@@ -533,20 +533,24 @@ impl From<DecisionRecord> for Decision {
 #[serde(rename_all = "camelCase")]
 pub struct DecisionNode {
     pub questions: Vec<DecisionQuestion>,
-    /// A tier reference (`sm`, or `provider/tier`) or an exact model. Unset
-    /// takes the workspace's first decision-capable offer.
+    /// The allotment the decision is answered from. Unset takes the
+    /// workspace's `decisionModel`, else the best decision-capable offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub models: Option<Vec<crate::allotment::AllotmentEntry>>,
     #[serde(default, skip_serializing_if = "Thresholds::is_empty")]
     pub thresholds: Thresholds,
 }
 
 impl DecisionNode {
     /// A recipe condition's question and ports as a decision node.
-    pub fn port_choice(question: &str, ports: &[String], model: Option<String>) -> Self {
+    pub fn port_choice(
+        question: &str,
+        ports: &[String],
+        models: Option<Vec<crate::allotment::AllotmentEntry>>,
+    ) -> Self {
         Self {
             questions: vec![DecisionQuestion::port_choice(question, ports)],
-            model,
+            models,
             thresholds: Thresholds::default(),
         }
     }
@@ -879,7 +883,7 @@ mod tests {
                     kind: QuestionKind::Predicate,
                 },
             ],
-            model: None,
+            models: None,
             thresholds: Thresholds::default(),
         };
         assert!(node.problems().is_empty());
@@ -912,7 +916,7 @@ mod tests {
                     kind: QuestionKind::Predicate,
                 },
             ],
-            model: None,
+            models: None,
             thresholds: Thresholds {
                 native: Some(1.5),
                 logprobs: None,

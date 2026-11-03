@@ -146,18 +146,11 @@ impl std::fmt::Display for DecisionFailure {
     }
 }
 
-/// What a decision node asks the catalog for: the model it names, or else the
-/// workspace's decision default (`decisionModel`), or else the best offer.
-fn decision_query<'a>(
-    decision: &'a DecisionNode,
-    workspace_default: Option<&'a str>,
-) -> OfferQuery<'a> {
-    let named = decision
-        .model
-        .as_deref()
-        .filter(|model| !model.trim().is_empty());
+/// What a decision node asks the catalog for: the `provider/model` selection
+/// chose for it, or, when it has no allotment, the best offer.
+fn decision_query(target: Option<&str>) -> OfferQuery<'_> {
     OfferQuery {
-        requested: named.or(workspace_default),
+        requested: target,
         ..OfferQuery::new(VerbKind::Decide)
     }
 }
@@ -249,7 +242,7 @@ fn select(
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DecideRequest {
-    /// A catalog id, native id, alias, or `provider/tier`, as any verb's
+    /// A catalog id, native id, alias, or `provider/model`, as any verb's
     /// selector reads it. Optional only so its absence is refused by name.
     #[serde(default)]
     pub model: Option<String>,
@@ -320,17 +313,47 @@ impl Orchestrator {
         ))
     }
 
-    /// The offer a recipe's decision node would be answered by: the model it
-    /// names, else the workspace's `decisionModel`, else the best offer.
+    /// The model a decision node is answered by, as `provider/model`: chosen
+    /// within its allotment, else within the workspace's `decisionModel` (a
+    /// pool or `provider/model`), on the Decide verb. `None` when neither is
+    /// set, which leaves the choice to the catalog's best decision offer.
+    pub(crate) fn decision_target(
+        &self,
+        project_id: Option<&str>,
+        decision: &DecisionNode,
+    ) -> Result<Option<String>, String> {
+        let allotment = match &decision.models {
+            Some(models) => models.clone(),
+            None => match self.get_settings().decision_model {
+                Some(raw) => vec![cairn_config::allotment::AllotmentEntry::parse(&raw)?],
+                None => return Ok(None),
+            },
+        };
+        let record = self
+            .select_models(
+                project_id,
+                &allotment,
+                VerbKind::Decide,
+                &Default::default(),
+                Default::default(),
+            )
+            .map_err(String::from)?;
+        Ok(Some(cairn_config::allotment::model_ref(&record.chosen)))
+    }
+
+    /// The offer a recipe's decision node would be answered by
+    /// ([`Self::decision_target`]).
     pub(crate) fn node_decision_offer(
         &self,
         project_id: Option<&str>,
         decision: &DecisionNode,
     ) -> Result<SelectedOffer, DecisionFailure> {
-        let workspace_default = self.get_settings().decision_model;
+        let target = self
+            .decision_target(project_id, decision)
+            .map_err(DecisionFailure::Unanswerable)?;
         self.decision_offer(
             project_id,
-            decision_query(decision, workspace_default.as_deref()),
+            decision_query(target.as_deref()),
             &decision.questions,
         )
     }
@@ -399,7 +422,6 @@ impl Orchestrator {
             project_id: project_id.map(str::to_string),
         };
         let catalog = self.catalog(&scope);
-        let workspace_default = self.get_settings().decision_model;
         nodes
             .iter()
             .filter_map(|node| {
@@ -419,11 +441,12 @@ impl Orchestrator {
                         ))
                     }
                 };
-                let offer = match select(
-                    catalog,
-                    decision_query(decision, workspace_default.as_deref()),
-                    &decision.questions,
-                ) {
+                let target = match self.decision_target(project_id, decision) {
+                    Ok(target) => target,
+                    Err(refusal) => return Some(report(true, format!("can't be answered: {refusal}"))),
+                };
+                let offer = match select(catalog, decision_query(target.as_deref()), &decision.questions)
+                {
                     Ok(offer) => offer,
                     Err(refusal) => return Some(report(true, format!("can't be answered: {refusal}"))),
                 };
@@ -490,10 +513,12 @@ impl Orchestrator {
         let project_id = project_id.map(str::to_string);
         let decision = decision.clone();
         tokio::task::spawn_blocking(move || {
-            let workspace_default = orch.get_settings().decision_model;
+            let target = orch
+                .decision_target(project_id.as_deref(), &decision)
+                .map_err(DecisionFailure::Unanswerable)?;
             orch.decide_blocking(
                 project_id.as_deref(),
-                decision_query(&decision, workspace_default.as_deref()),
+                decision_query(target.as_deref()),
                 &decision.questions,
                 &input,
             )
@@ -1080,6 +1105,13 @@ pub(crate) mod tests {
             ..Default::default()
         })
         .unwrap();
+        orch.seed_model_catalog_for_test(cairn_models::types::catalog::ProviderModelCatalog {
+            backend: "claude".into(),
+            models: cairn_models::types::catalog::claude_models(),
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
 
         let refused = unanswerable(
             orch.decide_named(None, named_request(Some("opus"), scale()))
@@ -1166,11 +1198,14 @@ pub(crate) mod tests {
     async fn a_recipe_node_naming_an_unserved_model_is_told_what_does_serve() {
         let (orch, server, key) = workspace_with_chat_server_keyed().await;
         let options = ["yes".to_string(), "no".to_string()];
-        let recipe = decision_recipe_naming(&options, Some("not-served"));
+        let recipe = decision_recipe_naming(&options, Some(&format!("{key}/not-served")));
         let refused = orch
             .refuse_unanswerable_decisions(&recipe.nodes, None)
             .unwrap_err();
-        assert!(refused.contains("'not-served'"), "{refused}");
+        assert!(
+            refused.contains(&format!("'{key}/not-served'")),
+            "{refused}"
+        );
         assert!(
             refused.contains(&format!("offers that serve decide: {key}/qwen3")),
             "{refused}"
@@ -1201,7 +1236,7 @@ pub(crate) mod tests {
         decision_recipe_naming(options, None)
     }
 
-    /// A one-decision recipe whose node names `model`, or none.
+    /// A one-decision recipe whose node's allotment is `model` alone, or none.
     fn decision_recipe_naming(options: &[String], model: Option<&str>) -> Recipe {
         let options = options
             .iter()
@@ -1209,7 +1244,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let model = model
-            .map(|model| format!("\n      model: {model}"))
+            .map(|model| format!("\n      models: [{model}]"))
             .unwrap_or_default();
         let yaml = format!(
             r#"cairnVersion: 1
@@ -1250,7 +1285,7 @@ edges:
     #[tokio::test(flavor = "multi_thread")]
     async fn the_workspace_decision_default_answers_only_a_node_that_names_no_model() {
         use crate::models::UpdateSettings;
-        let (orch, server) = workspace_with_chat_server(Vec::new()).await;
+        let (orch, server, key) = workspace_with_chat_server_keyed().await;
         let set_default = |model: Option<&str>| {
             orch.update_settings(UpdateSettings {
                 decision_model: Some(model.map(str::to_string)),
@@ -1259,7 +1294,7 @@ edges:
             .unwrap();
         };
         let options = ["yes".to_string(), "no".to_string()];
-        let naming_qwen = decision_recipe_naming(&options, Some("qwen3"));
+        let naming_qwen = decision_recipe_naming(&options, Some(&format!("{key}/qwen3")));
         set_default(Some("not-served"));
 
         // A node naming no model asks for the workspace default.

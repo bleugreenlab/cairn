@@ -89,7 +89,7 @@ const MODELS_SIGN_IN_CODE: KeySpec = KeySpec::new(
 const MODELS_DECIDE_MODEL: KeySpec = KeySpec::new(
     "model",
     KeyType::Str,
-    "the model to decide with: a catalog id, native id, alias, or provider/tier, as cairn://models/catalog?serves=decide lists them; never chosen for you",
+    "the model to decide with: a catalog id, native id, alias, or provider/model, as cairn://models/catalog?serves=decide lists them; never chosen for you",
 );
 
 const MODELS_DECIDE_INPUT: KeySpec =
@@ -154,7 +154,7 @@ pub(crate) const MODELS_EMBED_RUN_TARGET: RunTargetSpec = RunTargetSpec {
 const MODELS_COMPLETE_MODEL: KeySpec = KeySpec::new(
     "model",
     KeyType::Str,
-    "the model to complete with: a catalog id, native id, alias, provider/model or provider/tier, as cairn://models/complete lists them; never chosen for you",
+    "the model to complete with: a catalog id, native id, alias, or provider/model, as cairn://models/complete lists them; never chosen for you",
 );
 
 const MODELS_COMPLETE_PROMPT: KeySpec = KeySpec::new(
@@ -314,10 +314,10 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Models,
     uri_template: "cairn://models",
     name: "Models facet",
-    description: "The cairn-models facet: how tokens are produced, routed, and accounted. An index of its resources: the catalog of providers, models, and tier bindings; the provider accounts and their usage windows; each provider's pooled capacity; and the live model sessions. Every read shows what Settings → Providers shows for this workspace, and none reveals a credential value.",
+    description: "The cairn-models facet: how tokens are produced, routed, and accounted. An index of its resources: the catalog of providers and models; the provider accounts and their usage windows; each provider's pooled capacity; and the live model sessions. Every read shows what Settings → Providers shows for this workspace, and none reveals a credential value.",
     read_projections: NO_PROJECTIONS,
     related: &[
-        RelatedSpec { label: "providers, models, and tier bindings", kind: ResourceKind::ModelsCatalog, actions: false },
+        RelatedSpec { label: "providers and models", kind: ResourceKind::ModelsCatalog, actions: false },
         RelatedSpec { label: "answer typed questions with a named model (a run target)", kind: ResourceKind::ModelsDecide, actions: false },
         RelatedSpec { label: "embed texts with a named model (a run target)", kind: ResourceKind::ModelsEmbed, actions: false },
         RelatedSpec { label: "send one completion to a named model (a run target)", kind: ResourceKind::ModelsComplete, actions: false },
@@ -325,6 +325,8 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
         RelatedSpec { label: "speak text as an audio clip (a run target)", kind: ResourceKind::ModelsSpeak, actions: false },
         RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::ModelsAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
+        RelatedSpec { label: "pools, bands, and the capability ladder", kind: ResourceKind::ModelsLadder, actions: false },
+        RelatedSpec { label: "what an allotment would select now", kind: ResourceKind::ModelsSelection, actions: false },
         RelatedSpec { label: "the embedding model and how far history is embedded in it", kind: ResourceKind::ModelsEmbeddings, actions: false },
         RelatedSpec { label: "live model sessions", kind: ResourceKind::ModelsSessions, actions: false },
         RelatedSpec { label: "outside clients of the served OpenAI-compatible API and their keys", kind: ResourceKind::ModelsClients, actions: false },
@@ -337,9 +339,9 @@ pub(crate) const MODELS_CATALOG_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsCatalog,
     uri_template: "cairn://models/catalog",
     name: "Model catalog",
-    description: "Every provider this workspace installed, in the order Settings → Providers lists them: its category, whether an account or host is configured, what model discovery last found (id, name, context window, pricing where the provider reports it with each price in its own unit, what the model takes in and gives out, and the verbs it serves with the wire each rides; or the discovery error), the tiers bound to it, what the provider serves for any model it routes, and any model observed unable to serve a verb it declares, with why. A tier marked default is where an unqualified tier reference such as `lg` resolves; `claude/lg` names the provider outright. The same catalog is what tier resolution and context-window lookup read, so a binding shown here is the binding a launch gets.",
+    description: "Every provider this workspace installed, in the order Settings → Providers lists them: its category, whether an account or host is configured, what model discovery last found (id, name, context window, pricing where the provider reports it with each price in its own unit, what the model takes in and gives out, and the verbs it serves with the wire each rides; or the discovery error), what the provider serves for any model it routes, and any model observed unable to serve a verb it declares, with why. The same catalog is what selection and context-window lookup read, so a model listed here is one an allotment can select.",
     read_projections: &[
-        ProjectionSpec { key: "view", values: "providers (default) | models — each model once under its catalog id (the provider's canonical slug, else provider/model), with every provider offering it and the tier references bound to it" },
+        ProjectionSpec { key: "view", values: "providers (default) | models — each model once under its catalog id (the provider's canonical slug, else provider/model), with every provider offering it" },
         ProjectionSpec { key: "provider", values: "KEY — one provider, e.g. claude, codex, openrouter, custom:<account id>" },
         ProjectionSpec { key: "installed", values: "all — also list the supported providers this workspace has not installed (the Add-provider list)" },
         ProjectionSpec { key: "serves", values: "complete | session | decide | image | embed — only the models (in either view) that serve that verb; an image offer also says what it can draw (count, references, aspect ratios or sizes, mask), and an embed offer its width, which widths it can return, how it tells documents from queries, and its batch limits" },
@@ -477,6 +479,34 @@ pub(crate) const MODELS_USAGE_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const MODELS_LADDER_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsLadder,
+    uri_template: "cairn://models/ladder",
+    name: "Model ladder",
+    description: "The pools an allotment names and the capability ladder they slice, as Settings → Models shows them. Each pool with its description and kind: a band of the ladder (from its min to the next band's), or a hand-picked set and its members. The bands in order with their bounds. Every ladder entry, highest level first: its level on 0..1 and where that came from (set by a person, seeded by Cairn, measured), its band, its maker, its effort position with the level it launches at and its model's effort scale, its other launch options, and the set pools it belongs to. Then the served session models on installed providers that are not on the ladder (unranked), the default allotment, and any notes from the one-time conversion from tiers. Change it with a `cairn://settings` patch of `models`.",
+    read_projections: NO_PROJECTIONS,
+    related: &[
+        RelatedSpec { label: "what an allotment would select now", kind: ResourceKind::ModelsSelection, actions: false },
+        RelatedSpec { label: "providers and their discovered models", kind: ResourceKind::ModelsCatalog, actions: false },
+    ],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_SELECTION_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsSelection,
+    uri_template: "cairn://models/selection",
+    name: "Model selection preview",
+    description: "What an allotment would run on if it launched now, with the same selection a launch makes: the allotment expanded against the pools and ladder, the candidates the catalog serves for the verb, the band its top falls in, the band's candidates in supply order (expiring subscription allotment first, then headroom, then metered price) with what each costs now, the candidates set aside and why, the chosen model, account and effort, and the one-line provenance. A preview: nothing is stored and no provider is probed, so it reads the usage last measured. A model named directly is never replaced; when it cannot run the preview says why instead.",
+    read_projections: &[
+        ProjectionSpec { key: "models", values: "ENTRY,ENTRY — the allotment: pool ids and provider/model pairs, e.g. lg,claude/fable (default: the workspace's defaultModels)" },
+        ProjectionSpec { key: "verb", values: "session (default) | complete | decide — what the launch would run" },
+    ],
+    related: &[RelatedSpec { label: "the pools and ladder an allotment names", kind: ResourceKind::ModelsLadder, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const MODELS_EMBEDDINGS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsEmbeddings,
     uri_template: "cairn://models/embeddings",
@@ -492,13 +522,13 @@ pub(crate) const MODELS_SESSIONS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsSessions,
     uri_template: "cairn://models/sessions",
     name: "Model sessions",
-    description: "Every live model session on this host: its session id, the node it belongs to, provider, model, the account its launch chose, the provider's own id for the conversation, the machine it runs on (`local` today), whether it is busy (starting, serving a turn, or holding one open) or warm (parked between turns, resumable without a new process), and when it started. Read cairn://models/sessions/<id> for one session and to stop it. To start a session, append a task to `cairn:~/tasks` (choose the provider and model with `backend`/`tier`); to send a live session a message, append to its home's `/messages` (the home is shown on each session). This resource reads and stops sessions; it does not duplicate those doors.",
+    description: "Every live model session on this host: its session id, the node it belongs to, provider, model, the account its launch chose, the provider's own id for the conversation, the machine it runs on (`local` today), whether it is busy (starting, serving a turn, or holding one open) or warm (parked between turns, resumable without a new process), and when it started. Read cairn://models/sessions/<id> for one session and to stop it. To start a session, append a task to `cairn:~/tasks` (choose its model with `models`, an allotment of pools and provider/model pairs); to send a live session a message, append to its home's `/messages` (the home is shown on each session). This resource reads and stops sessions; it does not duplicate those doors.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: &[CrossActionSpec {
         kind: ResourceKind::NodeTasks,
         mode: ChangeMode::Append,
-        label: "start a session: delegate a task (choose its provider and model with backend/tier)",
+        label: "start a session: delegate a task (choose its model with models)",
     }],
     mutations: NO_MUTATIONS,
 };

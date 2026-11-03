@@ -37,8 +37,7 @@ use serde_json::{Map, Value};
 
 use super::recipe::{AgentNodeConfig, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType};
 use super::snapshot::{
-    merge_agent_patch, selection_inputs, AgentSnapshot, ExecutionSnapshot, RecipeSnapshot,
-    SnapshotOverrides,
+    merge_agent_patch, AgentSnapshot, ExecutionSnapshot, RecipeSnapshot, SnapshotOverrides,
 };
 
 /// How a launch customizes the snapshot it freezes. The two grammars are
@@ -52,56 +51,18 @@ pub enum LaunchCustomization {
     Deltas(LaunchDeltas),
 }
 
-impl LaunchCustomization {
-    /// The agents this launch chose a model for explicitly.
-    ///
-    /// Label routing is the input of last resort before an agent's own authored
-    /// tier, so it must never contest a human's choice. Rather than letting that
-    /// precedence emerge from the order the layers happen to apply in, the launch
-    /// path asks here once, up front, and routes only the agents nobody pinned.
-    ///
-    /// The two grammars express a pin differently. The composer sends a whole
-    /// resolved `AgentSnapshot`, where the pin is the concrete `selection` (its
-    /// `tier` is the agent config's own pre-fill, carried along rather than
-    /// chosen). A delta sends a field patch, where the pin is `selection` or any
-    /// of the authored inputs a selection is resolved from -- the same
-    /// `SELECTION_INPUTS` that decide when a merge invalidates a frozen
-    /// selection, so "what counts as choosing a model" is defined once.
-    pub fn pinned_agent_ids(&self) -> HashSet<String> {
-        match self {
-            LaunchCustomization::Snapshot(overrides) => overrides
-                .agents
-                .iter()
-                .flatten()
-                .filter(|(_, agent)| agent.selection.is_some())
-                .map(|(id, _)| id.clone())
-                .collect(),
-            LaunchCustomization::Deltas(deltas) => deltas
-                .agents
-                .iter()
-                .filter(|merge| {
-                    merge.patch.contains_key("selection")
-                        || selection_inputs()
-                            .iter()
-                            .any(|key| merge.patch.contains_key(*key))
-                })
-                .map(|merge| merge.agent_id.clone())
-                .collect(),
-        }
-    }
-}
+impl LaunchCustomization {}
 
 /// The delta keys, in application order.
 const DELTA_KEYS: &[&str] = &["without", "nodes", "agents"];
 
 /// Agent-snapshot fields a launch merge may carry. Deliberately a closed list:
 /// an unrecognized key is a typo that would otherwise be dropped in silence, and
-/// a caller who writes `{model: "opus"}` needs to be told the field is `tier`
+/// a caller who writes `{tier: "lg"}` needs to be told the field is `models`
 /// rather than watch the launch ignore it.
 const AGENT_PATCH_KEYS: &[&str] = &[
     "prompt",
-    "tier",
-    "backend",
+    "models",
     "selection",
     "tools",
     "disallowedTools",
@@ -341,6 +302,8 @@ impl LaunchDeltas {
             node.agent_config
                 .get_or_insert(AgentNodeConfig {
                     agent_config_id: None,
+                    models: None,
+                    constraints: Default::default(),
                     output_schema: None,
                     git_config: None,
                 })
@@ -397,10 +360,14 @@ fn validate_agent_patch(agent_id: &str, patch: &Map<String, Value>) -> Result<()
         .keys()
         .find(|key| !AGENT_PATCH_KEYS.contains(&key.as_str()))
     {
-        let hint = match unknown.as_str() {
-            "model" => " (the model tier is `tier`; a concrete backend+model pair is `selection`)",
-            "agent" => " (to change which agent a node runs, use overrides.nodes)",
-            _ => "",
+        let hint = match crate::allotment::retired_model_key(unknown) {
+            Some(instruction) => {
+                format!(" ({instruction}; a concrete backend+model pin is `selection`)")
+            }
+            None if unknown == "agent" => {
+                " (to change which agent a node runs, use overrides.nodes)".to_string()
+            }
+            None => String::new(),
         };
         return Err(format!(
             "overrides.agents.{agent_id}.{unknown} is not an agent snapshot field{hint}; accepted fields are {}",
@@ -627,8 +594,7 @@ mod tests {
             description: String::new(),
             prompt: format!("prompt for {id}"),
             tools: vec![],
-            tier: Some(Model::new(model)),
-            backend_preference: None,
+            models: vec![],
             selection: Some(ModelSelection::new("claude", Model::new(model))),
             provider_account: None,
             disallowed_tools: None,
@@ -970,19 +936,23 @@ mod tests {
     // `agents` — snapshot-field merges
     // ---------------------------------------------------------------
 
-    /// A merge that moves the authored tier must drop the frozen selection, or
-    /// the runtime would keep reading the pair it resolved before the patch and
-    /// the caller would silently get sonnet after asking for opus.
+    /// A merge that moves the allotment must drop a pin, or the launch would
+    /// keep running the pinned model and the caller would silently get it
+    /// after asking for `[lg]`.
     #[test]
-    fn agents_merge_of_a_tier_invalidates_the_frozen_selection() {
+    fn agents_merge_of_models_drops_the_pin() {
         let snapshot = snapshot_from_yaml(BUILD_YAML);
-        let overrides = compile(&snapshot, json!({"agents": {"build": {"tier": "opus"}}})).unwrap();
+        let overrides =
+            compile(&snapshot, json!({"agents": {"build": {"models": ["lg"]}}})).unwrap();
         let build = &overrides.agents.as_ref().unwrap()["build"];
 
-        assert_eq!(build.tier.as_ref().unwrap().as_str(), "opus");
+        assert_eq!(
+            build.models,
+            vec![crate::allotment::AllotmentEntry::Pool("lg".into())]
+        );
         assert!(
             build.selection.is_none(),
-            "a stale selection must not survive a tier change"
+            "a pin must not survive an allotment change"
         );
     }
 
@@ -1028,7 +998,7 @@ mod tests {
         let snapshot = snapshot_from_yaml(PLANBUILD_YAML);
         let error = compile(
             &snapshot,
-            json!({"without": ["review"], "agents": {"pr-review": {"tier": "opus"}}}),
+            json!({"without": ["review"], "agents": {"pr-review": {"models": ["lg"]}}}),
         )
         .unwrap_err();
         assert!(error.contains("runs no such agent"), "{error}");
@@ -1050,9 +1020,15 @@ mod tests {
     #[test]
     fn agents_refuses_a_field_that_would_be_ignored() {
         let snapshot = snapshot_from_yaml(BUILD_YAML);
-        let error =
-            compile(&snapshot, json!({"agents": {"build": {"model": "opus"}}})).unwrap_err();
-        assert!(error.contains("the model tier is `tier`"), "{error}");
+        for retired in ["tier", "model", "backend"] {
+            let error =
+                compile(&snapshot, json!({"agents": {"build": {retired: "lg"}}})).unwrap_err();
+            assert!(error.contains("models: ["), "{retired}: {error}");
+            assert!(
+                error.contains("docs/backends.md#model-selection"),
+                "{error}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1081,7 +1057,7 @@ mod tests {
             .unwrap_err()
             .contains("agent is required"));
         assert!(LaunchDeltas::parse(
-            &json!({"nodes": {"builder": {"agent": "x", "tier": "opus"}}})
+            &json!({"nodes": {"builder": {"agent": "x", "models": ["lg"]}}})
         )
         .unwrap_err()
         .contains("a node rebind takes only `agent`"));
@@ -1112,91 +1088,5 @@ mod tests {
             serde_json::to_value(recipe_of(&overrides)).unwrap(),
             serde_json::to_value(&snapshot.recipe).unwrap()
         );
-    }
-}
-
-#[cfg(test)]
-mod pinned_agent_tests {
-    use super::*;
-    use crate::{Model, ModelSelection};
-    use serde_json::json;
-
-    fn agent(id: &str, selection: Option<ModelSelection>) -> AgentSnapshot {
-        AgentSnapshot {
-            edited_at: None,
-            id: id.to_string(),
-            name: id.to_string(),
-            description: String::new(),
-            prompt: String::new(),
-            tools: vec![],
-            // The composer sends the agent config's own tier as a pre-fill on
-            // every row, chosen or not, which is exactly why a pin is read off
-            // `selection` rather than off this.
-            tier: Some(Model::new("md")),
-            backend_preference: None,
-            selection,
-            provider_account: None,
-            disallowed_tools: None,
-            skills: None,
-            fence: None,
-            sandbox: None,
-            on_escape: None,
-            extras: None,
-            model: None,
-            resolved_backend: None,
-            seed_budget_tokens: None,
-            seed_eras: None,
-        }
-    }
-
-    #[test]
-    fn composer_snapshot_pins_exactly_the_agents_carrying_a_selection() {
-        let overrides = SnapshotOverrides {
-            recipe: None,
-            agents: Some(HashMap::from([
-                (
-                    "builder".to_string(),
-                    agent(
-                        "builder",
-                        Some(ModelSelection::new("claude", Model::new("opus"))),
-                    ),
-                ),
-                ("review".to_string(), agent("review", None)),
-            ])),
-        };
-        let pinned = LaunchCustomization::Snapshot(overrides).pinned_agent_ids();
-        assert_eq!(pinned, HashSet::from(["builder".to_string()]));
-    }
-
-    #[test]
-    fn a_delta_pins_on_selection_or_any_authored_input() {
-        for key in ["selection", "tier", "backend"] {
-            let deltas = LaunchDeltas::parse(&json!({
-                "agents": {"builder": {key: if key == "selection" {
-                    json!({"backend": "claude", "model": "opus"})
-                } else {
-                    json!("lg")
-                }}}
-            }))
-            .unwrap_or_else(|error| panic!("delta with {key} parses: {error}"));
-            assert_eq!(
-                LaunchCustomization::Deltas(deltas).pinned_agent_ids(),
-                HashSet::from(["builder".to_string()]),
-                "a delta carrying {key} is an explicit model choice"
-            );
-        }
-    }
-
-    /// A delta that changes something other than the model leaves that agent
-    /// routable -- "skip review" is not a statement about which model runs.
-    #[test]
-    fn a_delta_touching_no_model_input_pins_nothing() {
-        let deltas = LaunchDeltas::parse(&json!({
-            "agents": {"builder": {"prompt": "do the thing"}}
-        }))
-        .expect("prompt-only delta parses");
-        assert!(LaunchCustomization::Deltas(deltas)
-            .pinned_agent_ids()
-            .is_empty());
     }
 }

@@ -1612,7 +1612,7 @@ async fn the_decision_asks_valid_questions_and_parses_by_name() {
     let candidates: Vec<_> = views.iter().collect();
     let decision = judge::decision(&candidates);
     assert!(decision.problems().is_empty(), "{:?}", decision.problems());
-    assert_eq!(decision.model, None, "the first decision-capable offer");
+    assert_eq!(decision.models, None, "the first decision-capable offer");
     assert!(
         decision.thresholds.is_empty(),
         "the worker applies its own floor"

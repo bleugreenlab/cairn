@@ -1561,7 +1561,6 @@ pub(crate) mod tests {
             None,
             None,
             None,
-            None,
             LaunchIntent::NewAttempt,
             clauses,
             crate::execution::recipe::QueuePlace::Tail,

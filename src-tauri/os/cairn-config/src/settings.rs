@@ -11,11 +11,16 @@ use std::sync::{Mutex, OnceLock};
 
 use cairn_common::logging::LogLevel;
 
+use crate::allotment::{
+    convert_decision_model, convert_tiers, Conversion, LegacyTiers, ModelsConfig, PositionFn,
+};
+use crate::legacy_presets::{
+    default_claude_presets, default_grid, tier_defaults_from_single_backend, LEGACY_TIERS,
+};
 use crate::models::{
     ChannelsConfig, ExternalReplyMode, MergeType, Model, OpenRouterRouting, Preset, Settings,
     ThinkingDisplayMode, TranscriptDensity, TranscriptTextSize, UpdateSettings,
 };
-use crate::presets::{default_presets_config, PresetsConfig};
 
 /// Where a warm thread rebuilds by default: four fifths of the model's context
 /// window. High enough that an ordinary working session never reaches it, low
@@ -203,14 +208,18 @@ pub struct SettingsFile {
     /// from the managed voice manifest rather than trusted from settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<crate::voice::VoicePreferences>,
-    // === Preset fields (new) ===
-    /// Tier name -> the backend that serves it by default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // === The retired tier grid: read only, as input to the one-time
+    // conversion into `models` ([`SettingsFile::legacy_grid`]) ===
+    #[serde(default, skip_serializing)]
     tier_defaults: Option<HashMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     tiers: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// Pools, the capability ladder, and the default allotment. Absent until
+    /// [`migrate_models`] converts the tier grid above into it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    models: Option<ModelsConfig>,
     /// The providers this workspace has installed.
     ///
     /// Absent means the workspace predates installable providers, and is read
@@ -221,8 +230,8 @@ pub struct SettingsFile {
     /// re-derived from whichever credentials happen to exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enabled_providers: Option<Vec<String>>,
-    /// The model or tier a decision node that names none is answered by.
-    /// Absent: the catalog's best decision offer.
+    /// The pool or `provider/model` a decision node that names no `models` is
+    /// answered from. Absent: the catalog's best decision offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     decision_model: Option<String>,
     /// The image model a request naming none is drawn by. Absent: refused.
@@ -241,9 +250,8 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<HashMap<String, cairn_packs::server_config::McpServerConfig>>,
 
-    /// Legacy global default provider. Read only, and dropped from the file on
-    /// the next save: it meant "every tier resolves against this one backend",
-    /// which `tier_defaults` now says per tier.
+    /// Legacy global default provider, read only as conversion input: it meant
+    /// "every tier resolves against this one backend".
     #[serde(default, skip_serializing)]
     active_backend: Option<String>,
 
@@ -464,7 +472,7 @@ fn migrate_legacy_models_to_presets(
 ) {
     // Build a map: default_model_str → tier_name for matching
     let default_model_to_tier: HashMap<String, String> = {
-        let defaults = crate::presets::default_claude_presets(Some(31999));
+        let defaults = default_claude_presets(Some(31999));
         defaults
             .into_iter()
             .map(|(tier, preset)| (preset.model.as_str().to_string(), tier))
@@ -501,7 +509,80 @@ fn migrate_legacy_models_to_presets(
     }
 }
 
+/// The tier x provider grid a settings file described before `models`,
+/// effective as it last resolved: the shipped cells with the file's laid over
+/// them per backend, and a legacy `activeBackend` expanded into each tier's
+/// default. Read only by the one-time conversion, and kept after the grid is
+/// retired ([`RETIRED_GRID_FILE`]) because a project's tier overrides are
+/// differences from it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyGrid {
+    pub tiers: Vec<String>,
+    pub tier_defaults: HashMap<String, String>,
+    pub backends: HashMap<String, HashMap<String, Preset>>,
+}
+
+impl LegacyGrid {
+    pub fn as_tiers(&self) -> LegacyTiers<'_> {
+        LegacyTiers {
+            tiers: &self.tiers,
+            tier_defaults: &self.tier_defaults,
+            backends: &self.backends,
+        }
+    }
+}
+
 impl SettingsFile {
+    /// Whether this file still carries any of the retired tier grid keys.
+    pub fn has_tier_grid(&self) -> bool {
+        self.tier_defaults.is_some()
+            || self.tiers.is_some()
+            || self.backends.is_some()
+            || self.active_backend.is_some()
+    }
+
+    /// The tier grid this file describes, effective as it last resolved.
+    ///
+    /// The set of known backends is defined in code, not in the file, so every
+    /// shipped provider appears while the user's cells still win; legacy
+    /// `defaultModel` / `preferredModels` patch the Claude cells of a file that
+    /// never had a grid.
+    pub fn legacy_grid(&self) -> LegacyGrid {
+        let max_thinking_tokens = match self.max_thinking_tokens {
+            None => Some(31999),
+            Some(inner) => inner,
+        };
+        let mut backends = default_grid(max_thinking_tokens);
+        let tiers: Vec<String> = match &self.backends {
+            Some(on_disk) => {
+                for (name, presets) in on_disk.clone() {
+                    backends.insert(name, presets);
+                }
+                self.resolved_tiers()
+            }
+            None => {
+                let tiers: Vec<String> = LEGACY_TIERS.iter().map(|s| s.to_string()).collect();
+                let legacy_models = match (&self.preferred_models, &self.default_model) {
+                    (Some(models), _) if !models.is_empty() => models.clone(),
+                    (_, Some(model)) => vec![model.clone()],
+                    _ => vec![],
+                };
+                if !legacy_models.is_empty() {
+                    if let Some(claude_presets) = backends.get_mut("claude") {
+                        migrate_legacy_models_to_presets(&legacy_models, claude_presets, &tiers);
+                    }
+                }
+                tiers
+            }
+        };
+        LegacyGrid {
+            tier_defaults: self.resolved_tier_defaults(&tiers),
+            tiers,
+            backends,
+        }
+    }
+
     /// The per-tier default backends this file describes, narrowed to `tiers`.
     ///
     /// Precedence is explicit `tierDefaults`, then the legacy global
@@ -520,17 +601,14 @@ impl SettingsFile {
                 .collect();
         }
         let legacy = self.active_backend.as_deref().unwrap_or("claude");
-        crate::presets::tier_defaults_from_single_backend(legacy, tiers)
+        tier_defaults_from_single_backend(legacy, tiers)
     }
 
     /// The tier list this file describes, defaulted when it names none.
     fn resolved_tiers(&self) -> Vec<String> {
-        self.tiers.clone().unwrap_or_else(|| {
-            crate::presets::DEFAULT_TIERS
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        })
+        self.tiers
+            .clone()
+            .unwrap_or_else(|| LEGACY_TIERS.iter().map(|s| s.to_string()).collect())
     }
 
     /// The providers a workspace that predates installable providers
@@ -566,65 +644,14 @@ impl SettingsFile {
     }
 
     /// Convert to Settings DTO with defaults applied.
-    ///
-    /// Migration: if `backends` is absent but legacy model fields are present,
-    /// builds default presets using the legacy values.
     pub fn to_settings(&self) -> Settings {
-        // Resolve max_thinking_tokens (used for both legacy compat and preset defaults)
         let max_thinking_tokens = match self.max_thinking_tokens {
             None => Some(31999),  // Missing field → default enabled
             Some(inner) => inner, // Explicit value (None or Some(n))
         };
 
-        // Build presets config (migrate from legacy if needed)
-        let presets: PresetsConfig = if let Some(ref backends) = self.backends {
-            // The set of known backends is defined in code, not in the settings
-            // file. Start from the full default set so every available provider
-            // (including ones added after this install was first configured)
-            // always appears, then overlay the on-disk customizations per
-            // backend so the user's tier choices still win. Without this, an
-            // older settings.yaml that names only `claude`/`codex` would hide a
-            // newer backend like `openrouter` entirely.
-            let mut merged = default_presets_config(max_thinking_tokens).backends;
-            for (name, presets) in backends.clone() {
-                merged.insert(name, presets);
-            }
-            let tiers = self.resolved_tiers();
-            PresetsConfig {
-                tier_defaults: self.resolved_tier_defaults(&tiers),
-                tiers,
-                backends: merged,
-                // Carried on the Settings DTO instead; `load_effective_presets`
-                // is where enablement joins a resolution config.
-                enabled_providers: None,
-            }
-        } else {
-            // Legacy migration: build default presets, then overlay legacy model fields.
-            let mut config = default_presets_config(max_thinking_tokens);
-
-            // Honor legacy defaultModel / preferredModels by patching Claude presets.
-            // Strategy: match each legacy model to the tier whose default it matches,
-            // then assign remaining models to remaining tiers by position.
-            let legacy_models = match (&self.preferred_models, &self.default_model) {
-                (Some(models), _) if !models.is_empty() => models.clone(),
-                (_, Some(model)) => vec![model.clone()],
-                _ => vec![],
-            };
-
-            if !legacy_models.is_empty() {
-                if let Some(claude_presets) = config.backends.get_mut("claude") {
-                    migrate_legacy_models_to_presets(&legacy_models, claude_presets, &config.tiers);
-                }
-            }
-
-            config.tier_defaults = self.resolved_tier_defaults(&config.tiers);
-            config
-        };
-
         Settings {
-            tier_defaults: presets.tier_defaults,
-            tiers: presets.tiers,
-            backends: presets.backends,
+            models: self.models.clone(),
             // A built-in provider is never one a workspace installed, even
             // where an older file still names it.
             enabled_providers: match &self.enabled_providers {
@@ -705,10 +732,11 @@ impl SettingsFile {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
             voice: None,
-            tier_defaults: Some(settings.tier_defaults.clone()),
+            tier_defaults: None,
             active_backend: None,
-            tiers: Some(settings.tiers.clone()),
-            backends: Some(settings.backends.clone()),
+            tiers: None,
+            backends: None,
+            models: settings.models.clone(),
             enabled_providers: Some(settings.enabled_providers.clone()),
             decision_model: settings.decision_model.clone(),
             image_model: settings.image_model.clone(),
@@ -1202,12 +1230,7 @@ pub fn load_settings_file(config_dir: &std::path::Path) -> Result<SettingsFile, 
 }
 
 const SETTINGS_DTO_KEYS: &[&str] = &[
-    "tierDefaults",
-    // Removed DTO key: the next save deletes the legacy global toggle once its
-    // value has migrated into per-tier defaults.
-    "activeBackend",
-    "tiers",
-    "backends",
+    "models",
     "enabledProviders",
     "decisionModel",
     "imageModel",
@@ -1242,7 +1265,11 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "autoStartJobs",
 ];
 
-fn merge_settings_keys(root: &mut serde_yaml::Mapping, settings: &Settings) -> Result<(), String> {
+fn merge_settings_keys(
+    config_dir: &std::path::Path,
+    root: &mut serde_yaml::Mapping,
+    settings: &Settings,
+) -> Result<(), String> {
     let target = serde_yaml::to_value(SettingsFile::from_settings(settings))
         .map_err(|error| format!("Failed to serialize settings: {error}"))?;
     let target = target
@@ -1259,13 +1286,17 @@ fn merge_settings_keys(root: &mut serde_yaml::Mapping, settings: &Settings) -> R
             }
         }
     }
+    // The tier grid is no DTO key, but a save retires it like one, and only
+    // once `models` is written: until then the grid is the only record of
+    // the user's model choices, and the one-time conversion still reads it.
+    retire_grid_in(config_dir, root)?;
     Ok(())
 }
 
 /// Save only the top-level keys owned by the general Settings DTO.
 pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Result<(), String> {
     mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
-        merge_settings_keys(root, settings)
+        merge_settings_keys(config_dir, root, settings)
     })
 }
 
@@ -1285,11 +1316,234 @@ pub fn update_settings(
                 .map_err(|error| format!("Failed to parse settings file: {error}"))?;
         let mut current = file.to_settings();
         let enablement_changed = input.enabled_providers.is_some();
+        let models_changed = input.models.is_some();
+        let enabled_before = current.enabled_providers.clone();
         apply_settings_update(&mut current, input);
+        drop_removed_providers(&mut current, &enabled_before);
         validate_enabled_providers(&current, enablement_changed, provider_names)?;
-        merge_settings_keys(root, &current)?;
+        if let (true, Some(models)) = (models_changed, &current.models) {
+            models.validate()?;
+        }
+        merge_settings_keys(config_dir, root, &current)?;
         Ok(current)
     })
+}
+
+/// Take every provider this update uninstalled off the ladder and out of
+/// every hand-picked pool. A pool or ladder entry naming a provider the
+/// workspace no longer has could never be selected, so it goes with the
+/// provider rather than lingering as a candidate that always refuses.
+fn drop_removed_providers(settings: &mut Settings, enabled_before: &[String]) {
+    let Some(models) = settings.models.as_mut() else {
+        return;
+    };
+    for provider in enabled_before {
+        if !settings.enabled_providers.contains(provider) {
+            let dropped = models.drop_provider(provider);
+            if !dropped.is_empty() {
+                log::info!(
+                    "Removing {provider} took {} off the ladder and out of its pools",
+                    dropped.join(", ")
+                );
+            }
+        }
+    }
+}
+
+/// The tier grid `file` describes, converted into pools and a ladder. The
+/// grid is the effective one ([`SettingsFile::legacy_grid`]), so shipped
+/// cells the user never edited count, and a legacy `activeBackend` has
+/// already become each tier's default.
+pub fn convert_settings_tiers(
+    file: &SettingsFile,
+    enabled: &[String],
+    position: PositionFn<'_>,
+) -> Conversion {
+    let mut conversion = convert_tiers(
+        &file.legacy_grid().as_tiers(),
+        enabled,
+        non_blank(&file.decision_model).as_deref(),
+        position,
+    );
+    let skipped = cells_of_disabled_providers(file.backends.as_ref(), enabled);
+    // The Models page notice reads `conversion_notes`, so the skipped cells
+    // go there as well as to the log.
+    conversion
+        .models
+        .conversion_notes
+        .extend(skipped.iter().cloned());
+    conversion.notes.extend(skipped);
+    conversion
+}
+
+/// The cells the user configured for providers that are not enabled. Only
+/// enabled providers reach the ladder and the grid is retired afterwards, so
+/// these are named rather than dropped in silence. Read from the user's own
+/// file, not the effective grid, so shipped cells nobody chose stay unnamed.
+fn cells_of_disabled_providers(
+    backends: Option<&HashMap<String, HashMap<String, Preset>>>,
+    enabled: &[String],
+) -> Vec<String> {
+    let Some(backends) = backends else {
+        return Vec::new();
+    };
+    let mut skipped: Vec<(&String, Vec<String>)> = backends
+        .iter()
+        .filter(|(backend, _)| !enabled.contains(backend))
+        .filter_map(|(backend, tiers)| {
+            let mut cells: Vec<String> = tiers
+                .iter()
+                .map(|(tier, preset)| format!("{tier} {}", preset.model.as_str()))
+                .collect();
+            cells.sort();
+            (!cells.is_empty()).then_some((backend, cells))
+        })
+        .collect();
+    skipped.sort();
+    skipped
+        .into_iter()
+        .map(|(backend, cells)| {
+            format!(
+                "{backend} is not enabled, so its cells were not converted ({}); add them on the Models page if you enable it",
+                cells.join(", ")
+            )
+        })
+        .collect()
+}
+
+const MODELS_KEY: &str = "models";
+
+/// The keys of the tier grid that `models` replaces.
+const TIER_GRID_KEYS: &[&str] = &["tierDefaults", "tiers", "backends", "activeBackend"];
+
+/// Convert this workspace's tier grid into pools and a ladder, once.
+///
+/// Writes `models` and returns the conversion notes, or `None` when the file
+/// already has a `models` key, which is the whole guard: running it again
+/// never revisits the user's pools. A workspace with no file, or one that
+/// never touched the grid, converts the shipped cells, which is the seed a
+/// fresh install starts from. `position` places a stored effort word on its
+/// model's own scale (the catalog provider's `position`).
+///
+/// The tier keys stay on disk; [`retire_tier_keys`] removes them once nothing
+/// resolves against them.
+pub fn migrate_models(
+    config_dir: &std::path::Path,
+    enabled: &[String],
+    position: PositionFn<'_>,
+) -> Result<Option<Vec<String>>, String> {
+    mutate_workspace_settings(config_dir, "cairn: convert tiers to model pools", |root| {
+        let key = serde_yaml::Value::String(MODELS_KEY.to_string());
+        if root.contains_key(&key) {
+            return Ok(None);
+        }
+        let file: SettingsFile =
+            serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
+                .map_err(|error| format!("Failed to parse settings file: {error}"))?;
+        let conversion = convert_settings_tiers(&file, enabled, position);
+        conversion.models.validate().map_err(|error| {
+            format!("the tier grid converts to models that do not validate: {error}")
+        })?;
+        let value = serde_yaml::to_value(&conversion.models)
+            .map_err(|error| format!("Failed to serialize models: {error}"))?;
+        root.insert(key, value);
+        Ok(Some(conversion.notes))
+    })
+}
+
+/// Remove the tier grid from the file, and restate `decisionModel` in the
+/// pools' vocabulary (`codex/lg` becomes the model that cell held).
+///
+/// Returns whether anything was removed. Refused while `models` is absent:
+/// the grid is then the only record of the user's model choices.
+pub fn retire_tier_keys(config_dir: &std::path::Path) -> Result<bool, String> {
+    mutate_workspace_settings(config_dir, "cairn: retire the tier grid", |root| {
+        if !TIER_GRID_KEYS.iter().any(|key| root.contains_key(*key)) {
+            return Ok(false);
+        }
+        if !root.contains_key(MODELS_KEY) {
+            return Err(
+                "the tier grid cannot be removed before it is converted to `models`".to_string(),
+            );
+        }
+        retire_grid_in(config_dir, root)
+    })
+}
+
+/// The file in the config directory that keeps the workspace's tier grid as
+/// it was when it was retired from `settings.yaml`.
+///
+/// A project's `.cairn/config.yaml` may still carry tier overrides (a project
+/// cloned later, a branch that predates the conversion). Those are
+/// differences from this workspace's grid, so they convert against it, in
+/// memory, whenever they are read. Nothing else reads the file.
+pub const RETIRED_GRID_FILE: &str = "tier-grid.retired.yaml";
+
+/// Keep `grid` beside `settings.yaml` for later overlay conversions. The
+/// first retirement's grid is kept: a later one can only be a grid restored
+/// by hand, which the conversion never read.
+fn archive_retired_grid(config_dir: &std::path::Path, grid: &LegacyGrid) -> Result<(), String> {
+    let path = config_dir.join(RETIRED_GRID_FILE);
+    if path.exists() {
+        return Ok(());
+    }
+    let yaml = serde_yaml::to_string(grid)
+        .map_err(|error| format!("Failed to serialize the retired tier grid: {error}"))?;
+    std::fs::write(
+        &path,
+        format!(
+            "# The tier grid this workspace had when it moved to model pools.\n\
+             # Read only to convert a project's leftover tier overrides; models live in settings.yaml.\n\
+             {yaml}"
+        ),
+    )
+    .map_err(|error| format!("Failed to write {}: {error}", path.display()))
+}
+
+/// The workspace grid a project's tier overrides are differences from: the
+/// grid still in `settings.yaml`, else the one archived when it was retired,
+/// else the shipped grid (a workspace that never had one of its own).
+pub fn workspace_legacy_grid(config_dir: &std::path::Path) -> Result<LegacyGrid, String> {
+    let file = load_settings_file(config_dir)?;
+    if file.has_tier_grid() {
+        return Ok(file.legacy_grid());
+    }
+    let path = config_dir.join(RETIRED_GRID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_yaml::from_str(&text)
+            .map_err(|error| format!("Failed to parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(file.legacy_grid()),
+        Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+    }
+}
+
+/// Restate `decisionModel` against the grid `root` still holds, archive the
+/// grid ([`RETIRED_GRID_FILE`]), then remove it. A no-op returning `false`
+/// while `models` is absent or the grid is already gone.
+fn retire_grid_in(
+    config_dir: &std::path::Path,
+    root: &mut serde_yaml::Mapping,
+) -> Result<bool, String> {
+    if !root.contains_key(MODELS_KEY) || !TIER_GRID_KEYS.iter().any(|key| root.contains_key(*key)) {
+        return Ok(false);
+    }
+    let file: SettingsFile = serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
+        .map_err(|error| format!("Failed to parse settings file: {error}"))?;
+    archive_retired_grid(config_dir, &file.legacy_grid())?;
+    if let (Some(raw), Some(models)) = (non_blank(&file.decision_model), &file.models) {
+        let grid = file.legacy_grid();
+        let converted = convert_decision_model(&raw, &grid.as_tiers(), &models.pools);
+        if converted != raw {
+            root.insert(
+                serde_yaml::Value::String("decisionModel".to_string()),
+                serde_yaml::Value::String(converted),
+            );
+        }
+    }
+    for key in TIER_GRID_KEYS {
+        root.remove(*key);
+    }
+    Ok(true)
 }
 
 /// Record which providers an existing workspace has installed, once.
@@ -1417,61 +1671,11 @@ fn validate_enabled_providers(
         }
     }
 
-    let label = |key: &str| provider_names.label(key);
     let enabled = |key: &str| settings.enabled_providers.iter().any(|entry| entry == key);
-
-    let mut stranded: Vec<(String, Vec<String>)> = Vec::new();
-    for (tier, backend) in &settings.tier_defaults {
-        if enabled(backend) {
-            continue;
-        }
-        match stranded.iter_mut().find(|(name, _)| name == backend) {
-            Some((_, tiers)) => tiers.push(tier.clone()),
-            None => stranded.push((backend.clone(), vec![tier.clone()])),
-        }
-    }
-    if let Some((backend, tiers)) = stranded.first_mut() {
-        tiers.sort();
-        return Err(format!(
-            "{} still serves {} {}. Assign {} another provider in the same change, or keep {}.",
-            label(backend),
-            if tiers.len() == 1 { "tier" } else { "tiers" },
-            tiers.join(", "),
-            if tiers.len() == 1 {
-                "that tier"
-            } else {
-                "those tiers"
-            },
-            label(backend),
-        ));
-    }
-
-    // A tier default naming a provider with no preset for that tier resolves
-    // through the tier's first defined provider instead — a redirect nobody
-    // asked for. Tolerated where it already exists, refused where an enablement
-    // change would be the thing that created it.
-    if enablement_changed {
-        for tier in &settings.tiers {
-            let Some(backend) = settings.tier_defaults.get(tier) else {
-                continue;
-            };
-            let serves = settings
-                .backends
-                .get(backend)
-                .is_some_and(|presets| presets.contains_key(tier));
-            if !serves {
-                return Err(format!(
-                    "{} has no model for tier {tier}, so it cannot serve it. Give it one in the tier matrix, or point that tier at a provider that already assigns it a model.",
-                    label(backend)
-                ));
-            }
-        }
-    }
-
     if settings.route_calls_via_openrouter && !enabled("openrouter") {
         return Err(
-            "This workspace routes tier-based calls through OpenRouter. Turn that off in the \
-             same change, or keep OpenRouter."
+            "This workspace routes calls through OpenRouter. Turn that off in the same change, \
+             or keep OpenRouter."
                 .to_string(),
         );
     }
@@ -1492,16 +1696,8 @@ fn trimmed_model(value: Option<String>) -> Option<String> {
 }
 
 fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
-    if let Some(value) = input.tier_defaults {
-        current.tier_defaults = value;
-    }
-    if let Some(value) = input.tiers {
-        // A tier that no longer exists keeps no default binding behind it.
-        current.tier_defaults.retain(|tier, _| value.contains(tier));
-        current.tiers = value;
-    }
-    if let Some(value) = input.backends {
-        current.backends = value;
+    if let Some(value) = input.models {
+        current.models = Some(value);
     }
     if let Some(value) = input.enabled_providers {
         current.enabled_providers = cairn_models_types::catalog::in_catalog_order(value);
@@ -1763,27 +1959,26 @@ mod tests {
     fn test_settings_file_defaults() {
         let file = SettingsFile::default();
         let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
-        // Preset defaults: every tier starts bound to claude.
-        assert_eq!(settings.tiers, vec!["sm", "md", "lg"]);
-        assert_eq!(settings.tier_defaults["sm"], "claude");
-        assert_eq!(settings.tier_defaults["md"], "claude");
-        assert_eq!(settings.tier_defaults["lg"], "claude");
-        assert!(settings.backends.contains_key("claude"));
-        assert!(settings.backends.contains_key("codex"));
+        // The grid a fresh file converts from: every tier bound to claude.
+        assert_eq!(grid.tiers, vec!["sm", "md", "lg"]);
+        assert_eq!(grid.tier_defaults["sm"], "claude");
+        assert_eq!(grid.tier_defaults["md"], "claude");
+        assert_eq!(grid.tier_defaults["lg"], "claude");
+        assert!(grid.backends.contains_key("claude"));
+        assert!(grid.backends.contains_key("codex"));
 
         assert_eq!(
-            settings.backends["claude"]["sm"].model,
+            grid.backends["claude"]["sm"].model,
             Model::new(Model::HAIKU)
         );
         assert_eq!(
-            settings.backends["claude"]["md"].model,
+            grid.backends["claude"]["md"].model,
             Model::new(Model::SONNET)
         );
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
+        assert_eq!(grid.backends["claude"]["lg"].model, Model::new(Model::OPUS));
+        assert!(settings.models.is_none(), "nothing converted yet");
         assert_eq!(settings.max_thinking_tokens, Some(31999));
         assert_eq!(settings.merge_type, MergeType::Squash);
         assert_eq!(settings.orphan_cleanup_days, 3);
@@ -1962,8 +2157,7 @@ externalReplies: disabled
         let file = SettingsFile::from_settings(&settings);
         let restored = file.to_settings();
 
-        assert_eq!(restored.tier_defaults, settings.tier_defaults);
-        assert_eq!(restored.backends, settings.backends);
+        assert_eq!(restored.models, settings.models);
         assert_eq!(restored.max_thinking_tokens, settings.max_thinking_tokens);
         assert_eq!(restored.merge_type, settings.merge_type);
         assert_eq!(restored.repo_target_sweep_days, 14);
@@ -2781,14 +2975,15 @@ logLevel: verbose
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
         assert_eq!(settings.max_thinking_tokens, Some(31999));
         assert_eq!(settings.merge_type, MergeType::Squash);
         assert_eq!(
-            settings.backends["claude"]["md"].model,
+            grid.backends["claude"]["md"].model,
             Model::new(Model::SONNET)
         );
-        assert_eq!(settings.tier_defaults["md"], "claude");
+        assert_eq!(grid.tier_defaults["md"], "claude");
     }
 
     #[test]
@@ -2799,17 +2994,10 @@ defaultModel: opus
 logLevel: standard
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
-        assert_eq!(settings.tier_defaults["lg"], "claude");
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
+        assert_eq!(grid.backends["claude"]["lg"].model, Model::new(Model::OPUS));
+        assert_eq!(grid.tier_defaults["lg"], "claude");
     }
 
     #[test]
@@ -2822,18 +3010,13 @@ preferredModels:
   - haiku
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
         // Each model should be placed in its matching tier
-        let claude = &settings.backends["claude"];
+        let claude = &grid.backends["claude"];
         assert_eq!(claude["sm"].model, Model::new(Model::HAIKU));
         assert_eq!(claude["md"].model, Model::new(Model::SONNET));
         assert_eq!(claude["lg"].model, Model::new(Model::OPUS));
-
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
     }
 
     #[test]
@@ -2845,9 +3028,9 @@ preferredModels:
   - sonnet
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
-        let claude = &settings.backends["claude"];
+        let claude = &grid.backends["claude"];
         // sonnet matches md tier naturally
         assert_eq!(claude["md"].model, Model::new(Model::SONNET));
         // custom-model-v2 doesn't match any default → assigned to first remaining tier (sm)
@@ -2880,12 +3063,9 @@ backends:
         reasoningEffort: high
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
+        assert_eq!(grid.backends["claude"]["lg"].model, Model::new(Model::OPUS));
     }
 
     #[test]
@@ -2916,28 +3096,21 @@ backends:
       model: gpt-5.5
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
         // The named backends keep their on-disk customizations.
-        assert_eq!(
-            settings.backends["claude"]["lg"].model,
-            Model::new(Model::OPUS)
-        );
-        assert_eq!(
-            settings.backends["codex"]["md"].model.as_str(),
-            "gpt-5.3-codex"
-        );
+        assert_eq!(grid.backends["claude"]["lg"].model, Model::new(Model::OPUS));
+        assert_eq!(grid.backends["codex"]["md"].model.as_str(), "gpt-5.3-codex");
         // The unnamed-but-known backend is backfilled from defaults.
         assert!(
-            settings.backends.contains_key("openrouter"),
+            grid.backends.contains_key("openrouter"),
             "openrouter must be present even though settings.yaml omits it"
         );
-        assert_eq!(settings.backends["openrouter"].len(), 3);
+        assert_eq!(grid.backends["openrouter"].len(), 3);
     }
 
     #[test]
-    fn test_presets_roundtrip() {
-        // New format with backends roundtrips correctly
+    fn a_legacy_active_backend_reads_as_every_tiers_default() {
         let yaml = r#"
 activeBackend: codex
 tiers:
@@ -2960,22 +3133,19 @@ backends:
         reasoningEffort: high
 "#;
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
+        let grid = file.legacy_grid();
 
-        // A legacy global activeBackend loads as every tier defaulting to it.
-        assert_eq!(settings.tier_defaults["sm"], "codex");
-        assert_eq!(settings.tier_defaults["md"], "codex");
-        assert_eq!(settings.tier_defaults["lg"], "codex");
-        assert_eq!(
-            settings.backends["codex"]["md"].model.as_str(),
-            "gpt-5.3-codex"
-        );
+        assert_eq!(grid.tier_defaults["sm"], "codex");
+        assert_eq!(grid.tier_defaults["md"], "codex");
+        assert_eq!(grid.tier_defaults["lg"], "codex");
+        assert_eq!(grid.backends["codex"]["md"].model.as_str(), "gpt-5.3-codex");
 
-        // Roundtrip
-        let file2 = SettingsFile::from_settings(&settings);
-        let restored = file2.to_settings();
-        assert_eq!(restored.tier_defaults, settings.tier_defaults);
-        assert_eq!(restored.backends.get("codex").unwrap().len(), 3);
+        // The grid never writes back: the DTO carries none of it.
+        let written =
+            serde_yaml::to_string(&SettingsFile::from_settings(&file.to_settings())).unwrap();
+        for key in ["tierDefaults", "tiers", "backends", "activeBackend"] {
+            assert!(!written.contains(key), "{key}: {written}");
+        }
     }
 
     #[test]
@@ -3021,8 +3191,6 @@ autoStartJobs: false
 
             assert!(loaded_settings.auto_start_jobs); // Always true
             assert_eq!(loaded_settings.max_thinking_tokens, None);
-            // Default presets should be present
-            assert_eq!(loaded_settings.tier_defaults["md"], "claude");
         });
     }
 
@@ -3110,45 +3278,23 @@ thinkingDisplayMode: full
             "legacy preferredModels should not be serialized"
         );
 
-        // Preset fields should appear
-        assert!(
-            yaml.contains("tierDefaults"),
-            "tierDefaults should be serialized"
-        );
-        assert!(
-            !yaml.contains("activeBackend"),
-            "the legacy global toggle should not be serialized"
-        );
-        assert!(
-            !yaml.contains("defaultTier"),
-            "defaultTier should not be serialized"
-        );
-        assert!(yaml.contains("backends"), "backends should be serialized");
-        assert!(yaml.contains("tiers"), "tiers should be serialized");
+        // Nor does the retired tier grid.
+        for key in [
+            "tierDefaults",
+            "activeBackend",
+            "defaultTier",
+            "backends",
+            "tiers",
+        ] {
+            assert!(
+                !yaml.contains(key),
+                "{key} should not be serialized: {yaml}"
+            );
+        }
     }
 
     #[test]
-    fn test_settings_preset_roundtrip_preserves_backends() {
-        // Build settings with custom backends and verify they survive roundtrip
-        let mut settings = test_settings();
-        settings
-            .tier_defaults
-            .insert("md".to_string(), "codex".to_string());
-
-        let file = SettingsFile::from_settings(&settings);
-        let yaml = serde_yaml::to_string(&file).unwrap();
-        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
-        let restored = parsed.to_settings();
-
-        assert_eq!(restored.tier_defaults["md"], "codex");
-        assert!(restored.backends.contains_key("claude"));
-        assert!(restored.backends.contains_key("codex"));
-    }
-
-    #[test]
-    fn tier_defaults_may_differ_per_tier_and_survive_a_roundtrip() {
-        // The end state the per-tier model exists for: best model on top, cheap
-        // faucet at the bottom, each written and read back independently.
+    fn tier_defaults_may_differ_per_tier() {
         let yaml = r#"
 tierDefaults:
   sm: openrouter
@@ -3163,14 +3309,12 @@ backends:
     lg:
       model: opus
 "#;
-        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
-        assert_eq!(settings.tier_defaults["sm"], "openrouter");
-        assert_eq!(settings.tier_defaults["md"], "codex");
-        assert_eq!(settings.tier_defaults["lg"], "claude");
-
-        let restored = SettingsFile::from_settings(&settings).to_settings();
-        assert_eq!(restored.tier_defaults, settings.tier_defaults);
+        let grid = serde_yaml::from_str::<SettingsFile>(yaml)
+            .unwrap()
+            .legacy_grid();
+        assert_eq!(grid.tier_defaults["sm"], "openrouter");
+        assert_eq!(grid.tier_defaults["md"], "codex");
+        assert_eq!(grid.tier_defaults["lg"], "claude");
     }
 
     #[test]
@@ -3190,55 +3334,12 @@ backends:
     lg:
       model: opus
 "#;
-        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
-        assert_eq!(settings.tier_defaults["lg"], "claude");
-        // sm/md carry no binding, so they resolve to their first defined provider.
-        assert!(!settings.tier_defaults.contains_key("sm"));
-        assert!(!settings.tier_defaults.contains_key("md"));
-    }
-
-    #[test]
-    fn the_legacy_global_key_is_dropped_from_the_file_once_it_has_migrated() {
-        let yaml = r#"
-activeBackend: codex
-tiers:
-  - sm
-  - md
-  - lg
-backends:
-  codex:
-    md:
-      model: gpt-5.3-codex
-"#;
-        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let settings = file.to_settings();
-        let rendered = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
-        assert!(
-            !rendered.contains("activeBackend"),
-            "legacy global toggle must not be written back: {rendered}"
-        );
-        assert!(rendered.contains("tierDefaults"), "{rendered}");
-    }
-
-    #[test]
-    fn deleting_a_tier_removes_its_default_binding() {
-        let mut settings = test_settings();
-        settings
-            .tier_defaults
-            .insert("md".to_string(), "codex".to_string());
-        apply_settings_update(
-            &mut settings,
-            UpdateSettings {
-                tiers: Some(vec!["sm".to_string(), "lg".to_string()]),
-                ..Default::default()
-            },
-        );
-        assert!(
-            !settings.tier_defaults.contains_key("md"),
-            "a removed tier must not leave a default binding behind"
-        );
-        assert!(settings.tier_defaults.contains_key("lg"));
+        let grid = serde_yaml::from_str::<SettingsFile>(yaml)
+            .unwrap()
+            .legacy_grid();
+        assert_eq!(grid.tier_defaults["lg"], "claude");
+        assert!(!grid.tier_defaults.contains_key("sm"));
+        assert!(!grid.tier_defaults.contains_key("md"));
     }
 }
 
@@ -3768,87 +3869,6 @@ routeCallsViaOpenRouter: true
     }
 
     #[test]
-    fn removing_a_provider_a_tier_still_defaults_to_is_refused_with_the_obstacle_named() {
-        let temp = TempDir::new().unwrap();
-        write_settings(
-            temp.path(),
-            r#"
-enabledProviders:
-  - claude
-  - codex
-tiers: [sm, md, lg]
-tierDefaults:
-  sm: codex
-  md: claude
-  lg: claude
-"#,
-        );
-
-        let error = update_settings(
-            temp.path(),
-            UpdateSettings {
-                enabled_providers: Some(vec!["claude".to_string()]),
-                ..Default::default()
-            },
-            &Default::default(),
-        )
-        .unwrap_err();
-
-        assert!(error.contains("OpenAI"), "{error}");
-        assert!(error.contains("sm"), "{error}");
-        assert_eq!(
-            recorded(temp.path()).unwrap(),
-            vec!["claude", "codex"],
-            "a refused removal leaves the workspace exactly as it was"
-        );
-    }
-
-    #[test]
-    fn a_removal_that_reassigns_the_stranded_tier_succeeds_and_keeps_its_presets() {
-        let temp = TempDir::new().unwrap();
-        write_settings(
-            temp.path(),
-            r#"
-enabledProviders:
-  - claude
-  - codex
-tiers: [sm, md, lg]
-tierDefaults:
-  sm: codex
-  md: claude
-  lg: claude
-backends:
-  codex:
-    sm:
-      model: gpt-5.3-codex
-"#,
-        );
-
-        let settings = update_settings(
-            temp.path(),
-            UpdateSettings {
-                enabled_providers: Some(vec!["claude".to_string()]),
-                tier_defaults: Some(HashMap::from([
-                    ("sm".to_string(), "claude".to_string()),
-                    ("md".to_string(), "claude".to_string()),
-                    ("lg".to_string(), "claude".to_string()),
-                ])),
-                ..Default::default()
-            },
-            &Default::default(),
-        )
-        .unwrap();
-
-        assert_eq!(settings.enabled_providers, vec!["claude"]);
-        // Disabling is prospective configuration, not deletion: the removed
-        // provider's tier assignments survive so re-adding it restores them.
-        assert_eq!(
-            settings.backends["codex"]["sm"].model.as_str(),
-            "gpt-5.3-codex"
-        );
-    }
-
-    #[test]
     fn removing_openrouter_while_calls_route_through_it_is_refused() {
         let temp = TempDir::new().unwrap();
         write_settings(
@@ -3949,5 +3969,408 @@ routeCallsViaOpenRouter: true
             vec!["claude", "openrouter", "ollama"]
         );
         assert_eq!(installed(temp.path()), settings.enabled_providers);
+    }
+
+    // === The one-time conversion from the tier grid to `models` ===
+
+    use crate::allotment::{model_ref, parse_model_ref, AllotmentEntry, PoolKind};
+
+    /// Each provider's effort scale as its catalog answers when discovery has
+    /// not run: Claude's static four, Codex's static four (no `ultra`), Go's
+    /// per model.
+    fn position(
+        selection: &crate::models::ModelSelection,
+        level: &str,
+    ) -> crate::allotment::EffortPlacement {
+        use crate::allotment::EffortPlacement;
+        let levels: &[&str] = match (selection.backend.as_str(), selection.model.as_str()) {
+            ("claude" | "codex", _) => &["low", "medium", "high", "xhigh"],
+            ("opencode-go", "kimi-k3") => &["none", "low", "high", "max"],
+            ("opencode-go", _) => &["low", "high"],
+            _ => return EffortPlacement::ScaleUnknown,
+        };
+        match levels.iter().position(|known| *known == level) {
+            Some(index) => EffortPlacement::At((index as f64 + 0.5) / levels.len() as f64),
+            None => EffortPlacement::NotALevel,
+        }
+    }
+
+    fn enabled(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn migrate(dir: &std::path::Path, keys: &[&str]) -> Option<Vec<String>> {
+        migrate_models(dir, &enabled(keys), &position).unwrap()
+    }
+
+    fn converted(dir: &std::path::Path) -> ModelsConfig {
+        load_settings(dir).models.expect("models was written")
+    }
+
+    fn band(models: &ModelsConfig, id: &str) -> Vec<String> {
+        models
+            .expand(&[AllotmentEntry::Pool(id.into())])
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|candidate| model_ref(&candidate.model))
+            .collect()
+    }
+
+    fn word(models: &ModelsConfig, model: &str) -> Option<String> {
+        models
+            .rung(&parse_model_ref(model).unwrap())
+            .unwrap()
+            .effort_level
+            .clone()
+    }
+
+    fn effort(models: &ModelsConfig, model: &str) -> Option<f64> {
+        models
+            .rung(&parse_model_ref(model).unwrap())
+            .unwrap()
+            .effort
+    }
+
+    /// MD defaults to OpenCode Go's glm while MD on Claude is still the
+    /// shipped sonnet cell; every cell of an installed provider lands in its
+    /// tier's band, shipped or edited.
+    #[test]
+    fn the_operators_grid_converts_with_shipped_cells_counted() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude, codex, opencode-go]\n\
+             tierDefaults: {sm: claude, md: opencode-go, lg: codex}\n\
+             backends:\n  opencode-go:\n    md: {model: glm-5.3, options: {reasoningEffort: high}}\n",
+        );
+        let notes = migrate(temp.path(), &["claude", "codex", "opencode-go"]).unwrap();
+        let models = converted(temp.path());
+        models.validate().unwrap();
+        assert_eq!(
+            band(&models, "md"),
+            [
+                "claude/sonnet",
+                "codex/gpt-5.6-terra",
+                "opencode-go/glm-5.3"
+            ]
+        );
+        assert_eq!(band(&models, "sm"), ["claude/haiku", "codex/gpt-5.6-luna"]);
+        assert_eq!(band(&models, "lg"), ["claude/opus", "codex/gpt-5.6-sol"]);
+        // OpenRouter's shipped cells are not carried: it is not installed.
+        assert!(models
+            .ladder
+            .iter()
+            .all(|rung| rung.model.backend != "openrouter"));
+        // Efforts are kept as the configured words, placed at launch.
+        assert_eq!(effort(&models, "opencode-go/glm-5.3"), None);
+        assert_eq!(
+            word(&models, "opencode-go/glm-5.3").as_deref(),
+            Some("high")
+        );
+        assert_eq!(effort(&models, "claude/sonnet"), None);
+        assert_eq!(word(&models, "claude/sonnet").as_deref(), Some("high"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("md defaulted to opencode-go")),
+            "{notes:?}"
+        );
+        assert_eq!(models.conversion_notes, notes);
+        assert_eq!(models.default_models, [AllotmentEntry::Pool("md".into())]);
+    }
+
+    /// The conversion writes only `models`; a second run changes nothing; a
+    /// general save then retires the grid, restating `decisionModel` first.
+    #[test]
+    fn the_conversion_writes_models_beside_the_grid_and_a_second_run_changes_nothing() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude]\ntierDefaults: {sm: claude, md: claude, lg: claude}\ndecisionModel: claude/lg\n",
+        );
+        assert!(migrate(temp.path(), &["claude"]).is_some());
+        let after_first = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert!(after_first.contains("tierDefaults"), "{after_first}");
+        assert!(
+            after_first.contains("decisionModel: claude/lg"),
+            "{after_first}"
+        );
+        assert!(after_first.contains("models:"), "{after_first}");
+        let settings = load_settings(temp.path());
+
+        assert_eq!(migrate(temp.path(), &["claude", "codex"]), None);
+        let after_second = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert_eq!(after_first, after_second);
+
+        // A settings save keeps the converted models and retires the grid.
+        update_settings(
+            temp.path(),
+            UpdateSettings {
+                bug_reports: Some(false),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(converted(temp.path()), settings.models.unwrap());
+        let saved = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert!(!saved.contains("tierDefaults"), "{saved}");
+        assert!(saved.contains("decisionModel: claude/opus"), "{saved}");
+        assert!(!retire_tier_keys(temp.path()).unwrap());
+    }
+
+    /// A save before the conversion has run leaves the grid in place: it is
+    /// then the only record of the user's model choices.
+    #[test]
+    fn a_save_before_conversion_keeps_the_grid() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude]\ntierDefaults: {sm: claude, md: claude, lg: claude}\n",
+        );
+        update_settings(
+            temp.path(),
+            UpdateSettings {
+                bug_reports: Some(false),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        assert!(saved.contains("tierDefaults"), "{saved}");
+        assert!(retire_tier_keys(temp.path()).is_err());
+    }
+
+    /// A fresh install has no file at all; its seed is the shipped grid.
+    #[test]
+    fn a_fresh_install_converts_the_shipped_cells() {
+        let temp = TempDir::new().unwrap();
+        let notes = migrate(temp.path(), &["claude"]).unwrap();
+        let models = converted(temp.path());
+        let ids: Vec<&str> = models.pools.iter().map(|pool| pool.id.as_str()).collect();
+        assert_eq!(ids, ["sm", "md", "lg"]);
+        assert!(models.pools.iter().all(|pool| !pool.description.is_empty()));
+        assert_eq!(band(&models, "sm"), ["claude/haiku"]);
+        assert_eq!(band(&models, "md"), ["claude/sonnet"]);
+        assert_eq!(band(&models, "lg"), ["claude/opus"]);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// The bench pins one model under test into four tiers of one custom
+    /// provider.
+    #[test]
+    fn the_bench_grid_converts_to_one_model_in_its_highest_band() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "tiers: [sm, md, lg, myth]\n\
+             tierDefaults: {sm: custom:bench, md: custom:bench, lg: custom:bench, myth: custom:bench}\n\
+             backends:\n  custom:bench:\n    sm: {model: qwen3-coder}\n    md: {model: qwen3-coder}\n    lg: {model: qwen3-coder}\n    myth: {model: qwen3-coder}\n",
+        );
+        let notes = migrate(temp.path(), &["custom:bench"]).unwrap();
+        let models = converted(temp.path());
+        assert_eq!(models.ladder.len(), 1);
+        assert_eq!(band(&models, "lg"), ["custom:bench/qwen3-coder"]);
+        assert_eq!(band(&models, "myth"), ["custom:bench/qwen3-coder"]);
+        assert!(
+            notes.iter().any(|note| note.contains("several tiers")),
+            "{notes:?}"
+        );
+    }
+
+    /// A global `activeBackend` meant every tier defaults to it.
+    #[test]
+    fn a_legacy_active_backend_converts_as_every_tiers_default() {
+        let temp = TempDir::new().unwrap();
+        write_settings(temp.path(), "activeBackend: codex\n");
+        let notes = migrate(temp.path(), &["claude", "codex"]).unwrap();
+        for tier in ["sm", "md", "lg"] {
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.starts_with(&format!("{tier} defaulted to codex"))),
+                "{notes:?}"
+            );
+        }
+        let models = converted(temp.path());
+        assert_eq!(
+            band(&models, "md"),
+            ["claude/sonnet", "codex/gpt-5.6-terra"]
+        );
+    }
+
+    #[test]
+    fn a_model_in_two_tiers_keeps_the_higher_cell() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "backends:\n  claude:\n    sm: {model: haiku}\n    md: {model: sonnet, options: {reasoningEffort: low}}\n    lg: {model: sonnet, options: {reasoningEffort: xhigh}}\n",
+        );
+        let notes = migrate(temp.path(), &["claude"]).unwrap();
+        let models = converted(temp.path());
+        assert_eq!(band(&models, "lg"), ["claude/sonnet"]);
+        assert!(band(&models, "md").is_empty());
+        assert_eq!(effort(&models, "claude/sonnet"), None);
+        assert_eq!(word(&models, "claude/sonnet").as_deref(), Some("xhigh"));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("claude/sonnet was in several tiers")),
+            "{notes:?}"
+        );
+    }
+
+    /// The operator's real grid configured OpenCode Go and OpenRouter cells
+    /// with only OpenRouter enabled: the disabled provider's cells are named,
+    /// and an OpenRouter effort is kept as its word, not raised, while its
+    /// scale is unknown.
+    #[test]
+    fn disabled_providers_cells_are_named_and_unknown_scales_keep_the_effort_word() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "backends:\n  opencode-go:\n    md: {model: glm-5.3}\n  openrouter:\n    md: {model: anthropic/claude-haiku-5.5, options: {reasoningEffort: medium}}\n",
+        );
+        let notes = migrate(temp.path(), &["claude", "openrouter"]).unwrap();
+        let models = converted(temp.path());
+        // The Models page notice shows exactly what the log was told.
+        assert_eq!(models.conversion_notes, notes);
+        assert_eq!(
+            effort(&models, "openrouter/anthropic/claude-haiku-5.5"),
+            None
+        );
+        let haiku =
+            crate::allotment::parse_model_ref("openrouter/anthropic/claude-haiku-5.5").unwrap();
+        assert_eq!(
+            models
+                .rung(&haiku)
+                .and_then(|rung| rung.effort_level.as_deref()),
+            Some("medium")
+        );
+        assert!(
+            notes.iter().any(|note| note
+                == "opencode-go is not enabled, so its cells were not converted (md glm-5.3); add them on the Models page if you enable it"),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.starts_with(
+                "openrouter/anthropic/claude-haiku-5.5: effort 'medium' is kept as a word"
+            )),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("top of its scale")),
+            "{notes:?}"
+        );
+    }
+
+    /// Claude `max` is a subagent mode and Codex `ultra` is not on a scale
+    /// discovery has not reported: both become the top of the model's scale,
+    /// each with a note.
+    #[test]
+    fn claude_max_and_codex_ultra_become_the_top_of_the_scale() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "backends:\n  claude:\n    lg: {model: opus, options: {reasoningEffort: max}}\n",
+        );
+        let notes = migrate(temp.path(), &["claude", "codex"]).unwrap();
+        let models = converted(temp.path());
+        assert_eq!(effort(&models, "claude/opus"), Some(1.0));
+        // The shipped Codex lg cell is gpt-5.6-sol at `ultra`.
+        assert_eq!(effort(&models, "codex/gpt-5.6-sol"), Some(1.0));
+        for model in ["claude/opus", "codex/gpt-5.6-sol"] {
+            assert!(
+                notes
+                    .iter()
+                    .any(|note| note.starts_with(&format!("{model}: effort"))),
+                "{notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retiring_the_grid_removes_its_keys_and_restates_the_decision_model() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude, codex]\nactiveBackend: claude\ntiers: [sm, md, lg]\ndecisionModel: codex/lg\n",
+        );
+        let refused = retire_tier_keys(temp.path()).unwrap_err();
+        assert!(refused.contains("converted"), "{refused}");
+
+        let notes = migrate(temp.path(), &["claude", "codex"]).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note == "decisionModel 'codex/lg' is now 'codex/gpt-5.6-sol'"),
+            "{notes:?}"
+        );
+        assert!(retire_tier_keys(temp.path()).unwrap());
+        let yaml = std::fs::read_to_string(get_settings_path(temp.path())).unwrap();
+        for key in TIER_GRID_KEYS {
+            assert!(!yaml.contains(&format!("{key}:")), "{key} survived: {yaml}");
+        }
+        assert!(yaml.contains("decisionModel: codex/gpt-5.6-sol"), "{yaml}");
+        assert!(yaml.contains("models:"), "{yaml}");
+
+        assert!(!retire_tier_keys(temp.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(get_settings_path(temp.path())).unwrap(),
+            yaml
+        );
+    }
+
+    #[test]
+    fn an_update_naming_an_unknown_pool_is_refused() {
+        let temp = TempDir::new().unwrap();
+        migrate(temp.path(), &["claude"]);
+        let mut models = converted(temp.path());
+        models.default_models = vec![AllotmentEntry::Pool("xl".into())];
+        let refused = update_settings(
+            temp.path(),
+            UpdateSettings {
+                models: Some(models),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(refused.contains("defaultModels"), "{refused}");
+    }
+
+    #[test]
+    fn removing_a_provider_takes_it_off_the_ladder_and_out_of_its_pools() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude, codex]\ntiers: [sm, md, lg, myth]\n\
+             backends:\n  claude:\n    sm: {model: haiku}\n    md: {model: sonnet}\n    lg: {model: opus}\n    myth: {model: fable}\n  codex:\n    myth: {model: gpt-5.6-sol}\n",
+        );
+        migrate(temp.path(), &["claude", "codex"]);
+        let settings = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(enabled(&["claude"])),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let models = settings.models.unwrap();
+        assert!(models
+            .ladder
+            .iter()
+            .all(|rung| rung.model.backend != "codex"));
+        let PoolKind::Set { members } = &models.pool("myth").unwrap().kind else {
+            panic!("myth is a set pool");
+        };
+        assert_eq!(
+            members.iter().map(model_ref).collect::<Vec<_>>(),
+            ["claude/fable"]
+        );
+        assert_eq!(converted(temp.path()), models);
     }
 }

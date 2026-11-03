@@ -1388,8 +1388,10 @@ impl AgentBackend for ClaudeBackend {
             key: ProviderOptionKey::ReasoningEffort,
             label: "Effort".to_string(),
             kind: OptionKind::Enum,
-            choices: ["low", "medium", "high", "xhigh", "max"]
-                .into_iter()
+            choices: cairn_models::types::catalog::CLAUDE_EFFORT
+                .levels
+                .iter()
+                .copied()
                 .map(|value| OptionChoice {
                     value: value.to_string(),
                     label: value.to_string(),

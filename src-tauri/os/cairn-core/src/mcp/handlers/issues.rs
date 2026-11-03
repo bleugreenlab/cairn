@@ -16,12 +16,10 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 /// Optional create+start request parsed from the issue-create payload's
 /// `execution` key, taking the same keys an executions-collection append does.
-/// `recipe` is required by the launch (there is no default recipe); `backend`
-/// defaults to the recipe/agent default.
+/// `recipe` is required by the launch (there is no default recipe).
 #[derive(Debug, Default, Clone)]
 pub struct CreateExecutionSpec {
     pub(crate) recipe: Option<String>,
-    pub(crate) backend: Option<String>,
     /// Ad-hoc adjustments to the recipe this launch freezes — the same grammar
     /// the executions-collection append takes, so "create a child and skip its
     /// review" is one call rather than a create, a start, and a patch that
@@ -217,7 +215,7 @@ pub async fn create_issue_in_project(
         ),
         // Create+start is "create then start", not one transaction: the issue is
         // already durable here. Reuse the executions-collection start path so the
-        // recipe/backend resolution, `initiated_via="external"` stamp, and watcher
+        // recipe resolution, `initiated_via="external"` stamp, and watcher
         // wake are identical. If the start fails (bad recipe id, no default recipe),
         // surface an error that names the created issue so the caller can retry the
         // start instead of silently dropping it.
@@ -226,7 +224,6 @@ pub async fn create_issue_in_project(
             &ctx.project_key,
             issue.number,
             spec.recipe.as_deref(),
-            spec.backend.as_deref(),
             None,
             None,
             spec.overrides,
@@ -242,7 +239,7 @@ pub async fn create_issue_in_project(
             Err(error) => {
                 return Err(format!(
                     "{summary}\nIssue created, but starting the execution failed: {error} \
-                     Append {{recipe?, backend?}} to {executions_uri} to start it."
+                     Append {{recipe}} to {executions_uri} to start it."
                 ))
             }
         },

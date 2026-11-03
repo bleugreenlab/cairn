@@ -1,7 +1,4 @@
-use crate::config::{
-    agents as config_agents,
-    presets::{load_effective_presets, resolve_runtime_selection, spawned_task_backend},
-};
+use crate::config::agents as config_agents;
 use crate::execution::delegation::{
     DelegatedTaskPayload, SpawnCallPacketsInput, SpawnTaskPacketsInput, SpawnWorkflowPacketsInput,
 };
@@ -9,7 +6,7 @@ use crate::execution::jobs::{
     prepare_call_run, prepare_workflow_run, start_call_run, start_workflow_run, CreateCallRunInput,
     CreateWorkflowRunInput,
 };
-use crate::models::{AgentConfig, Model};
+use crate::models::AgentConfig;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::protocol::CallbackResponse;
@@ -107,49 +104,23 @@ async fn resolve_task_agent_config(
         ));
     }
 
-    let presets = load_effective_presets(&config_dir, project_path);
-    let authored_tier = payload
-        .tier
-        .as_deref()
-        .or(file_agent.tier.as_ref().map(Model::as_str));
-    let authored_backend = spawned_task_backend(
-        payload.backend_preference.as_deref(),
-        file_agent.backend_preference.as_deref(),
+    // The task's node selects at its own launch. Selecting now as well refuses
+    // a spawn whose allotment can never launch (an unknown pool, a named model
+    // no installed provider serves) while the spawning agent can still fix it.
+    let agent = file_agent.agent_config(&parent_ctx.project_id);
+    let (orch, project_id, own, models) = (
+        orch.clone(),
+        parent_ctx.project_id.clone(),
+        payload.models.clone(),
+        agent.models.clone(),
     );
-    // Resolve-early: real resolution (loud) at materialization fills the concrete
-    // atomic selection + extras, so the child session never re-resolves a tier.
-    let (selection, extras) = resolve_runtime_selection(authored_tier, authored_backend, &presets)?;
-
-    Ok(AgentConfig {
-        id: file_agent.id,
-        name: file_agent.name,
-        description: file_agent.description,
-        prompt: file_agent.prompt,
-        tools: file_agent.tools,
-        tier: payload.tier.as_ref().map(Model::new).or(file_agent.tier),
-        workspace_id: if file_agent.is_project_scoped {
-            None
-        } else {
-            Some("workspace".to_string())
-        },
-        project_id: if file_agent.is_project_scoped {
-            Some(parent_ctx.project_id.clone())
-        } else {
-            None
-        },
-        created_at: 0,
-        updated_at: 0,
-        disallowed_tools: file_agent.disallowed_tools,
-        skills: file_agent.skills,
-        fence: file_agent.fence,
-        icon: file_agent.icon,
-        backend_preference: payload
-            .backend_preference
-            .clone()
-            .or(file_agent.backend_preference),
-        selection: Some(selection),
-        extras: Some(extras),
+    tokio::task::spawn_blocking(move || {
+        orch.select_for_agent(&project_id, own.as_deref(), &models, Default::default())
     })
+    .await
+    .map_err(|error| format!("Task selection did not finish: {error}"))?
+    .map_err(|refusal| format!("Task '{}' cannot launch: {refusal}", payload.description))?;
+    Ok(agent)
 }
 
 /// A delegated child whose job exists. Its run may not exist yet: a task is
@@ -941,8 +912,7 @@ pub async fn spawn_call_packets(
                 subagent_type: payload.subagent_type.clone(),
                 description: payload.description.clone(),
                 prompt: payload.prompt.clone(),
-                tier: payload.tier.clone(),
-                backend_preference: payload.backend_preference.clone(),
+                models: payload.models.clone(),
                 output_contract: contract.clone(),
                 branch_policy: payload.branch_policy,
                 label: payload.label.clone(),
@@ -971,7 +941,7 @@ pub async fn spawn_call_packets(
             contract.clone(),
             &prepared.job_id,
             parent_tool_use_id,
-            payload.tier.as_deref(),
+            payload.models.as_deref(),
             task_index,
             input.background,
         )
@@ -1647,8 +1617,7 @@ pub(super) mod unstarted_child_tests {
             description: description.to_string(),
             prompt: "Trace how executors are placed.".to_string(),
             subagent_type: "Explore".to_string(),
-            tier: None,
-            backend_preference: None,
+            models: None,
             session: DelegatedTaskSessionMode::New,
             task_index: None,
             output_schema: None,
@@ -2915,8 +2884,7 @@ mod journal_replay_tests {
             description: "vote".to_string(),
             prompt: prompt.to_string(),
             subagent_type: "Explore".to_string(),
-            tier: None,
-            backend_preference: None,
+            models: None,
             output_schema: None,
             branch_policy: CallBranchPolicy::None,
             label: None,

@@ -384,7 +384,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
+        description: "Executions for an issue. Append {recipe, branch?, continuity?, lifecycle?, overrides?, after?, place?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied; a `tenet_verdict` clause holds it on the operator's verdict on a tenet.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -396,11 +396,6 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                 "recipe id to run; discover ids via cairn://recipes",
             )],
             optional: &[
-                KeySpec::new(
-                    "backend",
-                    KeyType::Str,
-                    "claude|codex; defaults to the recipe/agent default",
-                ),
                 KeySpec::new(
                     "branch",
                     KeyType::Str,

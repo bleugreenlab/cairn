@@ -43,10 +43,8 @@ pub mod mcp_import;
 pub mod mcp_servers;
 pub mod mcp_setup;
 pub mod mcp_tools;
-pub mod model_routing;
 pub mod pack;
 pub mod pdf;
-pub mod presets;
 pub mod project_settings;
 pub mod provider_options;
 pub mod recipes;
@@ -338,9 +336,6 @@ pub async fn get_recipe_as_snapshot(
         })
         .collect();
 
-    // Load presets for agent resolution
-    let presets_config = presets::load_effective_presets(config_dir, Some(&project_path));
-
     // Load agents
     let mut agents: HashMap<String, AgentSnapshot> = HashMap::new();
     for agent_id in agent_ids {
@@ -350,8 +345,7 @@ pub async fn get_recipe_as_snapshot(
 
         if let Ok(Some(file_agent)) = agents::get_agent(config_dir, &agent_id, Some(&project_path))
         {
-            let snapshot = presets::resolve_agent_snapshot(&file_agent, None, &presets_config)?;
-            agents.insert(agent_id.clone(), snapshot);
+            agents.insert(agent_id.clone(), file_agent.snapshot());
         }
     }
 

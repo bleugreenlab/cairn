@@ -199,6 +199,7 @@ fn embedding_target(route: inference_route::Route) -> (EmbedRoute, String) {
 /// One served model as the catalog lists it, by its real name.
 fn discovered(served: &ServedModel) -> DiscoveredModel {
     DiscoveredModel {
+        maker: None,
         id: served.id.clone(),
         model: served.id.clone(),
         display_name: served.id.clone(),

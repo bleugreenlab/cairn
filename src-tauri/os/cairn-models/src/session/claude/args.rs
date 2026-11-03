@@ -16,7 +16,7 @@ pub struct ClaudeArgsConfig {
     pub skip_permissions: bool,
     pub model: Option<String>,
     pub session_start: SessionStart,
-    pub effort: Option<String>, // Reasoning effort: low|medium|high|xhigh|max (None = CLI default)
+    pub effort: Option<String>, // Reasoning effort: low|medium|high|xhigh (None = CLI default)
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file

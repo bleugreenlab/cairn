@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn try_from_db_recipe_node_legacy_ai_condition_is_a_decision() {
-        let config = r#"{"conditionType": "ai", "question": "Is this ready?", "model": "sm", "ports": ["yes", "no"]}"#;
+        let config = r#"{"conditionType": "ai", "question": "Is this ready?", "models": ["sm"], "ports": ["yes", "no"]}"#;
         let db = make_db_recipe_node("condition", Some(config));
 
         let node = RecipeNode::try_from(db).unwrap();
@@ -202,7 +202,7 @@ mod tests {
             Some(decision::DecisionNode::port_choice(
                 "Is this ready?",
                 &["yes".to_string(), "no".to_string()],
-                Some("sm".to_string()),
+                Some(vec![allotment::AllotmentEntry::Pool("sm".into())]),
             ))
         );
     }

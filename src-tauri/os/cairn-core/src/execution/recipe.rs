@@ -49,22 +49,18 @@ fn get_selected_recipe(
     }
     Ok(file_recipe.recipe)
 }
-use crate::config::model_routing::IssueLabels;
-use crate::config::presets::{
-    available_selections, load_effective_presets, resolve_agent_snapshot,
-    resolve_selection_with_provenance, LaunchSelectionOverride, PresetsConfig, ResolutionSource,
-};
 use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
 use crate::execution::canonical;
-use crate::execution::model_routing::LaunchSelectionPlan;
+use crate::execution::model_selection::{ResolvedConstraints, SelectionRecord};
 use crate::execution::Initiator;
 use crate::models::{
     BranchTarget, Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, LaunchCustomization,
-    Model, ModelRoutingDecision, ModelSelection, RecipeNode, RecipeNodeType, RecipeSnapshot,
-    RuntimeExtras, SkillSnapshot, TriggerContext, TriggerType,
+    ModelSelection, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RuntimeExtras,
+    SkillSnapshot, TriggerContext, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
+use cairn_config::allotment::{model_ref, parse_model_ref, AllotmentEntry};
 use cairn_db::turso::params;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -176,7 +172,6 @@ pub(crate) async fn start_recipe_execution_and_advance(
     issue_id: &str,
     recipe_id: Option<&str>,
     project_id: &str,
-    backend: Option<&str>,
     initiated_via: Option<&str>,
     branch_target: Option<BranchTarget>,
     continuity: Option<Continuity>,
@@ -194,7 +189,6 @@ pub(crate) async fn start_recipe_execution_and_advance(
         recipe_id,
         project_id,
         customization,
-        backend,
         None,
         initiated_via,
         None,
@@ -260,7 +254,6 @@ pub async fn start_recipe_execution_impl(
     recipe_id: Option<&str>,
     project_id: &str,
     customization: Option<LaunchCustomization>,
-    backend: Option<&str>,
     initiator: Option<Initiator>,
     initiated_via: Option<&str>,
     // CAIRN-2629: the machine that should OWN this execution. `None` (or the local
@@ -286,7 +279,6 @@ pub async fn start_recipe_execution_impl(
         recipe_id,
         project_id,
         customization,
-        backend,
         initiator,
         initiated_via,
         runner_device_id,
@@ -326,7 +318,6 @@ async fn launch_recipe_execution(
     recipe_id: Option<&str>,
     project_id: &str,
     customization: Option<LaunchCustomization>,
-    backend: Option<&str>,
     initiator: Option<Initiator>,
     initiated_via: Option<&str>,
     runner_device_id: Option<String>,
@@ -374,31 +365,8 @@ async fn launch_recipe_execution(
         None => return Err("No recipe specified for execution".to_string()),
     };
 
-    let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
-
-    // The per-agent resolution plan for this launch, built once and consulted by
-    // every resolve_agent_snapshot call below. It carries three inputs: the
-    // execution-wide backend override (external driver / quickstart), the
-    // project's label bindings applied to this issue's labels, and the agents a
-    // human already chose a model for. Computing the pinned set here, before the
-    // customization is consumed, is what keeps "an explicit choice wins" a single
-    // decision rather than a property of the order later layers apply in.
-    let pinned = customization
-        .as_ref()
-        .map(LaunchCustomization::pinned_agent_ids)
-        .unwrap_or_default();
-    let plan = plan_for_launch(
-        &db,
-        &project_path,
-        Some(issue_id),
-        backend,
-        pinned,
-        &effective_presets,
-    )
-    .await?;
-
-    // Build execution snapshot. Resolution is early: the snapshot stores fully
-    // concrete per-agent selections rather than the inputs they came from.
+    // The snapshot carries each agent's allotment, and a pin only where an
+    // operator chose one. Each node selects its model at its own launch.
     let mut snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
@@ -407,7 +375,6 @@ async fn launch_recipe_execution(
         project_id,
         trigger_type.clone(),
         None,
-        &plan,
     )?;
     snapshot.trigger_context.initiated_via = initiated_via.map(str::to_string);
 
@@ -422,16 +389,7 @@ async fn launch_recipe_execution(
                 |agent_id: &str| -> Result<Option<crate::models::AgentSnapshot>, String> {
                     match config_agents::get_agent(&orch.config_dir, agent_id, Some(&project_path))
                     {
-                        Ok(Some(file_agent)) => {
-                            let routing = plan
-                                .for_agent(agent_id, file_agent.tier.as_ref().map(Model::as_str));
-                            resolve_agent_snapshot(
-                                &file_agent,
-                                routing.selection.as_ref(),
-                                &effective_presets,
-                            )
-                            .map(Some)
-                        }
+                        Ok(Some(file_agent)) => Ok(Some(file_agent.snapshot())),
                         Ok(None) => Ok(None),
                         Err(error) => Err(format!("Failed to load agent '{agent_id}': {error}")),
                     }
@@ -446,42 +404,10 @@ async fn launch_recipe_execution(
             snapshot.recipe = recipe_override;
         }
         if let Some(agents_override) = overrides.agents {
+            // Composer output is stored verbatim: a pin with its extras, or an
+            // allotment the node selects within at launch.
             for (agent_id, agent_snapshot) in agents_override {
-                // Concrete composer output is stored verbatim — its custom
-                // selection + extras survive unchanged. Anything without a
-                // resolved selection runs through the unified resolver once.
-                let normalized = if agent_snapshot.selection.is_some() {
-                    agent_snapshot
-                } else {
-                    let authored = agent_snapshot.tier.clone();
-                    let routing = plan.for_agent(&agent_id, authored.as_ref().map(Model::as_str));
-                    resolve_agent_snapshot(
-                        &crate::config::agents::FileAgent {
-                            id: agent_snapshot.id.clone(),
-                            name: agent_snapshot.name.clone(),
-                            description: agent_snapshot.description.clone(),
-                            prompt: agent_snapshot.prompt.clone(),
-                            tools: agent_snapshot.tools.clone(),
-                            tier: agent_snapshot.tier.clone().or_else(|| {
-                                agent_snapshot.selection.as_ref().map(|s| s.model.clone())
-                            }),
-                            fence: agent_snapshot.fence,
-                            disallowed_tools: agent_snapshot.disallowed_tools.clone(),
-                            skills: agent_snapshot.skills.clone(),
-                            hooks: None,
-                            backend_preference: agent_snapshot.backend_preference.clone(),
-                            icon: None,
-                            bundles: Vec::new(),
-                            is_project_scoped: true,
-                            file_path: std::path::PathBuf::new(),
-                            seed_budget_tokens: None,
-                            seed_eras: None,
-                        },
-                        routing.selection.as_ref(),
-                        &effective_presets,
-                    )?
-                };
-                snapshot.agents.insert(agent_id, normalized);
+                snapshot.agents.insert(agent_id, agent_snapshot);
             }
         }
 
@@ -505,14 +431,9 @@ async fn launch_recipe_execution(
                 if let Ok(Some(file_agent)) =
                     config_agents::get_agent(&orch.config_dir, &agent_id, Some(&project_path))
                 {
-                    let routing =
-                        plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str));
-                    let agent_snapshot = resolve_agent_snapshot(
-                        &file_agent,
-                        routing.selection.as_ref(),
-                        &effective_presets,
-                    )?;
-                    snapshot.agents.insert(agent_id.clone(), agent_snapshot);
+                    snapshot
+                        .agents
+                        .insert(agent_id.clone(), file_agent.snapshot());
                 }
             }
         }
@@ -531,10 +452,10 @@ async fn launch_recipe_execution(
     // what every launch that does not think about it should get.
     snapshot.continuity = continuity.unwrap_or_default();
 
-    // Freeze why every agent got the model it got, against the agent map the
-    // execution will actually run.
-    plan.record_frozen(&snapshot.agents, &effective_presets);
-    snapshot.model_routing = Some(plan.into_provenance());
+    // A constraint reads an upstream node's stored selection at launch, so the
+    // graph the execution will actually run is checked now, before any row
+    // exists, rather than refusing mid-run.
+    check_node_constraints(&snapshot.recipe)?;
 
     let snapshot_json = snapshot.to_json()?;
 
@@ -673,8 +594,6 @@ pub async fn start_manual_execution_impl(
         project_id,
         TriggerType::Manual,
         None,
-        // No issue means no labels, so nothing to route from.
-        &LaunchSelectionPlan::empty(None),
     )?;
     crate::execution::branch_target::apply_branch_target(
         &mut snapshot,
@@ -749,20 +668,9 @@ pub(crate) async fn start_event_triggered_execution(
 
     let db = resolve_owning_db_for_project(orch, project_id).await?;
 
-    // Build execution snapshot with event payload. An event-triggered launch is
-    // still a launch: when it carries an issue, that issue's labels route it.
+    // Build execution snapshot with event payload.
     let project_path = project_path_for_recipe(&db, project_id).await?;
-    let effective_presets = load_effective_presets(&orch.config_dir, Some(&project_path));
-    let plan = plan_for_launch(
-        &db,
-        &project_path,
-        issue_id,
-        None,
-        std::collections::HashSet::new(),
-        &effective_presets,
-    )
-    .await?;
-    let mut snapshot = build_execution_snapshot_from_files(
+    let snapshot = build_execution_snapshot_from_files(
         orch,
         Some(&project_path),
         &recipe.id,
@@ -770,10 +678,7 @@ pub(crate) async fn start_event_triggered_execution(
         project_id,
         trigger_type,
         Some(event_payload),
-        &plan,
     )?;
-    plan.record_frozen(&snapshot.agents, &effective_presets);
-    snapshot.model_routing = Some(plan.into_provenance());
     let snapshot_json = snapshot.to_json()?;
 
     // An event-triggered launch carrying an issue goes through the same atomic
@@ -846,17 +751,99 @@ pub(crate) async fn start_event_triggered_execution(
     })
 }
 
+/// Refuse a graph in which a node's constraint names anything but an agent
+/// node upstream of it. Recipe files are checked when they load; this checks
+/// the graph a launch will actually run, which a composer may have edited.
+pub fn check_node_constraints(recipe: &RecipeSnapshot) -> Result<(), String> {
+    let problems: Vec<String> = recipe
+        .nodes
+        .iter()
+        .filter_map(|node| constraint_problem(recipe, node))
+        .collect();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n"))
+    }
+}
+
+fn constraint_problem(recipe: &RecipeSnapshot, node: &RecipeNode) -> Option<String> {
+    let constraints = &node.agent_config.as_ref()?.constraints;
+    if constraints.is_empty() {
+        return None;
+    }
+    let upstream = upstream_of(recipe, &node.id);
+    constraints
+        .check_references(&node.id, |id| {
+            upstream.contains(id)
+                && recipe
+                    .nodes
+                    .iter()
+                    .any(|other| other.id == id && other.node_type == RecipeNodeType::Agent)
+        })
+        .err()
+}
+
+/// Every node an edge path of either kind leads from to `node_id`.
+fn upstream_of(recipe: &RecipeSnapshot, node_id: &str) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![node_id.to_string()];
+    while let Some(current) = frontier.pop() {
+        for edge in &recipe.edges {
+            if matches!(
+                edge.edge_type,
+                RecipeEdgeType::Control | RecipeEdgeType::Context
+            ) && edge.target_node_id == current
+                && seen.insert(edge.source_node_id.clone())
+            {
+                frontier.push(edge.source_node_id.clone());
+            }
+        }
+    }
+    seen
+}
+
 // ===========================================================================
-// Launch-composer resolution contract
+// Launch-composer preview contract
 // ===========================================================================
 //
 // `resolve_recipe_launch` is the single entry point a launch-composer UI calls
-// to preview a recipe's fully-resolved per-agent settings before starting it.
-// It returns one row per agent node carrying the chosen atomic `selection`,
-// orthogonal `extras`, permissions, and the resolution `source` (provenance) —
-// or a loud per-node `error` when that node cannot resolve. The whole plan only
-// fails (`Err`) for systemic problems (recipe not found, project missing); a
-// single unresolvable agent surfaces as `error: Some(..)` on its row.
+// to preview a recipe's per-agent settings before starting it. Nothing is
+// chosen here: each node selects its own model at its own launch. A row says
+// what the node would pick now and why (`preview`), or that it is pinned, or
+// carries a loud per-node `error` when it cannot launch. The whole plan only
+// fails (`Err`) for systemic problems (recipe not found, project missing).
+
+/// A launch-time override for one agent node: an allotment the node selects
+/// within at its launch, or a concrete pin it runs verbatim.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum LaunchSelectionOverride {
+    Allotment(Vec<AllotmentEntry>),
+    Concrete(ModelSelection),
+}
+
+/// What one node would run if it launched now, and why.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionPreview {
+    /// The allotment the node selects within: the launch override, else the
+    /// node's own, else its agent's, else the workspace default. Empty for a
+    /// pinned node.
+    allotment: Vec<AllotmentEntry>,
+    /// The node runs exactly the row's `selection`; no selection is made.
+    pinned: bool,
+    /// The would-pick-now selection. Absent for a pin the catalog cannot
+    /// place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<SelectionRecord>,
+    /// The upstream nodes (by name) a constrained preview read a predicted
+    /// pick from: the real choice waits for theirs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    depends_on: Vec<String>,
+    /// The row's one-line answer to "what would this run, and why".
+    line: String,
+}
 
 /// Fully-resolved launch preview for a recipe: the recipe graph plus one row per
 /// agent node. Documented contract for the launch-composer UI.
@@ -881,31 +868,23 @@ pub struct ResolvedLaunchNode {
     resolved: Option<ResolvedAgentRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    /// Atomic dropdown options for this node: the global tier-resolved list unioned
-    /// with the row's own resolved selection. Present on every node, including
-    /// error rows, so an unresolvable node still renders a selectable dropdown.
+    /// Models a pin may name: every ladder entry and unranked model that can
+    /// hold a session, unioned with the row's own selection. Present on every
+    /// node, including error rows, so an unplaceable node can still be pinned.
     available: Vec<ModelSelection>,
 }
 
-/// The concrete resolved settings for one agent node.
+/// One agent node's preview.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedAgentRow {
-    /// The chosen atomic backend+model (single-dropdown value).
+    /// The model the node would run now: its pin, or the preview's choice.
     selection: ModelSelection,
     extras: RuntimeExtras,
     #[serde(skip_serializing_if = "Option::is_none")]
     fence: Option<Fence>,
-    /// Which level decided the selection.
-    source: ResolutionSource,
-    /// Atomic options for the dropdown (each a backend+model pair). MAY ship
-    /// empty now and be filled in the composer follow-up.
+    preview: SelectionPreview,
     available: Vec<ModelSelection>,
-    /// Why this row resolved the way it did, when the launching issue's labels
-    /// had a say. Present on every routed row so the operator can see the reason
-    /// before pressing Start rather than discover it afterwards.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    routing: Option<ModelRoutingDecision>,
 }
 
 /// Per-node launch overrides, keyed by node id — one selection knob per node.
@@ -922,24 +901,23 @@ pub struct LaunchOverrides {
     recipe: Option<RecipeSnapshot>,
 }
 
-/// Resolve a recipe's per-agent-node launch settings with provenance and loud,
-/// per-node errors. The composer's contract.
+/// Preview a recipe's per-agent-node launch settings, with loud per-node
+/// errors. The composer's contract.
 pub async fn resolve_recipe_launch(
     orch: &Orchestrator,
     recipe_id: &str,
     project_id: &str,
-    issue_id: Option<&str>,
+    _issue_id: Option<&str>,
     overrides: Option<LaunchOverrides>,
 ) -> Result<LaunchPlan, String> {
     let db = resolve_owning_db_for_project(orch, project_id).await?;
     let project_path = project_path_for_recipe(&db, project_id).await?;
     let recipe = get_selected_recipe(&orch.config_dir, &project_path, project_id, recipe_id)?;
-    let presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let overrides = overrides.unwrap_or_default();
 
     // A composer that has edited the recipe structure (append/remove/graph-edit)
-    // supplies the working RecipeSnapshot; resolve against it so appended nodes
-    // resolve authoritatively. Otherwise resolve the file-loaded recipe.
+    // supplies the working RecipeSnapshot; preview against it so appended nodes
+    // preview authoritatively. Otherwise preview the file-loaded recipe.
     let recipe_snapshot = overrides.recipe.clone().unwrap_or_else(|| RecipeSnapshot {
         id: recipe.id.clone(),
         name: recipe.name.clone(),
@@ -948,19 +926,6 @@ pub async fn resolve_recipe_launch(
         nodes: recipe.nodes.clone(),
         edges: recipe.edges.clone(),
     });
-
-    // The preview applies the same plan the start path will. Nothing is pinned
-    // yet -- the composer's pin is the operator confirming what this shows them,
-    // which is only a meaningful confirmation if they saw the routed model here.
-    let plan = plan_for_launch(
-        &db,
-        &project_path,
-        issue_id,
-        None,
-        std::collections::HashSet::new(),
-        &presets,
-    )
-    .await?;
 
     let config_dir = orch.config_dir.clone();
     // One provider record per backend, asked whether a selection can hold a
@@ -981,14 +946,38 @@ pub async fn resolve_recipe_launch(
                     .unwrap_or_else(|| refusal.to_string())
             })
     };
+    let ladder = orch.models_ladder(Some(project_id))?;
+    let mut offered: Vec<ModelSelection> = Vec::new();
+    for raw in ladder
+        .rungs
+        .iter()
+        .map(|rung| rung.model.as_str())
+        .chain(ladder.unranked.iter().map(String::as_str))
+    {
+        if let Ok(selection) = parse_model_ref(raw) {
+            if !offered.contains(&selection) && serves_session(&selection).is_ok() {
+                offered.push(selection);
+            }
+        }
+    }
     let nodes = resolve_launch_nodes(
-        &recipe_snapshot.nodes,
-        &presets,
+        &recipe_snapshot,
         &overrides,
-        &plan,
+        &ladder.default_models,
+        offered,
         |agent_id| {
             config_agents::get_agent(&config_dir, agent_id, Some(&project_path))
                 .map_err(|e| e.to_string())
+        },
+        |allotment, constraints| {
+            orch.select_models(
+                Some(project_id),
+                allotment,
+                VerbKind::Session,
+                constraints,
+                Default::default(),
+            )
+            .map_err(String::from)
         },
         serves_session,
     );
@@ -999,199 +988,248 @@ pub async fn resolve_recipe_launch(
     })
 }
 
-/// Pure per-node resolver: maps recipe agent nodes to resolved launch rows using a
-/// supplied agent loader. Every node carries the global `available` option list
-/// (unioned with the row's own resolved selection) so even an unresolvable row can
-/// render the model dropdown. Loud, per-node errors; never fails the whole plan.
+/// The node's own preview before constraints are applied.
+struct NodePreview {
+    agent: config_agents::FileAgent,
+    allotment: Vec<AllotmentEntry>,
+    pin: Option<ModelSelection>,
+    record: Result<SelectionRecord, String>,
+}
+
+/// Pure per-node previewer: maps recipe agent nodes to preview rows using a
+/// supplied agent loader and selection. Every node carries `available` so even
+/// an unplaceable row can be pinned. Loud, per-node errors; never fails the
+/// whole plan.
 ///
-/// `serves_session` says whether a selection can hold a session. A selection
-/// that cannot is never offered, and a row that resolves to one is reported
-/// as an error naming its tier rather than quietly given another model.
+/// Nodes are previewed in two passes: each node on its own, then each
+/// constrained node again against the first-pass pick of the nodes it names,
+/// which is the best prediction of what those nodes will store at launch.
 fn resolve_launch_nodes(
-    recipe_nodes: &[RecipeNode],
-    presets: &PresetsConfig,
+    recipe: &RecipeSnapshot,
     overrides: &LaunchOverrides,
-    plan: &LaunchSelectionPlan,
+    default_models: &[AllotmentEntry],
+    offered: Vec<ModelSelection>,
     load_agent: impl Fn(&str) -> Result<Option<config_agents::FileAgent>, String>,
+    select: impl Fn(&[AllotmentEntry], &ResolvedConstraints) -> Result<SelectionRecord, String>,
     serves_session: impl Fn(&ModelSelection) -> Result<(), String>,
 ) -> Vec<ResolvedLaunchNode> {
-    let global: Vec<ModelSelection> = available_selections(presets)
-        .into_iter()
-        .filter(|selection| serves_session(selection).is_ok())
-        .collect();
     let union = |selection: Option<&ModelSelection>| -> Vec<ModelSelection> {
-        let mut list = global.clone();
-        if let Some(sel) = selection {
-            if !list
-                .iter()
-                .any(|s| s.backend == sel.backend && s.model.as_str() == sel.model.as_str())
-            {
-                list.push(sel.clone());
+        let mut list = offered.clone();
+        if let Some(selection) = selection {
+            if !list.contains(selection) {
+                list.push(selection.clone());
             }
         }
         list
     };
+    let agent_nodes: Vec<(&RecipeNode, String)> = recipe
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == RecipeNodeType::Agent)
+        .filter_map(|node| {
+            let agent_id = node.agent_config.as_ref()?.agent_config_id.clone()?;
+            Some((node, agent_id))
+        })
+        .collect();
 
-    let mut nodes = Vec::new();
-    for node in recipe_nodes {
-        if node.node_type != RecipeNodeType::Agent {
-            continue;
-        }
-        let Some(agent_id) = node
-            .agent_config
-            .as_ref()
-            .and_then(|c| c.agent_config_id.clone())
-        else {
-            continue;
-        };
-
-        let file_agent = match load_agent(&agent_id) {
-            Ok(Some(fa)) => fa,
-            Ok(None) => {
-                nodes.push(ResolvedLaunchNode {
-                    node_id: node.id.clone(),
-                    agent_id: agent_id.clone(),
-                    agent_name: agent_id.clone(),
-                    prompt_present: false,
-                    resolved: None,
-                    error: Some(format!("Agent config not found: {agent_id}")),
-                    available: union(None),
-                });
-                continue;
-            }
-            Err(e) => {
-                nodes.push(ResolvedLaunchNode {
-                    node_id: node.id.clone(),
-                    agent_id: agent_id.clone(),
-                    agent_name: agent_id.clone(),
-                    prompt_present: false,
-                    resolved: None,
-                    error: Some(format!("Failed to load agent '{agent_id}': {e}")),
-                    available: union(None),
-                });
-                continue;
-            }
-        };
-
-        // A per-node override in the preview payload is an explicit choice and
-        // is never contested; every other row asks the plan.
-        let node_override = overrides.nodes.get(&node.id);
-        let routing = match node_override {
-            Some(_) => None,
-            None => Some(plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str))),
-        };
-        let effective =
-            node_override.or_else(|| routing.as_ref().and_then(|r| r.selection.as_ref()));
-
-        let resolved = match effective {
-            Some(LaunchSelectionOverride::Concrete(selection)) => {
-                crate::config::presets::resolve_concrete_selection(selection, presets)
-            }
-            Some(LaunchSelectionOverride::Tier(tier)) => resolve_selection_with_provenance(
-                Some(tier),
-                None,
-                file_agent.backend_preference.as_deref(),
-                presets,
-            ),
-            Some(LaunchSelectionOverride::Backend(backend)) => resolve_selection_with_provenance(
-                file_agent.tier.as_ref().map(Model::as_str),
-                Some(backend),
-                file_agent.backend_preference.as_deref(),
-                presets,
-            ),
-            None => resolve_selection_with_provenance(
-                file_agent.tier.as_ref().map(Model::as_str),
-                None,
-                file_agent.backend_preference.as_deref(),
-                presets,
-            ),
-        };
-
-        // The tier this row asked for, to name in a refusal.
-        let asked_tier = match effective {
-            Some(LaunchSelectionOverride::Tier(tier)) => Some(tier.as_str()),
-            Some(LaunchSelectionOverride::Concrete(_)) => None,
-            Some(LaunchSelectionOverride::Backend(_)) | None => {
-                file_agent.tier.as_ref().map(Model::as_str)
-            }
-        };
-        let resolved = resolved.and_then(|r| match serves_session(&r.selection) {
-            Ok(()) => Ok(r),
-            Err(why) => {
-                let landed = format!("{} on {}", r.selection.model, r.selection.backend);
-                Err(match asked_tier {
-                    Some(tier) => format!("the '{tier}' tier resolves to {landed}: {why}"),
-                    None => format!("{landed}: {why}"),
+    // First pass: every node on its own.
+    let mut first: HashMap<String, Result<NodePreview, String>> = HashMap::new();
+    for (node, agent_id) in &agent_nodes {
+        let preview = match load_agent(agent_id) {
+            Ok(Some(agent)) => {
+                let node_models = node.agent_config.as_ref().and_then(|c| c.models.clone());
+                let (allotment, pin) = match overrides.nodes.get(&node.id) {
+                    Some(LaunchSelectionOverride::Concrete(pin)) => (Vec::new(), Some(pin.clone())),
+                    Some(LaunchSelectionOverride::Allotment(allotment)) => {
+                        (allotment.clone(), None)
+                    }
+                    None => (
+                        crate::execution::model_selection::effective_allotment(
+                            node_models.as_deref(),
+                            &agent.models,
+                            default_models,
+                        ),
+                        None,
+                    ),
+                };
+                let record = match &pin {
+                    Some(pin) => serves_session(pin)
+                        .map_err(|why| format!("{}: {why}", model_ref(pin)))
+                        .and_then(|()| {
+                            select(
+                                &[AllotmentEntry::Model(pin.clone())],
+                                &ResolvedConstraints::default(),
+                            )
+                        }),
+                    None => select(&allotment, &ResolvedConstraints::default()),
+                };
+                Ok(NodePreview {
+                    agent,
+                    allotment,
+                    pin,
+                    record,
                 })
             }
-        });
-        let (resolved_row, error, available) = match resolved {
-            Ok(r) => {
-                let available = union(Some(&r.selection));
-                (
-                    Some(ResolvedAgentRow {
-                        selection: r.selection,
-                        extras: r.extras,
-                        fence: file_agent.fence,
-                        source: r.source,
-                        available: available.clone(),
-                        routing: routing.as_ref().map(|r| r.decision.clone()),
-                    }),
-                    None,
-                    available,
-                )
+            Ok(None) => Err(format!("Agent config not found: {agent_id}")),
+            Err(e) => Err(format!("Failed to load agent '{agent_id}': {e}")),
+        };
+        first.insert(node.id.clone(), preview);
+    }
+
+    let name_of = |id: &str| {
+        recipe
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map_or_else(|| id.to_string(), |node| node.name.clone())
+    };
+    let picks: HashMap<String, SelectionRecord> = first
+        .iter()
+        .filter_map(|(id, preview)| {
+            let record = preview.as_ref().ok()?.record.as_ref().ok()?;
+            Some((id.clone(), record.clone()))
+        })
+        .collect();
+    let picked = |id: &str| picks.get(id).cloned();
+
+    let mut nodes = Vec::new();
+    for (node, agent_id) in &agent_nodes {
+        let preview = match first.remove(&node.id) {
+            Some(Ok(preview)) => preview,
+            failed => {
+                let error = match failed {
+                    Some(Err(error)) => error,
+                    _ => format!("Agent config not found: {agent_id}"),
+                };
+                nodes.push(ResolvedLaunchNode {
+                    node_id: node.id.clone(),
+                    agent_id: agent_id.clone(),
+                    agent_name: agent_id.clone(),
+                    prompt_present: false,
+                    resolved: None,
+                    error: Some(error),
+                    available: union(None),
+                });
+                continue;
             }
-            Err(e) => (None, Some(e), union(None)),
+        };
+        let NodePreview {
+            agent,
+            allotment,
+            pin,
+            record,
+        } = preview;
+
+        // Second pass: a constrained node reads its upstream's predicted pick.
+        let constraints = node
+            .agent_config
+            .as_ref()
+            .map(|config| config.constraints.clone())
+            .unwrap_or_default();
+        let mut depends_on = Vec::new();
+        let constraint_error = if pin.is_none() && !constraints.is_empty() {
+            constraint_problem(recipe, node)
+        } else {
+            None
+        };
+        let record = if pin.is_some() || constraints.is_empty() || constraint_error.is_some() {
+            record
+        } else {
+            let mut resolved = ResolvedConstraints::default();
+            for (slot, reference) in [
+                (&mut resolved.same_band_as, &constraints.same_band_as),
+                (
+                    &mut resolved.different_maker_from,
+                    &constraints.different_maker_from,
+                ),
+            ] {
+                if let Some(reference) = reference {
+                    let name = name_of(reference);
+                    if !depends_on.contains(&name) {
+                        depends_on.push(name.clone());
+                    }
+                    // The provenance names the upstream node as the recipe
+                    // shows it, not by its id.
+                    *slot = picked(reference).map(|record| (name, record));
+                }
+            }
+            select(&allotment, &resolved)
         };
 
+        let row = match (constraint_error, record, &pin) {
+            (Some(error), _, _) => Err(error),
+            (None, Ok(record), _) => Ok(record),
+            (None, Err(_), Some(pin)) if serves_session(pin).is_ok() => Err(String::new()),
+            (None, Err(error), _) => Err(error),
+        };
+        let (resolved, error) = match (row, pin) {
+            (Ok(record), pin) => {
+                let selection = pin.clone().unwrap_or_else(|| record.chosen.clone());
+                let line = match (&pin, depends_on.is_empty()) {
+                    (Some(pin), _) => format!("pinned to {}", model_ref(pin)),
+                    (None, true) => record.provenance.clone(),
+                    (None, false) => format!(
+                        "depends on {}: would pick now {}",
+                        depends_on.join(", "),
+                        record.provenance
+                    ),
+                };
+                (
+                    Some(ResolvedAgentRow {
+                        extras: if pin.is_some() {
+                            RuntimeExtras::default()
+                        } else {
+                            record.extras.clone()
+                        },
+                        available: union(Some(&selection)),
+                        selection,
+                        fence: agent.fence,
+                        preview: SelectionPreview {
+                            allotment: if pin.is_some() { Vec::new() } else { allotment },
+                            pinned: pin.is_some(),
+                            record: Some(record),
+                            depends_on,
+                            line,
+                        },
+                    }),
+                    None,
+                )
+            }
+            // A pin the selection cannot place but the session door admits
+            // still runs as pinned; only its provenance is missing.
+            (Err(error), Some(pin)) if error.is_empty() => (
+                Some(ResolvedAgentRow {
+                    extras: RuntimeExtras::default(),
+                    available: union(Some(&pin)),
+                    fence: agent.fence,
+                    preview: SelectionPreview {
+                        allotment: Vec::new(),
+                        pinned: true,
+                        record: None,
+                        depends_on,
+                        line: format!("pinned to {}", model_ref(&pin)),
+                    },
+                    selection: pin,
+                }),
+                None,
+            ),
+            (Err(error), _) => (None, Some(error)),
+        };
+        let available = resolved
+            .as_ref()
+            .map(|row| row.available.clone())
+            .unwrap_or_else(|| union(None));
         nodes.push(ResolvedLaunchNode {
             node_id: node.id.clone(),
             agent_id: agent_id.clone(),
-            agent_name: file_agent.name.clone(),
-            prompt_present: !file_agent.prompt.is_empty(),
-            resolved: resolved_row,
+            agent_name: agent.name.clone(),
+            prompt_present: !agent.prompt.is_empty(),
+            resolved,
             error,
             available,
         });
     }
     nodes
-}
-
-/// Build the per-agent resolution plan for one launch.
-///
-/// A launch with no issue has no labels, so it gets an empty plan whose behavior
-/// is exactly what it was before routing existed. A launch with an issue reads
-/// that issue's labels and the project's binding table -- and a malformed table
-/// refuses the launch here, before an execution row exists, rather than
-/// degrading into "everything resolves to its default" in silence.
-async fn plan_for_launch(
-    db: &Arc<LocalDb>,
-    project_path: &Path,
-    issue_id: Option<&str>,
-    backend: Option<&str>,
-    pinned: std::collections::HashSet<String>,
-    presets: &PresetsConfig,
-) -> Result<LaunchSelectionPlan, String> {
-    let backend = backend.map(str::to_string);
-    let Some(issue_id) = issue_id else {
-        return Ok(LaunchSelectionPlan::empty(backend));
-    };
-    let table = crate::config::model_routing::load_model_routing(project_path)?;
-    let labels = issue_labels_for_launch(db, issue_id).await?;
-    Ok(LaunchSelectionPlan::new(
-        backend, table, labels, pinned, presets,
-    ))
-}
-
-async fn issue_labels_for_launch(db: &LocalDb, issue_id: &str) -> Result<IssueLabels, String> {
-    let issue_id = issue_id.to_string();
-    db.read(|conn| {
-        let issue_id = issue_id.clone();
-        Box::pin(async move { crate::labels::attach::list_labels_for_issue(conn, &issue_id).await })
-    })
-    .await
-    .map_err(|e| format!("Failed to read issue labels for model routing: {e}"))
-    .map(|labels| IssueLabels::new(labels.into_iter().map(|label| (label.id, label.name))))
 }
 
 async fn project_path_for_recipe(
@@ -1636,7 +1674,6 @@ fn build_execution_snapshot_from_files(
     project_id: &str,
     trigger_type: TriggerType,
     event_payload: Option<serde_json::Value>,
-    plan: &LaunchSelectionPlan,
 ) -> Result<ExecutionSnapshot, String> {
     let config_dir = orch.config_dir.as_path();
     let recipe = get_recipe_from_files(config_dir, project_path, recipe_id)?;
@@ -1652,7 +1689,7 @@ fn build_execution_snapshot_from_files(
         nodes: recipe.nodes.clone(),
         edges: recipe.edges,
     };
-    let presets = load_effective_presets(config_dir, project_path);
+    check_node_constraints(&recipe_snapshot)?;
     let all_skills = load_all_skills(config_dir, project_path);
     let mut agents = std::collections::HashMap::new();
     let mut skills = std::collections::HashMap::new();
@@ -1674,10 +1711,7 @@ fn build_execution_snapshot_from_files(
                     .entry(skill_id.clone())
                     .or_insert_with(|| skill_snapshot.clone());
             }
-            let routing = plan.for_agent(&agent_id, file_agent.tier.as_ref().map(Model::as_str));
-            let snapshot =
-                resolve_agent_snapshot(&file_agent, routing.selection.as_ref(), &presets)?;
-            agents.insert(agent_id, snapshot);
+            agents.insert(agent_id, file_agent.snapshot());
         }
     }
     let trigger_context = TriggerContext {
@@ -1687,8 +1721,6 @@ fn build_execution_snapshot_from_files(
         event_payload,
         initiated_via: None,
     };
-    // Resolve-early: the snapshot now stores fully concrete per-agent selections;
-    // no frozen preset matrix is captured.
     Ok(ExecutionSnapshot::new(
         recipe_snapshot,
         agents,
@@ -1725,8 +1757,9 @@ fn load_all_skills(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::presets::default_presets_config;
-    use crate::models::{AgentNodeConfig, NodePosition};
+    use crate::execution::model_selection::tests::{run_entries, windows};
+    use crate::models::{AgentNodeConfig, Model, NodePosition, RecipeEdge, RecipeTrigger};
+    use cairn_config::allotment::NodeConstraints;
 
     fn agent_node(id: &str, agent_id: &str) -> RecipeNode {
         RecipeNode {
@@ -1738,6 +1771,8 @@ mod tests {
             trigger_config: None,
             agent_config: Some(AgentNodeConfig {
                 agent_config_id: Some(agent_id.to_string()),
+                models: None,
+                constraints: NodeConstraints::default(),
                 output_schema: None,
                 git_config: None,
             }),
@@ -1750,24 +1785,48 @@ mod tests {
         }
     }
 
-    /// A plan that routes nothing, for the rows these tests are about.
-    fn plan() -> LaunchSelectionPlan {
-        LaunchSelectionPlan::empty(None)
+    fn reviewing(id: &str, builder: &str) -> RecipeNode {
+        let mut node = agent_node(id, "review");
+        node.agent_config.as_mut().unwrap().constraints = NodeConstraints {
+            same_band_as: Some(builder.to_string()),
+            different_maker_from: Some(builder.to_string()),
+        };
+        node
     }
 
-    fn file_agent(id: &str, tier: Option<&str>) -> config_agents::FileAgent {
+    fn recipe(nodes: Vec<RecipeNode>, edges: &[(&str, &str)]) -> RecipeSnapshot {
+        RecipeSnapshot {
+            id: "r".to_string(),
+            name: "R".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes,
+            edges: edges
+                .iter()
+                .map(|(from, to)| RecipeEdge {
+                    id: format!("{from}-{to}"),
+                    edge_type: RecipeEdgeType::Control,
+                    source_node_id: from.to_string(),
+                    source_handle: "control-out".to_string(),
+                    target_node_id: to.to_string(),
+                    target_handle: "control-in".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn file_agent(id: &str, models: &[&str]) -> config_agents::FileAgent {
         config_agents::FileAgent {
             id: id.to_string(),
             name: format!("Agent {id}"),
             description: String::new(),
             prompt: "do work".to_string(),
             tools: Vec::new(),
-            tier: tier.map(Model::new),
+            models: cairn_config::allotment::parse_allotment(models).unwrap_or_default(),
             fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,
-            backend_preference: None,
             icon: None,
             bundles: Vec::new(),
             is_project_scoped: true,
@@ -1777,263 +1836,232 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolved_row_carries_nonempty_available() {
-        let presets = default_presets_config(Some(31999));
-        let nodes = [agent_node("n1", "builder")];
-        let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &plan(),
-            |_id| Ok(Some(file_agent("builder", Some("md")))),
-            |_| Ok(()),
-        );
-        assert_eq!(out.len(), 1);
-        let row = &out[0];
-        assert!(row.error.is_none());
-        let resolved = row.resolved.as_ref().unwrap();
-        assert_eq!(resolved.selection.model.as_str(), "sonnet");
-        assert!(!resolved.available.is_empty());
-        assert!(!row.available.is_empty());
-        assert!(row
-            .available
-            .iter()
-            .any(|s| s.backend == "claude" && s.model.as_str() == "sonnet"));
+    fn offered() -> Vec<ModelSelection> {
+        ["claude/sonnet", "claude/opus", "codex/gpt-5.6-sol"]
+            .into_iter()
+            .map(|raw| parse_model_ref(raw).unwrap())
+            .collect()
     }
 
-    #[test]
-    fn undefined_tier_produces_error_with_available() {
-        let presets = default_presets_config(Some(31999));
-        let nodes = [agent_node("n1", "weird")];
-        let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &plan(),
-            |_id| Ok(Some(file_agent("weird", Some("xl")))),
-            |_| Ok(()),
-        );
-        let row = &out[0];
-        assert!(row.resolved.is_none());
-        assert!(row.error.is_some());
-        // Error rows still render a selectable dropdown.
-        assert!(!row.available.is_empty());
-    }
-
-    #[test]
-    fn concrete_override_pins_verbatim_and_is_selectable() {
-        let presets = default_presets_config(Some(31999));
-        let nodes = [agent_node("n1", "builder")];
-        let mut overrides = LaunchOverrides::default();
-        let pin = ModelSelection {
-            backend: "claude".to_string(),
-            model: Model::new("custom-xl"),
-        };
-        overrides.nodes.insert(
-            "n1".to_string(),
-            LaunchSelectionOverride::Concrete(pin.clone()),
-        );
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &plan(),
-            |_id| Ok(Some(file_agent("builder", Some("md")))),
-            |_| Ok(()),
-        );
-        let resolved = out[0].resolved.as_ref().unwrap();
-        assert_eq!(resolved.selection.model.as_str(), "custom-xl");
-        assert_eq!(resolved.selection.backend, "claude");
-        assert!(out[0]
-            .available
-            .iter()
-            .any(|s| s.model.as_str() == "custom-xl"));
-    }
-
-    /// The regression guard for generation zero: with no labels and no rules,
-    /// every preview row resolves exactly as it did before routing existed, and
-    /// says so rather than staying silent.
-    #[test]
-    fn an_unrouted_row_resolves_to_the_agent_default_and_records_why() {
-        let presets = default_presets_config(Some(31999));
-        let nodes = [agent_node("n1", "builder")];
-        let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &plan(),
-            |_id| Ok(Some(file_agent("builder", Some("md")))),
-            |_| Ok(()),
-        );
-        let resolved = out[0].resolved.as_ref().unwrap();
-        assert_eq!(resolved.selection.model.as_str(), "sonnet");
-        let routing = resolved.routing.as_ref().expect("every row records why");
-        assert_eq!(
-            routing.source,
-            crate::models::ModelRoutingSource::AgentDefault
-        );
-        assert_eq!(routing.note, "no labels on issue");
-    }
-
-    /// The composer's preview applies the same plan the start path will, so the
-    /// operator sees the routed model -- and its reason -- before pressing Start.
-    #[test]
-    fn a_matching_rule_moves_the_preview_row_and_names_itself() {
-        let presets = default_presets_config(Some(31999));
-        let table: crate::config::model_routing::ModelRoutingTable = serde_yaml::from_str(
-            "rules:\n  - id: migration-builder\n    when:\n      all: [migration]\n    agents: [builder]\n    tier: lg\n",
+    fn preview(
+        recipe: &RecipeSnapshot,
+        overrides: &LaunchOverrides,
+        agent_models: &[&str],
+        serves_session: impl Fn(&ModelSelection) -> Result<(), String>,
+    ) -> Vec<ResolvedLaunchNode> {
+        resolve_launch_nodes(
+            recipe,
+            overrides,
+            &[AllotmentEntry::Pool("md".into())],
+            offered(),
+            |id| Ok((id != "ghost").then(|| file_agent(id, agent_models))),
+            |allotment, constraints| {
+                run_entries(allotment, constraints, &windows).map_err(String::from)
+            },
+            serves_session,
         )
-        .expect("test table parses");
-        let labels = IssueLabels::new([("migration".to_string(), "Migration".to_string())]);
-        let routed = LaunchSelectionPlan::new(
-            None,
-            table,
-            labels,
-            std::collections::HashSet::new(),
-            &presets,
-        );
-
-        let nodes = [agent_node("n1", "builder"), agent_node("n2", "review")];
-        let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &routed,
-            |id| Ok(Some(file_agent(id, Some("md")))),
-            |_| Ok(()),
-        );
-
-        let builder = out[0].resolved.as_ref().unwrap();
-        assert_eq!(builder.selection.model.as_str(), "opus");
-        let routing = builder.routing.as_ref().expect("a routed row says why");
-        assert_eq!(
-            routing.source,
-            crate::models::ModelRoutingSource::LabelBinding
-        );
-        assert_eq!(routing.rule.as_deref(), Some("migration-builder"));
-        assert_eq!(routing.tier.as_deref(), Some("lg"));
-
-        // The rule is scoped to the builder; nothing else moves.
-        let review = out[1].resolved.as_ref().unwrap();
-        assert_eq!(review.selection.model.as_str(), "sonnet");
     }
 
-    /// A per-node override in the preview payload is an explicit choice: the
-    /// table is not consulted for that row at all.
+    fn chosen(row: &ResolvedLaunchNode) -> String {
+        model_ref(&row.resolved.as_ref().expect("a preview").selection)
+    }
+
+    /// A row says what its node would pick now and why, from the agent's
+    /// allotment, and still offers every pin.
     #[test]
-    fn a_node_override_is_never_contested_by_a_rule() {
-        let presets = default_presets_config(Some(31999));
-        let table: crate::config::model_routing::ModelRoutingTable = serde_yaml::from_str(
-            "rules:\n  - id: migration-builder\n    when:\n      all: [migration]\n    tier: lg\n",
-        )
-        .unwrap();
-        let routed = LaunchSelectionPlan::new(
-            None,
-            table,
-            IssueLabels::new([("migration".to_string(), "Migration".to_string())]),
-            std::collections::HashSet::new(),
-            &presets,
+    fn a_row_previews_the_pick_with_its_provenance() {
+        let out = preview(
+            &recipe(vec![agent_node("n1", "builder")], &[]),
+            &LaunchOverrides::default(),
+            &["lg"],
+            |_| Ok(()),
         );
-        let nodes = [agent_node("n1", "builder")];
+        let row = out[0].resolved.as_ref().unwrap();
+        assert_eq!(chosen(&out[0]), "codex/gpt-5.6-sol");
+        assert!(!row.preview.pinned);
+        assert_eq!(
+            row.preview.allotment,
+            vec![AllotmentEntry::Pool("lg".into())]
+        );
+        assert_eq!(
+            row.preview.line,
+            row.preview.record.as_ref().unwrap().provenance
+        );
+        assert_eq!(row.available.len(), 3);
+    }
+
+    /// An agent that names no allotment previews the workspace default; a
+    /// launch override replaces both.
+    #[test]
+    fn the_default_and_an_allotment_override_are_what_the_row_selects_within() {
+        let nodes = recipe(vec![agent_node("n1", "builder")], &[]);
+        let out = preview(&nodes, &LaunchOverrides::default(), &[], |_| Ok(()));
+        assert_eq!(
+            out[0].resolved.as_ref().unwrap().preview.allotment,
+            vec![AllotmentEntry::Pool("md".into())]
+        );
         let mut overrides = LaunchOverrides::default();
         overrides.nodes.insert(
-            "n1".to_string(),
-            LaunchSelectionOverride::Tier("sm".to_string()),
+            "n1".into(),
+            LaunchSelectionOverride::Allotment(vec![AllotmentEntry::Pool("sm".into())]),
         );
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &routed,
-            |_id| Ok(Some(file_agent("builder", Some("md")))),
-            |_| Ok(()),
-        );
-        let resolved = out[0].resolved.as_ref().unwrap();
-        assert_eq!(resolved.selection.model.as_str(), "haiku");
-        assert!(
-            resolved.routing.is_none(),
-            "a row the operator chose carries no routing reason"
-        );
+        let out = preview(&nodes, &overrides, &["lg"], |_| Ok(()));
+        assert_eq!(chosen(&out[0]), "claude/haiku");
     }
 
     #[test]
-    fn missing_agent_is_per_node_error() {
-        let presets = default_presets_config(Some(31999));
-        let nodes = [agent_node("n1", "ghost")];
-        let overrides = LaunchOverrides::default();
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
-            &overrides,
-            &plan(),
-            |_id| Ok(None),
+    fn an_unknown_pool_is_a_row_error_that_can_still_be_pinned() {
+        let out = preview(
+            &recipe(vec![agent_node("n1", "weird")], &[]),
+            &LaunchOverrides::default(),
+            &["xl"],
             |_| Ok(()),
         );
-        assert!(out[0].error.as_ref().unwrap().contains("not found"));
         assert!(out[0].resolved.is_none());
+        assert!(out[0].error.as_ref().unwrap().contains("xl"));
         assert!(!out[0].available.is_empty());
     }
 
+    /// A concrete override runs verbatim, even one the ladder does not know.
     #[test]
-    fn a_selection_that_cannot_hold_a_session_is_never_offered_and_a_row_landing_on_it_says_so() {
-        let mut presets = default_presets_config(Some(31999));
-        presets
-            .backends
-            .entry("codex".to_string())
-            .or_default()
-            .insert(
-                "lg".to_string(),
-                crate::models::Preset {
-                    model: Model::new("gpt-image-2"),
-                    options: Default::default(),
-                },
-            );
-        let image_only = |selection: &ModelSelection| {
-            if selection.model.as_str() == "gpt-image-2" {
-                Err("'gpt-image-2' on codex serves only image".to_string())
-            } else {
-                Ok(())
-            }
-        };
-        assert!(available_selections(&presets)
-            .iter()
-            .any(|s| s.model.as_str() == "gpt-image-2"));
+    fn a_concrete_override_pins_verbatim_and_is_selectable() {
+        let mut overrides = LaunchOverrides::default();
+        let pin = ModelSelection::new("claude", Model::new("custom-xl"));
+        overrides
+            .nodes
+            .insert("n1".into(), LaunchSelectionOverride::Concrete(pin.clone()));
+        let out = preview(
+            &recipe(vec![agent_node("n1", "builder")], &[]),
+            &overrides,
+            &["lg"],
+            |_| Ok(()),
+        );
+        let row = out[0].resolved.as_ref().unwrap();
+        assert_eq!(row.selection, pin);
+        assert!(row.preview.pinned);
+        assert_eq!(row.preview.line, "pinned to claude/custom-xl");
+        assert!(out[0].available.contains(&pin));
+    }
 
-        let nodes = [agent_node("n1", "builder"), agent_node("n2", "review")];
+    /// A reviewer previews against its builder's predicted pick, and says
+    /// that its real choice waits for the builder's.
+    #[test]
+    fn a_constrained_row_depends_on_its_upstream_pick() {
+        let out = preview(
+            &recipe(
+                vec![agent_node("n1", "builder"), reviewing("n2", "n1")],
+                &[("n1", "n2")],
+            ),
+            &LaunchOverrides::default(),
+            &["lg"],
+            |_| Ok(()),
+        );
+        assert_eq!(chosen(&out[0]), "codex/gpt-5.6-sol");
+        assert_eq!(chosen(&out[1]), "claude/opus");
+        let review = &out[1].resolved.as_ref().unwrap().preview;
+        assert_eq!(review.depends_on, vec!["Node n1"]);
+        assert!(
+            review.line.starts_with("depends on Node n1: "),
+            "{}",
+            review.line
+        );
+    }
+
+    /// In a workspace with one maker, a reviewer's `differentMakerFrom` gives
+    /// way: the row previews a pick and says why, so the composer has no
+    /// unplaceable row to block the launch on.
+    #[test]
+    fn a_single_maker_reviewer_row_previews_the_waived_maker_rule() {
+        let out = preview(
+            &recipe(
+                vec![agent_node("n1", "builder"), reviewing("n2", "n1")],
+                &[("n1", "n2")],
+            ),
+            &LaunchOverrides::default(),
+            &["claude/opus", "claude/sonnet"],
+            |_| Ok(()),
+        );
+        assert_eq!(out[1].error, None);
+        assert_eq!(chosen(&out[1]), "claude/opus");
+        let line = &out[1].resolved.as_ref().unwrap().preview.line;
+        assert!(
+            line.ends_with(
+                "no model from a maker other than anthropic in [claude/opus, claude/sonnet]; same maker as Node n1"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_constraint_naming_a_node_that_is_not_upstream_is_a_row_error() {
+        let nodes = recipe(
+            vec![agent_node("n1", "builder"), reviewing("n2", "n1")],
+            &[("n2", "n1")],
+        );
+        let out = preview(&nodes, &LaunchOverrides::default(), &["lg"], |_| Ok(()));
+        assert!(out[1]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("not an agent node upstream"));
+        assert!(check_node_constraints(&nodes).is_err());
+    }
+
+    #[test]
+    fn a_missing_agent_is_a_row_error() {
+        let out = preview(
+            &recipe(vec![agent_node("n1", "ghost")], &[]),
+            &LaunchOverrides::default(),
+            &["lg"],
+            |_| Ok(()),
+        );
+        assert!(out[0].error.as_ref().unwrap().contains("not found"));
+        assert!(!out[0].available.is_empty());
+    }
+
+    /// A pin that cannot hold a session is refused on its row, naming why.
+    #[test]
+    fn a_pin_that_cannot_hold_a_session_says_so() {
         let mut overrides = LaunchOverrides::default();
         overrides.nodes.insert(
-            "n1".to_string(),
-            LaunchSelectionOverride::Tier("codex/lg".to_string()),
+            "n1".into(),
+            LaunchSelectionOverride::Concrete(ModelSelection::new(
+                "codex",
+                Model::new("gpt-image-2"),
+            )),
         );
-        let out = resolve_launch_nodes(
-            &nodes,
-            &presets,
+        let out = preview(
+            &recipe(vec![agent_node("n1", "builder")], &[]),
             &overrides,
-            &plan(),
-            |id| Ok(Some(file_agent(id, Some("md")))),
-            image_only,
+            &["lg"],
+            |selection| {
+                if selection.model.as_str() == "gpt-image-2" {
+                    Err("'gpt-image-2' on codex serves only image".to_string())
+                } else {
+                    Ok(())
+                }
+            },
         );
-
-        assert!(out[0].resolved.is_none());
         assert_eq!(
             out[0].error.as_deref(),
-            Some("the 'codex/lg' tier resolves to gpt-image-2 on codex: 'gpt-image-2' on codex serves only image")
+            Some("codex/gpt-image-2: 'gpt-image-2' on codex serves only image")
         );
-        for row in &out {
-            assert!(!row.available.is_empty());
-            assert!(row
-                .available
-                .iter()
-                .all(|s| s.model.as_str() != "gpt-image-2"));
-        }
-        assert_eq!(
-            out[1].resolved.as_ref().unwrap().selection.model.as_str(),
-            "sonnet"
-        );
+    }
+
+    #[test]
+    fn a_launch_override_round_trips_its_wire_shape() {
+        let allotment: LaunchSelectionOverride =
+            serde_json::from_value(serde_json::json!({"kind": "allotment", "value": ["lg"]}))
+                .unwrap();
+        assert!(matches!(allotment, LaunchSelectionOverride::Allotment(_)));
+        let pin: LaunchSelectionOverride = serde_json::from_value(serde_json::json!({
+            "kind": "concrete", "value": {"backend": "claude", "model": "opus"}
+        }))
+        .unwrap();
+        assert!(matches!(pin, LaunchSelectionOverride::Concrete(_)));
+        assert!(serde_json::from_value::<LaunchSelectionOverride>(
+            serde_json::json!({"kind": "tier", "value": "lg"})
+        )
+        .is_err());
     }
 }

@@ -810,7 +810,6 @@ fn provider(key: &str, models: Vec<DiscoveredModel>) -> CatalogProvider {
             refreshed_at: Some(1),
             error: None,
         }),
-        tiers: Vec::new(),
         serves: Vec::new(),
         unable: Vec::new(),
     }

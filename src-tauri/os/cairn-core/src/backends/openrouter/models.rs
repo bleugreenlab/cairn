@@ -418,6 +418,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
     let (modalities, serves) = capabilities(model.architecture);
     let tokenizer = tokenizer_for("openrouter", &model.id, model.hugging_face_id.as_deref());
     DiscoveredModel {
+        maker: cairn_models::types::catalog::openrouter_maker(&model.id),
         id: model.id.clone(),
         model: model.id.clone(),
         display_name: model.name.unwrap_or_else(|| model.id.clone()),

@@ -130,6 +130,16 @@ pub async fn list(db: &LocalDb, project_id: &str) -> Result<Vec<Thread>, CairnEr
     .map_err(CairnError::from)
 }
 
+/// The project's thread named `name`, closed ones included (see [`list`]).
+pub async fn by_name(db: &LocalDb, project_id: &str, name: &str) -> Result<Thread, String> {
+    list(db, project_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|thread| thread.name == name)
+        .ok_or_else(|| format!("Thread '{name}' not found"))
+}
+
 /// The shape the server allocates when a create arrives with no name.
 ///
 /// A placeholder is an address, not a description. The `-` keeps it clear of

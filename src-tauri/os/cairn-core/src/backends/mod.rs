@@ -875,12 +875,8 @@ pub(crate) mod tests {
     fn stale_agent_selection_still_constructs_the_claude_runtime() {
         assert_eq!(
             backend_for_name(
-                effective_backend_name(
-                    Some(&selection("codex", "gpt-5.6-sol")),
-                    Some("codex"),
-                    Some("fable")
-                )
-                .as_deref()
+                effective_backend_name(Some(&selection("codex", "gpt-5.6-sol")), Some("fable"))
+                    .as_deref()
             )
             .name(),
             "Claude"

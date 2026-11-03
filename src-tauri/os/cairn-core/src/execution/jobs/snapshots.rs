@@ -100,10 +100,7 @@ pub(super) async fn load_agent_snapshot_data(
                     description: agent.description.clone(),
                     prompt: agent.prompt.clone(),
                     tools: agent.tools.clone(),
-                    tier: agent
-                        .tier
-                        .clone()
-                        .or_else(|| agent.selection.as_ref().map(|s| s.model.clone())),
+                    models: agent.models.clone(),
                     workspace_id: None,
                     project_id: None,
                     created_at: snapshot.created_at as i32,
@@ -111,7 +108,6 @@ pub(super) async fn load_agent_snapshot_data(
                     disallowed_tools: agent.disallowed_tools.clone(),
                     skills: agent.skills.clone(),
                     fence: agent.fence,
-                    backend_preference: agent.backend_preference.clone(),
                     icon: None,
                     selection: agent.selection.clone(),
                     extras: agent.extras.clone(),
@@ -340,12 +336,8 @@ async fn create_host_execution(
             event_payload: None,
             initiated_via: None,
         },
-        presets: None,
         inline_delegated_packets: vec![],
         branch_target: Default::default(),
-        // A host execution runs no agent node of its own, so there is nothing for
-        // a routing table to have decided.
-        model_routing: None,
         created_at: now,
     };
     let snapshot_json = snapshot.to_json()?;
@@ -368,38 +360,37 @@ async fn create_host_execution(
     Ok(execution_id)
 }
 
-/// Resolve a host job's agent from configuration files, through the same chain
-/// `config_loading` uses: config dir → effective presets → file agent →
-/// [`resolve_agent_snapshot`], the central function all `AgentSnapshot`
-/// construction goes through.
+/// Load a host job's agent from configuration files ([`FileAgent::snapshot`]).
 ///
 /// Loud on failure: a snapshot with an empty prompt reads as a placeholder
-/// downstream, so an unresolvable agent must propagate rather than be written.
+/// downstream, so an unloadable agent must propagate rather than be written.
 ///
-/// `jobs.model` stays the authoritative launch fact — `effective_backend_name`
+/// `jobs.model` is the authoritative launch fact — `effective_backend_name`
 /// deliberately prefers it over the config's selection (CAIRN-3798) — so when it
 /// is set the snapshot's `selection` is DERIVED from it. That is what makes the
 /// two agree instead of compete, and it is what a per-thread agent editor
-/// displays. Because an unedited host snapshot re-resolves every turn, a model
-/// change on the job flows into the snapshot on the next turn with no second
-/// write path.
+/// displays. Because an unedited host snapshot re-reads its agent every turn, a
+/// model change on the job flows into the snapshot on the next turn with no
+/// second write path.
+///
+/// [`FileAgent::snapshot`]: crate::config::agents::FileAgent::snapshot
 fn resolve_host_agent(
     config_dir: &Path,
     agent_config_id: &str,
     job_model: Option<&str>,
     project_path: Option<&Path>,
 ) -> Result<AgentSnapshot, String> {
-    let presets = load_effective_presets(config_dir, project_path);
     let file_agent = config_agents::get_agent(config_dir, agent_config_id, project_path)
         .map_err(|e| format!("Failed to load agent config '{agent_config_id}': {e}"))?
         .ok_or_else(|| format!("Agent config '{agent_config_id}' not found"))?;
-    let override_selection = job_model.map(|model| {
-        LaunchSelectionOverride::Concrete(crate::models::ModelSelection::new(
+    let mut snapshot = file_agent.snapshot();
+    snapshot.selection = job_model.map(|model| {
+        crate::models::ModelSelection::new(
             crate::backends::resolved_backend_for_model(model),
             Model::new(model),
-        ))
+        )
     });
-    resolve_agent_snapshot(&file_agent, override_selection.as_ref(), &presets)
+    Ok(snapshot)
 }
 
 /// Skill snapshots for a host execution: only the skills the agent explicitly
@@ -949,7 +940,7 @@ mod host_snapshot_tests {
     /// with no settings file.
     fn thread_agent(prompt: &str) -> String {
         format!(
-            "---\nname: Thread\ndescription: Holds an ongoing topic\ntools: mcp__cairn__read, mcp__cairn__run\ntier: lg\nfence: allow\n---\n\n{prompt}\n"
+            "---\nname: Thread\ndescription: Holds an ongoing topic\ntools: mcp__cairn__read, mcp__cairn__run\nmodels: [lg]\nfence: allow\n---\n\n{prompt}\n"
         )
     }
 
@@ -1074,6 +1065,89 @@ mod host_snapshot_tests {
             )
             .await
             .unwrap();
+    }
+
+    /// A thread session job minted with no model (an agent appending to a
+    /// project's threads, a reopened thread) chooses one from its agent's
+    /// allotment at its first launch, stores it, runs every turn on it at its
+    /// effort, and keeps it on later launches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_session_with_no_model_selects_from_its_agents_allotment() {
+        use super::super::config_loading::load_agent_config;
+        use super::super::node_selection::{select_job_model, tests as selection};
+        use cairn_config::allotment::model_ref;
+
+        let fx = fixture("host-select-thread.db").await;
+        seed_thread_session(&fx, None).await;
+        let mut models = selection::two_makers();
+        models
+            .ladder
+            .iter_mut()
+            .for_each(|rung| rung.effort = Some(0.9));
+        selection::serve_claude_and_codex(&fx.orch, models);
+
+        select_job_model(&fx.orch, &fx.db, &fx.job("j").await, None).unwrap();
+        let stored = fx
+            .orch
+            .job_selection("j")
+            .unwrap()
+            .expect("a thread's first launch stores its selection");
+        assert_eq!(model_ref(&stored.chosen), "codex/gpt-5.6-sol");
+        assert!(
+            stored.provenance.starts_with("lg = top of [lg]"),
+            "{}",
+            stored.provenance
+        );
+        assert!(stored.extras.reasoning_effort.is_some(), "{stored:?}");
+        assert_eq!(fx.job("j").await.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            fx.db
+                .query_opt_text("SELECT backend FROM sessions WHERE id = 's'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("codex"),
+            "the unstarted session moves to the chosen provider"
+        );
+
+        // The host snapshot derives its selection from `jobs.model`; the turn
+        // takes the stored effort with it.
+        fx.ensure("j", SnapshotFreshness::Tracking).await;
+        let agent = load_agent_config(&fx.orch, &fx.job("j").await, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            agent.selection.as_ref().map(model_ref).as_deref(),
+            Some("codex/gpt-5.6-sol")
+        );
+        assert_eq!(agent.extras.as_ref(), Some(&stored.extras));
+
+        // A later launch keeps the stored choice, whatever the ladder says now.
+        selection::serve_claude_and_codex(&fx.orch, selection::two_makers());
+        select_job_model(&fx.orch, &fx.db, &fx.job("j").await, None).unwrap();
+        assert_eq!(fx.orch.job_selection("j").unwrap().as_ref(), Some(&stored));
+    }
+
+    /// A thread that already ran on a provider before it had a stored choice
+    /// stays where it is rather than being moved mid-conversation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_that_already_ran_is_not_reselected() {
+        use super::super::node_selection::{select_job_model, tests as selection};
+
+        let fx = fixture("host-select-started.db").await;
+        seed_thread_session(&fx, None).await;
+        fx.db
+            .execute(
+                "UPDATE sessions SET backend_id = 'cli-1' WHERE id = 's'",
+                (),
+            )
+            .await
+            .unwrap();
+        selection::serve_claude_and_codex(&fx.orch, selection::two_makers());
+
+        select_job_model(&fx.orch, &fx.db, &fx.job("j").await, None).unwrap();
+        assert_eq!(fx.orch.job_selection("j").unwrap(), None);
+        assert_eq!(fx.job("j").await.model, None);
     }
 
     #[tokio::test]

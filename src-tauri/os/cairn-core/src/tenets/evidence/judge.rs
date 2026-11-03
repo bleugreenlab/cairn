@@ -89,7 +89,7 @@ pub fn question(view: &TenetView) -> DecisionQuestion {
 pub fn decision(candidates: &[&TenetView]) -> DecisionNode {
     DecisionNode {
         questions: candidates.iter().map(|view| question(view)).collect(),
-        model: None,
+        models: None,
         // The worker applies `CONFIDENCE_FLOOR` itself, to the chosen
         // option's probability rather than to `DecisionAnswer::confidence`.
         thresholds: Thresholds::default(),

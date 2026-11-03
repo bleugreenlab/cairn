@@ -933,7 +933,6 @@ pub async fn launch_standalone_workflow(
         branch_target: Default::default(),
         continuity: Default::default(),
         // A workflow host node runs no recipe agents, so nothing was routed.
-        model_routing: None,
         recipe: crate::models::RecipeSnapshot {
             id: format!("workflow-{workflow_id}"),
             name: format!("Workflow: {display_name}"),
@@ -951,7 +950,6 @@ pub async fn launch_standalone_workflow(
             event_payload: None,
             initiated_via: Some("workflow".to_string()),
         },
-        presets: None,
         inline_delegated_packets: vec![],
         created_at: now as i64,
     };

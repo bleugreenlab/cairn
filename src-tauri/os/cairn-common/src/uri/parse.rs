@@ -130,6 +130,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             id: (*id).to_string(),
         }),
         ["models", "usage"] => Some(CairnResource::ModelsUsage),
+        ["models", "ladder"] => Some(CairnResource::ModelsLadder),
+        ["models", "selection"] => Some(CairnResource::ModelsSelection),
         ["models", "embeddings"] => Some(CairnResource::ModelsEmbeddings),
         ["inference"] => Some(CairnResource::Inference),
         ["inference", "profiles"] => Some(CairnResource::InferenceProfiles),

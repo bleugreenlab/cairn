@@ -1677,7 +1677,7 @@ mod tests {
                 description: "v1".to_string(),
                 prompt: "Help.".to_string(),
                 tools: vec!["Read".to_string()],
-                tier: None,
+                models: Vec::new(),
                 workspace_id: Some(ws_project_id.to_string()),
                 project_id: None,
                 disallowed_tools: None,
@@ -1685,7 +1685,6 @@ mod tests {
                 fence: None,
                 sandbox: None,
                 on_escape: None,
-                backend_preference: None,
                 icon: None,
             })
             .unwrap();
@@ -1707,7 +1706,7 @@ mod tests {
             description: "personal".to_string(),
             prompt: "Solo.".to_string(),
             tools: vec!["Read".to_string()],
-            tier: None,
+            models: Vec::new(),
             workspace_id: Some("default".to_string()),
             project_id: None,
             disallowed_tools: None,
@@ -1715,7 +1714,6 @@ mod tests {
             fence: None,
             sandbox: None,
             on_escape: None,
-            backend_preference: None,
             icon: None,
         })
         .unwrap();
@@ -2119,7 +2117,7 @@ mod tests {
             description: "Plans things".to_string(),
             prompt: "Plan.".to_string(),
             tools: vec!["Read".to_string(), "Grep".to_string()],
-            tier: None,
+            models: Vec::new(),
             workspace_id: Some("default".to_string()),
             project_id: None,
             disallowed_tools: None,
@@ -2127,7 +2125,6 @@ mod tests {
             fence: None,
             sandbox: None,
             on_escape: None,
-            backend_preference: None,
             icon: None,
         })
         .unwrap();
@@ -2279,7 +2276,7 @@ mod tests {
             description: "Plans things".to_string(),
             prompt: "Plan.".to_string(),
             tools: vec!["Read".to_string()],
-            tier: None,
+            models: Vec::new(),
             workspace_id: Some("default".to_string()),
             project_id: None,
             disallowed_tools: None,
@@ -2287,7 +2284,6 @@ mod tests {
             fence: None,
             sandbox: None,
             on_escape: None,
-            backend_preference: None,
             icon: None,
         })
         .unwrap();

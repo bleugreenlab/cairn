@@ -126,6 +126,7 @@ fn decide() -> Vec<ServedVerb> {
 /// anywhere Cairn has read, so none is claimed.
 fn jev(id: &str, name: &str, description: Option<String>, priced: bool) -> DiscoveredModel {
     DiscoveredModel {
+        maker: None,
         id: id.to_string(),
         model: id.to_string(),
         display_name: name.to_string(),
