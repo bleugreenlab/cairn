@@ -5452,6 +5452,18 @@ pub struct LearnedResourceEstimate {
 /// `None` as it always has. The number moves as a rollout trigger, as 137 and
 /// 151 did: without it no attached machine would run the corrected forecast.
 ///
+/// cairn/5872 does not move the number. A claim at a commit git refuses to check
+/// out on the executor's platform (a tracked path its `verify_path` rejects,
+/// such as a colon on NTFS) answers the existing
+/// `ObjectInfrastructure(IntegrityFailure)` refusal, and the same failure while
+/// provisioning a residency checkout answers the existing `Persistence`
+/// failure; the commit, the path and the platform ride in the diagnostic string
+/// each already carries. Retiring a quarantined slot authority without holding
+/// its own lock, and recording a rename that still fails as that authority's
+/// refusal, are executor-local. No frame, variant or field changes, and a
+/// runner talking to an older executor only sees that executor quarantine
+/// slots it should not have, as before.
+///
 /// cairn/5662 does not move the number. Placement waits on a machine the
 /// self-update rollout or an inference deployment holds rather than refusing
 /// work for want of a machine, a waiting queue entry records the inference
