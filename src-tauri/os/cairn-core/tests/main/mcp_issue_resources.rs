@@ -268,6 +268,126 @@ async fn node_and_task_resources_resolve_by_stored_uri_segment() {
     .contains("Task 'renamed-task' not found"));
 }
 
+/// A delegated task's `return` is the task's output, at the task's address. A
+/// node that never wrote an artifact of its own lists none, neither its named
+/// nor its generic artifact address resolves to the child's, and a confirm at
+/// the parent's address naming the child's artifact is refused instead of
+/// minting a checkpoint that resolves the parent's gate.
+#[tokio::test]
+async fn a_delegated_tasks_return_never_surfaces_as_its_parents_artifact() {
+    let fixture = issue_project_fixture("mcp").await;
+    let issue_id = fixture
+        .insert_issue_with_status_and_time(1, "Builder that never wrote a PR", "active", 1)
+        .await;
+
+    let project_id = fixture.project_id.clone();
+    fixture
+        .db
+        .write(|conn| {
+            let project_id = project_id.clone();
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-build', 'recipe', ?1, ?2, 'running', 1, 1)",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+                     VALUES ('job-builder', 'exec-build', 'builder', ?1, ?2, 'Builder', 'blocked', 1, 1, 'builder')",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, parent_job_id, issue_id, project_id, node_name, status, task_index, created_at, updated_at, uri_segment)
+                     VALUES ('job-map', 'exec-build', 'job-builder', ?1, ?2, 'map-commit', 'complete', 0, 2, 2, 'map-commit')",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    r#"INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, created_at, updated_at, confirmed)
+                       VALUES ('artifact-map', 'job-map', 'return', '{"content":"a read-only code map"}', 1, 'return', 3, 3, 1)"#,
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let summary = read_resource(&fixture.orch, "cairn://p/mcp/1/1/builder".to_string()).await;
+    assert!(
+        !summary.contains("Artifact: `cairn://p/mcp/1/1/builder/"),
+        "{summary}"
+    );
+    assert!(!summary.contains("Artifacts:"), "{summary}");
+    assert!(
+        !summary.contains("cairn://p/mcp/1/1/builder/return"),
+        "{summary}"
+    );
+
+    for address in [
+        "cairn://p/mcp/1/1/builder/return",
+        "cairn://p/mcp/1/1/builder/artifact",
+    ] {
+        let read = read_resource(&fixture.orch, address.to_string()).await;
+        assert!(
+            read.contains("No artifact found for node 'builder'"),
+            "{address}: {read}"
+        );
+        assert!(!read.contains("code map"), "{address}: {read}");
+        // The static kind affordance lists `confirmed` on every artifact
+        // address; what must be absent is the pending-gate actions block.
+        assert!(
+            !read.contains("approve this gated artifact"),
+            "{address}: {read}"
+        );
+    }
+
+    let task = read_resource(
+        &fixture.orch,
+        "cairn://p/mcp/1/1/builder/task/map-commit".to_string(),
+    )
+    .await;
+    assert!(
+        task.contains("Artifact: `cairn://p/mcp/1/1/builder/task/map-commit/return`"),
+        "{task}"
+    );
+    let task_artifact = read_resource(
+        &fixture.orch,
+        "cairn://p/mcp/1/1/builder/task/map-commit/return".to_string(),
+    )
+    .await;
+    assert!(
+        task_artifact.contains("a read-only code map"),
+        "{task_artifact}"
+    );
+
+    let confirm = apply_change(
+        &fixture.orch,
+        "cairn://p/mcp/1/1/builder/return",
+        "patch",
+        json!({ "confirmed": true }),
+    )
+    .await;
+    assert!(
+        confirm.contains("has no `return` artifact of its own to confirm"),
+        "{confirm}"
+    );
+    assert_eq!(job_status(&fixture.db, "job-builder").await, "blocked");
+    assert_eq!(
+        fixture
+            .db
+            .query_opt_text("SELECT id FROM artifacts WHERE job_id = 'job-builder'", ())
+            .await
+            .unwrap(),
+        None,
+        "a refused confirm must not mint an artifact on the parent"
+    );
+}
+
 #[tokio::test]
 async fn node_summary_surfaces_activity_and_latest_assistant_line() {
     let fixture = issue_project_fixture("mcp").await;

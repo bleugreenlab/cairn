@@ -1020,32 +1020,16 @@ pub(super) async fn find_task_job(
     Ok((parent_job, task_job))
 }
 
-/// Check if a job or any of its child jobs have an artifact
+/// Whether a job has an artifact of its own.
+///
+/// Every artifact lookup here reads only the addressed job's rows. A child job
+/// (a delegated task, a call, a child workflow) owns its output at its own
+/// address; counting it toward the parent presents the child's output as the
+/// parent's work product.
 pub(super) async fn has_artifact_for_job(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
-    // Check the job itself
-    let direct = match conn
-        .query(
-            "SELECT id FROM artifacts WHERE job_id = ?1 LIMIT 1",
-            (job_id,),
-        )
-        .await
-    {
-        Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
-        Err(_) => false,
-    };
-    if direct {
-        return true;
-    }
-
     match conn
         .query(
-            "
-            SELECT a.id
-            FROM artifacts a
-            JOIN jobs j ON j.id = a.job_id
-            WHERE j.parent_job_id = ?1
-            LIMIT 1
-            ",
+            "SELECT id FROM artifacts WHERE job_id = ?1 LIMIT 1",
             (job_id,),
         )
         .await
@@ -1093,43 +1077,17 @@ pub(super) async fn get_direct_artifact_for_job(
         .and_then(|row| resource_artifact_from_row(&row).ok())
 }
 
-/// Get artifact for a job (checking job itself and child jobs)
-pub(super) async fn get_artifact_for_job(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-) -> Option<ResourceArtifact> {
-    if let Some(artifact) = get_direct_artifact_for_job(conn, job_id).await {
-        return Some(artifact);
-    }
-
-    let sql = format!(
-        "
-        SELECT {ARTIFACT_COLUMNS}
-        FROM artifacts
-        WHERE job_id IN (SELECT id FROM jobs WHERE parent_job_id = ?1)
-        ORDER BY created_at DESC, rowid DESC
-        LIMIT 1
-        "
-    );
-    let mut rows = conn.query(sql.as_str(), (job_id,)).await.ok()?;
-    rows.next()
-        .await
-        .ok()
-        .flatten()
-        .and_then(|row| resource_artifact_from_row(&row).ok())
-}
-
-/// Get the latest version of a specifically-named artifact for a job (checking
-/// the job itself, then its child jobs). Unlike [`get_artifact_for_job`], this
-/// filters by `output_name`, so a named read (`.../{node}/plan`) returns that
-/// name's own version chain rather than whatever name carries the highest
-/// version across the job.
+/// Get the latest version of a specifically-named artifact on a job. Unlike
+/// [`get_direct_artifact_for_job`], this filters by `output_name`, so a named
+/// read (`.../{node}/plan`) returns that name's own version chain rather than
+/// whichever name was written most recently. Only the job's own rows count
+/// (see [`has_artifact_for_job`]).
 pub(super) async fn get_named_artifact_for_job(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     output_name: &str,
 ) -> Option<ResourceArtifact> {
-    let direct = format!(
+    let sql = format!(
         "
         SELECT {ARTIFACT_COLUMNS}
         FROM artifacts
@@ -1139,25 +1097,7 @@ pub(super) async fn get_named_artifact_for_job(
         "
     );
     let mut rows = conn
-        .query(direct.as_str(), params![job_id, output_name])
-        .await
-        .ok()?;
-    if let Some(row) = rows.next().await.ok().flatten() {
-        return resource_artifact_from_row(&row).ok();
-    }
-
-    let child = format!(
-        "
-        SELECT {ARTIFACT_COLUMNS}
-        FROM artifacts
-        WHERE job_id IN (SELECT id FROM jobs WHERE parent_job_id = ?1)
-          AND output_name = ?2
-        ORDER BY version DESC
-        LIMIT 1
-        "
-    );
-    let mut rows = conn
-        .query(child.as_str(), params![job_id, output_name])
+        .query(sql.as_str(), params![job_id, output_name])
         .await
         .ok()?;
     rows.next()
@@ -1170,7 +1110,7 @@ pub(super) async fn get_named_artifact_for_job(
 /// List the latest version of every distinct named artifact a job has produced,
 /// ordered by name. Each `output_name` chain contributes exactly one row (its
 /// highest version). A single-artifact node yields exactly one entry — the same
-/// artifact [`get_artifact_for_job`] would surface.
+/// artifact [`get_direct_artifact_for_job`] would surface.
 pub(super) async fn list_named_artifacts_for_job(
     conn: &cairn_db::turso::Connection,
     job_id: &str,

@@ -8,10 +8,9 @@ use cairn_db::turso::params;
 
 use super::common::{
     find_action_run_by_node_name, find_job_by_node_name, find_node_job, find_query_value,
-    find_task_job, get_artifact_for_job, get_direct_artifact_for_job, get_named_artifact_for_job,
-    has_artifact_for_job, list_named_artifacts_for_job, load_node_job, load_task_job,
-    read_resource, reject_query_params, resolve_issue_id, visible_job_node_segment,
-    ResourceActionRun, ResourceArtifact, ResourceJob,
+    find_task_job, get_direct_artifact_for_job, get_named_artifact_for_job, has_artifact_for_job,
+    list_named_artifacts_for_job, load_node_job, load_task_job, read_resource, reject_query_params,
+    resolve_issue_id, visible_job_node_segment, ResourceActionRun, ResourceArtifact, ResourceJob,
 };
 use super::transcript::{
     format_raw_transcript, format_transcript_digest_with, get_nth_run_id, grep_transcript_content,
@@ -1657,13 +1656,7 @@ pub(super) async fn read_node(
             };
             let visible_node_segment = visible_job_node_segment(conn, &job).await;
             let activity = load_node_activity(conn, &job.id).await;
-            let mut named_artifacts = list_named_artifacts_for_job(conn, &job.id).await;
-            if named_artifacts.is_empty() {
-                // The node's own artifact may live on a child job (a delegated
-                // task); fall back to the child-inclusive lookup so it still
-                // surfaces.
-                named_artifacts.extend(get_artifact_for_job(conn, &job.id).await);
-            }
+            let named_artifacts = list_named_artifacts_for_job(conn, &job.id).await;
             let pr = load_node_pr_row(conn, &job.id).await;
             Ok(NodeSummaryRows::Job(Box::new(JobSummaryRows {
                 job,
@@ -2736,7 +2729,7 @@ pub(super) async fn read_node_artifact(
             Box::pin(async move {
                 match wanted {
                     Some(name) => get_named_artifact_for_job(conn, &job.id, &name).await,
-                    None => get_artifact_for_job(conn, &job.id).await,
+                    None => get_direct_artifact_for_job(conn, &job.id).await,
                 }
             })
         },

@@ -5,6 +5,7 @@ use crate::mcp::handlers::comments_artifacts;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
+use cairn_db::turso::params;
 
 async fn resolution_attribution(
     orch: &Orchestrator,
@@ -22,6 +23,53 @@ async fn resolution_attribution(
         .await
         .ok()
         .map(crate::pr_data::actions::PrResolutionAttribution::agent)
+}
+
+/// Refuse a confirm addressed to an artifact name the node's own job never
+/// wrote.
+///
+/// Approval resolves the node's gate whatever name the URI carries, and a
+/// blocked job with no artifact is approved by minting a checkpoint for it
+/// (`confirm_latest_artifact_conn`). So confirming a name the node does not
+/// hold, such as a delegated task's `return` (which lives at the task's own
+/// address), would advance the DAG past a node that produced nothing under that
+/// name. The name matches the way read addresses are built: the stored
+/// `output_name`, else the artifact type.
+async fn require_own_artifact_chain(
+    orch: &Orchestrator,
+    job_id: &str,
+    node_id: &str,
+    name: &str,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (owned_job_id, owned_name) = (job_id.to_string(), name.to_string());
+    let held = db
+        .read(move |conn| {
+            let (job_id, name) = (owned_job_id.clone(), owned_name.clone());
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM artifacts
+                          WHERE job_id = ?1
+                            AND COALESCE(NULLIF(output_name, ''), artifact_type) = ?2
+                          LIMIT 1",
+                        params![job_id.as_str(), name.as_str()],
+                    )
+                    .await?;
+                Ok(rows.next().await?.is_some())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if held {
+        Ok(())
+    } else {
+        Err(format!(
+            "{node_id} has no `{name}` artifact of its own to confirm; a delegated task's output lives at its own `{node_id}/task/<task>` address and is never confirmed through its parent"
+        ))
+    }
 }
 
 pub(super) async fn dispatch(
@@ -241,6 +289,21 @@ pub(super) async fn dispatch(
                     ));
                 }
                 if dry_run {
+                    if let Some(name) = name.as_deref() {
+                        let job_id = crate::resources::resolve_node_or_task_job_id_for_read(
+                            &orch.db.local,
+                            project,
+                            *number,
+                            *exec_seq,
+                            node_id,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                        require_own_artifact_chain(orch, &job_id, node_id, name)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
+                    }
                     format!("Would confirm artifact {node_id}/{artifact_label}")
                 } else {
                     let job_id = crate::resources::resolve_node_or_task_job_id(
@@ -253,6 +316,11 @@ pub(super) async fn dispatch(
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
+                    if let Some(name) = name.as_deref() {
+                        require_own_artifact_chain(orch, &job_id, node_id, name)
+                            .await
+                            .map_err(|error| build_failure(index, item, error))?;
+                    }
                     crate::execution::checkpoints::approve_job_inner(orch, &job_id)
                         .await
                         .map_err(|error| build_failure(index, item, error))?;
