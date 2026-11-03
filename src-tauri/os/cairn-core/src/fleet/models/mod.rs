@@ -53,7 +53,7 @@ use super::{executor_public_name, Fleet};
 use crate::fleet::inference::Preemption;
 use crate::orchestrator::inference::load_inventory;
 use crate::orchestrator::inference_control::{
-    self, deployment_phases, last_footprint, load_history, Heads, LoadRow, MachineReading,
+    self, deployment_phases, load_history, Heads, LoadRow, MachineReading, Need,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
@@ -237,29 +237,23 @@ fn pool_settings(
         .collect()
 }
 
-/// A deployment's footprint on each of its machines: its last settled load,
-/// else what its profile states on every machine. Empty when neither is known.
-fn footprint_of(
+/// A deployment's need on each of its machines: its last settled load, else
+/// what its profile states, else what is predicted from what the profile runs,
+/// a share of memory taken of what each machine reports
+/// ([`inference_control::need_of`]). Refused when nothing predicts one.
+fn need_of(
     inventory: &Inventory,
     id: &DeploymentId,
     history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
-) -> BTreeMap<String, u64> {
-    let measured = last_footprint(history.get(id));
-    if !measured.is_empty() {
-        return measured;
-    }
-    let Some(deployment) = inventory.deployments.get(id) else {
-        return BTreeMap::new();
-    };
-    let stated = inventory
-        .profiles
-        .get(&deployment.profile)
-        .and_then(act::stated_need);
-    deployment
-        .machines
-        .iter()
-        .filter_map(|machine| Some((machine.as_str().to_string(), stated?)))
-        .collect()
+    readings: &BTreeMap<String, MachineReading>,
+) -> Result<Need, String> {
+    let deployment = inventory
+        .deployments
+        .get(id)
+        .ok_or_else(|| format!("there is no deployment {id}"))?;
+    inference_control::need_of(inventory, deployment, history.get(id), |machine| {
+        readings.get(machine)?.total_bytes
+    })
 }
 
 /// Whether `id`'s footprint is in the memory batches use.
@@ -317,7 +311,8 @@ fn machine_residents(
 }
 
 /// Drain each reserving resident's gang, preempting what the drain chooses,
-/// and launch the start once the gang fits.
+/// and launch the start once the gang fits. A start whose need nothing
+/// predicts is refused, naming what is missing, rather than drained blind.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     db: &LocalDb,
@@ -325,7 +320,7 @@ async fn drive(
     inventory: &Inventory,
     state: &State,
     phases: &BTreeMap<DeploymentId, Phase>,
-    footprints: &BTreeMap<DeploymentId, BTreeMap<String, u64>>,
+    needs: &BTreeMap<DeploymentId, Result<Need, String>>,
     readings: &BTreeMap<String, MachineReading>,
     now: Ms,
 ) {
@@ -338,10 +333,20 @@ async fn drive(
         let Some(deployment) = inventory.deployments.get(id) else {
             continue;
         };
+        let need = match needs.get(id) {
+            Some(Ok(need)) => need,
+            Some(Err(why)) => {
+                let reason = format!("its memory need is unknown: {why}");
+                if let Err(error) = inference_control::refuse(db, id, reason, now).await {
+                    log::warn!("models: could not refuse {id}'s start: {error}");
+                }
+                continue;
+            }
+            None => continue,
+        };
         let on = if !readings.contains_key(deployment.head.as_str()) {
             Some(format!("its head {} is not attached", deployment.head))
         } else {
-            let footprint = footprints.get(id).cloned().unwrap_or_default();
             let mut running = heads.running(&resident.machines);
             let gang: BTreeMap<String, GangMachine> = resident
                 .machines
@@ -353,7 +358,7 @@ async fn drive(
                         GangMachine {
                             room: Room {
                                 free_bytes: reading.and_then(|r| r.free_bytes),
-                                need_bytes: footprint.get(machine).copied(),
+                                need_bytes: need.per_machine.get(machine).copied(),
                             },
                             shared_with_batches: reading.is_some_and(|r| r.free_is_host_memory),
                             batches: running.remove(machine).unwrap_or_default(),
@@ -361,7 +366,7 @@ async fn drive(
                     )
                 })
                 .collect();
-            match drain(&gang, *since_ms, now) {
+            match drain(&gang, need.predicted(), *since_ms, now) {
                 Drain::Start => None,
                 Drain::Wait(on) => Some(on),
                 Drain::Preempt { batches, waiting } => {
@@ -477,11 +482,18 @@ async fn pass_locked(
         }
     }
     let phases = deployment_phases(db).await?;
-    let footprints: BTreeMap<DeploymentId, BTreeMap<String, u64>> = plan
+    let needs: BTreeMap<DeploymentId, Result<Need, String>> = plan
         .state
         .residents
         .keys()
-        .map(|id| (id.clone(), footprint_of(&inventory, id, &history)))
+        .map(|id| (id.clone(), need_of(&inventory, id, &history, &readings)))
+        .collect();
+    let footprints: BTreeMap<DeploymentId, BTreeMap<String, u64>> = needs
+        .iter()
+        .map(|(id, need)| {
+            let per_machine = need.as_ref().map(|need| need.per_machine.clone());
+            (id.clone(), per_machine.unwrap_or_default())
+        })
         .collect();
     drive(
         db,
@@ -489,7 +501,7 @@ async fn pass_locked(
         &inventory,
         &plan.state,
         &phases,
-        &footprints,
+        &needs,
         &readings,
         now,
     )

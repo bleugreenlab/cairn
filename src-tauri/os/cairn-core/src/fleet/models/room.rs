@@ -10,7 +10,11 @@
 //!
 //! A reserving start goes on FIT, not on empty: once every gang machine's
 //! measured free memory covers the model's need, work still running there is
-//! no reason to wait ([`drain`]).
+//! no reason to wait, and short of it only the memory it needs is drained
+//! ([`drain`]). Every start has a need to drain for: measured, stated, or
+//! predicted from what its profile runs
+//! ([`crate::orchestrator::inference_control::need_of`]); one with nothing to
+//! predict from is refused before it reaches the drain.
 
 use std::collections::BTreeMap;
 
@@ -57,10 +61,8 @@ pub fn gpu_allocated_bytes(host: &HostHealth) -> Option<u64> {
 pub struct ResidentRoom {
     /// The part of the loading models' footprints not yet allocated: memory
     /// they are about to take, which the machine's measured free memory still
-    /// counts as free. Everything, when a loading model has never been
-    /// measured, since nothing says how much it will take. A healthy model's
-    /// memory is already in use and already out of the measured free memory,
-    /// so it holds back nothing more.
+    /// counts as free. A healthy model's memory is already in use and already
+    /// out of the measured free memory, so it holds back nothing more.
     pub unmet_bytes: u64,
     /// The memory evicting every one of them that may give way for room would
     /// return. A pinned resident never does, so its memory is no relief: work
@@ -89,11 +91,7 @@ pub fn resident_room(
         .unwrap_or(0)
         .saturating_sub(healthy_footprint)
         .min(loading_footprint);
-    let unmet_bytes = if loading.iter().any(|r| r.held_bytes.is_none()) {
-        u64::MAX
-    } else {
-        loading_footprint - loading_taken
-    };
+    let unmet_bytes = loading_footprint - loading_taken;
     // What eviction returns, counting only the unpinned: the healthy models'
     // footprints (capped by what the GPUs hold beyond the pinned ones, or that
     // whole reading when an unpinned footprint was never measured and every
@@ -163,19 +161,26 @@ pub fn resident_misfit(
 /// Why a machine cannot take work whose memory has never been measured
 /// because of its model residents, or `None`. Nothing shows such work fits
 /// beside the room a loading model has reserved, so it is refused that room
-/// (fails closed, tenet 302), naming the loading model. A healthy model holds
-/// back nothing, so the work runs beside it as before. The refusal waits for
-/// the model and is never grounds to evict it.
+/// (fails closed, tenet 302), naming the loading model. So is a loading model
+/// whose footprint here is unknown (its need is a share of memory this machine
+/// has not reported). A healthy model holds back nothing, so the work runs
+/// beside it as before. The refusal waits for the model and is never grounds
+/// to evict it.
 pub fn unmeasured_misfit(
     residents: &[MachineModelResident],
     gpu_allocated: Option<u64>,
 ) -> Option<PlacementRejectionReason> {
-    if resident_room(residents, gpu_allocated).unmet_bytes == 0 {
+    let loading = |r: &&MachineModelResident| r.unified && r.phase != "healthy";
+    let unknown = residents
+        .iter()
+        .filter(loading)
+        .any(|r| r.held_bytes.is_none());
+    if !unknown && resident_room(residents, gpu_allocated).unmet_bytes == 0 {
         return None;
     }
     let named = residents
         .iter()
-        .filter(|r| r.unified && r.phase != "healthy")
+        .filter(loading)
         .max_by_key(|r| r.held_bytes.unwrap_or(u64::MAX))?;
     Some(model_resident_rejection(named, true))
 }
@@ -197,40 +202,43 @@ fn model_resident_rejection(
 
 /// What one machine has left for a deployment and what the deployment needs
 /// there, both in bytes of the same kind of memory (system RAM on a
-/// unified-memory machine, VRAM on a discrete card). `None` is unmeasured.
+/// unified-memory machine, VRAM on a discrete card). `None` free memory is
+/// unmeasured; a `None` need is a share of memory the machine has not
+/// reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Room {
     pub free_bytes: Option<u64>,
     pub need_bytes: Option<u64>,
 }
 
+/// One machine short of room: its name, what it has free and what the
+/// deployment needs there, either unknown until the machine reports it.
+pub type Shortfall = (String, Option<u64>, Option<u64>);
+
 /// Whether a gang fits, from each machine's [`Room`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fit {
     Fits,
-    /// The deployment has never been measured and its profile states no
-    /// memory, so nothing can be compared. The start waits for its machines
-    /// to run no batch work, preempting none (see [`drain`]), and its load
-    /// measures the footprint for next time.
-    Unknown,
-    /// These machines lack room, with what each has and needs.
-    Short(Vec<(String, Option<u64>, u64)>),
+    /// These machines lack room, or have not reported enough to tell.
+    Short(Vec<Shortfall>),
 }
 
 impl Fit {
     pub fn describe(&self) -> String {
         match self {
             Self::Fits => "every machine has the memory it needs".into(),
-            Self::Unknown => "its footprint is unmeasured, so memory was not checked".into(),
             Self::Short(short) => short
                 .iter()
-                .map(|(machine, free, need)| match free {
-                    Some(free) => {
+                .map(|(machine, free, need)| match (free, need) {
+                    (Some(free), Some(need)) => {
                         format!("{machine} has {} free and needs {}", gib(*free), gib(*need))
                     }
-                    None => format!(
+                    (None, Some(need)) => format!(
                         "{machine}'s free memory is unmeasured; it needs {}",
                         gib(*need)
+                    ),
+                    (_, None) => format!(
+                        "{machine} has not reported its memory, so its share of it is unknown"
                     ),
                 })
                 .collect::<Vec<_>>()
@@ -240,20 +248,14 @@ impl Fit {
 }
 
 /// Whether every machine has the room the deployment needs on it. A machine
-/// with a need and no measured free memory does not fit: an unmeasured
-/// reading is never read as room.
+/// with no measured free memory, or whose need is a share of memory it has not
+/// reported, does not fit: an unmeasured reading is never read as room.
 pub fn fit(rooms: &BTreeMap<String, Room>) -> Fit {
-    if rooms.values().all(|room| room.need_bytes.is_none()) {
-        return Fit::Unknown;
-    }
     let short: Vec<_> = rooms
         .iter()
-        .filter_map(|(machine, room)| {
-            let need = room.need_bytes?;
-            match room.free_bytes {
-                Some(free) if free >= need => None,
-                free => Some((machine.clone(), free, need)),
-            }
+        .filter_map(|(machine, room)| match (room.free_bytes, room.need_bytes) {
+            (Some(free), Some(need)) if free >= need => None,
+            (free, need) => Some((machine.clone(), free, need)),
         })
         .collect();
     if short.is_empty() {
@@ -307,8 +309,7 @@ pub struct PreemptionChoice {
 /// What a reserving start does next about the batch work on its machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Drain {
-    /// Send the start: every gang machine has the room, or nothing could be
-    /// compared and no batch work is left on them.
+    /// Send the start: every gang machine has the room.
     Start,
     /// Keep waiting, with what it waits on.
     Wait(String),
@@ -323,36 +324,36 @@ pub enum Drain {
 /// off the room the model has not taken ([`resident_misfit`]), so this decides
 /// only about the work already there.
 ///
-/// The start goes on FIT, not on empty. A footprint nothing can be compared
-/// with waits for the machines to run no batch work, and preempts nothing,
-/// since no conflict can be measured. Short of room, restartable work is left
-/// to finish for [`DRAIN_BOUND_SECS`]; past that, only checks whose measured
-/// memory is in the way are preempted, the fewest that cover each short
-/// machine's shortfall, largest first. Agent turns and unmeasured batches are
-/// never preempted. All or nothing across the gang: when any short machine
-/// cannot be covered that way, nothing is preempted anywhere, because the start
-/// could not be sent anyway.
-pub fn drain(gang: &BTreeMap<String, GangMachine>, reserving_since_ms: i64, now_ms: i64) -> Drain {
+/// The start goes on FIT, not on empty, and never waits for its machines to
+/// run no batch work: the only conflict is memory. Short of room, restartable
+/// work is left to finish for [`DRAIN_BOUND_SECS`]; past that, only checks
+/// whose measured memory is in the way are preempted, the fewest that cover
+/// each short machine's shortfall, largest first. Agent turns and unmeasured
+/// batches are never preempted. All or nothing across the gang: when any short
+/// machine cannot be covered that way, nothing is preempted anywhere, because
+/// the start could not be sent anyway. `predicted` is how the need was
+/// predicted, when nothing measured or stated it, and the wait says so.
+pub fn drain(
+    gang: &BTreeMap<String, GangMachine>,
+    predicted: Option<&str>,
+    reserving_since_ms: i64,
+    now_ms: i64,
+) -> Drain {
     let rooms: BTreeMap<String, Room> = gang
         .iter()
         .map(|(machine, state)| (machine.clone(), state.room))
         .collect();
     let short = match fit(&rooms) {
         Fit::Fits => return Drain::Start,
-        Fit::Unknown => {
-            let running: usize = gang.values().map(|machine| machine.batches.len()).sum();
-            return if running == 0 {
-                Drain::Start
-            } else {
-                Drain::Wait(format!(
-                    "its footprint is unmeasured, so it waits for the {} on its machines to finish and preempts none",
-                    batches(running)
-                ))
-            };
-        }
         Fit::Short(short) => short,
     };
-    let memory = format!("memory: {}", Fit::Short(short.clone()).describe());
+    let memory = match predicted {
+        Some(how) => format!(
+            "memory: {} (a predicted need: {how})",
+            Fit::Short(short.clone()).describe()
+        ),
+        None => format!("memory: {}", Fit::Short(short.clone()).describe()),
+    };
     let elapsed_ms = now_ms.saturating_sub(reserving_since_ms).max(0) as u64;
     let bound_ms = DRAIN_BOUND_SECS * 1_000;
     if elapsed_ms < bound_ms {
@@ -368,6 +369,10 @@ pub fn drain(gang: &BTreeMap<String, GangMachine>, reserving_since_ms: i64, now_
     let mut returning = 0usize;
     for (machine, free, need) in &short {
         let Some(state) = gang.get(machine) else {
+            continue;
+        };
+        let Some(need) = *need else {
+            blocked.push(format!("{machine} has not reported its memory"));
             continue;
         };
         let Some(free) = *free else {
@@ -418,7 +423,7 @@ pub fn drain(gang: &BTreeMap<String, GangMachine>, reserving_since_ms: i64, now_
                 request_id: batch.request_id.clone(),
                 attempt_id: batch.attempt_id.clone(),
                 resident_bytes: bytes,
-                need_bytes: *need,
+                need_bytes: need,
                 free_bytes: free,
             });
         }
@@ -670,15 +675,27 @@ mod tests {
         assert_eq!(resident_misfit(8 * GIB, 6 * GIB, &vram, Some(0)), None);
     }
 
+    /// A loading model's footprint is unknown only on a machine that has not
+    /// reported the memory its share is of. That holds back no arithmetic
+    /// "everything": measured work is weighed on the room the machine reports,
+    /// and unmeasured work, which nothing shows fits, is still refused.
     #[test]
-    fn an_unmeasured_model_still_loading_keeps_every_measured_batch_off() {
-        let unmeasured = [resident("reserving", None, true)];
-        assert!(resident_misfit(110 * GIB, GIB, &unmeasured, Some(0)).is_some());
+    fn a_loading_model_with_no_footprint_holds_back_no_arithmetic_everything() {
+        let unknown = [resident("reserving", None, true)];
+        assert_eq!(resident_room(&unknown, Some(0)), ResidentRoom::default());
+        let Some(PlacementRejectionReason::ModelResident {
+            demand_unmeasured, ..
+        }) = unmeasured_misfit(&unknown, Some(0))
+        else {
+            panic!("unmeasured work is refused the loading model's room");
+        };
+        assert!(demand_unmeasured);
         let healthy = [resident("healthy", None, true)];
         assert_eq!(
             resident_misfit(20 * GIB, 8 * GIB, &healthy, Some(90 * GIB)),
             None
         );
+        assert_eq!(unmeasured_misfit(&healthy, Some(90 * GIB)), None);
     }
 
     fn batch(id: &str, restartable: bool, resident_gib: Option<u64>) -> RunningBatch {
@@ -728,8 +745,11 @@ mod tests {
         );
         rooms.insert("sp2".to_string(), room(None, Some(100 * GIB)));
         assert!(matches!(fit(&rooms), Fit::Short(_)));
-        let unknown: BTreeMap<_, _> = [("sp1".to_string(), room(Some(1), None))].into();
-        assert_eq!(fit(&unknown), Fit::Unknown);
+        let unreported: BTreeMap<_, _> = [("sp1".to_string(), room(Some(1), None))].into();
+        assert_eq!(
+            fit(&unreported).describe(),
+            "sp1 has not reported its memory, so its share of it is unknown"
+        );
     }
 
     #[test]
@@ -744,22 +764,94 @@ mod tests {
                 machine(105, Some(100), vec![batch("turn", false, Some(4))]),
             ),
         ]);
-        assert_eq!(drain(&gang, T0, T0), Drain::Start, "fit, not empty");
+        assert_eq!(drain(&gang, None, T0, T0), Drain::Start, "fit, not empty");
     }
 
+    /// The operator's rule (cairn/5881): a load drains only the memory it
+    /// needs. A profile stating no memory and running vLLM at
+    /// `--gpu-memory-utilization 0.85` needs 0.85 of each 128 GiB Spark,
+    /// predicted, and past the bound only the checks covering that are
+    /// preempted while other work runs on beside it.
     #[test]
-    fn an_unmeasured_footprint_waits_for_empty_machines_and_preempts_nothing() {
-        let busy = gang(vec![(
+    fn a_predicted_need_drains_only_the_checks_covering_it_never_waiting_for_empty() {
+        let need = (128 * GIB) as f64 * 0.85;
+        let need_gib = (need / GIB as f64).ceil() as u64;
+        assert_eq!(need_gib, 109);
+        let how =
+            "vLLM pre-allocates 0.85 of each machine's memory (`--gpu-memory-utilization 0.85`)";
+        let gang = gang(vec![
+            (
+                "sp1",
+                machine(
+                    80,
+                    Some(need_gib),
+                    vec![
+                        batch("check-large", true, Some(40)),
+                        batch("check-small", true, Some(6)),
+                        batch("turn", false, Some(2)),
+                    ],
+                ),
+            ),
+            (
+                "sp2",
+                machine(
+                    115,
+                    Some(need_gib),
+                    vec![batch("check-beside", true, Some(8))],
+                ),
+            ),
+        ]);
+        let Drain::Wait(why) = drain(&gang, Some(how), T0, T0 + 1_000) else {
+            panic!("inside the bound the work may finish");
+        };
+        assert!(
+            why.starts_with("memory: sp1 has 80.0 GiB free and needs 109.0 GiB (a predicted need: vLLM pre-allocates 0.85"),
+            "{why}"
+        );
+        let Drain::Preempt { batches, waiting } = drain(&gang, Some(how), T0, PAST_BOUND) else {
+            panic!("a coverable shortfall preempts, never waiting for empty");
+        };
+        assert_eq!(
+            batches
+                .iter()
+                .map(|b| b.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["check-large"],
+            "29 GiB short: the largest check covers it; the small check, the turn and sp2's check run on"
+        );
+        assert!(waiting.contains("a predicted need"), "{waiting}");
+
+        // Room enough on both: the start goes beside every batch still running.
+        let roomy = gang_with_free(&gang, 112);
+        assert_eq!(drain(&roomy, Some(how), T0, T0), Drain::Start);
+    }
+
+    fn gang_with_free(
+        gang: &BTreeMap<String, GangMachine>,
+        free_gib: u64,
+    ) -> BTreeMap<String, GangMachine> {
+        gang.iter()
+            .map(|(name, state)| {
+                let mut state = state.clone();
+                state.room.free_bytes = Some(free_gib * GIB);
+                (name.clone(), state)
+            })
+            .collect()
+    }
+
+    /// A share of memory a machine has not reported waits on that reading,
+    /// preempting nothing, however many batches run or how long it has waited.
+    #[test]
+    fn a_share_of_unreported_memory_waits_for_the_reading_and_preempts_nothing() {
+        let gang = gang(vec![(
             "sp1",
             machine(10, None, vec![batch("check", true, Some(90))]),
         )]);
-        let Drain::Wait(why) = drain(&busy, T0, PAST_BOUND * 10) else {
-            panic!("an unmeasured footprint never preempts");
+        let Drain::Wait(why) = drain(&gang, Some("vLLM"), T0, PAST_BOUND * 10) else {
+            panic!("nothing to cover, so nothing is preempted");
         };
-        assert!(why.contains("footprint is unmeasured"), "{why}");
-        assert!(why.contains("1 batch on its machines"), "{why}");
-        let empty = gang(vec![("sp1", machine(10, None, Vec::new()))]);
-        assert_eq!(drain(&empty, T0, T0), Drain::Start);
+        assert!(why.contains("sp1 has not reported its memory"), "{why}");
+        assert!(!why.contains("to finish"), "never a wait for empty: {why}");
     }
 
     #[test]
@@ -768,7 +860,7 @@ mod tests {
             "sp1",
             machine(60, Some(100), vec![batch("check", true, Some(50))]),
         )]);
-        let Drain::Wait(why) = drain(&gang, T0, T0 + 60_000) else {
+        let Drain::Wait(why) = drain(&gang, None, T0, T0 + 60_000) else {
             panic!("inside the bound nothing is preempted");
         };
         assert!(
@@ -777,7 +869,7 @@ mod tests {
         );
         assert!(why.contains("may finish for 4 min more"), "{why}");
         assert!(matches!(
-            drain(&gang, T0, PAST_BOUND),
+            drain(&gang, None, T0, PAST_BOUND),
             Drain::Preempt { .. }
         ));
     }
@@ -804,7 +896,7 @@ mod tests {
                 machine(105, Some(100), vec![batch("fits", true, Some(30))]),
             ),
         ]);
-        let Drain::Preempt { batches, waiting } = drain(&gang, T0, PAST_BOUND) else {
+        let Drain::Preempt { batches, waiting } = drain(&gang, None, T0, PAST_BOUND) else {
             panic!("a coverable shortfall preempts");
         };
         let stopped: Vec<&str> = batches.iter().map(|b| b.request_id.as_str()).collect();
@@ -842,7 +934,7 @@ mod tests {
                 ),
             ),
         ]);
-        let Drain::Wait(why) = drain(&gang, T0, PAST_BOUND) else {
+        let Drain::Wait(why) = drain(&gang, None, T0, PAST_BOUND) else {
             panic!("preempting on sp1 alone would not let the start go");
         };
         assert!(
@@ -855,7 +947,7 @@ mod tests {
     fn memory_batches_do_not_use_or_cannot_measure_is_no_reason_to_preempt() {
         let mut discrete = machine(4, Some(20), vec![batch("check", true, Some(30))]);
         discrete.shared_with_batches = false;
-        let Drain::Wait(why) = drain(&gang(vec![("bbs", discrete)]), T0, PAST_BOUND) else {
+        let Drain::Wait(why) = drain(&gang(vec![("bbs", discrete)]), None, T0, PAST_BOUND) else {
             panic!("a VRAM shortfall is not a batch's");
         };
         assert!(
@@ -865,7 +957,7 @@ mod tests {
 
         let mut blind = machine(0, Some(20), vec![batch("check", true, Some(30))]);
         blind.room.free_bytes = None;
-        let Drain::Wait(why) = drain(&gang(vec![("sp1", blind)]), T0, PAST_BOUND) else {
+        let Drain::Wait(why) = drain(&gang(vec![("sp1", blind)]), None, T0, PAST_BOUND) else {
             panic!("an unmeasured free reading preempts nothing");
         };
         assert!(why.contains("sp1's free memory is unmeasured"), "{why}");
@@ -879,7 +971,7 @@ mod tests {
             "sp1",
             machine(60, Some(100), vec![stopped, batch("other", true, Some(30))]),
         )]);
-        let Drain::Wait(why) = drain(&gang, T0, PAST_BOUND) else {
+        let Drain::Wait(why) = drain(&gang, None, T0, PAST_BOUND) else {
             panic!("the stopped check's memory covers the shortfall");
         };
         assert!(why.contains("the 1 batch already preempted"), "{why}");

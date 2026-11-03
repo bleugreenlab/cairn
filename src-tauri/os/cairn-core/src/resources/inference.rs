@@ -485,6 +485,54 @@ fn footprint_line(footprint: &std::collections::BTreeMap<String, u64>) -> String
         .join(", ")
 }
 
+/// What a deployment needs on each machine and where that comes from: its
+/// last measured load, else its profile's statement, else a prediction marked
+/// as one; or why it has no need, which refuses its start.
+fn need_line(
+    view: &InferenceView,
+    deployment: &Deployment,
+    loads: Option<&Vec<LoadRow>>,
+) -> String {
+    use crate::orchestrator::inference_control::{need_of, NeedBasis};
+    const RESERVES: &str = "placement reserves this on each machine, and a start goes once each has this much free, draining only the checks that cover a shortfall";
+    let need = need_of(&view.inventory, deployment, loads, |machine| {
+        view.deployment_control.readings.get(machine)?.total_bytes
+    });
+    let need = match need {
+        Ok(need) => need,
+        Err(why) => {
+            return format!("- memory need: unknown, so a start is refused: {why}\n");
+        }
+    };
+    let unreported: Vec<&str> = deployment
+        .machines
+        .iter()
+        .map(|machine| machine.as_str())
+        .filter(|machine| !need.per_machine.contains_key(*machine))
+        .collect();
+    let mut each = footprint_line(&need.per_machine);
+    if !unreported.is_empty() {
+        if !each.is_empty() {
+            each.push_str(", ");
+        }
+        each.push_str(&format!(
+            "unknown on {} until it reports its memory",
+            unreported.join(" and ")
+        ));
+    }
+    match &need.basis {
+        NeedBasis::Measured => format!(
+            "- measured footprint (GPU-allocated once settled): {each}; {RESERVES}\n"
+        ),
+        NeedBasis::Stated => format!(
+            "- memory need, as its profile states (`requirements.memory`): {each}; {RESERVES}, and its first load's measured footprint replaces it\n"
+        ),
+        NeedBasis::Predicted(how) => format!(
+            "- memory need, predicted because nothing is measured or stated: {each}, as {how}; {RESERVES}, and its first load's measured footprint replaces it\n"
+        ),
+    }
+}
+
 fn load_line(view: &InferenceView, load: &LoadRow) -> String {
     let waited = load
         .sent_at
@@ -606,16 +654,7 @@ pub(crate) fn render_deployment(view: &InferenceView, id: &str, params: &[QueryP
         }
         None => out.push_str("- last measured load: none yet\n"),
     }
-    let footprint = crate::orchestrator::inference_control::last_footprint(loads);
-    if footprint.is_empty() {
-        out.push_str("- measured footprint: none yet; placement reserves what the profile states, or the whole of each machine's batch room while it loads if the profile states nothing\n");
-    } else {
-        let _ = writeln!(
-            out,
-            "- measured footprint (GPU-allocated once settled): {}; placement reserves this on each machine, and a start waits until each has this much free",
-            footprint_line(&footprint)
-        );
-    }
+    out.push_str(&need_line(view, deployment, loads));
     if let Some(loads) = loads.filter(|loads| !loads.is_empty()) {
         out.push_str("\n## Recent loads\n\n");
         for load in loads.iter().take(10) {
@@ -1466,6 +1505,42 @@ machines:
         );
         let page = render_deployment(&view, "dsv4f-tp2", &[]);
         assert!(page.contains("- last measured load: none yet"), "{page}");
+        assert!(
+            page.contains("- memory need, predicted because nothing is measured or stated: unknown on sp1 and sp2 until it reports its memory, as vLLM pre-allocates 0.90"),
+            "{page}"
+        );
+        let id = cairn_inference::InferenceProfileId::from("dsv4f-tp2");
+        let set_description = |view: &mut InferenceView, to: Option<&str>| {
+            if let Some(cairn_inference::Engine::Command { description, .. }) =
+                view.inventory.profiles.get_mut(&id).map(|p| &mut p.engine)
+            {
+                *description = to.map(str::to_string);
+            }
+        };
+        let described = view.inventory.profiles[&id].engine.clone();
+        set_description(&mut view, None);
+        let page = render_deployment(&view, "dsv4f-tp2", &[]);
+        assert!(
+            page.contains(
+                "- memory need: unknown, so a start is refused: its profile states no memory"
+            ),
+            "{page}"
+        );
+        if let Some(profile) = view.inventory.profiles.get_mut(&id) {
+            profile.engine = described;
+        }
+        view.deployment_control.readings.insert(
+            "sp1".into(),
+            MachineReading {
+                total_bytes: Some(122 << 30),
+                ..MachineReading::default()
+            },
+        );
+        let page = render_deployment(&view, "dsv4f-tp2", &[]);
+        assert!(
+            page.contains("- memory need, predicted because nothing is measured or stated: sp1 109.8 GiB, unknown on sp2 until it reports its memory, as vLLM pre-allocates 0.90 of each machine's memory, its default"),
+            "{page}"
+        );
 
         view.deployment_control.states.insert(
             "dsv4f-tp2".into(),
@@ -1484,6 +1559,7 @@ machines:
                 gpu_allocated_bytes: Some(100 << 30),
                 free_bytes: Some(20 << 30),
                 free_is_host_memory: true,
+                total_bytes: Some(122 << 30),
             },
         );
         view.deployment_control.loads.insert(

@@ -219,6 +219,21 @@ async fn every_selection_and_delete_seeks() {
     assert_seeks(&db, ARC_CHAINS, 2, "idx_artifacts_output_job_version").await;
     assert_seeks(&db, ARC_SUPERSEDED, 4, "idx_artifacts_output_job_version").await;
     assert_seeks(&db, ARC_PINNED, 1, "idx_job_artifact_inputs_producer").await;
+    for walk in [SETTLED_WAIT_WALK, UNSTAMPED_WAIT_WALK] {
+        assert_seeks(&db, walk, 3, "idx_agent_waits_settled").await;
+        let plan = query_plan(&db, walk, 3).await;
+        assert!(
+            !plan.iter().any(|line| line.contains("SORTER")),
+            "{walk} sorts: {plan:#?}"
+        );
+    }
+    assert_seeks(
+        &db,
+        HELD_TRANSFERRED_WAITS,
+        1,
+        "idx_permission_requests_status",
+    )
+    .await;
     for table in [
         "effect_outbox",
         "search_outbox",
@@ -226,6 +241,7 @@ async fn every_selection_and_delete_seeks() {
         "message_stream_chunks",
         "codemap_cache",
         "artifacts",
+        "agent_waits",
     ] {
         let delete = format!("DELETE FROM {table} WHERE rowid IN ({})", placeholders(3));
         assert_seeks(&db, &delete, 3, ROWID).await;
@@ -580,6 +596,276 @@ async fn applied_search_outbox_entries_go_after_a_day() {
     assert_eq!(
         ids(&db, "SELECT id FROM search_outbox ORDER BY id").await,
         vec!["applied-new", "pending-old"]
+    );
+}
+
+const DAY_MS: i64 = 86_400_000;
+const NOW_MS: i64 = NOW * 1_000;
+
+async fn seed_wait_owners(db: &LocalDb) {
+    seed_owners(db).await;
+    db.execute_script(
+        "INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('s', 'j', 1, 1);
+         INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+             VALUES ('t', 's', 'r', 'j', 1, 'yielded', 1, 1);",
+    )
+    .await
+    .unwrap();
+}
+
+/// A wait on its own call (`tool_use_id` = `id`), in milliseconds.
+async fn insert_wait(
+    db: &LocalDb,
+    id: &str,
+    state: &str,
+    resolution: Option<&str>,
+    created_at: i64,
+    resolved_at: Option<i64>,
+) {
+    db.execute(
+        "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id, tool_use_id,
+             condition_json, state, resolution_json, created_at, resolved_at)
+         VALUES (?1, 'j', 'r', 's', 't', ?1, '{}', ?2, ?3, ?4, ?5)",
+        (
+            id.to_string(),
+            state.to_string(),
+            resolution.map(str::to_string),
+            created_at,
+            resolved_at,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+async fn insert_permission(db: &LocalDb, tool_use_id: &str, status: &str) {
+    db.execute(
+        "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at)
+         VALUES (?1, 'r', ?1, 'Bash', '{}', ?2, 1)",
+        (tool_use_id.to_string(), status.to_string()),
+    )
+    .await
+    .unwrap();
+}
+
+async fn wait_ids(db: &LocalDb) -> Vec<String> {
+    ids(db, "SELECT id FROM agent_waits ORDER BY id").await
+}
+
+#[tokio::test]
+async fn settled_waits_go_a_week_after_they_settle_and_live_ones_never_do() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let created = NOW_MS - 40 * DAY_MS;
+    let done = Some(r#"{"outcome":"ok"}"#);
+    insert_wait(
+        &db,
+        "resolved-8d",
+        "resolved",
+        done,
+        created,
+        Some(NOW_MS - 8 * DAY_MS),
+    )
+    .await;
+    insert_wait(
+        &db,
+        "cancelled-8d",
+        "cancelled",
+        None,
+        created,
+        Some(NOW_MS - 8 * DAY_MS),
+    )
+    .await;
+    insert_wait(
+        &db,
+        "resolved-6d",
+        "resolved",
+        done,
+        created,
+        Some(NOW_MS - 6 * DAY_MS),
+    )
+    .await;
+    insert_wait(&db, "pending-old", "pending", None, created, None).await;
+    insert_wait(&db, "resolving-old", "resolving", None, created, None).await;
+    // A terminal row with no settle time is aged by creation.
+    insert_wait(&db, "unstamped-old", "cancelled", None, created, None).await;
+    insert_wait(
+        &db,
+        "unstamped-new",
+        "cancelled",
+        None,
+        NOW_MS - DAY_MS,
+        None,
+    )
+    .await;
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+
+    assert!(report.rules[0].finished, "{report}");
+    assert_eq!(report.rows(), 3);
+    assert_eq!(
+        wait_ids(&db).await,
+        vec![
+            "pending-old",
+            "resolved-6d",
+            "resolving-old",
+            "unstamped-new"
+        ]
+    );
+}
+
+/// Rows written before `kind` existed carry none, and are aged like any other.
+#[tokio::test]
+async fn a_settled_wait_without_a_kind_is_evicted_by_age() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    insert_wait(
+        &db,
+        "legacy",
+        "resolved",
+        None,
+        1,
+        Some(NOW_MS - 8 * DAY_MS),
+    )
+    .await;
+    db.execute("UPDATE agent_waits SET kind = NULL", ())
+        .await
+        .unwrap();
+
+    run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+
+    assert!(wait_ids(&db).await.is_empty());
+}
+
+/// A run-batch wait a permission took over is reclaimed when the permission is
+/// withdrawn, so it stays while the permission is pending, however old, and
+/// goes by age once the permission is answered.
+#[tokio::test]
+async fn a_transferred_wait_stays_while_its_permission_is_pending() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let settled = Some(NOW_MS - 30 * DAY_MS);
+    let transferred = Some(TRANSFERRED_TO_INNER_WAIT);
+    insert_wait(&db, "held", "resolved", transferred, 1, settled).await;
+    insert_permission(&db, "held", "pending").await;
+    insert_wait(&db, "answered", "resolved", transferred, 1, settled).await;
+    insert_permission(&db, "answered", "allowed").await;
+    insert_wait(&db, "orphaned", "resolved", transferred, 1, settled).await;
+    // A pending permission holds only the transferred wait of its own call.
+    insert_wait(&db, "other-call", "cancelled", None, 1, settled).await;
+    insert_permission(&db, "other-call", "pending").await;
+
+    run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+    assert_eq!(wait_ids(&db).await, vec!["held"]);
+
+    db.execute(
+        "UPDATE permission_requests SET status = 'allowed' WHERE id = 'held'",
+        (),
+    )
+    .await
+    .unwrap();
+    run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+    assert!(wait_ids(&db).await.is_empty());
+}
+
+/// Held rows filling whole pages are stepped over, not re-read forever, and the
+/// rows past them still go.
+#[tokio::test]
+async fn pages_full_of_held_waits_are_stepped_over() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let held = 2 * WAIT_PAGE_ROWS + 3;
+    db.write(move |conn| {
+        Box::pin(async move {
+            for index in 0..held + 300 {
+                let id = format!("w{index:04}");
+                let resolution = (index < held).then_some(TRANSFERRED_TO_INNER_WAIT);
+                conn.execute(
+                    "INSERT INTO agent_waits (id, job_id, run_id, session_id, predecessor_turn_id,
+                         tool_use_id, condition_json, state, resolution_json, created_at, resolved_at)
+                     VALUES (?1, 'j', 'r', 's', 't', ?1, '{}', 'resolved', ?2, 1, ?3)",
+                    (id.clone(), resolution, NOW_MS - 30 * DAY_MS + index as i64),
+                )
+                .await?;
+                if index < held {
+                    conn.execute(
+                        "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at)
+                         VALUES (?1, 'r', ?1, 'Bash', '{}', 'pending', 1)",
+                        (id,),
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let report = run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+
+    let rule = &report.rules[0];
+    assert!(rule.finished, "{report}");
+    assert_eq!(rule.rows, 300);
+    assert!(rule.max_page_rows <= WAIT_PAGE_ROWS, "{rule:?}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM agent_waits").await,
+        held as i64
+    );
+}
+
+/// An MCP question belongs to its wait (`prompts.mcp_wait_id` cascades), so it
+/// goes with an evicted wait; an ordinary prompt of the same run stays.
+#[tokio::test]
+async fn an_evicted_waits_mcp_prompts_go_with_it() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    insert_wait(&db, "old", "resolved", None, 1, Some(NOW_MS - 8 * DAY_MS)).await;
+    db.execute_script(
+        "INSERT INTO prompts (id, run_id, job_id, questions, created_at, mcp_wait_id)
+             VALUES ('bound', 'r', 'j', '[]', 1, 'old');
+         INSERT INTO prompts (id, run_id, job_id, questions, created_at)
+             VALUES ('ordinary', 'r', 'j', '[]', 1);",
+    )
+    .await
+    .unwrap();
+
+    run(&db, UNBOUNDED, &[Eviction::SettledWaits]).await;
+
+    assert!(wait_ids(&db).await.is_empty());
+    assert_eq!(ids(&db, "SELECT id FROM prompts").await, vec!["ordinary"]);
+}
+
+/// A wait delete cascades into `prompts` (`mcp_wait_id`). The engine reaches
+/// those children through an ordinary index on the key and scans the table for
+/// a partial one, which every evicted wait would pay in full.
+#[tokio::test]
+async fn a_wait_delete_reaches_its_prompts_through_the_index() {
+    let (_temp, db) = private_db().await;
+    let program = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("EXPLAIN DELETE FROM agent_waits WHERE rowid IN (1, 2)", ())
+                    .await?;
+                let mut ops = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    ops.push(format!("{} {}", row.text(1)?, row.text(7)?));
+                }
+                Ok(ops)
+            })
+        })
+        .await
+        .unwrap();
+    assert!(
+        program.iter().any(|op| op.contains("fk cascade delete")),
+        "the delete no longer cascades: {program:#?}"
+    );
+    assert!(
+        !program
+            .iter()
+            .any(|op| op.starts_with("Rewind") && op.contains("prompts")),
+        "the cascade scans prompts: {program:#?}"
     );
 }
 

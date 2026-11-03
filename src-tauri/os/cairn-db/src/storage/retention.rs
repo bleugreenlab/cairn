@@ -43,7 +43,7 @@
 //! columns sit after a large payload, and building `effect_outbox(state,
 //! updated_at)` took 39 s on the 10-30 production clone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::storage::{DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection};
@@ -196,6 +196,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     evict("message_stream_chunks", Eviction::TerminalStreams).budget(256),
     evict("codemap_cache", Eviction::InvalidatedCodemaps),
     evict("artifacts", Eviction::SupersededArcVersions).budget(768),
+    evict("agent_waits", Eviction::SettledWaits).budget(64),
     // Pruned by their own owners.
     owned_by(
         "runner_events",
@@ -352,7 +353,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "delete with its job; no foreign key carries it today",
     ),
     // Deleted with their parent.
-    owned("agent_waits", "jobs"),
     owned("attention_pushes", "jobs"),
     owned("attention_read_cursors", "jobs"),
     owned("build_change_notifications", "jobs"),
@@ -569,6 +569,18 @@ const CODEMAP_WALK_ROWS: usize = 2 * CODEMAP_PAGE_ROWS;
 const ARC_PAGE_ROWS: usize = 8;
 /// Arc chains examined per chain read.
 const ARC_CHAIN_BATCH: i64 = 64;
+/// A settled wait is read only while a resume or replay of its turn can reach
+/// it: a parked turn resumes within the batch ceiling (6 h) or at the next
+/// boot. A week is far past both.
+const SETTLED_WAIT_AGE_S: i64 = 7 * DAY_S;
+/// Wait rows carry the settled batch's output: about 3 KB on average and up to
+/// 3.3 MB on the 11-02 database, so a typical write stays near 400 KB.
+const WAIT_PAGE_ROWS: usize = 128;
+/// The resolution `durable_suspend::relinquish_to_inner_wait` writes when a
+/// permission takes over a call's continuation. Withdrawing that permission
+/// moves the row back to `pending` (`reclaim_from_inner_wait`), so such a row is
+/// live state, not history, while the permission is pending, however old it is.
+pub(crate) const TRANSFERRED_TO_INNER_WAIT: &str = r#"{"outcome":"transferred_to_inner_wait"}"#;
 
 pub(crate) const OUTBOX_WALK: &str = "SELECT rowid, state, updated_at, created_at \
      FROM effect_outbox WHERE rowid > ?1 ORDER BY rowid LIMIT ?2";
@@ -589,6 +601,22 @@ pub(crate) const ARC_SUPERSEDED: &str = "SELECT rowid, id, artifact_type, versio
      ORDER BY version LIMIT ?4";
 pub(crate) const ARC_PINNED: &str = "SELECT version FROM job_artifact_inputs \
      WHERE producer_job_id = ?1 AND output_name = 'arc'";
+/// Settled waits in settle order, read from `idx_agent_waits_settled` alone.
+/// The state list is spelled as the index's predicate is, or the planner does
+/// not substitute it.
+pub(crate) const SETTLED_WAIT_WALK: &str = "SELECT rowid, resolved_at FROM agent_waits \
+     WHERE state IN ('resolved', 'cancelled') AND resolved_at > ?1 AND resolved_at < ?2 \
+     ORDER BY resolved_at LIMIT ?3";
+/// Settled waits that carry no settle time, aged by creation instead.
+pub(crate) const UNSTAMPED_WAIT_WALK: &str = "SELECT rowid, created_at FROM agent_waits \
+     WHERE state IN ('resolved', 'cancelled') AND resolved_at IS NULL \
+     AND created_at > ?1 AND created_at < ?2 ORDER BY created_at LIMIT ?3";
+/// Transferred waits whose permission is still pending, driven from the few
+/// pending permissions. A permission owns exactly one call, the
+/// `(run_id, tool_use_id)` it shares with the wait it took over.
+pub(crate) const HELD_TRANSFERRED_WAITS: &str = "SELECT w.rowid FROM permission_requests p \
+     JOIN agent_waits w ON w.run_id = p.run_id AND w.tool_use_id = p.tool_use_id \
+     WHERE p.status = 'pending' AND w.state = 'resolved' AND w.resolution_json = ?1";
 
 /// One deleting rule of the evictor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -605,15 +633,22 @@ pub enum Eviction {
     InvalidatedCodemaps,
     /// `artifacts` arc versions older than the newest [`ARC_VERSIONS_KEPT`].
     SupersededArcVersions,
+    /// `agent_waits` resolved or cancelled more than a week ago, except a wait
+    /// a still-pending permission took over. Filtered on state and age, never
+    /// on `kind`, which rows from before it existed lack. MCP prompts bound to
+    /// a deleted wait go with it by `prompts.mcp_wait_id`'s cascade: they
+    /// belong to their wait, and a wait this old has none still open.
+    SettledWaits,
 }
 
 impl Eviction {
     /// Every rule, in the order a pass applies them: most reclaimed first.
-    pub const ALL: [Eviction; 5] = [
+    pub const ALL: [Eviction; 6] = [
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
         Eviction::InvalidatedCodemaps,
         Eviction::SupersededArcVersions,
+        Eviction::SettledWaits,
         Eviction::AppliedSearchOutbox,
     ];
 
@@ -624,6 +659,7 @@ impl Eviction {
             Eviction::TerminalStreams => "terminal_streams",
             Eviction::InvalidatedCodemaps => "invalidated_codemaps",
             Eviction::SupersededArcVersions => "superseded_arc_versions",
+            Eviction::SettledWaits => "settled_waits",
         }
     }
 
@@ -635,6 +671,7 @@ impl Eviction {
             Eviction::TerminalStreams => &["message_streams", "message_stream_chunks"],
             Eviction::InvalidatedCodemaps => &["codemap_cache"],
             Eviction::SupersededArcVersions => &["artifacts"],
+            Eviction::SettledWaits => &["agent_waits"],
         }
     }
 
@@ -646,6 +683,7 @@ impl Eviction {
             Eviction::TerminalStreams => select_terminal_streams(db, now, cursor).await?,
             Eviction::InvalidatedCodemaps => select_invalidated_codemaps(db, now, cursor).await?,
             Eviction::SupersededArcVersions => select_superseded_arcs(db, cursor).await?,
+            Eviction::SettledWaits => select_settled_waits(db, now, cursor).await?,
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -683,6 +721,10 @@ struct Cursor {
     job: Option<(String, i64)>,
     after_job: String,
     after_version: i64,
+    /// Settled waits: whether the walk over rows with no settle time is
+    /// finished, and the time the walk has stepped past in its current phase.
+    waits_stamped: bool,
+    after_at: Option<i64>,
 }
 
 /// What one page read chose to delete.
@@ -1111,6 +1153,87 @@ async fn select_superseded_arcs(db: &LocalDb, cursor: &mut Cursor) -> DbResult<S
         },
         unlink_parents: ids,
         done: false,
+    })
+}
+
+/// Settled waits older than [`SETTLED_WAIT_AGE_S`], oldest first: first those
+/// with no settle time (aged by creation), then the rest by settle time. Both
+/// walks read only `idx_agent_waits_settled`, never a row's payload.
+///
+/// The walk steps past what it read only when a page held a row back. A page
+/// that deletes everything it read leaves nothing behind it, so the next page
+/// starts where this one did and rows that share a settle time are never
+/// split. After a held row, rows tied with the page's last settle time wait for
+/// the next pass.
+///
+/// Reading the held set and deleting in a later write cannot race a reclaim: a
+/// row is reclaimable only while its permission is pending, which holds it here,
+/// and a permission never returns to pending. A row the transfer retires now is
+/// a week too young for either walk.
+async fn select_settled_waits(db: &LocalDb, now: i64, cursor: &mut Cursor) -> DbResult<Selection> {
+    let cutoff = (now - SETTLED_WAIT_AGE_S) * 1_000;
+    let stamped = cursor.waits_stamped;
+    let walk = if stamped {
+        SETTLED_WAIT_WALK
+    } else {
+        UNSTAMPED_WAIT_WALK
+    };
+    let after = cursor.after_at.unwrap_or(i64::MIN);
+    let (walked, held) = db
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut walked = Vec::new();
+                let mut rows = conn
+                    .query(walk, (after, cutoff, WAIT_PAGE_ROWS as i64))
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    walked.push((row.i64(0)?, row.i64(1)?));
+                }
+                drop(rows);
+                let mut held = HashSet::new();
+                if !walked.is_empty() {
+                    let mut rows = conn
+                        .query(
+                            HELD_TRANSFERRED_WAITS,
+                            (TRANSFERRED_TO_INNER_WAIT.to_string(),),
+                        )
+                        .await?;
+                    while let Some(row) = rows.next().await? {
+                        held.insert(row.i64(0)?);
+                    }
+                }
+                Ok((walked, held))
+            })
+        })
+        .await?;
+    let walked_all = walked.len() < WAIT_PAGE_ROWS;
+    let last_at = walked.last().map(|(_, at)| *at);
+    let mut rowids = Vec::new();
+    let mut held_any = false;
+    for (rowid, _) in walked {
+        if held.contains(&rowid) {
+            held_any = true;
+        } else {
+            rowids.push(rowid);
+        }
+    }
+    let mut done = false;
+    if walked_all && stamped {
+        done = true;
+    } else if walked_all {
+        cursor.waits_stamped = true;
+        cursor.after_at = None;
+    } else if held_any {
+        cursor.after_at = last_at;
+    }
+    Ok(Selection {
+        deletes: if rowids.is_empty() {
+            Vec::new()
+        } else {
+            vec![("agent_waits", rowids)]
+        },
+        unlink_parents: Vec::new(),
+        done,
     })
 }
 

@@ -1037,7 +1037,7 @@ mod host {
     use crate::fleet::models::requests::RequestState;
     use crate::fleet::pools::Pool;
     use crate::orchestrator::inference_control::tests::{
-        phase, sparks_db, FakeHeads, DSV4F, QWEN, SP1, SP2,
+        phase, profile, sparks_db, FakeHeads, DSV4F, QWEN, SP1, SP2,
     };
     use crate::orchestrator::inference_control::Heads;
     use crate::storage::LocalDb;
@@ -1400,5 +1400,123 @@ mod host {
             .iter()
             .all(|(_, _, _, op)| matches!(op, DeploymentOperation::Probe { .. })));
         assert!(matches!(phase(&db, DSV4F).await, Phase::Healthy { .. }));
+    }
+
+    /// The fixture's profiles state no memory and only their description
+    /// names vLLM, as the bginf-era ones do: the need is vLLM's default share,
+    /// 0.90 of each Spark's 122 GiB, and a request drains only the checks
+    /// covering it, never waiting for the Sparks to run nothing.
+    #[tokio::test]
+    async fn a_predicted_need_drains_only_the_checks_covering_it() {
+        let db = sparks_db("models-host-predicted").await;
+        let host = sparks();
+        host.heads.attach(SP1, 60, 0);
+        host.heads.attach(SP2, 115, 0);
+        host.heads.run(SP1, "check-big", true, 45);
+        host.heads.run(SP1, "check-small", true, 5);
+        host.heads.run(SP1, "check-tiny", true, 1);
+        host.heads.run(SP1, "turn", false, 2);
+        host.heads.run(SP2, "check-beside", true, 4);
+
+        let handle = request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+            .await
+            .unwrap();
+        let predicted = (122.0 * 0.9 * GIB as f64) as u64;
+        let published = host.published.lock().unwrap().clone();
+        for machine in [SP1, SP2] {
+            assert_eq!(published[machine][0].held_bytes, Some(predicted));
+        }
+        pass(&db, &host, 2_000).await.unwrap();
+        let status = status_with(&db, &host, handle.id).await.unwrap();
+        let said = status.describe();
+        assert!(
+            said.contains("a predicted need: vLLM pre-allocates 0.90"),
+            "{said}"
+        );
+        assert!(said.contains("may finish for 5 min more"), "{said}");
+
+        let past = 1_000 + (super::super::room::DRAIN_BOUND_SECS as i64) * 1_000;
+        pass(&db, &host, past).await.unwrap();
+        let mut preempted: Vec<String> = host
+            .heads
+            .preempted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        preempted.sort();
+        assert_eq!(
+            preempted,
+            ["check-big", "check-small"],
+            "49.8 GiB short on sp1: the two largest checks cover it; the tiny one, the turn and sp2's check run on"
+        );
+        host.heads
+            .running
+            .lock()
+            .unwrap()
+            .get_mut(SP1)
+            .unwrap()
+            .retain(|b| !b.preempted);
+        host.heads.attach(SP1, 110, 0);
+        pass(&db, &host, past + 5_000).await.unwrap();
+        assert_eq!(
+            host.heads.starts(),
+            [DSV4F],
+            "started with check-tiny, the turn and sp2's check still running"
+        );
+    }
+
+    /// A measured load replaces the prediction.
+    #[tokio::test]
+    async fn a_measured_load_overrides_the_prediction() {
+        let db = sparks_db("models-host-measured").await;
+        footprint(&db, 101).await;
+        let host = sparks();
+        host.heads.attach(SP1, 110, 0);
+        host.heads.attach(SP2, 110, 0);
+        request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+            .await
+            .unwrap();
+        let published = host.published.lock().unwrap().clone();
+        assert_eq!(published[SP1][0].held_bytes, Some(101 * GIB));
+    }
+
+    /// A profile giving nothing to predict from is refused with what is
+    /// missing: no wait for an empty machine, and nothing preempted.
+    #[tokio::test]
+    async fn a_profile_with_nothing_to_predict_from_is_refused_and_preempts_nothing() {
+        let db = sparks_db("models-host-refused").await;
+        let mut bare = profile(QWEN, 1);
+        bare.engine = cairn_inference::Engine::Command {
+            start: "./serve.sh".into(),
+            stop: None,
+            description: None,
+        };
+        db.execute(
+            "UPDATE inference_profiles SET body_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&bare).unwrap(), QWEN],
+        )
+        .await
+        .unwrap();
+        let host = sparks();
+        host.heads.attach(SP1, 110, 0);
+        host.heads.run(SP1, "check", true, 40);
+
+        request_with(&db, &host, QWEN, "agent-1", None, 1_000)
+            .await
+            .unwrap();
+        let past = 1_000 + (super::super::room::DRAIN_BOUND_SECS as i64) * 1_000;
+        pass(&db, &host, past).await.unwrap();
+        let Phase::Failed { reason, .. } = phase(&db, QWEN).await else {
+            panic!("the start is refused");
+        };
+        assert!(
+            reason.starts_with("its memory need is unknown: its profile states no memory"),
+            "{reason}"
+        );
+        assert!(reason.contains("add `requirements.memory`"), "{reason}");
+        assert!(host.heads.preempted.lock().unwrap().is_empty());
+        assert!(host.heads.starts().is_empty());
     }
 }

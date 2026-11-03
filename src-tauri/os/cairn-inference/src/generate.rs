@@ -614,6 +614,295 @@ pub fn generate(model: &Model, repos: &[HfRepo], pool: &PoolHw) -> Generated {
     generated
 }
 
+/// The share of a device's memory vLLM pre-allocates when the profile sets no
+/// `--gpu-memory-utilization`.
+pub const VLLM_DEFAULT_SHARE: f64 = 0.90;
+
+/// A memory need predicted, per machine, for a profile that states none, from
+/// what it runs. Placement reserves a stated need or a measured load in
+/// preference to this; it exists so no profile reaches placement without one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredictedNeed {
+    /// The engine pre-allocates this share of each machine's memory whatever
+    /// it loads (vLLM's `--gpu-memory-utilization`, SGLang's
+    /// `--mem-fraction-static`).
+    Share {
+        engine: &'static str,
+        flag: &'static str,
+        fraction: f64,
+        /// The engine's default, the profile setting no share of its own.
+        defaulted: bool,
+    },
+    /// Each machine's split of the weights times [`WEIGHT_OVERHEAD`], the KV
+    /// cache its context takes where the model's geometry is known, and
+    /// [`RESERVE_BYTES`].
+    Sized {
+        bytes: u64,
+        weight_bytes: u64,
+        /// Where the weights' size came from.
+        weights_from: String,
+        machines: u32,
+        /// The context's tokens and the KV cache they take on one machine.
+        kv: Option<(u64, u64)>,
+    },
+}
+
+impl PredictedNeed {
+    /// The need on one machine with `total` bytes of the memory the engine
+    /// lives in (system memory on a unified machine, VRAM on a discrete card).
+    /// A share of a machine that has not reported its memory is unknown.
+    pub fn bytes_on(&self, total: Option<u64>) -> Option<u64> {
+        match self {
+            Self::Share { fraction, .. } => total.map(|total| (total as f64 * fraction) as u64),
+            Self::Sized { bytes, .. } => Some(*bytes),
+        }
+    }
+
+    /// How it was predicted, in a clause.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Share {
+                engine,
+                flag,
+                fraction,
+                defaulted: true,
+            } => format!(
+                "{engine} pre-allocates {fraction:.2} of each machine's memory, its default (the profile sets no `{flag}`)"
+            ),
+            Self::Share {
+                engine,
+                flag,
+                fraction,
+                defaulted: false,
+            } => format!(
+                "{engine} pre-allocates {fraction:.2} of each machine's memory (`{flag} {fraction}`)"
+            ),
+            Self::Sized {
+                weight_bytes,
+                weights_from,
+                machines,
+                kv,
+                ..
+            } => {
+                let across = if *machines > 1 {
+                    format!(" split across {machines} machines")
+                } else {
+                    String::new()
+                };
+                let kv = match kv {
+                    Some((tokens, bytes)) => {
+                        format!(", {} of KV cache for {tokens} tokens", gib(*bytes))
+                    }
+                    None => String::new(),
+                };
+                format!(
+                    "{} of weights ({weights_from}){across} × {WEIGHT_OVERHEAD}{kv}, and a {} reserve",
+                    gib(*weight_bytes),
+                    gib(RESERVE_BYTES)
+                )
+            }
+        }
+    }
+}
+
+/// The engine a profile runs, as far as the profile shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runs {
+    Vllm,
+    LlamaCpp,
+    Sglang,
+    Unknown,
+}
+
+/// The engine a run of words names, if any does.
+fn named_engine<'a>(words: impl IntoIterator<Item = &'a str>) -> Option<Runs> {
+    words.into_iter().find_map(|word| {
+        let word = word.to_ascii_lowercase();
+        if word.contains("sglang") {
+            Some(Runs::Sglang)
+        } else if word.contains("vllm") {
+            Some(Runs::Vllm)
+        } else if ["llama-server", "llama.cpp", "llama-cpp"]
+            .iter()
+            .any(|name| word.contains(name))
+        {
+            Some(Runs::LlamaCpp)
+        } else {
+            None
+        }
+    })
+}
+
+/// Shell-ish words: whitespace-split with surrounding quotes and separators
+/// dropped. Enough to find an engine's flags in a start line or an argument.
+fn words_of(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .map(|word| word.trim_matches(|c| matches!(c, '\'' | '"' | ';' | ',' | '(' | ')')))
+        .filter(|word| !word.is_empty())
+}
+
+/// The last value of any of `names` that parses, as `--flag value` or
+/// `--flag=value`: the last one given is the one an engine takes, and a value
+/// that does not parse (`bash -c '...'` is no context size) is not one.
+fn flag<T: std::str::FromStr>(words: &[&str], names: &[&str]) -> Option<T> {
+    let mut found = None;
+    for (i, word) in words.iter().enumerate() {
+        for name in names {
+            let value = if word == name {
+                words.get(i + 1).copied()
+            } else {
+                word.strip_prefix(name)
+                    .and_then(|rest| rest.strip_prefix('='))
+            };
+            if let Some(parsed) = value.and_then(|value| value.parse().ok()) {
+                found = Some(parsed);
+            }
+        }
+    }
+    found
+}
+
+/// The words of what a profile runs (a container's entrypoint, arguments and
+/// environment, a native artifact's arguments, a command's start line) and the
+/// free text describing it, if any.
+fn engine_words(profile: &InferenceProfile) -> (Vec<&str>, Option<&str>) {
+    match &profile.engine {
+        Engine::Container(container) => (
+            container
+                .entrypoint
+                .iter()
+                .flatten()
+                .chain(&container.args)
+                .chain(container.env.values())
+                .flat_map(|text| words_of(text))
+                .collect(),
+            None,
+        ),
+        Engine::Native { artifact, args, .. } => (
+            std::iter::once(artifact)
+                .chain(args)
+                .flat_map(|text| words_of(text))
+                .collect(),
+            None,
+        ),
+        Engine::Command {
+            start, description, ..
+        } => (words_of(start).collect(), description.as_deref()),
+    }
+}
+
+/// The size of a profile's weights and where it came from: its listed weight
+/// files when every one states its size, else its model's parameter count at
+/// the profile's quantization (or the model's, or its checkpoint dtype). A
+/// quantization label this crate does not know is read as 16 bits, so an
+/// unknown never shrinks the need.
+fn weight_size(profile: &InferenceProfile, model: Option<&Model>) -> Option<(u64, String)> {
+    let listed = &profile.model.weights;
+    if !listed.is_empty() && listed.iter().all(|file| file.size.is_some()) {
+        let bytes = listed.iter().filter_map(|file| file.size).sum();
+        return Some((bytes, "its listed weight files".into()));
+    }
+    let facts = &model?.facts;
+    let parameters = facts.parameters?;
+    let label = profile
+        .quantization
+        .clone()
+        .or_else(|| facts.quantization.clone())
+        .or_else(|| facts.dtype.as_deref().map(dtype_label))?;
+    let lower = label.to_ascii_lowercase();
+    let bits = match precision(&lower) {
+        3 if !(lower.starts_with('q') || lower.starts_with("iq")) => 16,
+        bits => bits,
+    };
+    Some((
+        parameters * u64::from(bits) / 8,
+        format!("{:.1}B parameters at {label}", parameters as f64 / 1e9),
+    ))
+}
+
+/// Predict what `profile` needs on each of its machines from what it runs, for
+/// a profile that states no memory. `model` is its model's record, whose facts
+/// size the weights when the profile lists no sizes and give the KV geometry.
+///
+/// vLLM pre-allocates `--gpu-memory-utilization` (0.90 by default) of each
+/// machine's memory whatever the weights, and SGLang its
+/// `--mem-fraction-static` when set. Otherwise, llama.cpp and anything
+/// unrecognised take their weights split across the machines times
+/// [`WEIGHT_OVERHEAD`], plus [`RESERVE_BYTES`]; llama.cpp adds the KV cache for
+/// its `-c` context (the total its `--parallel` slots share), or the model's
+/// trained context when it sets none. The engine is a container's server, else
+/// one its start line or arguments name, else one its description names.
+///
+/// Refused, naming what is missing, when the profile shows neither a share
+/// nor a size for its weights.
+pub fn predict_need(
+    profile: &InferenceProfile,
+    model: Option<&Model>,
+) -> Result<PredictedNeed, String> {
+    let (words, description) = engine_words(profile);
+    let runs = match &profile.engine {
+        Engine::Container(container) => match container.server {
+            Server::Vllm => Runs::Vllm,
+            Server::LlamaCpp => Runs::LlamaCpp,
+        },
+        _ => named_engine(words.iter().copied())
+            .or_else(|| description.and_then(|text| named_engine(words_of(text))))
+            .unwrap_or(Runs::Unknown),
+    };
+    let share = |names: &[&str]| flag::<f64>(&words, names).filter(|f| *f > 0.0 && *f <= 1.0);
+    match runs {
+        Runs::Vllm => {
+            let stated = share(&["--gpu-memory-utilization"]);
+            return Ok(PredictedNeed::Share {
+                engine: "vLLM",
+                flag: "--gpu-memory-utilization",
+                fraction: stated.unwrap_or(VLLM_DEFAULT_SHARE),
+                defaulted: stated.is_none(),
+            });
+        }
+        Runs::Sglang => {
+            if let Some(fraction) = share(&["--mem-fraction-static"]) {
+                return Ok(PredictedNeed::Share {
+                    engine: "SGLang",
+                    flag: "--mem-fraction-static",
+                    fraction,
+                    defaulted: false,
+                });
+            }
+        }
+        Runs::LlamaCpp | Runs::Unknown => {}
+    }
+    let Some((weight_bytes, weights_from)) = weight_size(profile, model) else {
+        return Err(
+            "its profile states no memory, its engine takes no share of memory the profile shows, and no size for its weights is known (it lists no weight sizes and its model has no parameter count): add `requirements.memory` or verify it on an idle pool"
+                .into(),
+        );
+    };
+    let machines = profile.requirements.machines.max(1);
+    let kv = match (runs, model) {
+        (Runs::LlamaCpp, Some(model)) => flag::<u64>(&words, &["-c", "--ctx-size"])
+            .filter(|tokens| *tokens > 0)
+            .or(model.facts.context)
+            .zip(kv_bytes_per_token(model, machines))
+            .map(|(tokens, per_token)| (tokens, tokens * per_token)),
+        _ => None,
+    };
+    let bytes = (weight_bytes as f64 / f64::from(machines) * WEIGHT_OVERHEAD) as u64
+        + kv.map_or(0, |(_, bytes)| bytes)
+        + RESERVE_BYTES;
+    Ok(PredictedNeed::Sized {
+        bytes,
+        weight_bytes,
+        weights_from,
+        machines,
+        kv,
+    })
+}
+
+fn gib(bytes: u64) -> String {
+    crate::control::gib(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,5 +1157,177 @@ mod tests {
             "{:?}",
             generated.rejected
         );
+    }
+
+    /// A generated profile with its stated memory taken away.
+    fn unstated(mut profile: InferenceProfile) -> InferenceProfile {
+        profile.requirements.memory = None;
+        profile
+    }
+
+    fn command(start: &str, description: Option<&str>) -> InferenceProfile {
+        let mut profile = crate::fixture::command_profile("hand-written", 1);
+        profile.engine = Engine::Command {
+            start: start.into(),
+            stop: None,
+            description: description.map(str::to_string),
+        };
+        profile
+    }
+
+    #[test]
+    fn vllm_needs_its_memory_share_of_each_machine_as_generation_states_it() {
+        let base = repo!("Qwen--Qwen3.6-35B-A3B");
+        let nvfp4 = repo!("nvidia--Qwen3.6-35B-A3B-NVFP4");
+        let model = model_of(&base);
+        let generated = generate(&model, &[base, nvfp4], &sparks());
+        let candidate = &generated.candidates[1];
+        let stated = match candidate.profile.requirements.memory {
+            Some(MemoryPerMachine::Unified { system }) => system.0,
+            ref other => panic!("{other:?}"),
+        };
+        let predicted = predict_need(&unstated(candidate.profile.clone()), Some(&model)).unwrap();
+        assert_eq!(
+            predicted,
+            PredictedNeed::Share {
+                engine: "vLLM",
+                flag: "--gpu-memory-utilization",
+                fraction: 0.85,
+                defaulted: false,
+            }
+        );
+        assert_eq!(predicted.bytes_on(Some(128 * GIB)), Some(stated));
+        assert_eq!(
+            predicted.bytes_on(None),
+            None,
+            "a share of nothing reported"
+        );
+        assert_eq!(
+            predicted.describe(),
+            "vLLM pre-allocates 0.85 of each machine's memory (`--gpu-memory-utilization 0.85`)"
+        );
+    }
+
+    #[test]
+    fn llama_cpp_needs_its_weights_with_overhead_its_kv_and_the_reserve() {
+        let own = repo!("Qwen--Qwen3-Embedding-4B");
+        let gguf = repo!("Qwen--Qwen3-Embedding-4B-GGUF", no_config);
+        let model = model_of(&own);
+        let generated = generate(&model, &[own, gguf], &bbs());
+        let q8 = generated
+            .candidates
+            .iter()
+            .find(|c| c.profile.id.as_str() == "qwen3-embedding-4b-q8_0-llamacpp-x1")
+            .unwrap();
+        let PredictedNeed::Sized {
+            bytes,
+            weight_bytes,
+            kv: Some((tokens, kv_bytes)),
+            ..
+        } = predict_need(&unstated(q8.profile.clone()), Some(&model)).unwrap()
+        else {
+            panic!("a llama.cpp profile is sized");
+        };
+        assert_eq!(weight_bytes, q8.predicted.weight_bytes);
+        assert_eq!(tokens, 40_960, "its -c");
+        assert_eq!(
+            bytes,
+            (weight_bytes as f64 * WEIGHT_OVERHEAD) as u64 + kv_bytes + RESERVE_BYTES
+        );
+        assert_eq!(
+            Some(MemoryPerMachine::Discrete {
+                vram: VramBytes(bytes),
+                host: SystemRamBytes(0)
+            }),
+            q8.profile.requirements.memory,
+            "the same arithmetic generation states"
+        );
+    }
+
+    /// `qwen3-embed-4b` as adopted from bginf: a raw start line running the
+    /// llama.cpp image, no weight sizes, its model registered.
+    #[test]
+    fn a_command_is_read_for_its_engine_and_sized_from_its_model_s_parameters() {
+        let own = repo!("Qwen--Qwen3-Embedding-4B");
+        let model = model_of(&own);
+        let mut profile = command(
+            "M=/home/dev/models/qwen3-embedding-4b; podman run -d --name bginf-embed -v $M:/models:ro ghcr.io/ggml-org/llama.cpp@sha256:afdc -m /models/Qwen3-Embedding-4B-Q8_0.gguf --embedding --pooling last -c 32768 -b 8192 --parallel 4 -ngl 99",
+            Some("llama.cpp server-vulkan, 4 slots x 8k ctx"),
+        );
+        profile.quantization = Some("q8_0".into());
+        let PredictedNeed::Sized {
+            bytes,
+            weight_bytes,
+            weights_from,
+            kv: Some((tokens, kv_bytes)),
+            ..
+        } = predict_need(&profile, Some(&model)).unwrap()
+        else {
+            panic!("sized from its parameters");
+        };
+        let parameters = model.facts.parameters.unwrap();
+        assert_eq!(weight_bytes, parameters, "8 bits a parameter");
+        assert_eq!(weights_from, "4.0B parameters at q8_0");
+        assert_eq!(tokens, 32_768, "the context its four slots share");
+        assert_eq!(kv_bytes, 32_768 * kv_bytes_per_token(&model, 1).unwrap());
+        assert_eq!(
+            bytes,
+            (weight_bytes as f64 * WEIGHT_OVERHEAD) as u64 + kv_bytes + RESERVE_BYTES
+        );
+
+        // `bash -c '...'` is no context size: the model's trained one is.
+        let wrapped = command("bash -c 'llama-server -m /models/x.gguf'", None);
+        let PredictedNeed::Sized { kv, .. } = predict_need(
+            &InferenceProfile {
+                quantization: Some("q8_0".into()),
+                ..wrapped
+            },
+            Some(&model),
+        )
+        .unwrap() else {
+            panic!("sized");
+        };
+        assert_eq!(kv.map(|(tokens, _)| tokens), model.facts.context);
+    }
+
+    /// `qwen36-fast` and `dsv4f-tp2` as adopted: a script whose engine only
+    /// the description names, so vLLM's default share is the need.
+    #[test]
+    fn an_opaque_script_described_as_vllm_needs_vllm_s_default_share() {
+        let profile = command(
+            "cd /home/dev && ./serve-qwen36.sh",
+            Some("vllm (nvcr.io/nvidia/vllm:26.05.post1-py3, marlin moe, 128k ctx, util 0.45)"),
+        );
+        let predicted = predict_need(&profile, None).unwrap();
+        assert_eq!(
+            predicted,
+            PredictedNeed::Share {
+                engine: "vLLM",
+                flag: "--gpu-memory-utilization",
+                fraction: VLLM_DEFAULT_SHARE,
+                defaulted: true,
+            }
+        );
+        assert!(predicted.describe().contains("its default"));
+
+        let sglang = command(
+            "python -m sglang.launch_server --mem-fraction-static=0.7",
+            None,
+        );
+        assert_eq!(
+            predict_need(&sglang, None)
+                .unwrap()
+                .bytes_on(Some(100 * GIB)),
+            Some(70 * GIB)
+        );
+    }
+
+    #[test]
+    fn a_profile_showing_neither_a_share_nor_a_weight_size_is_refused_naming_why() {
+        let why = predict_need(&command("./start.sh", None), None).unwrap_err();
+        assert!(why.contains("lists no weight sizes"), "{why}");
+        assert!(why.contains("add `requirements.memory`"), "{why}");
+        // A model with no parameter count sizes nothing either.
+        assert!(predict_need(&command("./start.sh", None), Some(&Model::named("m"))).is_err());
     }
 }

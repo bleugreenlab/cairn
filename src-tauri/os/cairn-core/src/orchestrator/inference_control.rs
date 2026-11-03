@@ -76,11 +76,15 @@ pub struct MachineReading {
     /// (a unified-memory machine, or one with no discrete card), rather than
     /// VRAM no batch touches.
     pub free_is_host_memory: bool,
+    /// The whole of the memory `free_bytes` is of, which an engine's memory
+    /// share is a share of. `None` when unmeasured.
+    pub total_bytes: Option<u64>,
 }
 
 impl MachineReading {
     pub fn of(snapshot: &ExecutorHealthSnapshot) -> Self {
         let mut discrete_free: Option<u64> = None;
+        let mut discrete_total: Option<u64> = None;
         if let MeasurementReading::Measured { value: devices } = &snapshot.host.gpus.reading {
             for device in devices {
                 if let MeasurementReading::Measured {
@@ -92,17 +96,21 @@ impl MachineReading {
                 } = &device.memory
                 {
                     *discrete_free.get_or_insert(0) += total_bytes.saturating_sub(*used_bytes);
+                    *discrete_total.get_or_insert(0) += total_bytes;
                 }
             }
         }
-        let host_free = match &snapshot.machine.memory.reading {
-            MeasurementReading::Measured { value } => Some(value.available_bytes),
-            MeasurementReading::Unavailable { .. } => None,
+        let (host_free, host_total) = match &snapshot.machine.memory.reading {
+            MeasurementReading::Measured { value } => {
+                (Some(value.available_bytes), Some(value.total_bytes))
+            }
+            MeasurementReading::Unavailable { .. } => (None, None),
         };
         Self {
             gpu_allocated_bytes: gpu_allocated_bytes(&snapshot.host),
             free_is_host_memory: discrete_free.is_none(),
             free_bytes: discrete_free.or(host_free),
+            total_bytes: discrete_total.or(host_total),
         }
     }
 }
@@ -264,6 +272,87 @@ pub fn last_footprint(loads: Option<&Vec<LoadRow>>) -> BTreeMap<String, u64> {
         .flatten()
         .find_map(|load| load.footprint.clone())
         .unwrap_or_default()
+}
+
+/// Where a deployment's memory need comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NeedBasis {
+    /// Its newest load, settled.
+    Measured,
+    /// Its profile's `requirements.memory`.
+    Stated,
+    /// Predicted from what its profile runs, with how.
+    Predicted(String),
+}
+
+/// What a deployment needs on each of its machines, in the memory placement
+/// compares (system memory on a unified machine, VRAM on a discrete card). A
+/// machine is missing only when its need is a share of a memory it has not
+/// reported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Need {
+    pub per_machine: BTreeMap<String, u64>,
+    pub basis: NeedBasis,
+}
+
+impl Need {
+    /// How it was predicted, when it was.
+    pub fn predicted(&self) -> Option<&str> {
+        match &self.basis {
+            NeedBasis::Predicted(how) => Some(how),
+            _ => None,
+        }
+    }
+}
+
+/// A deployment's need on each of its machines: its newest measured load when
+/// that covers every machine, else what its profile states, else what
+/// [`cairn_inference::generate::predict_need`] predicts from what the profile
+/// runs (a share of a machine's memory is taken of `total_of` it). Refused,
+/// naming what is missing, when the profile gives nothing to predict from:
+/// the one placement may not weigh, so its start is refused, never sent blind.
+pub fn need_of(
+    inventory: &Inventory,
+    deployment: &Deployment,
+    loads: Option<&Vec<LoadRow>>,
+    total_of: impl Fn(&str) -> Option<u64>,
+) -> Result<Need, String> {
+    let measured = last_footprint(loads);
+    if !measured.is_empty()
+        && deployment
+            .machines
+            .iter()
+            .all(|machine| measured.contains_key(machine.as_str()))
+    {
+        return Ok(Need {
+            per_machine: measured,
+            basis: NeedBasis::Measured,
+        });
+    }
+    let profile = inventory
+        .profiles
+        .get(&deployment.profile)
+        .ok_or_else(|| format!("its profile {} is not in the inventory", deployment.profile))?;
+    let machines = deployment.machines.iter().map(MachineName::as_str);
+    if let Some(stated) = control::stated_need(profile) {
+        return Ok(Need {
+            per_machine: machines.map(|m| (m.to_string(), stated)).collect(),
+            basis: NeedBasis::Stated,
+        });
+    }
+    let model = inventory.models.get(&profile.model.name).or_else(|| {
+        inventory
+            .models
+            .values()
+            .find(|model| model.name.eq_ignore_ascii_case(&profile.model.name))
+    });
+    let predicted = cairn_inference::generate::predict_need(profile, model)?;
+    Ok(Need {
+        per_machine: machines
+            .filter_map(|m| Some((m.to_string(), predicted.bytes_on(total_of(m))?)))
+            .collect(),
+        basis: NeedBasis::Predicted(predicted.describe()),
+    })
 }
 
 type Decide = dyn Fn(Option<&StateRow>) -> Option<(Phase, Option<String>)> + Send + Sync;
@@ -827,18 +916,18 @@ fn probe(
 }
 
 /// Each gang machine's GPU memory against the deployment's footprint there:
-/// the newest measured load's, or else what its profile states.
+/// its need ([`need_of`]), measured, stated or predicted.
 fn allocations_of(
     inventory: &Inventory,
     deployment: &Deployment,
     readings: &BTreeMap<String, MachineReading>,
     history: &BTreeMap<DeploymentId, Vec<LoadRow>>,
 ) -> BTreeMap<MachineName, Allocation> {
-    let footprint = last_footprint(history.get(&deployment.id));
-    let stated = inventory
-        .profiles
-        .get(&deployment.profile)
-        .and_then(control::stated_need);
+    let need = need_of(inventory, deployment, history.get(&deployment.id), |m| {
+        readings.get(m)?.total_bytes
+    })
+    .map(|need| need.per_machine)
+    .unwrap_or_default();
     deployment
         .machines
         .iter()
@@ -849,7 +938,7 @@ fn allocations_of(
                     held_bytes: readings
                         .get(machine.as_str())
                         .and_then(|reading| reading.gpu_allocated_bytes),
-                    footprint_bytes: footprint.get(machine.as_str()).copied().or(stated),
+                    footprint_bytes: need.get(machine.as_str()).copied(),
                 },
             )
         })
@@ -1020,6 +1109,27 @@ pub(crate) async fn note_waiting(
         &inventory,
         id,
         Observation::Waiting { on },
+        Matching::Any,
+        None,
+        now_ms,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Fail a reserving start placement cannot weigh, naming why.
+pub(crate) async fn refuse(
+    db: &LocalDb,
+    id: &DeploymentId,
+    reason: String,
+    now_ms: i64,
+) -> Result<(), String> {
+    let inventory = load_inventory(db).await?;
+    apply(
+        db,
+        &inventory,
+        id,
+        Observation::NotSent { reason },
         Matching::Any,
         None,
         now_ms,
@@ -1217,6 +1327,7 @@ pub(crate) mod tests {
                     gpu_allocated_bytes: Some(allocated_gib << 30),
                     free_bytes: Some(free_gib << 30),
                     free_is_host_memory: true,
+                    total_bytes: Some(SPARK_TOTAL_GIB << 30),
                 },
             );
         }
@@ -1266,8 +1377,10 @@ pub(crate) mod tests {
     pub(crate) const SP2: &str = "bginf-sp2";
     pub(crate) const DSV4F: &str = "dsv4f-tp2";
     pub(crate) const QWEN: &str = "qwen36-fast";
+    /// What a GB10 Spark reports as its memory.
+    pub(crate) const SPARK_TOTAL_GIB: u64 = 122;
 
-    fn profile(id: &str, machines: u32) -> InferenceProfile {
+    pub(crate) fn profile(id: &str, machines: u32) -> InferenceProfile {
         InferenceProfile {
             id: id.into(),
             source: RecordSource::Cairn,
@@ -1284,7 +1397,10 @@ pub(crate) mod tests {
             engine: Engine::Command {
                 start: format!("./start-{id}.sh"),
                 stop: Some(format!("./stop-{id}.sh")),
-                description: None,
+                // As adopted from bginf: only the description names the
+                // engine, so the need is vLLM's default share, 0.90 of each
+                // Spark's 122 GiB (109.8 GiB).
+                description: Some("vllm".into()),
             },
             requirements: Requirements {
                 machines,

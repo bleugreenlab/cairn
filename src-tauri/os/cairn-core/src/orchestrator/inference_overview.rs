@@ -208,6 +208,9 @@ pub struct ProfileFit {
     pub failed: Option<String>,
     /// A verification on the pool is under way.
     pub verifying: bool,
+    /// `memory_bytes` is predicted from what the profile runs: nothing
+    /// measured it and the profile states none.
+    pub predicted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -474,21 +477,30 @@ impl Sources<'_> {
             .min()
     }
 
-    /// What `deployment` takes: its whole size and the most it needs of one
-    /// machine, from its measured footprint, else its profile's declaration.
-    fn size(
-        &self,
-        deployment: &DeploymentId,
-        profile: &InferenceProfile,
-    ) -> (Option<u64>, Option<u64>) {
-        let footprint = self.footprint(deployment);
-        if !footprint.is_empty() {
-            return (
-                Some(footprint.values().sum()),
-                footprint.values().max().copied(),
-            );
-        }
-        Self::declared_size(profile)
+    /// What `deployment` takes: its whole size, the most it needs of one
+    /// machine, and whether that is predicted rather than measured or stated
+    /// ([`inference_control::need_of`]). The whole size is unknown while a
+    /// machine whose share it is has not reported its memory.
+    fn size(&self, deployment: &DeploymentId) -> (Option<u64>, Option<u64>, bool) {
+        let Some(record) = self.inventory.deployments.get(deployment) else {
+            return (None, None, false);
+        };
+        let need = inference_control::need_of(
+            self.inventory,
+            record,
+            self.loads.get(deployment),
+            |machine| Some(self.machines.get(machine)?.memory?.0),
+        );
+        let Ok(need) = need else {
+            return (None, None, false);
+        };
+        let whole = (need.per_machine.len() == record.machines.len())
+            .then(|| need.per_machine.values().sum());
+        (
+            whole,
+            need.per_machine.values().max().copied(),
+            need.predicted().is_some(),
+        )
     }
 
     /// What `profile` declares it takes: its whole size and its size on one
@@ -697,7 +709,7 @@ impl Sources<'_> {
             // content nothing has vouched for: a load verifies it first.
             .filter(|(_, profile)| !self.edited.contains(profile.id.as_str()))
             .map(|(id, profile)| {
-                let (size, per_machine) = self.size(id, profile);
+                let (size, per_machine, _) = self.size(id);
                 let blocked = if !self.fits(pool, profile, per_machine) {
                     Some("won't fit".to_string())
                 } else {
@@ -848,6 +860,7 @@ impl Sources<'_> {
                     failed: (row.outcome == "failed")
                         .then(|| row.reason.clone().unwrap_or_else(|| "failed".to_string())),
                     verifying: row.outcome == "running",
+                    predicted: false,
                 },
             );
         }
@@ -865,10 +878,10 @@ impl Sources<'_> {
             if fits.contains_key(&key) {
                 continue;
             }
-            let (size, per_machine) = self.size(id, profile);
+            let (size, per_machine, predicted) = self.size(id);
             let fits_here = self.fits(pool, profile, per_machine);
             let loads = self.loads.get(id).filter(|loads| !loads.is_empty());
-            if loads.is_none() && fits_here {
+            if loads.is_none() && fits_here && !predicted {
                 continue;
             }
             fits.insert(
@@ -884,6 +897,7 @@ impl Sources<'_> {
                         .filter(|load| !load.healthy)
                         .and_then(|load| load.reason.clone()),
                     verifying: false,
+                    predicted,
                 },
             );
         }
@@ -1890,7 +1904,12 @@ deployments:
         let deepseek = sparks.loadable.iter().find(|l| l.model == DSV4).unwrap();
         assert_eq!(deepseek.blocked, None);
         assert_eq!(deepseek.profile.as_deref(), Some("dsv4f-tp2"));
-        assert_eq!(deepseek.size_bytes, None);
+        // Stating no memory, it is predicted at vLLM's default share of each
+        // Spark (its description names vLLM).
+        assert_eq!(
+            deepseek.size_bytes,
+            Some(2 * ((122 * GIB) as f64 * 0.9) as u64)
+        );
         let model = overview.models.iter().find(|m| m.name == QWEN).unwrap();
         assert!(!model.profiles[0].fit[0].fits);
         assert_eq!(model.profiles[0].fit[0].pool, SPARKS);
@@ -1966,6 +1985,7 @@ deployments:
                 decode_tokens_per_sec: None,
                 failed: None,
                 verifying: false,
+                predicted: false,
             }]
         );
         let embedder = &overview.models[1];
@@ -2045,6 +2065,7 @@ deployments:
                     decode_tokens_per_sec: Some(2_400.0),
                     failed: None,
                     verifying: false,
+                    predicted: false,
                 },
                 ProfileFit {
                     pool: SPARKS.into(),
@@ -2054,6 +2075,7 @@ deployments:
                     decode_tokens_per_sec: None,
                     failed: None,
                     verifying: true,
+                    predicted: false,
                 },
             ]
         );
