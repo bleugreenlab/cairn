@@ -43,6 +43,7 @@ pub(crate) type IssueStatusCache = CadencedCache<Arc<IssueStatusSnapshot>>;
 pub(crate) type IssueListCache = CadencedCache<EncodedIssueList>;
 pub(crate) type OperatorNotificationsCache =
     CadencedCache<Arc<crate::notifications::OperatorNotificationsSnapshot>>;
+pub(crate) type PendingDeliveriesCache = CadencedCache<crate::messages::pending::PendingDeliveries>;
 
 /// The shortest interval between two rebuilds of one project's thread or issue
 /// status rollup.
@@ -60,6 +61,48 @@ pub(crate) const STATUS_ROLLUP_FLOOR: Duration = Duration::from_secs(2);
 /// The same bound for the issue list. Shorter, because a new or retitled issue
 /// is something a person just did and is waiting to see.
 pub(crate) const ISSUE_LIST_FLOOR: Duration = Duration::from_secs(1);
+
+/// The same bound for one job's pending-delivery list.
+///
+/// A rebuild is a handful of index seeks, well under a millisecond on the 11-02
+/// production clone, so the floor is about rate, not cost: the list's inputs
+/// include `events`, and a streaming turn writes several a second.
+pub(crate) const PENDING_DELIVERIES_FLOOR: Duration = Duration::from_secs(1);
+
+/// The tables a job's pending-delivery list reads (`messages::pending`).
+///
+/// The three sources (pushes, side-channel notices, channel messages); the
+/// channel source's scope (the job's session and cursor, its owner, and the runs
+/// whose posts it excludes); a turn boundary, where pending items are delivered;
+/// and what decides whether a push is still live
+/// (`cairn_attention::push::resolve_verdicts`): issues, merge requests,
+/// artifacts, prompts and permission requests. A direct push's card reads its
+/// message too, which `messages` already covers.
+///
+/// None of these frames can be placed against one job: a frame's `jobId` names
+/// the job that owns the row, which for a message is its sender and for a merge
+/// request its producer, not the recipient whose list moved. So each dirties
+/// every list that has a reader. That breadth is affordable here because it
+/// costs no refetch: only a list read within the last minute is rebuilt, at most
+/// once per floor, and an unchanged answer is not announced.
+///
+/// `events` is the one input a frame does place. Delivering a push stamps it in
+/// the same transaction as the event that carries it, and that event's frame,
+/// scoped to the recipient, is the only frame the delivery produces.
+const PENDING_DELIVERY_INPUT_TABLES: &[&str] = &[
+    "attention_pushes",
+    "suppressed_wakes",
+    "messages",
+    "sessions",
+    "jobs",
+    "runs",
+    "turns",
+    "issues",
+    "merge_requests",
+    "artifacts",
+    "prompts",
+    "permission_requests",
+];
 
 /// The tables the issue rollup reads.
 ///
@@ -219,6 +262,7 @@ pub(crate) struct ProjectionInvalidatingEmitter {
     issue_status: Arc<IssueStatusCache>,
     issue_list: Arc<IssueListCache>,
     operator_notifications: Arc<OperatorNotificationsCache>,
+    pending_deliveries: Arc<PendingDeliveriesCache>,
 }
 
 impl ProjectionInvalidatingEmitter {
@@ -228,6 +272,7 @@ impl ProjectionInvalidatingEmitter {
         issue_status: Arc<IssueStatusCache>,
         issue_list: Arc<IssueListCache>,
         operator_notifications: Arc<OperatorNotificationsCache>,
+        pending_deliveries: Arc<PendingDeliveriesCache>,
     ) -> Self {
         Self {
             inner,
@@ -235,6 +280,7 @@ impl ProjectionInvalidatingEmitter {
             issue_status,
             issue_list,
             operator_notifications,
+            pending_deliveries,
         }
     }
 
@@ -246,6 +292,7 @@ impl ProjectionInvalidatingEmitter {
             self.note_team_sync(payload);
             return;
         }
+        self.note_pending_delivery_input(table, payload);
         let thread_input = THREAD_STATUS_INPUT_TABLES.contains(&table);
         let issue_input = ISSUE_STATUS_INPUT_TABLES.contains(&table);
         let list_input = ISSUE_LIST_INPUT_TABLES.contains(&table);
@@ -295,10 +342,37 @@ impl ProjectionInvalidatingEmitter {
         }
     }
 
+    /// Dirty the pending-delivery lists one committed write could have moved
+    /// (see [`PENDING_DELIVERY_INPUT_TABLES`]). Only lists some reader has asked
+    /// for exist to dirty; a frame never creates one.
+    fn note_pending_delivery_input(&self, table: &str, payload: &Value) {
+        if table == "events" {
+            match payload
+                .get("jobId")
+                .or_else(|| payload.get("job_id"))
+                .and_then(Value::as_str)
+            {
+                Some(job_id) => self
+                    .pending_deliveries
+                    .invalidate_matching("pending-delivery-carrier", |key| key == job_id),
+                None => self
+                    .pending_deliveries
+                    .invalidate_matching("pending-delivery-carrier-unscoped", |_| true),
+            }
+        } else if PENDING_DELIVERY_INPUT_TABLES.contains(&table) {
+            self.pending_deliveries
+                .invalidate_matching("pending-delivery-input", |_| true);
+        }
+    }
+
     /// A team pull applies a batch of remote rows at once and announces it with
     /// one frame naming the projects it reconciled, not one frame per table, so
     /// any of the three projections may have moved in any of those projects.
+    /// Pending-delivery lists are keyed by job, not project, so a pull dirties
+    /// every one of them.
     fn note_team_sync(&self, payload: &Value) {
+        self.pending_deliveries
+            .invalidate_matching("team-sync", |_| true);
         let projects: Option<Vec<&str>> = payload
             .get("projectIds")
             .and_then(Value::as_array)
@@ -2196,6 +2270,7 @@ mod tests {
         issues: Arc<IssueStatusCache>,
         list: Arc<IssueListCache>,
         notifications: Arc<OperatorNotificationsCache>,
+        pending: Arc<PendingDeliveriesCache>,
         thread_jobs: Arc<Mutex<HashSet<String>>>,
         issue_jobs: Arc<Mutex<HashSet<String>>>,
         announced: Arc<Mutex<Vec<String>>>,
@@ -2255,12 +2330,19 @@ mod tests {
             rebuild_with(|_key| async { Ok(Arc::default()) }),
             recording(&announced, "operator_notifications"),
         );
+        let pending = PendingDeliveriesCache::new(
+            "test-pending",
+            floor,
+            rebuild_with(|_key| async { Ok(Arc::default()) }),
+            recording(&announced, "pending_deliveries"),
+        );
         let emitter = ProjectionInvalidatingEmitter::new(
             Arc::new(CapturingEmitter::new()),
             threads.clone(),
             issues.clone(),
             list.clone(),
             notifications.clone(),
+            pending.clone(),
         );
         Sidebar {
             emitter,
@@ -2268,6 +2350,7 @@ mod tests {
             issues,
             list,
             notifications,
+            pending,
             thread_jobs,
             issue_jobs,
             announced,
@@ -2342,6 +2425,64 @@ mod tests {
             s.notifications.generation("proj"),
             before,
             "a table no entry reads"
+        );
+    }
+
+    /// A job's pending-delivery list cannot be placed against the frame's job for
+    /// any input but `events` (a message names its sender, a merge request its
+    /// producer), so each input dirties every list a reader holds, and nothing
+    /// else does.
+    #[tokio::test(start_paused = true)]
+    async fn every_pending_delivery_input_dirties_every_read_list() {
+        let s = sidebar(PENDING_DELIVERIES_FLOOR);
+        s.pending.get("job-a").await.unwrap();
+        s.pending.get("job-b").await.unwrap();
+        for table in PENDING_DELIVERY_INPUT_TABLES {
+            let (a, b) = (s.pending.generation("job-a"), s.pending.generation("job-b"));
+            s.emit(serde_json::json!({"table": table, "projectId": "proj", "jobId": "job-a"}));
+            assert_eq!(s.pending.generation("job-a"), a + 1, "{table}");
+            assert_eq!(s.pending.generation("job-b"), b + 1, "{table}");
+        }
+
+        let (a, b) = (s.pending.generation("job-a"), s.pending.generation("job-b"));
+        for frame in [
+            // Its own announcement is not a write.
+            serde_json::json!({"table": "pending_deliveries", "action": "published", "jobId": "job-a"}),
+            // Nor is a table no source reads.
+            serde_json::json!({"table": "session_positions", "projectId": "proj"}),
+        ] {
+            s.emit(frame);
+        }
+        assert_eq!(
+            (s.pending.generation("job-a"), s.pending.generation("job-b")),
+            (a, b)
+        );
+    }
+
+    /// A delivery is stamped with the event that carries it, so an event moves
+    /// its own job's list and no other, and never brings a list into being.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_dirties_only_its_own_jobs_pending_list() {
+        let s = sidebar(PENDING_DELIVERIES_FLOOR);
+        s.pending.get("job-a").await.unwrap();
+        s.pending.get("job-b").await.unwrap();
+        let (a, b) = (s.pending.generation("job-a"), s.pending.generation("job-b"));
+
+        s.emit(events_frame("proj", "job-a"));
+        assert_eq!(s.pending.generation("job-a"), a + 1);
+        assert_eq!(s.pending.generation("job-b"), b, "another job's event");
+
+        s.emit(events_frame("proj", "job-unread"));
+        assert!(
+            s.pending.published("job-unread").is_none() && s.pending.generation("job-unread") == 0,
+            "a list nobody asked for is not created by a write"
+        );
+
+        s.emit(serde_json::json!({"table": "events", "action": "insert"}));
+        assert_eq!(
+            s.pending.generation("job-b"),
+            b + 1,
+            "an event that names no job could be anyone's"
         );
     }
 

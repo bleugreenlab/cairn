@@ -19,7 +19,7 @@ use super::types::*;
 /// agent was meant to see, and short enough that a job resumed later opens on
 /// the user's actual reply instead of a fortnight of replayed issue comments.
 /// Nothing is lost: every notice names a canonical URI that is still readable.
-const NOTICE_DELIVERY_HORIZON_SECS: i64 = 24 * 60 * 60;
+pub const NOTICE_DELIVERY_HORIZON_SECS: i64 = 24 * 60 * 60;
 
 pub async fn record_live_comment_side_channel_message(
     db: &LocalDb,

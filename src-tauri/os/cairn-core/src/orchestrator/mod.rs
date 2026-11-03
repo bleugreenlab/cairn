@@ -140,6 +140,7 @@ pub struct OrchestratorBuilder {
     issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     issue_list_cache: Arc<generation_cache::IssueListCache>,
     operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
+    pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
     hold_sources: Arc<crate::notifications::HoldRegistry>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
@@ -340,6 +341,65 @@ impl OrchestratorBuilder {
             announce(crate::notifications::PROJECTION),
         );
         let _ = notifications_cache_slot.set(Arc::downgrade(&operator_notifications_cache));
+        // One list per job, announced per job, so a change reaches only the panes
+        // showing that job. A side-channel notice ages out of its list with no
+        // write to say so; the rebuild asks for a re-check then, once per distinct
+        // expiry rather than once per rebuild, since a rebuild can run every
+        // second and the horizon is a day.
+        let pending_deliveries_cache_slot: Arc<
+            std::sync::OnceLock<std::sync::Weak<generation_cache::PendingDeliveriesCache>>,
+        > = Arc::default();
+        let pending_expiries: Arc<Mutex<HashMap<String, i64>>> = Arc::default();
+        let pending_deliveries_cache = generation_cache::PendingDeliveriesCache::new(
+            "pending deliveries projection",
+            generation_cache::PENDING_DELIVERIES_FLOOR,
+            generation_cache::rebuild_with({
+                let dbs = dbs.clone();
+                let slot = pending_deliveries_cache_slot.clone();
+                move |job_id: String| {
+                    let dbs = dbs.clone();
+                    let slot = slot.clone();
+                    let expiries = pending_expiries.clone();
+                    async move {
+                        let dbs = dbs.upgrade().ok_or_else(runner_gone)?;
+                        let items =
+                            crate::messages::pending::rebuild_pending_deliveries(&dbs, &job_id)
+                                .await?;
+                        let expiry = crate::messages::pending::next_expiry(&items);
+                        let newly_due = expiries.lock().is_ok_and(|mut expiries| match expiry {
+                            Some(at) => expiries.insert(job_id.clone(), at) != Some(at),
+                            None => {
+                                expiries.remove(&job_id);
+                                false
+                            }
+                        });
+                        if let (true, Some(at), Some(cache)) = (
+                            newly_due,
+                            expiry,
+                            slot.get().and_then(std::sync::Weak::upgrade),
+                        ) {
+                            let wait = (at - chrono::Utc::now().timestamp()).max(0) as u64 + 1;
+                            cache.invalidate_after(
+                                &job_id,
+                                std::time::Duration::from_secs(wait),
+                                "pending-delivery-expired",
+                            );
+                        }
+                        Ok(Arc::new(items))
+                    }
+                }
+            }),
+            {
+                let emitter = services.emitter.clone();
+                Arc::new(move |job_id: &str| {
+                    let _ = emitter.emit(
+                        "db-change",
+                        crate::notify::pending_deliveries_published_db_change(job_id),
+                    );
+                })
+            },
+        );
+        let _ = pending_deliveries_cache_slot.set(Arc::downgrade(&pending_deliveries_cache));
         let issue_list_cache = generation_cache::IssueListCache::new(
             "issue list projection",
             generation_cache::ISSUE_LIST_FLOOR,
@@ -362,6 +422,7 @@ impl OrchestratorBuilder {
                 issue_status_cache.clone(),
                 issue_list_cache.clone(),
                 operator_notifications_cache.clone(),
+                pending_deliveries_cache.clone(),
             )),
             clock: services.clock.clone(),
             fs: services.fs.clone(),
@@ -403,6 +464,7 @@ impl OrchestratorBuilder {
             issue_status_cache,
             issue_list_cache,
             operator_notifications_cache,
+            pending_deliveries_cache,
             hold_sources,
             api_config: ApiConfig::default(),
             effect_tx: None,
@@ -803,6 +865,7 @@ impl OrchestratorBuilder {
             issue_status_cache: self.issue_status_cache,
             issue_list_cache: self.issue_list_cache,
             operator_notifications_cache: self.operator_notifications_cache,
+            pending_deliveries_cache: self.pending_deliveries_cache,
             hold_sources: self.hold_sources,
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
@@ -834,6 +897,9 @@ impl OrchestratorBuilder {
             });
             orchestrator
                 .operator_notifications_cache
+                .bind_runtime(handle.clone());
+            orchestrator
+                .pending_deliveries_cache
                 .bind_runtime(handle.clone());
             let mut pulls = crate::storage::subscribe_team_pull_applied();
             let snapshot = Arc::downgrade(&orchestrator.sidebar_active_issues);
@@ -1327,6 +1393,9 @@ pub struct Orchestrator {
     pub(crate) issue_list_cache: Arc<generation_cache::IssueListCache>,
     /// Per-project operator notification center list, on the same terms.
     pub(crate) operator_notifications_cache: Arc<generation_cache::OperatorNotificationsCache>,
+    /// Per-job pending-delivery list (the composer's system chips), keyed by job
+    /// id and announced per job, on the same terms.
+    pub(crate) pending_deliveries_cache: Arc<generation_cache::PendingDeliveriesCache>,
     /// The producers of hold entries in the notification center.
     pub(crate) hold_sources: Arc<crate::notifications::HoldRegistry>,
     /// Runner-owned persistent commit-addressed execution workspaces.

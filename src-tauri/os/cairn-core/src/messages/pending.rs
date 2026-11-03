@@ -1,10 +1,19 @@
 //! Unified read/dismiss surface for system-originated content pending delivery
 //! to a job's agent.
+//!
+//! The frontend reads it through a per-job projection
+//! (`generation_cache::PendingDeliveriesCache`): the runner rebuilds a job's list
+//! when one of its input tables moves and announces `pending_deliveries` only
+//! when the answer changed, so an open pane refetches on a change to its own
+//! list rather than on every write anywhere (cairn/5619).
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::DbState;
 use crate::messages::side_channel;
-use crate::orchestrator::{attention_push, session};
+use crate::orchestrator::{attention_push, session, Orchestrator};
 use crate::storage::LocalDb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +35,7 @@ impl PendingDeliverySource {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingDelivery {
     id: String,
@@ -36,6 +45,60 @@ pub struct PendingDelivery {
     detail: Option<String>,
     uri: Option<String>,
     created_at: i64,
+}
+
+/// One job's list as its projection publishes it.
+pub type PendingDeliveries = Arc<Vec<PendingDelivery>>;
+
+impl PendingDelivery {
+    /// When this item leaves the list with no write to say so: a side-channel
+    /// notice is dropped once it is older than its delivery horizon.
+    fn expires_at(&self) -> Option<i64> {
+        (self.source == PendingDeliverySource::SideChannel)
+            .then(|| self.created_at + crate::orchestrator::wakes::NOTICE_DELIVERY_HORIZON_SECS)
+    }
+}
+
+/// Unix seconds at which a list next changes with time alone, if it ever does.
+pub(crate) fn next_expiry(items: &[PendingDelivery]) -> Option<i64> {
+    items.iter().filter_map(PendingDelivery::expires_at).min()
+}
+
+/// The projection's rebuild: one job's list, read from the database that owns
+/// the job.
+pub(crate) async fn rebuild_pending_deliveries(
+    dbs: &DbState,
+    job_id: &str,
+) -> Result<Vec<PendingDelivery>, String> {
+    let db = crate::execution::routing::owning_db_for_job(dbs, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    list_pending_deliveries(&db, job_id).await
+}
+
+/// A job's pending deliveries, served from its projection.
+pub async fn pending_deliveries_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<PendingDeliveries, String> {
+    orch.pending_deliveries_cache.get(job_id).await
+}
+
+/// Dismiss one item, then rebuild the job's list past the floor: the person who
+/// dismissed it is looking at the list as they do.
+pub async fn dismiss_pending_delivery_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+    id: &str,
+    source: PendingDeliverySource,
+) -> Result<(), String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    dismiss_pending_delivery(&db, job_id, id, source).await?;
+    orch.pending_deliveries_cache
+        .invalidate_now(job_id, "pending-delivery-dismissed");
+    Ok(())
 }
 
 pub async fn list_pending_deliveries(
@@ -368,6 +431,38 @@ mod tests {
             .unwrap()
             .flatten();
         assert_eq!(delivered_at, None);
+    }
+
+    /// A side-channel notice is the one item that leaves the list with time
+    /// alone, so it is the one that sets when the list next changes.
+    #[test]
+    fn only_side_channel_notices_expire() {
+        let item = |id: &str, source, created_at| PendingDelivery {
+            id: id.to_string(),
+            source,
+            kind: "k".to_string(),
+            headline: "h".to_string(),
+            detail: None,
+            uri: None,
+            created_at,
+        };
+        let horizon = crate::orchestrator::wakes::NOTICE_DELIVERY_HORIZON_SECS;
+
+        assert_eq!(
+            next_expiry(&[
+                item("push", PendingDeliverySource::Push, 5),
+                item("channel", PendingDeliverySource::Channel, 6),
+            ]),
+            None
+        );
+        assert_eq!(
+            next_expiry(&[
+                item("push", PendingDeliverySource::Push, 5),
+                item("later", PendingDeliverySource::SideChannel, 300),
+                item("sooner", PendingDeliverySource::SideChannel, 200),
+            ]),
+            Some(200 + horizon)
+        );
     }
 
     #[test]

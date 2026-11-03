@@ -1097,6 +1097,21 @@ pub fn projection_published_db_change(projection: &str, project_id: &str) -> Val
     })
 }
 
+/// A job's pending-delivery list changed: the system-originated items queued
+/// for its agent that the composer shows as dismissible chips (cairn/5619).
+///
+/// Like [`projection_published_db_change`], the only frame the frontend
+/// refetches that list on, and not a table, so publishing never feeds another
+/// rebuild. Keyed by job because the list is per job.
+pub fn pending_deliveries_published_db_change(job_id: &str) -> Value {
+    json!({
+        "table": "pending_deliveries",
+        "action": "published",
+        "jobId": job_id,
+        "job_id": job_id,
+    })
+}
+
 pub fn job_presence_db_change(scope: &EventRunScope) -> Value {
     json!({
         "table": "job_presence",

@@ -1525,6 +1525,36 @@ enum ChannelScope<'a> {
     Thread(&'a str),
 }
 
+/// One channel's messages past a session's injection cursor, newest first.
+///
+/// A run reads up to two channels, the project's and its owner's issue or thread
+/// channel, and each gets its own statement. With both in one `OR` and the
+/// channel bound as parameters, Turso planned the read through
+/// `idx_messages_channel_created` on `channel_type` alone and fetched every row
+/// of that type in the workspace to find one channel's handful: 53k issue
+/// messages, 55-160 ms per call on the 11-02 production clone (cairn/5619).
+/// `INDEXED BY` keeps a later `messages` index from flipping the plan again, the
+/// way 0225's did.
+///
+/// The walk is the channel's own index entries, newest first, stopping at the
+/// limit. Turso does not seek an index's trailing rowid, so `rowid > ?3` filters
+/// the walk rather than bounding it: a channel with fewer than `limit` matches
+/// past the cursor costs its whole history, which is that channel's size, never
+/// the workspace's. The own-job exclusion is a correlated primary-key probe,
+/// because an `IN (SELECT ...)` list under `OR` is rebuilt for every row.
+const CHANNEL_MESSAGES_SQL: &str = "SELECT rowid, sender_name, content, created_at
+     FROM messages INDEXED BY idx_messages_channel_seq
+     WHERE channel_type = ?1 AND channel_id = ?2
+       AND rowid > ?3
+       AND (?4 = 1 OR sender_name != 'system')
+       AND NOT EXISTS (SELECT 1 FROM runs r
+                        WHERE r.id = messages.sender_run_id AND r.job_id = ?5)
+     ORDER BY rowid DESC
+     LIMIT ?6";
+
+/// The newest `limit` messages across the channels `scope` reads, oldest first,
+/// excluding every run of `exclude_job_id` (a recipient never hears its own
+/// posts) and, unless `include_system`, lifecycle messages.
 async fn recent_messages_for_run(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
@@ -1534,70 +1564,40 @@ async fn recent_messages_for_run(
     limit: i64,
     include_system: bool,
 ) -> DbResult<Vec<PromptMessage>> {
-    let include_system = if include_system { 1_i64 } else { 0_i64 };
-    let thread_id = match scope {
-        ChannelScope::Thread(thread_id) => Some(thread_id),
-        _ => None,
-    };
-    let mut rows = if let ChannelScope::Issue(issue_key) = scope {
-        conn.query(
-            "SELECT rowid, sender_name, content, created_at
-             FROM messages
-             WHERE (sender_run_id IS NULL
-                    OR ?1 IS NULL
-                    OR sender_run_id NOT IN (SELECT id FROM runs WHERE job_id = ?1))
-               AND (?6 = 1 OR sender_name != 'system')
-               AND (
-                    (channel_type = 'project' AND channel_id = ?2)
-                    OR (channel_type = 'issue' AND channel_id = ?3)
-               )
-               AND (?5 IS NULL OR rowid > ?5)
-             ORDER BY rowid DESC
-             LIMIT ?4",
-            params![
-                exclude_job_id,
-                project_key,
-                issue_key,
-                limit,
-                cursor,
-                include_system
-            ],
-        )
-        .await?
-    } else {
-        conn.query(
-            "SELECT rowid, sender_name, content, created_at
-             FROM messages
-             WHERE (sender_run_id IS NULL
-                    OR ?1 IS NULL
-                    OR sender_run_id NOT IN (SELECT id FROM runs WHERE job_id = ?1))
-               AND (?5 = 1 OR sender_name != 'system')
-               AND ((channel_type = 'project' AND channel_id = ?2)
-                    OR (channel_type = 'thread' AND channel_id = ?6))
-               AND (?4 IS NULL OR rowid > ?4)
-             ORDER BY rowid DESC
-             LIMIT ?3",
-            params![
-                exclude_job_id,
-                project_key,
-                limit,
-                cursor,
-                include_system,
-                thread_id
-            ],
-        )
-        .await?
-    };
-
-    let mut messages = Vec::new();
-    while let Some(row) = rows.next().await? {
-        messages.push(PromptMessage {
-            rowid: row.i64(0)?,
-            sender_name: row.text(1)?,
-            content: row.text(2)?,
-            created_at: row.i64(3)?,
-        });
+    let mut channels = vec![("project", project_key)];
+    match scope {
+        ChannelScope::ProjectOnly => {}
+        ChannelScope::Issue(issue_key) => channels.push(("issue", issue_key)),
+        ChannelScope::Thread(thread_id) => channels.push(("thread", thread_id)),
     }
+    // Rowids start at 1, so an absent cursor is `rowid > 0`.
+    let cursor = cursor.unwrap_or(0);
+    let mut messages = Vec::new();
+    for (channel_type, channel_id) in channels {
+        let mut rows = conn
+            .query(
+                CHANNEL_MESSAGES_SQL,
+                params![
+                    channel_type,
+                    channel_id,
+                    cursor,
+                    i64::from(include_system),
+                    exclude_job_id,
+                    limit
+                ],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            messages.push(PromptMessage {
+                rowid: row.i64(0)?,
+                sender_name: row.text(1)?,
+                content: row.text(2)?,
+                created_at: row.i64(3)?,
+            });
+        }
+    }
+    messages.sort_unstable_by_key(|message| std::cmp::Reverse(message.rowid));
+    messages.truncate(usize::try_from(limit).unwrap_or(0));
     messages.reverse();
     Ok(messages)
 }
@@ -4757,6 +4757,124 @@ mod tests {
         let next = fetch_recent(&db, "proj/1", Some("j"), cursor).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].content, "same-second later");
+    }
+
+    /// cairn/5619: the channel read seeks one channel's own index entries in
+    /// rowid order. A plan keyed on `channel_type` alone walks every message of
+    /// that type in the workspace, and a sorter means the newest-first walk no
+    /// longer stops at the limit.
+    #[tokio::test]
+    async fn channel_messages_seek_their_channel_in_rowid_order() {
+        let db = migrated_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {CHANNEL_MESSAGES_SQL}");
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(&sql, params!["issue", "proj/1", 0_i64, 0_i64, "j", 20_i64])
+                        .await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+        let plan = plan.join("\n");
+
+        assert!(
+            plan.contains("idx_messages_channel_seq (channel_type=? AND channel_id=?)"),
+            "the read must seek its one channel:\n{plan}"
+        );
+        assert!(
+            !plan.contains("SORTER"),
+            "a sorter materializes the whole channel instead of stopping at the limit:\n{plan}"
+        );
+        assert!(!plan.contains("SCAN messages"), "{plan}");
+    }
+
+    /// Both channels a run reads arrive as one oldest-first window of the newest
+    /// `limit`, other channels stay out, and the recipient's own runs never echo
+    /// back to it.
+    #[tokio::test]
+    async fn channel_window_merges_project_and_issue_and_skips_own_runs() {
+        let db = migrated_db().await;
+        seed_session(&db).await;
+        db.execute_script(
+            "INSERT INTO runs(id, project_id, job_id, issue_id, session_id, status, created_at, updated_at)
+               VALUES('run-own', 'p', 'j', 'i', 'sess', 'running', 1, 1);",
+        )
+        .await
+        .unwrap();
+        for (id, channel_type, channel_id, sender_run_id, content, at) in [
+            ("p1", "project", "proj", None, "project note", 1000),
+            (
+                "i1",
+                "issue",
+                "proj/1",
+                Some("run-peer"),
+                "issue note",
+                1001,
+            ),
+            (
+                "own",
+                "issue",
+                "proj/1",
+                Some("run-own"),
+                "my own echo",
+                1002,
+            ),
+            ("elsewhere", "issue", "proj/2", None, "another issue", 1003),
+            ("p2", "project", "proj", None, "latest project note", 1004),
+        ] {
+            insert_msg(
+                &db,
+                id,
+                channel_type,
+                channel_id,
+                sender_run_id,
+                "builder",
+                content,
+                at,
+            )
+            .await;
+        }
+
+        let contents = |messages: Vec<PromptMessage>| {
+            messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            contents(fetch_recent(&db, "proj/1", Some("j"), None).await),
+            ["project note", "issue note", "latest project note"]
+        );
+
+        let newest_two = db
+            .read(|conn| {
+                Box::pin(async move {
+                    recent_messages_for_run(
+                        conn,
+                        "proj",
+                        ChannelScope::Issue("proj/1"),
+                        Some("j"),
+                        None,
+                        2,
+                        true,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            contents(newest_two),
+            ["issue note", "latest project note"],
+            "the limit keeps the newest across both channels"
+        );
     }
 
     #[tokio::test]
