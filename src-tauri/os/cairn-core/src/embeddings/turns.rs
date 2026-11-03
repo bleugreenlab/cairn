@@ -967,23 +967,9 @@ async fn load_turn_events(
     db: &LocalDb,
     turn_ids: &[String],
 ) -> DbResult<Vec<(String, crate::models::Event)>> {
-    use crate::runs::queries::{event_from_row, EVENT_COLUMNS, EVENT_COLUMN_COUNT};
+    use crate::runs::queries::{event_from_row, EVENT_COLUMN_COUNT};
 
-    let turn_placeholders = (1..=turn_ids.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let type_placeholders = (1..=CONTENT_EVENT_TYPES.len())
-        .map(|index| format!("?{}", index + turn_ids.len()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT {EVENT_COLUMNS}, turn_id
-           FROM events
-          WHERE turn_id IN ({turn_placeholders})
-            AND event_type IN ({type_placeholders})
-          ORDER BY sequence ASC"
-    );
+    let sql = turn_events_sql(turn_ids.len());
     let values: Vec<Value> = turn_ids
         .iter()
         .map(|id| Value::Text(id.clone()))
@@ -1000,6 +986,35 @@ async fn load_turn_events(
         Ok((turn_id, event))
     })
     .await
+}
+
+/// The statement [`load_turn_events`] runs for `turn_count` turns: turn ids
+/// bound first, then [`CONTENT_EVENT_TYPES`].
+///
+/// The unary `+` keeps `event_type` out of index selection. Given a long turn
+/// list, Turso otherwise seeks `idx_events_type_run` on the type list, which
+/// walks every content event in the database (seconds on a production
+/// workspace) instead of the few thousand events the turns hold. `INDEXED BY
+/// idx_events_turn_id` does not help: under the hint the planner scans the
+/// whole index rather than seeking each listed turn.
+fn turn_events_sql(turn_count: usize) -> String {
+    use crate::runs::queries::EVENT_COLUMNS;
+
+    let turn_placeholders = (1..=turn_count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let type_placeholders = (1..=CONTENT_EVENT_TYPES.len())
+        .map(|index| format!("?{}", index + turn_count))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT {EVENT_COLUMNS}, turn_id
+           FROM events
+          WHERE turn_id IN ({turn_placeholders})
+            AND +event_type IN ({type_placeholders})
+          ORDER BY sequence ASC"
+    )
 }
 
 /// Join `parts` under a character budget, sharing it fairly.
@@ -2162,6 +2177,30 @@ mod tests {
         .await
         .unwrap()
         .join("\n")
+    }
+
+    /// A semantic search loads excerpts for up to a full page of turns. The
+    /// turns hold a few thousand events between them; the database holds
+    /// millions of content events. Probing the turn index visits the former,
+    /// while seeking `idx_events_type_run` on the type list walks the latter,
+    /// and Turso picks that plan once the turn list grows long.
+    #[tokio::test(flavor = "current_thread")]
+    async fn excerpts_for_a_full_page_of_turns_seek_the_turn_index() {
+        let db = migrated_db().await;
+        let turns = 100;
+        let values: Vec<Value> = (0..turns)
+            .map(|index| Value::Text(format!("turn-{index}")))
+            .chain(
+                CONTENT_EVENT_TYPES
+                    .iter()
+                    .map(|kind| Value::Text((*kind).to_string())),
+            )
+            .collect();
+        let excerpts = plan(&db, &turn_events_sql(turns), values).await;
+        assert!(
+            excerpts.contains("idx_events_turn_id") && !excerpts.contains("idx_events_type_run"),
+            "{excerpts}"
+        );
     }
 
     /// The settled test reads `model` and `dims`, which sit after the vector
