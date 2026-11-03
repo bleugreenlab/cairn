@@ -85,12 +85,130 @@ async fn insert_permission_fixture(db: &LocalDb) {
     .unwrap();
 }
 
+/// The node fixture plus a sub-agent task `write-scripts` beneath `builder`,
+/// whose own run holds a pending crossing at `perm-1` — the same segment the
+/// node's request carries, so an answer that resolved the wrong owner would
+/// show up as the node's request changing instead.
+async fn insert_task_permission_fixture(db: &LocalDb) {
+    insert_permission_fixture(db).await;
+    let tool_input = crossing_tool_input();
+    db.write(|conn| {
+        let tool_input = tool_input.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, issue_id, project_id, parent_job_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 SELECT 'job-task', 'exec-1', 'issue-1', project_id, 'job-1', 'Build', 'running', 'session-task', 'write-scripts', 2, 2
+                 FROM jobs WHERE id = 'job-1'",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('session-task', 'job-task', 'active', 2, 2)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 SELECT 'run-task', project_id, 'issue-1', 'job-task', 'live', 'session-task', 2, 2, 'resume'
+                 FROM jobs WHERE id = 'job-1'",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, uri_segment)
+                 VALUES ('perm-row-task', 'run-task', 'job-task', 'toolu-task', 'read', ?1, 'pending', 2, 'perm-1')",
+                params![tool_input.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+/// A thread `design` that has actually run (session job with no issue, the
+/// reserved `thread` segment, no parent) with a task `probe` beneath its
+/// session, whose run holds a pending crossing at `perm-1`.
+async fn insert_thread_task_permission_fixture(db: &LocalDb) {
+    let project_id = common::create_project(db, "tpt").await;
+    let tool_input = crossing_tool_input();
+    db.write(|conn| {
+        let project_id = project_id.clone();
+        let tool_input = tool_input.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+                 VALUES ('thread-1', ?1, 'design', 'active', 'needs_input', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO executions(id, recipe_id, project_id, status, started_at)
+                 VALUES ('host-exec-1', 'host-thread-job-1', ?1, 'running', 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, thread_id, project_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 VALUES ('thread-job-1', 'host-exec-1', 'thread-1', ?1, 'Thread', 'running', 'thread-session-1', 'thread', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('thread-session-1', 'thread-job-1', 'active', 1, 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-t1', ?1, 'thread-job-1', 'live', 'thread-session-1', 1, 1, 'resume')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, project_id, parent_job_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 VALUES ('thread-task-job', 'host-exec-1', ?1, 'thread-job-1', 'Explore', 'running', 'thread-task-session', 'probe', 2, 2)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('thread-task-session', 'thread-task-job', 'active', 2, 2)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-probe', ?1, 'thread-task-job', 'live', 'thread-task-session', 2, 2, 'resume')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, created_at, uri_segment)
+                 VALUES ('perm-row-thread-task', 'run-probe', 'thread-task-job', 'toolu-probe', 'read', ?1, 'pending', 2, 'perm-1')",
+                params![tool_input.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
+    change_request_as("run-1", payload)
+}
+
+fn change_request_as(run_id: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
         answer_bound_ms: None,
         thread_id: None,
         cwd: String::new(),
-        run_id: Some("run-1".to_string()),
+        run_id: Some(run_id.to_string()),
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
@@ -99,12 +217,18 @@ fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
 }
 
 async fn perm_status(db: &LocalDb) -> Option<String> {
-    db.read(|conn| {
+    perm_status_of(db, "perm-row-1").await
+}
+
+async fn perm_status_of(db: &LocalDb, id: &str) -> Option<String> {
+    let id = id.to_string();
+    db.read(move |conn| {
+        let id = id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT status FROM permission_requests WHERE id = 'perm-row-1'",
-                    (),
+                    "SELECT status FROM permission_requests WHERE id = ?1",
+                    params![id.as_str()],
                 )
                 .await?;
             rows.next().await?.map(|row| row.opt_text(0)).transpose()
@@ -203,6 +327,140 @@ async fn node_permission_patch_deny_resolves() {
             .contains("/etc/hosts"),
         "deny must not record a grant"
     );
+}
+
+/// A sub-agent task's job has a parent, so it is not addressable as a node: its
+/// permission must resolve through the parent node AND the task. Answering by
+/// the task segment alone failed with `node tpa/1/1/write-scripts not found`,
+/// leaving the task's batch blocked on a prompt nobody could answer.
+#[tokio::test]
+async fn task_permission_patch_allow_resolves_the_tasks_request() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_task_permission_fixture(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tpa/1/1/builder/task/write-scripts/permissions/perm-1",
+                "mode": "patch",
+                "payload": {"decision": "allow", "scope": "session"}
+            }]
+        })),
+    )
+    .await;
+    assert!(
+        result.contains("Answered permission perm-1"),
+        "unexpected result: {result}"
+    );
+    assert_eq!(
+        perm_status_of(&db, "perm-row-task").await.as_deref(),
+        Some("allowed")
+    );
+    assert_eq!(
+        perm_status(&db).await.as_deref(),
+        Some("pending"),
+        "answering the task's perm-1 must not touch the parent node's perm-1"
+    );
+}
+
+#[tokio::test]
+async fn task_permission_patch_deny_resolves_the_tasks_request() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_task_permission_fixture(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tpa/1/1/builder/task/write-scripts/permissions/perm-1",
+                "mode": "patch",
+                "payload": {"decision": "deny"}
+            }]
+        })),
+    )
+    .await;
+    assert!(
+        result.contains("Answered permission perm-1"),
+        "unexpected result: {result}"
+    );
+    assert_eq!(
+        perm_status_of(&db, "perm-row-task").await.as_deref(),
+        Some("denied")
+    );
+    assert_eq!(perm_status(&db).await.as_deref(), Some("pending"));
+}
+
+/// The node address of a task permission is still the parent node: a task
+/// name that is not beneath it names nothing, and says which task it looked
+/// for rather than reporting a missing node.
+#[tokio::test]
+async fn task_permission_patch_for_an_unknown_task_names_the_task() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_task_permission_fixture(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tpa/1/1/builder/task/no-such-task/permissions/perm-1",
+                "mode": "patch",
+                "payload": {"decision": "deny"}
+            }]
+        })),
+    )
+    .await;
+    assert!(
+        result.contains("task tpa/1/1/builder/task/no-such-task not found"),
+        "unexpected result: {result}"
+    );
+    assert_eq!(
+        perm_status_of(&db, "perm-row-task").await.as_deref(),
+        Some("pending")
+    );
+}
+
+/// A thread-hosted task's permission URI normalizes onto the reserved
+/// `(0, 0, thread)` coordinate; it resolves through the thread's session to the
+/// task beneath it, exactly as an issue-hosted task resolves through its node.
+#[tokio::test]
+async fn thread_task_permission_patch_resolves_the_tasks_request() {
+    for (decision, expected) in [("allow", "allowed"), ("deny", "denied")] {
+        let (temp, db) = common::migrated_db().await;
+        let db = Arc::new(db);
+        insert_thread_task_permission_fixture(&db).await;
+        let orch = orchestrator(&temp, db.clone());
+
+        let result = handle_write(
+            &orch,
+            &change_request_as(
+                "run-t1",
+                json!({
+                    "changes": [{
+                        "target": "cairn://p/tpt/design/task/probe/permissions/perm-1",
+                        "mode": "patch",
+                        "payload": {"decision": decision}
+                    }]
+                }),
+            ),
+        )
+        .await;
+        assert!(
+            result.contains("Answered permission perm-1"),
+            "{decision}: unexpected result: {result}"
+        );
+        assert_eq!(
+            perm_status_of(&db, "perm-row-thread-task").await.as_deref(),
+            Some(expected),
+            "{decision}"
+        );
+    }
 }
 
 #[tokio::test]

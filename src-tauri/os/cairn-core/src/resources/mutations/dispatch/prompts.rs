@@ -197,6 +197,7 @@ pub(super) async fn dispatch(
                     *number,
                     *exec_seq,
                     node_id,
+                    None,
                     segment,
                     answer.with_actor(actor),
                 )
@@ -244,15 +245,13 @@ pub(super) async fn dispatch(
                             "permission resolution requires an authenticated run",
                         )
                     })?;
-                // The permission resource keys on the OWNING job's own
-                // `uri_segment`; for a sub-agent task that is the task segment,
-                // so the task name addresses the request directly (issue #143).
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
                     orch,
                     project,
                     *number,
                     *exec_seq,
-                    task_name,
+                    node_id,
+                    Some(task_name),
                     segment,
                     answer.with_actor(actor),
                 )

@@ -377,6 +377,7 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 number,
                 exec_seq,
                 &node_id,
+                None,
                 &segment,
                 crate::mcp::handlers::permission::PermissionAnswer::from_surface(
                     decision,

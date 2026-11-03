@@ -2560,6 +2560,11 @@ async fn resolve_permission_request_impl(
 /// `permissions/{segment}` resource patch path). Looks the request id up from
 /// the node coordinates + segment, then delegates to
 /// [`resolve_permission_request`].
+///
+/// `task_name: None` addresses a permission on the node itself; `Some` addresses
+/// one raised by a sub-agent task beneath that node. A task's job has a parent,
+/// so it is only reachable through its parent node's coordinate, never as a
+/// node in its own right.
 #[allow(clippy::too_many_arguments)]
 pub async fn answer_node_permission(
     orch: &Orchestrator,
@@ -2567,6 +2572,7 @@ pub async fn answer_node_permission(
     number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_name: Option<&str>,
     perm_segment: &str,
     answer: PermissionAnswer,
 ) -> Result<ResolveOutcome, String> {
@@ -2576,6 +2582,7 @@ pub async fn answer_node_permission(
         number,
         exec_seq,
         node_segment,
+        task_name,
         perm_segment,
     )
     .await?;
@@ -2588,18 +2595,27 @@ async fn lookup_permission_request_for_node(
     number: i32,
     exec_seq: i32,
     node_segment: &str,
+    task_name: Option<&str>,
     perm_segment: &str,
 ) -> Result<String, String> {
     let project_key = cairn_common::uri::canonical_project(project_key);
     let node_segment = node_segment.to_string();
+    let task_name = task_name.map(str::to_string);
     let perm_segment = perm_segment.to_string();
     orch.db
         .local
         .read(|conn| {
             let project_key = project_key.clone();
             let node_segment = node_segment.clone();
+            let task_name = task_name.clone();
             let perm_segment = perm_segment.clone();
             Box::pin(async move {
+                let owner = match task_name.as_deref() {
+                    None => format!("{project_key}/{number}/{exec_seq}/{node_segment}"),
+                    Some(task) => {
+                        format!("{project_key}/{number}/{exec_seq}/{node_segment}/task/{task}")
+                    }
+                };
                 let mut project_rows = conn
                     .query(
                         "SELECT id FROM projects WHERE key = ?1 COLLATE NOCASE LIMIT 2",
@@ -2611,9 +2627,7 @@ async fn lookup_permission_request_for_node(
                     .await?
                     .map(|row| row.text(0))
                     .transpose()?
-                    .ok_or_else(|| {
-                        DbError::Row(format!("project {project_key} not found"))
-                    })?;
+                    .ok_or_else(|| DbError::Row(format!("project {project_key} not found")))?;
                 if project_rows.next().await?.is_some() {
                     return Err(DbError::Row(format!(
                         "project key {project_key} is ambiguous"
@@ -2626,12 +2640,13 @@ async fn lookup_permission_request_for_node(
                     number,
                     exec_seq,
                     &node_segment,
-                    None,
+                    task_name.as_deref(),
                 )
                 .await?
-                .ok_or_else(|| DbError::Row(format!(
-                    "node {project_key}/{number}/{exec_seq}/{node_segment} not found"
-                )))?;
+                .ok_or_else(|| {
+                    let kind = if task_name.is_some() { "task" } else { "node" };
+                    DbError::Row(format!("{kind} {owner} not found"))
+                })?;
                 let mut rows = conn
                     .query(
                         "
@@ -2643,10 +2658,7 @@ async fn lookup_permission_request_for_node(
                           AND pr.uri_segment = ?2
                         LIMIT 1
                         ",
-                        params![
-                            job_id.as_str(),
-                            perm_segment.as_str()
-                        ],
+                        params![job_id.as_str(), perm_segment.as_str()],
                     )
                     .await?;
                 rows.next()
@@ -2654,9 +2666,7 @@ async fn lookup_permission_request_for_node(
                     .map(|row| row.text(0))
                     .transpose()?
                     .ok_or_else(|| {
-                        DbError::Row(format!(
-                            "permission {perm_segment} not found for {project_key}/{number}/{exec_seq}/{node_segment}"
-                        ))
+                        DbError::Row(format!("permission {perm_segment} not found for {owner}"))
                     })
             })
         })
