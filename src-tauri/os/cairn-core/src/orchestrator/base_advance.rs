@@ -1577,9 +1577,10 @@ async fn reconcile_jj_downstream(
         return Ok(());
     }
 
-    // The store already owns the merge (the child's commit was folded into the
-    // integration bookmark), so the rebase dest is the bare local integration
-    // bookmark.
+    // The store's local bookmark for the base now holds the merge: a local fold
+    // wrote it directly, and for a default-branch PR that GitHub merged, the
+    // origin reconcile above imported it (when its fetch succeeded). So the
+    // rebase dest is the bare local bookmark.
     let issue_info = match merged_job.issue_id.as_deref() {
         Some(issue_id) => load_issue_info(db, issue_id).await?,
         None => None,

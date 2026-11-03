@@ -29,9 +29,10 @@ use std::path::PathBuf;
 /// across every MCP callback router.
 pub const MCP_CALLBACK_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Prod callback port (the running Cairn desktop app).
+/// Retired desktop MCP callback port for release builds. The runner serves the
+/// callback route on its own transport port, so nothing binds this.
 const PROD_CALLBACK_PORT: u16 = 3847;
-/// Dev callback port (the `tauri dev` desktop app).
+/// Retired desktop MCP callback port for debug builds; unbound like the above.
 const DEV_CALLBACK_PORT: u16 = 3857;
 
 /// Published SDK spelling (`CAIRN_RUNNER_PORT` / `DEFAULT_RUNNER_PORT`) is

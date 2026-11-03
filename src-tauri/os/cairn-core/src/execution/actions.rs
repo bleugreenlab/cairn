@@ -1171,7 +1171,7 @@ async fn ensure_resolution_not_blocked(
     ))
 }
 
-/// Handle the merge_pr action using `gh` CLI.
+/// Handle the merge_pr action through the in-app merge path.
 async fn handle_merge_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
@@ -1211,11 +1211,12 @@ async fn handle_merge_pr(
         ));
     }
 
-    // The shared jj store owns the merge. Route through the same in-app merge
-    // path (fold + push integration, resolve the PR node, reconcile siblings,
-    // wake watchers), so recipe and in-app merges are identical. Passing `None`
-    // selects the default `squash` shape, landing one commit per PR on the
-    // default branch.
+    // Route through the same in-app merge path, so recipe and in-app merges are
+    // identical. That path lands a remote PR into the default branch through
+    // GitHub's merge API, and folds every other PR (local-only projects, child
+    // into integration branch, workspace PRs) in the shared jj store; either way
+    // it then resolves the PR node, reconciles siblings, and wakes watchers.
+    // Passing `None` selects the default `squash` shape, one commit per PR.
     crate::pr_data::actions::merge_pr_for_job(
         orch,
         &mr_job_id,
