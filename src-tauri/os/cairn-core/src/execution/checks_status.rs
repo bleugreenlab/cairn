@@ -2001,17 +2001,53 @@ const WAKE_ROLLUP_NAMES: usize = 12;
 /// latest inputs, chosen by [`select_lane_row`]. The consequence is that a lane's
 /// last recorded verdict may predate this node's current tree; the URI in the
 /// wake header is the live surface.
+///
+/// The one fact about the head a row cannot carry is that the head declares a
+/// check this build cannot run: such a check never writes a row there, so its
+/// newest row is always an earlier tree's. That set is read from the newest
+/// recorded wave plan ([`latest_planned_unsupported`]), one more indexed query,
+/// and every turn-check push is written by a wave after it recorded its plan.
 pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option<String> {
     let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .ok()?;
+    let unsupported = latest_planned_unsupported(&db, job_id)
+        .await
+        .unwrap_or_else(|error| {
+            log::debug!("check wake body for job {job_id}: recorded plan unreadable: {error}");
+            BTreeMap::new()
+        });
     match crate::execution::cache::latest_check_results_for_job(&db, job_id).await {
-        Ok(lanes) => format_check_wake_body(&lanes),
+        Ok(lanes) => format_check_wake_body(&lanes, &unsupported),
         Err(error) => {
             log::debug!("check wake body for job {job_id}: {error}");
             None
         }
     }
+}
+
+/// The checks the newest recorded wave plan for `job_id` declared that this
+/// build cannot run. Empty when no wave has recorded a plan.
+async fn latest_planned_unsupported(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<BTreeMap<String, UnsupportedCheck>, String> {
+    let plan_json = db
+        .query_opt(
+            "SELECT plan_json FROM turn_end_check_attempts
+              WHERE job_id = ?1 AND plan_json IS NOT NULL
+              ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id.to_string(),),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(plan_json) = plan_json else {
+        return Ok(BTreeMap::new());
+    };
+    serde_json::from_str::<WavePlan>(&plan_json)
+        .map(|plan| plan.unsupported)
+        .map_err(|error| error.to_string())
 }
 
 /// Pure renderer for [`check_wake_body`], so the shape a wake speaks in is
@@ -2023,11 +2059,21 @@ pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option
 /// suppressed, an empty selection, a substrate failure) is listed as itself
 /// and counted in neither. The headline's failing count is therefore only ever
 /// reds about the change, and the passing list only ever greens that judged it.
-pub(crate) fn format_check_wake_body(lanes: &[LaneRow]) -> Option<String> {
-    if lanes.is_empty() {
+///
+/// A check in `unsupported` is listed by its notice, exactly as `/checks` lists
+/// it, and whatever row it last recorded is set aside: that row is about a tree
+/// before the head, and the head has no verdict for it, red or green.
+pub(crate) fn format_check_wake_body(
+    lanes: &[LaneRow],
+    unsupported: &BTreeMap<String, UnsupportedCheck>,
+) -> Option<String> {
+    let mut lanes: Vec<&LaneRow> = lanes
+        .iter()
+        .filter(|lane| !unsupported.contains_key(&lane.row.check_name))
+        .collect();
+    if lanes.is_empty() && unsupported.is_empty() {
         return None;
     }
-    let mut lanes: Vec<&LaneRow> = lanes.iter().collect();
     lanes.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
     let mut failing: Vec<&CheckResultCacheEntry> = Vec::new();
     let mut no_verdict: Vec<(&CheckResultCacheEntry, LaneExistence)> = Vec::new();
@@ -2135,6 +2181,9 @@ pub(crate) fn format_check_wake_body(lanes: &[LaneRow]) -> Option<String> {
                 join_capped(names, WAKE_ROLLUP_NAMES)
             ));
         }
+    }
+    for (name, check) in unsupported {
+        out.push_str(&format!("\n- {name}: {}", check.notice));
     }
     for lane in &lanes {
         if let Some(note) = newer_attempt_note(lane) {
@@ -2767,7 +2816,100 @@ mod tests {
     /// A wake body over rows that each answer their own lane.
     fn wake(rows: impl IntoIterator<Item = CheckResultCacheEntry>) -> Option<String> {
         let lanes: Vec<LaneRow> = rows.into_iter().map(LaneRow::from).collect();
-        format_check_wake_body(&lanes)
+        format_check_wake_body(&lanes, &BTreeMap::new())
+    }
+
+    /// A check the head declares with a key this build does not know, as a
+    /// branch's config does when it is ahead of the running app.
+    fn unsupported_set(names: &[&str]) -> BTreeMap<String, UnsupportedCheck> {
+        let declared: serde_yaml::Value =
+            serde_yaml::from_str("command: bun run check:migrations\nfromAFutureCairn: true\n")
+                .unwrap();
+        let crate::models::DeclaredCheck::Unsupported(check) = crate::models::read_declared_check(
+            declared,
+            &crate::models::CheckVocabulary::this_build(),
+        )
+        .unwrap() else {
+            panic!("`fromAFutureCairn` is not a key this build reads");
+        };
+        names
+            .iter()
+            .map(|name| (name.to_string(), check.clone()))
+            .collect()
+    }
+
+    /// cairn://posts/547 (cairn/6020): `migrations` and `rust-lint` were red at
+    /// an earlier commit, and the head declares them with a key this build does
+    /// not read. The wake lists them by their notice, exactly as `/checks` does
+    /// for the head, and counts neither as failing.
+    #[test]
+    fn an_unsupported_lane_on_the_head_supersedes_an_earlier_trees_red() {
+        let unsupported = unsupported_set(&["migrations", "rust-lint"]);
+        let notice = unsupported["migrations"].notice.clone();
+        assert!(notice.starts_with("needs a newer Cairn"), "{notice}");
+        let mut stale_red = verdict_row("migrations", false);
+        stale_red.output_tail = "error: Cannot find module './lib/lineage'".to_string();
+        let lanes: Vec<LaneRow> = [
+            stale_red,
+            verdict_row("rust-lint", false),
+            verdict_row("rust-fmt", true),
+        ]
+        .into_iter()
+        .map(LaneRow::from)
+        .collect();
+
+        let body = format_check_wake_body(&lanes, &unsupported).unwrap();
+
+        assert!(
+            body.starts_with("Project checks on this node: all 1 passing (rust-fmt)."),
+            "{body}"
+        );
+        assert!(!body.contains('✗'), "{body}");
+        assert!(!body.contains("Cannot find module"), "{body}");
+        assert!(
+            body.contains(&format!("\n- migrations: {notice}")),
+            "{body}"
+        );
+        assert!(body.contains(&format!("\n- rust-lint: {notice}")), "{body}");
+
+        // The same failing set `/checks` derives for the head: its unsupported
+        // lanes are no verdict at all.
+        let head_lanes = with_unsupported_lanes(Vec::new(), "job", &unsupported);
+        assert!(head_lanes
+            .iter()
+            .all(|lane| lane.state == NodeCheckState::Unsupported));
+    }
+
+    /// The superseding is by name: a genuine red on a lane the head can run is
+    /// still a red beside an unsupported one, and an unsupported check with no
+    /// row at all is still listed.
+    #[test]
+    fn a_genuine_red_beside_an_unsupported_lane_still_fails() {
+        let unsupported = unsupported_set(&["dead-code"]);
+        let lanes: Vec<LaneRow> = [verdict_row("typecheck", false), verdict_row("lint", true)]
+            .into_iter()
+            .map(LaneRow::from)
+            .collect();
+
+        let body = format_check_wake_body(&lanes, &unsupported).unwrap();
+
+        assert!(
+            body.starts_with("Project checks on this node: 1 of 2 failing."),
+            "{body}"
+        );
+        assert!(body.contains("✗ typecheck"), "{body}");
+        assert!(
+            body.contains("\n- dead-code: needs a newer Cairn"),
+            "{body}"
+        );
+
+        let only_unsupported = format_check_wake_body(&[], &unsupported).unwrap();
+        assert!(
+            only_unsupported.starts_with("Project checks on this node: no lane holds a verdict."),
+            "{only_unsupported}"
+        );
+        assert!(only_unsupported.contains("- dead-code: needs a newer Cairn"));
+        assert_eq!(format_check_wake_body(&[], &BTreeMap::new()), None);
     }
 
     /// A row that ended without a verdict, recorded `ran_at` after the epoch.
@@ -2924,7 +3066,7 @@ mod tests {
         ])
         .unwrap();
 
-        let body = format_check_wake_body(&[lane]).unwrap();
+        let body = format_check_wake_body(&[lane], &BTreeMap::new()).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: all 1 passing (frontend-tests)."),

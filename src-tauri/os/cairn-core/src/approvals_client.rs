@@ -82,7 +82,6 @@ pub struct IssuedChallenge {
 pub struct ChallengeStatus {
     pub challenge_id: String,
     pub state: ApprovalOutcome,
-    pub expires_at: i64,
     pub intent_digest_sha256: String,
     pub service_assertion: Option<String>,
 }
@@ -121,7 +120,7 @@ pub enum ClaimOutcome {
     Claimed,
     /// An earlier call with the same claim id already consumed it.
     AlreadyClaimed,
-    /// Nothing to consume: not authorized, expired, or claimed by another id.
+    /// Nothing to consume: not authorized, superseded, or claimed by another id.
     Unavailable,
 }
 
@@ -157,7 +156,6 @@ struct IssueDto {
     nonce: String,
     intent_digest_sha256: String,
     issued_at: String,
-    expires_at: String,
     policy_id: String,
     policy_version: u32,
     audience: String,
@@ -171,7 +169,6 @@ struct IssueDto {
 struct StatusDto {
     challenge_id: String,
     state: ApprovalOutcome,
-    expires_at: String,
     intent_digest_sha256: String,
     service_assertion: Option<String>,
 }
@@ -372,7 +369,6 @@ impl<'a> ApprovalsClient<'a> {
             nonce: dto.nonce,
             intent_digest_sha256: digest_bytes(&dto.intent_digest_sha256)?,
             issued_at: rfc3339_seconds("issuedAt", &dto.issued_at)?,
-            expires_at: rfc3339_seconds("expiresAt", &dto.expires_at)?,
             policy_id: dto.policy_id,
             policy_version: dto.policy_version,
             audience: dto.audience,
@@ -396,7 +392,6 @@ impl<'a> ApprovalsClient<'a> {
         Ok(ChallengeStatus {
             challenge_id: dto.challenge_id,
             state: dto.state,
-            expires_at: rfc3339_seconds("expiresAt", &dto.expires_at)?,
             intent_digest_sha256: dto.intent_digest_sha256,
             service_assertion: dto.service_assertion,
         })
@@ -595,7 +590,7 @@ pub struct AssertionExpectation<'a> {
 /// Why an assertion was not accepted, in the journal's vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssertionRejection {
-    /// The signature, header, lifetime, digest, or enrollment is wrong.
+    /// The signature, header, issue time, claims, digest, or enrollment is wrong.
     InvalidSignature(String),
     /// It was minted for another issuer, audience, or organization.
     WrongAudience(String),
@@ -624,9 +619,11 @@ impl AssertionRejection {
 }
 
 /// Verify a `cairn_human_approval` assertion completely: the EdDSA signature
-/// under one of `keys`, the `cairn-approval+jwt` type, the lifetime at `now`,
-/// the canonical claims ([`ServiceApprovalAssertion::validate`]), and that the
-/// approving enrollment is the one the policy selected.
+/// under one of `keys`, the `cairn-approval+jwt` type, an issue time not in
+/// the future at `now`, the canonical claims
+/// ([`ServiceApprovalAssertion::validate`]), and that the approving enrollment
+/// is the one the policy selected. The assertion has no expiry to judge: it is
+/// attribution evidence, and the claim that follows spends it exactly once.
 pub fn verify_service_assertion(
     token: &str,
     keys: &[String],
@@ -643,7 +640,7 @@ pub fn verify_service_assertion(
         return Err(invalid("the assertion is not a cairn-approval+jwt"));
     }
     let mut validation = Validation::new(Algorithm::EdDSA);
-    // Lifetime, issuer, and audience are judged below against `now` and the
+    // Issue time, issuer, and audience are judged below against `now` and the
     // canonical claims, so each failure is named rather than folded into one.
     validation.validate_exp = false;
     validation.validate_nbf = false;
@@ -654,9 +651,11 @@ pub fn verify_service_assertion(
         .filter_map(|x| DecodingKey::from_ed_components(x).ok())
         .find_map(|key| decode::<ServiceApprovalAssertion>(token, &key, &validation).ok())
         .map(|data| data.claims)
-        .ok_or_else(|| invalid("the assertion's signature does not verify"))?;
-    if claims.exp <= now || claims.iat > now + 60 {
-        return Err(invalid("the assertion is outside its validity window"));
+        .ok_or_else(|| {
+            invalid("the assertion does not verify as a canonical Human approval under these keys")
+        })?;
+    if claims.iat > now + 60 {
+        return Err(invalid("the assertion claims to be issued in the future"));
     }
     if claims.iss != expected.issuer || claims.aud != expected.audience {
         return Err(AssertionRejection::WrongAudience(
@@ -824,6 +823,14 @@ mod tests {
         // The control: re-signing unchanged claims still verifies.
         verify_service_assertion(&resign(|_| {}, approval_header()), &keys(), &expect, now)
             .unwrap();
+        // Elapsed time is not a reason to refuse: a day after issue it verifies.
+        verify_service_assertion(
+            fixture["assertion"]["jwt"].as_str().unwrap(),
+            &keys(),
+            &expect,
+            now + 86_400,
+        )
+        .unwrap();
 
         // Bad signature: one byte of the signature flipped.
         let jwt = fixture["assertion"]["jwt"].as_str().unwrap();
@@ -847,9 +854,20 @@ mod tests {
         )
         .unwrap();
         check(&hs, ApprovalOutcome::InvalidSignature);
-        // Expired.
+        // Issued in the future.
         check(
-            &resign(|claims| claims["exp"] = (now - 1).into(), approval_header()),
+            &resign(
+                |claims| claims["iat"] = (now + 61).into(),
+                approval_header(),
+            ),
+            ApprovalOutcome::InvalidSignature,
+        );
+        // A lifetime is not part of this contract, so a claim naming one is refused.
+        check(
+            &resign(
+                |claims| claims["exp"] = (now + 300).into(),
+                approval_header(),
+            ),
             ApprovalOutcome::InvalidSignature,
         );
         // Wrong audience, issuer, organization.

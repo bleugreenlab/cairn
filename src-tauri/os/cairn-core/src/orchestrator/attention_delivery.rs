@@ -325,6 +325,88 @@ mod tests {
         );
     }
 
+    /// cairn://posts/547: `migrations` went red at an earlier commit, and the
+    /// head's config declares it with a key the running build does not read. The
+    /// delivered wake reads the head's unsupported set from the wave's recorded
+    /// plan and says what `/checks` says, instead of the earlier tree's red.
+    #[tokio::test]
+    async fn checks_push_lists_a_heads_unsupported_check_by_its_notice_not_an_old_red() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            r#"
+            INSERT INTO check_result_cache
+              (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+               output_tail, duration_ms, ran_at, target_results_json, job_id)
+            VALUES
+              ('p','tree-h1','ih-mig','migrations',1,0,
+               'error: Cannot find module ./lib/lineage',10,1,NULL,'child-job'),
+              ('p','tree-h2','ih-fmt','rust-fmt',0,1,'',10,3,NULL,'child-job');
+            "#,
+        )
+        .await
+        .unwrap();
+        let notice = "needs a newer Cairn, or the key is misspelled: `fromAFutureCairn` is not \
+                      a check key this build understands";
+        let plan = crate::execution::checks_turn_end::WavePlan {
+            head: "head-h2".to_string(),
+            base: "base".to_string(),
+            tree_hash: "tree-h2".to_string(),
+            checks: Default::default(),
+            applicable_names: Default::default(),
+            input_hashes: Default::default(),
+            expected_toolchain: String::new(),
+            unsupported: [(
+                "migrations".to_string(),
+                crate::config::project_settings::UnsupportedCheck {
+                    field: "fromAFutureCairn".to_string(),
+                    value: "true".to_string(),
+                    known: Vec::new(),
+                    notice: notice.to_string(),
+                    declared: serde_yaml::Value::Null,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        db.execute(
+            "INSERT INTO turn_end_check_attempts
+               (id, job_id, state, reason, created_at, updated_at, sealed_commit, plan_json)
+             VALUES ('attempt-h2', 'child-job', 'completed', NULL, 2, 2, ?1, ?2)",
+            (
+                plan.head.as_str(),
+                serde_json::to_string(&plan).unwrap().as_str(),
+            ),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let uri = "cairn://p/proj/2/1/builder/checks";
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-checks".into(),
+            recipient: "child-job".into(),
+            content_ref: uri.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: format!("turn-checks:{uri}"),
+            created_at: 4,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(
+            rendered.contains("Project checks on this node: all 1 passing (rust-fmt)."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("- migrations: {notice}")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('✗'), "{rendered}");
+        assert!(!rendered.contains("Cannot find module"), "{rendered}");
+    }
+
     #[tokio::test]
     async fn compact_push_batch_preserves_delivery_order() {
         let orch = test_orchestrator(migrated_db().await);
@@ -2084,7 +2166,7 @@ mod tests {
         const CHILD_JOB: &str = "e4d228a6-02fa-4d7b-9b60-12b505953a41";
         const CHILD_NODE: &str = "cairn://p/cairn/4602/1/builder";
         let db = migrated_db().await;
-        db.execute_script(&format!(
+        db.execute_script(format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)

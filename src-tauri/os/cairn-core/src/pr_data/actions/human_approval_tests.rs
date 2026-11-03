@@ -863,8 +863,8 @@ async fn a_rebase_is_refused_before_the_phone_is_asked() {
 }
 
 #[tokio::test]
-async fn denied_expired_revoked_and_stale_answers_refuse_without_a_claim() {
-    for state in ["denied", "expired", "authorization_revoked", "stale"] {
+async fn denied_superseded_revoked_and_stale_answers_refuse_without_a_claim() {
+    for state in ["denied", "superseded", "authorization_revoked", "stale"] {
         let run = run(
             Service {
                 statuses: vec![respond(200, status_body(state, None))],
@@ -884,10 +884,49 @@ async fn denied_expired_revoked_and_stale_answers_refuse_without_a_claim() {
 }
 
 #[tokio::test]
-async fn a_phone_that_never_answers_expires_unclaimed() {
+async fn an_approval_given_hours_later_is_still_claimed_once() {
+    // Three hours of polling at the fake clock's pace, then the phone approves.
+    let polls = (3 * 60 * 60 / POLL_INTERVAL.as_secs()) as usize;
+    let mut statuses: Vec<HttpResponse> = (0..polls)
+        .map(|_| respond(200, status_body("pending", None)))
+        .collect();
+    statuses.push(respond(
+        200,
+        status_body(
+            "authorized_not_executed",
+            Some(assertion_for(&approved_digest())),
+        ),
+    ));
+    let run = twice(
+        Service {
+            statuses,
+            ..Service::default()
+        },
+        landed(),
+        Ok(squash_shape()),
+    )
+    .await;
+    assert!(run.result.is_ok(), "{:?}", run.result.as_ref().err());
+    assert_eq!(
+        states(&run.rows),
+        [
+            "pending",
+            "authorized_not_executed",
+            "executing",
+            "succeeded"
+        ]
+    );
+    assert_eq!(run.posted("/claims").len(), 1);
+}
+
+#[tokio::test]
+async fn a_status_read_the_service_refuses_ends_the_wait_unclaimed() {
     let run = run(
         Service {
-            statuses: vec![respond(200, status_body("pending", None))],
+            statuses: vec![respond(
+                404,
+                serde_json::json!({ "error": "no such challenge" }),
+            )],
             ..Service::default()
         },
         vec![Ok(observation())],
@@ -896,9 +935,42 @@ async fn a_phone_that_never_answers_expires_unclaimed() {
         ENROLLMENT,
     )
     .await;
-    assert!(run.result.as_ref().unwrap_err().contains("expired"));
-    assert_eq!(states(&run.rows).last(), Some(&"expired"));
+    assert!(run
+        .result
+        .as_ref()
+        .unwrap_err()
+        .contains("stopped answering for this approval request"));
+    assert_eq!(states(&run.rows).last(), Some(&"failed"));
     assert!(run.posted("/claims").is_empty());
+    assert!(!run.executed());
+}
+
+#[tokio::test]
+async fn a_newer_request_superseding_an_approval_before_the_claim_mutates_nothing() {
+    // The phone approved, the runner verified and revalidated, and a newer
+    // request for the same merge superseded this one before the claim landed.
+    let run = twice(
+        Service {
+            statuses: vec![
+                respond(
+                    200,
+                    status_body(
+                        "authorized_not_executed",
+                        Some(assertion_for(&approved_digest())),
+                    ),
+                ),
+                respond(200, status_body("superseded", None)),
+            ],
+            claim: respond(409, fixture()["responses"]["claim"]["unavailable"].clone()),
+            ..Service::default()
+        },
+        landed(),
+        Ok(squash_shape()),
+    )
+    .await;
+    assert!(run.result.is_err());
+    assert!(!run.executed());
+    assert_eq!(states(&run.rows).last(), Some(&"superseded"));
 }
 
 #[tokio::test]

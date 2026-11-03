@@ -8,7 +8,8 @@
 //! 1. **Ask.** Resolve the selected enrollment to its installation, refuse
 //!    unless every gate check passed on the source tip, build a
 //!    `base_merge_v2` intent from live state, issue the challenge, and poll
-//!    until the phone answers or the challenge expires.
+//!    until the phone answers or a newer request for the same merge
+//!    supersedes it. The request has no deadline (tenet #1385).
 //! 2. **Verify.** Verify the service's signed Human assertion here, before
 //!    anything is consumed.
 //! 3. **Revalidate.** Observe every bound fact again and recompute the digest.
@@ -794,45 +795,47 @@ impl Ceremony<'_> {
         )
         .await?;
 
-        // Wait for the phone. An unreachable service is retried until expiry,
-        // because nothing has been consumed and the challenge then dies alone.
-        let expires_at = issued.challenge.expires_at;
+        // Wait for the phone. The request has no deadline: it ends when the
+        // person answers, when a newer request for this merge supersedes it,
+        // or, after an approval, when revalidation below finds a bound fact
+        // moved. Nothing has been consumed, so an unreachable service is
+        // retried; a service that answers it no longer knows this request is
+        // final, because no later read can.
         let status = loop {
             match self.client.status(&challenge_id).await {
                 Ok(status) if status.state == ApprovalOutcome::Pending => {}
-                Ok(status) => break Some(status),
+                Ok(status) => break status,
+                Err(error @ ApprovalsError::Refused { .. }) => {
+                    return Err(self
+                        .refuse(
+                            ApprovalOutcome::Failed,
+                            bound(empty()),
+                            &format!("the challenge status read was refused: {error}"),
+                            format!(
+                                "The approvals service stopped answering for this approval \
+                                 request ({error}). Nothing was merged; merge again to send a \
+                                 new request."
+                            ),
+                        )
+                        .await);
+                }
                 Err(error) => log::debug!("approval {challenge_id}: status read failed: {error}"),
-            }
-            if self.clock.now() > expires_at {
-                break None;
             }
             self.clock.sleep(POLL_INTERVAL).await;
         };
-        let Some(status) = status else {
-            return Err(self
-                .refuse(
-                    ApprovalOutcome::Expired,
-                    bound(empty()),
-                    "the phone did not answer before the approval expired",
-                    "The approval request expired before it was answered on the phone. Nothing \
-                     was merged; merge again to send a new request."
-                        .to_string(),
-                )
-                .await);
-        };
         let refused_by = |state: ApprovalOutcome| match state {
             ApprovalOutcome::Denied => Some("Merge was denied on the approval phone."),
-            ApprovalOutcome::Expired => Some(
-                "The approval request expired before it was answered on the phone. Nothing was \
-                 merged; merge again to send a new request.",
+            ApprovalOutcome::Superseded => Some(
+                "A newer merge request replaced this approval request on the phone. Nothing was \
+                 merged by this one.",
             ),
             ApprovalOutcome::Stale => Some(
                 "The approval request went out of date before it was approved. Merge again to \
                  request a new approval.",
             ),
             ApprovalOutcome::AuthorizationRevoked => Some(
-                "The approval was withdrawn because the approving phone was revoked. Nothing was \
-                 merged.",
+                "The approval phone was revoked or reset, so this request was withdrawn. Nothing \
+                 was merged.",
             ),
             ApprovalOutcome::InvalidSignature | ApprovalOutcome::WrongAudience => {
                 Some("The approval phone's answer could not be verified. Nothing was merged.")
@@ -923,7 +926,6 @@ impl Ceremony<'_> {
                     "enrollmentId": claims.enrollment_id,
                     "issuer": claims.iss,
                     "iat": claims.iat,
-                    "exp": claims.exp,
                 })),
                 detail: serde_json::to_string(&ids).ok(),
                 ..empty()

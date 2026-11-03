@@ -43,10 +43,15 @@ pub enum ApprovalIntent {
 
 /// Claims carried by the separately signed approvals-service assertion.
 ///
-/// Signature, issuer, audience, and time validation happen in the consuming
-/// runner before this semantic validation. This type then proves the service
+/// Signature, issuer, and audience validation happen in the consuming runner
+/// before this semantic validation. This type then proves the service
 /// constructed canonical Human appearance evidence rather than accepting a
 /// client-defined identity dialect.
+///
+/// There is no `exp`: the assertion is attribution evidence, never a bearer.
+/// What it attributes is spent once, through the service's claim, after the
+/// runner revalidates every bound fact, so a lifetime would add a clock and no
+/// integrity. An `exp` claim fails decoding like any other unknown field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceApprovalAssertion {
@@ -56,7 +61,6 @@ pub struct ServiceApprovalAssertion {
     pub sub: String,
     pub jti: String,
     pub iat: i64,
-    pub exp: i64,
     pub challenge_id: String,
     pub enrollment_id: String,
     pub intent_digest_sha256: String,
@@ -94,7 +98,6 @@ impl ServiceApprovalAssertion {
             validate_text(name, value)?;
         }
         if self.iat < 0
-            || self.exp <= self.iat
             || self.intent_digest_sha256 != hex_digest(expected_intent_digest)
             || !is_lower_sha256(&self.phone_assertion_hash_sha256)
             || self.residual_trust != "attested_app_implementation_and_enrollment_contract"
@@ -212,8 +215,8 @@ impl ApprovalChallenge {
         validate_text("nonce", &self.nonce)?;
         validate_text("policy_id", &self.policy_id)?;
         validate_text("audience", &self.audience)?;
-        if self.issued_at < 0 || self.expires_at <= self.issued_at {
-            return Err(ApprovalContractError::InvalidChallengeWindow);
+        if self.issued_at < 0 {
+            return Err(ApprovalContractError::InvalidChallengeIssueTime);
         }
         Ok(())
     }
@@ -436,6 +439,8 @@ pub enum ApprovalDecision {
 /// honest screen for it. `AlreadyConsumed` is distinct from `Accepted` because
 /// exactly-once consumption has visibly happened; `Reset` is distinct from
 /// `Revoked` because no authenticator survives and the recovery differs.
+/// `Superseded` is a newer request for the same merge replacing this one; a
+/// pending act has no deadline, so nothing else ends it unanswered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PhoneApprovalOutcome {
@@ -443,7 +448,7 @@ pub enum PhoneApprovalOutcome {
     Accepted,
     AlreadyConsumed,
     Denied,
-    Expired,
+    Superseded,
     StaleRef,
     Revoked,
     Reset,
@@ -695,7 +700,6 @@ pub struct ApprovalChallenge {
     pub nonce: String,
     pub intent_digest_sha256: [u8; 32],
     pub issued_at: i64,
-    pub expires_at: i64,
     pub policy_id: String,
     pub policy_version: u32,
     pub audience: String,
@@ -749,15 +753,17 @@ pub enum ApprovalOutcome {
     PolicyUnavailable,
     Pending,
     Denied,
-    Expired,
+    /// A newer request for the same merge replaced this one before it was
+    /// claimed. Reachable from `Pending` and `AuthorizedNotExecuted`.
+    Superseded,
     Stale,
     Consumed,
     InvalidSignature,
     WrongAudience,
-    /// An authorization nobody claimed, killed because the approval key that
-    /// produced it was retired. Terminal, and reachable only from
-    /// `AuthorizedNotExecuted`: an execution in flight or already finished keeps
-    /// its own history.
+    /// An authorization nobody claimed, or a request still waiting, killed
+    /// because the approval phone it belongs to was retired. Terminal, and
+    /// reachable only from `AuthorizedNotExecuted` and `Pending`: an execution
+    /// in flight or already finished keeps its own history.
     AuthorizationRevoked,
     AuthorizedNotExecuted,
     Executing,
@@ -774,10 +780,16 @@ impl ApprovalOutcome {
             (self, next),
             (
                 Pending,
-                Denied | Expired | Stale | InvalidSignature | WrongAudience | AuthorizedNotExecuted
+                Denied
+                    | Superseded
+                    | AuthorizationRevoked
+                    | Stale
+                    | InvalidSignature
+                    | WrongAudience
+                    | AuthorizedNotExecuted
             ) | (
                 AuthorizedNotExecuted,
-                Executing | Stale | AuthorizationRevoked
+                Executing | Superseded | Stale | AuthorizationRevoked
             ) | (Executing, Succeeded | Failed | Indeterminate)
                 | (Indeterminate, Succeeded | Failed | Violation)
         )
@@ -817,8 +829,8 @@ pub enum ApprovalContractError {
     LengthOverflow,
     #[error("challenge nonce must be lowercase 32-byte hex")]
     InvalidChallengeNonce,
-    #[error("challenge expiry must be after a non-negative issue time")]
-    InvalidChallengeWindow,
+    #[error("challenge issue time must be non-negative")]
+    InvalidChallengeIssueTime,
     #[error("signature must be bounded canonical ASN.1 DER")]
     InvalidSignatureEncoding,
     #[error("service assertion does not match the canonical Human approval contract")]
@@ -1092,6 +1104,14 @@ mod tests {
         assert!(Pending.can_transition_to(AuthorizedNotExecuted));
         assert!(AuthorizedNotExecuted.can_transition_to(Executing));
         assert!(AuthorizedNotExecuted.can_transition_to(AuthorizationRevoked));
+        // A request still waiting on a retired phone is withdrawn too.
+        assert!(Pending.can_transition_to(AuthorizationRevoked));
+        // A newer request for the same merge retires an open challenge, and
+        // never one whose execution began.
+        assert!(Pending.can_transition_to(Superseded));
+        assert!(AuthorizedNotExecuted.can_transition_to(Superseded));
+        assert!(!Executing.can_transition_to(Superseded));
+        assert!(!Superseded.can_transition_to(Pending));
         // Retiring a key never rewrites an execution that already began.
         assert!(!Executing.can_transition_to(AuthorizationRevoked));
         assert!(!Succeeded.can_transition_to(AuthorizationRevoked));
@@ -1105,7 +1125,7 @@ mod tests {
             PolicyDisabled,
             PolicyUnavailable,
             Denied,
-            Expired,
+            Superseded,
             Stale,
             Consumed,
             InvalidSignature,
@@ -1132,17 +1152,16 @@ mod tests {
             nonce: "nonce-1".into(),
             intent_digest_sha256: [7; 32],
             issued_at: 10,
-            expires_at: 20,
             policy_id: "human-base-merge".into(),
             policy_version: 1,
             audience: "cairn-runner:runner-1".into(),
         };
         challenge.validate().unwrap();
         let mut invalid = challenge;
-        invalid.expires_at = invalid.issued_at;
+        invalid.issued_at = -1;
         assert_eq!(
             invalid.validate(),
-            Err(ApprovalContractError::InvalidChallengeWindow)
+            Err(ApprovalContractError::InvalidChallengeIssueTime)
         );
 
         let assertion = PhoneApprovalAssertion {
@@ -1200,7 +1219,6 @@ mod tests {
             "sub": "user-1",
             "jti": "asa-1",
             "iat": 10,
-            "exp": 20,
             "challenge_id": "challenge-1",
             "enrollment_id": "enrollment-1",
             "intent_digest_sha256": hex_digest(&digest),
@@ -1261,6 +1279,11 @@ mod tests {
                 "accepted malformed {field}"
             );
         }
+        // The assertion carries no lifetime; one that names an expiry is not
+        // this contract's assertion.
+        let mut with_expiry = value.clone();
+        with_expiry["exp"] = 20.into();
+        assert!(serde_json::from_value::<ServiceApprovalAssertion>(with_expiry).is_err());
         let mut altered = assertion;
         altered.residual_trust = "direct_hardware_attestation".into();
         assert_eq!(
