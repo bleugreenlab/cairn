@@ -15,7 +15,8 @@
 //! mistaken for a containment exception, and answering it grants no path.
 
 use cairn_common::authorization::{
-    AuthorityAudience, AuthorityDecision, AuthorityPrincipal, AuthorityReason, AuthorityRequest,
+    ActBinding, AuthorityAudience, AuthorityDecision, AuthorityPrincipal, AuthorityReason,
+    AuthorityRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -38,8 +39,14 @@ pub struct AuthorityPromptDetail {
     /// The verb to re-dispatch on allow.
     pub verb: String,
     /// The normalized scope plus the concrete mutation and its system-rendered
-    /// summary.
+    /// summary. Its act does not survive storage; see `act`.
     pub authority: AuthorityRequest,
+    /// The act this card shows, bound under a salt drawn for this card alone.
+    /// A `Once` answer mints its grant bound to exactly this. A prompt stored
+    /// before acts were salted has none, so a `Once` answer to it mints
+    /// nothing and the operator is asked again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActBinding>,
     /// Stable policy reason code.
     pub reason: AuthorityReason,
     pub principal: AuthorityPrincipal,
@@ -50,6 +57,29 @@ pub struct AuthorityPromptDetail {
 }
 
 impl AuthorityPromptDetail {
+    /// The prompt raised for `authority`, its act bound under a fresh salt.
+    /// The request's own act digest is unsalted and never stored, so this is
+    /// the one place a card's act binding is made.
+    pub fn new(
+        verb: &str,
+        authority: &AuthorityRequest,
+        reason: AuthorityReason,
+        principal: AuthorityPrincipal,
+        audience: AuthorityAudience,
+        request: McpCallbackRequest,
+    ) -> Self {
+        Self {
+            kind: AUTHORITY_KIND.to_string(),
+            verb: verb.to_string(),
+            authority: authority.clone(),
+            act: authority.bind_act(),
+            reason,
+            principal,
+            audience,
+            request,
+        }
+    }
+
     /// The scope shorthand the prompt and the grant list both display.
     pub fn scope_shorthand(&self) -> String {
         self.authority.scope.shorthand()
@@ -134,15 +164,14 @@ pub async fn raise_authority(
     embedded.run_id = Some(run_id.clone());
     embedded.tool_use_id = Some(tool_use_id.clone());
 
-    let detail = AuthorityPromptDetail {
-        kind: AUTHORITY_KIND.to_string(),
-        verb: verb.to_string(),
-        authority: authority.clone(),
+    let detail = AuthorityPromptDetail::new(
+        verb,
+        authority,
         reason,
-        principal: actor.principal.clone(),
-        audience: actor.audience.clone(),
-        request: embedded,
-    };
+        actor.principal.clone(),
+        actor.audience.clone(),
+        embedded,
+    );
     let tool_input = match serde_json::to_value(&detail) {
         Ok(value) => value,
         Err(error) => {
@@ -221,6 +250,7 @@ mod tests {
         AuthorityPromptDetail {
             kind: AUTHORITY_KIND.to_string(),
             verb: "write".to_string(),
+            act: None,
             authority: AuthorityRequest::new(
                 AuthorityScope::new(
                     AuthorityPlace::Tool {

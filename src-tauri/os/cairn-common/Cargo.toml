@@ -25,6 +25,8 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 libc = "0.2"
 sha2 = "0.10"
 hex = "0.4"
+# The per-card salt of an authority act binding (`authorization::ActBinding`).
+getrandom = "0.3"
 tokio = { version = "1", features = ["fs", "net"] }
 # The executor link's keepalive and TCP_USER_TIMEOUT (`link_transport`); `all`
 # is what exposes the keepalive probe count and the user timeout.

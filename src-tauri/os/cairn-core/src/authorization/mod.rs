@@ -741,8 +741,12 @@ mod tests {
             // The same derivation `mint_authority_grant` uses. A fixture that
             // minted less than the real path does would test a grant the system
             // never issues.
-            constraints: AuthorityConstraintSet::for_approval(request, lifetime)
-                .expect("a fixture request names everything its approval binds"),
+            constraints: AuthorityConstraintSet::for_approval(
+                request,
+                request.bind_act().as_ref(),
+                lifetime,
+            )
+            .expect("a fixture request names everything its approval binds"),
         }
     }
 
@@ -806,6 +810,33 @@ mod tests {
         issue_grant(&actor.db, legacy).await.unwrap();
         assert_eq!(
             gate(&actor, &request).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+    }
+
+    /// A Once grant whose act binding the scrub migration blanked, stored the
+    /// way that migration leaves it, still loads and authorizes nothing, not
+    /// even the act it was minted for.
+    #[tokio::test]
+    async fn a_once_grant_with_a_scrubbed_act_binding_is_asked_about_again() {
+        let actor = actor("authz-once-scrubbed.db").await;
+        let request = settings_value(serde_json::json!({"api_key": "sk-dummy"}));
+        let mut scrubbed = issue(&request, AuthorityLifetimeKind::Once);
+        scrubbed.constraints = AuthorityConstraintSet::parse(&format!(
+            r#"{{"version":{},"constraints":[
+                {{"constraint":"mutation_modes","modes":["update"]}},
+                {{"constraint":"exact_act","digest":{{"algorithm":"sha256","encoding_version":1,"digest":""}}}}
+            ]}}"#,
+            cairn_common::authorization::AUTHORITY_MODEL_VERSION
+        ))
+        .unwrap();
+        issue_grant(&actor.db, scrubbed).await.unwrap();
+        assert_eq!(
+            gate(&actor, &request).await.unwrap(),
+            AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
+        );
+        assert_eq!(
+            authorize(&actor, &request).await.unwrap(),
             AuthorityDecision::ApprovalRequired(AuthorityReason::WorkspaceSettingsCapability)
         );
     }

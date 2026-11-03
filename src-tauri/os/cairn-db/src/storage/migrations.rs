@@ -8974,4 +8974,116 @@ mod tests {
             1
         );
     }
+
+    /// Rows written before act bindings were salted lose the unsalted digest
+    /// and keep everything else: the card still reads as an authority prompt,
+    /// and the grant keeps its exact_act constraint, so it still parses and
+    /// still covers nothing. A salted binding is left alone.
+    #[tokio::test]
+    async fn unsalted_act_digests_are_scrubbed_from_cards_and_grants() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("scrub-act-digests.turso.db"))
+            .await
+            .unwrap();
+        let name = "scrub_unsalted_act_digests";
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != name)
+            .copied()
+            .collect::<Vec<_>>();
+        let scrub = TURSO_MIGRATIONS
+            .iter()
+            .find(|migration| migration.name() == name)
+            .copied()
+            .expect("the scrub is in the private lineage");
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        let unsalted = r#"{"algorithm":"sha256","encoding_version":1,"digest":"UNSALTED"}"#;
+        let salted = r#"{"algorithm":"sha256","encoding_version":2,"salt":"SALT","digest":"KEEP"}"#;
+        let card = format!(
+            r#"{{"kind":"authority_request","verb":"write","authority":{{"summary":"s","facts":{{"act":{unsalted}}}}}}}"#
+        );
+        let crossing = r#"{"kind":"external_host_write","authority":{"facts":{"act":"UNSALTED-but-not-a-card"}}}"#;
+        let modes = r#"{"constraint":"mutation_modes","modes":["update"]}"#;
+        let mcp = r#"{"constraint":"mcp_config","fingerprint":{"algorithm":"sha256","encoding_version":1,"digest":"cfg"}}"#;
+        let set = |constraints: &[&str]| {
+            format!(
+                r#"{{"version":3,"constraints":[{}]}}"#,
+                constraints.join(",")
+            )
+        };
+        let act = |binding: &str| format!(r#"{{"constraint":"exact_act","digest":{binding}}}"#);
+        let grants = [
+            ("settings", set(&[modes, &act(unsalted)])),
+            ("mcp", set(&[modes, mcp, &act(unsalted)])),
+            ("salted", set(&[modes, &act(salted)])),
+        ];
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('project', 'default', 'Project', 'project', '/tmp/project', 1, 1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES ('job', 'project', 'running', 1, 1);
+             INSERT INTO runs(id, job_id, created_at, updated_at) VALUES ('run', 'job', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let mut script = String::new();
+        for (id, tool_use, input) in [("card", "t1", card.as_str()), ("crossing", "t2", crossing)] {
+            script.push_str(&format!(
+                "INSERT INTO permission_requests(id, run_id, tool_use_id, tool_name, tool_input, created_at)
+                   VALUES ('{id}', 'run', '{tool_use}', 'write', '{input}', 1);\n"
+            ));
+        }
+        for (id, constraints) in &grants {
+            script.push_str(&format!(
+                "INSERT INTO authority_grants(id, scope_key, place_kind, action, scope_json,
+                   constraints_json, principal_json, audience_json, workspace_id, lifetime_kind,
+                   lifetime_anchor, provenance_json, created_at)
+                   VALUES ('{id}', 'k', 'settings', 'write', '{{}}', '{constraints}', '{{}}', '{{}}',
+                     'default', 'once', 'perm', '{{}}', 1);\n"
+            ));
+        }
+        db.execute_script(&script).await.unwrap();
+
+        MigrationRunner::new(vec![scrub]).run(&db).await.unwrap();
+
+        let card = query_text(
+            &db,
+            "SELECT tool_input FROM permission_requests WHERE id = 'card'",
+        )
+        .await
+        .unwrap();
+        assert!(!card.contains("UNSALTED"), "{card}");
+        assert!(
+            card.contains("authority_request") && card.contains("\"summary\""),
+            "{card}"
+        );
+        let crossing = query_text(
+            &db,
+            "SELECT tool_input FROM permission_requests WHERE id = 'crossing'",
+        )
+        .await
+        .unwrap();
+        assert!(crossing.contains("UNSALTED-but-not-a-card"), "{crossing}");
+        for (id, sql) in [
+            (
+                "settings",
+                "SELECT constraints_json FROM authority_grants WHERE id = 'settings'",
+            ),
+            (
+                "mcp",
+                "SELECT constraints_json FROM authority_grants WHERE id = 'mcp'",
+            ),
+        ] {
+            let stored = query_text(&db, sql).await.unwrap();
+            assert!(!stored.contains("UNSALTED"), "{id}: {stored}");
+            assert!(stored.contains("exact_act"), "{id}: {stored}");
+        }
+        let kept = query_text(
+            &db,
+            "SELECT constraints_json FROM authority_grants WHERE id = 'salted'",
+        )
+        .await
+        .unwrap();
+        assert!(kept.contains("KEEP") && kept.contains("SALT"), "{kept}");
+    }
 }

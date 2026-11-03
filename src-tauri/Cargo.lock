@@ -986,6 +986,7 @@ dependencies = [
  "cairn-cell",
  "dirs 6.0.0",
  "flate2",
+ "getrandom 0.3.4",
  "hex",
  "libc",
  "log",

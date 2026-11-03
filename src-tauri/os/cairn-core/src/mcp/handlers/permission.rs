@@ -3225,6 +3225,7 @@ async fn mint_authority_grant(
     let lifetime = answer.grant_lifetime();
     let constraints = cairn_common::authorization::AuthorityConstraintSet::for_approval(
         &detail.authority,
+        detail.act.as_ref(),
         lifetime,
     )?;
 

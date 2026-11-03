@@ -106,11 +106,7 @@ async fn grant(
     let mut constraints = constraints;
     if lifetime == AuthorityLifetimeKind::Once {
         constraints.push(AuthorityConstraint::ExactAct {
-            digest: request
-                .facts
-                .act
-                .clone()
-                .expect("a carded request names its act"),
+            digest: request.bind_act().expect("a carded request names its act"),
         });
     }
     issue_grant(
@@ -710,6 +706,105 @@ async fn no_account_action_or_read_reveals_a_secret() {
             );
         }
     }
+}
+
+/// An `accounts` settings write carrying a key, carded and approved Once. The
+/// prompt row the card is stored as, the grant row its answer mints, and the
+/// grant list and page hold neither the key nor the act's unsalted digest, so
+/// a reader of `cairn.db` cannot confirm a guessed key with one hash. The
+/// grant still spends on exactly that act.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_prompt_grant_or_listing_holds_an_unsalted_act_digest() {
+    use crate::authorization::authorize;
+    use crate::mcp::handlers::authority::{parse_authority_detail, AuthorityPromptDetail};
+    use cairn_common::authorization::AuthorityReason;
+    const DUMMY_KEY: &str = "sk-ant-dummy-6010-0123456789abcdef0123456789";
+
+    let f = fixture().await;
+    let actor = resolve_actor(&f.orch, &as_run(&f.run_id)).await.unwrap();
+    let value =
+        json!({"edits": [{"label": "Dummy key", "provider": "anthropic", "api_key": DUMMY_KEY}]});
+    let request =
+        normalize::workspace_settings_section_write(WORKSPACE_ID, "accounts", &value).unwrap();
+    let unsalted = request.facts.act.as_ref().unwrap().unsalted_hex();
+
+    // The card, exactly as `raise_authority` stores it on the prompt row.
+    let prompt_row = serde_json::to_value(AuthorityPromptDetail::new(
+        "write",
+        &request,
+        AuthorityReason::WorkspaceSettingsCapability,
+        actor.principal.clone(),
+        actor.audience.clone(),
+        as_run(&f.run_id),
+    ))
+    .unwrap()
+    .to_string();
+    // The Once grant, minted from the stored row as an operator's answer is.
+    let stored = parse_authority_detail(&prompt_row).expect("an authority prompt");
+    let grant = issue_grant(
+        &f.orch.db.local,
+        GrantIssue {
+            request: stored.authority.clone(),
+            principal: stored.principal.clone(),
+            audience: stored.audience.clone(),
+            lifetime: AuthorityLifetimeKind::Once,
+            request_id: Some("perm-6010".to_string()),
+            turn_id: actor.context.turn_id.clone(),
+            session_id: actor.context.session_id.clone(),
+            expires_at: None,
+            provenance: AuthorityProvenance {
+                issuer: "operator_prompt".to_string(),
+                ..Default::default()
+            },
+            constraints: AuthorityConstraintSet::for_approval(
+                &stored.authority,
+                stored.act.as_ref(),
+                AuthorityLifetimeKind::Once,
+            )
+            .unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stored_text = f
+        .orch
+        .db
+        .local
+        .query_all(
+            "SELECT scope_json || constraints_json || principal_json || provenance_json \
+             FROM authority_grants",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored_text.len(), 1);
+    assert!(stored_text[0].contains("\"salt\""), "{}", stored_text[0]);
+    stored_text.push(prompt_row);
+    stored_text.push(crate::resources::grants::read_grants(&f.orch.db.local).await);
+    let page = crate::resources::grants::read_grant(&f.orch.db.local, &grant.id).await;
+    assert!(
+        page.contains("exactly the approved act sha256:v2:"),
+        "{page}"
+    );
+    stored_text.push(page);
+    for text in &stored_text {
+        assert!(
+            !text.contains(&unsalted),
+            "holds the unsalted digest:\n{text}"
+        );
+        assert!(!text.contains(DUMMY_KEY), "holds the key:\n{text}");
+    }
+
+    let other = normalize::workspace_settings_section_write(
+        WORKSPACE_ID,
+        "accounts",
+        &json!({"edits": [{"label": "Dummy key", "provider": "anthropic", "api_key": "sk-other"}]}),
+    )
+    .unwrap();
+    assert!(!authorize(&actor, &other).await.unwrap().is_allowed());
+    assert!(authorize(&actor, &request).await.unwrap().is_allowed());
 }
 
 /// A ChatGPT sign-in whose id token names `plan_type`.

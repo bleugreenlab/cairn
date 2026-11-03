@@ -443,19 +443,31 @@ impl CanonicalEncoder {
     }
 
     pub fn finish(self) -> String {
+        hex::encode(self.finish_bytes())
+    }
+
+    pub fn finish_bytes(self) -> [u8; 32] {
         use sha2::Digest;
-        format!("{:x}", self.hasher.finalize())
+        self.hasher.finalize().into()
     }
 }
 
-/// Digest algorithm behind [`ActDigest`].
+/// Digest algorithm behind [`ActDigest`] and [`ActBinding`].
 pub const ACT_DIGEST_ALGORITHM: &str = "sha256";
 
-/// Version of the canonical encoding fed to an act digest. Bump on any change
-/// to what an adapter feeds it, so one digest can never name two acts.
-pub const ACT_DIGEST_ENCODING_VERSION: u32 = 1;
+/// Version of what an [`ActBinding`] is taken over: the canonical encoding an
+/// adapter feeds an act, and the salt the binding puts ahead of it. Bump on any
+/// change to either, so one binding can never name two acts.
+///
+/// Version 1 was an unsalted digest of the act. A binding stored at version 1
+/// names no act (see [`ActBinding::names`]).
+pub const ACT_DIGEST_ENCODING_VERSION: u32 = 2;
+
+/// Bytes of OS randomness each [`ActBinding`] is salted with.
+pub const ACT_SALT_BYTES: usize = 32;
 
 const ACT_DIGEST_DOMAIN: &str = "cairn.authority.act";
+const ACT_BINDING_DOMAIN: &str = "cairn.authority.act.salted";
 
 /// The identity of the one concrete act a request performs: the resolved
 /// content of the change, such as the value written to a settings section or
@@ -468,14 +480,19 @@ const ACT_DIGEST_DOMAIN: &str = "cairn.authority.act";
 /// prose, and never from live state that can change between the gate and the
 /// pre-persist re-check, since the two must name the same act.
 ///
-/// Only the algorithm, encoding version, and digest are persisted or rendered;
-/// the content it was taken over is not.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ActDigest {
-    pub algorithm: String,
-    pub encoding_version: u32,
-    pub digest: String,
+/// It is unsalted, so it never leaves memory: it is not serializable, and its
+/// `Debug` form shows nothing of it. The content it is taken over can carry a
+/// credential, and an unsalted hash of it would let anyone who read it and
+/// knew the rest of the content confirm a guessed secret, or tell two
+/// identical acts apart from two different ones. What is stored or rendered is
+/// an [`ActBinding`].
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ActDigest([u8; 32]);
+
+impl std::fmt::Debug for ActDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActDigest(..)")
+    }
 }
 
 impl ActDigest {
@@ -486,11 +503,79 @@ impl ActDigest {
         let mut encoder = CanonicalEncoder::new(ACT_DIGEST_DOMAIN, ACT_DIGEST_ENCODING_VERSION);
         encoder.field("act", kind);
         encode(&mut encoder);
+        Self(encoder.finish_bytes())
+    }
+
+    /// The unsalted digest in hex, so a test can assert it is stored nowhere.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn unsalted_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// An act as a card and a `Once` grant hold it: the [`ActDigest`] taken again
+/// under a random salt drawn for that one card.
+///
+/// The salt is stored beside the digest, and matching recomputes the binding
+/// under it, so each grant names its act without naming it the way any other
+/// grant does: two grants for the identical act store different digests, and
+/// no stored digest can be looked up in a table precomputed over likely acts.
+/// A guess at a secret inside the act can still be checked by someone who
+/// holds the binding and the rest of the act; closing that would take a keyed
+/// digest under a secret the reader cannot reach, and there is no such key to
+/// reuse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActBinding {
+    pub algorithm: String,
+    pub encoding_version: u32,
+    /// Hex. Absent on a binding stored before acts were salted, which names no
+    /// act; it still parses, so the grant that carries it can be read, listed
+    /// and asked about again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    pub digest: String,
+}
+
+impl ActBinding {
+    /// Bind `act` under a fresh salt from the operating system's random number
+    /// generator.
+    pub fn fresh(act: &ActDigest) -> Self {
+        let mut salt = [0u8; ACT_SALT_BYTES];
+        getrandom::fill(&mut salt)
+            .expect("the operating system's random number generator is available");
+        Self::salted(act, &salt)
+    }
+
+    fn salted(act: &ActDigest, salt: &[u8]) -> Self {
         Self {
             algorithm: ACT_DIGEST_ALGORITHM.to_string(),
             encoding_version: ACT_DIGEST_ENCODING_VERSION,
-            digest: encoder.finish(),
+            salt: Some(hex::encode(salt)),
+            digest: Self::digest(act, salt),
         }
+    }
+
+    fn digest(act: &ActDigest, salt: &[u8]) -> String {
+        let mut encoder = CanonicalEncoder::new(ACT_BINDING_DOMAIN, ACT_DIGEST_ENCODING_VERSION);
+        encoder.field("salt", &hex::encode(salt));
+        encoder.field("act", &hex::encode(act.0));
+        encoder.finish()
+    }
+
+    /// Whether this binding names `act`, recomputed under the binding's own
+    /// salt. A binding without a full salt, or from another encoding, names
+    /// nothing.
+    pub fn names(&self, act: &ActDigest) -> bool {
+        if self.algorithm != ACT_DIGEST_ALGORITHM
+            || self.encoding_version != ACT_DIGEST_ENCODING_VERSION
+        {
+            return false;
+        }
+        let Some(salt) = self.salt.as_deref().and_then(|salt| hex::decode(salt).ok()) else {
+            return false;
+        };
+        salt.len() == ACT_SALT_BYTES && Self::digest(act, &salt) == self.digest
     }
 
     /// Short display form for a grant listing.
@@ -498,6 +583,18 @@ impl ActDigest {
         let head: String = self.digest.chars().take(12).collect();
         format!("{}:v{}:{head}", self.algorithm, self.encoding_version)
     }
+}
+
+/// Read whatever a stored request carries for its act, and keep none of it. A
+/// prompt stored before acts were salted holds an unsalted digest there, and
+/// it must still parse: an authority prompt that fails to parse is no longer
+/// recognised as one.
+fn discard_stored_act<'de, D>(deserializer: D) -> Result<Option<ActDigest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde::de::IgnoredAny as Deserialize>::deserialize(deserializer)?;
+    Ok(None)
 }
 
 /// Typed, system-derived facts about the concrete change a request performs.
@@ -520,8 +617,9 @@ pub struct AuthorityFacts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acting_thread: Option<String>,
     /// The one concrete act this request performs, which a `Once` grant binds
-    /// to. See [`ActDigest`].
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// to. In memory only: see [`ActDigest`]. A stored request reads back
+    /// without it, and its card carries the act as an [`ActBinding`] instead.
+    #[serde(default, skip_serializing, deserialize_with = "discard_stored_act")]
     pub act: Option<ActDigest>,
 }
 
@@ -567,6 +665,12 @@ impl AuthorityRequest {
     pub fn with_act(mut self, act: ActDigest) -> Self {
         self.facts.act = Some(act);
         self
+    }
+
+    /// The act this request performs, bound under a fresh salt, for the card
+    /// that asks about it. `None` when the request names no act.
+    pub fn bind_act(&self) -> Option<ActBinding> {
+        self.facts.act.as_ref().map(ActBinding::fresh)
     }
 
     /// Whether this request writes an MCP server entry, and therefore may only
@@ -637,7 +741,7 @@ pub enum AuthorityConstraint {
     /// "this, this time", so the grant must not be spendable by a different
     /// act in the same scope that happens to arrive first. Turn, session and
     /// standing grants mean "this kind of act" and do not carry it.
-    ExactAct { digest: ActDigest },
+    ExactAct { digest: ActBinding },
 }
 
 impl AuthorityConstraint {
@@ -671,7 +775,11 @@ impl AuthorityConstraint {
             }
             // An act is never vacuous: a request that cannot name its act is
             // not the act the operator approved.
-            AuthorityConstraint::ExactAct { digest } => request.facts.act.as_ref() == Some(digest),
+            AuthorityConstraint::ExactAct { digest } => request
+                .facts
+                .act
+                .as_ref()
+                .is_some_and(|act| digest.names(act)),
         }
     }
 
@@ -728,7 +836,9 @@ impl AuthorityConstraintSet {
     ///   lifetime: a standing approval is "let judgment do this", never "let
     ///   any run do this";
     /// - for `Once`, the act itself, so the single use is spent only by the act
-    ///   the card described.
+    ///   the card described. `act` is the binding the card was raised with
+    ///   ([`AuthorityRequest::bind_act`]), because a stored request no longer
+    ///   carries its unsalted act.
     ///
     /// A request missing a fact its approval must bind is an error rather than
     /// a wider grant: minting without the binding would either authorize more
@@ -736,6 +846,7 @@ impl AuthorityConstraintSet {
     /// looking valid.
     pub fn for_approval(
         request: &AuthorityRequest,
+        act: Option<&ActBinding>,
         lifetime: AuthorityLifetimeKind,
     ) -> Result<Self, String> {
         let mut constraints = vec![AuthorityConstraint::MutationModes {
@@ -754,7 +865,7 @@ impl AuthorityConstraintSet {
             constraints.push(AuthorityConstraint::ActingThread { thread_id });
         }
         if lifetime == AuthorityLifetimeKind::Once {
-            let digest = request.facts.act.clone().ok_or_else(|| {
+            let digest = act.cloned().ok_or_else(|| {
                 "this approval does not name the exact act it would authorize once".to_string()
             })?;
             constraints.push(AuthorityConstraint::ExactAct { digest });
@@ -1423,7 +1534,7 @@ mod tests {
         }
         if matches!(lifetime, AuthorityLifetime::Once { .. }) {
             constraints.push(AuthorityConstraint::ExactAct {
-                digest: fixture_act(),
+                digest: ActBinding::fresh(&fixture_act()),
             });
         }
         let constraints = AuthorityConstraintSet::new(constraints);
@@ -1880,7 +1991,12 @@ mod exact_act_tests {
                 ..Default::default()
             },
             audience: AuthorityAudience::workspace("default"),
-            constraints: AuthorityConstraintSet::for_approval(request, lifetime.kind()).unwrap(),
+            constraints: AuthorityConstraintSet::for_approval(
+                request,
+                request.bind_act().as_ref(),
+                lifetime.kind(),
+            )
+            .unwrap(),
             lifetime,
             provenance: AuthorityProvenance::default(),
             created_at: 1,
@@ -1971,25 +2087,174 @@ mod exact_act_tests {
     fn a_once_approval_that_cannot_name_its_act_mints_nothing() {
         let mut unnamed = write(serde_json::json!(1));
         unnamed.facts.act = None;
-        let error = AuthorityConstraintSet::for_approval(&unnamed, AuthorityLifetimeKind::Once)
-            .unwrap_err();
+        assert!(unnamed.bind_act().is_none());
+        let error = AuthorityConstraintSet::for_approval(
+            &unnamed,
+            unnamed.bind_act().as_ref(),
+            AuthorityLifetimeKind::Once,
+        )
+        .unwrap_err();
         assert!(error.contains("exact act"), "{error}");
         // The wider lifetimes never needed one.
-        assert!(
-            AuthorityConstraintSet::for_approval(&unnamed, AuthorityLifetimeKind::Standing).is_ok()
-        );
+        assert!(AuthorityConstraintSet::for_approval(
+            &unnamed,
+            None,
+            AuthorityLifetimeKind::Standing
+        )
+        .is_ok());
     }
 
     #[test]
     fn an_exact_act_constraint_round_trips_through_storage() {
+        let request = write(serde_json::json!(1));
         let set = AuthorityConstraintSet::for_approval(
-            &write(serde_json::json!(1)),
+            &request,
+            request.bind_act().as_ref(),
             AuthorityLifetimeKind::Once,
         )
         .unwrap();
         let json = serde_json::to_string(&set).unwrap();
         assert!(json.contains("\"constraint\":\"exact_act\""), "{json}");
-        assert_eq!(AuthorityConstraintSet::parse(&json).unwrap(), set);
+        assert!(json.contains("\"salt\""), "{json}");
+        let parsed = AuthorityConstraintSet::parse(&json).unwrap();
+        assert_eq!(parsed, set);
+        assert!(parsed
+            .constraints
+            .iter()
+            .all(|constraint| constraint.covers(&request)));
+    }
+
+    /// Each binding draws its own salt, so two Once grants for the identical
+    /// act store different digests, and each still names that act.
+    #[test]
+    fn two_bindings_of_one_act_differ_and_each_names_it() {
+        let shown = write(serde_json::json!({"api_key": "sk-dummy"}));
+        let first = minted(&shown, once());
+        let second = minted(&shown, once());
+        let binding = |grant: &AuthorityGrant| match &grant.constraints.constraints[..] {
+            [.., AuthorityConstraint::ExactAct { digest }] => digest.clone(),
+            other => panic!("no act binding: {other:?}"),
+        };
+        let (a, b) = (binding(&first), binding(&second));
+        assert_ne!(a.salt, b.salt);
+        assert_ne!(a.digest, b.digest);
+        assert_eq!(a.salt.as_deref().map(str::len), Some(ACT_SALT_BYTES * 2));
+        for grant in [&first, &second] {
+            assert!(grant.matches(&shown, &context(), 2));
+        }
+        // Neither stores the act's unsalted digest.
+        let act = shown.facts.act.as_ref().unwrap();
+        for stored in [&a, &b] {
+            assert_ne!(stored.digest, act.unsalted_hex());
+        }
+    }
+
+    /// A binding moved onto another salt, or onto another act's digest, names
+    /// nothing.
+    #[test]
+    fn a_binding_names_only_its_own_act_under_its_own_salt() {
+        let shown = write(serde_json::json!(1));
+        let act = shown.facts.act.clone().unwrap();
+        let binding = ActBinding::fresh(&act);
+        assert!(binding.names(&act));
+        assert!(!binding.names(&value_act(serde_json::json!(2))));
+        let mut resalted = binding.clone();
+        resalted.salt = ActBinding::fresh(&act).salt;
+        assert!(!resalted.names(&act));
+        let mut short_salt = binding.clone();
+        short_salt.salt = Some("00".to_string());
+        assert!(!short_salt.names(&act));
+    }
+
+    /// The shape 5999 stored: an unsalted version-1 digest. It still parses,
+    /// so the grant carrying it can be read and listed, and it covers nothing.
+    #[test]
+    fn an_unsalted_binding_stored_before_salting_names_no_act() {
+        let shown = write(serde_json::json!(1));
+        let stored = r#"{"version":3,"constraints":[
+            {"constraint":"mutation_modes","modes":["update"]},
+            {"constraint":"exact_act","digest":{"algorithm":"sha256","encoding_version":1,"digest":"abc"}}
+        ]}"#
+            .replace("\"version\":3", &format!("\"version\":{AUTHORITY_MODEL_VERSION}"));
+        let mut legacy = minted(&shown, once());
+        legacy.constraints = AuthorityConstraintSet::parse(&stored).unwrap();
+        assert!(legacy.constraints.binds_exact_act());
+        assert_eq!(
+            legacy.check(&shown, &context(), 2),
+            Err(GrantMismatch::Constraints)
+        );
+    }
+
+    /// Every binding without a full salt authorizes nothing, the act it was
+    /// minted for included: one the scrub migration blanked, an empty one, and
+    /// even one carrying that act's own unsalted digest. An empty or missing
+    /// digest never compares equal to anything.
+    #[test]
+    fn a_scrubbed_or_unsalted_binding_authorizes_not_even_its_own_act() {
+        let shown = write(serde_json::json!({"api_key": "sk-dummy"}));
+        let act = shown.facts.act.clone().unwrap();
+        let salt = ActBinding::fresh(&act).salt;
+        let mut cases = Vec::new();
+        for encoding_version in [1, ACT_DIGEST_ENCODING_VERSION] {
+            for digest in [String::new(), act.unsalted_hex()] {
+                for salt in [None, Some(String::new())] {
+                    cases.push(ActBinding {
+                        algorithm: ACT_DIGEST_ALGORITHM.to_string(),
+                        encoding_version,
+                        salt,
+                        digest: digest.clone(),
+                    });
+                }
+            }
+        }
+        // A full salt with the digest blanked away is no better.
+        cases.push(ActBinding {
+            algorithm: ACT_DIGEST_ALGORITHM.to_string(),
+            encoding_version: ACT_DIGEST_ENCODING_VERSION,
+            salt,
+            digest: String::new(),
+        });
+        for binding in cases {
+            assert!(!binding.names(&act), "{binding:?}");
+            let mut grant = minted(&shown, once());
+            grant.constraints = AuthorityConstraintSet::new(vec![
+                AuthorityConstraint::MutationModes {
+                    modes: vec![AuthorityMutation::Update],
+                },
+                AuthorityConstraint::ExactAct {
+                    digest: binding.clone(),
+                },
+            ]);
+            let stored = serde_json::to_string(&grant.constraints).unwrap();
+            grant.constraints = AuthorityConstraintSet::parse(&stored).unwrap();
+            assert_eq!(
+                grant.check(&shown, &context(), 2),
+                Err(GrantMismatch::Constraints),
+                "{binding:?}"
+            );
+        }
+    }
+
+    /// A request never serializes its unsalted act, and a request stored with
+    /// one before salting still parses, without it.
+    #[test]
+    fn a_stored_request_carries_no_unsalted_act() {
+        let shown = write(serde_json::json!({"api_key": "sk-dummy"}));
+        let json = serde_json::to_string(&shown).unwrap();
+        let act = shown.facts.act.as_ref().unwrap();
+        assert!(!json.contains(&act.unsalted_hex()), "{json}");
+        assert!(!json.contains("\"act\""), "{json}");
+        assert!(!format!("{shown:?}").contains(&act.unsalted_hex()));
+
+        let mut stored: serde_json::Value = serde_json::from_str(&json).unwrap();
+        stored["facts"]["act"] = serde_json::json!({
+            "algorithm": "sha256",
+            "encoding_version": 1,
+            "digest": act.unsalted_hex(),
+        });
+        let parsed: AuthorityRequest = serde_json::from_value(stored).unwrap();
+        assert_eq!(parsed.facts.act, None);
+        assert_eq!(parsed.scope, shown.scope);
     }
 
     #[test]
