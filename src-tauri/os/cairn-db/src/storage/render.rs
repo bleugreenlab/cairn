@@ -13,7 +13,10 @@
 //! cairn-cmd composer lives here.
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
-use cairn_common::token_meter::TokenMeter;
+use cairn_common::token_meter::{Cut, TokenMeter};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::OnceLock;
 
 use cairn_common::read::{
@@ -135,12 +138,109 @@ impl TokenMeter for ByteMeter {
         text.len().try_into().unwrap_or(u32::MAX)
     }
 
-    fn cut(&self, text: &str, budget: u32) -> cairn_common::token_meter::Cut {
+    fn cut(&self, text: &str, budget: u32) -> Cut {
         let byte_offset = safe_char_boundary(text, (budget as usize).min(text.len()));
-        cairn_common::token_meter::Cut {
+        Cut {
             byte_offset,
             tokens: byte_offset.try_into().unwrap_or(u32::MAX),
         }
+    }
+}
+
+/// Bytes a windowed cut reads past the expected cut point, on top of a quarter
+/// of the expected span.
+const CUT_WINDOW_SLACK: u64 = 1024;
+
+/// One composition's meter: the caller's [`TokenMeter`], plus a memo of what it
+/// has measured of the segment bodies the composition borrows.
+///
+/// A composition renders each body many times over: once per probe of the
+/// byte-ceiling search, and once per pass of [`render_with`]'s shrinking loop.
+/// Without the memo every pass recounts the whole body, and without
+/// [`Self::body_cut`]'s window every cut tokenizes the whole body as well, which
+/// on a large read is seconds of metering before anything renders.
+///
+/// Entries are keyed by a text's address and length. That is sound because
+/// every keyed text is borrowed for `'t`, which is invariant, so no other text
+/// can occupy that address while the memo can still be asked about it.
+/// Transient texts such as headers and candidates go through [`Self::count`]
+/// unmemoized.
+struct Metering<'t, 'm> {
+    meter: &'m dyn TokenMeter,
+    counts: RefCell<HashMap<(usize, usize), u32>>,
+    cuts: RefCell<HashMap<(usize, usize, u32), Cut>>,
+    borrowed: PhantomData<Cell<&'t str>>,
+}
+
+fn text_key(text: &str) -> (usize, usize) {
+    (text.as_ptr() as usize, text.len())
+}
+
+impl<'t, 'm> Metering<'t, 'm> {
+    fn new(meter: &'m dyn TokenMeter) -> Self {
+        Self {
+            meter,
+            counts: RefCell::default(),
+            cuts: RefCell::default(),
+            borrowed: PhantomData,
+        }
+    }
+
+    /// Count a text that lives only for this call.
+    fn count(&self, text: &str) -> u32 {
+        self.meter.count(text)
+    }
+
+    /// Count a borrowed body text, once per composition.
+    fn body_tokens(&self, text: &'t str) -> u32 {
+        let key = text_key(text);
+        if let Some(tokens) = self.counts.borrow().get(&key) {
+            return *tokens;
+        }
+        let tokens = self.meter.count(text);
+        self.counts.borrow_mut().insert(key, tokens);
+        tokens
+    }
+
+    /// The meter's cut of a borrowed body text, taken over a prefix window of
+    /// it rather than the whole text.
+    ///
+    /// A meter's `cut` costs time in proportion to the text it is handed, not
+    /// to the budget, so cutting a megabyte body to a few thousand tokens would
+    /// otherwise pay for the megabyte. The window is sized from the text's mean
+    /// density and doubled until the cut lands with an eighth of the window
+    /// still ahead of it, far enough that where the window ends does not decide
+    /// the cut for ordinary text. Either way a prefix of the window is the same
+    /// string as that prefix of the text, so the cut keeps the meter's contract.
+    fn body_cut(&self, text: &'t str, budget: u32) -> Cut {
+        let tokens = u64::from(self.body_tokens(text).max(1));
+        let expected = (u64::from(budget) + 1).saturating_mul(text.len() as u64) / tokens;
+        let mut window = expected
+            .saturating_add(expected / 4)
+            .saturating_add(CUT_WINDOW_SLACK);
+        loop {
+            let end =
+                usize::try_from(window).map_or(text.len(), |end| ceil_char_boundary(text, end));
+            if end >= text.len() {
+                return self.memo_cut(text, budget);
+            }
+            let cut = self.memo_cut(&text[..end], budget);
+            if cut.byte_offset + end / 8 < end {
+                return cut;
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
+    fn memo_cut(&self, text: &'t str, budget: u32) -> Cut {
+        let (address, len) = text_key(text);
+        let key = (address, len, budget);
+        if let Some(cut) = self.cuts.borrow().get(&key) {
+            return *cut;
+        }
+        let cut = self.meter.cut(text, budget);
+        self.cuts.borrow_mut().insert(key, cut);
+        cut
     }
 }
 
@@ -545,47 +645,64 @@ fn safe_char_boundary(text: &str, mut byte: usize) -> usize {
     byte
 }
 
+fn ceil_char_boundary(text: &str, mut byte: usize) -> usize {
+    if byte >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(byte) {
+        byte += 1;
+    }
+    byte
+}
+
 /// The numbering prefix length of a file-text line (`"{:>6}\t"` and wider), or 0
 /// for un-numbered bodies. Used to derive a text-relative `char_offset`.
 fn numbering_prefix_len(line: &str) -> usize {
     line.find('\t').map(|tab| tab + 1).unwrap_or(0)
 }
 
-struct BodyCut {
-    body: String,
+struct BodyCut<'t> {
+    body: &'t str,
     shown_lines: usize,
     budget_truncated: bool,
     char_offset: Option<usize>,
+    /// For a cut on a line boundary, the length of the body prefix through the
+    /// newline it stopped before. For a meter whose prefix counts never shrink
+    /// as the prefix grows and whose cut is the longest prefix in budget, every
+    /// smaller budget that still covers this prefix cuts at the same newline.
+    through_newline: Option<usize>,
 }
 
 /// Cut `body` to `budget` tokens on a line boundary. When even the first line
 /// alone exceeds the budget, fall back to a token-truncated prefix of that
 /// line and report a text-relative `char_offset` so the continue URI advances.
-fn cut_body(
-    body: &str,
+fn cut_body<'t>(
+    body: &'t str,
     budget: u32,
     numbered: bool,
     logical_lines: Option<usize>,
-    meter: &dyn TokenMeter,
-) -> BodyCut {
-    if meter.count(body) <= budget {
+    meter: &Metering<'t, '_>,
+) -> BodyCut<'t> {
+    if meter.body_tokens(body) <= budget {
         return BodyCut {
-            body: body.to_string(),
+            body,
             shown_lines: logical_lines.unwrap_or_else(|| body.lines().count()),
             budget_truncated: false,
             char_offset: None,
+            through_newline: None,
         };
     }
     // Keep only whole lines that fit. When at least one newline precedes the
     // budget, cut there; the first line then fits and no char fallback is needed.
-    let safe_end = safe_char_boundary(body, meter.cut(body, budget).byte_offset);
+    let safe_end = safe_char_boundary(body, meter.body_cut(body, budget).byte_offset);
     if let Some(newline) = body[..safe_end].rfind('\n') {
         let cut = &body[..newline];
         return BodyCut {
-            body: cut.to_string(),
+            body: cut,
             shown_lines: cut.lines().count().max(1),
             budget_truncated: true,
             char_offset: None,
+            through_newline: Some(newline + 1),
         };
     }
     // No complete line fits: the first line alone exceeds the budget. Character
@@ -598,7 +715,7 @@ fn cut_body(
     };
     // Keep at least one text character so the continue URI strictly advances.
     let min_end = safe_char_boundary(first_line, (prefix_len + 1).min(first_line.len()));
-    let mut end = safe_char_boundary(first_line, meter.cut(first_line, budget).byte_offset);
+    let mut end = safe_char_boundary(first_line, meter.body_cut(first_line, budget).byte_offset);
     if end < min_end {
         end = min_end;
     }
@@ -608,38 +725,45 @@ fn cut_body(
         .map(|t| t.chars().count())
         .unwrap_or(0);
     BodyCut {
-        body: shown.to_string(),
+        body: shown,
         shown_lines: 1,
         budget_truncated: true,
         char_offset: Some(char_offset.max(1)),
+        through_newline: None,
     }
 }
 
-/// Render one produced segment to its final text block under `budget` characters,
+/// Render one produced segment to its final text block under `budget` tokens,
 /// emitting the enriched header, body, an always-valid continue footer, and any
 /// issue history. Updates `meta.shown_units`, `truncated`, and `char_continuation`.
 pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> RenderedSegment {
+    render_with(&seg, seg.history.as_deref(), budget, &Metering::new(meter))
+}
+
+/// [`render_segment`] of a borrowed segment, carrying `history` in place of the
+/// segment's own (a fitting pass sheds it) and metering through one
+/// composition's memo.
+fn render_with<'t>(
+    seg: &'t ReadSegment,
+    history: Option<&str>,
+    budget: u32,
+    meter: &Metering<'t, '_>,
+) -> RenderedSegment {
     if matches!(
         seg.meta.natural_unit,
         NaturalUnit::Record | NaturalUnit::Turn
     ) {
-        return render_record_segment(seg, budget, meter);
+        return render_record_segment(seg, history, budget, meter);
     }
-    let ReadSegment {
-        body,
-        affordance: _,
-        images,
-        history,
-        mut meta,
-    } = seg;
+    let body = seg.body.as_str();
+    let mut meta = seg.meta.clone();
 
     let numbered = matches!(meta.kind, SegmentKind::File);
     let history_suffix = history
-        .as_deref()
         .filter(|h| !h.is_empty())
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
-    let image_trailer = image_reference_trailer(&images, &meta.uri);
+    let image_trailer = image_reference_trailer(&seg.images, &meta.uri);
 
     let logical_full_lines = (meta.shown_units > 0).then_some(meta.shown_units);
     let full_lines = logical_full_lines.unwrap_or_else(|| body.lines().count());
@@ -650,16 +774,16 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
             .total_units
             .is_some_and(|total| meta.offset + full_lines < total);
 
+    let fixed_tokens = meter.count(&format!(
+        "{}\n{}{}",
+        header(&meta, full_lines, true),
+        image_trailer,
+        history_suffix
+    ));
     let mut content_budget = budget;
     loop {
-        let fixed = format!(
-            "{}\n{}{}",
-            header(&meta, full_lines, true),
-            image_trailer,
-            history_suffix
-        );
-        let body_budget = content_budget.saturating_sub(meter.count(&fixed));
-        let cut = cut_body(&body, body_budget, numbered, logical_full_lines, meter);
+        let body_budget = content_budget.saturating_sub(fixed_tokens);
+        let cut = cut_body(body, body_budget, numbered, logical_full_lines, meter);
         // A grep window that elided matches is a truncated read like any other:
         // a structured consumer must be able to see that without re-deriving it.
         let truncated = cut.budget_truncated
@@ -723,11 +847,30 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
             return RenderedSegment {
                 text: candidate,
                 meta,
-                images,
+                images: seg.images.clone(),
             };
         }
-        content_budget = content_budget.saturating_sub(candidate_tokens - budget + 1);
+        let step = (candidate_tokens - budget).saturating_add(1);
+        content_budget = content_budget.saturating_sub(step);
+        if let Some(through) = cut.through_newline {
+            let keeps_lines_from = fixed_tokens.saturating_add(meter.body_tokens(&body[..through]));
+            content_budget = skip_passes_keeping_lines(content_budget, step, keeps_lines_from);
+        }
     }
+}
+
+/// The content budget of the shrinking loop's next pass that can cut
+/// differently. Every pass at or above `keeps_lines_from` cuts the same lines
+/// as the pass that just missed, so it rebuilds the same candidate, misses by
+/// the same `step` and shrinks again; the answer is the first budget of that
+/// sequence (`budget`, `budget - step`, ...) below `keeps_lines_from`.
+fn skip_passes_keeping_lines(budget: u32, step: u32, keeps_lines_from: u32) -> u32 {
+    if budget < keeps_lines_from {
+        return budget;
+    }
+    let passes = u64::from(budget - keeps_lines_from) / u64::from(step) + 1;
+    // At most `budget`, since the subtraction saturates.
+    u64::from(budget).saturating_sub(passes * u64::from(step)) as u32
 }
 
 /// Render one segment's standalone section text (header + body + footer) — the
@@ -747,7 +890,7 @@ pub(crate) fn render_section_text(seg: ReadSegment, meter: &dyn TokenMeter) -> S
 /// line per record); without it the count is unknown, and reporting the
 /// producer's window instead would hand out a continuation that skips every
 /// record the cut dropped.
-fn retained_records(meta: &SegmentMeta, cut: &BodyCut, produced_shown: usize) -> Option<usize> {
+fn retained_records(meta: &SegmentMeta, cut: &BodyCut<'_>, produced_shown: usize) -> Option<usize> {
     if !cut.budget_truncated {
         return Some(produced_shown);
     }
@@ -809,17 +952,17 @@ fn uncounted_record_footer(uri: &str, noun: &str, smaller_limit: Option<usize>) 
 /// cut page is recounted through its declared line framing, and a cut page
 /// with no framing claims no count and continues from its own start under a
 /// smaller `limit` (see [`retained_records`]).
-fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> RenderedSegment {
-    let ReadSegment {
-        body,
-        affordance: _,
-        images,
-        history,
-        mut meta,
-    } = seg;
+fn render_record_segment<'t>(
+    seg: &'t ReadSegment,
+    history: Option<&str>,
+    budget: u32,
+    meter: &Metering<'t, '_>,
+) -> RenderedSegment {
+    let body = seg.body.as_str();
+    let images = seg.images.clone();
+    let mut meta = seg.meta.clone();
 
     let history_suffix = history
-        .as_deref()
         .filter(|h| !h.is_empty())
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
@@ -833,14 +976,14 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
         history_suffix
     );
     let body_budget = budget.saturating_sub(meter.count(&fixed));
-    let cut = cut_body(&body, body_budget, false, None, meter);
+    let cut = cut_body(body, body_budget, false, None, meter);
     let Some(shown) = retained_records(&meta, &cut, produced_shown) else {
         let noun = meta.unit_noun.clone().unwrap_or_else(|| "records".into());
         let suffix = match meta.total_units {
             Some(total) => format!("partial page of {total} {noun}; cut by read budget"),
             None => "truncated".into(),
         };
-        let smaller_limit = smaller_record_limit(&meta, produced_shown, &body, &cut.body);
+        let smaller_limit = smaller_record_limit(&meta, produced_shown, body, cut.body);
         // Zero is the only count this page can vouch for; `truncated` says
         // the body holds more than that.
         meta.shown_units = 0;
@@ -848,7 +991,7 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
         let mut text = header_with_suffix(&meta, Some(suffix));
         if !cut.body.is_empty() {
             text.push('\n');
-            text.push_str(&cut.body);
+            text.push_str(cut.body);
         }
         text.push('\n');
         text.push_str(&uncounted_record_footer(&meta.uri, &noun, smaller_limit));
@@ -881,7 +1024,7 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
         })
         .to_string()
     } else {
-        cut.body
+        cut.body.to_string()
     };
     let mut text = if rendered_body.is_empty() {
         head
@@ -911,18 +1054,21 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
 /// Render a standalone segment under both the live token budget and the client
 /// byte ceiling. This is the single-target counterpart to [`assemble`].
 pub fn render_segment_bounded(seg: ReadSegment, meter: &dyn TokenMeter) -> RenderedSegment {
-    if let Some(rendered) = render_segment_fitting(&seg, meter, None) {
+    let meter = Metering::new(meter);
+    let history = seg.history.as_deref().filter(|history| !history.is_empty());
+    if let Some(rendered) = render_segment_fitting(&seg, history, &meter, None) {
         return rendered;
     }
-
-    let mut without_history = seg.clone();
-    without_history.history = None;
-    if let Some(rendered) = render_segment_fitting(&without_history, meter, Some(HISTORY_ELISION)) {
-        return rendered;
+    // With no history to shed, a second pass would render the first one's
+    // sections plus a marker, which cannot fit where they did not.
+    if history.is_some() {
+        if let Some(rendered) = render_segment_fitting(&seg, None, &meter, Some(HISTORY_ELISION)) {
+            return rendered;
+        }
     }
 
     let uri = bounded_uri_label(&seg.meta.uri);
-    let mut overflow = render_segment(without_history, 0, meter);
+    let mut overflow = render_with(&seg, None, 0, &meter);
     overflow.text = format!(
         "Read target {uri} cannot fit below the 45,000-byte client ceiling because its required header exceeds the ceiling."
     );
@@ -931,9 +1077,10 @@ pub fn render_segment_bounded(seg: ReadSegment, meter: &dyn TokenMeter) -> Rende
     overflow
 }
 
-fn render_segment_fitting(
-    seg: &ReadSegment,
-    meter: &dyn TokenMeter,
+fn render_segment_fitting<'t>(
+    seg: &'t ReadSegment,
+    history: Option<&str>,
+    meter: &Metering<'t, '_>,
     marker: Option<&str>,
 ) -> Option<RenderedSegment> {
     let finish = |mut rendered: RenderedSegment| {
@@ -944,7 +1091,7 @@ fn render_segment_fitting(
         (rendered.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING).then_some(rendered)
     };
 
-    let first = render_segment(seg.clone(), READ_BATCH_TOKEN_BUDGET, meter);
+    let first = render_with(seg, history, READ_BATCH_TOKEN_BUDGET, meter);
     if let Some(first) = finish(first) {
         return Some(first);
     }
@@ -954,7 +1101,7 @@ fn render_segment_fitting(
     let mut best = None;
     while low <= high {
         let budget = low + (high - low) / 2;
-        let candidate = render_segment(seg.clone(), budget, meter);
+        let candidate = render_with(seg, history, budget, meter);
         if let Some(candidate) = finish(candidate) {
             best = Some(candidate);
             low = budget + 1;
@@ -972,10 +1119,41 @@ fn render_segment_fitting(
 // Batch assembly.
 // ---------------------------------------------------------------------------
 
+/// Which optional parts of its segments a composition pass carries. The
+/// fitting passes shed affordances, then history, to get under the client byte
+/// ceiling.
+#[derive(Clone, Copy)]
+struct Carried {
+    affordances: bool,
+    history: bool,
+}
+
+impl Carried {
+    const ALL: Self = Self {
+        affordances: true,
+        history: true,
+    };
+    const WITHOUT_AFFORDANCES: Self = Self {
+        affordances: false,
+        history: true,
+    };
+    const NEITHER: Self = Self {
+        affordances: false,
+        history: false,
+    };
+
+    fn affordance(self, segment: &ReadSegment) -> Option<&Affordance> {
+        segment.affordance.as_ref().filter(|_| self.affordances)
+    }
+
+    fn history(self, segment: &ReadSegment) -> Option<&str> {
+        segment.history.as_deref().filter(|_| self.history)
+    }
+}
+
 /// Estimated untruncated length of a segment's text block, for fair-share
 /// budgeting: header (with suffix slack), body, a footer allowance, and history.
-fn estimate_len(segment: &ReadSegment, meter: &dyn TokenMeter) -> u32 {
-    let history = segment.history.as_deref().unwrap_or_default();
+fn estimate_len(segment: &ReadSegment, history: Option<&str>, meter: &Metering<'_, '_>) -> u32 {
     let images = image_reference_trailer(&segment.images, &segment.meta.uri);
     let estimate = format!(
         "{}\n{}\n{}{}{}",
@@ -983,9 +1161,39 @@ fn estimate_len(segment: &ReadSegment, meter: &dyn TokenMeter) -> u32 {
         segment.body,
         "x".repeat(220),
         images,
-        history
+        history.unwrap_or_default()
     );
     meter.count(&estimate)
+}
+
+/// One pass's fair-share inputs. None depends on the batch budget, so the
+/// byte-ceiling search computes them once per pass rather than once per probe.
+struct FairShare {
+    lengths: Vec<u32>,
+    /// Tokens for the separators between sections and for the affordance
+    /// blocks after them, reserved before the remainder is water-filled.
+    reserved: u32,
+    affordances: Vec<Affordance>,
+}
+
+impl FairShare {
+    fn new(segments: &[ReadSegment], carried: Carried, meter: &Metering<'_, '_>) -> Self {
+        let lengths = segments
+            .iter()
+            .map(|segment| estimate_len(segment, carried.history(segment), meter))
+            .collect();
+        let separators = meter.count(&"\n".repeat(segments.len().saturating_sub(1)));
+        let affordances = distinct_affordances(segments, carried);
+        let blocks: u32 = affordances
+            .iter()
+            .map(|affordance| meter.count(&format!("\n\n{}", affordance.block)))
+            .sum();
+        Self {
+            lengths,
+            reserved: separators.saturating_add(blocks),
+            affordances,
+        }
+    }
 }
 
 /// Compose produced segments into one envelope under a single budget. Affordances
@@ -1030,38 +1238,43 @@ fn assemble_inner(
     meter: &dyn TokenMeter,
 ) -> ReadBatchEnvelope {
     if let ReadBudget::Whole { byte_ceiling } = budget {
-        return assemble_whole(segments, include_bodies, byte_ceiling);
+        return assemble_whole(&segments, include_bodies, byte_ceiling);
     }
-    if let Some(envelope) = assemble_fitting(&segments, include_bodies, meter, None) {
+    let meter = Metering::new(meter);
+    if let Some(envelope) = assemble_fitting(&segments, Carried::ALL, include_bodies, &meter, None)
+    {
         return envelope;
     }
 
-    let mut without_affordances = segments.clone();
-    for segment in &mut without_affordances {
-        segment.affordance = None;
+    // Each later pass sheds something more. One with nothing to shed would
+    // render the previous pass's sections under a marker no shorter than that
+    // pass's, which cannot fit where they did not, so it is not run.
+    if segments.iter().any(|segment| segment.affordance.is_some()) {
+        if let Some(envelope) = assemble_fitting(
+            &segments,
+            Carried::WITHOUT_AFFORDANCES,
+            include_bodies,
+            &meter,
+            Some(AFFORDANCE_ELISION),
+        ) {
+            return envelope;
+        }
     }
-    if let Some(mut envelope) = assemble_fitting(
-        &without_affordances,
-        include_bodies,
-        meter,
-        Some(AFFORDANCE_ELISION),
-    ) {
-        envelope.affordances.clear();
-        return envelope;
-    }
-
-    let mut without_trailers = without_affordances;
-    for segment in &mut without_trailers {
-        segment.history = None;
-    }
-    if let Some(mut envelope) = assemble_fitting(
-        &without_trailers,
-        include_bodies,
-        meter,
-        Some(METADATA_ELISION),
-    ) {
-        envelope.affordances.clear();
-        return envelope;
+    if segments.iter().any(|segment| {
+        segment
+            .history
+            .as_deref()
+            .is_some_and(|history| !history.is_empty())
+    }) {
+        if let Some(envelope) = assemble_fitting(
+            &segments,
+            Carried::NEITHER,
+            include_bodies,
+            &meter,
+            Some(METADATA_ELISION),
+        ) {
+            return envelope;
+        }
     }
 
     let largest_header = segments
@@ -1084,10 +1297,17 @@ fn assemble_inner(
         ),
         None => "Empty read batch cannot be rendered below the 45,000-byte client ceiling.".to_string(),
     };
-    let mut overflow = assemble_at_budget(without_trailers, include_bodies, meter, 0);
+    let share = FairShare::new(&segments, Carried::NEITHER, &meter);
+    let mut overflow = compose_at_budget(
+        &segments,
+        Carried::NEITHER,
+        &share,
+        include_bodies,
+        &meter,
+        0,
+    );
     overflow.text = refusal.clone();
     overflow.images.clear();
-    overflow.affordances.clear();
     for meta in &mut overflow.segments {
         meta.truncated = true;
     }
@@ -1100,10 +1320,11 @@ fn assemble_inner(
     overflow
 }
 
-fn assemble_fitting(
-    segments: &[ReadSegment],
+fn assemble_fitting<'t>(
+    segments: &'t [ReadSegment],
+    carried: Carried,
     include_bodies: bool,
-    meter: &dyn TokenMeter,
+    meter: &Metering<'t, '_>,
     marker: Option<&str>,
 ) -> Option<ReadBatchEnvelope> {
     let finish = |mut envelope: ReadBatchEnvelope| {
@@ -1113,14 +1334,11 @@ fn assemble_fitting(
         }
         (envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING).then_some(envelope)
     };
+    let share = FairShare::new(segments, carried, meter);
+    let at_budget =
+        |budget| compose_at_budget(segments, carried, &share, include_bodies, meter, budget);
 
-    let first = assemble_at_budget(
-        segments.to_vec(),
-        include_bodies,
-        meter,
-        READ_BATCH_TOKEN_BUDGET,
-    );
-    if let Some(first) = finish(first) {
+    if let Some(first) = finish(at_budget(READ_BATCH_TOKEN_BUDGET)) {
         return Some(first);
     }
 
@@ -1132,8 +1350,7 @@ fn assemble_fitting(
     let mut best = None;
     while low <= high {
         let budget = low + (high - low) / 2;
-        let candidate = assemble_at_budget(segments.to_vec(), include_bodies, meter, budget);
-        if let Some(candidate) = finish(candidate) {
+        if let Some(candidate) = finish(at_budget(budget)) {
             best = Some(candidate);
             low = budget + 1;
         } else {
@@ -1153,23 +1370,34 @@ fn assemble_at_budget(
     meter: &dyn TokenMeter,
     batch_budget: u32,
 ) -> ReadBatchEnvelope {
-    let lengths: Vec<u32> = segments
-        .iter()
-        .map(|segment| estimate_len(segment, meter))
-        .collect();
-    let separator_budget = meter.count(&"\n".repeat(segments.len().saturating_sub(1)));
-    let affordances = distinct_affordances(&segments);
-    let affordance_budget: u32 = affordances
-        .iter()
-        .map(|affordance| meter.count(&format!("\n\n{}", affordance.block)))
-        .sum();
-    let total_budget = batch_budget
-        .saturating_sub(separator_budget)
-        .saturating_sub(affordance_budget);
-    let budgets = fair_share_budgets(&lengths, total_budget);
-    compose(segments, include_bodies, affordances, |segment, index| {
-        render_segment(segment, budgets[index], meter)
-    })
+    let meter = Metering::new(meter);
+    let share = FairShare::new(&segments, Carried::ALL, &meter);
+    compose_at_budget(
+        &segments,
+        Carried::ALL,
+        &share,
+        include_bodies,
+        &meter,
+        batch_budget,
+    )
+}
+
+fn compose_at_budget<'t>(
+    segments: &'t [ReadSegment],
+    carried: Carried,
+    share: &FairShare,
+    include_bodies: bool,
+    meter: &Metering<'t, '_>,
+    batch_budget: u32,
+) -> ReadBatchEnvelope {
+    let budgets = fair_share_budgets(&share.lengths, batch_budget.saturating_sub(share.reserved));
+    compose(
+        segments,
+        carried,
+        include_bodies,
+        &share.affordances,
+        |segment, index| render_with(segment, carried.history(segment), budgets[index], meter),
+    )
 }
 
 /// Compose a batch with every target whole: no token budget and no client
@@ -1178,40 +1406,49 @@ fn assemble_at_budget(
 /// ceiling, so the reader gets a refusal it can act on instead of a body cut
 /// partway through.
 fn assemble_whole(
-    segments: Vec<ReadSegment>,
+    segments: &[ReadSegment],
     include_bodies: bool,
     byte_ceiling: usize,
 ) -> ReadBatchEnvelope {
-    let affordances = distinct_affordances(&segments);
-    compose(segments, include_bodies, affordances, |segment, _| {
-        let rendered = render_segment(segment, u32::MAX, &ByteMeter);
-        if rendered.text.len() <= byte_ceiling {
-            return rendered;
-        }
-        let refusal = format!(
-            "{} renders {} bytes, more than the {byte_ceiling}-byte ceiling a whole read carries for one target. It is refused rather than cut, because a cut body is not the answer it claims to be (cut JSON does not parse). Narrow the read, for example with a smaller `limit`, a `path`, or a line range, and read it in parts.",
-            bounded_uri_label(&rendered.meta.uri),
-            rendered.text.len(),
-        );
-        render_segment(
-            error_segment(rendered.meta.uri, refusal),
-            u32::MAX,
-            &ByteMeter,
-        )
-    })
+    let meter = Metering::new(&ByteMeter);
+    let affordances = distinct_affordances(segments, Carried::ALL);
+    compose(
+        segments,
+        Carried::ALL,
+        include_bodies,
+        &affordances,
+        |segment, _| {
+            let rendered = render_with(segment, segment.history.as_deref(), u32::MAX, &meter);
+            if rendered.text.len() <= byte_ceiling {
+                return rendered;
+            }
+            let refusal = format!(
+                "{} renders {} bytes, more than the {byte_ceiling}-byte ceiling a whole read carries for one target. It is refused rather than cut, because a cut body is not the answer it claims to be (cut JSON does not parse). Narrow the read, for example with a smaller `limit`, a `path`, or a line range, and read it in parts.",
+                bounded_uri_label(&rendered.meta.uri),
+                rendered.text.len(),
+            );
+            render_segment(
+                error_segment(rendered.meta.uri, refusal),
+                u32::MAX,
+                &ByteMeter,
+            )
+        },
+    )
 }
 
-/// The batch's affordance blocks, deduped by `(kind, block)` in first-seen
-/// order: what the composed text appends once after all content.
-fn distinct_affordances(segments: &[ReadSegment]) -> Vec<Affordance> {
+/// The affordance blocks a pass carries, deduped by `(kind, block)` in
+/// first-seen order: what the composed text appends once after all content.
+fn distinct_affordances(segments: &[ReadSegment], carried: Carried) -> Vec<Affordance> {
     let mut affordances: Vec<Affordance> = Vec::new();
-    for segment in segments {
-        if let Some(affordance) = &segment.affordance {
-            if !affordances.iter().any(|existing| {
-                existing.kind == affordance.kind && existing.block == affordance.block
-            }) {
-                affordances.push(affordance.clone());
-            }
+    for affordance in segments
+        .iter()
+        .filter_map(|segment| carried.affordance(segment))
+    {
+        if !affordances
+            .iter()
+            .any(|existing| existing.kind == affordance.kind && existing.block == affordance.block)
+        {
+            affordances.push(affordance.clone());
         }
     }
     affordances
@@ -1220,21 +1457,22 @@ fn distinct_affordances(segments: &[ReadSegment]) -> Vec<Affordance> {
 /// Join rendered segments into one envelope: sections in input order, then
 /// the deduped affordance blocks. `render` turns the segment at an index into
 /// its final section; how much of it survives is the caller's budget.
-fn compose(
-    segments: Vec<ReadSegment>,
+fn compose<'t>(
+    segments: &'t [ReadSegment],
+    carried: Carried,
     include_bodies: bool,
-    affordances: Vec<Affordance>,
-    mut render: impl FnMut(ReadSegment, usize) -> RenderedSegment,
+    affordances: &[Affordance],
+    mut render: impl FnMut(&'t ReadSegment, usize) -> RenderedSegment,
 ) -> ReadBatchEnvelope {
     let structured_affordances: Vec<Affordance> = segments
         .iter()
-        .filter_map(|segment| segment.affordance.clone())
+        .filter_map(|segment| carried.affordance(segment).cloned())
         .collect();
     let mut text = String::new();
     let mut images = Vec::new();
     let mut metas: Vec<SegmentMeta> = Vec::new();
     let mut bodies = include_bodies.then(|| Vec::with_capacity(segments.len()));
-    for (index, segment) in segments.into_iter().enumerate() {
+    for (index, segment) in segments.iter().enumerate() {
         let rendered = render(segment, index);
         if !text.is_empty() {
             text.push('\n');
@@ -2216,9 +2454,10 @@ mod tests {
 
     #[test]
     fn equal_token_budgets_cut_different_byte_lengths_by_density() {
-        let meter = DensityMeter;
-        let dense = cut_body(&"!".repeat(100), 10, false, None, &meter);
-        let sparse = cut_body(&"a".repeat(100), 10, false, None, &meter);
+        let (dense_body, sparse_body) = ("!".repeat(100), "a".repeat(100));
+        let meter = Metering::new(&DensityMeter);
+        let dense = cut_body(&dense_body, 10, false, None, &meter);
+        let sparse = cut_body(&sparse_body, 10, false, None, &meter);
 
         assert_eq!(dense.body.len(), 10);
         assert_eq!(sparse.body.len(), 40);
@@ -2491,5 +2730,155 @@ mod tests {
         assert!(!envelope.text.contains("body text"));
         assert_eq!(envelope.segments[1].kind, SegmentKind::Resource);
         assert_eq!(bodies[1], "small body");
+    }
+
+    /// Records the length of every text its inner meter is asked about.
+    struct Recording<'a> {
+        inner: &'a dyn TokenMeter,
+        counts: std::sync::Mutex<Vec<usize>>,
+        cuts: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl<'a> Recording<'a> {
+        fn new(inner: &'a dyn TokenMeter) -> Self {
+            Self {
+                inner,
+                counts: Default::default(),
+                cuts: Default::default(),
+            }
+        }
+
+        fn counts_of(&self, len: usize) -> usize {
+            self.counts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|counted| **counted == len)
+                .count()
+        }
+    }
+
+    impl TokenMeter for Recording<'_> {
+        fn count(&self, text: &str) -> u32 {
+            self.counts.lock().unwrap().push(text.len());
+            self.inner.count(text)
+        }
+
+        fn cut(&self, text: &str, budget: u32) -> Cut {
+            self.cuts.lock().unwrap().push(text.len());
+            self.inner.cut(text, budget)
+        }
+    }
+
+    fn numbered_lines(lines: usize, width: usize) -> String {
+        (1..=lines)
+            .map(|line| format!("{line:>6}\t{}", "x".repeat(width)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_bounded_read_counts_its_body_once_and_never_cuts_it_whole() {
+        let body = numbered_lines(20_000, 60);
+        let meter = Recording::new(&DensityMeter);
+
+        let rendered = render_segment_bounded(file_seg("file:big.rs", &body, 20_000, 0), &meter);
+
+        // The byte-ceiling search ran: the context budget alone renders past it.
+        assert!(
+            DensityMeter.count(&body[..CLIENT_TOOL_RESULT_BYTE_CEILING]) < READ_BATCH_TOKEN_BUDGET
+        );
+        assert!(rendered.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING);
+        assert!(rendered.text.contains("continue: file:big.rs?offset="));
+        assert_eq!(meter.counts_of(body.len()), 1, "the body is counted once");
+        let cuts = meter.cuts.lock().unwrap();
+        assert!(
+            cuts.iter().all(|len| *len < body.len() / 4),
+            "every cut reads a window of the body: {cuts:?}"
+        );
+    }
+
+    #[test]
+    fn a_batch_search_counts_each_body_once() {
+        let bodies: Vec<String> = (0..4)
+            .map(|i| numbered_lines(3_000 + i * 100, 50))
+            .collect();
+        let segments = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| file_seg(&format!("file:part-{i}.txt"), body, body.lines().count(), 0))
+            .collect();
+        let meter = Recording::new(&DensityMeter);
+
+        let envelope = assemble(segments, ReadBudget::Context, &meter);
+
+        assert!(envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING);
+        assert_eq!(envelope.text.matches("continue:").count(), 4);
+        for body in &bodies {
+            assert_eq!(meter.counts_of(body.len()), 1, "each body is counted once");
+        }
+    }
+
+    #[test]
+    fn a_windowed_cut_is_the_meters_cut_of_the_whole_text() {
+        let text: String = (0..5_000)
+            .map(|i| match i % 7 {
+                0 => "!!!!!!!!\n".to_string(),
+                _ => format!("line {i} of sparse text\n"),
+            })
+            .collect();
+        for meter in [&BYTE_METER as &dyn TokenMeter, &DensityMeter] {
+            let metering = Metering::new(meter);
+            for budget in (0..meter.count(&text) + 10).step_by(97) {
+                assert_eq!(
+                    metering.body_cut(&text, budget),
+                    meter.cut(&text, budget),
+                    "budget {budget}"
+                );
+            }
+        }
+    }
+
+    /// The premise of [`skip_passes_keeping_lines`]: for these meters, every
+    /// smaller budget that still covers the prefix through the cut's newline
+    /// keeps exactly the same lines.
+    #[test]
+    fn a_smaller_budget_that_covers_the_kept_lines_cuts_the_same_lines() {
+        let body = "short\na somewhat longer line\n\n!!!!\nx\n".repeat(30);
+        for meter in [&BYTE_METER as &dyn TokenMeter, &DensityMeter] {
+            let metering = Metering::new(meter);
+            for budget in 1..metering.body_tokens(&body) {
+                let cut = cut_body(&body, budget, false, None, &metering);
+                let Some(through) = cut.through_newline else {
+                    continue;
+                };
+                for smaller in metering.body_tokens(&body[..through])..=budget {
+                    assert_eq!(
+                        cut_body(&body, smaller, false, None, &metering).body,
+                        cut.body,
+                        "budget {budget}, smaller {smaller}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn skipping_passes_lands_where_shrinking_one_pass_at_a_time_would() {
+        for budget in 0..120 {
+            for step in 1..9 {
+                for keeps_lines_from in 1..130 {
+                    let mut one_at_a_time = budget;
+                    while one_at_a_time >= keeps_lines_from {
+                        one_at_a_time = u32::saturating_sub(one_at_a_time, step);
+                    }
+                    assert_eq!(
+                        skip_passes_keeping_lines(budget, step, keeps_lines_from),
+                        one_at_a_time,
+                        "budget {budget}, step {step}, keeps lines from {keeps_lines_from}"
+                    );
+                }
+            }
+        }
     }
 }

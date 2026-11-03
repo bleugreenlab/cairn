@@ -192,6 +192,18 @@ fn main() {
     println!("|---|---|---|---|---|---|---|");
     for (name, meter) in &meters {
         let reads: Vec<Read> = vec![
+            // An agent's `read` composes even a single target through `assemble`,
+            // whose fair share measures the target before rendering it.
+            ("1 MB file, read as a batch of one".into(), {
+                let text = body("code", 1 << 20);
+                Box::new(move |meter| {
+                    black_box(assemble(
+                        vec![segment("file:big.rs", &text)],
+                        ReadBudget::Context,
+                        meter,
+                    ));
+                })
+            }),
             ("1 MB file".into(), {
                 let text = body("code", 1 << 20);
                 Box::new(move |meter| {

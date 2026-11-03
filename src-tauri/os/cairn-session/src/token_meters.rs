@@ -93,17 +93,18 @@ impl TokenMeter for O200kTokenMeter {
             .take(budget as usize + 1)
             .sum::<usize>()
             .min(text.len());
+        // Each candidate prefix is recounted from the last pre-token split at or
+        // before the window rather than from the start of the text: the prefix's
+        // tokens before the split are the text's own.
+        let split = o200k_split_before(text, start);
+        let (split, split_tokens) =
+            tokens_before(&token_bytes, split).map_or((0, 0), |tokens| (split, tokens));
         let mut best = Cut {
             byte_offset: 0,
             tokens: 0,
         };
-        for byte_offset in text
-            .char_indices()
-            .map(|(at, _)| at)
-            .chain(std::iter::once(text.len()))
-            .filter(|at| *at >= start && *at <= end)
-        {
-            let count = self.count(&text[..byte_offset]);
+        for byte_offset in (start..=end).filter(|at| text.is_char_boundary(*at)) {
+            let count = split_tokens + self.count(&text[split..byte_offset]);
             if count <= budget && byte_offset >= best.byte_offset {
                 best = Cut {
                     byte_offset,
@@ -113,6 +114,64 @@ impl TokenMeter for O200kTokenMeter {
         }
         best
     }
+}
+
+/// The last offset at or before `limit` where o200k's pre-tokenizer must split
+/// `text`, or 0 when there is none. See [`o200k_must_split`] for where that is.
+fn o200k_split_before(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    for (at, before) in text[..end].char_indices().rev() {
+        let split = at + before.len_utf8();
+        if o200k_must_split(before, &text[split..]) {
+            return split;
+        }
+    }
+    0
+}
+
+/// Whether every prefix of a text that reaches past the point between `before`
+/// and `rest` pre-tokenizes, under the o200k pattern, as the text before that
+/// point followed by `rest`'s prefix on its own.
+///
+/// That holds where no alternative of the pattern can run across the point,
+/// because the pattern has no lookbehind and BPE never merges across
+/// pre-tokens. Two such points are recognized:
+///
+/// - Between a non-whitespace character and whitespace other than `\r` or
+///   `\n`. The word, number and punctuation alternatives end at whitespace,
+///   except a punctuation run's `[\r\n/]*` tail, which takes only `\r` and `\n`.
+/// - Right after a newline, when `rest` does not open with `/` and its leading
+///   whitespace holds no further `\r` or `\n`. The word alternatives exclude
+///   `\r\n`, a whitespace run that holds a newline matches `\s*[\r\n]+` and ends
+///   at its last newline, and the punctuation tail could take only a `/`.
+fn o200k_must_split(before: char, rest: &str) -> bool {
+    let Some(next) = rest.chars().next() else {
+        return false;
+    };
+    if before == '\n' {
+        return next != '/'
+            && rest
+                .chars()
+                .take_while(|ch| ch.is_whitespace())
+                .all(|ch| ch != '\r' && ch != '\n');
+    }
+    !before.is_whitespace() && next.is_whitespace() && next != '\r' && next != '\n'
+}
+
+/// How many of a text's tokens, given by byte length, lie before `split`, or
+/// `None` when `split` falls inside a token.
+fn tokens_before(token_bytes: &[usize], split: usize) -> Option<u32> {
+    let mut end = 0;
+    for (index, bytes) in token_bytes.iter().enumerate() {
+        if end >= split {
+            return (end == split).then_some(index as u32);
+        }
+        end += bytes;
+    }
+    (end == split).then_some(token_bytes.len() as u32)
 }
 
 /// A meter over a model's own tokenizer, through toks. Built only by the
@@ -622,6 +681,95 @@ mod tests {
             cut.tokens,
             O200K_TOKEN_METER.count(&text[..cut.byte_offset])
         );
+    }
+
+    /// o200k's cut with every candidate prefix recounted from the start of the
+    /// text: the definition the split recount must reproduce exactly.
+    fn o200k_cut_by_whole_prefix(text: &str, budget: u32) -> Cut {
+        let tokens = o200k().encode_ordinary(text);
+        if tokens.len() <= budget as usize {
+            return O200K_TOKEN_METER.cut(text, budget);
+        }
+        let token_bytes: Vec<usize> = o200k()
+            ._decode_native_and_split(tokens)
+            .map(|bytes| bytes.len())
+            .collect();
+        let start: usize = token_bytes
+            .iter()
+            .take(budget.saturating_sub(1) as usize)
+            .sum();
+        let end = token_bytes
+            .iter()
+            .take(budget as usize + 1)
+            .sum::<usize>()
+            .min(text.len());
+        let mut best = Cut {
+            byte_offset: 0,
+            tokens: 0,
+        };
+        for byte_offset in (start..=end).filter(|at| text.is_char_boundary(*at)) {
+            let count = O200K_TOKEN_METER.count(&text[..byte_offset]);
+            if count <= budget && byte_offset >= best.byte_offset {
+                best = Cut {
+                    byte_offset,
+                    tokens: count,
+                };
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn o200k_cut_recounted_from_a_split_matches_a_whole_prefix_recount() {
+        let lines = [
+            "fn main() {",
+            "    let x = compute(&input[3..], 9)?;  ",
+            "",
+            "/// doc comment",
+            "/path/to/file",
+            "};",
+            "\t\tindented",
+            "   ",
+            "a/b//c",
+            "\u{65e5}\u{672c}\u{8a9e} cafe\u{301} \u{1f600}",
+            "12345678901",
+            "don't stop",
+            "a;\u{a0}b\u{85}c \t d",
+            "x  ,  y\u{3000}z",
+        ];
+        let text: String = (0..240)
+            .map(|i| {
+                let line = lines[(i * 7) % lines.len()];
+                let ending = if i % 5 == 0 { "\r\n" } else { "\n" };
+                if i % 3 == 0 {
+                    format!("{line}{ending}")
+                } else {
+                    format!("{:>6}\t{line}{ending}", i + 1)
+                }
+            })
+            .collect();
+        // The same lines run together, so only splits inside a line apply.
+        let one_line = text.replace(['\r', '\n'], " ");
+        for text in [text, one_line] {
+            let total = O200K_TOKEN_METER.count(&text);
+            for budget in (0..total).step_by(23) {
+                assert_eq!(
+                    O200K_TOKEN_METER.cut(&text, budget),
+                    o200k_cut_by_whole_prefix(&text, budget),
+                    "budget {budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_o200k_split_never_precedes_a_slash_or_another_newline() {
+        assert_eq!(o200k_split_before("a;\n/b", 5), 0);
+        assert_eq!(o200k_split_before("ab\n  \nc", 7), 6);
+        assert_eq!(o200k_split_before("ab\n  c", 6), 3);
+        assert_eq!(o200k_split_before("ab\r\nc", 5), 4);
+        assert_eq!(o200k_split_before("one word", 8), 3);
+        assert_eq!(o200k_split_before(";\r\n", 3), 0);
     }
 
     fn digest_of(family: &str) -> [u8; 32] {
