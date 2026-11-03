@@ -111,6 +111,14 @@ pub fn store(endpoint_id: &str, secret: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Register a provider's own signing secret, which lives with the provider's
+/// credentials (the GitHub App's `webhook_secret`) rather than in the
+/// keychain. Nothing is written and nothing is marked held: there is no Copy
+/// for a secret the provider already has.
+pub fn hold_provider_secret(endpoint_id: &str, secret: &str) {
+    hold(endpoint_id, secret);
+}
+
 /// Drop the registration and delete the keychain entry. Succeeds when there
 /// was none.
 pub fn forget(endpoint_id: &str) -> Result<(), String> {
@@ -199,6 +207,18 @@ mod tests {
         );
         forget(id).unwrap();
         assert!(!held(id));
+        assert!(!is_registered(id));
+    }
+
+    #[test]
+    fn a_provider_secret_is_registered_but_not_held_or_stored() {
+        crate::config::secrets::mock_keychain::install();
+        let id = "src_custody_provider";
+        hold_provider_secret(id, "Pw3kX8m-provider-signing-secret-value");
+        assert!(is_registered(id));
+        assert!(!held(id));
+        assert_eq!(reveal_for_copy(id), None);
+        forget(id).unwrap();
         assert!(!is_registered(id));
     }
 

@@ -1812,15 +1812,27 @@ mod tests {
     #[test]
     fn only_the_terminal_name_takes_a_user_policy() {
         use super::addressed_confirm_policy as policy;
-        assert_eq!(policy(Some("plan"), Some("plan"), ConfirmPolicy::User), ConfirmPolicy::User);
-        assert_eq!(policy(None, Some("plan"), ConfirmPolicy::User), ConfirmPolicy::User);
-        assert_eq!(policy(Some("plan"), None, ConfirmPolicy::User), ConfirmPolicy::User);
+        assert_eq!(
+            policy(Some("plan"), Some("plan"), ConfirmPolicy::User),
+            ConfirmPolicy::User
+        );
+        assert_eq!(
+            policy(None, Some("plan"), ConfirmPolicy::User),
+            ConfirmPolicy::User
+        );
+        assert_eq!(
+            policy(Some("plan"), None, ConfirmPolicy::User),
+            ConfirmPolicy::User
+        );
         assert_eq!(
             policy(Some("notes"), Some("plan"), ConfirmPolicy::User),
             ConfirmPolicy::Auto,
             "a second chain beside the terminal is never a gate"
         );
-        assert_eq!(policy(Some("notes"), Some("plan"), ConfirmPolicy::Auto), ConfirmPolicy::Auto);
+        assert_eq!(
+            policy(Some("notes"), Some("plan"), ConfirmPolicy::Auto),
+            ConfirmPolicy::Auto
+        );
     }
 
     #[test]

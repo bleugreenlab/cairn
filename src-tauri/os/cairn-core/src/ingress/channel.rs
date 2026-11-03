@@ -37,6 +37,8 @@ pub struct RelaySignals {
     repaired: Notify,
     repair_generation: AtomicU64,
     channel_changed: Notify,
+    github_app_changed: Notify,
+    github_app: Mutex<()>,
 }
 
 impl RelaySignals {
@@ -68,6 +70,27 @@ impl RelaySignals {
 
     pub fn notify_channel_changed(&self) {
         self.channel_changed.notify_one();
+        // The App's endpoint lives on the channel, so its maintainer has to
+        // hear of a change too. It has a signal of its own: `notify_one` wakes
+        // one waiter, and the doorbell is this one's.
+        self.github_app_changed.notify_one();
+    }
+
+    /// Resolves when the GitHub App's endpoint may need minting or
+    /// repointing: the App was connected or disconnected, or the channel
+    /// changed. [`crate::github::webhook::maintain`] is the one waiter.
+    pub async fn github_app_changed(&self) {
+        self.github_app_changed.notified().await;
+    }
+
+    pub fn notify_github_app_changed(&self) {
+        self.github_app_changed.notify_one();
+    }
+
+    /// Serializes [`crate::github::webhook::ensure`]. Not the operation lock:
+    /// minting can register the channel, which takes that one.
+    pub fn github_app_lock(&self) -> &Mutex<()> {
+        &self.github_app
     }
 }
 

@@ -814,20 +814,45 @@ pub(crate) async fn fetch_run_logs(
     Ok(resp.body)
 }
 
-/// Update GitHub App's webhook URL via REST API.
+/// The App's webhook configuration, as much of it as GitHub shows: it masks
+/// the secret, so only the URL is read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AppWebhookConfig {
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Read the App's webhook configuration. App-level JWT authentication.
+pub async fn get_app_webhook_config(
+    http: &dyn HttpClient,
+    app: &AppAuthority,
+) -> Result<AppWebhookConfig, String> {
+    let resp = app
+        .get(http, &format!("{}/app/hook/config", GITHUB_API_BASE))
+        .await?;
+    ensure_github_api_success(&resp)?;
+    resp.json()
+}
+
+/// Point the App's webhook at `new_webhook_url`, and when `secret` is given,
+/// make it the secret GitHub signs deliveries with.
 ///
 /// Requires App-level JWT authentication (not installation token).
 pub async fn update_app_webhook_url(
     http: &dyn HttpClient,
     app: &AppAuthority,
     new_webhook_url: &str,
+    secret: Option<&str>,
 ) -> Result<(), String> {
     let url = format!("{}/app/hook/config", GITHUB_API_BASE);
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "url": new_webhook_url,
         "content_type": "json"
     });
+    if let Some(secret) = secret {
+        body["secret"] = serde_json::json!(secret);
+    }
 
     let resp = app.patch(http, &url, body).await?;
     check_rate_limit(&resp)?;

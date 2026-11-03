@@ -1038,6 +1038,16 @@ pub(crate) mod fixture {
         temp: &Path,
         routes: &[(&str, &str)],
     ) -> (Orchestrator, Arc<LocalDb>) {
+        orchestrator_with(temp, routes, TestServicesBuilder::new()).await
+    }
+
+    /// [`orchestrator`] over the given services, for a test that needs a git
+    /// or HTTP mock of its own.
+    pub(crate) async fn orchestrator_with(
+        temp: &Path,
+        routes: &[(&str, &str)],
+        services: TestServicesBuilder,
+    ) -> (Orchestrator, Arc<LocalDb>) {
         let config = temp.join("config");
         // A bare config dir: no pack sync runs here, so the only routes are
         // the ones each test declares.
@@ -1056,7 +1066,7 @@ pub(crate) mod fixture {
         let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());
         let orch = Orchestrator::builder(
             Arc::new(DbState::new(db.clone(), search)),
-            Arc::new(TestServicesBuilder::new().build()),
+            Arc::new(services.build()),
             config,
         )
         .boot_at(0)

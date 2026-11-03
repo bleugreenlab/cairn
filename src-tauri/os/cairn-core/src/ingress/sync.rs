@@ -2,7 +2,9 @@
 //! endpoint's events and the GitHub App's webhooks on one shared cursor.
 //!
 //! Each event is handled on its own. An endpoint event goes to
-//! [`super::consume`]; a GitHub event goes to [`crate::github::relay`]. An
+//! [`super::consume`], which hands the GitHub App endpoint's events on to
+//! [`crate::github::relay`]; a legacy `/hook` GitHub event (one with no
+//! endpoint) goes to [`crate::github::relay`] directly. An
 //! event that cannot be handled is recorded and skipped, and the cursor moves
 //! past it, so one poison event never parks the feed for the events behind
 //! it. The one exception is a key mismatch, which means every later event is
@@ -343,6 +345,7 @@ async fn handle_event(
             received_at: event.received_at.clone(),
             body,
         },
+        ctx.app_slug,
     )
     .await;
     Ok(match consumed {
@@ -536,6 +539,10 @@ pub fn spawn(orch: Orchestrator, relay_url: String) {
         let orch = orch.clone();
         async move { super::custody::restore(&orch.db.local).await }
     });
+    tokio::spawn(crate::github::webhook::maintain(
+        orch.clone(),
+        relay_url.clone(),
+    ));
     tokio::spawn(super::ws::maintain(
         orch.clone(),
         relay_url.clone(),
@@ -1019,6 +1026,66 @@ mod tests {
         assert_eq!(channel.undeliverable_since_healthy, 0);
         assert!(channel.failing_event_id.is_none());
         assert!(channel.last_successful_delivery_at.is_some());
+    }
+
+    /// The same poison through the GitHub App's endpoint is an `undeliverable`
+    /// row that keeps its body, and the bug event behind it is still
+    /// delivered.
+    #[tokio::test]
+    async fn a_failing_github_app_endpoint_event_is_undeliverable_and_does_not_park_the_feed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = crate::routes::fixture::orchestrator(temp.path(), &[]).await;
+        let feed = SealedFeed::new(&db).await;
+        crate::ingress::consume::tests::github_app_endpoint(&db).await;
+        let through_endpoint = |id: i64| RelayEvent {
+            endpoint_id: Some("src_app".into()),
+            delivery_id: Some(format!("gh-{id}")),
+            verification: Some("github".into()),
+            ..feed.poison_github_event(id)
+        };
+
+        apply_page(&orch, vec![through_endpoint(1)], &feed.ctx())
+            .await
+            .unwrap();
+        let channel = channel::get_relay_channel(&db).await.unwrap();
+        assert_eq!(channel.health_state.as_deref(), Some("skipping"));
+        assert_eq!(
+            channel.health_reason.as_deref(),
+            Some("relay_event_processing_failed")
+        );
+
+        let bug = feed.bug_event(3, "src_bugs", 7);
+        let bug_cursor = event_cursor(&bug);
+        let cursor = apply_page(&orch, vec![through_endpoint(2), bug], &feed.ctx())
+            .await
+            .unwrap();
+        assert_eq!(cursor.as_deref(), Some(bug_cursor.as_str()));
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ingress_events WHERE endpoint_id = 'src_app' AND status = 'undeliverable' AND body LIKE '%not-a-repository-name%'"
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ingress_events WHERE status = 'ok' AND delivery_id = 'bug-report:7'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'ingress'"
+            )
+            .await,
+            1
+        );
+        let channel = channel::get_relay_channel(&db).await.unwrap();
+        assert_eq!(channel.health_state.as_deref(), Some("healthy"));
     }
 
     /// An endpoint event this install cannot deliver is recorded undeliverable,

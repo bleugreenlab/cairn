@@ -1,8 +1,11 @@
 //! GitHub App webhooks delivered over the install's relay channel.
 //!
-//! [`crate::ingress::sync`] reads the channel and opens each event; a
-//! webhook (an event with no endpoint) comes here. A mention of the App
-//! becomes a route fact, and a branch push reaches the base-branch sync.
+//! [`crate::ingress::sync`] reads the channel and opens each event. A webhook
+//! reaches [`process_event`] one of two ways: through the App's own endpoint
+//! (`/e/:id`, signature-verified by the api), via [`crate::ingress::consume`],
+//! or as a legacy `/hook` event with no endpoint, via [`handle_github_event`].
+//! A mention of the App becomes a route fact, and a branch push reaches the
+//! base-branch sync.
 
 use std::collections::BTreeMap;
 
@@ -160,6 +163,18 @@ pub enum ProcessEventOutcome {
     BranchPush,
 }
 
+impl ProcessEventOutcome {
+    /// How an `ingress_events` row names the outcome.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ignored => "ignored",
+            Self::UnmappedMention => "unmapped_mention",
+            Self::Routed => "routed",
+            Self::BranchPush => "push",
+        }
+    }
+}
+
 /// The `push` fields the base-branch sync needs, when this is a push that left
 /// a branch (not a tag, not a deletion) at a new commit.
 fn branch_push(event_type: &str, payload: &Value) -> Option<BranchPush> {
@@ -284,12 +299,16 @@ async fn handle_branch_push(
     })
 }
 
+/// Handle one App webhook. `origin` is who a mention's fact is from: the
+/// verified GitHub sender for an endpoint delivery, this machine for a legacy
+/// `/hook` one nothing verified.
 pub async fn process_event(
     orch: &Orchestrator,
     event_id: i64,
     event_type: &str,
     payload: &Value,
     app_slug: &str,
+    origin: crate::issues::crud::IssueAuthorship,
 ) -> Result<ProcessEventOutcome, String> {
     if let Some(push) = branch_push(event_type, payload) {
         // Like minting, the relay's obligation ends at handing the push off:
@@ -351,11 +370,7 @@ pub async fn process_event(
     crate::routes::mint(
         orch,
         crate::routes::Mint {
-            fact: comment_fact(
-                &comment,
-                &project.key,
-                crate::routes::installation_machine_origin(orch)?,
-            ),
+            fact: comment_fact(&comment, &project.key, origin),
             record_ref: comment.url.clone(),
             record_id: Some(comment.comment_id.to_string()),
             project_id: Some(&project.id),
@@ -404,7 +419,21 @@ pub(crate) async fn handle_github_event(
             detail: "no GitHub App is connected on this install".into(),
         };
     };
-    match process_event(orch, event.id, &event.event_type, &payload, app_slug).await {
+    let processed = match crate::routes::installation_machine_origin(orch) {
+        Ok(origin) => {
+            process_event(
+                orch,
+                event.id,
+                &event.event_type,
+                &payload,
+                app_slug,
+                origin,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    match processed {
         Ok(_) if decrypted => EventOutcome::Delivered,
         Ok(_) => EventOutcome::PassedOver,
         Err(error) => {
@@ -449,6 +478,10 @@ mod tests {
         (orch, db)
     }
 
+    fn machine(orch: &Orchestrator) -> crate::issues::crud::IssueAuthorship {
+        crate::routes::installation_machine_origin(orch).unwrap()
+    }
+
     fn comment(author: &str, author_type: &str, body: &str) -> Value {
         json!({
             "action": "created",
@@ -468,6 +501,7 @@ mod tests {
             "issue_comment",
             &comment("alice", "User", "hello"),
             "cairn-app",
+            machine(&orch),
         )
         .await
         .unwrap();
@@ -481,9 +515,16 @@ mod tests {
         let mut payload = comment("alice", "User", "@cairn-app please investigate");
         payload["repository"]["full_name"] = json!("unknown/repository");
 
-        let outcome = process_event(&orch, 101, "issue_comment", &payload, "cairn-app")
-            .await
-            .unwrap();
+        let outcome = process_event(
+            &orch,
+            101,
+            "issue_comment",
+            &payload,
+            "cairn-app",
+            machine(&orch),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ProcessEventOutcome::UnmappedMention);
         let credentials = credentials::get_github_credentials(&db).await.unwrap();
@@ -626,6 +667,75 @@ mod tests {
         );
     }
 
+    /// A default-branch push through the App's endpoint reaches the
+    /// base-branch sync, and its row says so without keeping the body.
+    #[tokio::test]
+    async fn a_default_branch_push_through_the_app_endpoint_reaches_the_sync() {
+        use crate::services::testing::MockGitClient;
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .returning(|_| Ok("git@github.com:acme/repo.git".into()));
+        git.expect_status()
+            .returning(|_| Ok(" M src/lib.rs".into()));
+        git.expect_fetch_origin_branch()
+            .returning(|_, _| Err("git fetch origin failed: offline".into()));
+        let (orch, db) = crate::routes::fixture::orchestrator_with(
+            temp.path(),
+            &[],
+            crate::services::testing::TestServicesBuilder::new().with_git(git),
+        )
+        .await;
+        db.execute(
+            "UPDATE projects SET default_branch = 'main' WHERE id = 'p'",
+            (),
+        )
+        .await
+        .unwrap();
+        crate::ingress::consume::tests::github_app_endpoint(&db).await;
+
+        let consumed = crate::ingress::consume::consume(
+            &orch,
+            crate::ingress::consume::tests::app_event(
+                60,
+                "push",
+                push("refs/heads/main", "acme/repo"),
+            ),
+            Some("cairn-app"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                consumed,
+                crate::ingress::consume::Consumed::Delivered { .. }
+            ),
+            "{consumed:?}"
+        );
+        let row = crate::ingress::recent_events(&db, "src_app", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.note.as_deref(), Some("github:push"));
+        assert_eq!(row.body, None);
+        let observed = async {
+            loop {
+                if let Some(state) = orch.base_branch_sync.snapshot("p", "main") {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        let state = tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+            .await
+            .expect("the push reached the base-branch sync");
+        assert_eq!(
+            state.remote_tip.as_deref(),
+            Some("9e77a2750000000000000000000000000000000b")
+        );
+    }
+
     #[tokio::test]
     async fn process_event_hands_a_default_branch_push_off_and_still_routes_mentions() {
         let (orch, _) = test_orchestrator("relay-push-outcome.db").await;
@@ -635,6 +745,7 @@ mod tests {
             "push",
             &push("refs/heads/main", "acme/repo"),
             "cairn-app",
+            machine(&orch),
         )
         .await
         .unwrap();
@@ -645,6 +756,7 @@ mod tests {
             "push",
             &push("refs/tags/v1", "acme/repo"),
             "cairn-app",
+            machine(&orch),
         )
         .await
         .unwrap();

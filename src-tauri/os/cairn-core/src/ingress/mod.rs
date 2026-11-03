@@ -6,8 +6,11 @@
 //! the same feed as the GitHub App's. The relay consumer hands each endpoint
 //! event to [`consume::consume`], which records it in `ingress_events` (the
 //! canonical local record, delivered or not) and mints one `ingress` fact log
-//! row pointing at it. Thread wakes then come from the fact log's standing
-//! triggers, coalesced per thread and source like any other fact.
+//! row pointing at it. The GitHub App's own endpoint
+//! ([`EndpointRecord::is_github_app`]) is the exception: its events are App
+//! webhooks, handed on to [`crate::github::relay`]. Thread wakes then come
+//! from the fact log's standing triggers, coalesced per thread and source like
+//! any other fact.
 //!
 //! This module owns the two local tables: `ingress_endpoints`, this install's
 //! mirror of the endpoints it minted, and `ingress_events`.
@@ -82,6 +85,14 @@ pub struct EndpointRecord {
 impl EndpointRecord {
     pub fn is_active(&self) -> bool {
         self.status == "active"
+    }
+
+    /// Whether this is the GitHub App's own endpoint: a `github` endpoint
+    /// scoped to the install rather than a project. Its events are App
+    /// webhooks and go to [`crate::github::relay`]; a project-scoped `github`
+    /// endpoint an agent minted is generic ingress like any other.
+    pub fn is_github_app(&self) -> bool {
+        self.provider == "github" && self.project_id.is_none()
     }
 }
 

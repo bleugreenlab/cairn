@@ -1,11 +1,17 @@
 //! Turning one endpoint event from the relay into a recorded delivery and an
-//! `ingress` fact.
+//! `ingress` fact, or, for the GitHub App's own endpoint, into whatever
+//! [`crate::github::relay`] makes of an App webhook.
 //!
 //! Called from the relay loop, and nothing else: it imports nothing from the
 //! channel router, and nothing in the channel sweep or backlog seal awaits it.
 //! Every outcome is recorded in `ingress_events`, so an event that could not
 //! be delivered is visible there rather than silently dropped, and the relay
 //! cursor moves past it either way.
+//!
+//! A GitHub App event that went through keeps no body: the App subscribes to
+//! check runs, pushes and pull requests, thousands of events a day on a busy
+//! repository, and the row is what is read back when one fails. Its body is
+//! kept only when it is undeliverable.
 
 use std::collections::BTreeMap;
 
@@ -218,8 +224,14 @@ pub(crate) fn ingress_identity(endpoint_id: &str, delivery_key: &str) -> String 
     format!("ingress:{endpoint_id}:{delivery_key}")
 }
 
-/// Record `event` and, when it is deliverable, mint its `ingress` fact.
-pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
+/// Record `event` and, when it is deliverable, mint its `ingress` fact, or
+/// hand a GitHub App event to [`crate::github::relay`]. `app_slug` is the
+/// connected App's, when one is.
+pub async fn consume(
+    orch: &Orchestrator,
+    event: EndpointEvent,
+    app_slug: Option<&str>,
+) -> Consumed {
     let db = &orch.db.local;
     let delivery_key = event
         .delivery_id
@@ -254,7 +266,11 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
             "ingress_endpoint_revoked",
             format!("endpoint {} was revoked", endpoint.name),
         )),
-        (Some(endpoint), _) if project_key.is_none() => Some((
+        (Some(endpoint), _) if endpoint.is_github_app() && app_slug.is_none() => Some((
+            "github_not_connected",
+            "no GitHub App is connected on this install".to_string(),
+        )),
+        (Some(endpoint), _) if !endpoint.is_github_app() && project_key.is_none() => Some((
             "ingress_unscoped_endpoint",
             format!(
                 "endpoint {} resolves to no project on this install",
@@ -268,6 +284,15 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
         (_, Err(why)) => Some((why.reason, why.detail.clone())),
         _ => None,
     };
+
+    if let (None, Some(endpoint), Some(app_slug), Ok(body)) =
+        (&refusal, &endpoint, app_slug, &event.body)
+    {
+        if endpoint.is_github_app() {
+            return deliver_github_app_event(orch, &event, endpoint, delivery_key, body, app_slug)
+                .await;
+        }
+    }
 
     let (body, cut) = match &event.body {
         Ok(body) => {
@@ -377,8 +402,89 @@ pub async fn consume(orch: &Orchestrator, event: EndpointEvent) -> Consumed {
     }
 }
 
+/// A GitHub App webhook, delivered through the App's endpoint: handed to
+/// [`crate::github::relay::process_event`] and then recorded. Never an
+/// `ingress` fact.
+///
+/// Processing comes first so the row can say what became of the event. A
+/// replay after a crash between the two processes again, which is safe: a
+/// mention's `github_comment` fact is unique by comment id, and handing a
+/// push to the base-branch sync twice is idempotent.
+async fn deliver_github_app_event(
+    orch: &Orchestrator,
+    event: &EndpointEvent,
+    endpoint: &EndpointRecord,
+    delivery_key: String,
+    body: &Value,
+    app_slug: &str,
+) -> Consumed {
+    // The provider-signed sender is who the delivery came from; with no
+    // verified signer to name, the machine that received it stands in, as it
+    // does for the legacy `/hook` path.
+    let origin = match delivery_origin(
+        endpoint,
+        event.verification.as_deref(),
+        &event.received_at,
+        body,
+    ) {
+        Some(origin) => Ok(origin),
+        None => crate::routes::installation_machine_origin(orch),
+    };
+    let processed = match origin {
+        Ok(origin) => {
+            crate::github::relay::process_event(
+                orch,
+                event.relay_event_id,
+                &event.event_type,
+                body,
+                app_slug,
+                origin,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let (status, kept_body, note) = match &processed {
+        Ok(outcome) => ("ok", None, format!("github:{}", outcome.label())),
+        Err(error) => {
+            let (text, _) = bounded_body(body);
+            (
+                "undeliverable",
+                Some(text),
+                format!("relay_event_processing_failed: {error}"),
+            )
+        }
+    };
+    let recorded = super::record_event(
+        &orch.db.local,
+        IngressEventRow {
+            id: 0,
+            endpoint_id: endpoint.id.clone(),
+            endpoint_name: Some(endpoint.name.clone()),
+            project_id: None,
+            relay_event_id: event.relay_event_id,
+            delivery_id: event.delivery_id.clone(),
+            delivery_key,
+            event_type: event.event_type.clone(),
+            verification: event.verification.clone(),
+            sender_json: event.sender.as_ref().map(Value::to_string),
+            body: kept_body,
+            received_at: event.received_at.clone(),
+            recorded_at: chrono::Utc::now().timestamp_millis(),
+            status: status.to_string(),
+            note: Some(note),
+        },
+    )
+    .await;
+    match (processed, recorded) {
+        (Err(error), _) => undeliverable("relay_event_processing_failed", error),
+        (Ok(_), Err(error)) => undeliverable("ingress_record_failed", error),
+        (Ok(_), Ok((ingress_event_id, _))) => Consumed::Delivered { ingress_event_id },
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::routes::fixture::{orchestrator, standing_triggers};
 
@@ -483,7 +589,7 @@ mod tests {
         let body =
             json!({"sender": {"id": 583231, "login": "octocat"}, "installation": {"id": 4242}});
         assert!(matches!(
-            consume(&orch, external_event("src_gh", "github", body)).await,
+            consume(&orch, external_event("src_gh", "github", body), None).await,
             Consumed::Delivered { .. }
         ));
         let (principal, appearance) = stored_origin(&db).await;
@@ -527,6 +633,7 @@ mod tests {
         consume(
             &orch,
             external_event("src_ci", "cairn-hmac", json!({"ok": true})),
+            None,
         )
         .await;
         let (principal, appearance) = stored_origin(&db).await;
@@ -555,7 +662,7 @@ mod tests {
         external_endpoint(&db, "src_gh", "github").await;
         let body = json!({"sender": {"id": 1}, "installation": {"id": 2}});
         assert!(matches!(
-            consume(&orch, external_event("src_gh", "bearer", body)).await,
+            consume(&orch, external_event("src_gh", "bearer", body), None).await,
             Consumed::Delivered { .. }
         ));
         assert_eq!(stored_origin(&db).await, (None, None));
@@ -566,7 +673,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (orch, db) = orchestrator(temp.path(), &[]).await;
         bugs_endpoint(&db).await;
-        consume(&orch, bug_event(10, 7)).await;
+        consume(&orch, bug_event(10, 7), None).await;
         assert_eq!(stored_origin(&db).await, (None, None));
     }
 
@@ -576,8 +683,8 @@ mod tests {
         let (orch, db) = orchestrator(temp.path(), &[]).await;
         bugs_endpoint(&db).await;
 
-        let first = consume(&orch, bug_event(10, 7)).await;
-        let again = consume(&orch, bug_event(11, 7)).await;
+        let first = consume(&orch, bug_event(10, 7), None).await;
+        let again = consume(&orch, bug_event(11, 7), None).await;
 
         assert!(matches!(first, Consumed::Delivered { .. }), "{first:?}");
         assert_eq!(first, again, "a redelivery resolves to the same record");
@@ -597,7 +704,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (orch, db) = orchestrator(temp.path(), &[]).await;
         bugs_endpoint(&db).await;
-        let Consumed::Delivered { ingress_event_id } = consume(&orch, bug_event(10, 7)).await
+        let Consumed::Delivered { ingress_event_id } = consume(&orch, bug_event(10, 7), None).await
         else {
             panic!("expected delivery")
         };
@@ -665,7 +772,7 @@ mod tests {
 
         let mut reasons = Vec::new();
         for event in [unknown, bad_type, no_body, unopenable] {
-            match consume(&orch, event).await {
+            match consume(&orch, event, None).await {
                 Consumed::Undeliverable { reason, .. } => reasons.push(reason),
                 other => panic!("expected undeliverable, got {other:?}"),
             }
@@ -713,7 +820,7 @@ mod tests {
         .await;
 
         for report in 1..=5 {
-            consume(&orch, bug_event(100 + report, report)).await;
+            consume(&orch, bug_event(100 + report, report), None).await;
         }
         crate::routes::drain_fact_log(&orch).await;
 
@@ -732,5 +839,278 @@ mod tests {
             .unwrap();
         assert_eq!(wakes.len(), 1, "one coalesced wake: {wakes:?}");
         assert_eq!(wakes[0].0, 5);
+    }
+
+    /// The GitHub App's own endpoint: `github`, scoped to no project.
+    pub(crate) async fn github_app_endpoint(db: &crate::storage::LocalDb) {
+        crate::ingress::upsert_endpoint(
+            db,
+            &crate::ingress::EndpointRecord {
+                id: "src_app".into(),
+                channel_id: "ch-1".into(),
+                project_id: None,
+                name: "github-app-1".into(),
+                provider: "github".into(),
+                status: "active".into(),
+                created_at: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    pub(crate) fn mention(comment_id: i64, repository: &str) -> Value {
+        json!({
+            "action": "created",
+            "repository": {"full_name": repository},
+            "issue": {"number": 42, "pull_request": {"url": "https://api.github.test/pulls/42"}},
+            "comment": {
+                "id": comment_id,
+                "body": "@cairn-app please look",
+                "html_url": format!("https://github.test/{repository}/pull/42#issuecomment-{comment_id}"),
+                "user": {"login": "alice", "type": "User"}
+            },
+            "sender": {"id": 583231, "login": "alice"},
+            "installation": {"id": 4242}
+        })
+    }
+
+    pub(crate) fn app_event(relay_id: i64, event_type: &str, body: Value) -> EndpointEvent {
+        EndpointEvent {
+            relay_event_id: relay_id,
+            endpoint_id: "src_app".into(),
+            delivery_id: Some(format!("gh-delivery-{relay_id}")),
+            event_type: event_type.into(),
+            verification: Some("github".into()),
+            sender: Some(json!({"id": 583231, "login": "alice"})),
+            received_at: "2026-11-02T20:00:00.000Z".into(),
+            body: Ok(body),
+        }
+    }
+
+    /// The fixture, with project `p`'s checkout pointing at `acme/repo`.
+    async fn mapped_orchestrator(
+        temp: &std::path::Path,
+    ) -> (Orchestrator, std::sync::Arc<crate::storage::LocalDb>) {
+        let mut git = crate::services::testing::MockGitClient::new();
+        git.expect_remote_get_url()
+            .returning(|_| Ok("git@github.com:acme/repo.git".into()));
+        crate::routes::fixture::orchestrator_with(
+            temp,
+            &[],
+            crate::services::testing::TestServicesBuilder::new().with_git(git),
+        )
+        .await
+    }
+
+    async fn app_row(db: &crate::storage::LocalDb) -> IngressEventRow {
+        crate::ingress::recent_events(db, "src_app", 1)
+            .await
+            .unwrap()
+            .remove(0)
+    }
+
+    /// A mention through the App's endpoint is the same `github_comment` fact
+    /// the legacy `/hook` path mints, from the verified GitHub sender, and its
+    /// row says it was routed without keeping the body.
+    #[tokio::test]
+    async fn a_github_app_endpoint_mention_mints_github_comment_not_ingress() {
+        use crate::storage::RowExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = mapped_orchestrator(temp.path()).await;
+        github_app_endpoint(&db).await;
+
+        let consumed = consume(
+            &orch,
+            app_event(40, "issue_comment", mention(99, "acme/repo")),
+            Some("cairn-app"),
+        )
+        .await;
+
+        assert!(
+            matches!(consumed, Consumed::Delivered { .. }),
+            "{consumed:?}"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'ingress'"
+            )
+            .await,
+            0
+        );
+        let (identity, project_id, fields, summary, principal) = db
+            .query_one(
+                "SELECT identity, project_id, fields_json, summary, origin_principal_json FROM fact_log WHERE source = 'github_comment'",
+                (),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.opt_text(1)?,
+                        row.text(2)?,
+                        row.opt_text(3)?,
+                        row.opt_text(4)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity, "github-comment:99");
+        assert_eq!(project_id.as_deref(), Some("p"));
+        let fields: Value = serde_json::from_str(&fields).unwrap();
+        for (key, value) in [
+            ("project", "cairn"),
+            ("repository", "acme/repo"),
+            ("number", "42"),
+            ("kind", "pull_request"),
+            ("author", "alice"),
+            ("text", "@cairn-app please look"),
+        ] {
+            assert_eq!(fields[key], json!(value), "{key}: {fields}");
+        }
+        // Composed from labels, as for any `github_comment`: the source is
+        // untrusted, so the producer's title never reaches the summary.
+        assert_eq!(summary.as_deref(), Some("acme/repo pull_request 42 alice"));
+        let principal: PrincipalRef = serde_json::from_str(&principal.unwrap()).unwrap();
+        assert_eq!(
+            principal,
+            PrincipalRef::External {
+                provider: "github".into(),
+                namespace: "4242".into(),
+                id: "583231".into()
+            }
+        );
+
+        let row = app_row(&db).await;
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.body, None);
+        assert_eq!(row.note.as_deref(), Some("github:routed"));
+        assert_eq!(row.project_id, None);
+        assert_eq!(row.event_type, "issue_comment");
+    }
+
+    #[tokio::test]
+    async fn a_github_app_endpoint_ignored_event_is_an_ok_row_without_a_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        github_app_endpoint(&db).await;
+
+        let consumed = consume(
+            &orch,
+            app_event(41, "check_run", json!({"action": "completed"})),
+            Some("cairn-app"),
+        )
+        .await;
+
+        assert!(
+            matches!(consumed, Consumed::Delivered { .. }),
+            "{consumed:?}"
+        );
+        let row = app_row(&db).await;
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.body, None);
+        assert_eq!(row.note.as_deref(), Some("github:ignored"));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM fact_log").await, 0);
+    }
+
+    /// An event `process_event` fails on is recorded undeliverable once, with
+    /// its body so it can be read back. There is no retry.
+    #[tokio::test]
+    async fn a_github_app_endpoint_processing_failure_is_undeliverable_with_its_body() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        github_app_endpoint(&db).await;
+
+        let consumed = consume(
+            &orch,
+            app_event(42, "issue_comment", mention(7, "not-a-repository-name")),
+            Some("cairn-app"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                consumed,
+                Consumed::Undeliverable {
+                    reason: "relay_event_processing_failed",
+                    ..
+                }
+            ),
+            "{consumed:?}"
+        );
+        let row = app_row(&db).await;
+        assert_eq!(row.status, "undeliverable");
+        assert!(row.body.unwrap().contains("not-a-repository-name"));
+        assert!(row
+            .note
+            .unwrap()
+            .starts_with("relay_event_processing_failed: "));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM fact_log").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_github_app_endpoint_event_without_a_connected_app_is_undeliverable() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        github_app_endpoint(&db).await;
+
+        let consumed = consume(
+            &orch,
+            app_event(43, "issue_comment", mention(8, "acme/repo")),
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                consumed,
+                Consumed::Undeliverable {
+                    reason: "github_not_connected",
+                    ..
+                }
+            ),
+            "{consumed:?}"
+        );
+        let row = app_row(&db).await;
+        assert_eq!(row.status, "undeliverable");
+        assert!(row.body.is_some());
+        assert!(row.note.unwrap().starts_with("github_not_connected: "));
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM fact_log").await, 0);
+    }
+
+    /// What decides the GitHub App path is the endpoint's provider and scope,
+    /// not that the event came through an endpoint: a project's own `github`
+    /// endpoint stays generic ingress, even with an App connected.
+    #[tokio::test]
+    async fn a_project_scoped_github_endpoint_stays_generic_ingress() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        external_endpoint(&db, "src_gh", "github").await;
+        let mut event = external_event("src_gh", "github", mention(9, "acme/repo"));
+        event.event_type = "issue_comment".into();
+
+        let consumed = consume(&orch, event, Some("cairn-app")).await;
+
+        assert!(
+            matches!(consumed, Consumed::Delivered { .. }),
+            "{consumed:?}"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'ingress'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM fact_log WHERE source = 'github_comment'"
+            )
+            .await,
+            0
+        );
     }
 }

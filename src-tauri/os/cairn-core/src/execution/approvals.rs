@@ -451,14 +451,20 @@ pub(crate) mod tests {
         }
         let listed = pending(&db).await;
         assert_eq!(
-            listed.iter().map(|a| a.artifact_id.as_str()).collect::<Vec<_>>(),
+            listed
+                .iter()
+                .map(|a| a.artifact_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["u2"]
         );
         assert_eq!(listed[0].what(), "output");
         db.execute("UPDATE artifacts SET confirmed = 1 WHERE id = 'u2'", ())
             .await
             .unwrap();
-        assert!(pending(&db).await.is_empty(), "the older version is not pending");
+        assert!(
+            pending(&db).await.is_empty(),
+            "the older version is not pending"
+        );
     }
 
     #[tokio::test]

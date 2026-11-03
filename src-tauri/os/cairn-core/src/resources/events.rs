@@ -845,6 +845,7 @@ mod tests {
                     received_at: "2026-10-18T20:00:00.000Z".into(),
                     body: Ok(serde_json::json!({})),
                 },
+                None,
             )
             .await;
         }
