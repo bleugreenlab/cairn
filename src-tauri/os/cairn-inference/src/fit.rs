@@ -1,31 +1,36 @@
-//! Generating profiles: from a model's facts, its weight sources and a pool's
-//! hardware, the candidate profiles that may run it there, best first, and why
-//! each other combination was not offered.
+//! The arithmetic and starting points a profile-generating agent works with
+//! (tenet 1364).
 //!
-//! Every engine is a template (`templates.yaml`): an image pinned by digest,
-//! the server it runs, the hardware it serves and the weight formats it reads.
-//! On NVIDIA, safetensors weights go to vLLM and GGUF to llama.cpp's CUDA
-//! build; on AMD, GGUF goes to llama.cpp's Vulkan build. Apple is not
-//! generated for yet.
+//! There is one way Cairn generates a profile: an agent session (the
+//! `inference-generate` workflow) gathers the model's facts and the machines'
+//! hardware, researches how the model is best run there, asks the operator,
+//! writes a profile and has verification measure it. Nothing here chooses a
+//! profile. What it offers the agent, through `cairn://inference/fit` and
+//! `cairn://inference/templates`, is:
 //!
-//! The fit is arithmetic, and it is a prediction: verification is what
-//! decides. A candidate's weights are the sum of its files' sizes. The number
-//! of machines `k` is the smallest, up to the pool's size, for which each
-//! machine's share (`weights / k × 1.05`, plus a reserve for activations)
-//! fits the memory an engine may use there: 0.90 of a discrete card's VRAM or
-//! 0.85 of a unified machine's memory. More than one machine needs a linked
-//! pool, and `k` must divide the attention heads. The context is the model's,
-//! clamped to what the memory left over holds in KV cache when the model's KV
-//! geometry is known, and floored to a multiple of 1024; below 8192 the
-//! candidate does not fit. With the geometry unknown nothing is clamped here,
-//! and verification clamps to the cache the engine measures.
+//! - [`fit`]: whether weights of a size fit a pool, on how many machines, and
+//!   with how much context. A prediction; verification decides. Each of `k`
+//!   machines carries `weights / k × 1.05` plus a reserve for activations, in
+//!   the memory an engine may use there: 0.90 of a discrete card's VRAM or
+//!   0.85 of a unified machine's memory. More than one machine needs a linked
+//!   pool, and `k` must divide the attention heads. The context is the
+//!   model's, clamped to what the memory left over holds in KV cache when the
+//!   model's KV geometry is known, and floored to a multiple of 1024; below
+//!   8192 nothing fits. With the geometry unknown nothing is clamped here, and
+//!   verification clamps to the cache the engine measures.
+//! - [`templates`] (`templates.yaml`): engines known to work, each an image
+//!   pinned by digest with the server it runs, the hardware it serves and the
+//!   weight formats it reads, and [`starting_profile`], one of them made into
+//!   a whole profile for a weight source on a pool, which the agent may take
+//!   as it is or change.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use cairn_models_types::catalog::Modality;
+use serde::{Deserialize, Serialize};
 
-use crate::hf::{HfFile, HfRepo, WeightFormat};
+use crate::hf::{AuxiliaryFile, WeightSource};
 use crate::machine::MachineName;
 use crate::model::Model;
 use crate::profile::{
@@ -42,12 +47,9 @@ pub const DISCRETE_USABLE: f64 = 0.90;
 pub const UNIFIED_USABLE: f64 = 0.85;
 pub const WEIGHT_OVERHEAD: f64 = 1.05;
 pub const MIN_CONTEXT: u64 = 8_192;
-/// A candidate holding at least this much context ranks above any that
-/// holds less.
-pub const GOOD_CONTEXT: u64 = 32_768;
 
-/// One engine template.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One engine known to work: a starting point, not a rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Template {
     pub id: String,
@@ -62,14 +64,14 @@ pub struct Template {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
     Safetensors,
     Gguf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Arch {
     Aarch64,
@@ -120,13 +122,20 @@ pub enum HwMemory {
 impl MachineHw {
     /// What an engine may take on this machine.
     pub fn usable_bytes(&self) -> u64 {
+        (self.memory_bytes() as f64 * self.usable_fraction()) as u64
+    }
+
+    /// The GPU's memory: the machine's on a unified machine, the card's VRAM
+    /// on a discrete one.
+    pub fn memory_bytes(&self) -> u64 {
         match self.memory {
-            HwMemory::Unified { total } => (total as f64 * UNIFIED_USABLE) as u64,
-            HwMemory::Discrete { vram } => (vram as f64 * DISCRETE_USABLE) as u64,
+            HwMemory::Unified { total } => total,
+            HwMemory::Discrete { vram } => vram,
         }
     }
 
-    fn usable_fraction(&self) -> f64 {
+    /// The share of [`Self::memory_bytes`] an engine may take.
+    pub fn usable_fraction(&self) -> f64 {
         match self.memory {
             HwMemory::Unified { .. } => UNIFIED_USABLE,
             HwMemory::Discrete { .. } => DISCRETE_USABLE,
@@ -150,7 +159,7 @@ impl MachineHw {
     }
 }
 
-/// A pool's machines, as generation sees them.
+/// A pool's machines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolHw {
     pub machines: Vec<MachineHw>,
@@ -159,8 +168,9 @@ pub struct PoolHw {
     pub linked: bool,
 }
 
-/// What generation predicts of a candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What [`fit`] predicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Predicted {
     pub machines: u32,
     pub weight_bytes: u64,
@@ -169,28 +179,6 @@ pub struct Predicted {
     pub context: u64,
     /// The KV cache the memory left over holds, when the geometry is known.
     pub kv_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
-    pub profile: InferenceProfile,
-    pub predicted: Predicted,
-    precision: u32,
-}
-
-/// A combination not offered, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rejected {
-    /// `<repo> <quantization>`.
-    pub weights: String,
-    pub template: String,
-    pub why: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Generated {
-    pub candidates: Vec<Candidate>,
-    pub rejected: Vec<Rejected>,
 }
 
 /// A profile id from what distinguishes it: `<model>-<quant>-<server>-x<k>`.
@@ -238,75 +226,16 @@ pub fn precision(label: &str) -> u32 {
         6
     } else if label.starts_with("q5") {
         5
-    } else if label == "nvfp4" || label == "awq" || label == "gptq" || label.starts_with("q4") {
+    } else if label == "nvfp4"
+        || label == "awq"
+        || label == "gptq"
+        || label.starts_with("q4")
+        || label.starts_with("mxfp4")
+    {
         4
     } else {
         3
     }
-}
-
-/// One way to get the model's weights: a set of files of one format and
-/// quantization.
-struct Source<'a> {
-    repo: &'a HfRepo,
-    format: WeightFormat,
-    quantization: String,
-    files: Vec<&'a HfFile>,
-}
-
-impl Source<'_> {
-    fn bytes(&self) -> u64 {
-        self.files.iter().map(|f| f.size).sum()
-    }
-
-    fn label(&self) -> String {
-        format!("{} {}", self.repo.repo, self.quantization)
-    }
-}
-
-fn sources<'a>(model: &Model, repos: &'a [HfRepo]) -> Vec<Source<'a>> {
-    let mut sources = Vec::new();
-    for repo in repos {
-        let safetensors: Vec<&HfFile> = repo.weights_of(WeightFormat::Safetensors).collect();
-        if !safetensors.is_empty() {
-            let quantization = repo
-                .facts
-                .quantization
-                .clone()
-                .or_else(|| repo.facts.dtype.as_deref().map(dtype_label))
-                .or_else(|| model.facts.dtype.as_deref().map(dtype_label))
-                .unwrap_or_else(|| "unknown".into());
-            sources.push(Source {
-                repo,
-                format: WeightFormat::Safetensors,
-                quantization,
-                files: safetensors,
-            });
-        }
-        for file in repo.weights_of(WeightFormat::Gguf) {
-            if let Some(quantization) = file.gguf_quantization() {
-                sources.push(Source {
-                    repo,
-                    format: WeightFormat::Gguf,
-                    quantization,
-                    files: vec![file],
-                });
-            }
-        }
-    }
-    sources
-}
-
-fn template_serves(template: &Template, format: WeightFormat, machine: &MachineHw) -> bool {
-    let format_ok = template.formats.iter().any(|f| {
-        matches!(
-            (f, format),
-            (Format::Safetensors, WeightFormat::Safetensors) | (Format::Gguf, WeightFormat::Gguf)
-        )
-    });
-    format_ok
-        && template.family == machine.family
-        && template.arch.is_none_or(|arch| arch == machine.arch)
 }
 
 /// Bytes of KV cache one token takes on one machine of `k`.
@@ -327,10 +256,13 @@ fn floor_1024(tokens: u64) -> u64 {
     tokens / 1024 * 1024
 }
 
-/// The machine count, per-machine share and context for `source` on `pool`,
-/// or why it does not fit.
-fn fit(model: &Model, source: &Source<'_>, pool: &PoolHw) -> Result<Predicted, String> {
-    let weight_bytes = source.bytes();
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / GIB as f64
+}
+
+/// The machine count, per-machine share and context for `weight_bytes` of
+/// `model`'s weights on `pool`, or why they do not fit.
+pub fn fit(model: &Model, weight_bytes: u64, pool: &PoolHw) -> Result<Predicted, String> {
     let usable = pool
         .machines
         .iter()
@@ -338,7 +270,7 @@ fn fit(model: &Model, source: &Source<'_>, pool: &PoolHw) -> Result<Predicted, S
         .min()
         .unwrap_or(0);
     let max_k = if pool.linked {
-        pool.machines.len() as u32
+        pool.machines.len().max(1) as u32
     } else {
         1
     };
@@ -351,9 +283,9 @@ fn fit(model: &Model, source: &Source<'_>, pool: &PoolHw) -> Result<Predicted, S
         .ok_or_else(|| {
             format!(
                 "its weights ({:.1} GiB) need {:.1} GiB a machine even across {max_k}, and each machine has {:.1} GiB to give",
-                weight_bytes as f64 / GIB as f64,
-                share(max_k) as f64 / GIB as f64,
-                usable as f64 / GIB as f64
+                gib(weight_bytes),
+                gib(share(max_k)),
+                gib(usable)
             )
         })?;
     let per_machine = share(k);
@@ -386,17 +318,39 @@ fn embeds(model: &Model) -> bool {
         .is_some_and(|verbs| verbs.contains(&cairn_models_types::catalog::VerbKind::Embed))
 }
 
-/// The profile for `source` through `template` as predicted.
-fn profile(
-    model: &Model,
-    source: &Source<'_>,
+/// `template` made into a whole profile for `source` on `pool` as `fit`
+/// predicted it. On llama.cpp a `projector` is pinned beside the weights and
+/// passed as `--mmproj`; without one the profile takes text alone, so it
+/// never claims an image input it cannot serve. Every shard of a split source
+/// is pinned and `-m` names the first, which llama.cpp loads the rest beside.
+pub fn starting_profile(
     template: &Template,
-    machine: &MachineHw,
+    source: &WeightSource,
+    model: &Model,
+    pool: &PoolHw,
     predicted: &Predicted,
+    projector: Option<&AuxiliaryFile>,
 ) -> InferenceProfile {
     let k = predicted.machines;
+    let machine = &pool.machines[0];
     let mut command = template.command.clone();
     let embed = embeds(model);
+    let mount_to = match template.server {
+        Server::Vllm => "/root/.cache/huggingface",
+        Server::LlamaCpp => "/models",
+    };
+    let mut weights: Vec<WeightFile> = source
+        .files
+        .iter()
+        .map(|file| WeightFile {
+            repo: source.repo.clone(),
+            revision: source.revision.clone(),
+            path: file.path.clone(),
+            sha256: file.sha256.clone(),
+            size: Some(file.size),
+        })
+        .collect();
+    let projector = projector.filter(|_| template.server == Server::LlamaCpp);
     match template.server {
         Server::Vllm => {
             command.extend([
@@ -416,6 +370,20 @@ fn profile(
             command.extend(["-c".into(), predicted.context.to_string()]);
             if embed {
                 command.extend(["--embeddings".into(), "--pooling".into(), "last".into()]);
+            }
+            if let Some(projector) = projector {
+                let file = WeightFile {
+                    repo: projector.repo.clone(),
+                    revision: projector.revision.clone(),
+                    path: projector.file.path.clone(),
+                    sha256: projector.file.sha256.clone(),
+                    size: Some(projector.file.size),
+                };
+                command.extend([
+                    "--mmproj".into(),
+                    crate::render::cached_weight_path(mount_to, &file),
+                ]);
+                weights.push(file);
             }
         }
     }
@@ -448,26 +416,12 @@ fn profile(
     } else {
         (Some(Vec::new()), command, Vec::new())
     };
-    let mount_to = match template.server {
-        Server::Vllm => "/root/.cache/huggingface",
-        Server::LlamaCpp => "/models",
-    };
-    let weights: Vec<WeightFile> = source
-        .files
-        .iter()
-        .map(|file| WeightFile {
-            repo: source.repo.repo.clone(),
-            revision: source.repo.revision.clone(),
-            path: file.path.clone(),
-            sha256: file.sha256.clone(),
-            size: Some(file.size),
-        })
-        .collect();
     let need = match template.server {
         // vLLM takes its whole memory share up front.
         Server::Vllm => machine.usable_bytes(),
         Server::LlamaCpp => {
             predicted.per_machine_bytes
+                + projector.map_or(0, |p| p.file.size)
                 + kv_bytes_per_token(model, k).map_or(0, |per_token| per_token * predicted.context)
         }
     };
@@ -480,6 +434,12 @@ fn profile(
             host: SystemRamBytes(0),
         },
     };
+    let mut modalities = model.facts.modalities.clone();
+    if template.server == Server::LlamaCpp && projector.is_none() {
+        if let Some(modalities) = modalities.as_mut() {
+            modalities.input.retain(|m| *m == Modality::Text);
+        }
+    }
     InferenceProfile {
         id: profile_id(&model.name, Some(&source.quantization), template.server, k).into(),
         source: Default::default(),
@@ -490,11 +450,14 @@ fn profile(
         served_name: model.name.clone(),
         upstream_id: None,
         verbs: model.facts.verbs.clone(),
-        modalities: model.facts.modalities.clone(),
+        modalities,
         quantization: Some(source.quantization.clone()),
         origin: ProfileOrigin::Generated {
-            template: template.id.clone(),
+            run: None,
             model_revision: model.revision.clone().unwrap_or_default(),
+            starting_template: Some(template.id.clone()),
+            sources: Vec::new(),
+            answers: Vec::new(),
         },
         engine: Engine::Container(Container {
             image: template.image.clone(),
@@ -529,89 +492,6 @@ fn profile(
         },
         notes: None,
     }
-}
-
-/// Every candidate for `model` from `repos` (its own repository and its
-/// quantized derivatives) on `pool`, best first, and every combination left
-/// out with why.
-pub fn generate(model: &Model, repos: &[HfRepo], pool: &PoolHw) -> Generated {
-    let mut generated = Generated::default();
-    let Some(machine) = pool.machines.first() else {
-        return generated;
-    };
-    if pool
-        .machines
-        .iter()
-        .any(|m| m.family != machine.family || m.arch != machine.arch)
-    {
-        generated.rejected.push(Rejected {
-            weights: "any".into(),
-            template: "any".into(),
-            why: "the pool's machines differ in accelerator or CPU architecture".into(),
-        });
-        return generated;
-    }
-    if machine.family == AcceleratorFamily::Apple {
-        generated.rejected.push(Rejected {
-            weights: "any".into(),
-            template: "any".into(),
-            why: "Apple engines (MLX and native llama.cpp) are not generated yet".into(),
-        });
-        return generated;
-    }
-    for source in sources(model, repos) {
-        let fitting: Vec<&Template> = templates()
-            .iter()
-            .filter(|t| template_serves(t, source.format, machine))
-            .collect();
-        if fitting.is_empty() {
-            generated.rejected.push(Rejected {
-                weights: source.label(),
-                template: "none".into(),
-                why: format!(
-                    "no template serves {} weights on {} {:?}",
-                    match source.format {
-                        WeightFormat::Safetensors => "safetensors",
-                        WeightFormat::Gguf => "GGUF",
-                    },
-                    machine.family.as_str(),
-                    machine.arch
-                ),
-            });
-            continue;
-        }
-        for template in fitting {
-            if source.quantization == "nvfp4" && !machine.blackwell() {
-                generated.rejected.push(Rejected {
-                    weights: source.label(),
-                    template: template.id.clone(),
-                    why: format!("NVFP4 needs a Blackwell GPU and {} is not one", machine.gpu),
-                });
-                continue;
-            }
-            match fit(model, &source, pool) {
-                Ok(predicted) => generated.candidates.push(Candidate {
-                    profile: profile(model, &source, template, machine, &predicted),
-                    precision: precision(&source.quantization),
-                    predicted,
-                }),
-                Err(why) => generated.rejected.push(Rejected {
-                    weights: source.label(),
-                    template: template.id.clone(),
-                    why,
-                }),
-            }
-        }
-    }
-    generated.candidates.sort_by(|a, b| {
-        let good = |c: &Candidate| c.predicted.context >= GOOD_CONTEXT;
-        good(b)
-            .cmp(&good(a))
-            .then(b.precision.cmp(&a.precision))
-            .then(a.predicted.machines.cmp(&b.predicted.machines))
-            .then(a.profile.id.cmp(&b.profile.id))
-    });
-    generated
 }
 
 /// The share of a device's memory vLLM pre-allocates when the profile sets no
@@ -691,14 +571,17 @@ impl PredictedNeed {
                 };
                 let kv = match kv {
                     Some((tokens, bytes)) => {
-                        format!(", {} of KV cache for {tokens} tokens", gib(*bytes))
+                        format!(
+                            ", {} of KV cache for {tokens} tokens",
+                            crate::control::gib(*bytes)
+                        )
                     }
                     None => String::new(),
                 };
                 format!(
                     "{} of weights ({weights_from}){across} × {WEIGHT_OVERHEAD}{kv}, and a {} reserve",
-                    gib(*weight_bytes),
-                    gib(RESERVE_BYTES)
+                    crate::control::gib(*weight_bytes),
+                    crate::control::gib(RESERVE_BYTES)
                 )
             }
         }
@@ -899,14 +782,10 @@ pub fn predict_need(
     })
 }
 
-fn gib(bytes: u64) -> String {
-    crate::control::gib(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hf;
+    use crate::hf::{self, classify, HfRepo, RepoFiles};
 
     macro_rules! repo {
         ($slug:literal) => {
@@ -937,6 +816,14 @@ mod tests {
             facts: repo.facts.clone(),
             read_at: None,
         }
+    }
+
+    fn files(model: &Model, repos: &[HfRepo]) -> RepoFiles {
+        classify(repos, model.facts.dtype.as_deref())
+    }
+
+    fn template(id: &str) -> &'static Template {
+        templates().iter().find(|t| t.id == id).unwrap()
     }
 
     fn spark(name: &str) -> MachineHw {
@@ -982,12 +869,11 @@ mod tests {
         }
     }
 
-    fn ids(generated: &Generated) -> Vec<&str> {
-        generated
-            .candidates
-            .iter()
-            .map(|c| c.profile.id.as_str())
-            .collect()
+    fn args(profile: &InferenceProfile) -> &[String] {
+        let Engine::Container(container) = &profile.engine else {
+            unreachable!()
+        };
+        &container.args
     }
 
     #[test]
@@ -1002,65 +888,43 @@ mod tests {
     fn deepseek_spans_both_sparks_and_does_not_fit_a_4090() {
         let repo = repo!("deepseek-ai--DeepSeek-V4-Flash-Vision-Exp");
         let model = model_of(&repo);
-        let repos = [repo];
-        let on_sparks = generate(&model, &repos, &sparks());
-        assert_eq!(
-            ids(&on_sparks),
-            vec!["deepseek-v4-flash-vision-exp-fp8-vllm-x2"]
+        let files = files(&model, &[repo]);
+        let source = &files.sources[0];
+        assert_eq!(source.quantization, "fp8");
+
+        let predicted = fit(&model, source.bytes(), &sparks()).unwrap();
+        assert_eq!(predicted.machines, 2);
+        assert_eq!(predicted.kv_tokens, None, "compressed attention");
+        assert_eq!(predicted.context, 1_048_576, "verification clamps it");
+
+        let profile = starting_profile(
+            template("vllm-ngc"),
+            source,
+            &model,
+            &sparks(),
+            &predicted,
+            None,
         );
-        let candidate = &on_sparks.candidates[0];
-        assert_eq!(candidate.predicted.machines, 2);
-        assert_eq!(candidate.predicted.kv_tokens, None, "compressed attention");
         assert_eq!(
-            candidate.predicted.context, 1_048_576,
-            "verification clamps it"
+            profile.id.as_str(),
+            "deepseek-v4-flash-vision-exp-fp8-vllm-x2"
         );
-        let profile = &candidate.profile;
         assert_eq!(profile.problems(), vec![]);
         let Engine::Container(container) = &profile.engine else {
             unreachable!()
         };
         assert_eq!(container.ranks.len(), 2);
+        assert_eq!(container.ranks[1]["HEADLESS"], "1");
         assert!(container.args[0].contains("--node-rank \"$NODE_RANK\" --master-addr {head.link}"));
         assert!(container.args[0].contains("'--tensor-parallel-size' '2'"));
+        assert_eq!(profile.requirements.interconnect, Some(Interconnect::Rdma));
+        assert!(matches!(
+            profile.requirements.memory,
+            Some(MemoryPerMachine::Unified { .. })
+        ));
 
-        let on_bbs = generate(&model, &repos, &bbs());
-        assert!(on_bbs.candidates.is_empty());
-        assert!(
-            on_bbs.rejected[0].why.contains("need"),
-            "{:?}",
-            on_bbs.rejected
-        );
-    }
-
-    #[test]
-    fn qwen36_nvfp4_runs_on_one_spark_and_is_skipped_on_a_4090() {
-        let base = repo!("Qwen--Qwen3.6-35B-A3B");
-        let nvfp4 = repo!("nvidia--Qwen3.6-35B-A3B-NVFP4");
-        let model = model_of(&base);
-        let repos = [base, nvfp4];
-        let on_sparks = generate(&model, &repos, &sparks());
-        assert_eq!(
-            ids(&on_sparks),
-            vec![
-                "qwen3.6-35b-a3b-bf16-vllm-x1",
-                "qwen3.6-35b-a3b-nvfp4-vllm-x1"
-            ],
-            "both fit one Spark with a long context; higher precision first"
-        );
-        let nvfp4 = &on_sparks.candidates[1];
-        assert_eq!(
-            nvfp4.profile.model.weights[0].repo,
-            "nvidia/Qwen3.6-35B-A3B-NVFP4"
-        );
-        assert_eq!(nvfp4.predicted.context, 262_144);
-
-        let on_bbs = generate(&model, &repos, &bbs());
-        assert!(on_bbs.candidates.is_empty());
-        assert!(on_bbs
-            .rejected
-            .iter()
-            .any(|r| r.weights.ends_with("nvfp4") && r.why.contains("Blackwell")));
+        let why = fit(&model, source.bytes(), &bbs()).unwrap_err();
+        assert!(why.contains("need"), "{why}");
     }
 
     #[test]
@@ -1068,53 +932,114 @@ mod tests {
         let own = repo!("Qwen--Qwen3-Embedding-4B");
         let gguf = repo!("Qwen--Qwen3-Embedding-4B-GGUF", no_config);
         let model = model_of(&own);
-        let repos = [own, gguf];
+        let files = files(&model, &[own, gguf]);
 
-        let on_bbs = generate(&model, &repos, &bbs());
-        assert_eq!(
-            on_bbs.candidates[0].profile.id.as_str(),
-            "qwen3-embedding-4b-bf16-vllm-x1"
-        );
-        assert!(ids(&on_bbs).contains(&"qwen3-embedding-4b-q8_0-llamacpp-x1"));
-        let Engine::Container(vllm) = &on_bbs.candidates[0].profile.engine else {
-            unreachable!()
-        };
-        assert!(vllm.args.windows(2).any(|w| w == ["--runner", "pooling"]));
-
-        let on_halo = generate(&model, &repos, &halo());
-        assert!(ids(&on_halo).contains(&"qwen3-embedding-4b-q8_0-llamacpp-x1"));
-        assert!(on_halo.candidates.iter().all(|c| {
-            c.profile.origin
-                == ProfileOrigin::Generated {
-                    template: "llamacpp-vulkan".into(),
-                    model_revision: model.revision.clone().unwrap(),
-                }
-        }));
-        assert!(on_halo
-            .rejected
-            .iter()
-            .any(|r| r.weights.ends_with("bf16") && r.template == "none"));
-        let q8 = on_halo
-            .candidates
-            .iter()
-            .find(|c| c.profile.quantization.as_deref() == Some("q8_0"))
-            .unwrap();
-        assert_eq!(q8.profile.problems(), vec![]);
-        let Engine::Container(llama) = &q8.profile.engine else {
-            unreachable!()
-        };
-        assert!(llama.args.windows(2).any(|w| w == ["--pooling", "last"]));
-        assert_eq!(q8.predicted.context, 40_960);
-
-        let on_spark = generate(
+        let bf16 = files.source("Qwen/Qwen3-Embedding-4B@bf16").unwrap();
+        let predicted = fit(&model, bf16.bytes(), &bbs()).unwrap();
+        let vllm = starting_profile(
+            template("vllm-openai"),
+            bf16,
             &model,
-            &repos,
-            &PoolHw {
-                machines: vec![spark("bginf-sp1")],
-                linked: false,
-            },
+            &bbs(),
+            &predicted,
+            None,
         );
-        assert_eq!(on_spark.candidates[0].predicted.machines, 1);
+        assert_eq!(vllm.id.as_str(), "qwen3-embedding-4b-bf16-vllm-x1");
+        assert!(args(&vllm).windows(2).any(|w| w == ["--runner", "pooling"]));
+
+        let q8 = files.source("Qwen/Qwen3-Embedding-4B-GGUF@q8_0").unwrap();
+        let predicted = fit(&model, q8.bytes(), &halo()).unwrap();
+        assert_eq!(predicted.context, 40_960);
+        let llama = starting_profile(
+            template("llamacpp-vulkan"),
+            q8,
+            &model,
+            &halo(),
+            &predicted,
+            None,
+        );
+        assert_eq!(llama.problems(), vec![]);
+        assert_eq!(
+            llama.origin,
+            ProfileOrigin::Generated {
+                run: None,
+                model_revision: model.revision.clone().unwrap(),
+                starting_template: Some("llamacpp-vulkan".into()),
+                sources: vec![],
+                answers: vec![],
+            }
+        );
+        assert!(args(&llama).windows(2).any(|w| w == ["--pooling", "last"]));
+
+        let one_spark = PoolHw {
+            machines: vec![spark("bginf-sp1")],
+            linked: false,
+        };
+        assert_eq!(fit(&model, bf16.bytes(), &one_spark).unwrap().machines, 1);
+    }
+
+    #[test]
+    fn the_qwen36_gguf_is_sized_by_its_real_weights_and_wires_its_projector() {
+        let base = repo!("Qwen--Qwen3.6-35B-A3B");
+        let gguf = repo!("ggml-org--Qwen3.6-35B-A3B-GGUF", no_config);
+        let model = model_of(&base);
+        let files = files(&model, &[gguf]);
+        let bf16 = files.source("ggml-org/Qwen3.6-35B-A3B-GGUF@bf16").unwrap();
+        let q4 = files
+            .source("ggml-org/Qwen3.6-35B-A3B-GGUF@q4_k_m")
+            .unwrap();
+
+        for source in [bf16, q4] {
+            let why = fit(&model, source.bytes(), &bbs()).unwrap_err();
+            assert!(why.contains("need"), "{}: {why}", source.key);
+        }
+
+        let one_spark = PoolHw {
+            machines: vec![spark("bginf-sp1")],
+            linked: false,
+        };
+        let predicted = fit(&model, bf16.bytes(), &one_spark).unwrap();
+        assert_eq!(predicted.weight_bytes, 69_376_637_248);
+        let projector = files
+            .projectors
+            .iter()
+            .find(|p| p.quantization.as_deref() == Some("bf16"));
+        let with = starting_profile(
+            template("llamacpp-cuda"),
+            bf16,
+            &model,
+            &one_spark,
+            &predicted,
+            projector,
+        );
+        assert_eq!(with.problems(), vec![]);
+        assert_eq!(with.model.weights.len(), 2);
+        assert_eq!(with.model.weights[0].path, "Qwen3.6-35B-A3B-BF16.gguf");
+        let mmproj = args(&with)
+            .windows(2)
+            .find(|w| w[0] == "--mmproj")
+            .map(|w| w[1].clone())
+            .unwrap();
+        assert!(
+            mmproj.starts_with("/models/hub/models--ggml-org--Qwen3.6-35B-A3B-GGUF/snapshots/")
+                && mmproj.ends_with("/mmproj-Qwen3.6-35B-A3B-BF16.gguf"),
+            "{mmproj}"
+        );
+        assert_eq!(with.modalities, model.facts.modalities);
+
+        let without = starting_profile(
+            template("llamacpp-cuda"),
+            bf16,
+            &model,
+            &one_spark,
+            &predicted,
+            None,
+        );
+        assert_eq!(
+            without.modalities.unwrap().input,
+            vec![Modality::Text],
+            "no projector, no image input"
+        );
     }
 
     #[test]
@@ -1122,16 +1047,17 @@ mod tests {
         let own = repo!("Qwen--Qwen3-Embedding-4B");
         let mut model = model_of(&own);
         model.facts.context = Some(10_000_000);
-        let tight = PoolHw {
+        let bytes = files(&model, &[own]).sources[0].bytes();
+        let card = |gib_of_vram: u64| PoolHw {
             machines: vec![MachineHw {
-                memory: HwMemory::Discrete { vram: 16 * GIB },
+                memory: HwMemory::Discrete {
+                    vram: gib_of_vram * GIB,
+                },
                 ..bbs().machines[0].clone()
             }],
             linked: false,
         };
-        let repos = [own];
-        let generated = generate(&model, &repos, &tight);
-        let predicted = &generated.candidates[0].predicted;
+        let predicted = fit(&model, bytes, &card(16)).unwrap();
         let kv = predicted.kv_tokens.unwrap();
         assert!(
             predicted.context <= kv && kv - predicted.context < 1024,
@@ -1139,24 +1065,8 @@ mod tests {
         );
         assert_eq!(predicted.context % 1024, 0);
 
-        let starved = PoolHw {
-            machines: vec![MachineHw {
-                memory: HwMemory::Discrete { vram: 11 * GIB },
-                ..bbs().machines[0].clone()
-            }],
-            linked: false,
-        };
-        let generated = generate(&model, &repos, &starved);
-        assert!(
-            generated.candidates.is_empty(),
-            "{:?}",
-            generated.candidates
-        );
-        assert!(
-            generated.rejected[0].why.contains("tokens of KV cache fit"),
-            "{:?}",
-            generated.rejected
-        );
+        let why = fit(&model, bytes, &card(11)).unwrap_err();
+        assert!(why.contains("tokens of KV cache fit"), "{why}");
     }
 
     /// A generated profile with its stated memory taken away.
@@ -1177,35 +1087,48 @@ mod tests {
 
     #[test]
     fn vllm_needs_its_memory_share_of_each_machine_as_generation_states_it() {
-        let base = repo!("Qwen--Qwen3.6-35B-A3B");
-        let nvfp4 = repo!("nvidia--Qwen3.6-35B-A3B-NVFP4");
-        let model = model_of(&base);
-        let generated = generate(&model, &[base, nvfp4], &sparks());
-        let candidate = &generated.candidates[1];
-        let stated = match candidate.profile.requirements.memory {
+        let repo = repo!("deepseek-ai--DeepSeek-V4-Flash-Vision-Exp");
+        let model = model_of(&repo);
+        let files = files(&model, &[repo]);
+        let source = &files.sources[0];
+        let predicted = fit(&model, source.bytes(), &sparks()).unwrap();
+        let profile = starting_profile(
+            template("vllm-ngc"),
+            source,
+            &model,
+            &sparks(),
+            &predicted,
+            None,
+        );
+        let stated = match profile.requirements.memory {
             Some(MemoryPerMachine::Unified { system }) => system.0,
             ref other => panic!("{other:?}"),
         };
-        let predicted = predict_need(&unstated(candidate.profile.clone()), Some(&model)).unwrap();
+        let need = predict_need(&unstated(profile), Some(&model)).unwrap();
+        let PredictedNeed::Share {
+            engine,
+            flag,
+            fraction,
+            defaulted,
+        } = &need
+        else {
+            panic!("{need:?}");
+        };
         assert_eq!(
-            predicted,
-            PredictedNeed::Share {
-                engine: "vLLM",
-                flag: "--gpu-memory-utilization",
-                fraction: 0.85,
-                defaulted: false,
-            }
-        );
-        assert_eq!(predicted.bytes_on(Some(128 * GIB)), Some(stated));
-        assert_eq!(
-            predicted.bytes_on(None),
-            None,
-            "a share of nothing reported"
+            (*engine, *flag, *defaulted),
+            ("vLLM", "--gpu-memory-utilization", false)
         );
         assert_eq!(
-            predicted.describe(),
-            "vLLM pre-allocates 0.85 of each machine's memory (`--gpu-memory-utilization 0.85`)"
+            format!("{fraction:.2}"),
+            format!("{:.2}", sparks().machines[0].usable_fraction())
         );
+        assert_eq!(
+            need.bytes_on(Some(128 * GIB)),
+            Some(stated),
+            "the same share generation states"
+        );
+        assert_eq!(need.bytes_on(None), None, "a share of nothing reported");
+        assert!(need.describe().starts_with("vLLM pre-allocates"));
     }
 
     #[test]
@@ -1213,33 +1136,39 @@ mod tests {
         let own = repo!("Qwen--Qwen3-Embedding-4B");
         let gguf = repo!("Qwen--Qwen3-Embedding-4B-GGUF", no_config);
         let model = model_of(&own);
-        let generated = generate(&model, &[own, gguf], &bbs());
-        let q8 = generated
-            .candidates
-            .iter()
-            .find(|c| c.profile.id.as_str() == "qwen3-embedding-4b-q8_0-llamacpp-x1")
-            .unwrap();
+        let files = files(&model, &[own, gguf]);
+        let q8 = files.source("Qwen/Qwen3-Embedding-4B-GGUF@q8_0").unwrap();
+        let predicted = fit(&model, q8.bytes(), &bbs()).unwrap();
+        let profile = starting_profile(
+            template("llamacpp-cuda"),
+            q8,
+            &model,
+            &bbs(),
+            &predicted,
+            None,
+        );
+        let stated = profile.requirements.memory;
         let PredictedNeed::Sized {
             bytes,
             weight_bytes,
             kv: Some((tokens, kv_bytes)),
             ..
-        } = predict_need(&unstated(q8.profile.clone()), Some(&model)).unwrap()
+        } = predict_need(&unstated(profile), Some(&model)).unwrap()
         else {
             panic!("a llama.cpp profile is sized");
         };
-        assert_eq!(weight_bytes, q8.predicted.weight_bytes);
-        assert_eq!(tokens, 40_960, "its -c");
+        assert_eq!(weight_bytes, predicted.weight_bytes);
+        assert_eq!(tokens, predicted.context, "its -c");
         assert_eq!(
             bytes,
             (weight_bytes as f64 * WEIGHT_OVERHEAD) as u64 + kv_bytes + RESERVE_BYTES
         );
         assert_eq!(
+            stated,
             Some(MemoryPerMachine::Discrete {
                 vram: VramBytes(bytes),
                 host: SystemRamBytes(0)
             }),
-            q8.profile.requirements.memory,
             "the same arithmetic generation states"
         );
     }

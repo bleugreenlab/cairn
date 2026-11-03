@@ -2586,6 +2586,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "inference_verifications",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // The profile generations the operator started on this install's pools
+    // (cairn/5885).
+    (
+        "inference_generations",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // What this runner has commanded its inference machines to do (cairn/5660):
     // the phase of each deployment it acted on, and the loads it measured.
     (

@@ -37,7 +37,7 @@ const MACHINES: &str = "inference_machines";
 /// interleave.
 pub(crate) static INVENTORY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

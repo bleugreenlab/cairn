@@ -167,6 +167,8 @@ pub struct InferenceModel {
     pub profiles: Vec<ModelProfile>,
     /// Why none of its deployments can run now, in a few words.
     pub blocked: Option<String>,
+    /// Its profile generations, newest first.
+    pub generations: Vec<super::inference_generate::GenerationView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -188,6 +190,8 @@ pub struct ModelProfile {
     pub machines: u32,
     /// authored, imported or generated.
     pub origin: String,
+    /// How a generated profile was made.
+    pub provenance: Option<ProfileProvenance>,
     pub in_use: bool,
     /// A container profile, which verification can measure on a pool.
     pub verifiable: bool,
@@ -196,6 +200,35 @@ pub struct ModelProfile {
     pub edited: bool,
     /// Its measured fit per pool; empty when nothing is measured yet.
     pub fit: Vec<ProfileFit>,
+}
+
+/// How a generated profile was made: the run that wrote it, the template it
+/// started from, what it cited and what the operator answered.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileProvenance {
+    pub run: Option<String>,
+    pub starting_template: Option<String>,
+    pub sources: Vec<cairn_inference::CitedSource>,
+    pub answers: Vec<cairn_inference::OperatorAnswer>,
+}
+
+fn provenance(origin: &cairn_inference::ProfileOrigin) -> Option<ProfileProvenance> {
+    match origin {
+        cairn_inference::ProfileOrigin::Generated {
+            run,
+            starting_template,
+            sources,
+            answers,
+            ..
+        } => Some(ProfileProvenance {
+            run: run.clone(),
+            starting_template: starting_template.clone(),
+            sources: sources.clone(),
+            answers: answers.clone(),
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1001,6 +1034,7 @@ impl Sources<'_> {
                             engine: engine_label(&profile.engine),
                             machines: profile.requirements.machines,
                             origin: profile.origin.label().to_string(),
+                            provenance: provenance(&profile.origin),
                             in_use: in_use.contains(profile.id.as_str()),
                             verifiable: matches!(profile.engine, Engine::Container(_)),
                             edited: self.edited.contains(profile.id.as_str()),
@@ -1008,6 +1042,7 @@ impl Sources<'_> {
                         })
                         .collect(),
                     blocked: self.model_blocked(group),
+                    generations: Vec::new(),
                 }
             })
             .collect()
@@ -1120,7 +1155,16 @@ fn current_verifications(
 }
 
 pub async fn overview(orch: &Orchestrator) -> Result<InferenceOverview, String> {
-    with_sources(orch, |sources| sources.overview()).await
+    let mut overview = with_sources(orch, |sources| sources.overview()).await?;
+    let generations = super::inference_generate::generation_views(orch).await?;
+    for model in &mut overview.models {
+        model.generations = generations
+            .iter()
+            .filter(|generation| generation.row.model == model.name)
+            .cloned()
+            .collect();
+    }
+    Ok(overview)
 }
 
 pub async fn running_detail(
@@ -1315,26 +1359,23 @@ pub async fn import_profile(
     }
 }
 
-/// Generate candidate profiles for `model` on `pool` from its machines'
-/// reported hardware, as `append cairn://inference/profiles {generate}` does.
-pub async fn generate_profiles(
+/// Start generating a profile for `model` on `pool`: the agent session runs
+/// under an anchor issue in `project_id`. Answers the generation as the page
+/// shows it.
+pub async fn start_generation(
     orch: &Orchestrator,
+    project_id: &str,
     model: &str,
     pool: &str,
-) -> Result<super::inference_generate::Generation, String> {
-    use super::inference_generate::{detected_pool, executor_snapshots, generate};
-    let pool = detected_pool(orch, pool)?;
-    let hub = super::inference_models::Web::new()?;
-    generate(
-        &orch.db.local,
-        &hub,
-        model,
-        &pool,
-        &executor_snapshots(orch),
-        &orch.fleet.network(),
-        &BTreeMap::new(),
-    )
-    .await
+    hardware: BTreeMap<String, super::inference_generate::StatedHardware>,
+) -> Result<super::inference_generate::GenerationView, String> {
+    let row = super::inference_generate::launch(orch, project_id, model, pool, hardware).await?;
+    Ok(super::inference_generate::generation_view(orch, row).await)
+}
+
+/// Cancel a running generation.
+pub async fn cancel_generation(orch: &Orchestrator, id: &str) -> Result<String, String> {
+    super::inference_generate::cancel(orch, id).await
 }
 
 /// One profile's record YAML, for its editor.

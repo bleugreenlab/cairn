@@ -9,7 +9,7 @@
 //! image in its spec. The weights are the registered model's own files, or a
 //! named derivative's, pinned at a revision with every file's hash.
 
-use cairn_inference::generate::{dtype_label, profile_id};
+use cairn_inference::fit::{dtype_label, profile_id};
 use cairn_inference::hf::{HfRepo, WeightFormat};
 use cairn_inference::import::{self, Files, ImportError, ImportSpec, Missing};
 use cairn_inference::{

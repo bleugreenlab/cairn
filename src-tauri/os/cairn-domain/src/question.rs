@@ -8,6 +8,29 @@ use serde::{Deserialize, Serialize};
 pub struct QuestionOption {
     pub label: String,
     pub description: String,
+    /// The asker's recommendation, which an answer form preselects so that
+    /// accepting it is one click. At most one per single-select question.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recommended: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Refuse questions no form can show coherently: a single-select question
+/// recommending more than one option.
+pub fn validate_questions(questions: &[Question]) -> Result<(), String> {
+    for (index, question) in questions.iter().enumerate() {
+        let recommended = question.options.iter().filter(|o| o.recommended).count();
+        if !question.multi_select && recommended > 1 {
+            return Err(format!(
+                "question index {index} ({}) is single-select but recommends {recommended} options; recommend at most one, or set multiSelect",
+                question_label(index)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A single question to ask the user
@@ -277,6 +300,46 @@ mod tests {
             options: Vec::new(),
             multi_select: false,
         }
+    }
+
+    fn option(label: &str, recommended: bool) -> QuestionOption {
+        QuestionOption {
+            label: label.to_string(),
+            description: String::new(),
+            recommended,
+        }
+    }
+
+    #[test]
+    fn a_recommendation_round_trips_and_an_unrecommended_option_omits_it() {
+        let json = serde_json::json!({
+            "question": "Quantization?",
+            "header": null,
+            "options": [
+                {"label": "q8_0", "description": "", "recommended": true},
+                {"label": "bf16", "description": ""}
+            ]
+        });
+        let question: Question = serde_json::from_value(json).unwrap();
+        assert!(question.options[0].recommended);
+        assert!(!question.options[1].recommended);
+        let back = serde_json::to_value(&question).unwrap();
+        assert_eq!(back["options"][0]["recommended"], true);
+        assert!(back["options"][1].get("recommended").is_none());
+    }
+
+    #[test]
+    fn a_single_select_question_recommends_at_most_one_option() {
+        let mut q = question("Engine?");
+        q.options = vec![option("vLLM", true), option("llama.cpp", false)];
+        assert_eq!(validate_questions(std::slice::from_ref(&q)), Ok(()));
+        q.options[1].recommended = true;
+        assert_eq!(
+            validate_questions(std::slice::from_ref(&q)).unwrap_err(),
+            "question index 0 (Question 1) is single-select but recommends 2 options; recommend at most one, or set multiSelect"
+        );
+        q.multi_select = true;
+        assert_eq!(validate_questions(&[q]), Ok(()));
     }
 
     #[test]

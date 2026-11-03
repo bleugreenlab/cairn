@@ -1814,8 +1814,21 @@ mod tests {
         }
         let profiles = affordance_for_kind(ResourceKind::InferenceProfiles);
         assert!(
-            profiles.contains("import a profile from a compose file, or generate candidates"),
+            profiles
+                .contains("import a profile from a compose file, or write a generation's draft"),
             "{profiles}"
+        );
+        assert!(!profiles.contains("`generate("), "{profiles}");
+        let generation = affordance_for_kind(ResourceKind::InferenceGeneration);
+        assert!(
+            generation
+                .contains("record the operator's approval of its draft (its own workflow only)"),
+            "{generation}"
+        );
+        let fit = affordance_for_kind(ResourceKind::InferenceFit);
+        assert!(
+            fit.contains("source") && fit.contains("generation"),
+            "{fit}"
         );
         let models = affordance_for_kind(ResourceKind::InferenceModels);
         assert!(

@@ -1040,6 +1040,22 @@ struct NodeQuestionRow {
     response: Option<String>,
     answered: bool,
     resolution: Option<cairn_db::models::ResolutionReceipt>,
+    /// `Some` when withdrawn, holding the stored cause if there is one.
+    withdrawn: Option<Option<String>>,
+}
+
+impl NodeQuestionRow {
+    /// Where the question stands. A string rather than a flag, so states
+    /// beyond pending, answered and withdrawn have somewhere to go.
+    fn state(&self) -> &'static str {
+        if self.answered {
+            "answered"
+        } else if self.withdrawn.is_some() {
+            "withdrawn"
+        } else {
+            "pending"
+        }
+    }
 }
 
 async fn load_node_questions(
@@ -1052,7 +1068,8 @@ async fn load_node_questions(
             "
             SELECT p.uri_segment, p.questions, p.response, p.answered_at,
                    p.resolution_id, p.resolution_surface, p.resolution_provider,
-                   p.resolution_conversation, p.resolution_actor, p.created_at
+                   p.resolution_conversation, p.resolution_actor, p.created_at,
+                   p.withdrawn_at, p.withdrawn_cause
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
             WHERE r.job_id = ?1
@@ -1088,6 +1105,11 @@ async fn load_node_questions(
                         resolved_at: answered_at.unwrap_or_else(|| row.i64(9).unwrap_or_default()),
                     }
                 }),
+                withdrawn: row
+                    .opt_i64(10)
+                    .ok()
+                    .flatten()
+                    .map(|_| row.opt_text(11).ok().flatten()),
             });
         }
     }
@@ -1164,13 +1186,8 @@ pub(super) async fn read_node_question(
         );
     };
 
-    let status = if question.answered {
-        "answered"
-    } else {
-        "pending"
-    };
     let mut output = format!("# Question {} — {}\n\n", segment, node_name);
-    output.push_str(&format!("Status: {}\n\n", status));
+    output.push_str(&format!("Status: {}\n\n", question.state()));
 
     if let Ok(serde_json::Value::Array(items)) =
         serde_json::from_str::<serde_json::Value>(&question.questions_json)
@@ -1203,6 +1220,78 @@ pub(super) async fn read_node_question(
     }
 
     output
+}
+
+/// Block until a question is no longer pending, then return where it stands
+/// as one line of JSON: `{"state":"answered","answers":[{index,answer}],"text"}`,
+/// `{"state":"withdrawn","cause"}`, or, when the long-poll budget runs out
+/// first, `{"state":"pending"}` (the caller reads again). The script-facing
+/// await behind the harness `ask()`, as [`wait_for_task_artifact`] is behind
+/// `agent()`.
+pub(super) async fn wait_for_question(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    segment: &str,
+) -> String {
+    // Answers are broadcast; a withdrawal is not, so the wait also re-reads
+    // on a short tick.
+    const TICK: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut rx = orch.prompt_responses.subscribe();
+    let deadline = tokio::time::Instant::now() + CALL_WAIT_BUDGET;
+    loop {
+        let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
+            Box::pin(async move { load_node_questions(conn, &job.id).await })
+        });
+        let question = match read.await {
+            Ok((_, questions)) => questions.into_iter().find(|q| q.segment == segment),
+            Err(error) => {
+                return serde_json::json!({ "state": "error", "error": error }).to_string()
+            }
+        };
+        let Some(question) = question else {
+            return serde_json::json!({
+                "state": "error",
+                "error": format!("question {segment} not found for node {node_name}"),
+            })
+            .to_string();
+        };
+        match question.state() {
+            "pending" => {}
+            "withdrawn" => {
+                return serde_json::json!({
+                    "state": "withdrawn",
+                    "cause": question.withdrawn.flatten(),
+                })
+                .to_string()
+            }
+            state => {
+                let response = question.response.unwrap_or_default();
+                let questions: Vec<crate::models::question::Question> =
+                    serde_json::from_str(&question.questions_json).unwrap_or_default();
+                let stored = crate::models::question::PromptAnswers::decode_stored(&response);
+                let text = stored.render(&questions);
+                let answers = stored
+                    .into_answers(questions.len())
+                    .map(|answers| answers.into_answers())
+                    .unwrap_or_default();
+                return serde_json::json!({ "state": state, "answers": answers, "text": text })
+                    .to_string();
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return serde_json::json!({ "state": "pending" }).to_string();
+        }
+        if let Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) =
+            tokio::time::timeout(remaining.min(TICK), rx.recv()).await
+        {
+            tokio::time::sleep(remaining.min(TICK)).await
+        }
+    }
 }
 
 /// A stored answer as a reader sees it: indexed answers rendered against the

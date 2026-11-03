@@ -39,11 +39,13 @@ pub(crate) const PROMPT_SUSPENDED_OWNED_LOOP_MARKER: &str =
 
 /// Ask the user one or more questions.
 ///
-/// Stores a prompt addressable at `.../questions/{segment}`. With `background`
-/// false (the default), yields the current turn and blocks until the user
-/// responds, resuming on the prompt_responses broadcast. With `background`
-/// true, inserts the prompt and returns its URI immediately without yielding;
-/// the answer becomes observable later via the question read resolver.
+/// Stores a prompt addressable at `.../questions/{segment}`. A blocking ask
+/// (`background` false, the default) yields the current turn and blocks until
+/// the user responds, resuming on the prompt_responses broadcast. A
+/// non-blocking ask (`background` true, the append's `blocking: false`)
+/// inserts the prompt and returns its URI immediately without yielding; the
+/// answer becomes observable later through the question's read, and its
+/// `?wait` long-poll.
 pub async fn ask_questions(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -60,6 +62,8 @@ pub async fn ask_questions(
 pub struct QuestionsOutcome {
     pub text: String,
     pub answers: Option<Vec<QuestionAnswer>>,
+    /// The question's own URI, for a non-blocking ask.
+    pub uri: Option<String>,
 }
 
 impl From<String> for QuestionsOutcome {
@@ -67,6 +71,7 @@ impl From<String> for QuestionsOutcome {
         Self {
             text,
             answers: None,
+            uri: None,
         }
     }
 }
@@ -84,6 +89,7 @@ impl From<AnsweredPrompt> for QuestionsOutcome {
         Self {
             text: answered.rendered,
             answers: Some(answered.answers.into_answers()),
+            uri: None,
         }
     }
 }
@@ -120,6 +126,9 @@ async fn ask_questions_owned(
         return "A questions append needs at least one question in payload.questions"
             .to_string()
             .into();
+    }
+    if let Err(refusal) = crate::models::question::validate_questions(&payload.questions) {
+        return refusal.into();
     }
 
     let services = &orch.services;
@@ -420,14 +429,17 @@ async fn ask_questions_owned(
             _ => None,
         };
         let _ = &current_turn_id;
-        return match question_uri {
-            Some(uri) => format!(
-                "Question '{}' recorded; the answer will be available at {}",
-                uri_segment, uri
-            ),
-            None => format!("Question '{}' recorded.", uri_segment),
-        }
-        .into();
+        return QuestionsOutcome {
+            text: match &question_uri {
+                Some(uri) => format!(
+                    "Question '{}' recorded; the answer will be available at {}",
+                    uri_segment, uri
+                ),
+                None => format!("Question '{}' recorded.", uri_segment),
+            },
+            answers: None,
+            uri: question_uri,
+        };
     }
 
     // Emit run-paused event for frontend to show prompt UI
@@ -1573,6 +1585,7 @@ mod prompt_answer_tests {
         QuestionOption {
             label: label.to_string(),
             description: String::new(),
+            recommended: false,
         }
     }
 

@@ -1097,6 +1097,30 @@ pub enum CairnResource {
     InferenceVerification {
         id: String,
     },
+    /// A model's repositories' files sorted into weight sources, projectors
+    /// and draft heads: a profile-generating agent's facts.
+    InferenceModelFiles {
+        name: String,
+    },
+    /// A detected pool's hardware, exactly as the fit arithmetic reads it.
+    InferencePoolHardware {
+        pool: String,
+    },
+    /// Whether a model's weight source fits a pool, on how many machines and
+    /// with how much context.
+    InferenceFit,
+    /// The shipped engine templates, starting points for a profile.
+    InferenceTemplates,
+    /// One template made into a whole starting profile.
+    InferenceTemplate {
+        id: String,
+    },
+    /// The profile generations started from Settings > Inference.
+    InferenceGenerations,
+    /// One generation: its state, phase, waiting question and outcome.
+    InferenceGeneration {
+        id: String,
+    },
     /// Global bug report sink.
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
@@ -1252,6 +1276,13 @@ impl CairnResource {
             Self::InferenceProfile { .. } => ResourceKind::InferenceProfile,
             Self::InferenceVerifications => ResourceKind::InferenceVerifications,
             Self::InferenceVerification { .. } => ResourceKind::InferenceVerification,
+            Self::InferenceModelFiles { .. } => ResourceKind::InferenceModelFiles,
+            Self::InferencePoolHardware { .. } => ResourceKind::InferencePoolHardware,
+            Self::InferenceFit => ResourceKind::InferenceFit,
+            Self::InferenceTemplates => ResourceKind::InferenceTemplates,
+            Self::InferenceTemplate { .. } => ResourceKind::InferenceTemplate,
+            Self::InferenceGenerations => ResourceKind::InferenceGenerations,
+            Self::InferenceGeneration { .. } => ResourceKind::InferenceGeneration,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,

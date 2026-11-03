@@ -501,6 +501,10 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "inference_requests",
         "placement deletes answered model requests a week after they were answered",
     ),
+    keep(
+        "inference_generations",
+        "one row per profile generation the operator started by hand from Settings > Inference",
+    ),
     keep("ingress_endpoints", CONFIG),
     keep("account", IDENTITY),
     keep("anon_device", IDENTITY),

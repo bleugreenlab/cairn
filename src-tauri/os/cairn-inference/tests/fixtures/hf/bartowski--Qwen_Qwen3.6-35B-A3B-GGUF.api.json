@@ -1,0 +1,268 @@
+{
+ "id": "bartowski/Qwen_Qwen3.6-35B-A3B-GGUF",
+ "sha": "5c2410d71524f4f72b023ce8daf7a80528226d5f",
+ "gated": false,
+ "pipeline_tag": "image-text-to-text",
+ "tags": [
+  "gguf",
+  "image-text-to-text",
+  "base_model:Qwen/Qwen3.6-35B-A3B",
+  "base_model:quantized:Qwen/Qwen3.6-35B-A3B",
+  "license:apache-2.0",
+  "endpoints_compatible",
+  "region:us",
+  "imatrix",
+  "conversational"
+ ],
+ "gguf": {
+  "total": 35505251456,
+  "architecture": "qwen35moe",
+  "context_length": 262144
+ },
+ "siblings": [
+  {
+   "rfilename": ".gitattributes"
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ1_M.gguf",
+   "lfs": {
+    "sha256": "d291e12a0f693b5f14c11bb1278ba43b432b2b6f6c33c7fdaf750c214ff83f28",
+    "size": 9421649536
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ2_M.gguf",
+   "lfs": {
+    "sha256": "faae766ad5d1e09551a0f4deff9a3e8aa49618515d10e9fcae79f4e96ad4c178",
+    "size": 12964402816
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ2_S.gguf",
+   "lfs": {
+    "sha256": "52ac86b61423aff6721d59586ddc16f87983c5b3719c2a26c3bdbf403544f775",
+    "size": 11907962496
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ2_XS.gguf",
+   "lfs": {
+    "sha256": "a873df6cd354f49c87d4ab0382d5301b3fe9bb16ba68577a70efe6a57a2bd23d",
+    "size": 11694831232
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ2_XXS.gguf",
+   "lfs": {
+    "sha256": "aa4a46af613699d81841505974c91c877139c713e9e1f25b7708471e0542e85b",
+    "size": 10676139648
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ3_M.gguf",
+   "lfs": {
+    "sha256": "aedaa7010e09065d3a4129a624e45804ccfa1950838e67ee935b87d1e71a3d1f",
+    "size": 17791661696
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ3_XS.gguf",
+   "lfs": {
+    "sha256": "815607fc5ce720f30552d6aa901633629560daaeb76dc14ddaab3c14628559e7",
+    "size": 17110087296
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ3_XXS.gguf",
+   "lfs": {
+    "sha256": "4eb30af2df0dde76fe8d0a60f0e88f285ee668dcb1b8da892ee5c13dd6b00399",
+    "size": 15761446528
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ4_NL.gguf",
+   "lfs": {
+    "sha256": "41e9f836690bde9619928538cb4dd170472d2e851243637f7092937a151297ad",
+    "size": 20754978432
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf",
+   "lfs": {
+    "sha256": "afc7238af403ed454b7846454091b5e38b07575bdbb64c3e86777414dde4193c",
+    "size": 19699553920
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q2_K.gguf",
+   "lfs": {
+    "sha256": "673142cca6255bbb19774c8d438220d9ecfc3c8b215bc619d5e801bc37a35405",
+    "size": 13506778752
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q2_K_L.gguf",
+   "lfs": {
+    "sha256": "bcecb058c4b349b2df86353ae16538b0787a5704cafe412a79600696ea9234ef",
+    "size": 14003418752
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q3_K_L.gguf",
+   "lfs": {
+    "sha256": "8fecfc2c33a3f78f37cab7c1d1684c0ee28fa983058d68a8b3f36a440a0e9909",
+    "size": 17777899136
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q3_K_M.gguf",
+   "lfs": {
+    "sha256": "17350b1355d32397cffe7d4b446fd9361dbb01aa26bbf41fc950aa595033794f",
+    "size": 17117951616
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q3_K_S.gguf",
+   "lfs": {
+    "sha256": "699b1e56ee8e0975facc98c2a947c6a5a8c2874695e6fb8df8780dac19077417",
+    "size": 16404919936
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q3_K_XL.gguf",
+   "lfs": {
+    "sha256": "1451710903a99bfe99edb7b4de3f12ae80e0ef4d90cd6c64c774a4bde8b7f8ad",
+    "size": 18222888576
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q4_0.gguf",
+   "lfs": {
+    "sha256": "52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e",
+    "size": 20836243072
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q4_1.gguf",
+   "lfs": {
+    "sha256": "8babe2c6f46b43815cae7ec2b970be8508d6867234ebf16c376bd9cc79477354",
+    "size": 22868448896
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q4_K_L.gguf",
+   "lfs": {
+    "sha256": "49418000a889fef4b4353f36f598ad5a668c6ae374ac791bf923f76395a1bceb",
+    "size": 22662526592
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf",
+   "lfs": {
+    "sha256": "b46fedd33e0bfb0cae308aa3c158d0a4b2c4a1d2185a1ed6f093cdaf39064772",
+    "size": 22285080192
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q4_K_S.gguf",
+   "lfs": {
+    "sha256": "20933baa65d05b0c3b3958d3006a4485b8abbae1850c1f0a43c77c8316e9531c",
+    "size": 21486360192
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q5_K_L.gguf",
+   "lfs": {
+    "sha256": "8b062b51562496de4b228961afa8004850d30c80507e53ff48f91be318784526",
+    "size": 26227062400
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q5_K_M.gguf",
+   "lfs": {
+    "sha256": "ec438d1326eb11d8bb94785c54739cd4b60b01ae32bd8532e232a046b19d296d",
+    "size": 25913185920
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q5_K_S.gguf",
+   "lfs": {
+    "sha256": "c2c80fca38e0a91709ac2365b77c69936f03d6305ad188ac206583db5826f3d0",
+    "size": 25051879040
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q6_K.gguf",
+   "lfs": {
+    "sha256": "a97ef79439194d8ec722bc0b6c316f0c41c0b477b35bbae8177c772ecbb0eb91",
+    "size": 30947309184
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q6_K_L.gguf",
+   "lfs": {
+    "sha256": "51c8ecf2867186ddba4e0441a5925663688c84539a0b3be04ba8131da888fec7",
+    "size": 31193642624
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "bc57de096ec30e45773aa86103f35a8a32cea01f2193a53a3c636d618e4434e9",
+    "size": 37812647552
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-bf16/Qwen_Qwen3.6-35B-A3B-bf16-00001-of-00002.gguf",
+   "lfs": {
+    "sha256": "dbe8742f9ecf1624ac99577e174c7ae0642162232a47774c9d7fad45fbd0a75b",
+    "size": 39753375712
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-bf16/Qwen_Qwen3.6-35B-A3B-bf16-00002-of-00002.gguf",
+   "lfs": {
+    "sha256": "c895ee5a12392ede7ae7e9f554ed9f3d9430e8a7efc9c2c553e598b2a6108df9",
+    "size": 31312565824
+   }
+  },
+  {
+   "rfilename": "Qwen_Qwen3.6-35B-A3B-imatrix.gguf",
+   "lfs": {
+    "sha256": "e860d71bd40c83378a06da0407cd5cbfe61b9330784781a047f07a5348d8fd8c",
+    "size": 192223904
+   }
+  },
+  {
+   "rfilename": "README.md"
+  },
+  {
+   "rfilename": "mmproj-Qwen_Qwen3.6-35B-A3B-bf16.gguf",
+   "lfs": {
+    "sha256": "1c625f05cd52e90abc76a5f756226c3a5fe279593379c22f6c6846c970a0cd18",
+    "size": 902822240
+   }
+  },
+  {
+   "rfilename": "mmproj-Qwen_Qwen3.6-35B-A3B-f16.gguf",
+   "lfs": {
+    "sha256": "67924785ff1885c2b34c15d0e52979e991acca64221694ba2cc3a6474a053fb4",
+    "size": 899283296
+   }
+  },
+  {
+   "rfilename": "mtp-Qwen_Qwen3.6-35B-A3B-Q4_0.gguf",
+   "lfs": {
+    "sha256": "623351aeccfb9a26991ea6a7f0d24ef993a975fb2a508e4d95d3be1f72bf58da",
+    "size": 1190098816
+   }
+  },
+  {
+   "rfilename": "mtp-Qwen_Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "7f72d7cc4a9ff28cf0bd98a4e6e95e6869efa3b70c7244075376335f38109330",
+    "size": 1989597056
+   }
+  }
+ ]
+}

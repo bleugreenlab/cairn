@@ -1,0 +1,106 @@
+{
+ "id": "ggml-org/Qwen3.6-35B-A3B-GGUF",
+ "sha": "7878dc9a905c7c9379e5e8d6a1aa9affdd6839c5",
+ "gated": false,
+ "pipeline_tag": "image-text-to-text",
+ "tags": [
+  "gguf",
+  "quantized",
+  "image-text-to-text",
+  "base_model:Qwen/Qwen3.6-35B-A3B",
+  "base_model:quantized:Qwen/Qwen3.6-35B-A3B",
+  "license:apache-2.0",
+  "endpoints_compatible",
+  "region:us",
+  "conversational"
+ ],
+ "gguf": {
+  "total": 34660610688,
+  "architecture": "qwen35moe",
+  "context_length": 262144
+ },
+ "siblings": [
+  {
+   "rfilename": ".gitattributes"
+  },
+  {
+   "rfilename": ".src_sha"
+  },
+  {
+   "rfilename": "Qwen3.6-35B-A3B-BF16.gguf",
+   "lfs": {
+    "sha256": "2f33e1b02728bf63bde20fb675f734fd4e1e67f0f13aeeb92045f93f3512c9cf",
+    "size": 69376637248
+   }
+  },
+  {
+   "rfilename": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+   "lfs": {
+    "sha256": "671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7",
+    "size": 20419565568
+   }
+  },
+  {
+   "rfilename": "Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "d8d7842cc657d720f39546878e431937c84473aa130c36371669ac17c80c7361",
+    "size": 36903139328
+   }
+  },
+  {
+   "rfilename": "README.md"
+  },
+  {
+   "rfilename": "convert.log"
+  },
+  {
+   "rfilename": "dflash-Qwen3.6-35B-A3B-BF16.gguf",
+   "lfs": {
+    "sha256": "48f1fad7e7858f268f868900840d0f07cf40afd3648e8933b36d9001ff51292c",
+    "size": 782819520
+   }
+  },
+  {
+   "rfilename": "dflash-Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "339030c9dad4f410c7ef2d6cbd6e38251a84fabb59c44db992538c2451a0efee",
+    "size": 421060800
+   }
+  },
+  {
+   "rfilename": "mmproj-Qwen3.6-35B-A3B-BF16.gguf",
+   "lfs": {
+    "sha256": "360c746ddf38fb67c06f83a0a88742492aa231e59e335cd980e6302f59ea6089",
+    "size": 902822144
+   }
+  },
+  {
+   "rfilename": "mmproj-Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "904cbf8c8e876220066ab3bf676c7efa40f3da372276fdaf8b01d2fb2a37a51d",
+    "size": 614194304
+   }
+  },
+  {
+   "rfilename": "mtp-Qwen3.6-35B-A3B-BF16.gguf",
+   "lfs": {
+    "sha256": "dae566e176666fc149c34cf8300af4abf4b5a98ceab8fc1d2b74846f5f34788a",
+    "size": 3735545632
+   }
+  },
+  {
+   "rfilename": "mtp-Qwen3.6-35B-A3B-Q4_0.gguf",
+   "lfs": {
+    "sha256": "606fca331adcbfbdadc107512ce6a7161e84e1646ba0e0018256426f6296877f",
+    "size": 1060038432
+   }
+  },
+  {
+   "rfilename": "mtp-Qwen3.6-35B-A3B-Q8_0.gguf",
+   "lfs": {
+    "sha256": "f6cb995fab78e7284097b2e13508e8daad4ffc6a747b433aef399f4e48524b5a",
+    "size": 1990649632
+   }
+  }
+ ]
+}

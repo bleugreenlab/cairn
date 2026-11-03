@@ -102,7 +102,8 @@ pub fn digest(profile: &InferenceProfile) -> String {
 }
 
 /// One stored verification.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VerificationRow {
     pub id: String,
     pub profile: String,
@@ -807,7 +808,7 @@ pub fn candidates(
             .cmp(&rank(b))
             .then_with(|| {
                 let p = |r: &InferenceProfile| {
-                    cairn_inference::generate::precision(r.quantization.as_deref().unwrap_or(""))
+                    cairn_inference::fit::precision(r.quantization.as_deref().unwrap_or(""))
                 };
                 p(b).cmp(&p(a))
             })
@@ -1783,8 +1784,11 @@ machines:
         let mut generated = inventory.profiles[&InferenceProfileId::from("chat")].clone();
         generated.id = "chat-gen".into();
         generated.origin = ProfileOrigin::Generated {
-            template: "vllm-openai".into(),
+            run: None,
             model_revision: "abc".into(),
+            starting_template: Some("vllm-openai".into()),
+            sources: vec![],
+            answers: vec![],
         };
         inventory.insert_profile(generated);
         let mut imported = inventory.profiles[&InferenceProfileId::from("chat")].clone();

@@ -31,6 +31,7 @@ use cairn_inference::control::{
     self, Allocation, AllocationWatch, LoadOutcome, Observation, Phase, Report, Request,
     START_TIMEOUT_SECS, STOPPED_HEALTH_WAIT_SECS, STOP_TIMEOUT_SECS,
 };
+use cairn_inference::fit::predict_need;
 use cairn_inference::render::render;
 use cairn_inference::{
     unknown_address, Address, Addresses, Deployment, DeploymentId, Inventory, MachineName, Network,
@@ -324,7 +325,7 @@ impl Need {
 
 /// A deployment's need on each of its machines: its newest measured load when
 /// that covers every machine, else what its profile states, else what
-/// [`cairn_inference::generate::predict_need`] predicts from what the profile
+/// [`predict_need`] (`cairn_inference::fit`) predicts from what the profile
 /// runs (a share of a machine's memory is taken of `total_of` it). Refused,
 /// naming what is missing, when the profile gives nothing to predict from:
 /// the one placement may not weigh, so its start is refused, never sent blind.
@@ -363,7 +364,7 @@ pub fn need_of(
             .values()
             .find(|model| model.name.eq_ignore_ascii_case(&profile.model.name))
     });
-    let predicted = cairn_inference::generate::predict_need(profile, model)?;
+    let predicted = predict_need(profile, model)?;
     Ok(Need {
         per_machine: machines
             .filter_map(|m| Some((m.to_string(), predicted.bytes_on(total_of(m))?)))

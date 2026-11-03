@@ -813,6 +813,7 @@ pub(crate) async fn start_workflow_run(
 #[serde(rename_all = "camelCase")]
 pub struct LaunchedWorkflow {
     pub project_key: String,
+    pub issue_id: String,
     pub issue_number: i32,
     pub exec_seq: i32,
     pub node_segment: String,
@@ -840,11 +841,13 @@ pub struct LaunchedWorkflow {
 /// execution; a workflow's node addressability does not. The tradeoff (a
 /// lightweight issue per ad-hoc run) is the honest cost of reusing the
 /// issue-anchored execution model rather than inventing a parallel surface.
+/// `title` names the anchor issue; `Workflow: <name>` when `None`.
 pub async fn launch_standalone_workflow(
     orch: &Orchestrator,
     project_id: &str,
     workflow_id: &str,
     args_json: serde_json::Value,
+    title: Option<String>,
 ) -> Result<LaunchedWorkflow, String> {
     // 1. Resolve project addressing + repo path + default branch.
     let owning = crate::projects::crud::owning_db(&orch.db, project_id)
@@ -908,7 +911,7 @@ pub async fn launch_standalone_workflow(
         &*orch.services.clock,
         crate::models::CreateIssue {
             project_id: project_id.to_string(),
-            title: format!("Workflow: {display_name}"),
+            title: title.unwrap_or_else(|| format!("Workflow: {display_name}")),
             description: Some(format!("Standalone run of the `{workflow_id}` workflow.")),
             backend_override: None,
             label_ids: None,
@@ -1073,6 +1076,7 @@ pub async fn launch_standalone_workflow(
 
     Ok(LaunchedWorkflow {
         project_key,
+        issue_id: issue.id.clone(),
         issue_number: issue.number,
         exec_seq: 1,
         node_segment,

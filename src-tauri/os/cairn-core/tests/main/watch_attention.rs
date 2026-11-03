@@ -287,10 +287,12 @@ async fn typed_question_event_carries_inline_questions() {
                         QuestionOption {
                             label: "Yes".to_string(),
                             description: String::new(),
+                            recommended: false,
                         },
                         QuestionOption {
                             label: "No".to_string(),
                             description: String::new(),
+                            recommended: false,
                         },
                     ],
                     multi_select: false,
@@ -589,10 +591,12 @@ async fn ask_questions_handler_emits_typed_question_event() {
                 QuestionOption {
                     label: "Yes".to_string(),
                     description: String::new(),
+                    recommended: false,
                 },
                 QuestionOption {
                     label: "No".to_string(),
                     description: String::new(),
+                    recommended: false,
                 },
             ],
             multi_select: false,

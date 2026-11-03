@@ -190,11 +190,18 @@ pub(crate) const NODE_QUESTIONS_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[QUESTIONS],
-            optional: &[KeySpec::new(
-                "background",
-                KeyType::Bool,
-                "fire-and-forget; returns without waiting for the answer",
-            )],
+            optional: &[
+                KeySpec::new(
+                    "blocking",
+                    KeyType::Bool,
+                    "default true; false records the question and returns its URI at once (read it, or read it ?wait, for the answer)",
+                ),
+                KeySpec::new(
+                    "ordinal",
+                    KeyType::Int,
+                    "a workflow's dispatch ordinal for a non-blocking ask; a replay at the same ordinal returns the same question",
+                ),
+            ],
             label: "ask question",
             example: "write({changes:[{target:\"cairn:~/questions\",mode:\"append\",payload:{questions:[{question:\"...\",options:[{label:\"...\",description:\"...\"}],multiSelect:false}]}}]})",
         }],

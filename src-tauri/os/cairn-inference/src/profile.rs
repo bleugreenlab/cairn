@@ -68,12 +68,42 @@ pub enum ProfileOrigin {
         /// The compose service it was compiled from.
         service: String,
     },
-    /// Generated from a template for the model's facts at a revision.
+    /// Written by a profile-generating agent session (tenet 1364) for the
+    /// model at a revision. Profiles the retired template matcher wrote load
+    /// as generated with no run, their `template` read as the starting
+    /// template.
     #[serde(rename_all = "camelCase")]
     Generated {
-        template: String,
+        /// The generation run's node URI, stamped from the writer, never
+        /// taken from what it wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<String>,
         model_revision: String,
+        /// The shipped template the agent started from, if any.
+        #[serde(default, alias = "template", skip_serializing_if = "Option::is_none")]
+        starting_template: Option<String>,
+        /// What the agent cited for how it runs the model.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<CitedSource>,
+        /// The operator's answers to the agent's questions.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<OperatorAnswer>,
     },
+}
+
+/// A source a generated profile cites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CitedSource {
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// One question a generation asked the operator, and the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorAnswer {
+    pub question: String,
+    pub answer: String,
 }
 
 impl ProfileOrigin {
@@ -505,6 +535,11 @@ impl InferenceProfile {
         if !matches!(self.engine, Engine::Command { .. }) && self.model.weights.is_empty() {
             problems.push(ValidationError::UnpinnedWeights { profile: profile() });
         }
+        if matches!(self.origin, ProfileOrigin::Generated { .. })
+            && self.requirements.memory.is_none()
+        {
+            problems.push(ValidationError::GeneratedWithoutMemory { profile: profile() });
+        }
         problems
     }
 
@@ -751,8 +786,17 @@ mod tests {
         engine.host.gpus = true;
         let mut generated = profile(Engine::Container(engine), vec![weight(SHA)]);
         generated.origin = ProfileOrigin::Generated {
-            template: "llamacpp-vulkan".into(),
+            run: Some("cairn://p/cairn/9/1/workflow".into()),
             model_revision: "abc".into(),
+            starting_template: Some("llamacpp-vulkan".into()),
+            sources: vec![CitedSource {
+                url: "https://github.com/ggml-org/llama.cpp".into(),
+                title: "llama.cpp".into(),
+            }],
+            answers: vec![OperatorAnswer {
+                question: "Quantization".into(),
+                answer: "q8_0".into(),
+            }],
         };
         generated.quantization = Some("q8_0".into());
         let yaml = serde_yaml::to_string(&generated).unwrap();
@@ -760,10 +804,57 @@ mod tests {
         assert!(yaml.contains("server: llamaCpp"), "{yaml}");
         assert!(yaml.contains("kind: hfCache"), "{yaml}");
         assert!(yaml.contains("modelRevision: abc"), "{yaml}");
+        assert!(yaml.contains("startingTemplate: llamacpp-vulkan"), "{yaml}");
         assert_eq!(
             serde_yaml::from_str::<InferenceProfile>(&yaml).unwrap(),
             generated
         );
+    }
+
+    #[test]
+    fn a_profile_the_template_matcher_wrote_still_loads_as_generated_with_no_run() {
+        let origin: ProfileOrigin =
+            serde_yaml::from_str("kind: generated\ntemplate: llamacpp-cuda\nmodelRevision: abc\n")
+                .unwrap();
+        assert_eq!(
+            origin,
+            ProfileOrigin::Generated {
+                run: None,
+                model_revision: "abc".into(),
+                starting_template: Some("llamacpp-cuda".into()),
+                sources: vec![],
+                answers: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn a_generated_profile_must_state_its_memory() {
+        let mut generated = profile(
+            Engine::Container(container(format!("ghcr.io/org/server@sha256:{SHA}"))),
+            vec![weight(SHA)],
+        );
+        generated.origin = ProfileOrigin::Generated {
+            run: None,
+            model_revision: "abc".into(),
+            starting_template: None,
+            sources: vec![],
+            answers: vec![],
+        };
+        let problems: Vec<String> = generated
+            .problems()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            problems,
+            vec!["profile r is generated but states no memory need (requirements.memory)"]
+        );
+        generated.requirements.memory = Some(MemoryPerMachine::Discrete {
+            vram: VramBytes(1),
+            host: SystemRamBytes(0),
+        });
+        assert_eq!(generated.problems(), vec![]);
     }
 
     #[test]

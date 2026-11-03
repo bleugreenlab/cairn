@@ -2672,6 +2672,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::InferenceModel => "cairn://inference/models/Qwen/Qwen3-Embedding-4B",
         K::InferenceProfiles => "cairn://inference/profiles",
         K::InferenceProfile => "cairn://inference/profiles/embed",
+        K::InferenceGeneration => "cairn://inference/generations/g1",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
         K::ProjectEventEndpoints => "cairn://p/cairn/events/endpoints",
         K::ProjectEventEndpoint => "cairn://p/cairn/events/endpoints/bugs",

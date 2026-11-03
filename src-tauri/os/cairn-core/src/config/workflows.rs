@@ -583,6 +583,32 @@ mod tests {
     }
 
     #[test]
+    fn bundled_inference_generate_workflow_loads_with_no_branch() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packs/core/workflows/inference-generate")
+            .canonicalize()
+            .expect("inference-generate ships in the core pack");
+        match load_workflow_dir(&dir, false) {
+            ConfigResult::Ok(w) => {
+                assert_eq!(w.id, crate::orchestrator::inference_generate::WORKFLOW);
+                assert_eq!(
+                    w.branch,
+                    WorkflowBranchMode::None,
+                    "it writes no repository"
+                );
+                let schema = w.args_schema.expect("it declares its args");
+                assert_eq!(
+                    schema["required"],
+                    serde_json::json!(["generation", "model", "pool"])
+                );
+            }
+            ConfigResult::Err { error, .. } => {
+                panic!("bundled inference-generate failed to load: {error}")
+            }
+        }
+    }
+
+    #[test]
     fn missing_script_entry_is_rejected() {
         let temp = tempdir().unwrap();
         let dir = temp.path().join("workflows").join("no-script");

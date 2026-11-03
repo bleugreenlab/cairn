@@ -193,6 +193,10 @@ const EXPORT_EXCLUDED: &[(&str, &str)] = &[
         "what this runner's service processes did: lifecycle transitions, stderr lines, and call records keyed to this runner's process generations; a destination runner starts its own processes, and the log is pruned to the newest rows per service anyway",
     ),
     (
+        "inference_generations",
+        "a profile generation on this runner's inference machines: its row names a workflow job and anchor issue, but the inference records and machines it generated for are this install's, which an export does not carry",
+    ),
+    (
         "service_schedules",
         "this runner's cadence for the service processes it supervises: anchors and last outcomes of scheduled methods; a destination runner anchors its own cadence from the declarations, which export with their thread or live in the repository",
     ),

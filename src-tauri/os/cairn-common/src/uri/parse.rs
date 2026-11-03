@@ -152,6 +152,21 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["inference", "verifications", id] => Some(CairnResource::InferenceVerification {
             id: (*id).to_string(),
         }),
+        ["inference", "models", owner, name, "files"] => Some(CairnResource::InferenceModelFiles {
+            name: format!("{owner}/{name}"),
+        }),
+        ["inference", "pools", pool, "hardware"] => Some(CairnResource::InferencePoolHardware {
+            pool: (*pool).to_string(),
+        }),
+        ["inference", "fit"] => Some(CairnResource::InferenceFit),
+        ["inference", "templates"] => Some(CairnResource::InferenceTemplates),
+        ["inference", "templates", id] => Some(CairnResource::InferenceTemplate {
+            id: (*id).to_string(),
+        }),
+        ["inference", "generations"] => Some(CairnResource::InferenceGenerations),
+        ["inference", "generations", id] => Some(CairnResource::InferenceGeneration {
+            id: (*id).to_string(),
+        }),
         ["models", "sessions"] => Some(CairnResource::ModelsSessions),
         ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),

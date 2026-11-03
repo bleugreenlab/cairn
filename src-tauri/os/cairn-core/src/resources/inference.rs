@@ -272,13 +272,34 @@ fn origin_line(out: &mut String, origin: &cairn_inference::ProfileOrigin) {
             );
         }
         cairn_inference::ProfileOrigin::Generated {
-            template,
+            run,
             model_revision,
+            starting_template,
+            sources,
+            answers,
         } => {
             let _ = writeln!(
                 out,
-                "- origin: generated from template {template} for the model at {model_revision}"
+                "- origin: generated {}for the model at {model_revision}{}",
+                match run {
+                    Some(run) => format!("by {run} "),
+                    None => String::new(),
+                },
+                starting_template
+                    .as_deref()
+                    .map(|template| format!(", starting from template {template}"))
+                    .unwrap_or_default()
             );
+            for source in sources {
+                let _ = writeln!(out, "  - cited: {} ({})", source.url, source.title);
+            }
+            for answer in answers {
+                let _ = writeln!(
+                    out,
+                    "  - the operator answered {}: {}",
+                    answer.question, answer.answer
+                );
+            }
         }
     }
 }
@@ -1153,18 +1174,23 @@ pub(crate) fn render_verifications(view: &InferenceView, params: &[QueryParam]) 
 }
 
 pub(crate) fn render_verification(view: &InferenceView, id: &str, params: &[QueryParam]) -> String {
-    if let Some(error) = reject_params(
-        &format!("cairn://inference/verifications/{id}"),
-        params,
-        &[],
-    ) {
+    let uri = format!("cairn://inference/verifications/{id}");
+    if let Some(error) = reject_params(&uri, params, &["format"]) {
         return error;
     }
+    let as_data = match find_query_value(params, "format") {
+        None => false,
+        Some("json") => true,
+        Some(other) => return format!("Unknown format='{other}' for {uri}; expected json."),
+    };
     let Some(row) = view.verifications.iter().find(|r| r.id == id) else {
         return format!(
             "There is no verification {id}. cairn://inference/verifications lists them."
         );
     };
+    if as_data {
+        return serde_json::to_string_pretty(row).unwrap_or_default();
+    }
     let mut out = format!("# Verification {id}\n\n");
     let _ = writeln!(
         out,

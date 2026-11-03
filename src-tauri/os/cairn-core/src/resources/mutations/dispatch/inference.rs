@@ -18,7 +18,7 @@ use crate::fleet::pools::PoolKey;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::inference::{adopt, write_inventory, Authoring, Removals};
 use crate::orchestrator::inference_generate::{
-    detected_pool, executor_snapshots as snapshots, generate, pool_hardware, StatedHardware,
+    self as generation, detected_pool, executor_snapshots as snapshots, pool_hardware,
 };
 use crate::orchestrator::inference_import::import;
 use crate::orchestrator::inference_models::{register, Web};
@@ -298,18 +298,24 @@ pub(crate) fn inference_records_authority(
     let authoring = match (parse_uri(&item.target)?, item.mode) {
         (CairnResource::Inference, ChangeMode::Replace) => true,
         (CairnResource::Inference, ChangeMode::Patch) => !payload_has("adopt"),
-        // Registering, refreshing and removing a model, and importing or
-        // generating a profile, write records. Verifying does not cross the
-        // records authority, as starting a deployment from its page does not,
-        // though it writes two bounded records of its own: its
+        // Registering, refreshing and removing a model, and importing a
+        // profile, write records. Verifying does not cross the records
+        // authority, as starting a deployment from its page does not, though
+        // it writes two bounded records of its own: its
         // `verify-<profile>-<pool>` deployment, which runs a profile already
-        // written under the authority, and, when the engine's KV cache is
-        // smaller than the profile's context, that profile's context lowered to
-        // fit. Neither adds shell or raises what a profile asks of a machine.
+        // written, and, when the engine's KV cache is smaller than the
+        // profile's context, that profile's context lowered to fit. Neither
+        // adds shell or raises what a profile asks of a machine.
+        //
+        // A generation's draft (`generated`) does not cross it either: the
+        // operator's own start of the generation is the authority, and the
+        // door is narrow. Only that generation's workflow node may write
+        // through it, only a digest-pinned container profile of its model, and
+        // never over a profile that is not its own draft.
         (CairnResource::InferenceModels, ChangeMode::Append) => true,
         (CairnResource::InferenceModel { .. }, ChangeMode::Delete) => true,
         (CairnResource::InferenceModel { .. }, ChangeMode::Patch) => payload_has("refresh"),
-        (CairnResource::InferenceProfiles, ChangeMode::Append) => true,
+        (CairnResource::InferenceProfiles, ChangeMode::Append) => !payload_has("generated"),
         _ => false,
     };
     authoring.then(|| Ok(records_authority(item)))
@@ -396,6 +402,7 @@ pub(super) async fn dispatch(
     item: &ChangeItem,
     dry_run: bool,
     resource: &CairnResource,
+    applied_data: &mut Option<Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let fail = |error: String| build_failure(index, item, error);
     match (resource, item.mode) {
@@ -589,11 +596,23 @@ pub(super) async fn dispatch(
             let family = pool_hardware(&detected, &snapshots(orch), &Default::default())
                 .ok()
                 .and_then(|hw| hw.machines.first().map(|m| m.family));
-            let profiles =
-                inference_verify::candidates(&inventory, name, detected.members.len(), family);
+            let mut profiles = Vec::new();
+            for profile in
+                inference_verify::candidates(&inventory, name, detected.members.len(), family)
+            {
+                // An open generation's draft is verified only once the
+                // operator approved what it runs.
+                if generation::unapproved_draft(&orch.db.local, profile.as_str())
+                    .await
+                    .map_err(fail)?
+                    .is_none()
+                {
+                    profiles.push(profile);
+                }
+            }
             if profiles.is_empty() {
                 return Err(fail(format!(
-                    "model {name} has no container profile that suits pool {pool}; import one or generate candidates at cairn://inference/profiles"
+                    "model {name} has no container profile that suits pool {pool}; import one at cairn://inference/profiles, or generate one from Settings > Inference"
                 )));
             }
             let requester = actor(orch, request, None).await;
@@ -649,54 +668,100 @@ pub(super) async fn dispatch(
                 .map(Some)
                 .map_err(fail);
             }
-            let generate_payload = payload
-                .get("generate")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    fail("payload takes import:{...} or generate:{model, pool, hardware?}".into())
-                })?;
-            let model = generate_payload
-                .get("model")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    fail("payload.generate.model must name a registered model".into())
-                })?;
-            let pool = generate_payload
-                .get("pool")
-                .and_then(Value::as_str)
-                .ok_or_else(|| fail("payload.generate.pool must name a pool".into()))?;
-            let stated: std::collections::BTreeMap<String, StatedHardware> =
-                match generate_payload.get("hardware") {
-                    None | Some(Value::Null) => Default::default(),
-                    Some(hardware) => serde_json::from_value(hardware.clone()).map_err(|error| {
-                        fail(format!("payload.generate.hardware is {{<machine>: {{family, memoryGib, unified, arch, gpu?}}}}: {error}"))
-                    })?,
-                };
+            if payload.get("generate").is_some() {
+                return Err(fail(
+                    "generate retired: a profile is generated by an agent session started from Settings > Inference (tenet 1364); its workflow appends its draft as generated".into(),
+                ));
+            }
+            let generated = payload.get("generated").ok_or_else(|| {
+                fail("payload takes import:{...}, or generated:{profile, sources?, answers?, startingTemplate?} from a profile generation's own workflow".into())
+            })?;
             if dry_run {
+                return Ok(Some("Would write a generation's draft profile".into()));
+            }
+            let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
+                .await
+                .map_err(|_| {
+                    fail(
+                        "only a profile generation's own workflow writes a generated profile"
+                            .into(),
+                    )
+                })?;
+            let (said, data) =
+                generation::write_generated(&orch.db.local, &agent.home, &agent.job_id, generated)
+                    .await
+                    .map_err(fail)?;
+            refresh_offers(orch);
+            orch.notifier.emit_change("inference_generations");
+            *applied_data = Some(data);
+            Ok(Some(said))
+        }
+        (CairnResource::InferenceGeneration { id }, ChangeMode::Patch) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| fail("mode=patch requires payload".into()))?;
+            let agent = if dry_run {
+                None
+            } else {
+                Some(
+                    crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
+                        .await
+                        .map_err(|_| {
+                            fail("only the generation's own workflow patches it".into())
+                        })?,
+                )
+            };
+            if let Some(approve) = payload.get("approve") {
+                let question = approve
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        fail("payload.approve is {question}: the URI of the question the operator answered Approve".into())
+                    })?;
+                let Some(agent) = agent else {
+                    return Ok(Some(format!(
+                        "Would record the approval of generation {id}'s draft"
+                    )));
+                };
+                let asked = generation::asked_question(orch, &agent.job_id, question)
+                    .await
+                    .map_err(fail)?;
+                let digest = generation::approve(&orch.db.local, &agent.job_id, id, asked)
+                    .await
+                    .map_err(fail)?;
+                *applied_data = Some(serde_json::json!({ "generation": id, "approved": digest }));
                 return Ok(Some(format!(
-                    "Would generate profiles for {model} on pool {pool}"
+                    "The operator approved generation {id}'s draft as it stands (surface {digest}); it may be verified now."
                 )));
             }
-            let detected = detected_pool(orch, pool).map_err(fail)?;
-            let hub = Web::new().map_err(fail)?;
-            let snapshots = snapshots(orch);
-            let network = orch.fleet.network();
-            authorized(orch, request, item, async {
-                generate(
-                    &orch.db.local,
-                    &hub,
-                    model,
-                    &detected,
-                    &snapshots,
-                    &network,
-                    &stated,
-                )
+            let outcome = payload
+                .get("outcome")
+                .filter(|outcome| outcome.is_object())
+                .ok_or_else(|| {
+                    fail("payload takes approve:{question}, or outcome:{outcome: verified|cannotRun|gaveUp, verification?, why?, measured?, sources?, attempts?}".into())
+                })?;
+            let Some(agent) = agent else {
+                return Ok(Some(format!("Would end generation {id}")));
+            };
+            let verifications = inference_verify::load_verifications(&orch.db.local)
                 .await
-                .map(|generation| generation.said)
-            })
+                .map_err(fail)?;
+            let (said, ended) = generation::record_outcome(
+                &orch.db.local,
+                &agent.job_id,
+                id,
+                outcome,
+                &verifications,
+            )
             .await
-            .map(Some)
-            .map_err(fail)
+            .map_err(fail)?;
+            refresh_offers(orch);
+            orch.notifier.emit_change("inference_generations");
+            generation::close_anchor_when_done(orch, &ended);
+            *applied_data =
+                Some(serde_json::json!({ "generation": ended.id, "state": ended.state }));
+            Ok(Some(said))
         }
         (CairnResource::InferenceProfile { id }, ChangeMode::Patch) => {
             let payload = item
@@ -706,6 +771,12 @@ pub(super) async fn dispatch(
             let (pool, _) = pool_of(payload, "verify").map_err(fail)?;
             if dry_run {
                 return Ok(Some(format!("Would verify profile {id} on pool {pool}")));
+            }
+            if let Some(refusal) = generation::unapproved_draft(&orch.db.local, id)
+                .await
+                .map_err(fail)?
+            {
+                return Err(fail(refusal));
             }
             let detected = detected_pool(orch, &pool).map_err(fail)?;
             let requester = actor(orch, request, None).await;
@@ -720,6 +791,7 @@ pub(super) async fn dispatch(
             .await
             .map_err(fail)?;
             let (verification, head) = (plan.id, plan.head);
+            *applied_data = Some(serde_json::json!({ "verification": verification }));
             Ok(Some(format!(
                 "Verification {verification} started: profile {id} loads on pool {pool} as deployment verify-{id}-{pool}, its head reached at {head}, pinned for the verification so placement displaces any unpinned model on its machines, then its health is checked and it is benchmarked; afterwards it is unloaded and placement's rules bring the pool's models back. Read cairn://inference/verifications/{verification} for its stage."
             )))
@@ -903,6 +975,23 @@ mod tests {
             ..item(ChangeMode::Patch, serde_json::json!({"refresh": true}))
         };
         assert_eq!(scope(&refresh), inference);
+        let import = ChangeItem {
+            target: "cairn://inference/profiles".into(),
+            ..item(ChangeMode::Append, serde_json::json!({"import": {}}))
+        };
+        assert_eq!(scope(&import), inference);
+        let generated = ChangeItem {
+            target: "cairn://inference/profiles".into(),
+            ..item(
+                ChangeMode::Append,
+                serde_json::json!({"generated": {"profile": ""}}),
+            )
+        };
+        assert_eq!(
+            scope(&generated),
+            None,
+            "a generation's draft is authorized by the operator's start, through its own narrow door"
+        );
         let pools = ChangeItem {
             target: "cairn://inference/pools".into(),
             ..item(ChangeMode::Patch, serde_json::json!({"pool": "halo"}))

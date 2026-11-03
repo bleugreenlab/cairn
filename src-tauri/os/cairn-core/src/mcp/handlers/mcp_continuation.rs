@@ -662,6 +662,7 @@ fn input_prompt(requests: serde_json::Value) -> crate::mcp::types::AskUserPayloa
             options: vec![crate::mcp::types::QuestionOption {
                 label: "Continue".into(),
                 description: "Submit this response to the MCP tool".into(),
+                recommended: false,
             }],
             multi_select: false,
         }],

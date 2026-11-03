@@ -1221,6 +1221,25 @@ pub(crate) async fn produce_cairn_resource(
             return RenderedResource::line(body, None, None, None);
         }
     }
+    // `?wait` on a question: block until it is answered or withdrawn, then
+    // return its state as one line of JSON (the harness `ask()` parses it).
+    if let CairnResource::NodeQuestion {
+        project,
+        number,
+        exec_seq,
+        node_id,
+        segment,
+    } = &resource
+    {
+        if find_query_value(&split.params, "wait").is_some() {
+            let routed = orch.db.for_project(project).await;
+            let body = super::node::wait_for_question(
+                orch, &routed, project, *number, *exec_seq, node_id, segment,
+            )
+            .await;
+            return RenderedResource::line(body, None, None, None);
+        }
+    }
 
     let raw_artifact = matches!(
         resource,
@@ -2068,6 +2087,28 @@ async fn render_resource_body(
                     _ => crate::resources::inference::render_pools(&view, &params),
                 },
             }
+        }
+        // The profile generator's reads and its generations (tenet 1364).
+        CairnResource::InferenceModelFiles { name } => {
+            crate::resources::inference_generate::render_model_files(orch, &name, &params).await
+        }
+        CairnResource::InferencePoolHardware { pool } => {
+            crate::resources::inference_generate::render_pool_hardware(orch, &pool, &params).await
+        }
+        CairnResource::InferenceFit => {
+            crate::resources::inference_generate::render_fit(orch, &params).await
+        }
+        CairnResource::InferenceTemplates => {
+            crate::resources::inference_generate::render_templates(&params)
+        }
+        CairnResource::InferenceTemplate { id } => {
+            crate::resources::inference_generate::render_template(orch, &id, &params).await
+        }
+        CairnResource::InferenceGenerations => {
+            crate::resources::inference_generate::render_generations(orch, &params).await
+        }
+        CairnResource::InferenceGeneration { id } => {
+            crate::resources::inference_generate::render_generation(orch, &id, &params).await
         }
         // The cairn-models facet. Each page renders the facet interface's answer,
         // which the orchestrator composes from what Settings → Providers reads.

@@ -125,7 +125,7 @@ impl From<QuestionsOutcome> for BlockingResult {
     fn from(outcome: QuestionsOutcome) -> Self {
         Self {
             text: outcome.text,
-            artifact_uri: None,
+            artifact_uri: outcome.uri,
             answers: outcome.answers,
         }
     }
@@ -237,13 +237,30 @@ pub(crate) async fn run_blocking_group(
                     .to_string()
                     .into();
             };
-            let background = payload
-                .get("background")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
+            let mode = match QuestionAskMode::of(&payload) {
+                Ok(mode) => mode,
+                Err(refusal) => return refusal.into(),
+            };
             let ask: AskUserPayload = match serde_json::from_value(payload) {
                 Ok(ask) => ask,
                 Err(e) => return format!("Invalid question append payload: {e}").into(),
+            };
+            let memo = match mode.ordinal {
+                Some(ordinal) => match question_memo(orch, request, ordinal, &ask).await {
+                    Ok(QuestionMemo::Replayed(uri)) => {
+                        return BlockingResult {
+                            text: format!(
+                            "Question already asked at ordinal {ordinal}; its answer is at {uri}"
+                        ),
+                            artifact_uri: Some(uri),
+                            answers: None,
+                        }
+                        .into()
+                    }
+                    Ok(QuestionMemo::Ask(key)) => Some(key),
+                    Err(refusal) => return refusal.into(),
+                },
+                None => None,
             };
             let resolved_tool_use_id = match request.run_id.as_deref() {
                 Some(run_id) => claim_change_tool_use_id(orch, run_id, "/questions").await,
@@ -253,19 +270,142 @@ pub(crate) async fn run_blocking_group(
                 .tool_use_id
                 .as_deref()
                 .or(resolved_tool_use_id.as_deref());
-            BlockingResult::from(
-                crate::mcp::handlers::planning::ask_questions(
-                    orch,
-                    request,
-                    ask,
-                    background,
-                    tool_use_id,
-                )
-                .await,
+            let outcome = crate::mcp::handlers::planning::ask_questions(
+                orch,
+                request,
+                ask,
+                !mode.blocking,
+                tool_use_id,
             )
-            .into()
+            .await;
+            if let (Some(key), Some(uri)) = (memo, outcome.uri.as_deref()) {
+                if let Err(error) = crate::workflow_journal::store_entry(
+                    &orch.db.local,
+                    &key.run_id,
+                    key.ordinal,
+                    &key.hash,
+                    Some(uri),
+                    crate::workflow_journal::JournalStatus::Success,
+                )
+                .await
+                {
+                    log::warn!("failed to journal question {uri}: {error}");
+                }
+            }
+            BlockingResult::from(outcome).into()
         }
     }
+}
+
+/// How a questions append asks: blocking (the default) or not, and the
+/// journal ordinal a workflow node keys a non-blocking ask by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuestionAskMode {
+    blocking: bool,
+    ordinal: Option<i64>,
+}
+
+impl QuestionAskMode {
+    fn of(payload: &serde_json::Value) -> Result<Self, String> {
+        if payload.get("background").is_some() {
+            return Err(
+                "A questions append is non-blocking with blocking: false, not background"
+                    .to_string(),
+            );
+        }
+        let blocking = match payload.get("blocking") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Bool(blocking)) => *blocking,
+            Some(_) => return Err("payload.blocking is true or false".to_string()),
+        };
+        let ordinal = match payload.get("ordinal") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                "payload.ordinal is a non-negative integer, the workflow's dispatch ordinal"
+                    .to_string()
+            })?),
+        };
+        if ordinal.is_some() && blocking {
+            return Err(
+                "payload.ordinal keys a non-blocking ask; set blocking: false with it".to_string(),
+            );
+        }
+        Ok(Self { blocking, ordinal })
+    }
+}
+
+/// The journal key a workflow's non-blocking ask is recorded under.
+struct QuestionJournalKey {
+    run_id: String,
+    ordinal: i64,
+    hash: String,
+}
+
+enum QuestionMemo {
+    /// The same questions were asked at this ordinal before: their URI.
+    Replayed(String),
+    /// Not asked yet: ask, then journal under this key.
+    Ask(QuestionJournalKey),
+}
+
+/// A workflow's ordinal-keyed ask, looked up in the journal its `agent()`
+/// calls share, so a replayed script gets the question it already asked
+/// (answered or not) instead of a second prompt. Only a workflow node keys
+/// asks by ordinal.
+async fn question_memo(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    ordinal: i64,
+    ask: &AskUserPayload,
+) -> Result<QuestionMemo, String> {
+    let run_id = request
+        .run_id
+        .clone()
+        .ok_or("payload.ordinal needs an authenticated workflow run")?;
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, &run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let agent = {
+        let run_id = run_id.clone();
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT j.agent_config_id FROM jobs j JOIN runs r ON r.job_id = j.id WHERE r.id = ?1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => crate::storage::RowExt::opt_text(&row, 0)?,
+                    None => None,
+                })
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    };
+    if agent.as_deref() != Some("workflow") {
+        return Err(
+            "payload.ordinal is a workflow's dispatch ordinal; only a workflow node keys its asks by one"
+                .to_string(),
+        );
+    }
+    let questions = serde_json::to_string(&ask.questions).map_err(|error| error.to_string())?;
+    let hash = crate::workflow_journal::hash_prompt(&format!("questions:{questions}"));
+    if let Ok(Some(entry)) =
+        crate::workflow_journal::get_entry(&orch.db.local, &run_id, ordinal).await
+    {
+        if entry.prompt_hash == hash {
+            if let Some(uri) = entry.result_json {
+                return Ok(QuestionMemo::Replayed(uri));
+            }
+        }
+    }
+    Ok(QuestionMemo::Ask(QuestionJournalKey {
+        run_id,
+        ordinal,
+        hash,
+    }))
 }
 
 /// Node-tasks URI coordinates: `(project_key, number, exec_seq, node_id)`.
@@ -797,6 +937,268 @@ fn delegated_task_payload(task: TaskPayload) -> DelegatedTaskPayload {
         session,
         task_index: task.task_index,
         output_schema: task.output_schema,
+    }
+}
+
+#[cfg(test)]
+mod non_blocking_question_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
+    use std::sync::Arc;
+
+    async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
+        let local = Arc::new(
+            LocalDb::open_migrated_for_test(tempfile::tempdir().unwrap().keep().join("ask.db"))
+                .await
+                .unwrap(),
+        );
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(local.clone(), search));
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        (orch, local)
+    }
+
+    /// A workflow node (`flow`, run `wf-run`) and an ordinary agent node
+    /// (`agent`, run `ag-run`) on issue 7.
+    async fn seed(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-wf','e','i','p','running','flow','Flow','workflow',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-ag','e','i','p','running','agent','Agent','build',1,1)",
+            "INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('sess','j-wf',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('wf-run','j-wf','i','live',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('ag-run','j-ag','i','live',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    async fn ask(
+        orch: &Orchestrator,
+        run: &str,
+        node: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: "/tmp/p".to_string(),
+            run_id: Some(run.to_string()),
+            tool: "write".to_string(),
+            tool_use_id: None,
+            payload: serde_json::json!({
+                "changes": [{
+                    "target": format!("cairn://p/prj/7/1/{node}/questions"),
+                    "mode": "append",
+                    "payload": payload,
+                }]
+            }),
+            origin: None,
+        };
+        let result = crate::mcp::handlers::write::handle_write(orch, &request).await;
+        serde_json::from_str(&result).unwrap()
+    }
+
+    fn questions() -> serde_json::Value {
+        serde_json::json!([{
+            "question": "Quantization?",
+            "header": "Quant",
+            "options": [
+                {"label": "q8_0", "description": "fits", "recommended": true},
+                {"label": "bf16", "description": "does not fit"}
+            ]
+        }])
+    }
+
+    async fn prompt_count(db: &LocalDb) -> i64 {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query("SELECT COUNT(*) FROM prompts", ()).await?;
+                Ok(rows
+                    .next()
+                    .await?
+                    .map(|r| r.i64(0))
+                    .transpose()?
+                    .unwrap_or(0))
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_workflow_asks_once_per_ordinal_and_waits_on_the_answer() {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        let payload =
+            serde_json::json!({"questions": questions(), "blocking": false, "ordinal": 3});
+        let first = ask(&orch, "wf-run", "flow", payload.clone()).await;
+        let uri = first["blocking"]["artifact_uri"]
+            .as_str()
+            .expect("the question's URI")
+            .to_string();
+        assert_eq!(uri, "cairn://p/prj/7/1/flow/questions/q-1");
+        assert_eq!(prompt_count(&db).await, 1);
+
+        let replayed = ask(&orch, "wf-run", "flow", payload).await;
+        assert_eq!(
+            replayed["blocking"]["artifact_uri"].as_str(),
+            Some(uri.as_str())
+        );
+        assert_eq!(
+            prompt_count(&db).await,
+            1,
+            "a replay asks no second question"
+        );
+
+        crate::mcp::handlers::planning::answer_node_question(
+            &orch,
+            "prj",
+            7,
+            1,
+            "flow",
+            "q-1",
+            &serde_json::json!({"answers": [{"index": 0, "selection": "q8_0"}]}),
+        )
+        .await
+        .unwrap();
+        let waited: serde_json::Value = serde_json::from_str(
+            &crate::resources::node::wait_for_question(&orch, &db, "prj", 7, 1, "flow", "q-1")
+                .await,
+        )
+        .unwrap();
+        assert_eq!(waited["state"], "answered");
+        assert_eq!(waited["answers"][0]["answer"], "q8_0");
+
+        // A changed question at a new ordinal is a new prompt; withdrawn, the
+        // wait says so rather than waiting on.
+        let second = ask(
+            &orch,
+            "wf-run",
+            "flow",
+            serde_json::json!({"questions": questions(), "blocking": false, "ordinal": 4}),
+        )
+        .await;
+        assert_eq!(
+            second["blocking"]["artifact_uri"].as_str(),
+            Some("cairn://p/prj/7/1/flow/questions/q-2"),
+            "the same form at another ordinal is a second question"
+        );
+        // The memo is keyed by ordinal: a replay of each ask returns its own
+        // question, never the other's.
+        for (ordinal, own) in [(3, "q-1"), (4, "q-2")] {
+            let replay = ask(
+                &orch,
+                "wf-run",
+                "flow",
+                serde_json::json!({"questions": questions(), "blocking": false, "ordinal": ordinal}),
+            )
+            .await;
+            assert_eq!(
+                replay["blocking"]["artifact_uri"].as_str(),
+                Some(format!("cairn://p/prj/7/1/flow/questions/{own}").as_str())
+            );
+        }
+        assert_eq!(prompt_count(&db).await, 2);
+        // A different form at an asked ordinal is a divergence: it is asked
+        // afresh, never answered from the memo.
+        let diverged = ask(
+            &orch,
+            "wf-run",
+            "flow",
+            serde_json::json!({"questions": [{"question": "Something else?", "header": null, "options": []}], "blocking": false, "ordinal": 3}),
+        )
+        .await;
+        assert_eq!(
+            diverged["blocking"]["artifact_uri"].as_str(),
+            Some("cairn://p/prj/7/1/flow/questions/q-3")
+        );
+        db.execute(
+            "UPDATE prompts SET withdrawn_at = 9, withdrawn_cause = 'operator_stop' WHERE uri_segment = 'q-2'",
+            (),
+        )
+        .await
+        .unwrap();
+        let waited: serde_json::Value = serde_json::from_str(
+            &crate::resources::node::wait_for_question(&orch, &db, "prj", 7, 1, "flow", "q-2")
+                .await,
+        )
+        .unwrap();
+        assert_eq!(
+            waited,
+            serde_json::json!({"state": "withdrawn", "cause": "operator_stop"})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_non_blocking_ask_is_spelled_blocking_false_and_only_a_workflow_keys_it_by_ordinal()
+    {
+        let (orch, db) = orch_with_db().await;
+        seed(&db).await;
+        let refused = |report: &serde_json::Value| report.to_string();
+        let background = ask(
+            &orch,
+            "wf-run",
+            "flow",
+            serde_json::json!({"questions": questions(), "background": true}),
+        )
+        .await;
+        assert!(
+            refused(&background).contains("blocking: false, not background"),
+            "{background}"
+        );
+        let blocking_ordinal = ask(
+            &orch,
+            "wf-run",
+            "flow",
+            serde_json::json!({"questions": questions(), "ordinal": 0}),
+        )
+        .await;
+        assert!(
+            refused(&blocking_ordinal).contains("set blocking: false with it"),
+            "{blocking_ordinal}"
+        );
+        let agent_ordinal = ask(
+            &orch,
+            "ag-run",
+            "agent",
+            serde_json::json!({"questions": questions(), "blocking": false, "ordinal": 0}),
+        )
+        .await;
+        assert!(
+            refused(&agent_ordinal).contains("only a workflow node keys its asks by one"),
+            "{agent_ordinal}"
+        );
+        let two_recommended = ask(
+            &orch,
+            "ag-run",
+            "agent",
+            serde_json::json!({"blocking": false, "questions": [{
+                "question": "Engine?", "header": null,
+                "options": [
+                    {"label": "vLLM", "description": "", "recommended": true},
+                    {"label": "llama.cpp", "description": "", "recommended": true}
+                ]
+            }]}),
+        )
+        .await;
+        assert!(
+            refused(&two_recommended).contains("recommends 2 options"),
+            "{two_recommended}"
+        );
+        assert_eq!(prompt_count(&db).await, 0);
     }
 }
 

@@ -89,6 +89,11 @@ pub enum ValidationError {
         profile: InferenceProfileId,
         commit: String,
     },
+    /// A generated profile with no memory need, which placement and a
+    /// verification load's drain both size by.
+    GeneratedWithoutMemory {
+        profile: InferenceProfileId,
+    },
     /// A profile serving a model the inventory does not register.
     ProfileModelUnregistered {
         profile: InferenceProfileId,
@@ -172,6 +177,10 @@ impl fmt::Display for ValidationError {
             Self::BadSourceCommit { profile, commit } => write!(
                 f,
                 "profile {profile} pins source commit {commit:?}, which is not a full 40-hex sha"
+            ),
+            Self::GeneratedWithoutMemory { profile } => write!(
+                f,
+                "profile {profile} is generated but states no memory need (requirements.memory)"
             ),
             Self::ProfileModelUnregistered { profile, model } => write!(
                 f,

@@ -22,6 +22,7 @@ mod files;
 pub mod grants;
 pub mod home;
 mod inference;
+mod inference_generate;
 mod issue;
 mod labels;
 mod memories;

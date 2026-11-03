@@ -29,7 +29,7 @@
 //! on the models facet's vocabulary, so it is hostable outside Cairn.
 pub mod control;
 pub mod deployment;
-pub mod generate;
+pub mod fit;
 pub mod hf;
 pub mod import;
 pub mod inventory;
@@ -54,10 +54,10 @@ pub use machine::{
 };
 pub use model::{Model, ModelFacts};
 pub use profile::{
-    Accelerator, AcceleratorFamily, AcceleratorRuntime, Container, Engine, HostOptions,
-    InferenceProfile, InferenceProfileId, Interconnect, MemoryPerMachine, ModelRef, Mount,
-    MountSource, ProfileOrigin, Requirements, Server, SourcePin, SystemRamBytes, VramBytes,
-    WeightFile,
+    Accelerator, AcceleratorFamily, AcceleratorRuntime, CitedSource, Container, Engine,
+    HostOptions, InferenceProfile, InferenceProfileId, Interconnect, MemoryPerMachine, ModelRef,
+    Mount, MountSource, OperatorAnswer, ProfileOrigin, Requirements, Server, SourcePin,
+    SystemRamBytes, VramBytes, WeightFile,
 };
 pub use record::RecordSource;
 pub use served::{

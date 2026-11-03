@@ -484,8 +484,13 @@ pub(crate) async fn dispatch_resource_change(
     .await?
     {
         summary
-    } else if let Some(summary) =
-        off_frame(|| inference::dispatch(orch, request, index, item, dry_run, &resource)).await?
+    } else if let Some(summary) = {
+        let (resource, applied_data) = (&resource, &mut applied_data);
+        off_frame(move || {
+            inference::dispatch(orch, request, index, item, dry_run, resource, applied_data)
+        })
+    }
+    .await?
     {
         summary
     } else if let Some(summary) =
