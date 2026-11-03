@@ -15,6 +15,7 @@ use cairn_common::identity::{
 };
 use cairn_common::ids;
 use cairn_db::turso::params;
+use cairn_workflow::advancement::{close_job_sessions_conn, SessionCloseReason};
 use std::sync::Arc;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
@@ -775,7 +776,7 @@ pub async fn resolve(
             };
             drop(prior);
 
-            let reason = match resolution {
+            match resolution {
                 Resolution::Merged => {
                     conn.execute(
                         "UPDATE issues
@@ -785,7 +786,6 @@ pub async fn resolve(
                         params![now, now, now, id.as_str()],
                     )
                     .await?;
-                    "issue_merged"
                 }
                 Resolution::Closed => {
                     conn.execute(
@@ -796,9 +796,9 @@ pub async fn resolve(
                         params![now, now, now, id.as_str()],
                     )
                     .await?;
-                    "issue_closed"
                 }
-            };
+            }
+            let reason = SessionCloseReason::from(resolution);
 
             // Live work was stopped before this write, while the issue was
             // still open, so a blocked condition could have held an execution
@@ -938,40 +938,29 @@ async fn continue_sessions_for_issue_conn(
     Ok(())
 }
 
+/// Close the sessions of every job on the issue with the resolution's `reason`,
+/// whatever the job's status, returning the ids it closed: a resolved issue's
+/// work takes no turns until a reopen continues it.
 async fn close_sessions_for_issue_conn(
     conn: &cairn_db::turso::Connection,
     issue_id: &str,
-    reason: &str,
+    reason: SessionCloseReason,
     now: i64,
 ) -> DbResult<Vec<String>> {
     let mut rows = conn
-        .query(
-            "SELECT s.id
-             FROM sessions s
-             INNER JOIN jobs j ON s.job_id = j.id
-             WHERE j.issue_id = ?1
-               AND s.status = 'open'
-               AND COALESCE(j.memory_review_state, '') != 'sent'",
-            params![issue_id],
-        )
+        .query("SELECT id FROM jobs WHERE issue_id = ?1", params![issue_id])
         .await?;
-
-    let mut session_ids = Vec::new();
+    let mut job_ids = Vec::new();
     while let Some(row) = rows.next().await? {
-        session_ids.push(row.text(0)?);
+        job_ids.push(row.text(0)?);
     }
+    drop(rows);
 
-    for session_id in &session_ids {
-        conn.execute(
-            "UPDATE sessions
-             SET status = 'closed', terminal_reason = ?1, closed_at = ?2, updated_at = ?3
-             WHERE id = ?4",
-            params![reason, now, now, session_id.as_str()],
-        )
-        .await?;
+    let mut closed = Vec::new();
+    for job_id in &job_ids {
+        closed.extend(close_job_sessions_conn(conn, job_id, reason, now).await?);
     }
-
-    Ok(session_ids)
+    Ok(closed)
 }
 
 pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {

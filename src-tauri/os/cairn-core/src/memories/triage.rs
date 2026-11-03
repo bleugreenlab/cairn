@@ -2568,4 +2568,69 @@ mod tests {
             0
         );
     }
+
+    /// A review sent to a job whose current session is closed can never start,
+    /// because the closed session refuses its delivery, so the sweep confirms
+    /// its drafts instead of waiting on a turn that will not come. One sent to
+    /// a job whose session is still open may yet run, and keeps its drafts.
+    #[tokio::test]
+    async fn confirm_orphaned_drafts_does_not_wait_on_a_review_a_closed_session_refuses() {
+        let test = test_orch().await;
+        // Drafts confirm only once their issue merges, which is also what
+        // closes the session.
+        test.orch
+            .db
+            .local
+            .execute(
+                "UPDATE issues SET merged_at = 10 WHERE id = 'issue-main'",
+                (),
+            )
+            .await
+            .unwrap();
+        for (job, session_status) in [("job-closed", "closed"), ("job-open", "open")] {
+            insert_terminal_job(&test, job, "complete", Some("sent"), job).await;
+            test.orch
+                .db
+                .local
+                .execute(
+                    "INSERT INTO sessions (id, job_id, status, created_at, updated_at)
+                     VALUES ('s-' || ?1, ?1, ?2, 1, 1)",
+                    params![job, session_status],
+                )
+                .await
+                .unwrap();
+            test.orch
+                .db
+                .local
+                .execute(
+                    "UPDATE jobs SET current_session_id = 's-' || ?1 WHERE id = ?1",
+                    params![job],
+                )
+                .await
+                .unwrap();
+            for idx in 0..2 {
+                insert_memory_with_status(
+                    &test,
+                    &format!("{job}-{idx}"),
+                    "draft",
+                    "project",
+                    "project-1",
+                    job,
+                    idx + 1,
+                    idx + 1,
+                )
+                .await;
+            }
+        }
+
+        let confirmed = crate::memories::commands::confirm_orphaned_drafts(&test.orch).unwrap();
+
+        assert_eq!(confirmed, 2);
+        assert_eq!(draft_count(&test, "job-closed").await, 0);
+        assert_eq!(
+            draft_count(&test, "job-open").await,
+            2,
+            "a sent review on an open session may still run"
+        );
+    }
 }

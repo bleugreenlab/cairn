@@ -399,6 +399,21 @@ pub(crate) fn memory_review_turn_ended(orch: &Orchestrator, job_id: &str) -> boo
         == Some("1")
 }
 
+/// Whether the job's current session is closed. A closed session refuses every
+/// delivery, so a memory review sent to the job but not yet started never will.
+pub(crate) fn current_session_closed(orch: &Orchestrator, job_id: &str) -> bool {
+    blocking_text_lookup(
+        orch,
+        job_id,
+        "SELECT CASE WHEN s.status = 'closed' THEN '1' ELSE '0' END
+         FROM jobs j JOIN sessions s ON s.id = j.current_session_id
+         WHERE j.id = ?1",
+        TextColumn::Optional,
+    )
+    .as_deref()
+        == Some("1")
+}
+
 fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str) {
     let dbs = orch.db.clone();
     let job_id = job_id.to_string();
@@ -406,40 +421,52 @@ fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str
         let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
             .await
             .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().timestamp();
         db.write(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT i.status
-                         FROM jobs j
-                         JOIN issues i ON i.id = j.issue_id
-                         WHERE j.id = ?1
-                         LIMIT 1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Ok(());
-                };
-                let status = row.text(0)?;
-                if !matches!(status.as_str(), "closed" | "merged") {
-                    return Ok(());
-                }
-                let now = chrono::Utc::now().timestamp();
-                conn.execute(
-                    "UPDATE sessions
-                     SET status = 'closed', terminal_reason = 'issue_closed', closed_at = ?1, updated_at = ?1
-                     WHERE job_id = ?2 AND status = 'open'",
-                    (now, job_id.as_str()),
-                )
-                .await?;
-                Ok(())
+                close_resolved_sessions_after_memory_review_conn(conn, &job_id, now).await
             })
         })
         .await
         .map_err(|e| e.to_string())
     });
+}
+
+/// Close the sessions a resolution left open on a job for its memory review,
+/// now that the review is done, with the reason the job's issue records. A job
+/// whose issue is not resolved keeps its sessions.
+async fn close_resolved_sessions_after_memory_review_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    now: i64,
+) -> crate::storage::DbResult<()> {
+    let mut rows = conn
+        .query(
+            "SELECT i.status
+             FROM jobs j
+             JOIN issues i ON i.id = j.issue_id
+             WHERE j.id = ?1
+             LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(());
+    };
+    let status = row.text(0)?;
+    drop(rows);
+    if !matches!(status.as_str(), "closed" | "merged") {
+        return Ok(());
+    }
+    cairn_workflow::advancement::close_job_sessions_conn(
+        conn,
+        job_id,
+        cairn_workflow::advancement::SessionCloseReason::for_issue_status(Some(&status)),
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Journal a completed workflow-parented ephemeral call's result under its
@@ -1309,6 +1336,68 @@ pub(crate) fn run_digest_reseed_fallback(orch: &Orchestrator, plan: &DigestResee
             &plan.session_id[..plan.session_id.len().min(8)],
             error
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_review_session_tests {
+    use super::close_resolved_sessions_after_memory_review_conn;
+
+    /// Once its review is done, a job on a resolved issue closes with the
+    /// reason its issue records; one on an active issue keeps its session.
+    #[tokio::test]
+    async fn a_finished_review_closes_with_its_issues_own_reason() {
+        let db = crate::storage::migrated_test_db("memory-review-close.db").await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('merged', 'p', 1, 'M', 'merged', 'merged', 'none', 1, 1),
+                   ('closed', 'p', 2, 'C', 'closed', 'closed', 'none', 1, 1),
+                   ('active', 'p', 3, 'A', 'active', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, memory_review_state, created_at, updated_at)
+             VALUES('on-merged', 'p', 'merged', 'complete', 'done', 1, 1),
+                   ('on-closed', 'p', 'closed', 'complete', 'done', 1, 1),
+                   ('on-active', 'p', 'active', 'complete', 'done', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES('s-merged', 'on-merged', 'claude', 'open', 1, 1, 1),
+                   ('s-closed', 'on-closed', 'claude', 'open', 1, 1, 1),
+                   ('s-active', 'on-active', 'claude', 'open', 1, 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        for job in ["on-merged", "on-closed", "on-active"] {
+            db.write(|conn| {
+                Box::pin(async move {
+                    close_resolved_sessions_after_memory_review_conn(conn, job, 42).await
+                })
+            })
+            .await
+            .unwrap();
+        }
+
+        for (session, expected) in [
+            ("s-merged", "closed:issue_merged:42"),
+            ("s-closed", "closed:issue_closed:42"),
+            ("s-active", "open::"),
+        ] {
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT status || ':' || COALESCE(terminal_reason, '') || ':' || COALESCE(closed_at, '')
+                       FROM sessions WHERE id = ?1",
+                    cairn_db::turso::params![session],
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some(expected),
+                "{session}"
+            );
+        }
     }
 }
 

@@ -641,9 +641,9 @@ pub(crate) fn confirm_drafts_for_completed_job_without_artifact_review(
 /// review. A failed job, or a review interrupted by process eviction / app
 /// restart, leaves its drafts inert. This sweep advances to `pending` every
 /// draft whose owning job is terminal and is not in an in-flight review (a job
-/// whose `memory_review_state = 'sent'` and whose review turn has not yet
-/// ended), enqueueing content embeds for the confirmed drafts. Returns the
-/// total confirmed count.
+/// whose `memory_review_state = 'sent'`, whose review turn has not yet ended,
+/// and whose current session can still take that turn), enqueueing content
+/// embeds for the confirmed drafts. Returns the total confirmed count.
 pub(crate) fn confirm_orphaned_drafts(
     orch: &crate::orchestrator::Orchestrator,
 ) -> Result<usize, String> {
@@ -668,9 +668,13 @@ pub(crate) fn confirm_orphaned_drafts(
     for (job_id, review_state) in jobs {
         // A 'sent' review whose turn has not ended is still in flight: the agent
         // may still be editing drafts. Skip it; the review-completion hook (or a
-        // later sweep once the turn ends) confirms its survivors.
+        // later sweep once the turn ends) confirms its survivors. A review sent
+        // to a job whose current session is closed is not in flight: a live
+        // review holds its session open, and a closed one refuses the delivery
+        // of a review that has not started, so that turn never runs.
         if review_state.as_deref() == Some("sent")
             && !crate::orchestrator::lifecycle::memory_review_turn_ended(orch, &job_id)
+            && !crate::orchestrator::lifecycle::current_session_closed(orch, &job_id)
         {
             continue;
         }

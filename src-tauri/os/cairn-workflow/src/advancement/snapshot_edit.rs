@@ -126,11 +126,11 @@ pub fn reconcile_removed_nodes(
     })
 }
 
-/// Why a cancelled job's sessions were closed, as `sessions.terminal_reason`
-/// records it.
+/// Why a job's sessions were closed by a cancel or by its issue's resolution,
+/// as `sessions.terminal_reason` records it.
 ///
 /// The reason is what the launch funnel turns into the operator's next step
-/// (`closed_session_refusal` in cairn-core), so each cancel names its own cause
+/// (`closed_session_refusal` in cairn-core), so each close names its own cause
 /// rather than one constant: a merged builder told to "add the node back to the
 /// execution" has been told something false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,15 +192,17 @@ impl From<crate::transitions::status::Resolution> for SessionCloseReason {
     }
 }
 
-/// Close every open session of a cancelled job with `reason`, returning the ids
-/// it closed.
+/// Close every open session of a job with `reason`, returning the ids it
+/// closed.
 ///
-/// The one way a cancel closes its sessions, so a cancelled job never keeps an
-/// open session that would let a turn through or tell the operator nothing. A
-/// job whose memory review turn is live keeps its session: the review is still
+/// The one way a job's sessions close when it is cancelled or its issue is
+/// resolved, whatever the job's status, so such a job never keeps an open
+/// session that would let a turn through or tell the operator nothing. A job
+/// whose memory review turn is live keeps its session: the review is still
 /// running there, and its finalizer closes the session once the review ends. A
-/// review that was sent but never started gets no such hold, because the
-/// cancel means it never will start, and nothing else would close the session.
+/// review that was sent but never started gets no such hold: it never will
+/// start, because the closed session refuses its delivery, and nothing else
+/// would close the session. The orphan-draft sweep confirms its drafts.
 pub async fn close_job_sessions_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,

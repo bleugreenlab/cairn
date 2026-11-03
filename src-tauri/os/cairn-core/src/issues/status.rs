@@ -1115,6 +1115,8 @@ mod projection_tests {
                     {"id": "planner", "nodeType": "agent", "name": "Planner", "position": {"x": 0.0, "y": 0.0}},
                     {"id": "coordinator", "nodeType": "agent", "name": "Coordinator", "position": {"x": 0.0, "y": 0.0}},
                     {"id": "followup", "nodeType": "agent", "name": "Followup", "position": {"x": 0.0, "y": 0.0}},
+                    {"id": "qa", "nodeType": "agent", "name": "QA", "position": {"x": 0.0, "y": 0.0}},
+                    {"id": "reviewed", "nodeType": "agent", "name": "Reviewed", "position": {"x": 0.0, "y": 0.0}},
                     {"id": "pr", "nodeType": "pr", "name": "PR", "position": {"x": 1.0, "y": 0.0}}
                 ],
                 "edges": []
@@ -1134,6 +1136,9 @@ mod projection_tests {
     /// - the builder's first attempt, archived by a restart (its node remains,
     ///   beside the newer builder job) after a completed turn;
     /// - a job archived by removing its node;
+    /// - a failed job;
+    /// - a complete job whose memory review was sent and whose review turn was
+    ///   cancelled, so no finalizer will close its session;
     ///
     /// plus a superseded earlier execution whose builder the supersession froze.
     async fn orch_with_execution() -> Orchestrator {
@@ -1166,19 +1171,27 @@ mod projection_tests {
                    ('followup', 'e-t', 'followup', 'issue-t', 'p-t', 'followup', 'followup', 'running', 's-followup', 1, 1),
                    ('builder-attempt-1', 'e-t', 'builder', 'issue-t', 'p-t', 'builder', 'builder-1', 'cancelled', 's-attempt-1', 0, 0),
                    ('archived', 'e-t', 'removed', 'issue-t', 'p-t', 'removed', 'removed', 'cancelled', NULL, 1, 1),
-                   ('old-builder', 'e-old', 'builder', 'issue-t', 'p-t', 'builder', 'builder', 'cancelled', NULL, 1, 1);
+                   ('old-builder', 'e-old', 'builder', 'issue-t', 'p-t', 'builder', 'builder', 'cancelled', NULL, 1, 1),
+                   ('qa', 'e-t', 'qa', 'issue-t', 'p-t', 'qa', 'qa', 'failed', 's-qa', 1, 1);
+            INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, status, current_session_id, memory_review_state, created_at, updated_at)
+             VALUES('reviewed', 'e-t', 'reviewed', 'issue-t', 'p-t', 'reviewed', 'reviewed', 'complete', 's-reviewed', 'sent', 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
              VALUES('s-builder', 'builder', 'claude', 'open', 1, 1, 1),
                    ('s-planner', 'planner', 'claude', 'open', 1, 1, 1),
                    ('s-coordinator', 'coordinator', 'claude', 'open', 1, 1, 1),
                    ('s-followup', 'followup', 'claude', 'open', 1, 1, 1),
-                   ('s-attempt-1', 'builder-attempt-1', 'claude', 'closed', 1, 0, 0);
+                   ('s-attempt-1', 'builder-attempt-1', 'claude', 'closed', 1, 0, 0),
+                   ('s-qa', 'qa', 'claude', 'open', 1, 1, 1),
+                   ('s-reviewed', 'reviewed', 'claude', 'open', 1, 1, 1);
             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at)
              VALUES('t-builder', 's-builder', 'builder', 1, 'interrupted', 'initial', 1, 2, 2),
                    ('t-planner', 's-planner', 'planner', 1, 'complete', 'initial', 1, 2, 2),
                    ('t-coordinator', 's-coordinator', 'coordinator', 1, 'complete', 'initial', 1, 2, 2),
                    ('t-followup-1', 's-followup', 'followup', 1, 'complete', 'initial', 1, 2, 2),
-                   ('t-attempt-1', 's-attempt-1', 'builder-attempt-1', 1, 'complete', 'initial', 0, 0, 0);
+                   ('t-attempt-1', 's-attempt-1', 'builder-attempt-1', 1, 'complete', 'initial', 0, 0, 0),
+                   ('t-qa', 's-qa', 'qa', 1, 'failed', 'initial', 1, 2, 2),
+                   ('t-reviewed', 's-reviewed', 'reviewed', 1, 'complete', 'initial', 1, 2, 2),
+                   ('t-reviewed-review', 's-reviewed', 'reviewed', 2, 'cancelled', 'memory_review', 3, 4, 4);
             INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
              VALUES('t-followup-2', 's-followup', 'followup', 2, 'running', 'follow_up', 3, 3);
             ",
@@ -1269,14 +1282,22 @@ mod projection_tests {
                     "{resolution:?} {session}"
                 );
             }
-            // The stop closes the sessions of the work it cancels with the
-            // resolution's own reason, which is what tells the operator that
-            // reopening the issue picks the work back up.
+            // The resolution closes every job's sessions with its own reason,
+            // whatever the job's status, which is what tells the operator that
+            // reopening the issue picks the work back up. A sent memory review
+            // whose turn has ended holds nothing open.
             let reason = match resolution {
                 Resolution::Merged => "issue_merged",
                 Resolution::Closed => "issue_closed",
             };
-            for session in ["s-builder", "s-coordinator", "s-followup", "s-planner"] {
+            for session in [
+                "s-builder",
+                "s-coordinator",
+                "s-followup",
+                "s-planner",
+                "s-qa",
+                "s-reviewed",
+            ] {
                 assert_eq!(
                     text(
                         &orch,
@@ -1388,10 +1409,15 @@ mod projection_tests {
             "a restart archive stays archived"
         );
 
-        // The lifted builder and the complete planner each continue on a fresh
-        // open successor of the session the merge closed; the closed one keeps
-        // the merge's reason as history.
-        for (job, closed) in [("builder", "s-builder"), ("planner", "s-planner")] {
+        // The lifted builder, the complete planner, the failed job and the
+        // reviewed one each continue on a fresh open successor of the session
+        // the merge closed; the closed one keeps the merge's reason as history.
+        for (job, closed) in [
+            ("builder", "s-builder"),
+            ("planner", "s-planner"),
+            ("qa", "s-qa"),
+            ("reviewed", "s-reviewed"),
+        ] {
             let current = text(
                 &orch,
                 "SELECT current_session_id FROM jobs WHERE id = ?1",
@@ -1464,10 +1490,12 @@ mod projection_tests {
             ),
             "{start:?}"
         );
-        assert!(
-            !crate::execution::jobs::current_session_refuses_turns(&db, "planner").await,
-            "the planner's current session takes a turn"
-        );
+        for job in ["planner", "qa", "reviewed"] {
+            assert!(
+                !crate::execution::jobs::current_session_refuses_turns(&db, job).await,
+                "{job}'s current session takes a turn"
+            );
+        }
     }
 
     /// The migration converges the open sessions older builds left on
@@ -1520,10 +1548,18 @@ mod projection_tests {
         .await
         .unwrap();
 
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
+        // Up to the migration that closes every resolved issue's sessions, so
+        // this one is seen alone.
+        MigrationRunner::new(
+            TURSO_MIGRATIONS
+                .iter()
+                .take_while(|migration| migration.name() != "close_sessions_on_resolved_issues")
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+        .run(&db)
+        .await
+        .unwrap();
 
         for (session, expected) in [
             ("s-merged", "closed:issue_merged:50"),
@@ -1558,6 +1594,111 @@ mod projection_tests {
             .as_deref(),
             Some("closed:job_cancelled:1"),
             "a job with no issue closes as job_cancelled, stamped with the migration's time"
+        );
+    }
+
+    /// The migration converges the open sessions older builds left on the jobs
+    /// of resolved issues, whatever the job's status and whatever its memory
+    /// review state, stamped with when the issue resolved, and leaves an active
+    /// issue's sessions and already-closed sessions alone.
+    #[tokio::test]
+    async fn the_migration_closes_the_sessions_of_resolved_issues() {
+        use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("resolved-sessions.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "close_sessions_on_resolved_issues")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(
+            before.len() < TURSO_MIGRATIONS.len(),
+            "the migration must be in the lineage"
+        );
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p', 'w', 'P', 'p', '/tmp/p', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, merged_at, closed_at, completed_at, created_at, updated_at)
+             VALUES('merged', 'p', 1, 'M', 'merged', 'merged', 'none', 100, NULL, 101, 1, 1),
+                   ('closed', 'p', 2, 'C', 'closed', 'closed', 'none', NULL, 200, 201, 1, 1),
+                   ('merged-bare', 'p', 3, 'MB', 'merged', 'merged', 'none', NULL, NULL, 300, 1, 1),
+                   ('closed-unstamped', 'p', 4, 'CU', 'closed', 'closed', 'none', NULL, NULL, NULL, 1, 1),
+                   ('open', 'p', 5, 'O', 'active', 'active', 'none', NULL, NULL, NULL, 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, memory_review_state, created_at, updated_at)
+             VALUES('complete', 'p', 'merged', 'complete', NULL, 1, 1),
+                   ('failed', 'p', 'closed', 'failed', NULL, 1, 1),
+                   ('pending', 'p', 'merged', 'pending', NULL, 1, 1),
+                   ('reviewing', 'p', 'merged', 'complete', 'sent', 1, 1),
+                   ('bare', 'p', 'merged-bare', 'complete', NULL, 1, 1),
+                   ('unstamped', 'p', 'closed-unstamped', 'failed', NULL, 1, 1),
+                   ('live', 'p', 'open', 'running', NULL, 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, terminal_reason, closed_at, sequence, created_at, updated_at)
+             VALUES('s-complete', 'complete', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-failed', 'failed', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-pending', 'pending', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-reviewing', 'reviewing', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-bare', 'bare', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-unstamped', 'unstamped', 'claude', 'open', NULL, NULL, 1, 1, 1),
+                   ('s-earlier', 'complete', 'claude', 'closed', 'rotated_reseed', 5, 0, 1, 1),
+                   ('s-live', 'live', 'claude', 'open', NULL, NULL, 1, 1, 1);
+            INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES('t-review', 's-reviewing', 'reviewing', 1, 'yielded', 'memory_review', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        for (session, expected, why) in [
+            ("s-complete", "closed:issue_merged:100", "a complete job"),
+            ("s-failed", "closed:issue_closed:200", "a failed job"),
+            ("s-pending", "closed:issue_merged:100", "a pending stray"),
+            (
+                "s-reviewing",
+                "closed:issue_merged:100",
+                "no review turn is live while migrations run",
+            ),
+            (
+                "s-bare",
+                "closed:issue_merged:300",
+                "falls back to the issue's completion time",
+            ),
+            ("s-earlier", "closed:rotated_reseed:5", "already closed"),
+            ("s-live", "open::", "an active issue's work"),
+        ] {
+            assert_eq!(
+                db.query_opt_text(
+                    "SELECT status || ':' || COALESCE(terminal_reason, '') || ':' || COALESCE(closed_at, '')
+                       FROM sessions WHERE id = ?1",
+                    params![session],
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+                Some(expected),
+                "{session}: {why}"
+            );
+        }
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status || ':' || terminal_reason || ':' || (closed_at IS NOT NULL)
+                   FROM sessions WHERE id = 's-unstamped'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("closed:issue_closed:1"),
+            "an issue with no resolution time closes stamped with the migration's time"
         );
     }
 }
