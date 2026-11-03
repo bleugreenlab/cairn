@@ -30,7 +30,6 @@ pub struct BrokeredContentStore {
     /// The PRIVATE database, home of the `cas_cache` read-through cache. Never the
     /// team replica (whose synced rows must stay free of fetched bytes).
     local: Arc<LocalDb>,
-    client: reqwest::Client,
 }
 
 impl BrokeredContentStore {
@@ -45,8 +44,16 @@ impl BrokeredContentStore {
             api,
             minter,
             local,
-            client: cairn_tls::client().clone(),
         }
+    }
+
+    /// The shared client, taken per request rather than at construction: a
+    /// store is built when its team's replica reopens during state
+    /// initialisation, on the boot thread, before the platform root store has
+    /// necessarily loaded.
+    async fn client() -> &'static reqwest::Client {
+        cairn_tls::ready().await;
+        cairn_tls::client()
     }
 
     /// Read-through cache lookup. Best-effort: a cache miss or error returns
@@ -67,8 +74,8 @@ impl ContentStore for BrokeredContentStore {
     async fn put(&self, hash: &str, bytes: &[u8]) -> Result<(), String> {
         let token = self.minter.mint(&self.team_id).await?;
         let url = self.api.team_cas_url(&self.team_id, hash);
-        let resp = self
-            .client
+        let resp = Self::client()
+            .await
             .put(url)
             .bearer_auth(token)
             .body(bytes.to_vec())
@@ -90,8 +97,8 @@ impl ContentStore for BrokeredContentStore {
         }
         let token = self.minter.mint(&self.team_id).await?;
         let url = self.api.team_cas_url(&self.team_id, hash);
-        let resp = self
-            .client
+        let resp = Self::client()
+            .await
             .get(url)
             .bearer_auth(token)
             .send()

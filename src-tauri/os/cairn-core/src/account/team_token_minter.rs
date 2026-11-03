@@ -47,19 +47,18 @@ pub trait TeamTokenMinter: Send + Sync {
 
 /// The production minter: reads the live device JWT from the private DB and
 /// exchanges it for a team-scoped sync token via the api, leasing it per team.
+///
+/// Built on the boot thread during state initialisation, before the platform
+/// root store has necessarily loaded, so it holds no HTTP client: `mint`
+/// awaits the load and takes the shared client then.
 pub struct DefaultTeamTokenMinter {
     local: Arc<LocalDb>,
     api: ApiConfig,
-    client: reqwest::Client,
 }
 
 impl DefaultTeamTokenMinter {
     pub fn new(local: Arc<LocalDb>, api: ApiConfig) -> Self {
-        Self {
-            local,
-            api,
-            client: cairn_tls::client().clone(),
-        }
+        Self { local, api }
     }
 }
 
@@ -73,8 +72,10 @@ impl TeamTokenMinter for DefaultTeamTokenMinter {
                 let device_jwt = read_device_jwt(&self.local).await?.ok_or_else(|| {
                     "no device JWT available to mint a team sync token".to_string()
                 })?;
+                cairn_tls::ready().await;
                 let (token, expires_at) =
-                    mint_team_sync_token(&self.client, &device_jwt, team_id, &self.api).await?;
+                    mint_team_sync_token(cairn_tls::client(), &device_jwt, team_id, &self.api)
+                        .await?;
                 account::lease_sync_token(team_id, expires_at, token)
             }
         };

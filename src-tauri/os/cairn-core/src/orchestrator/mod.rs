@@ -694,9 +694,11 @@ impl OrchestratorBuilder {
         // `storage::install_crypto_provider`.
         crate::storage::install_crypto_provider();
 
-        // Load the platform root store now, on its own thread, so no task ever
-        // has to: building a TLS client otherwise asks the OS trust store from
-        // whichever runtime worker polls the build (see `cairn_tls`).
+        // Load the platform root store on its own thread, so no task ever has
+        // to: building a TLS client otherwise asks the OS trust store from
+        // whichever runtime worker polls the build (see `cairn_tls`). The runner
+        // starts this earlier, before its migrations; this call is a no-op there
+        // and the start for every other host.
         cairn_tls::preload();
 
         // Register the archived-file renderer so archival reconstruction (in
