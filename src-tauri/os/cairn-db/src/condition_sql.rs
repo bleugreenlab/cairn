@@ -47,6 +47,40 @@ macro_rules! awaiting_release_sql {
     };
 }
 
+/// The executions that have gate rows, as the row source of a statement that
+/// LISTS gated or held executions. [`gated_unreleased_sql!`] implies it (and so
+/// [`awaiting_release_sql!`] does), so ANDing it changes no result; it lets
+/// the planner walk `execution_gates` and seek each execution through
+/// `idx_executions_hold_facts` instead of scanning `executions`, whose every
+/// row read costs that row's snapshot (cairn/5894). The list is deduplicated,
+/// so an execution with several gates comes back once.
+///
+/// Only as a top-level WHERE conjunct: under OR, CASE or NOT, Turso rebuilds or
+/// probes the list per row (cairn/5332), which is why the predicates keep their
+/// EXISTS. Name no `INDEXED BY` on `e` beside it: the pinned Turso serves a
+/// forced index only through an equality, so the hint turns each seek into a
+/// scan of the whole index. Expects an `executions` row aliased `e`.
+#[macro_export]
+macro_rules! gated_execution_source_sql {
+    () => {
+        "e.id IN (SELECT gated_source.execution_id FROM execution_gates gated_source)"
+    };
+}
+
+/// The executions with an UNSATISFIED gate row: [`gated_execution_source_sql!`]
+/// narrowed to the rows `idx_execution_gates_unsatisfied` holds, which grow
+/// with live work rather than with history. A source only for a statement
+/// whose predicate requires an unsatisfied gate (a cap holding it, or
+/// [`awaits_authored_gate_sql!`]); an execution whose gates are all satisfied
+/// but which is still unreleased is still held, and this would miss it. The
+/// same placement rules apply. Expects an `executions` row aliased `e`.
+#[macro_export]
+macro_rules! unsatisfied_gate_source_sql {
+    () => {
+        "e.id IN (SELECT unsatisfied_source.execution_id FROM execution_gates unsatisfied_source WHERE unsatisfied_source.satisfied_at IS NULL)"
+    };
+}
+
 /// True when gate row `g` is a CAPACITY hold the system filed (the execution
 /// queue's fleet slot or thread focus), not an authored `after:` gate. Expects
 /// an `execution_gates` row aliased `g`. The fact names are

@@ -9,6 +9,8 @@ mod admission_tests;
 pub mod authoring;
 pub mod capacity;
 pub mod census;
+#[cfg(test)]
+mod held_reads_tests;
 pub mod pulse;
 pub mod reorder;
 pub mod sweep;

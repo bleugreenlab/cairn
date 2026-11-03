@@ -150,8 +150,10 @@ impl QueuedHold {
 }
 
 /// The thread's cap-held children's executions, in queue order: exactly the
-/// set the queue page lists, narrowed to this thread.
-const THREAD_QUEUE_SQL: &str = concat!(
+/// set the queue page lists, narrowed to this thread. The predicate's gate
+/// list drives it, so `issues` (which has no `parent_thread_id` index) is only
+/// probed by id.
+pub(super) const THREAD_QUEUE_SQL: &str = concat!(
     "SELECT e.id, i.number, i.title, ",
     cairn_workflow::held_since_sql!(),
     ", ",
@@ -164,12 +166,12 @@ const THREAD_QUEUE_SQL: &str = concat!(
 );
 
 /// Every unlatched capacity row of the thread's children, blocking or dormant.
-const THREAD_HOLDS_SQL: &str = concat!(
+pub(super) const THREAD_HOLDS_SQL: &str = concat!(
     "SELECT g.execution_id, g.id, g.predicate_json,
             COALESCE(g.queue_key, g.created_at * 1000000), g.detail,
             g.last_outcome = 'no_evidence'
        FROM execution_gates g
-       JOIN executions e ON e.id = g.execution_id
+       JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
        JOIN issues i ON i.id = e.issue_id
       WHERE i.parent_thread_id = ?1
         AND g.satisfied_at IS NULL AND ",
@@ -320,12 +322,21 @@ pub(crate) async fn rotate_to_front_conn(
     })
 }
 
-/// Why an issue a thread listed has no cap-held execution to order.
-const LATEST_EXECUTION_SQL: &str =
+/// Why an issue a thread listed has no cap-held execution to order. It walks
+/// `idx_executions_issue_seq` down to the newest execution and reads that one
+/// row: `status` is in no index keyed by issue. Only a refused `order` entry
+/// runs it.
+pub(super) const LATEST_EXECUTION_SQL: &str =
     "SELECT status FROM executions WHERE issue_id = ?1 ORDER BY seq DESC LIMIT 1";
 
-const AWAITS_AUTHORED_SQL: &str = concat!(
-    "SELECT 1 FROM executions e WHERE e.issue_id = ?1 AND ",
+/// Whether the issue's execution waits on an authored gate. The unsatisfied
+/// gates drive it, which that gate implies; the unary `+` keeps
+/// `idx_executions_issue_seq`, which would read every execution on the issue
+/// from its row, from serving the issue instead.
+pub(super) const AWAITS_AUTHORED_SQL: &str = concat!(
+    "SELECT 1 FROM executions e WHERE ",
+    cairn_db::unsatisfied_gate_source_sql!(),
+    " AND +e.issue_id = ?1 AND ",
     cairn_db::awaiting_release_sql!(),
     " AND ",
     cairn_db::awaits_authored_gate_sql!(),

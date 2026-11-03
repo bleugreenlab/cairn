@@ -275,18 +275,29 @@ async fn list_all_executions_async(
 
     // The `held` filter means WAITING: the projection also derives `held` for a
     // gated execution that can never start (superseded, or its issue resolved),
-    // so the shared predicate narrows it in both the count and the page.
+    // so the shared predicate narrows it in both the count and the page. It is
+    // a top-level conjunct, beside the gate list as the row source, so the held
+    // list walks the gates instead of scanning every execution; under the
+    // `OR` that would let one statement serve every filter, no source could
+    // drive it.
+    let status_clause = if status.as_deref() == Some("held") {
+        concat!(
+            "e.status = ?1 AND ",
+            cairn_db::gated_execution_source_sql!(),
+            " AND ",
+            cairn_db::awaiting_release_sql!()
+        )
+    } else {
+        "(?1 IS NULL OR e.status = ?1)"
+    };
     let total = db
         .query_one(
-            concat!(
+            format!(
                 "SELECT COUNT(*)
              FROM executions e
              LEFT JOIN issues i ON i.id = e.issue_id
              LEFT JOIN projects p ON p.id = e.project_id
-             WHERE (?1 IS NULL OR e.status = ?1)
-               AND (?1 IS NULL OR ?1 <> 'held' OR (",
-                cairn_db::awaiting_release_sql!(),
-                "))
+             WHERE {status_clause}
                AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
                AND (
                  ?3 IS NULL
@@ -311,8 +322,7 @@ async fn list_all_executions_async(
                  FROM executions e
                  LEFT JOIN issues i ON i.id = e.issue_id
                  LEFT JOIN projects p ON p.id = e.project_id
-                 WHERE (?1 IS NULL OR e.status = ?1)
-                   AND (?1 IS NULL OR ?1 <> 'held' OR ({awaiting_release}))
+                 WHERE {status_clause}
                    AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
                    AND (
                      ?3 IS NULL
@@ -322,7 +332,6 @@ async fn list_all_executions_async(
                  ORDER BY e.started_at DESC
                  LIMIT ?4 OFFSET ?5",
                 prefixed_execution_columns = prefixed_execution_columns("e"),
-                awaiting_release = cairn_db::awaiting_release_sql!()
             ),
             params![
                 status.as_deref(),

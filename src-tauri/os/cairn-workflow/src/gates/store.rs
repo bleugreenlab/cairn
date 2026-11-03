@@ -457,30 +457,30 @@ pub struct BlockingCapacityGate {
     pub queue_key: i64,
 }
 
+/// [`list_blocking_capacity_gates_conn`]'s statement. It starts from the
+/// unsatisfied gates and reaches each execution by an equality, which the
+/// forced `idx_executions_hold_facts` serves without reading the row.
+pub const BLOCKING_CAPACITY_GATES_SQL: &str = concat!(
+    "SELECT g.id, g.execution_id, e.issue_id, g.predicate_json, g.detail,
+            COALESCE(g.queue_key, g.created_at * 1000000)
+       FROM execution_gates g
+       JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
+      WHERE g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
+    cairn_db::capacity_gate_sql!(),
+    " AND ",
+    cairn_db::awaiting_release_sql!(),
+    " AND NOT ",
+    cairn_db::awaits_authored_gate_sql!(),
+    " ORDER BY 6, g.id"
+);
+
 /// Every capacity gate currently blocking an execution that can still start
 /// and is not waiting on an authored gate of its own (such an execution has no
 /// place in line until its own gates clear).
 pub async fn list_blocking_capacity_gates_conn(
     conn: &Connection,
 ) -> DbResult<Vec<BlockingCapacityGate>> {
-    let mut rows = conn
-        .query(
-            concat!(
-                "SELECT g.id, g.execution_id, e.issue_id, g.predicate_json, g.detail,
-                        COALESCE(g.queue_key, g.created_at * 1000000)
-                   FROM execution_gates g
-                   JOIN executions e ON e.id = g.execution_id
-                  WHERE g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",
-                cairn_db::capacity_gate_sql!(),
-                " AND ",
-                cairn_db::awaiting_release_sql!(),
-                " AND NOT ",
-                cairn_db::awaits_authored_gate_sql!(),
-                " ORDER BY 6, g.id"
-            ),
-            (),
-        )
-        .await?;
+    let mut rows = conn.query(BLOCKING_CAPACITY_GATES_SQL, ()).await?;
     let mut gates = Vec::new();
     while let Some(row) = rows.next().await? {
         gates.push(BlockingCapacityGate {
@@ -570,6 +570,26 @@ pub struct HeldExecution {
     pub queue_key: i64,
 }
 
+/// [`list_held_executions_conn`]'s statement. Its row source is EVERY gated
+/// execution ([`cairn_db::gated_execution_source_sql!`]), not only those with
+/// an unsatisfied gate: one whose gates are all satisfied but which is still
+/// unreleased (a crash between satisfying and releasing) is still held, and
+/// the sweep must see it.
+pub const HELD_EXECUTIONS_SQL: &str = concat!(
+    "SELECT e.id, e.issue_id, i.number, e.seq, ",
+    held_since_sql!(),
+    ", ",
+    queue_key_sql!(),
+    "
+       FROM executions e
+       LEFT JOIN issues i ON i.id = e.issue_id
+      WHERE ",
+    cairn_db::gated_execution_source_sql!(),
+    " AND ",
+    cairn_db::awaiting_release_sql!(),
+    " ORDER BY 6, i.number IS NULL, i.number, e.seq, e.id"
+);
+
 /// Every held execution that can still be released, in queue order (see
 /// [`HeldExecution::queue_key`]). The set is
 /// [`cairn_db::awaiting_release_sql!`] — the same predicate the gate census
@@ -581,23 +601,7 @@ pub struct HeldExecution {
 /// burst is released in becomes the order it is admitted in; a nondeterministic
 /// order would turn a plan's implicit priority into a coin flip.
 pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldExecution>> {
-    let mut rows = conn
-        .query(
-            concat!(
-                "SELECT e.id, e.issue_id, i.number, e.seq, ",
-                held_since_sql!(),
-                ", ",
-                queue_key_sql!(),
-                "
-                   FROM executions e
-                   LEFT JOIN issues i ON i.id = e.issue_id
-                  WHERE ",
-                cairn_db::awaiting_release_sql!(),
-                " ORDER BY 6, i.number IS NULL, i.number, e.seq, e.id"
-            ),
-            (),
-        )
-        .await?;
+    let mut rows = conn.query(HELD_EXECUTIONS_SQL, ()).await?;
     let mut held = Vec::new();
     while let Some(row) = rows.next().await? {
         held.push(HeldExecution {
@@ -612,6 +616,20 @@ pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldEx
     Ok(held)
 }
 
+/// [`list_waiting_gate_predicates_conn`]'s statement. It starts from the
+/// unsatisfied gates already, so it needs no row source; each execution is
+/// reached by an equality the forced `idx_executions_hold_facts` serves.
+pub const WAITING_GATE_PREDICATES_SQL: &str = concat!(
+    "SELECT e.issue_id, g.predicate_json
+       FROM execution_gates g
+       JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
+      WHERE g.satisfied_at IS NULL
+        AND e.issue_id IS NOT NULL
+        AND e.id IS NOT ?1
+        AND ",
+    cairn_db::awaiting_release_sql!()
+);
+
 /// The unsatisfied gates of every held execution except `excluding`, each with
 /// the id of the issue its execution belongs to. This is the whole edge set
 /// "issue X waits on ..." that cycle refusal walks; a satisfied gate can no
@@ -622,19 +640,7 @@ pub async fn list_waiting_gate_predicates_conn(
     excluding: Option<&str>,
 ) -> DbResult<Vec<(String, String)>> {
     let mut rows = conn
-        .query(
-            concat!(
-                "SELECT e.issue_id, g.predicate_json
-                   FROM execution_gates g
-                   JOIN executions e ON e.id = g.execution_id
-                  WHERE g.satisfied_at IS NULL
-                    AND e.issue_id IS NOT NULL
-                    AND e.id IS NOT ?1
-                    AND ",
-                cairn_db::awaiting_release_sql!()
-            ),
-            params![excluding],
-        )
+        .query(WAITING_GATE_PREDICATES_SQL, params![excluding])
         .await?;
     let mut edges = Vec::new();
     while let Some(row) = rows.next().await? {

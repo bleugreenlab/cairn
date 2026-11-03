@@ -581,7 +581,9 @@ pub fn unclassified_yield_counts() -> BTreeMap<String, u64> {
 }
 
 /// Candidate working jobs of executions the fleet may count, on this device.
-const FLEET_JOBS_SQL: &str = concat!(
+/// Each job reaches its execution by an equality, which the forced
+/// `idx_executions_hold_facts` serves without reading the execution's row.
+pub(super) const FLEET_JOBS_SQL: &str = concat!(
     "SELECT e.id, j.id, j.issue_id, t.state, t.yield_reason,
             (SELECT json_extract(aw.condition_json, '$.kind') FROM agent_waits aw
               WHERE aw.job_id = j.id AND aw.state IN ('pending', 'resolving')
@@ -596,7 +598,7 @@ const FLEET_JOBS_SQL: &str = concat!(
                 AND (json_extract(aw.condition_json, '$.kind') IN ('terminal', 'run_batch')
                      OR (json_extract(aw.condition_json, '$.kind') = 'checks'
                          AND watched.issue_id = j.issue_id)))
-       FROM executions e
+       FROM executions e INDEXED BY idx_executions_hold_facts
        JOIN jobs j ON j.execution_id = e.id
        LEFT JOIN turns t ON t.id = j.current_turn_id
       WHERE COALESCE(e.runner_device_id, ?1) = ?1 AND ",
@@ -742,7 +744,7 @@ async fn open_thread_children_conn(
 /// to know about its execution: whether it runs on this device (`?1`),
 /// whether it is in line at all (awaiting release, and not waiting on an
 /// authored gate of its own), and its issue's thread.
-const CAPACITY_ROWS_SQL: &str = concat!(
+pub(super) const CAPACITY_ROWS_SQL: &str = concat!(
     "SELECT g.execution_id, json_extract(g.predicate_json, '$.fact'),
             COALESCE(g.queue_key, g.created_at * 1000000),
             g.last_outcome,
@@ -754,11 +756,16 @@ const CAPACITY_ROWS_SQL: &str = concat!(
     " THEN 1 ELSE 0 END,
             i.parent_thread_id
        FROM execution_gates g
-       JOIN executions e ON e.id = g.execution_id
+       JOIN executions e INDEXED BY idx_executions_hold_facts ON e.id = g.execution_id
        LEFT JOIN issues i ON i.id = e.issue_id
       WHERE g.satisfied_at IS NULL AND ",
     cairn_db::capacity_gate_sql!()
 );
+
+/// The device a wanted start's execution runs on, through the index that
+/// carries it rather than the execution's row.
+pub(super) const RUNNER_DEVICE_SQL: &str =
+    "SELECT runner_device_id FROM executions INDEXED BY idx_executions_hold_facts WHERE id = ?1";
 
 struct CapacityRow {
     execution_id: String,
@@ -912,7 +919,7 @@ impl QueueSnapshot {
                             if let Some(execution_id) = execution_id {
                                 let runner = crate::storage::query_opt_text_conn(
                                     conn,
-                                    "SELECT runner_device_id FROM executions WHERE id = ?1",
+                                    RUNNER_DEVICE_SQL,
                                     params![execution_id.as_str()],
                                 )
                                 .await?;
@@ -1394,9 +1401,17 @@ pub struct QueueView {
 /// blocking capacity gate (the same `no_evidence` row a [`QueueSnapshot`] reads
 /// as in line), and no unmet authored gate of its own holds it. The queue
 /// page and a thread's own queue list exactly this set.
+///
+/// It opens with [`cairn_db::unsatisfied_gate_source_sql!`], which the blocking
+/// capacity gate below implies, so a statement listing this set walks the
+/// unsatisfied gates and seeks each execution in `idx_executions_hold_facts`
+/// instead of scanning `executions`. So it must stand as a top-level `WHERE`
+/// conjunct, and its statement must name no `INDEXED BY` on `e`.
 macro_rules! cap_held_sql {
     () => {
         concat!(
+            cairn_db::unsatisfied_gate_source_sql!(),
+            " AND ",
             cairn_db::awaiting_release_sql!(),
             " AND EXISTS (SELECT 1 FROM execution_gates g WHERE g.execution_id = e.id
                    AND g.satisfied_at IS NULL AND g.last_outcome = 'no_evidence' AND ",

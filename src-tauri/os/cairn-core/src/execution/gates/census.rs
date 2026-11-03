@@ -503,6 +503,11 @@ fn bound_ids(ids: &[String]) -> Vec<SqlValue> {
 /// NOT [`cairn_db::awaiting_release_sql!`] — so the census calls an execution
 /// held exactly when the sweep would release it, never by a second definition
 /// that could drift from the sweep's.
+///
+/// Every column it takes from `e` and from `successor` is in
+/// `idx_executions_hold_facts`, so neither is read from its row (and its
+/// snapshot). `e` names no `INDEXED BY`: each filter below seeks it through an
+/// `IN` list, which a forced index would turn into a scan of the whole index.
 const CENSUS_ROW_SQL: &str = concat!(
     "SELECT e.id, e.issue_id, e.seq, e.released_at, e.release_override_json,
             CASE WHEN ",
@@ -513,7 +518,8 @@ const CENSUS_ROW_SQL: &str = concat!(
             e.lifecycle = 'superseded',
             (SELECT MAX(successor.seq)
                FROM execution_supersessions supersession
-               JOIN executions successor ON successor.id = supersession.successor_execution_id
+               JOIN executions successor INDEXED BY idx_executions_hold_facts
+                 ON successor.id = supersession.successor_execution_id
               WHERE supersession.superseded_execution_id = e.id),
             p.key, i.number, i.merged_at, i.closed_at
        FROM executions e
@@ -534,7 +540,7 @@ struct CensusRow {
 
 /// [`CENSUS_ROW_SQL`] over `filter`, a predicate on `e` (and optionally
 /// `i`/`p`), in issue then execution order.
-fn census_rows_sql(filter: &str) -> String {
+pub(super) fn census_rows_sql(filter: &str) -> String {
     format!("{CENSUS_ROW_SQL}{filter} ORDER BY e.issue_id, e.seq, e.id")
 }
 
@@ -595,7 +601,7 @@ async fn render_rows(
 
 /// The census rows of `n` listed executions that can have a census: gated, or
 /// released by hand.
-fn executions_census_sql(n: usize) -> String {
+pub(super) fn executions_census_sql(n: usize) -> String {
     census_rows_sql(&format!(
         "e.id IN ({})
            AND (e.release_override_json IS NOT NULL
@@ -624,17 +630,34 @@ pub async fn census_for_executions_conn(
 }
 
 /// The census statement for gated, unreleased executions selected by `filter`,
-/// a SQL predicate over `e`.
+/// a SQL predicate over `e`. The gate list is its row source
+/// ([`cairn_db::gated_execution_source_sql!`]), so `filter` must not be one
+/// the planner would rather drive from.
 fn gated_unreleased_rows_sql(filter: &str) -> String {
     census_rows_sql(&format!(
-        "{filter} AND e.issue_id IS NOT NULL AND {}",
+        "{} AND {filter} AND e.issue_id IS NOT NULL AND {}",
+        cairn_db::gated_execution_source_sql!(),
         cairn_db::gated_unreleased_sql!()
     ))
 }
 
-/// The gated, unreleased executions on `n` issues.
-fn issues_gated_sql(n: usize) -> String {
-    gated_unreleased_rows_sql(&format!("e.issue_id IN ({})", placeholders(n)))
+/// The gated, unreleased executions on `n` issues. The unary `+` keeps
+/// `idx_executions_issue_seq` from serving the issue list: through it, every
+/// execution on those issues is read from its row, snapshot and all, before
+/// the gate test drops the ungated ones.
+pub(super) fn issues_gated_sql(n: usize) -> String {
+    gated_unreleased_rows_sql(&format!("+e.issue_id IN ({})", placeholders(n)))
+}
+
+/// The gated, unreleased executions on the unresolved issues of project `?1`.
+/// The project's issues are a per-row probe, not a list of every open issue
+/// whose executions would each be read.
+pub(super) fn project_gated_sql() -> String {
+    gated_unreleased_rows_sql(
+        "EXISTS (SELECT 1 FROM issues project_issue
+                  WHERE project_issue.id = e.issue_id AND project_issue.project_id = ?1
+                    AND project_issue.status NOT IN ('merged', 'closed'))",
+    )
 }
 
 /// Gated, unreleased executions selected by `sql` (built by
@@ -730,10 +753,7 @@ pub async fn held_executions_for_project_conn(
 ) -> DbResult<Vec<ProjectHeldExecution>> {
     let held = gated_unreleased_rows(
         conn,
-        &gated_unreleased_rows_sql(
-            "e.issue_id IN (SELECT id FROM issues
-                             WHERE project_id = ?1 AND status NOT IN ('merged', 'closed'))",
-        ),
+        &project_gated_sql(),
         vec![SqlValue::Text(project_id.to_string())],
     )
     .await?;
@@ -904,28 +924,45 @@ mod tests {
     /// one `json_each` array the planner could not seek and scanned the whole
     /// executions table: 5.4 s and 2.7 s on a production database of 5.5k
     /// executions (cairn/5206). Every table they reach, the gate EXISTS
-    /// probes and the supersession subquery included, must be a seek.
+    /// probes and the supersession subquery included, must be a seek, and
+    /// every execution, the successor too, is read from
+    /// `idx_executions_hold_facts` rather than its row, whose snapshot a row
+    /// read pays for (cairn/5894). The one scan allowed is the gate list the
+    /// issue and project statements are driven from, over a covering index.
     #[tokio::test]
     async fn census_statements_never_scan() {
         let db = crate::storage::migrated_test_db("gate-census-plan.db").await;
-        for (label, sql, driving_index) in [
-            ("issues", issues_gated_sql(3), "idx_executions_issue_seq"),
-            ("executions", executions_census_sql(3), "(id=?)"),
+        for (label, sql, bound) in [
+            ("issues", issues_gated_sql(3), 3),
+            ("executions", executions_census_sql(3), 3),
+            ("project", project_gated_sql(), 1),
         ] {
-            let plan = query_plan(&db, sql, 3).await;
-            assert!(
-                plan.iter()
-                    .any(|line| line.starts_with("SEARCH e ") && line.contains(driving_index)),
-                "{label}: executions are reached by {driving_index}: {plan:#?}"
-            );
+            let plan = query_plan(&db, sql, bound).await;
+            for alias in ["e", "successor"] {
+                assert!(
+                    plan.iter().any(|line| line
+                        == &format!(
+                            "SEARCH {alias} USING COVERING INDEX idx_executions_hold_facts (id=?)"
+                        )),
+                    "{label}: {alias} is sought in the hold-facts index: {plan:#?}"
+                );
+            }
             assert!(
                 plan.iter()
                     .any(|line| line.contains("idx_execution_gates_execution")),
                 "{label}: the gate probes seek by execution: {plan:#?}"
             );
             assert!(
-                !plan.iter().any(|line| line.starts_with("SCAN")),
+                !plan.iter().any(|line| line.starts_with("SCAN")
+                    && !line
+                        .starts_with("SCAN execution_gates AS gated_source USING COVERING INDEX")),
                 "{label}: no table in the census is scanned: {plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.contains("sqlite_autoindex_executions_1")),
+                "{label}: no execution is read from its row: {plan:#?}"
             );
         }
     }
