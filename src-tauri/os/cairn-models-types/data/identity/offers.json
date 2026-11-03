@@ -1,0 +1,9 @@
+{
+  "notes": "Provider offers whose native id is not a canonical id with an optional maker/ prefix, mapped by hand. Keyed provider/native as a ladder writes it. Nothing is matched by date stripping or by hyphen-for-dot rewriting: each such offer is listed here.",
+  "offers": {
+    "openrouter/google/gemini-3-pro-preview": "gemini-3-pro",
+    "openrouter/google/gemini-3-flash-preview": "gemini-3-flash",
+    "openrouter/google/gemini-3.1-pro-preview": "gemini-3.1-pro",
+    "openrouter/qwen/qwen3-coder": "qwen3-coder-480b"
+  }
+}

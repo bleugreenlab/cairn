@@ -4223,7 +4223,10 @@ routeCallsViaOpenRouter: true
 
     fn band(models: &ModelsConfig, id: &str) -> Vec<String> {
         models
-            .expand(&[AllotmentEntry::Pool(id.into())])
+            .expand(
+                &[AllotmentEntry::Pool(id.into())],
+                &crate::allotment::unplaced,
+            )
             .unwrap()
             .candidates
             .iter()

@@ -934,12 +934,12 @@ pub async fn resolve_recipe_launch(
     let serves_session = crate::execution::launch_preview::session_admitter(orch, project_id);
     let ladder = orch.models_ladder(Some(project_id))?;
     let mut offered: Vec<ModelSelection> = Vec::new();
-    for raw in ladder
-        .rungs
-        .iter()
-        .map(|rung| rung.model.as_str())
-        .chain(ladder.unranked.iter().map(String::as_str))
-    {
+    for raw in ladder.rungs.iter().map(|rung| rung.model.as_str()).chain(
+        ladder
+            .unranked
+            .iter()
+            .map(|unranked| unranked.model.as_str()),
+    ) {
         if let Ok(selection) = parse_model_ref(raw) {
             if !offered.contains(&selection) && serves_session(&selection).is_ok() {
                 offered.push(selection);

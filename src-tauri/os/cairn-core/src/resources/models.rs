@@ -387,6 +387,7 @@ pub(crate) fn render_ladder(
     };
     let mut out = String::from("# Model ladder\n\n");
     out.push_str("An allotment (`models: [sm, md, lg]`, `models: [lg, claude/fable]`) names pools and models; a launch selects inside it. Band pools are slices of the 0..1 capability ladder below; set pools are hand-picked. Change any of it with a `cairn://settings` patch of `models`.\n");
+    out.push_str("\nA benchmark level (the expected solve rate on the anchor's reference panel, fitted from licensed public benchmarks) is an input, never a setting. It is a solve rate, not a ladder position, so it is mapped onto this ladder through the entries here that have both a level and a benchmark level. Mapped, it places a model the ladder holds no level for when an allotment names it or a set pool holds it, and it is shown beside a stored level, which always wins. Band pools hold only what the ladder places.\n");
     out.push_str("\n## Pools\n\n");
     for pool in &view.pools {
         let kind = match (&pool.band, &pool.members) {
@@ -409,7 +410,8 @@ pub(crate) fn render_ladder(
             let source = match rung.level_source {
                 Some(cairn_config::allotment::LevelSource::Seeded) => "seeded",
                 Some(cairn_config::allotment::LevelSource::Measured) => "measured",
-                _ => "set",
+                Some(cairn_config::allotment::LevelSource::Benchmarks) => "benchmarks",
+                Some(cairn_config::allotment::LevelSource::Set) | None => "set",
             };
             match &rung.level_from {
                 Some(from) => {
@@ -464,6 +466,19 @@ pub(crate) fn render_ladder(
         if !rung.pools.is_empty() {
             facts.push(format!("in {}", rung.pools.join(", ")));
         }
+        if let Some(newer) = &rung.superseded_by {
+            facts.push(format!("superseded by {newer}"));
+        }
+        if let Some(hint) = &rung.benchmark {
+            facts.push(match (rung.level, hint.position, &rung.band) {
+                (None, Some(position), Some(band)) => format!(
+                    "placed by benchmarks at {} ({band}): {}",
+                    level_text(position),
+                    hint.summary
+                ),
+                _ => hint.summary.clone(),
+            });
+        }
         let _ = write!(line, " — {}", facts.join(", "));
         line
     };
@@ -479,7 +494,7 @@ pub(crate) fn render_ladder(
         let members: Vec<&LadderRung> = view
             .rungs
             .iter()
-            .filter(|rung| rung.band.as_deref() == Some(band.id.as_str()))
+            .filter(|rung| rung.level.is_some() && rung.band.as_deref() == Some(band.id.as_str()))
             .collect();
         if members.is_empty() {
             out.push_str("Nothing on the ladder here.\n");
@@ -505,9 +520,25 @@ pub(crate) fn render_ladder(
     if view.unranked.is_empty() {
         out.push_str("Every served session model on an installed provider is on the ladder.\n");
     } else {
-        out.push_str("Served session models on installed providers with no level. Named directly, one counts as the top of its allotment.\n\n");
+        out.push_str("Served session models on installed providers with no level. Named directly, one the benchmarks place selects in that band; one they do not cover counts as the top of its allotment.\n\n");
         for model in &view.unranked {
-            let _ = writeln!(out, "- `{model}`");
+            match (&model.benchmark, &model.band) {
+                (Some(hint), Some(band)) if hint.position.is_some() => {
+                    let _ = writeln!(
+                        out,
+                        "- `{}` placed by benchmarks at {} ({band}): {}",
+                        model.model,
+                        level_text(hint.position.unwrap_or(hint.level)),
+                        hint.summary
+                    );
+                }
+                (Some(hint), _) => {
+                    let _ = writeln!(out, "- `{}` {} (not placed)", model.model, hint.summary);
+                }
+                (None, _) => {
+                    let _ = writeln!(out, "- `{}`", model.model);
+                }
+            }
         }
     }
     let defaults: Vec<String> = view
@@ -524,6 +555,29 @@ pub(crate) fn render_ladder(
         out.push_str("\n## From the conversion of tiers\n\n");
         for note in &view.conversion_notes {
             let _ = writeln!(out, "- {note}");
+        }
+    }
+    if !view.benchmark_attribution.is_empty() {
+        out.push_str("\n## Benchmark data\n\n");
+        match &view.benchmark_note {
+            Some(note) => {
+                let _ = writeln!(out, "{note}\n");
+            }
+            None => {
+                let points: Vec<String> = view
+                    .benchmark_calibration
+                    .iter()
+                    .map(|[x, y]| format!("{x:.3} → {}", level_text(*y)))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "Solve rates map onto this ladder through its own entries that have both a level and a benchmark level (solve rate → level): {}. Between them the map interpolates; beyond them it continues at its own overall slope. Within a product line, releases are placed in release order: one the benchmarks rank above a newer release is pooled with it, and a newer release with too few results of its own is placed at least where its predecessor is, which places it but calibrates nothing.\n",
+                    points.join(", ")
+                );
+            }
+        }
+        for line in &view.benchmark_attribution {
+            let _ = writeln!(out, "- {line}");
         }
     }
     out
@@ -1041,7 +1095,7 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
     let mut out = String::from("# Model catalog — models\n\n");
     let _ = writeln!(
         out,
-        "{} model{} across the installed providers, each under its catalog id: the provider's canonical slug when it reports one, otherwise `provider/model`. Offers merge only on a shared slug.{}\n",
+        "{} model{} across the installed providers, each under its catalog id: the provider's canonical slug when it reports one, otherwise `provider/model`. Offers merge only on a shared slug. An offer Cairn can name without guessing also shows its canonical model id, the one benchmark results and the ladder share.{}\n",
         models.len(),
         if models.len() == 1 { "" } else { "s" },
         serving
@@ -1056,6 +1110,9 @@ fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind
         out.push('\n');
         for offer in &model.offers {
             let mut facts = Vec::new();
+            if let Some(canonical) = &offer.canonical {
+                facts.push(format!("canonical `{canonical}`"));
+            }
             if let Some(window) = offer.context_window {
                 facts.push(format!("{} context", tokens(window)));
             }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use cairn_config::allotment::{
-    parse_allotment, parse_model_ref, Level, ModelsConfig, Pool, PoolKind, Rung,
+    parse_allotment, parse_model_ref, Level, LevelMap, ModelsConfig, Pool, PoolKind, Rung,
 };
 use cairn_models::interface::{Catalog, CatalogProvider};
 use cairn_models::supply::SupplyInputs;
@@ -291,6 +291,122 @@ fn a_model_off_the_ladder_sits_at_the_top() {
     assert_eq!(chosen(&record), "claude/fable");
 }
 
+/// A named model with no ladder entry is placed where the shipped benchmarks
+/// put it, instead of counting as the top; a stored level is never replaced.
+#[test]
+fn a_named_model_off_the_ladder_takes_its_benchmark_level() {
+    let shipped = cairn_models::types::benchmarks::shipped();
+    let placed = shipped
+        .model("claude-opus-4.6")
+        .expect("the shipped fit places claude-opus-4.6")
+        .clone();
+    let mut catalog = catalog();
+    catalog.providers.push(provider(
+        "openrouter",
+        vec![discovered("anthropic/claude-opus-4.6", &[], None)],
+    ));
+    let mut models = models();
+    // With no calibration rung the benchmarks place nothing: the named model
+    // counts as the top, as a model off the ladder always has.
+    {
+        let ctx = SelectionContext {
+            models: &models,
+            catalog: &catalog,
+            supply: SupplyInputs {
+                store: None,
+                project_id: None,
+                assignments: &[],
+                provider_windows: &no_windows,
+                now: NOW,
+            },
+        };
+        let record = select(
+            &ctx,
+            &parse_allotment(&["sm", "openrouter/anthropic/claude-opus-4.6"]).unwrap(),
+            VerbKind::Session,
+            &ResolvedConstraints::default(),
+            &TopOfAllotment,
+        )
+        .unwrap();
+        let opus = record
+            .candidates
+            .iter()
+            .find(|c| c.model == "openrouter/anthropic/claude-opus-4.6")
+            .unwrap();
+        assert_eq!((opus.level, opus.level_source), (None, None));
+    }
+    // Two calibration rungs on the user's ladder set the scale.
+    models
+        .ladder
+        .push(rung("openrouter/openai/gpt-5.5", 0.9, None));
+    models
+        .ladder
+        .push(rung("openrouter/anthropic/claude-opus-4.5", 0.6, None));
+    let point = |id: &str, level: f64| {
+        let placed = shipped.model(id).expect("shipped");
+        cairn_config::allotment::CalibrationPoint {
+            at: placed.level,
+            low: placed.low,
+            high: placed.high,
+            level,
+        }
+    };
+    let map = LevelMap::fit([point("gpt-5.5", 0.9), point("claude-opus-4.5", 0.6)])
+        .expect("gpt-5.5 and claude-opus-4.5 are distinguishable");
+    let position = map.position(placed.level);
+    let ctx = |models: &ModelsConfig| -> SelectionRecord {
+        let ctx = SelectionContext {
+            models,
+            catalog: &catalog,
+            supply: SupplyInputs {
+                store: None,
+                project_id: None,
+                assignments: &[],
+                provider_windows: &no_windows,
+                now: NOW,
+            },
+        };
+        select(
+            &ctx,
+            &parse_allotment(&["sm", "openrouter/anthropic/claude-opus-4.6"]).unwrap(),
+            VerbKind::Session,
+            &ResolvedConstraints::default(),
+            &TopOfAllotment,
+        )
+        .unwrap()
+    };
+    let record = ctx(&models);
+    let expected = models.band_of(position).unwrap().id;
+    assert_eq!(record.band.as_deref(), Some(expected.as_str()));
+    assert_eq!(chosen(&record), "openrouter/anthropic/claude-opus-4.6");
+    let opus = &record.candidates[0];
+    assert_eq!(opus.level, Some(position));
+    assert_eq!(opus.level_source, Some(LevelSource::Benchmarks));
+    let says = format!(
+        "level from benchmarks {:.3} → {position:.2} via your ladder, anchor v1",
+        placed.level
+    );
+    assert!(record.provenance.contains(&says), "{}", record.provenance);
+
+    // A level the user set stands, whatever the benchmarks say.
+    models
+        .ladder
+        .push(rung("openrouter/anthropic/claude-opus-4.6", 0.2, None));
+    let held = ctx(&models);
+    let opus = held
+        .candidates
+        .iter()
+        .find(|c| c.model == "openrouter/anthropic/claude-opus-4.6")
+        .unwrap();
+    assert_eq!(opus.level, Some(0.2));
+    assert_eq!(opus.level_source, Some(LevelSource::Set));
+    assert!(
+        !held.provenance.contains("benchmarks"),
+        "{}",
+        held.provenance
+    );
+}
+
 #[test]
 fn a_named_model_is_never_substituted() {
     let refused = run(
@@ -311,8 +427,14 @@ fn a_named_model_is_never_substituted() {
 fn builder(model: &str, band: Option<&str>, maker: Option<&str>) -> SelectionRecord {
     SelectionRecord {
         allotment: parse_allotment(&["sm", "md", "lg"]).unwrap(),
-        requirement: TopOfAllotment
-            .requirement(&models().expand(&parse_allotment(&["lg"]).unwrap()).unwrap()),
+        requirement: TopOfAllotment.requirement(
+            &models()
+                .expand(
+                    &parse_allotment(&["lg"]).unwrap(),
+                    &cairn_config::allotment::unplaced,
+                )
+                .unwrap(),
+        ),
         band: band.map(str::to_string),
         candidates: Vec::new(),
         chosen: parse_model_ref(model).unwrap(),

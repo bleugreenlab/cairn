@@ -15,8 +15,9 @@ use cairn_config::allotment::{
 use cairn_config::project_settings::{convert_project_tiers, load_project_settings_read_only};
 use cairn_config::settings::{convert_settings_tiers, load_settings_file};
 use cairn_db::storage::run_db_blocking;
-use cairn_models::interface::{Catalog, ModelScope, Models};
+use cairn_models::interface::{Catalog, CatalogProvider, ModelScope, Models};
 use cairn_models::supply::SupplyInputs;
+use cairn_models::types::benchmarks::Basis;
 use cairn_models::types::catalog::VerbKind;
 use cairn_models::types::usage::ProviderUsageWindow;
 use serde::Serialize;
@@ -24,8 +25,8 @@ use serde::Serialize;
 use super::Orchestrator;
 use crate::credentials::RoutedProvider;
 use crate::execution::model_selection::{
-    select, ResolvedConstraints, SelectionContext, SelectionRecord, SelectionRefusal,
-    SelectionSubject, TopOfAllotment,
+    select, BenchmarkPlacer, ResolvedConstraints, SelectionContext, SelectionRecord,
+    SelectionRefusal, SelectionSubject, TopOfAllotment, CALIBRATE_BENCHMARKS,
 };
 use crate::models::{ModelSelection, PresetOptionValue};
 
@@ -40,11 +41,136 @@ pub struct LadderView {
     /// Every ladder entry, highest level first; entries off the ladder
     /// (launch options without a level) last.
     pub rungs: Vec<LadderRung>,
-    /// Served session models on installed providers with no level, as
-    /// `provider/model`.
-    pub unranked: Vec<String>,
+    /// Served session models on installed providers with no level, each with
+    /// where the benchmarks would place it.
+    pub unranked: Vec<UnrankedModel>,
     pub default_models: Vec<AllotmentEntry>,
     pub conversion_notes: Vec<String>,
+    /// The credit lines the benchmark data's license requires.
+    pub benchmark_attribution: Vec<String>,
+    /// The anchor the benchmark levels are on (`v1`).
+    pub benchmark_anchor: String,
+    /// The points (solve rate, ladder level) the map from benchmark levels
+    /// onto this ladder runs through; empty when it is not calibrated.
+    pub benchmark_calibration: Vec<[f64; 2]>,
+    /// What to do when it is not calibrated, said once for every surface.
+    pub benchmark_note: Option<String>,
+}
+
+/// Where the shipped benchmark fit places a model: an input beside the
+/// ladder, never a stored level.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BenchmarkHint {
+    /// The expected solve rate on the anchor's reference panel, and its interval.
+    pub level: f64,
+    pub low: f64,
+    pub high: f64,
+    pub sources: Vec<String>,
+    pub anchor: String,
+    /// The solve rate mapped onto this ladder, with its interval mapped too;
+    /// `None` while the ladder has fewer than two calibration rungs.
+    pub position: Option<f64>,
+    pub position_low: Option<f64>,
+    pub position_high: Option<f64>,
+    /// What "Place at" records as the level's `from`:
+    /// `benchmarks 0.655 → 0.82 via your ladder, anchor v1`.
+    pub from: Option<String>,
+    /// `benchmarks: 0.655 solve rate → 0.82 on your ladder [0.78, 0.86], 3 sources, anchor v1`,
+    /// or the raw solve rate alone when the ladder is not calibrated.
+    pub summary: String,
+    /// The fit's own solve rate when release order moved it (`level` is then
+    /// the pooled one), and the releases of its line it was pooled with.
+    pub measured: Option<f64>,
+    pub pooled_with: Vec<String>,
+    /// For a release with too few results of its own, the earlier release of
+    /// its line whose level it takes as a floor.
+    pub at_least: Option<String>,
+}
+
+fn benchmark_hint(
+    placer: &BenchmarkPlacer<'_>,
+    provider: &str,
+    model: &str,
+) -> Option<BenchmarkHint> {
+    let placed = placer.placement(provider, model)?;
+    let position = placer.position(placed.level);
+    let (position_low, position_high) = (placer.position(placed.low), placer.position(placed.high));
+    let note = placed
+        .basis_note()
+        .map(|note| format!("; {note}"))
+        .unwrap_or_default();
+    let summary = match (position, position_low, position_high) {
+        (Some(at), _, _) if placed.is_floor() => format!(
+            "benchmarks: at least {:.3} solve rate → at least {at:.2} on your ladder, anchor {}{note}",
+            placed.level, placed.anchor
+        ),
+        (Some(at), Some(low), Some(high)) => format!(
+            "benchmarks: {:.3} solve rate → {at:.2} on your ladder [{low:.2}, {high:.2}], {} source{}, anchor {}{note}",
+            placed.level,
+            placed.sources.len(),
+            if placed.sources.len() == 1 { "" } else { "s" },
+            placed.anchor
+        ),
+        _ => placed.summary(),
+    };
+    let (measured, pooled_with, at_least) = match &placed.basis {
+        Basis::Measured => (None, Vec::new(), None),
+        Basis::Ordered {
+            measured,
+            pooled_with,
+        } => (Some(*measured), pooled_with.clone(), None),
+        Basis::AtLeast { succeeds } => (None, Vec::new(), Some(succeeds.clone())),
+    };
+    Some(BenchmarkHint {
+        measured,
+        pooled_with,
+        at_least,
+        from: placer.from_text(&placed),
+        summary,
+        position,
+        position_low,
+        position_high,
+        level: placed.level,
+        low: placed.low,
+        high: placed.high,
+        sources: placed.sources,
+        anchor: placed.anchor,
+    })
+}
+
+/// The newest release of `model`'s product line that `provider` lists after
+/// it, as `provider/model`: what to replace an older rung with. Release order
+/// alone decides; whether the newer one is worth its price is selection's.
+fn superseded_by(provider: &CatalogProvider, model: &str) -> Option<String> {
+    let identity = cairn_models::types::identity::identity();
+    let (line, at) = identity.release(&provider.canonical(model)?)?;
+    let key: &str = provider.descriptor.key.as_ref();
+    provider
+        .models
+        .as_ref()?
+        .models
+        .iter()
+        .filter(|listed| !listed.hidden)
+        .filter_map(|listed| {
+            let (other, later) = identity.release(&provider.canonical(&listed.model)?)?;
+            (other == line && later > at).then_some((later, listed.model.as_str()))
+        })
+        .max_by_key(|(later, _)| *later)
+        .map(|(_, newer)| format!("{key}/{newer}"))
+}
+
+/// A served model with no level on the ladder.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnrankedModel {
+    /// `provider/model`.
+    pub model: String,
+    /// Where the benchmarks place it, when they cover it.
+    pub benchmark: Option<BenchmarkHint>,
+    /// The band the benchmark level falls in, which is where an allotment
+    /// naming it selects it.
+    pub band: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -65,11 +191,20 @@ pub struct LadderPool {
 pub struct LadderRung {
     /// `provider/model`.
     pub model: String,
+    /// The stored level only; a benchmark placement is in `benchmark`.
     pub level: Option<f64>,
     pub level_source: Option<LevelSource>,
     /// What the level was derived from, in words.
     pub level_from: Option<String>,
+    /// The band of the level selection uses: the stored one, else the
+    /// benchmark placement.
     pub band: Option<String>,
+    /// Where the benchmarks place this model, shown beside a stored level
+    /// and never replacing it.
+    pub benchmark: Option<BenchmarkHint>,
+    /// A newer release of this model's product line the same provider offers
+    /// (`provider/model`, the newest), when there is one.
+    pub superseded_by: Option<String>,
     pub maker: Option<String>,
     /// Position on the model's effort scale, 0..1.
     pub effort: Option<f64>,
@@ -99,6 +234,7 @@ pub struct EffortStep {
 
 /// The ladder view of `models` against `catalog`.
 pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
+    let placer = BenchmarkPlacer::new(models, catalog);
     let bands = models.bands();
     let provider = |key: &str| {
         catalog
@@ -129,6 +265,7 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
             let model = rung.model.model.as_str();
             let on = provider(&rung.model.backend);
             let scale = on.and_then(|provider| provider.effort_scale(model));
+            let benchmark = benchmark_hint(&placer, &rung.model.backend, model);
             LadderRung {
                 model: model_ref(&rung.model),
                 level: rung.level.as_ref().map(|level| level.value),
@@ -137,8 +274,12 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
                 band: rung
                     .level
                     .as_ref()
-                    .and_then(|level| models.band_of(level.value))
+                    .map(|level| level.value)
+                    .or(benchmark.as_ref().and_then(|hint| hint.position))
+                    .and_then(|level| models.band_of(level))
                     .map(|band| band.id),
+                benchmark,
+                superseded_by: on.and_then(|provider| superseded_by(provider, model)),
                 maker: on.and_then(|provider| provider.maker(model)),
                 effort: rung.effort,
                 effort_level: match (rung.effort, scale.as_ref()) {
@@ -191,7 +332,7 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
             rung.level.is_some() && rung.model.backend == key && rung.model.model.as_str() == model
         })
     };
-    let mut unranked: Vec<String> = Vec::new();
+    let mut unranked: Vec<UnrankedModel> = Vec::new();
     for provider in catalog
         .providers
         .iter()
@@ -204,18 +345,41 @@ pub fn ladder_view(models: &ModelsConfig, catalog: &Catalog) -> LadderView {
         for model in listed.models.iter().filter(|model| !model.hidden) {
             let served = provider.admit(&model.model, VerbKind::Session).is_ok();
             let entry = format!("{key}/{}", model.model);
-            if served && !laddered(key, &model.model) && !unranked.contains(&entry) {
-                unranked.push(entry);
+            if served
+                && !laddered(key, &model.model)
+                && !unranked.iter().any(|known| known.model == entry)
+            {
+                let benchmark = benchmark_hint(&placer, key, &model.model);
+                unranked.push(UnrankedModel {
+                    band: benchmark
+                        .as_ref()
+                        .and_then(|hint| hint.position)
+                        .and_then(|position| models.band_of(position))
+                        .map(|band| band.id),
+                    benchmark,
+                    model: entry,
+                });
             }
         }
     }
+    let shipped = cairn_models::types::benchmarks::shipped();
+    let calibration: Vec<[f64; 2]> = placer
+        .map()
+        .map(|map| map.points().iter().map(|&(x, y)| [x, y]).collect())
+        .unwrap_or_default();
     LadderView {
+        benchmark_note: calibration
+            .is_empty()
+            .then(|| format!("Benchmark levels are not placed yet: {CALIBRATE_BENCHMARKS}.")),
+        benchmark_calibration: calibration,
         pools,
         bands,
         rungs,
         unranked,
         default_models: models.default_models.clone(),
         conversion_notes: models.conversion_notes.clone(),
+        benchmark_attribution: shipped.attribution(),
+        benchmark_anchor: shipped.anchor.clone(),
     }
 }
 
@@ -673,8 +837,226 @@ mod tests {
             myth.members.as_deref(),
             Some(&["claude/fable".to_string()][..])
         );
-        assert!(view.unranked.contains(&"codex/gpt-5.6-terra".to_string()));
-        assert!(!view.unranked.contains(&"codex/gpt-5.6-sol".to_string()));
+        let unranked: Vec<&str> = view.unranked.iter().map(|u| u.model.as_str()).collect();
+        assert!(unranked.contains(&"codex/gpt-5.6-terra"));
+        assert!(!unranked.contains(&"codex/gpt-5.6-sol"));
+        // Models the benchmarks do not cover keep today's view.
+        assert!(view.unranked.iter().all(|u| u.benchmark.is_none()));
+        assert!(sol.benchmark.is_none());
+        assert!(!view.benchmark_attribution.is_empty());
+    }
+
+    /// A stored level stays the level, with the benchmark placement beside it
+    /// as a hint; an unranked model the benchmarks cover shows its placement
+    /// and band.
+    #[test]
+    fn the_ladder_view_hints_benchmarks_beside_a_stored_level_and_places_the_unranked() {
+        let mut catalog = catalog();
+        let openrouter = |models: &[&str]| cairn_models::interface::CatalogProvider {
+            descriptor: cairn_models::types::catalog::descriptor("openrouter")
+                .cloned()
+                .unwrap(),
+            installed: true,
+            models: Some(cairn_models::types::catalog::ProviderModelCatalog {
+                backend: "openrouter".into(),
+                models: models
+                    .iter()
+                    .map(|id| {
+                        let mut model = cairn_models::types::catalog::claude_models().remove(0);
+                        model.id = id.to_string();
+                        model.model = id.to_string();
+                        model
+                    })
+                    .collect(),
+                options: Vec::new(),
+                refreshed_at: Some(1),
+                error: None,
+            }),
+            serves: cairn_models::types::catalog::ServedVerb::conversation(
+                cairn_models::types::catalog::Wire::OpenAiChatCompletions,
+            ),
+            unable: Vec::new(),
+        };
+        catalog
+            .providers
+            .push(openrouter(&["anthropic/claude-opus-4.6", "openai/gpt-5.5"]));
+        let stored = |model: &str, level: f64| cairn_config::allotment::Rung {
+            model: cairn_config::allotment::parse_model_ref(model).unwrap(),
+            level: Some(cairn_config::allotment::Level::set(level)),
+            effort: None,
+            effort_level: None,
+            options: BTreeMap::new(),
+        };
+        let shipped = cairn_models::types::benchmarks::shipped();
+        let rate = |id: &str| shipped.model(id).expect("shipped").level;
+        let gpt_of = |view: &LadderView| {
+            view.unranked
+                .iter()
+                .find(|u| u.model == "openrouter/openai/gpt-5.5")
+                .cloned()
+                .unwrap()
+        };
+
+        // One calibration rung fixes no scale: hints, but nothing placed.
+        let mut models = models();
+        models
+            .ladder
+            .push(stored("openrouter/anthropic/claude-opus-4.6", 0.8));
+        let alone = ladder_view(&models, &catalog);
+        let gpt = gpt_of(&alone);
+        let raw = gpt.benchmark.as_ref().expect("a hint");
+        assert_eq!((raw.position, gpt.band.as_deref()), (None, None));
+        assert!(raw.summary.contains("solve rate") && !raw.summary.contains("on your ladder"));
+        assert!(alone.benchmark_calibration.is_empty());
+        let rendered = render_ladder(&[], || Ok(alone.clone()));
+        assert!(rendered.contains(CALIBRATE_BENCHMARKS), "{rendered}");
+        assert!(rendered.contains("(not placed)"), "{rendered}");
+
+        let point = |id: &str, level: f64| {
+            let placed = shipped.model(id).expect("shipped");
+            cairn_config::allotment::CalibrationPoint {
+                at: placed.level,
+                low: placed.low,
+                high: placed.high,
+                level,
+            }
+        };
+
+        // Two the benchmarks cannot tell apart are one point: a converted
+        // Codex grid (gpt-5.3-codex at md's centre, gpt-5.5 at lg's) does not
+        // calibrate.
+        let mut codex = crate::execution::model_selection::tests::models();
+        codex.ladder.push(stored("codex/gpt-5.3-codex", 0.505));
+        codex.ladder.push(stored("codex/gpt-5.5", 0.835));
+        let near = ladder_view(&codex, &catalog);
+        assert!(near.benchmark_calibration.is_empty());
+        assert!(near
+            .benchmark_note
+            .as_deref()
+            .unwrap()
+            .contains(CALIBRATE_BENCHMARKS));
+        assert_eq!(gpt_of(&near).benchmark.unwrap().position, None);
+
+        // Two it can: the user's own levels set the scale.
+        models.ladder.push(stored("opencode-go/kimi-k2.5", 0.5));
+        let view = ladder_view(&models, &catalog);
+        let map = cairn_config::allotment::LevelMap::fit([
+            point("claude-opus-4.6", 0.8),
+            point("kimi-k2.5", 0.5),
+        ])
+        .expect("claude-opus-4.6 and kimi-k2.5 are distinguishable");
+        let opus = view
+            .rungs
+            .iter()
+            .find(|rung| rung.model == "openrouter/anthropic/claude-opus-4.6")
+            .unwrap();
+        assert_eq!(opus.level, Some(0.8));
+        assert_eq!(opus.level_source, Some(LevelSource::Set));
+        assert_eq!(opus.band.as_deref(), Some("lg"));
+        let hint = opus
+            .benchmark
+            .as_ref()
+            .expect("a hint beside the stored level");
+        assert!(hint.summary.contains("solve rate →"), "{}", hint.summary);
+
+        let gpt = gpt_of(&view);
+        let placed = gpt.benchmark.as_ref().expect("placed");
+        let expected = map.position(rate("gpt-5.5"));
+        assert_eq!(placed.position, Some(expected));
+        assert_eq!(gpt.band, models.band_of(expected).map(|band| band.id));
+        assert!(placed.from.as_deref().unwrap().contains("via your ladder"));
+        assert_eq!(view.benchmark_note, None);
+
+        // A band edit moves where a placement falls; the position follows
+        // only the calibration rungs.
+        let mut moved = models.clone();
+        for pool in &mut moved.pools {
+            if pool.id == "lg" {
+                pool.kind = cairn_config::allotment::PoolKind::Band {
+                    min: expected + 0.01,
+                };
+            }
+        }
+        let after = gpt_of(&ladder_view(&moved, &catalog));
+        assert_eq!(after.benchmark.as_ref().unwrap().position, Some(expected));
+        assert_eq!(after.band.as_deref(), Some("md"));
+
+        // Release order: a pooled release shows what the fit measured, a newer
+        // release with too few results takes its predecessor's level as a
+        // floor, and an older rung names the newest release that replaces it.
+        catalog
+            .providers
+            .retain(|p| p.descriptor.key != "openrouter");
+        catalog.providers.push(openrouter(&[
+            "anthropic/claude-opus-4.6",
+            "anthropic/claude-opus-4.8",
+            "anthropic/claude-opus-5.5",
+        ]));
+        let ordered = ladder_view(&models, &catalog);
+        let opus = ordered
+            .rungs
+            .iter()
+            .find(|rung| rung.model == "openrouter/anthropic/claude-opus-4.6")
+            .unwrap();
+        assert_eq!(
+            opus.superseded_by.as_deref(),
+            Some("openrouter/anthropic/claude-opus-5.5")
+        );
+        let hint = opus.benchmark.as_ref().unwrap();
+        assert_eq!(hint.pooled_with, vec!["claude-opus-4.7".to_string()]);
+        assert!(hint.measured.unwrap() > hint.level, "{hint:?}");
+        assert!(
+            hint.summary.contains("to keep release order, measured"),
+            "{}",
+            hint.summary
+        );
+        let unranked = |id: &str| {
+            ordered
+                .unranked
+                .iter()
+                .find(|u| u.model == id)
+                .cloned()
+                .unwrap()
+        };
+        let newest = unranked("openrouter/anthropic/claude-opus-5.5");
+        let floor = newest.benchmark.as_ref().unwrap();
+        assert_eq!(floor.at_least.as_deref(), Some("claude-opus-4.8"));
+        let predecessor = unranked("openrouter/anthropic/claude-opus-4.8");
+        assert_eq!(
+            floor.position,
+            predecessor.benchmark.as_ref().unwrap().position
+        );
+        assert!(floor.summary.contains("at least"), "{}", floor.summary);
+        assert!(floor
+            .from
+            .as_deref()
+            .unwrap()
+            .starts_with("benchmarks at least "));
+        let rendered = render_ladder(&[], || Ok(ordered.clone()));
+        assert!(
+            rendered.contains("superseded by openrouter/anthropic/claude-opus-5.5"),
+            "{rendered}"
+        );
+        // A floor places but never calibrates: with it and one measured rung,
+        // the ladder still has a single calibration point.
+        let mut floored = crate::execution::model_selection::tests::models();
+        floored
+            .ladder
+            .push(stored("openrouter/anthropic/claude-opus-5.5", 0.9));
+        floored.ladder.push(stored("opencode-go/kimi-k2.5", 0.5));
+        assert!(ladder_view(&floored, &catalog)
+            .benchmark_calibration
+            .is_empty());
+
+        let rendered = render_ladder(&[], || Ok(view.clone()));
+        assert!(rendered.contains(&hint.summary), "{rendered}");
+        assert!(
+            rendered.contains("`openrouter/openai/gpt-5.5` placed by benchmarks at"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("## Benchmark data"), "{rendered}");
+        assert!(rendered.contains("CC-BY-SA-4.0"), "{rendered}");
+        assert!(rendered.contains("map onto this ladder"), "{rendered}");
     }
 
     /// An editor writes the position a level's step carries, so each step must
@@ -901,7 +1283,10 @@ mod tests {
 
         let xl = |models: &ModelsConfig| -> Vec<String> {
             models
-                .expand(&[AllotmentEntry::Pool("xl".into())])
+                .expand(
+                    &[AllotmentEntry::Pool("xl".into())],
+                    &cairn_config::allotment::unplaced,
+                )
                 .unwrap()
                 .candidates
                 .iter()

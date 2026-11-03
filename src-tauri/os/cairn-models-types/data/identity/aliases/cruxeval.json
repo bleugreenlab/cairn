@@ -1,0 +1,31 @@
+{
+  "notes": "CRUXEval short model names -> canonical ids. The checkpoints are the ones inference/scripts/run_*_prediction.sh pairs with each short name at the pinned revision (for example phind = Phind/Phind-CodeLlama-34B-v2, starcoderbase-16b = bigcode/starcoderbase, the 15.5B model). codellama-<n>b, mistral-7b and mixtral-8x7b are the base checkpoints and take -base where an instruction-tuned sibling has the plain id. The chain-of-thought prompt (+cot) is the configuration cot, set from the record.",
+  "aliases": {
+    "cruxeval:codellama-13b": {"model": "codellama-13b-base"},
+    "cruxeval:codellama-34b": {"model": "codellama-34b-base"},
+    "cruxeval:codellama-7b": {"model": "codellama-7b-base"},
+    "cruxeval:codellama-python-13b": {"model": "codellama-python-13b"},
+    "cruxeval:codellama-python-34b": {"model": "codellama-python-34b"},
+    "cruxeval:codellama-python-7b": {"model": "codellama-python-7b"},
+    "cruxeval:codetulu-2-34b": {"model": "codetulu-2-34b"},
+    "cruxeval:deepseek-base-1.3b": {"model": "deepseek-coder-1.3b-base"},
+    "cruxeval:deepseek-base-33b": {"model": "deepseek-coder-33b-base"},
+    "cruxeval:deepseek-base-6.7b": {"model": "deepseek-coder-6.7b-base"},
+    "cruxeval:deepseek-instruct-1.3b": {"model": "deepseek-coder-1.3b"},
+    "cruxeval:deepseek-instruct-33b": {"model": "deepseek-coder-33b"},
+    "cruxeval:deepseek-instruct-6.7b": {"model": "deepseek-coder-6.7b"},
+    "cruxeval:gpt-3.5-turbo-0613": {"model": "gpt-3.5-turbo-0613"},
+    "cruxeval:gpt-4-0613": {"model": "gpt-4-0613"},
+    "cruxeval:magicoder-ds-7b": {"model": "magicoder-s-ds-6.7b"},
+    "cruxeval:mistral-7b": {"model": "mistral-7b-v0.1-base"},
+    "cruxeval:mixtral-8x7b": {"model": "mixtral-8x7b-base"},
+    "cruxeval:phi-1": {"model": "phi-1"},
+    "cruxeval:phi-1.5": {"model": "phi-1.5"},
+    "cruxeval:phi-2": {"model": "phi-2"},
+    "cruxeval:phind": {"model": "phind-codellama-34b-v2"},
+    "cruxeval:starcoderbase-16b": {"model": "starcoderbase-15.5b"},
+    "cruxeval:starcoderbase-7b": {"model": "starcoderbase-7b"},
+    "cruxeval:wizard-13b": {"model": "wizardcoder-python-13b-v1.0"},
+    "cruxeval:wizard-34b": {"model": "wizardcoder-python-34b-v1.0"}
+  }
+}

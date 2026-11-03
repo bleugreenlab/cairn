@@ -32,6 +32,7 @@ use std::fmt;
 
 use cairn_credentials::AccountInfo;
 use cairn_domain::decision::MeasuredBy;
+pub use cairn_models_types::benchmarks::BenchmarkPlacement;
 use cairn_models_types::catalog::{
     DiscoveredModel, Modalities, ModelPricing, ProviderDescriptor, ProviderModelCatalog,
     ServedVerb, Verb, VerbKind,
@@ -307,6 +308,11 @@ pub struct CatalogOffer {
     /// provider.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub serving_account_ids: Vec<String>,
+    /// The provider-independent model this offer is
+    /// ([`cairn_models_types::identity`]), when Cairn can tell without
+    /// guessing. Annotation only: offers still group by catalog id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<String>,
 }
 
 impl CatalogOffer {
@@ -651,12 +657,34 @@ impl Catalog {
                         pricing: model.pricing.clone(),
                         serves: provider.serves_declared(&model.model, model.serves.as_deref()),
                         serving_account_ids: model.serving_account_ids.clone(),
+                        canonical: cairn_models_types::identity::for_offer(
+                            key,
+                            &model.model,
+                            model.canonical_slug.as_deref(),
+                        )
+                        .map(str::to_string),
                     },
                     aliases,
                 );
             }
         }
         out
+    }
+
+    /// Where licensed public benchmarks place `model` on `provider`, when its
+    /// canonical id is known and the shipped fit placed it
+    /// ([`cairn_models_types::benchmarks`]). An input to the ladder, never a
+    /// stored level.
+    pub fn benchmark(&self, provider: &str, model: &str) -> Option<BenchmarkPlacement> {
+        let canonical = match self.providers.iter().find(|p| p.descriptor.key == provider) {
+            Some(found) => found.canonical(model),
+            None => {
+                cairn_models_types::identity::for_offer(provider, model, None).map(str::to_string)
+            }
+        }?;
+        cairn_models_types::benchmarks::shipped()
+            .model(&canonical)
+            .cloned()
     }
 
     /// Every offer of the model `name` names exactly: its catalog id, a
@@ -2338,6 +2366,62 @@ mod tests {
         let local = find(&models, "ollama/opus");
         assert_eq!(local.offers[0].provider, "ollama");
         assert_eq!(local.aliases, vec!["opus"]);
+    }
+
+    #[test]
+    fn offers_carry_their_canonical_id_without_regrouping() {
+        let catalog = Catalog {
+            providers: vec![
+                provider("claude", Some(claude_models())),
+                provider(
+                    "openrouter",
+                    Some(vec![model(
+                        "anthropic/claude-opus-4.6",
+                        Some("anthropic/claude-4.6-opus-20260205"),
+                    )]),
+                ),
+                provider("opencode-go", Some(vec![model("kimi-k2.5", None)])),
+            ],
+        };
+        let models = catalog.models();
+        let opus = find(&models, "anthropic/claude-4.6-opus-20260205");
+        assert_eq!(opus.offers[0].canonical.as_deref(), Some("claude-opus-4.6"));
+        let kimi = find(&models, "opencode-go/kimi-k2.5");
+        assert_eq!(kimi.offers[0].canonical.as_deref(), Some("kimi-k2.5"));
+        // The CLI's alias names no version, so it has no canonical id.
+        assert_eq!(find(&models, "claude/opus").offers[0].canonical, None);
+        assert_eq!(
+            catalog.providers[1]
+                .canonical("anthropic/claude-opus-4.6")
+                .as_deref(),
+            Some("claude-opus-4.6")
+        );
+        assert_eq!(catalog.providers[0].canonical("opus"), None);
+    }
+
+    #[test]
+    fn the_benchmarks_place_a_model_through_its_canonical_id() {
+        let catalog = Catalog {
+            providers: vec![
+                provider("claude", Some(claude_models())),
+                provider(
+                    "openrouter",
+                    Some(vec![model("anthropic/claude-opus-4.6", None)]),
+                ),
+            ],
+        };
+        let placed = catalog
+            .benchmark("openrouter", "anthropic/claude-opus-4.6")
+            .expect("placed");
+        assert_eq!(placed.canonical, "claude-opus-4.6");
+        assert!(placed.summary().starts_with("benchmarks: "));
+        // A provider the catalog does not list still resolves by the rule.
+        assert_eq!(
+            catalog.benchmark("codex", "gpt-5.5").map(|p| p.canonical),
+            Some("gpt-5.5".to_string())
+        );
+        // The CLI's alias names no version, so the benchmarks cannot place it.
+        assert_eq!(catalog.benchmark("claude", "opus"), None);
     }
 
     #[test]

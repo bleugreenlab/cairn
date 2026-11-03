@@ -1,0 +1,482 @@
+{
+ "notes": "HAL response-matrix model strings, per scaffold. Dated snapshots and spelling variants collapse to one id (claude-3-7-sonnet-20250219, claude-3.7-sonnet and claude-3.7-sonnet:thinking are claude-sonnet-3.7; the thinking budget is the run's reasoning_effort). o3-2025-04-03 is a mislabel of o3 (no such snapshot; the runs date from April 2025). deepseek-chat is DeepSeek V3 as the API served it then. deepseek-r1-0528, deepseek-v3-0324 and deepseek-v3.1 are distinct releases with their own ids, as is gemini-2.5-pro-preview-03-25 (a preview checkpoint, not the GA gemini-2.5-pro).",
+ "aliases": {
+  "hal-assistantbench-browser-agent:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-assistantbench-browser-agent:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-assistantbench-browser-agent:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-assistantbench-browser-agent:claude-sonnet-4.5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-assistantbench-browser-agent:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-assistantbench-browser-agent:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-assistantbench-browser-agent:gpt-5": {
+   "model": "gpt-5"
+  },
+  "hal-assistantbench-browser-agent:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-assistantbench-browser-agent:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-browser-use:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-browser-use:claude-haiku-4-5-20251001": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-browser-use:claude-sonnet-4-20250514": {
+   "model": "claude-sonnet-4"
+  },
+  "hal-browser-use:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-browser-use:deepseek-r1": {
+   "model": "deepseek-r1"
+  },
+  "hal-browser-use:deepseek-v3": {
+   "model": "deepseek-v3"
+  },
+  "hal-browser-use:gemini-2.0-flash-001": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-browser-use:gemini-2.5-pro-preview-03-25": {
+   "model": "gemini-2.5-pro-preview-03-25"
+  },
+  "hal-browser-use:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-browser-use:gpt-5-20250807": {
+   "model": "gpt-5"
+  },
+  "hal-browser-use:o3-20250416": {
+   "model": "o3"
+  },
+  "hal-browser-use:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-coreagent:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-coreagent:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-coreagent:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-coreagent:claude-haiku-4-5": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-coreagent:claude-opus-4-5-20251101": {
+   "model": "claude-opus-4.5"
+  },
+  "hal-coreagent:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-coreagent:claude-sonnet-4-20250514": {
+   "model": "claude-sonnet-4"
+  },
+  "hal-coreagent:claude-sonnet-4-5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-coreagent:deepseek-chat-v3.1": {
+   "model": "deepseek-v3.1"
+  },
+  "hal-coreagent:deepseek-r1": {
+   "model": "deepseek-r1"
+  },
+  "hal-coreagent:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-coreagent:gemini-2.5-pro-preview-03-25": {
+   "model": "gemini-2.5-pro-preview-03-25"
+  },
+  "hal-coreagent:gemini-3-pro-preview": {
+   "model": "gemini-3-pro"
+  },
+  "hal-coreagent:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-coreagent:gpt-oss-120b": {
+   "model": "gpt-oss-120b"
+  },
+  "hal-coreagent:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-coreagent:o3-mini-2025-01-31": {
+   "model": "o3-mini"
+  },
+  "hal-coreagent:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-generalist-agent:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-generalist-agent:deepseek-v3": {
+   "model": "deepseek-v3"
+  },
+  "hal-generalist-agent:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-generalist-agent:o3-20250416": {
+   "model": "o3"
+  },
+  "hal-generalist-agent:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-generalist:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-generalist:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-generalist:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-generalist:claude-3.7-sonnet": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-generalist:claude-3.7-sonnet:thinking": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-generalist:claude-haiku-4-5": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-generalist:claude-haiku-4-5-20251001": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-generalist:claude-opus-4-1-20250805": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-generalist:claude-opus-4-20250514": {
+   "model": "claude-opus-4"
+  },
+  "hal-generalist:claude-opus-4-5-20251101": {
+   "model": "claude-opus-4.5"
+  },
+  "hal-generalist:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-generalist:claude-sonnet-4-5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-generalist:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-generalist:claude-sonnet-4.5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-generalist:deepseek-chat-v3-0324": {
+   "model": "deepseek-v3-0324"
+  },
+  "hal-generalist:deepseek-r1": {
+   "model": "deepseek-r1"
+  },
+  "hal-generalist:deepseek-r1-0528": {
+   "model": "deepseek-r1-0528"
+  },
+  "hal-generalist:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-generalist:gemini-2.5-pro-preview-03-25": {
+   "model": "gemini-2.5-pro-preview-03-25"
+  },
+  "hal-generalist:gemini-3-pro-preview": {
+   "model": "gemini-3-pro"
+  },
+  "hal-generalist:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-generalist:gpt-4o-2024-11-20": {
+   "model": "gpt-4o"
+  },
+  "hal-generalist:gpt-5": {
+   "model": "gpt-5"
+  },
+  "hal-generalist:gpt-5-2025-08-07": {
+   "model": "gpt-5"
+  },
+  "hal-generalist:gpt-oss-120b": {
+   "model": "gpt-oss-120b"
+  },
+  "hal-generalist:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-generalist:o3-mini-2025-01-31": {
+   "model": "o3-mini"
+  },
+  "hal-generalist:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-hf-open-deep-research:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-hf-open-deep-research:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-hf-open-deep-research:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-hf-open-deep-research:claude-opus-4": {
+   "model": "claude-opus-4"
+  },
+  "hal-hf-open-deep-research:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-hf-open-deep-research:claude-sonnet-4.5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-hf-open-deep-research:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-hf-open-deep-research:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-hf-open-deep-research:gpt-5-2025-08-07": {
+   "model": "gpt-5"
+  },
+  "hal-hf-open-deep-research:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-hf-open-deep-research:o3-mini-2025-01-31": {
+   "model": "o3-mini"
+  },
+  "hal-hf-open-deep-research:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-sab-selfdebug:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-sab-selfdebug:claude-haiku-4-5-20251001": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-sab-selfdebug:claude-opus-4-1-20250805": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-sab-selfdebug:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-sab-selfdebug:deepseek-r1": {
+   "model": "deepseek-r1"
+  },
+  "hal-sab-selfdebug:deepseek-v3": {
+   "model": "deepseek-v3"
+  },
+  "hal-sab-selfdebug:gemini-2.0-flash-001": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-sab-selfdebug:gemini-2.5-pro-preview-03-25": {
+   "model": "gemini-2.5-pro-preview-03-25"
+  },
+  "hal-sab-selfdebug:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-sab-selfdebug:gpt-5-20250807": {
+   "model": "gpt-5"
+  },
+  "hal-sab-selfdebug:o3-20250416": {
+   "model": "o3"
+  },
+  "hal-sab-selfdebug:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-scicode-zero-shot-agent:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-scicode-zero-shot-agent:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-scicode-zero-shot-agent:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-scicode-zero-shot-agent:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-scicode-zero-shot-agent:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-scicode-zero-shot-agent:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-scicode-zero-shot-agent:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-seeact:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-seeact:claude-haiku-4.5": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-seeact:claude-sonnet-4-20250514": {
+   "model": "claude-sonnet-4"
+  },
+  "hal-seeact:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-seeact:gemini-2.0-flash-001": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-seeact:gemini-2.5-pro-preview-03-25": {
+   "model": "gemini-2.5-pro-preview-03-25"
+  },
+  "hal-seeact:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-seeact:gpt-5-20250807": {
+   "model": "gpt-5"
+  },
+  "hal-seeact:o3-20250416": {
+   "model": "o3"
+  },
+  "hal-seeact:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-sweagent:claude-opus-4-1-20250805": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-sweagent:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-sweagent:gpt-5-2025-08-07": {
+   "model": "gpt-5"
+  },
+  "hal-sweagent:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-taubench-fewshot:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-taubench-fewshot:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-taubench-fewshot:claude-opus-4-20250514": {
+   "model": "claude-opus-4"
+  },
+  "hal-taubench-fewshot:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-taubench-fewshot:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-taubench-fewshot:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-taubench-fewshot:gpt-5": {
+   "model": "gpt-5"
+  },
+  "hal-taubench-fewshot:o3-2025-04-03": {
+   "model": "o3"
+  },
+  "hal-taubench-fewshot:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-taubench-fewshot:o3-mini-2025-01-31": {
+   "model": "o3-mini"
+  },
+  "hal-taubench-fewshot:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-taubench-toolcalling:claude-3.7-sonnet": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-taubench-toolcalling:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-taubench-toolcalling:deepseek-chat": {
+   "model": "deepseek-v3"
+  },
+  "hal-taubench-toolcalling:deepseek-r1": {
+   "model": "deepseek-r1"
+  },
+  "hal-taubench-toolcalling:gemini-2.0-flash-001": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-taubench-toolcalling:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-taubench-toolcalling:gpt-5-2025-08-07": {
+   "model": "gpt-5"
+  },
+  "hal-taubench-toolcalling:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-taubench-toolcalling:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-tool-calling-agent:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-tool-calling-agent:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-tool-calling-agent:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-tool-calling-agent:claude-haiku-4-5": {
+   "model": "claude-haiku-4.5"
+  },
+  "hal-tool-calling-agent:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-tool-calling-agent:claude-sonnet-4-5-20250929": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-tool-calling-agent:claude-sonnet-4.5": {
+   "model": "claude-sonnet-4.5"
+  },
+  "hal-tool-calling-agent:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-tool-calling-agent:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-tool-calling-agent:gpt-5": {
+   "model": "gpt-5"
+  },
+  "hal-tool-calling-agent:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-tool-calling-agent:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  },
+  "hal-usaco-episodic-semantic:DeepSeek-R1": {
+   "model": "deepseek-r1"
+  },
+  "hal-usaco-episodic-semantic:DeepSeek-V3": {
+   "model": "deepseek-v3"
+  },
+  "hal-usaco-episodic-semantic:claude-3-7-sonnet-20250219": {
+   "model": "claude-sonnet-3.7"
+  },
+  "hal-usaco-episodic-semantic:claude-opus-4.1": {
+   "model": "claude-opus-4.1"
+  },
+  "hal-usaco-episodic-semantic:gemini-2.0-flash": {
+   "model": "gemini-2.0-flash"
+  },
+  "hal-usaco-episodic-semantic:gpt-4.1-2025-04-14": {
+   "model": "gpt-4.1"
+  },
+  "hal-usaco-episodic-semantic:gpt-5-2025-08-07": {
+   "model": "gpt-5"
+  },
+  "hal-usaco-episodic-semantic:o3-2025-04-16": {
+   "model": "o3"
+  },
+  "hal-usaco-episodic-semantic:o3-mini-2025-01-31": {
+   "model": "o3-mini"
+  },
+  "hal-usaco-episodic-semantic:o4-mini-2025-04-16": {
+   "model": "o4-mini"
+  }
+ }
+}

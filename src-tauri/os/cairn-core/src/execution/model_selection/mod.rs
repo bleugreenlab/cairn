@@ -19,9 +19,10 @@ use std::cmp::Ordering;
 use std::fmt;
 
 use cairn_config::allotment::{
-    model_ref, AllotmentEntry, Candidate, ExpandedAllotment, ModelsConfig,
+    model_ref, AllotmentEntry, CalibrationPoint, Candidate, ExpandedAllotment, Level, LevelMap,
+    LevelSource, ModelsConfig,
 };
-use cairn_models::interface::{Catalog, CatalogProvider};
+use cairn_models::interface::{BenchmarkPlacement, Catalog, CatalogProvider};
 use cairn_models::supply::{self, Supply, SupplyAccount, SupplyInputs, SupplyKey};
 use cairn_models::types::catalog::VerbKind;
 use cairn_models::types::supply::CostClass;
@@ -41,6 +42,10 @@ pub struct RankedCandidate {
     /// `provider/model`.
     pub model: String,
     pub level: Option<f64>,
+    /// Where `level` came from; `benchmarks` for a model the shipped
+    /// benchmark fit placed because the ladder holds no level for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_source: Option<LevelSource>,
     pub band: Option<String>,
     pub maker: Option<String>,
     /// The supply class, absent when the candidate was set aside before
@@ -130,6 +135,88 @@ pub fn effective_allotment(
     }
 }
 
+/// What the Models page and `cairn://models/ladder` say when the ladder cannot
+/// yet map benchmark levels onto itself.
+pub const CALIBRATE_BENCHMARKS: &str = "place two covered models the benchmarks can tell apart (a frontier model and a smaller one) to calibrate benchmark placement";
+
+/// Where the shipped benchmark fit places models on this workspace's ladder.
+///
+/// A benchmark level is an expected solve rate, not a ladder position, so it
+/// is mapped through the ladder's own calibration rungs (entries with both a
+/// stored level and a benchmark level) by [`LevelMap`]. Rungs whose benchmark
+/// intervals overlap count as one point; with fewer than two distinguishable
+/// points nothing is placed, and the raw solve rate is still shown as a hint.
+/// A floor (a release placed at its predecessor's level for want of results
+/// of its own) places but never calibrates: it was not measured.
+pub struct BenchmarkPlacer<'a> {
+    catalog: &'a Catalog,
+    map: Option<LevelMap>,
+}
+
+impl<'a> BenchmarkPlacer<'a> {
+    pub fn new(models: &ModelsConfig, catalog: &'a Catalog) -> Self {
+        let points = models.ladder.iter().filter_map(|rung| {
+            let stored = rung.level.as_ref()?.value;
+            let placed = catalog
+                .benchmark(&rung.model.backend, rung.model.model.as_str())
+                .filter(|placed| !placed.is_floor())?;
+            Some(CalibrationPoint {
+                at: placed.level,
+                low: placed.low,
+                high: placed.high,
+                level: stored,
+            })
+        });
+        Self {
+            catalog,
+            map: LevelMap::fit(points),
+        }
+    }
+
+    /// The map from solve rate to this ladder, when it is calibrated.
+    pub fn map(&self) -> Option<&LevelMap> {
+        self.map.as_ref()
+    }
+
+    /// The raw shipped placement of `model` on `provider`.
+    pub fn placement(&self, provider: &str, model: &str) -> Option<BenchmarkPlacement> {
+        self.catalog.benchmark(provider, model)
+    }
+
+    /// A solve rate as a position on this ladder, when it is calibrated.
+    pub fn position(&self, solve_rate: f64) -> Option<f64> {
+        self.map.as_ref().map(|map| map.position(solve_rate))
+    }
+
+    /// How a mapped level records where it came from:
+    /// `benchmarks 0.655 → 0.82 via your ladder, anchor v1`, then what release
+    /// order did to the level when it did anything.
+    pub fn from_text(&self, placed: &BenchmarkPlacement) -> Option<String> {
+        let position = self.position(placed.level)?;
+        let text = format!(
+            "benchmarks {}{:.3} → {position:.2} via your ladder, anchor {}",
+            if placed.is_floor() { "at least " } else { "" },
+            placed.level,
+            placed.anchor
+        );
+        Some(match placed.basis_note() {
+            Some(note) => format!("{text}; {note}"),
+            None => text,
+        })
+    }
+
+    /// The placement [`ModelsConfig::expand`] uses for a model with no stored
+    /// level: its benchmark solve rate mapped onto this ladder.
+    pub fn level(&self, model: &ModelSelection) -> Option<Level> {
+        let placed = self.placement(&model.backend, model.model.as_str())?;
+        Some(Level {
+            value: self.position(placed.level)?,
+            source: LevelSource::Benchmarks,
+            from: self.from_text(&placed),
+        })
+    }
+}
+
 /// What selection reads.
 pub struct SelectionContext<'a> {
     pub models: &'a ModelsConfig,
@@ -168,7 +255,11 @@ pub fn select(
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    let expanded = ctx.models.expand(allotment).map_err(refuse)?;
+    let placer = BenchmarkPlacer::new(ctx.models, ctx.catalog);
+    let expanded = ctx
+        .models
+        .expand(allotment, &|model| placer.level(model))
+        .map_err(refuse)?;
     if expanded.candidates.is_empty() {
         return Err(refuse(format!(
             "[{names}] holds no model: its pools are empty. Add models to them on the Models page, or name a model as provider/model"
@@ -358,6 +449,7 @@ pub fn select(
         .map(|(l, supply)| RankedCandidate {
             model: model_ref(&l.candidate.model),
             level: l.candidate.level,
+            level_source: l.candidate.level_source,
             band: l.candidate.band.clone(),
             maker: l.maker.clone(),
             class: supply.as_ref().ok().map(|s| s.cost.class()),
@@ -427,6 +519,14 @@ pub fn select(
         }),
     }
     notes.extend(effort_note);
+    if first.candidate.level_source == Some(LevelSource::Benchmarks) {
+        if let Some(from) = placer
+            .level(&first.candidate.model)
+            .and_then(|level| level.from)
+        {
+            notes.push(format!("level from {from}"));
+        }
+    }
     let provenance = supply::provenance_line(
         &requirement.note,
         &model_ref(&chosen),
@@ -455,8 +555,10 @@ pub fn select(
 pub fn pinned(models: &ModelsConfig, catalog: &Catalog, pin: &ModelSelection) -> SelectionRecord {
     let level = models
         .rung(pin)
-        .and_then(|rung| rung.level.as_ref())
-        .map(|level| level.value);
+        .and_then(|rung| rung.level.clone())
+        .or_else(|| BenchmarkPlacer::new(models, catalog).level(pin));
+    let level_source = level.as_ref().map(|level| level.source);
+    let level = level.map(|level| level.value);
     let band = level
         .and_then(|level| models.band_of(level))
         .map(|band| band.id);
@@ -478,6 +580,7 @@ pub fn pinned(models: &ModelsConfig, catalog: &Catalog, pin: &ModelSelection) ->
         candidates: vec![RankedCandidate {
             model: reference.clone(),
             level,
+            level_source,
             band,
             maker: maker.clone(),
             class: None,
@@ -521,6 +624,7 @@ fn aside(candidate: &Candidate, maker: Option<String>, note: String) -> RankedCa
     RankedCandidate {
         model: model_ref(&candidate.model),
         level: candidate.level,
+        level_source: candidate.level_source,
         band: candidate.band.clone(),
         maker,
         class: None,

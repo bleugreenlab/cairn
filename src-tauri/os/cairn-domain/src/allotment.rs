@@ -213,6 +213,10 @@ pub enum LevelSource {
     Seeded,
     /// Measured from outcomes.
     Measured,
+    /// Placed at run time by the shipped benchmark fit, for a model with no
+    /// stored level. Never stored: a ladder rung carrying it is refused, so
+    /// a benchmark refresh can never move a level the ladder holds.
+    Benchmarks,
 }
 
 impl Level {
@@ -469,8 +473,13 @@ fn round2(x: f64) -> f64 {
 pub struct Candidate {
     #[serde(serialize_with = "serialize_model_ref")]
     pub model: ModelSelection,
-    /// Its ladder level, when it has one.
+    /// Its ladder level, when it has one: the stored level, or for a model
+    /// with none, where the benchmarks place it.
     pub level: Option<f64>,
+    /// Where `level` came from. [`LevelSource::Benchmarks`] marks a
+    /// placement rather than a stored level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_source: Option<LevelSource>,
     /// The band its level falls in. `None` for a model off the ladder, which
     /// counts as the top of the allotment that names it.
     pub band: Option<String>,
@@ -531,6 +540,113 @@ impl ExpandedAllotment {
         let below = self.bands[..index].iter().rev();
         above.chain(below).collect()
     }
+}
+
+/// A monotone map from another 0..1 scale onto this ladder's levels, fitted
+/// through pairs (the other scale's value, the level the ladder holds) for the
+/// same models.
+///
+/// The benchmark fit's levels are expected solve rates, not positions on a
+/// user's ladder: the shipped ones span roughly 0.3 to 0.8 while a seeded
+/// ladder runs 0.17 to 0.835. Placing a model the ladder holds no level for
+/// goes through this map, fitted on the models the ladder does hold, so it
+/// lands where the user's own levels say models like it belong.
+///
+/// Points the other scale cannot tell apart fix no scale between them: two
+/// calibration models inside each other's intervals would turn noise into a
+/// band boundary. So points are first pooled while a point's interval
+/// overlaps the interval of its group's first point. The pooled points are
+/// then fitted isotonically (pool-adjacent-violators, sorted by the other
+/// scale), interpolated linearly between them, and extended beyond the ends
+/// at the map's own overall slope, so the outside sits on the same scale as
+/// the inside. The result is clamped to 0..1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelMap {
+    points: Vec<(f64, f64)>,
+}
+
+/// One model the ladder holds a level for and the other scale also places:
+/// where the other scale puts it (`at`, with its interval) and its level here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibrationPoint {
+    pub at: f64,
+    pub low: f64,
+    pub high: f64,
+    pub level: f64,
+}
+
+impl LevelMap {
+    /// The map through `points`, or `None` when fewer than two
+    /// distinguishable points survive pooling (one point fixes no scale).
+    pub fn fit(points: impl IntoIterator<Item = CalibrationPoint>) -> Option<Self> {
+        let mut points: Vec<CalibrationPoint> = points
+            .into_iter()
+            .filter(|p| p.at.is_finite() && p.level.is_finite())
+            .collect();
+        points.sort_by(|a, b| a.at.total_cmp(&b.at).then(a.level.total_cmp(&b.level)));
+        // Groups of points the other scale cannot tell apart, as (sum at,
+        // sum level, count, the group's first point's upper bound).
+        let mut groups: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for p in points {
+            match groups.last_mut() {
+                Some(group) if p.low <= group.3 => {
+                    group.0 += p.at;
+                    group.1 += p.level;
+                    group.2 += 1.0;
+                }
+                _ => groups.push((p.at, p.level, 1.0, p.high)),
+            }
+        }
+        // Blocks of (sum at, sum level, count); a block whose mean level is
+        // above the next one's, or that shares its position, is merged with it.
+        let mut blocks: Vec<(f64, f64, f64)> = Vec::new();
+        for (x, y, n, _) in groups {
+            blocks.push((x, y, n));
+            while blocks.len() >= 2 {
+                let (a, b) = (blocks[blocks.len() - 2], blocks[blocks.len() - 1]);
+                let violates = a.1 / a.2 > b.1 / b.2 || a.0 / a.2 >= b.0 / b.2;
+                if !violates {
+                    break;
+                }
+                blocks.pop();
+                let last = blocks.len() - 1;
+                blocks[last] = (a.0 + b.0, a.1 + b.1, a.2 + b.2);
+            }
+        }
+        let points: Vec<(f64, f64)> = blocks.into_iter().map(|(x, y, n)| (x / n, y / n)).collect();
+        (points.len() >= 2).then_some(Self { points })
+    }
+
+    /// Where `x` on the other scale sits on this ladder.
+    pub fn position(&self, x: f64) -> f64 {
+        let points = &self.points;
+        let (first, last) = (points[0], points[points.len() - 1]);
+        let slope = (last.1 - first.1) / (last.0 - first.0);
+        let y = if x <= first.0 {
+            first.1 + (x - first.0) * slope
+        } else if x >= last.0 {
+            last.1 + (x - last.0) * slope
+        } else {
+            let i = points
+                .windows(2)
+                .position(|pair| x <= pair[1].0)
+                .expect("x lies inside the fitted range");
+            let ((x0, y0), (x1, y1)) = (points[i], points[i + 1]);
+            y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+        };
+        y.clamp(0.0, 1.0)
+    }
+
+    /// The pooled points the map runs through, lowest first.
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+}
+
+/// The placement lookup for [`ModelsConfig::expand`] when nothing beyond the
+/// ladder places models.
+pub fn unplaced(_: &ModelSelection) -> Option<Level> {
+    None
 }
 
 impl ModelsConfig {
@@ -595,7 +711,17 @@ impl ModelsConfig {
     }
 
     /// Expand an allotment into its candidates and bands.
-    pub fn expand(&self, allotment: &[AllotmentEntry]) -> Result<ExpandedAllotment, String> {
+    ///
+    /// `placed` says where something other than the ladder places a model
+    /// (the shipped benchmark fit). It is asked only for a model the
+    /// allotment reaches by name or through a set pool that has no stored
+    /// level; a stored level always wins, and band pools grow only from the
+    /// ladder itself. Pass [`unplaced`] when nothing else places models.
+    pub fn expand(
+        &self,
+        allotment: &[AllotmentEntry],
+        placed: &dyn Fn(&ModelSelection) -> Option<Level>,
+    ) -> Result<ExpandedAllotment, String> {
         self.check_allotment(allotment)?;
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut add = |model: &ModelSelection, named: bool| {
@@ -606,11 +732,14 @@ impl ModelsConfig {
             let rung = self.rung(model).cloned();
             let level = rung
                 .as_ref()
-                .and_then(|rung| rung.level.as_ref())
-                .map(|level| level.value);
+                .and_then(|rung| rung.level.clone())
+                .or_else(|| placed(model));
+            let level_source = level.as_ref().map(|level| level.source);
+            let level = level.map(|level| level.value);
             candidates.push(Candidate {
                 model: model.clone(),
                 level,
+                level_source,
                 band: level
                     .and_then(|level| self.band_of(level))
                     .map(|band| band.id),
@@ -698,6 +827,16 @@ impl ModelsConfig {
                 return Err(format!("{} is on the ladder twice", model_ref(&rung.model)));
             }
             models.push(&rung.model);
+            if rung
+                .level
+                .as_ref()
+                .is_some_and(|level| level.source == LevelSource::Benchmarks)
+            {
+                return Err(format!(
+                    "{}'s level has source 'benchmarks', which is a placement the benchmarks make at run time and is never stored; set the level (or record it as seeded from the benchmarks) instead",
+                    model_ref(&rung.model)
+                ));
+            }
             for (what, value) in [
                 ("level", rung.level.as_ref().map(|level| level.value)),
                 ("effort", rung.effort),
@@ -1205,7 +1344,7 @@ mod tests {
 
     #[test]
     fn a_band_pool_expands_to_its_ladder_slice() {
-        let expanded = config().expand(&entries(&["md"])).unwrap();
+        let expanded = config().expand(&entries(&["md"]), &unplaced).unwrap();
         let models: Vec<String> = expanded
             .candidates
             .iter()
@@ -1217,7 +1356,9 @@ mod tests {
 
     #[test]
     fn a_model_off_the_ladder_is_the_top_of_its_allotment() {
-        let expanded = config().expand(&entries(&["sm", "md", "pinned"])).unwrap();
+        let expanded = config()
+            .expand(&entries(&["sm", "md", "pinned"]), &unplaced)
+            .unwrap();
         assert_eq!(expanded.top().unwrap().id, "md");
         let top: Vec<String> = expanded
             .in_band(Some("md"))
@@ -1228,7 +1369,9 @@ mod tests {
             top,
             ["claude/fable", "claude/sonnet", "opencode-go/glm-5.3"]
         );
-        let alone = config().expand(&entries(&["claude/fable"])).unwrap();
+        let alone = config()
+            .expand(&entries(&["claude/fable"]), &unplaced)
+            .unwrap();
         assert!(alone.top().is_none());
         assert_eq!(alone.in_band(None).len(), 1);
         assert!(alone.candidates[0].named);
@@ -1236,22 +1379,133 @@ mod tests {
 
     #[test]
     fn placement_at_x_takes_the_lowest_band_reaching_it() {
-        let expanded = config().expand(&entries(&["sm", "md", "lg"])).unwrap();
+        let expanded = config()
+            .expand(&entries(&["sm", "md", "lg"]), &unplaced)
+            .unwrap();
         assert_eq!(expanded.band_at(0.0).unwrap().id, "sm");
         assert_eq!(expanded.band_at(0.34).unwrap().id, "sm");
         assert_eq!(expanded.band_at(0.35).unwrap().id, "md");
         assert_eq!(expanded.band_at(1.0).unwrap().id, "lg");
         // An allotment without the band x needs places it at its own top.
-        let small = config().expand(&entries(&["sm", "md"])).unwrap();
+        let small = config().expand(&entries(&["sm", "md"]), &unplaced).unwrap();
         assert_eq!(small.band_at(0.9).unwrap().id, "md");
         // And one without a low band starts at its lowest.
-        let big = config().expand(&entries(&["md", "lg"])).unwrap();
+        let big = config().expand(&entries(&["md", "lg"]), &unplaced).unwrap();
         assert_eq!(big.band_at(0.1).unwrap().id, "md");
+    }
+
+    fn benchmarks(value: f64) -> Level {
+        Level {
+            value,
+            source: LevelSource::Benchmarks,
+            from: Some("benchmarks, anchor v1".into()),
+        }
+    }
+
+    #[test]
+    fn a_benchmark_level_places_only_a_model_with_no_stored_level() {
+        let mut models = config();
+        models.ladder.push(Rung {
+            level: Some(Level::seeded(0.3, "converted from the sm tier")),
+            ..rung("claude/haiku-seeded", 0.0)
+        });
+        // Every model would be placed at 0.9: only the unranked one is.
+        let everywhere = |_: &ModelSelection| Some(benchmarks(0.9));
+        let expanded = models
+            .expand(
+                &entries(&["pinned", "claude/sonnet", "claude/haiku-seeded"]),
+                &everywhere,
+            )
+            .unwrap();
+        let by = |name: &str| {
+            expanded
+                .candidates
+                .iter()
+                .find(|c| model_ref(&c.model) == name)
+                .unwrap()
+        };
+        let fable = by("claude/fable");
+        assert_eq!(fable.level, Some(0.9));
+        assert_eq!(fable.level_source, Some(LevelSource::Benchmarks));
+        assert_eq!(fable.band.as_deref(), Some("lg"));
+        let sonnet = by("claude/sonnet");
+        assert_eq!(sonnet.level, Some(0.5));
+        assert_eq!(sonnet.level_source, Some(LevelSource::Set));
+        let seeded = by("claude/haiku-seeded");
+        assert_eq!(seeded.level, Some(0.3));
+        assert_eq!(seeded.level_source, Some(LevelSource::Seeded));
+        // A band pool grows only from the ladder: placement adds nobody to lg.
+        let lg = models.expand(&entries(&["lg"]), &everywhere).unwrap();
+        let members: Vec<String> = lg.candidates.iter().map(|c| model_ref(&c.model)).collect();
+        assert_eq!(members, ["codex/gpt-5.6-sol", "claude/opus"]);
+    }
+
+    #[test]
+    fn a_level_map_is_monotone_interpolates_and_extends_at_its_own_slope() {
+        let p = |at: f64, half: f64, level: f64| CalibrationPoint {
+            at,
+            low: at - half,
+            high: at + half,
+            level,
+        };
+        let map =
+            LevelMap::fit([p(0.5, 0.02, 0.505), p(0.7, 0.02, 0.835), p(0.3, 0.02, 0.17)]).unwrap();
+        assert_eq!(map.points(), &[(0.3, 0.17), (0.5, 0.505), (0.7, 0.835)]);
+        assert!((map.position(0.6) - 0.67).abs() < 1e-9);
+        // Beyond the ends, the overall slope (0.665 / 0.4), not 1.
+        assert!((map.position(0.75) - (0.835 + 0.05 * 1.6625)).abs() < 1e-9);
+        assert!((map.position(0.2) - (0.17 - 0.1 * 1.6625)).abs() < 1e-9);
+        assert_eq!(map.position(0.99), 1.0);
+        assert_eq!(map.position(0.0), 0.0);
+        // A pair out of order is pooled with its neighbour, never followed.
+        let pooled =
+            LevelMap::fit([p(0.4, 0.02, 0.6), p(0.5, 0.02, 0.4), p(0.7, 0.02, 0.9)]).unwrap();
+        assert_eq!(pooled.points().len(), 2);
+        assert!((pooled.points()[0].1 - 0.5).abs() < 1e-9);
+        let mut last = 0.0;
+        for step in 0..=100 {
+            let y = pooled.position(step as f64 / 100.0);
+            assert!(y >= last - 1e-12);
+            last = y;
+        }
+        // A 0.655 solve rate the user put at 0.80 and a 0.45 one at 0.40.
+        let user = LevelMap::fit([p(0.655, 0.04, 0.80), p(0.45, 0.04, 0.40)]).unwrap();
+        let between = user.position(0.55);
+        assert!(0.40 < between && between < 0.80, "{between}");
+        assert!(user.position(0.5) < between && between < user.position(0.6));
+        assert!(user.position(0.77) > 0.80);
+        // One point, or two that pool into one, fix no scale.
+        assert_eq!(LevelMap::fit([p(0.5, 0.0, 0.5)]), None);
+        assert_eq!(LevelMap::fit([p(0.5, 0.0, 0.6), p(0.6, 0.0, 0.4)]), None);
+        assert_eq!(LevelMap::fit([p(0.5, 0.0, 0.4), p(0.5, 0.0, 0.6)]), None);
+    }
+
+    #[test]
+    fn calibration_points_the_benchmarks_cannot_tell_apart_fix_no_scale() {
+        let p = |at: f64, low: f64, high: f64, level: f64| CalibrationPoint {
+            at,
+            low,
+            high,
+            level,
+        };
+        // A converted Codex grid: gpt-5.3-codex at md's centre and gpt-5.5 at
+        // lg's, whose shipped intervals overlap. Two near-peers are one point.
+        let codex = [p(0.638, 0.588, 0.694, 0.505), p(0.700, 0.656, 0.753, 0.835)];
+        assert_eq!(LevelMap::fit(codex), None);
+        // A covered smaller model calibrates it, with the near-peers pooled, so
+        // two models 0.021 apart in solve rate stay close on the ladder.
+        let map = LevelMap::fit([codex[0], codex[1], p(0.45, 0.42, 0.48, 0.17)]).unwrap();
+        assert_eq!(map.points().len(), 2);
+        let gap = map.position(0.676) - map.position(0.655);
+        // Unpooled, the pair alone gave these two a gap of 0.11 and a band boundary.
+        assert!((0.0..0.06).contains(&gap), "{gap}");
     }
 
     #[test]
     fn relaxation_goes_up_then_down() {
-        let expanded = config().expand(&entries(&["sm", "md", "lg"])).unwrap();
+        let expanded = config()
+            .expand(&entries(&["sm", "md", "lg"]), &unplaced)
+            .unwrap();
         let order: Vec<&str> = expanded
             .relaxations_from("md")
             .iter()
@@ -1274,6 +1528,9 @@ mod tests {
         let mut slash = config();
         slash.pools.push(pool("a/b", 0.9));
         assert!(slash.validate().is_err());
+        let mut stored = config();
+        stored.ladder[0].level = Some(benchmarks(0.4));
+        assert!(stored.validate().unwrap_err().contains("never stored"));
         config().validate().unwrap();
     }
 
@@ -1425,7 +1682,7 @@ defaultModels: [sm]
 
     fn band_models(models: &ModelsConfig, band: &str) -> Vec<String> {
         models
-            .expand(&[AllotmentEntry::Pool(band.into())])
+            .expand(&[AllotmentEntry::Pool(band.into())], &unplaced)
             .unwrap()
             .candidates
             .iter()

@@ -1,0 +1,13 @@
+{
+  "notes": "Terminal-Bench 2.0 submissions run with terminus-2, keyed by metadata.yaml's model_name. GLM 5 ran on a private endpoint whose trial config points its tokenizer at an internal checkpoint (/cloud/checkpoints/glm-moe/.../700b-sft-dsa-260127), so it is not the public glm-5. AfterQuery's gpt-oss-20b-rl is an RL fine-tune of gpt-oss-20b. DeepSeek V3.2 ran as deepseek-chat (non-thinking), configuration default.",
+  "aliases": {
+    "terminus-2:claude-opus-4-6": {"model": "claude-opus-4.6"},
+    "terminus-2:deepseek-v3.2": {"model": "deepseek-v3.2"},
+    "terminus-2:glm-4.7": {"model": "glm-4.7"},
+    "terminus-2:glm-5": {"model": "glm-5-private-checkpoint"},
+    "terminus-2:gpt-5.3-codex": {"model": "gpt-5.3-codex"},
+    "terminus-2:kimi-k2.5": {"model": "kimi-k2.5"},
+    "terminus-2:minimax-m2.5": {"model": "minimax-m2.5"},
+    "terminus-2:gpt-oss-20b-rl": {"model": "gpt-oss-20b-afterquery-rl"}
+  }
+}

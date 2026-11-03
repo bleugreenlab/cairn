@@ -2999,7 +2999,10 @@ activeBackend: codex
 
     fn lg_of(models: &crate::allotment::ModelsConfig) -> Vec<String> {
         models
-            .expand(&[crate::allotment::AllotmentEntry::Pool("lg".into())])
+            .expand(
+                &[crate::allotment::AllotmentEntry::Pool("lg".into())],
+                &crate::allotment::unplaced,
+            )
             .unwrap()
             .candidates
             .iter()

@@ -1,0 +1,24 @@
+{
+  "notes": "AIMS subjects.display_name per scaffold. Only subjects the loader keeps are mapped. HLE under Sup AI pro: DeepSeek-V3.2-Thinking is DeepSeek V3.2 in thinking mode, configuration 'reasoner' as in models.json. Kimi-K2-Thinking-Turbo is Moonshot's faster serving of kimi-k2-thinking (the same weights). TheAgentCompany under OpenHands 0.14.2 (Dec 2024): claude-3-5-sonnet-20241022 is the October 2024 Claude 3.5 Sonnet (claude-sonnet-3.5-v2, as in the HELM aliases). gemini-1.5-pro names no checkpoint (unverified whether -001 or -002), so it stays gemini-1.5-pro. Dated GPT-4o snapshots collapse to gpt-4o, as elsewhere.",
+  "aliases": {
+    "aims-hle-sup-ai-pro:Claude-Opus-4.5": {"model": "claude-opus-4.5"},
+    "aims-hle-sup-ai-pro:Claude-Sonnet-4.5": {"model": "claude-sonnet-4.5"},
+    "aims-hle-sup-ai-pro:DeepSeek-V3.2-Thinking": {"model": "deepseek-v3.2", "configuration": "reasoner"},
+    "aims-hle-sup-ai-pro:GPT-5-Pro": {"model": "gpt-5-pro"},
+    "aims-hle-sup-ai-pro:GPT-5.1": {"model": "gpt-5.1"},
+    "aims-hle-sup-ai-pro:Gemini-2.5-Pro": {"model": "gemini-2.5-pro"},
+    "aims-hle-sup-ai-pro:Gemini-3-Pro-Preview": {"model": "gemini-3-pro"},
+    "aims-hle-sup-ai-pro:Grok-4": {"model": "grok-4"},
+    "aims-hle-sup-ai-pro:Kimi-K2-Thinking-Turbo": {"model": "kimi-k2-thinking"},
+    "aims-theagentcompany-openhands-0.14.2:amazon-nova-pro-v1:0": {"model": "nova-pro"},
+    "aims-theagentcompany-openhands-0.14.2:claude-3-5-sonnet-20241022": {"model": "claude-sonnet-3.5-v2"},
+    "aims-theagentcompany-openhands-0.14.2:gemini-1.5-pro": {"model": "gemini-1.5-pro"},
+    "aims-theagentcompany-openhands-0.14.2:gemini-2.0-flash": {"model": "gemini-2.0-flash"},
+    "aims-theagentcompany-openhands-0.14.2:gpt-4o-2024-08-06": {"model": "gpt-4o"},
+    "aims-theagentcompany-openhands-0.14.2:llama-3.1-405b": {"model": "llama-3.1-405b"},
+    "aims-theagentcompany-openhands-0.14.2:llama-3.1-70b": {"model": "llama-3.1-70b"},
+    "aims-theagentcompany-openhands-0.14.2:llama-3.3-70b": {"model": "llama-3.3-70b"},
+    "aims-theagentcompany-openhands-0.14.2:qwen2-72b": {"model": "qwen2-72b"},
+    "aims-theagentcompany-openhands-0.14.2:qwen2.5-72b": {"model": "qwen2.5-72b"}
+  }
+}

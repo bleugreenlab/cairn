@@ -604,7 +604,7 @@ fn select_call_via_openrouter(
         return orch.select_for_agent(project_id, Some(&allotment), &agent.models, subject);
     }
     let routed: Vec<AllotmentEntry> = models
-        .expand(&allotment)?
+        .expand(&allotment, &cairn_config::allotment::unplaced)?
         .candidates
         .into_iter()
         .filter(|candidate| candidate.model.backend == "openrouter")

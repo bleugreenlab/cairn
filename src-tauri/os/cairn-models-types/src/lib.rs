@@ -5,11 +5,16 @@
 //! provider's capacity ([`pool`]), and what an image offer ([`image`]), a
 //! speech offer ([`speech`]) and an embedding offer ([`embedding`]) can do,
 //! and what a subscription account's plan costs ([`subscription`]).
+//! Which model a provider's offer or a leaderboard's name is, across
+//! providers, is [`identity`]; where licensed public benchmarks place a
+//! model on the capability ladder is [`benchmarks`].
 //! Pure values and pure functions only; this crate depends on no other
 //! workspace crate, so anything that only needs to name a provider or render
 //! a usage window can depend on it alone.
+pub mod benchmarks;
 pub mod catalog;
 pub mod embedding;
+pub mod identity;
 pub mod image;
 pub mod pool;
 pub mod provider_id;

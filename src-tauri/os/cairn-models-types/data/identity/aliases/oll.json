@@ -1,0 +1,674 @@
+{
+  "notes": "Open LLM Leaderboard repos -> canonical ids, for the loaded subjects only: the stratified sample and every model linked to another table. Linked entries are the official provider's or original author's repo only, mapped on the conventions of aliases/livecodebench.json and aliases/bigcodebench.json (a base checkpoint takes -base where an instruction-tuned sibling has the plain id, an -Instruct/-Chat/-it release takes the plain id). Re-uploads and fine-tunes (unsloth/phi-4, braindao/Qwen2.5-14B, jebish7/gemma-2-9b-it, ...) are never linked; a sampled community repo gets its own id <repo>-<org>. Command R+ (c4ai-command-r-plus) maps to command-r-plus-04-2024 and Mistral-Nemo-Instruct-2407 to mistral-nemo-2407, the dated forms; the undated duplicates command-r-plus (helm_safety) and mistral-nemo (livebench) name the same releases. mattshumer/Reflection-Llama-3.1-70B is mapped to reflection-llama-3.1-70b as the original release; that its weights are the ones livebench scored is unverified.",
+  "aliases": {
+    "open-llm-leaderboard:01-ai/Yi-1.5-34B": {
+      "model": "yi-1.5-34b-base"
+    },
+    "open-llm-leaderboard:01-ai/Yi-1.5-34B-Chat": {
+      "model": "yi-1.5-34b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-1.5-6B": {
+      "model": "yi-1.5-6b-base"
+    },
+    "open-llm-leaderboard:01-ai/Yi-1.5-6B-Chat": {
+      "model": "yi-1.5-6b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-1.5-9B": {
+      "model": "yi-1.5-9b-base"
+    },
+    "open-llm-leaderboard:01-ai/Yi-1.5-9B-Chat": {
+      "model": "yi-1.5-9b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-34B-Chat": {
+      "model": "yi-34b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-6B-Chat": {
+      "model": "yi-6b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-9B": {
+      "model": "yi-9b"
+    },
+    "open-llm-leaderboard:01-ai/Yi-Coder-9B-Chat": {
+      "model": "yi-coder-9b"
+    },
+    "open-llm-leaderboard:AALF/gemma-2-27b-it-SimPO-37K-100steps": {
+      "model": "gemma-2-27b-it-simpo-37k-100steps-aalf"
+    },
+    "open-llm-leaderboard:AELLM/gemma-2-aeria-infinity-9b": {
+      "model": "gemma-2-aeria-infinity-9b-aellm"
+    },
+    "open-llm-leaderboard:Ateron/Lotus-Magpic": {
+      "model": "lotus-magpic-ateron"
+    },
+    "open-llm-leaderboard:Ayush-Singh/Llama1B-sft-2": {
+      "model": "llama1b-sft-2-ayush-singh"
+    },
+    "open-llm-leaderboard:BramVanroy/fietje-2-instruct": {
+      "model": "fietje-2-instruct-bramvanroy"
+    },
+    "open-llm-leaderboard:CausalLM/preview-1-hf": {
+      "model": "causallm-preview-1"
+    },
+    "open-llm-leaderboard:Changgil/K2S3-v0.1": {
+      "model": "k2s3-v0.1-changgil"
+    },
+    "open-llm-leaderboard:CohereForAI/aya-expanse-32b": {
+      "model": "aya-expanse-32b"
+    },
+    "open-llm-leaderboard:CohereForAI/aya-expanse-8b": {
+      "model": "aya-expanse-8b"
+    },
+    "open-llm-leaderboard:CohereForAI/c4ai-command-r-plus": {
+      "model": "command-r-plus-04-2024"
+    },
+    "open-llm-leaderboard:CohereForAI/c4ai-command-r-plus-08-2024": {
+      "model": "command-r-plus-08-2024"
+    },
+    "open-llm-leaderboard:CohereForAI/c4ai-command-r-v01": {
+      "model": "command-r-03-2024"
+    },
+    "open-llm-leaderboard:CohereForAI/c4ai-command-r7b-12-2024": {
+      "model": "command-r7b"
+    },
+    "open-llm-leaderboard:CultriX/Qwen2.5-14B-FinalMerge": {
+      "model": "qwen2.5-14b-finalmerge-cultrix"
+    },
+    "open-llm-leaderboard:Daemontatox/DocumentCogito": {
+      "model": "documentcogito-daemontatox"
+    },
+    "open-llm-leaderboard:Daemontatox/RA_Reasoner": {
+      "model": "ra-reasoner-daemontatox"
+    },
+    "open-llm-leaderboard:Daemontatox/Zirel_1.5": {
+      "model": "zirel-1.5-daemontatox"
+    },
+    "open-llm-leaderboard:DavieLion/Llama-3.2-1B-SPIN-iter0": {
+      "model": "llama-3.2-1b-spin-iter0-davielion"
+    },
+    "open-llm-leaderboard:DeepMount00/Lexora-Lite-3B_v2": {
+      "model": "lexora-lite-3b-v2-deepmount00"
+    },
+    "open-llm-leaderboard:DeepMount00/Lexora-Medium-7B": {
+      "model": "lexora-medium-7b-deepmount00"
+    },
+    "open-llm-leaderboard:DreadPoor/Oh_Boy-8B-LINEAR": {
+      "model": "oh-boy-8b-linear-dreadpoor"
+    },
+    "open-llm-leaderboard:Goekdeniz-Guelmez/josie-3b-v6.0": {
+      "model": "josie-3b-v6.0-goekdeniz-guelmez"
+    },
+    "open-llm-leaderboard:HuggingFaceH4/zephyr-7b-alpha": {
+      "model": "zephyr-7b-alpha"
+    },
+    "open-llm-leaderboard:HuggingFaceH4/zephyr-7b-beta": {
+      "model": "zephyr-7b-beta"
+    },
+    "open-llm-leaderboard:Invalid-Null/PeiYangMe-0.7": {
+      "model": "peiyangme-0.7-invalid-null"
+    },
+    "open-llm-leaderboard:Isaak-Carter/Josiefied-Qwen2.5-7B-Instruct-abliterated": {
+      "model": "josiefied-qwen2.5-7b-instruct-abliterated-isaak-carter"
+    },
+    "open-llm-leaderboard:Khetterman/DarkAtom-12B-v3": {
+      "model": "darkatom-12b-v3-khetterman"
+    },
+    "open-llm-leaderboard:LeroyDyer/CheckPoint_B": {
+      "model": "checkpoint-b-leroydyer"
+    },
+    "open-llm-leaderboard:LeroyDyer/Mixtral_AI_SwahiliTron_7b": {
+      "model": "mixtral-ai-swahilitron-7b-leroydyer"
+    },
+    "open-llm-leaderboard:LilRg/PRYMMAL-6B-slerp": {
+      "model": "prymmal-6b-slerp-lilrg"
+    },
+    "open-llm-leaderboard:LimYeri/CodeMind-Llama3-8B-unsloth_v4-one-DPO-merged": {
+      "model": "codemind-llama3-8b-unsloth-v4-one-dpo-merged-limyeri"
+    },
+    "open-llm-leaderboard:Magpie-Align/MagpieLM-8B-SFT-v0.1": {
+      "model": "magpielm-8b-sft-v0.1-magpie-align"
+    },
+    "open-llm-leaderboard:NTQAI/Nxcode-CQ-7B-orpo": {
+      "model": "nxcode-cq-7b-orpo"
+    },
+    "open-llm-leaderboard:Nexesenex/Llama_3.1_8b_Hermedive_V1.01": {
+      "model": "llama-3.1-8b-hermedive-v1.01-nexesenex"
+    },
+    "open-llm-leaderboard:Nexesenex/Llama_3.1_8b_Mediver_V1.01": {
+      "model": "llama-3.1-8b-mediver-v1.01-nexesenex"
+    },
+    "open-llm-leaderboard:Nexesenex/Nemotron_W_4b_MagLight_0.1": {
+      "model": "nemotron-w-4b-maglight-0.1-nexesenex"
+    },
+    "open-llm-leaderboard:NotASI/FineTome-v1.5-Llama3.2-3B-1007": {
+      "model": "finetome-v1.5-llama3.2-3b-1007-notasi"
+    },
+    "open-llm-leaderboard:NousResearch/Hermes-3-Llama-3.1-70B": {
+      "model": "hermes-3-llama-3.1-70b"
+    },
+    "open-llm-leaderboard:OEvortex/HelpingAI2-9B": {
+      "model": "helpingai2-9b-oevortex"
+    },
+    "open-llm-leaderboard:OpenBuddy/openbuddy-qwen2.5llamaify-14b-v23.1-200k": {
+      "model": "openbuddy-qwen2.5llamaify-14b-v23.1-200k-openbuddy"
+    },
+    "open-llm-leaderboard:OpenLLM-France/Lucie-7B-Instruct-v1.1": {
+      "model": "lucie-7b-instruct-v1.1-openllm-france"
+    },
+    "open-llm-leaderboard:Quazim0t0/Jekyl-8b-sce": {
+      "model": "jekyl-8b-sce-quazim0t0"
+    },
+    "open-llm-leaderboard:Quazim0t0/Origami-14B-sce": {
+      "model": "origami-14b-sce-quazim0t0"
+    },
+    "open-llm-leaderboard:Quazim0t0/graphite-14b-sce": {
+      "model": "graphite-14b-sce-quazim0t0"
+    },
+    "open-llm-leaderboard:Qwen/QwQ-32B": {
+      "model": "qwq-32b"
+    },
+    "open-llm-leaderboard:Qwen/QwQ-32B-Preview": {
+      "model": "qwq-32b-preview"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-0.5B-Chat": {
+      "model": "qwen1.5-0.5b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-1.8B-Chat": {
+      "model": "qwen1.5-1.8b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-110B-Chat": {
+      "model": "qwen1.5-110b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-14B-Chat": {
+      "model": "qwen1.5-14b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-32B-Chat": {
+      "model": "qwen1.5-32b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-4B-Chat": {
+      "model": "qwen1.5-4b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen1.5-7B-Chat": {
+      "model": "qwen1.5-7b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-0.5B-Instruct": {
+      "model": "qwen2-0.5b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-1.5B-Instruct": {
+      "model": "qwen2-1.5b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-57B-A14B-Instruct": {
+      "model": "qwen2-57b-a14b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-72B": {
+      "model": "qwen2-72b-base"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-72B-Instruct": {
+      "model": "qwen2-72b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-7B-Instruct": {
+      "model": "qwen2-7b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2-Math-72B-Instruct": {
+      "model": "qwen2-math-72b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-0.5B-Instruct": {
+      "model": "qwen2.5-0.5b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-1.5B-Instruct": {
+      "model": "qwen2.5-1.5b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-14B-Instruct": {
+      "model": "qwen2.5-14b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-32B": {
+      "model": "qwen2.5-32b-base"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-32B-Instruct": {
+      "model": "qwen2.5-32b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-3B-Instruct": {
+      "model": "qwen2.5-3b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-72B": {
+      "model": "qwen2.5-72b-base"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-72B-Instruct": {
+      "model": "qwen2.5-72b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-7B": {
+      "model": "qwen2.5-7b-base"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-7B-Instruct": {
+      "model": "qwen2.5-7b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-Coder-14B-Instruct": {
+      "model": "qwen2.5-coder-14b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-Coder-32B-Instruct": {
+      "model": "qwen2.5-coder-32b"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-Coder-7B": {
+      "model": "qwen2.5-coder-7b-base"
+    },
+    "open-llm-leaderboard:Qwen/Qwen2.5-Coder-7B-Instruct": {
+      "model": "qwen2.5-coder-7b"
+    },
+    "open-llm-leaderboard:SaisExperiments/Not-So-Small-Alpaca-24B": {
+      "model": "not-so-small-alpaca-24b-saisexperiments"
+    },
+    "open-llm-leaderboard:Sakalti/Llama3.2-3B-Uranus-1": {
+      "model": "llama3.2-3b-uranus-1-sakalti"
+    },
+    "open-llm-leaderboard:SenseLLM/ReflectionCoder-CL-34B": {
+      "model": "reflectioncoder-cl-34b"
+    },
+    "open-llm-leaderboard:SenseLLM/ReflectionCoder-DS-33B": {
+      "model": "reflectioncoder-ds-33b"
+    },
+    "open-llm-leaderboard:T145/ZEUS-8B-V10": {
+      "model": "zeus-8b-v10-t145"
+    },
+    "open-llm-leaderboard:T145/ZEUS-8B-V28": {
+      "model": "zeus-8b-v28-t145"
+    },
+    "open-llm-leaderboard:T145/ZEUS-8B-V29": {
+      "model": "zeus-8b-v29-t145"
+    },
+    "open-llm-leaderboard:TTTXXX01/Mistral-7B-Base-SimPO2-5e-7": {
+      "model": "mistral-7b-base-simpo2-5e-7-tttxxx01"
+    },
+    "open-llm-leaderboard:Triangle104/DS-Distilled-Hermes-Llama-3.1_TIES": {
+      "model": "ds-distilled-hermes-llama-3.1-ties-triangle104"
+    },
+    "open-llm-leaderboard:VAGOsolutions/Llama-3-SauerkrautLM-8b-Instruct": {
+      "model": "llama-3-sauerkrautlm-8b-instruct-vagosolutions"
+    },
+    "open-llm-leaderboard:VAGOsolutions/SauerkrautLM-gemma-2-9b-it": {
+      "model": "sauerkrautlm-gemma-2-9b-it-vagosolutions"
+    },
+    "open-llm-leaderboard:Weyaxi/SauerkrautLM-UNA-SOLAR-Instruct": {
+      "model": "sauerkrautlm-una-solar-instruct-weyaxi"
+    },
+    "open-llm-leaderboard:ZHLiu627/zephyr-7b-gemma-rpo-avg": {
+      "model": "zephyr-7b-gemma-rpo-avg-zhliu627"
+    },
+    "open-llm-leaderboard:abacusai/Dracarys-72B-Instruct": {
+      "model": "dracarys-72b"
+    },
+    "open-llm-leaderboard:aixonlab/Grey-12b": {
+      "model": "grey-12b-aixonlab"
+    },
+    "open-llm-leaderboard:allenai/OLMo-2-1124-7B-Instruct": {
+      "model": "olmo-2-7b"
+    },
+    "open-llm-leaderboard:allenai/OLMo-7B-Instruct-hf": {
+      "model": "olmo-7b"
+    },
+    "open-llm-leaderboard:allenai/OLMoE-1B-7B-0125-Instruct": {
+      "model": "olmoe-1b-7b"
+    },
+    "open-llm-leaderboard:allknowingroger/Ph3merge2-14B": {
+      "model": "ph3merge2-14b-allknowingroger"
+    },
+    "open-llm-leaderboard:allknowingroger/Yi-1.5-34B": {
+      "model": "yi-1.5-34b-allknowingroger"
+    },
+    "open-llm-leaderboard:bamec66557/VICIOUS_MESH-12B-0.X.ver": {
+      "model": "vicious-mesh-12b-0.x.ver-bamec66557"
+    },
+    "open-llm-leaderboard:bigcode/starcoder2-15b": {
+      "model": "starcoder2-15b"
+    },
+    "open-llm-leaderboard:bigcode/starcoder2-3b": {
+      "model": "starcoder2-3b"
+    },
+    "open-llm-leaderboard:bigcode/starcoder2-7b": {
+      "model": "starcoder2-7b"
+    },
+    "open-llm-leaderboard:bunnycore/FwF-Qwen-7B-0.2": {
+      "model": "fwf-qwen-7b-0.2-bunnycore"
+    },
+    "open-llm-leaderboard:bunnycore/Phi-4-Sce-exp-v0.1": {
+      "model": "phi-4-sce-exp-v0.1-bunnycore"
+    },
+    "open-llm-leaderboard:bunnycore/QandoraExp-7B-Persona": {
+      "model": "qandoraexp-7b-persona-bunnycore"
+    },
+    "open-llm-leaderboard:carsenk/phi3.5_mini_exp_825_uncensored": {
+      "model": "phi3.5-mini-exp-825-uncensored-carsenk"
+    },
+    "open-llm-leaderboard:cstr/llama3.1-8b-spaetzle-v90": {
+      "model": "llama3.1-8b-spaetzle-v90-cstr"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Llama-70B": {
+      "model": "deepseek-r1-distill-llama-70b"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Llama-8B": {
+      "model": "deepseek-r1-distill-llama-8b"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": {
+      "model": "deepseek-r1-distill-qwen-1.5b"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": {
+      "model": "deepseek-r1-distill-qwen-14b"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Qwen-32B": {
+      "model": "deepseek-r1-distill-qwen-32b"
+    },
+    "open-llm-leaderboard:deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": {
+      "model": "deepseek-r1-distill-qwen-7b"
+    },
+    "open-llm-leaderboard:deepseek-ai/deepseek-llm-67b-chat": {
+      "model": "deepseek-llm-67b"
+    },
+    "open-llm-leaderboard:deepseek-ai/deepseek-llm-7b-chat": {
+      "model": "deepseek-llm-7b"
+    },
+    "open-llm-leaderboard:djuna/L3.1-Promissum_Mane-8B-Della-calc": {
+      "model": "l3.1-promissum-mane-8b-della-calc-djuna"
+    },
+    "open-llm-leaderboard:djuna/MN-Chinofun-12B-4": {
+      "model": "mn-chinofun-12b-4-djuna"
+    },
+    "open-llm-leaderboard:dwikitheduck/gen-try1": {
+      "model": "gen-try1-dwikitheduck"
+    },
+    "open-llm-leaderboard:ehristoforu/della-70b-test-v1": {
+      "model": "della-70b-test-v1-ehristoforu"
+    },
+    "open-llm-leaderboard:ehristoforu/mllama-3.1-8b-instruct": {
+      "model": "mllama-3.1-8b-instruct-ehristoforu"
+    },
+    "open-llm-leaderboard:flammenai/Mahou-1.5-llama3.1-70B": {
+      "model": "mahou-1.5-llama3.1-70b-flammenai"
+    },
+    "open-llm-leaderboard:google/gemma-1.1-7b-it": {
+      "model": "gemma-1.1-7b"
+    },
+    "open-llm-leaderboard:google/gemma-2-27b-it": {
+      "model": "gemma-2-27b"
+    },
+    "open-llm-leaderboard:google/gemma-2b": {
+      "model": "gemma-2b-base"
+    },
+    "open-llm-leaderboard:google/gemma-7b": {
+      "model": "gemma-7b-base"
+    },
+    "open-llm-leaderboard:gradientai/Llama-3-8B-Instruct-Gradient-1048k": {
+      "model": "llama-3-8b-instruct-gradient-1048k"
+    },
+    "open-llm-leaderboard:grimjim/Magnolia-v2-12B": {
+      "model": "magnolia-v2-12b-grimjim"
+    },
+    "open-llm-leaderboard:huihui-ai/Qwen2.5-72B-Instruct-abliterated": {
+      "model": "qwen2.5-72b-instruct-abliterated-huihui-ai"
+    },
+    "open-llm-leaderboard:ibm-granite/granite-3.0-2b-instruct": {
+      "model": "granite-3.0-2b"
+    },
+    "open-llm-leaderboard:ibm-granite/granite-3.0-8b-instruct": {
+      "model": "granite-3.0-8b"
+    },
+    "open-llm-leaderboard:ibm-granite/granite-3.1-8b-instruct": {
+      "model": "granite-3.1-8b"
+    },
+    "open-llm-leaderboard:ibm-granite/granite-3.2-2b-instruct": {
+      "model": "granite-3.2-2b"
+    },
+    "open-llm-leaderboard:ibm-granite/granite-3.2-8b-instruct": {
+      "model": "granite-3.2-8b"
+    },
+    "open-llm-leaderboard:icefog72/Ice0.52.1-16.01-RP": {
+      "model": "ice0.52.1-16.01-rp-icefog72"
+    },
+    "open-llm-leaderboard:internlm/internlm2_5-7b-chat": {
+      "model": "internlm2.5-7b"
+    },
+    "open-llm-leaderboard:jaspionjader/Kosmos-EVAA-TSN-light-8B": {
+      "model": "kosmos-evaa-tsn-light-8b-jaspionjader"
+    },
+    "open-llm-leaderboard:jebish7/gemma-2-2b-it": {
+      "model": "gemma-2-2b-it-jebish7"
+    },
+    "open-llm-leaderboard:jeffmeloy/Qwen2.5-7B-nerd-uncensored-v0.9": {
+      "model": "qwen2.5-7b-nerd-uncensored-v0.9-jeffmeloy"
+    },
+    "open-llm-leaderboard:johnsutor/Llama-3-8B-Instruct_breadcrumbs-density-0.3-gamma-0.01": {
+      "model": "llama-3-8b-instruct-breadcrumbs-density-0.3-gamma-0.01-johnsutor"
+    },
+    "open-llm-leaderboard:jpacifico/Chocolatine-2-14B-Instruct-DPO-v2.0b1": {
+      "model": "chocolatine-2-14b-instruct-dpo-v2.0b1-jpacifico"
+    },
+    "open-llm-leaderboard:lalainy/ECE-PRYMMAL-YL-6B-SLERP-V2": {
+      "model": "ece-prymmal-yl-6b-slerp-v2-lalainy"
+    },
+    "open-llm-leaderboard:lars1234/Mistral-Small-24B-Instruct-2501-writer": {
+      "model": "mistral-small-24b-instruct-2501-writer-lars1234"
+    },
+    "open-llm-leaderboard:lmsys/vicuna-7b-v1.5": {
+      "model": "vicuna-7b-v1.5"
+    },
+    "open-llm-leaderboard:marcuscedricridia/Hush-Qwen2.5-7B-Preview": {
+      "model": "hush-qwen2.5-7b-preview-marcuscedricridia"
+    },
+    "open-llm-leaderboard:marcuscedricridia/Hush-Qwen2.5-7B-v1.2": {
+      "model": "hush-qwen2.5-7b-v1.2-marcuscedricridia"
+    },
+    "open-llm-leaderboard:marcuscedricridia/pre-cursa-o1-v1.3": {
+      "model": "pre-cursa-o1-v1.3-marcuscedricridia"
+    },
+    "open-llm-leaderboard:marcuscedricridia/stray-r1o-et": {
+      "model": "stray-r1o-et-marcuscedricridia"
+    },
+    "open-llm-leaderboard:mattshumer/Reflection-Llama-3.1-70B": {
+      "model": "reflection-llama-3.1-70b"
+    },
+    "open-llm-leaderboard:mergekit-community/mergekit-model_stock-azgztvm": {
+      "model": "mergekit-model-stock-azgztvm-mergekit-community"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-2-7b-chat-hf": {
+      "model": "llama-2-7b"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.1-70B": {
+      "model": "llama-3.1-70b-base"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.1-70B-Instruct": {
+      "model": "llama-3.1-70b"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.1-8B": {
+      "model": "llama-3.1-8b-base"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.1-8B-Instruct": {
+      "model": "llama-3.1-8b"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.2-1B-Instruct": {
+      "model": "llama-3.2-1b"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.2-3B-Instruct": {
+      "model": "llama-3.2-3b"
+    },
+    "open-llm-leaderboard:meta-llama/Llama-3.3-70B-Instruct": {
+      "model": "llama-3.3-70b"
+    },
+    "open-llm-leaderboard:meta-llama/Meta-Llama-3-70B": {
+      "model": "llama-3-70b-base"
+    },
+    "open-llm-leaderboard:meta-llama/Meta-Llama-3-70B-Instruct": {
+      "model": "llama-3-70b"
+    },
+    "open-llm-leaderboard:meta-llama/Meta-Llama-3-8B": {
+      "model": "llama-3-8b-base"
+    },
+    "open-llm-leaderboard:meta-llama/Meta-Llama-3-8B-Instruct": {
+      "model": "llama-3-8b"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3-medium-128k-instruct": {
+      "model": "phi-3-medium-128k"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3-medium-4k-instruct": {
+      "model": "phi-3-medium-4k"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3-mini-128k-instruct": {
+      "model": "phi-3-mini-128k"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3-mini-4k-instruct": {
+      "model": "phi-3-mini-4k"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3.5-MoE-instruct": {
+      "model": "phi-3.5-moe"
+    },
+    "open-llm-leaderboard:microsoft/Phi-3.5-mini-instruct": {
+      "model": "phi-3.5-mini"
+    },
+    "open-llm-leaderboard:microsoft/phi-1": {
+      "model": "phi-1"
+    },
+    "open-llm-leaderboard:microsoft/phi-1_5": {
+      "model": "phi-1.5"
+    },
+    "open-llm-leaderboard:microsoft/phi-2": {
+      "model": "phi-2"
+    },
+    "open-llm-leaderboard:microsoft/phi-4": {
+      "model": "phi-4"
+    },
+    "open-llm-leaderboard:migtissera/Llama-3-70B-Synthia-v3.5": {
+      "model": "llama-3-70b-synthia-v3.5"
+    },
+    "open-llm-leaderboard:migtissera/Tess-v2.5.2-Qwen2-72B": {
+      "model": "tess-v2.5.2-qwen2-72b"
+    },
+    "open-llm-leaderboard:minghaowu/Qwen1.5-1.8B-OpenHermes-2.5": {
+      "model": "qwen1.5-1.8b-openhermes-2.5-minghaowu"
+    },
+    "open-llm-leaderboard:mistralai/Codestral-22B-v0.1": {
+      "model": "codestral-22b-v0.1"
+    },
+    "open-llm-leaderboard:mistralai/Ministral-8B-Instruct-2410": {
+      "model": "ministral-8b-2410"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-7B-Instruct-v0.1": {
+      "model": "mistral-7b-v0.1"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-7B-Instruct-v0.2": {
+      "model": "mistral-7b-v0.2"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-7B-Instruct-v0.3": {
+      "model": "mistral-7b-v0.3"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-7B-v0.1": {
+      "model": "mistral-7b-v0.1-base"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-7B-v0.3": {
+      "model": "mistral-7b-v0.3-base"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-Large-Instruct-2411": {
+      "model": "mistral-large-2411"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-Nemo-Instruct-2407": {
+      "model": "mistral-nemo-2407"
+    },
+    "open-llm-leaderboard:mistralai/Mistral-Small-Instruct-2409": {
+      "model": "mistral-small-2409"
+    },
+    "open-llm-leaderboard:mistralai/Mixtral-8x22B-v0.1": {
+      "model": "mixtral-8x22b-base"
+    },
+    "open-llm-leaderboard:mistralai/Mixtral-8x7B-Instruct-v0.1": {
+      "model": "mixtral-8x7b"
+    },
+    "open-llm-leaderboard:mistralai/Mixtral-8x7B-v0.1": {
+      "model": "mixtral-8x7b-base"
+    },
+    "open-llm-leaderboard:mrdayl/OpenCognito-r2": {
+      "model": "opencognito-r2-mrdayl"
+    },
+    "open-llm-leaderboard:netcat420/MFANN-llama3.1-abliterated-SLERP-v3": {
+      "model": "mfann-llama3.1-abliterated-slerp-v3-netcat420"
+    },
+    "open-llm-leaderboard:nvidia/Llama-3.1-Nemotron-70B-Instruct-HF": {
+      "model": "llama-3.1-nemotron-70b"
+    },
+    "open-llm-leaderboard:nvidia/Nemotron-Mini-4B-Instruct": {
+      "model": "nemotron-mini-4b"
+    },
+    "open-llm-leaderboard:openchat/openchat-3.6-8b-20240522": {
+      "model": "openchat-3.6-8b-20240522"
+    },
+    "open-llm-leaderboard:pankajmathur/orca_mini_v9_4_70B": {
+      "model": "orca-mini-v9-4-70b-pankajmathur"
+    },
+    "open-llm-leaderboard:princeton-nlp/Llama-3-8B-ProLong-512k-Base": {
+      "model": "llama-3-8b-prolong-512k-base-princeton-nlp"
+    },
+    "open-llm-leaderboard:prithivMLmods/Bellatrix-Tiny-1.5B-R1": {
+      "model": "bellatrix-tiny-1.5b-r1-prithivmlmods"
+    },
+    "open-llm-leaderboard:prithivMLmods/Evac-Opus-14B-Exp": {
+      "model": "evac-opus-14b-exp-prithivmlmods"
+    },
+    "open-llm-leaderboard:prithivMLmods/Llama-3.2-6B-AlgoCode": {
+      "model": "llama-3.2-6b-algocode-prithivmlmods"
+    },
+    "open-llm-leaderboard:qingy2019/Qwen2.5-Ultimate-14B-Instruct": {
+      "model": "qwen2.5-ultimate-14b-instruct-qingy2019"
+    },
+    "open-llm-leaderboard:qingy2024/Qwen2.5-Math-14B-Instruct-Preview": {
+      "model": "qwen2.5-math-14b-instruct-preview-qingy2024"
+    },
+    "open-llm-leaderboard:sabersaleh/Llama2-7B-SPO": {
+      "model": "llama2-7b-spo-sabersaleh"
+    },
+    "open-llm-leaderboard:saishshinde15/TethysAI_Vortex_Reasoning": {
+      "model": "tethysai-vortex-reasoning-saishshinde15"
+    },
+    "open-llm-leaderboard:speakleash/Bielik-11B-v2.3-Instruct": {
+      "model": "bielik-11b-v2.3"
+    },
+    "open-llm-leaderboard:sthenno-com/miscii-14b-0218": {
+      "model": "miscii-14b-0218-sthenno-com"
+    },
+    "open-llm-leaderboard:teknium/OpenHermes-2.5-Mistral-7B": {
+      "model": "openhermes-2.5-mistral-7b"
+    },
+    "open-llm-leaderboard:tensopolis/virtuoso-small-v2-tensopolis-v1": {
+      "model": "virtuoso-small-v2-tensopolis-v1-tensopolis"
+    },
+    "open-llm-leaderboard:theprint/Boptruth-Agatha-7B": {
+      "model": "boptruth-agatha-7b-theprint"
+    },
+    "open-llm-leaderboard:theprint/ReWiz-7B": {
+      "model": "rewiz-7b-theprint"
+    },
+    "open-llm-leaderboard:tiiuae/Falcon3-10B-Instruct": {
+      "model": "falcon3-10b"
+    },
+    "open-llm-leaderboard:tiiuae/Falcon3-1B-Base": {
+      "model": "falcon3-1b-base"
+    },
+    "open-llm-leaderboard:tiiuae/Falcon3-1B-Instruct": {
+      "model": "falcon3-1b"
+    },
+    "open-llm-leaderboard:tiiuae/Falcon3-3B-Instruct": {
+      "model": "falcon3-3b"
+    },
+    "open-llm-leaderboard:tiiuae/Falcon3-7B-Instruct": {
+      "model": "falcon3-7b"
+    },
+    "open-llm-leaderboard:vonjack/Phi-3.5-mini-instruct-hermes-fc-json": {
+      "model": "phi-3.5-mini-instruct-hermes-fc-json-vonjack"
+    },
+    "open-llm-leaderboard:yam-peleg/Hebrew-Mistral-7B-200K": {
+      "model": "hebrew-mistral-7b-200k-yam-peleg"
+    },
+    "open-llm-leaderboard:yfzp/Llama-3-8B-Instruct-SPPO-score-Iter1_bt_8b-table-0.002": {
+      "model": "llama-3-8b-instruct-sppo-score-iter1-bt-8b-table-0.002-yfzp"
+    },
+    "open-llm-leaderboard:ymcki/Llama-3.1-8B-GRPO-Instruct": {
+      "model": "llama-3.1-8b-grpo-instruct-ymcki"
+    },
+    "open-llm-leaderboard:zelk12/MT2-Gen7-gemma-2-9B": {
+      "model": "mt2-gen7-gemma-2-9b-zelk12"
+    }
+  }
+}

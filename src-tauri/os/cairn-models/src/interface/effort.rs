@@ -126,6 +126,17 @@ impl CatalogProvider {
             .or_else(|| self.descriptor.maker.as_deref().map(str::to_string))
             .or_else(|| (self.descriptor.key == "openrouter").then(|| openrouter_maker(model))?)
     }
+
+    /// The provider-independent model `model` here is, when Cairn can tell
+    /// without guessing ([`cairn_models_types::identity::for_offer`]). A
+    /// model discovery never listed resolves on its native id alone.
+    pub fn canonical(&self, model: &str) -> Option<String> {
+        let slug = self
+            .discovered(model)
+            .and_then(|discovered| discovered.canonical_slug.as_deref());
+        cairn_models_types::identity::for_offer(self.descriptor.key.as_ref(), model, slug)
+            .map(str::to_string)
+    }
 }
 
 #[cfg(test)]

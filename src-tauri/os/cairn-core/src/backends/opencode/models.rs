@@ -449,3 +449,27 @@ fn supported_parameters(metadata: &PublishedModel) -> Vec<String> {
 fn per_token(per_million: Option<f64>) -> Option<String> {
     per_million.map(|value| format!("{:.12}", value / 1_000_000.0))
 }
+
+#[cfg(test)]
+mod maker_tests {
+    use super::{maker, MAKERS};
+    use cairn_models::types::identity::identity;
+
+    #[test]
+    fn go_makers_agree_with_the_identity_table() {
+        // A Go family's maker and the canonical table's maker for a model of
+        // that family are one spelling, so a maker constraint and a benchmark
+        // placement agree on whose model it is.
+        for (prefix, expected) in MAKERS {
+            let first_party: Vec<_> = identity()
+                .models()
+                .filter(|model| model.id.starts_with(prefix) && model.maker.is_some())
+                .collect();
+            assert!(!first_party.is_empty(), "{prefix}");
+            for model in first_party {
+                assert_eq!(model.maker.as_deref(), Some(*expected), "{}", model.id);
+                assert_eq!(maker(&model.id).as_deref(), Some(*expected));
+            }
+        }
+    }
+}
