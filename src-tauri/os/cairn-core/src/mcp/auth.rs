@@ -65,10 +65,6 @@ impl SecretStore {
         }
     }
 
-    pub(crate) fn config_dir(&self) -> &Path {
-        &self.config_dir
-    }
-
     /// Where this credential lives.
     pub fn path(&self) -> PathBuf {
         self.config_dir.join(self.file_name)
@@ -152,10 +148,6 @@ impl SecretStore {
 pub struct McpAuthState(SecretStore);
 
 impl McpAuthState {
-    pub(crate) fn config_dir(&self) -> &Path {
-        self.0.config_dir()
-    }
-
     pub fn new(config_dir: PathBuf) -> Self {
         Self(SecretStore::new(
             config_dir,
@@ -614,6 +606,26 @@ mod tests {
             // only the runner's payload; the runner gates the input against
             // the page's manifest.
             "src-tauri/src/commands/pages.rs",
+            // Database browser row writes: routed through `operator_target`
+            // like page writes, so only the main webview reaches the local
+            // runner or a configured peer; inline browser webviews and page
+            // windows are refused by label even when they name a peer. The
+            // command names only `invoke_as_operator`, forwards
+            // `{projectId, input}` unchanged, and returns only the runner's
+            // payload; the runner's `write_db_rows` confines the write to one
+            // thread's rows. Its test names the file constant and header only
+            // to plant a throwaway credential in a tempdir and assert the
+            // header is sent.
+            "src-tauri/src/commands/db_browser.rs",
+            // Grant revocation (Settings -> Grants): routed through
+            // `operator_target` with no peer, so only the main webview reaches
+            // the local runner; agent-opened browser labels and page windows
+            // are refused. The module never reads the credential: it names
+            // only `invoke_as_operator`, forwards the grant id unchanged, and
+            // returns only the runner's payload, while `runner_client` keeps
+            // the token in the loopback request header. Its test names the
+            // header only to assert it is sent.
+            "src-tauri/src/commands/grants.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-orch/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",
