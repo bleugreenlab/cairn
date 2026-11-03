@@ -8465,6 +8465,17 @@ mod tests {
                 ) {
                     continue;
                 }
+                // `projects` is re-rooted (above), so its owner-key index is
+                // the private one under the same transform.
+                if name == "idx_projects_team_id" {
+                    assert_eq!(
+                        norm(sql),
+                        norm(&priv_objs["idx_projects_workspace_id"])
+                            .replace("workspace_id", "team_id"),
+                        "re-rooted index `{name}` drifted from its private counterpart"
+                    );
+                    continue;
+                }
                 let p = priv_objs.get(name).unwrap_or_else(|| {
                     panic!("team {kind} `{name}` is missing from the private lineage")
                 });
@@ -8592,6 +8603,268 @@ mod tests {
                 let _ = target;
             }
         }
+    }
+
+    /// A foreign key as the census reads it: the child's referencing columns in
+    /// key order, the parent table, and the action a parent delete runs.
+    struct ChildKey {
+        columns: Vec<String>,
+        parent: String,
+        on_delete: String,
+    }
+
+    /// Every foreign key on `db` whose child columns lead no full index, as
+    /// `child(columns) -> parent (ON DELETE action)`, sorted.
+    ///
+    /// A parent delete runs each child key's action (for NO ACTION and RESTRICT,
+    /// its constraint check) as a lookup on the child columns. With an index
+    /// leading with them the lookup seeks; without one it walks the whole child
+    /// table once per deleted parent row, and a cascade multiplies that by the
+    /// rows it deletes (cairn/5956). A key is covered by an index with
+    /// `partial = 0` whose leading columns are the key's columns in any order (a
+    /// `sqlite_autoindex_*` counts, which is how a PRIMARY KEY or UNIQUE
+    /// constraint covers), or by the table's INTEGER PRIMARY KEY rowid alias. A
+    /// partial index never covers: the lookup's `col = ?` does not imply its
+    /// predicate to Turso.
+    ///
+    /// One exemption, by rule rather than by list: a NO ACTION or RESTRICT key
+    /// that references its own table. The pinned engine checks that constraint
+    /// by scanning the table whatever indexes exist (cairn/5623), so an index
+    /// there costs every write and buys nothing.
+    /// `storage::retention::tests::the_engine_still_scans_for_self_referencing_children`
+    /// pins that behaviour; when it fails after an engine bump, this exemption
+    /// goes too. A self-referencing CASCADE or SET NULL key is not exempt: its
+    /// action is an ordinary child lookup and seeks through an index.
+    async fn uncovered_foreign_keys(db: &LocalDb) -> Vec<String> {
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let tables = db
+            .query_all(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' \
+                 ORDER BY name",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        let mut uncovered = Vec::new();
+        for table in tables {
+            let mut fk_rows = db
+                .query_all(
+                    format!("PRAGMA foreign_key_list({})", quote(&table)),
+                    (),
+                    |row| {
+                        Ok((
+                            row.i64(0)?,
+                            row.i64(1)?,
+                            row.text(2)?,
+                            row.text(3)?,
+                            row.text(6)?,
+                        ))
+                    },
+                )
+                .await
+                .unwrap();
+            if fk_rows.is_empty() {
+                continue;
+            }
+            fk_rows.sort_by_key(|(id, seq, ..)| (*id, *seq));
+            let mut keys: std::collections::BTreeMap<i64, ChildKey> =
+                std::collections::BTreeMap::new();
+            for (id, _seq, parent, from, on_delete) in fk_rows {
+                keys.entry(id)
+                    .or_insert_with(|| ChildKey {
+                        columns: Vec::new(),
+                        parent,
+                        on_delete: on_delete.to_ascii_uppercase(),
+                    })
+                    .columns
+                    .push(from);
+            }
+
+            // The ordered column names of every full index; an expression
+            // column reads as `None` and matches no key column.
+            let indexes = db
+                .query_all(format!("PRAGMA index_list({})", quote(&table)), (), |row| {
+                    Ok((row.text(1)?, row.i64(4)?))
+                })
+                .await
+                .unwrap();
+            let mut leads: Vec<Vec<Option<String>>> = Vec::new();
+            for (index, partial) in indexes {
+                if partial != 0 {
+                    continue;
+                }
+                let mut columns = db
+                    .query_all(format!("PRAGMA index_info({})", quote(&index)), (), |row| {
+                        Ok((row.i64(0)?, row.opt_text(2)?))
+                    })
+                    .await
+                    .unwrap();
+                columns.sort_by_key(|(seqno, _)| *seqno);
+                leads.push(columns.into_iter().map(|(_, name)| name).collect());
+            }
+            let primary_key = db
+                .query_all(format!("PRAGMA table_info({})", quote(&table)), (), |row| {
+                    Ok((row.text(1)?, row.text(2)?, row.i64(5)?))
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|(_, _, pk)| *pk > 0)
+                .collect::<Vec<_>>();
+            let rowid_alias = match primary_key.as_slice() {
+                [(name, kind, _)] if kind.eq_ignore_ascii_case("INTEGER") => Some(name.clone()),
+                _ => None,
+            };
+
+            for key in keys.into_values() {
+                if key.parent == table && matches!(key.on_delete.as_str(), "NO ACTION" | "RESTRICT")
+                {
+                    continue;
+                }
+                let wanted: std::collections::BTreeSet<&str> =
+                    key.columns.iter().map(String::as_str).collect();
+                let width = key.columns.len();
+                let by_rowid =
+                    width == 1 && rowid_alias.as_deref() == Some(key.columns[0].as_str());
+                let by_index = leads.iter().any(|lead| {
+                    lead.len() >= width
+                        && lead[..width]
+                            .iter()
+                            .map(Option::as_deref)
+                            .collect::<Option<std::collections::BTreeSet<&str>>>()
+                            .is_some_and(|leading| leading == wanted)
+                });
+                if !by_rowid && !by_index {
+                    uncovered.push(format!(
+                        "{table}({}) -> {} (ON DELETE {})",
+                        key.columns.join(", "),
+                        key.parent,
+                        key.on_delete
+                    ));
+                }
+            }
+        }
+        uncovered.sort();
+        uncovered
+    }
+
+    /// Foreign keys whose index a named issue owes, as
+    /// `(lineage, child table, child column, issue)`. Only an index held back on
+    /// measured boot cost belongs here: `codex_watchdog_lifecycle` holds about
+    /// 1.0M rows until cairn/6037's eviction drains it, and its two builds took
+    /// 45 s on the 11-03 clone. An entry whose key is covered fails the census as
+    /// stale, so the list only shrinks.
+    const PENDING_FOREIGN_KEY_INDEXES: &[(&str, &str, &str, &str)] = &[
+        (
+            "private",
+            "codex_watchdog_lifecycle",
+            "session_id",
+            "cairn://p/cairn/6039",
+        ),
+        (
+            "private",
+            "codex_watchdog_lifecycle",
+            "successor_run_id",
+            "cairn://p/cairn/6039",
+        ),
+    ];
+
+    /// `docs/database.md` ("Deleting Rows With Dependents"): every foreign-key
+    /// child column needs a full index, in both lineages. See
+    /// `uncovered_foreign_keys` for what covers a key and the one exemption,
+    /// and `PENDING_FOREIGN_KEY_INDEXES` for the indexes an issue owes.
+    #[tokio::test]
+    async fn every_foreign_key_child_column_leads_an_index() {
+        let private = migrated_db().await.unwrap();
+        let (_team_temp, team) = migrated_team_db().await;
+        let mut uncovered = Vec::new();
+        let mut pending_seen = std::collections::BTreeSet::new();
+        for (lineage, db) in [("private", &private), ("team", &team)] {
+            for key in uncovered_foreign_keys(db).await {
+                let pending = PENDING_FOREIGN_KEY_INDEXES.iter().position(
+                    |(pending_lineage, table, column, _)| {
+                        *pending_lineage == lineage
+                            && key.starts_with(&format!("{table}({column}) ->"))
+                    },
+                );
+                match pending {
+                    Some(index) => {
+                        pending_seen.insert(index);
+                    }
+                    None => uncovered.push(format!("{lineage}: {key}")),
+                }
+            }
+        }
+        let stale: Vec<String> = PENDING_FOREIGN_KEY_INDEXES
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !pending_seen.contains(index))
+            .map(|(_, (lineage, table, column, issue))| {
+                format!("{lineage}: {table}({column}) ({issue})")
+            })
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these pending foreign-key indexes now exist; remove them from \
+             PENDING_FOREIGN_KEY_INDEXES: {stale:?}"
+        );
+        assert!(
+            uncovered.is_empty(),
+            "{} foreign key(s) lead no full index, so each parent delete walks the \
+             whole child table. Add a full index (no WHERE) leading with the child \
+             column(s) in a migration, shared when both lineages carry the table:\n  {}",
+            uncovered.len(),
+            uncovered.join("\n  ")
+        );
+    }
+
+    /// The census's own negative check: a child with no index and a child whose
+    /// only index is partial are named; an index leading with the column (or a
+    /// composite key's columns in another order) covers; a self-referencing NO
+    /// ACTION key is exempt and a self-referencing CASCADE key is not.
+    #[tokio::test]
+    async fn the_foreign_key_census_names_unindexed_children_and_exempts_only_self_checks() {
+        let db = migrated_db().await.unwrap();
+        db.execute_batch(
+            "CREATE TABLE census_parent (id TEXT PRIMARY KEY);
+             CREATE TABLE census_pair (a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b));
+             CREATE TABLE census_child (
+                 id TEXT PRIMARY KEY,
+                 bare_id TEXT REFERENCES census_parent(id) ON DELETE CASCADE,
+                 partial_id TEXT REFERENCES census_parent(id) ON DELETE SET NULL,
+                 indexed_id TEXT REFERENCES census_parent(id) ON DELETE CASCADE,
+                 pair_a TEXT,
+                 pair_b TEXT,
+                 self_check_id TEXT REFERENCES census_child(id),
+                 self_cascade_id TEXT REFERENCES census_child(id) ON DELETE CASCADE,
+                 FOREIGN KEY (pair_a, pair_b) REFERENCES census_pair(a, b) ON DELETE CASCADE
+             );
+             CREATE INDEX idx_census_child_partial ON census_child(partial_id)
+                 WHERE partial_id IS NOT NULL;
+             CREATE INDEX idx_census_child_indexed ON census_child(indexed_id, id);
+             CREATE INDEX idx_census_child_pair ON census_child(pair_b, pair_a);
+             CREATE TABLE census_rowid_child (
+                 id INTEGER PRIMARY KEY REFERENCES census_rowid_parent(id) ON DELETE CASCADE
+             );
+             CREATE TABLE census_rowid_parent (id INTEGER PRIMARY KEY);",
+        )
+        .await
+        .unwrap();
+        let named: Vec<String> = uncovered_foreign_keys(&db)
+            .await
+            .into_iter()
+            .filter(|key| key.starts_with("census_"))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "census_child(bare_id) -> census_parent (ON DELETE CASCADE)",
+                "census_child(partial_id) -> census_parent (ON DELETE SET NULL)",
+                "census_child(self_cascade_id) -> census_child (ON DELETE CASCADE)",
+            ]
+        );
     }
 
     /// The two claims 0256 rests on.

@@ -404,23 +404,10 @@ async fn trigger_scans(db: &LocalDb, on: Option<&str>) -> Vec<Scan> {
 /// `(parent table written, child table walked, issue that owes the fix)`.
 /// The sweep reaches them because a statement that fires a trigger also fires
 /// the cascades. An entry that no longer walks fails as stale, so the list
-/// only shrinks.
-const KNOWN_CASCADE_WALKS: &[(&str, &str, &str)] = &[
-    ("issues", "action_runs", "cairn://p/cairn/5956"),
-    ("issues", "agent_waits", "cairn://p/cairn/5956"),
-    ("issues", "artifact_content", "cairn://p/cairn/5956"),
-    ("issues", "ask_conditions", "cairn://p/cairn/5956"),
-    ("issues", "attention_pushes", "cairn://p/cairn/5956"),
-    (
-        "issues",
-        "build_change_notifications",
-        "cairn://p/cairn/5956",
-    ),
-    ("issues", "condition_evaluations", "cairn://p/cairn/5956"),
-    ("issues", "jobs", "cairn://p/cairn/5956"),
-    ("issues", "provider_limit_holds", "cairn://p/cairn/5956"),
-    ("issues", "suppressed_wakes", "cairn://p/cairn/5956"),
-];
+/// only shrinks. Empty since cairn/5956 indexed every child column;
+/// `storage::migrations::tests::every_foreign_key_child_column_leads_an_index`
+/// keeps it so at schema-write time, and this sweep proves the engine seeks.
+const KNOWN_CASCADE_WALKS: &[(&str, &str, &str)] = &[];
 
 fn is_known_cascade_walk(scan: &Scan) -> bool {
     scan.finding.excerpt.starts_with("-- fk action")
