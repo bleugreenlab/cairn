@@ -844,14 +844,24 @@ async fn a_write_back_past_the_ceiling_is_refused_by_name_and_resumes_once_it_fi
         elsewhere.contains("Not included: scratch-a's writes refused by the ceiling"),
         "{elsewhere}"
     );
-    let shrunk = node
-        .shell(
-            "r-1",
-            Some(MACHINE_A),
-            "rm \"$TMPDIR/export.bin\" && echo summary > \"$TMPDIR/summary\"",
-        )
+    // Deleting the refused files alone leaves nothing to write back. The
+    // batch's start still met the refusal (the file was there then), but its
+    // result describes the scratch as it ends (cairn/5910).
+    let deleted = node
+        .shell("r-1", Some(MACHINE_A), "rm \"$TMPDIR/export.bin\"")
         .await;
-    assert!(!shrunk.contains("refused"), "{shrunk}");
+    assert!(
+        !deleted.contains("Scratch write-back refused"),
+        "a refusal of deleted files is not repeated: {deleted}"
+    );
+    assert!(
+        deleted.contains("Scratch write-back refusal cleared"),
+        "{deleted}"
+    );
+    let shrunk = node
+        .shell("r-1", Some(MACHINE_A), "echo summary > \"$TMPDIR/summary\"")
+        .await;
+    assert!(!shrunk.contains("refus"), "{shrunk}");
     assert!(shrunk.contains("wrote back"), "{shrunk}");
 }
 

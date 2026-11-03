@@ -7,10 +7,15 @@
 //! > back 1.2 MB in 0.3 s; 62.4 MB of 512 MiB.
 //!
 //! then whichever of these apply: conflicts, paths that do not travel, a
-//! refusal, a deferred bring-current, writes another machine holds that this
-//! batch could not see, and a warning once the scratch passes 80% of its
-//! ceiling. Every sentence names the machine, so an agent never has to guess
-//! where its data is.
+//! refusal, a refusal an earlier batch met that this one cleared, a deferred
+//! bring-current, writes another machine holds that this batch could not see,
+//! and a warning once the scratch passes 80% of its ceiling. Every sentence
+//! names the machine, so an agent never has to guess where its data is.
+//!
+//! A refusal is a fact about the batch that met it. Each line says what this
+//! batch's write-back did; an earlier refusal on the same machine is named
+//! only once, by the first batch that leaves nothing held back there, as
+//! cleared.
 
 use cairn_common::executor_protocol::{
     ScratchEntrySize, ScratchRefusal, ScratchSyncReport, ScratchWriteBackOutcome,
@@ -138,15 +143,18 @@ fn not_synced_text(report: &ScratchSyncReport) -> String {
 }
 
 /// Everything the run result says about the scratch, given what the executor
-/// reported and what the authority holds now. `None` when there is nothing to
-/// say: the scratch was already current, the batch changed nothing in it, and
-/// no warning applies.
+/// reported and what the authority holds now. `earlier_refusal` is the merged
+/// size the authority last recorded refusing from this machine, if that
+/// refusal still stood when the batch ended. `None` when there is nothing to
+/// say: the scratch was already current, the batch changed nothing in it, no
+/// earlier refusal cleared, and no warning applies.
 pub fn compose(
     report: &ScratchSyncReport,
     machine: &str,
     from_machine: Option<&str>,
     ceiling_bytes: u64,
     held_elsewhere: &[(String, Replica)],
+    earlier_refusal: Option<u64>,
 ) -> Option<String> {
     let mut lines = Vec::new();
     if let Some(unavailable) = &report.unavailable {
@@ -157,10 +165,18 @@ pub fn compose(
     }
     let near_ceiling = ceiling_bytes > 0
         && report.bytes.saturating_mul(100) > ceiling_bytes.saturating_mul(WARN_AT_PERCENT);
+    let refused_now = matches!(
+        report.write_back.as_ref().map(|write| &write.outcome),
+        Some(ScratchWriteBackOutcome::Refused(_))
+    );
+    // Cleared exactly when `settle` stops recording it: this batch was not
+    // refused and left nothing on the machine the head lacks.
+    let cleared = earlier_refusal.filter(|_| !refused_now && !report.dirty);
     if report.materialize.is_none()
         && report.write_back.is_none()
         && report.not_synced.is_empty()
         && held_elsewhere.is_empty()
+        && cleared.is_none()
         && !near_ceiling
     {
         return None;
@@ -219,6 +235,12 @@ pub fn compose(
             }
         }
     }
+    if let Some(refused) = cleared {
+        lines.push(format!(
+            "Scratch write-back refusal cleared: an earlier write-back from {machine} was refused at {}, past the ceiling; the scratch fits now and nothing on {machine} is held back.",
+            bytes(refused)
+        ));
+    }
     if let Some(reason) = report
         .materialize
         .as_ref()
@@ -246,12 +268,7 @@ pub fn compose(
             )),
         }
     }
-    if near_ceiling
-        && !matches!(
-            report.write_back.as_ref().map(|write| &write.outcome),
-            Some(ScratchWriteBackOutcome::Refused(_))
-        )
-    {
+    if near_ceiling && !refused_now {
         lines.push(format!(
             "Scratch is at {}% of its ceiling. Largest: {}. Trim it before a write-back is refused.",
             report.bytes.saturating_mul(100) / ceiling_bytes,
@@ -278,6 +295,13 @@ pub async fn settle(
     let known = owner::replicas(local, &scratch.id)
         .await
         .unwrap_or_default();
+    // Read before this report is recorded: a refusal this same batch met at
+    // its start (recorded as the runner refused it) counts as earlier.
+    let earlier_refusal = known
+        .iter()
+        .find(|replica| replica.executor_id == executor_id)
+        .and_then(|replica| replica.refused_bytes)
+        .filter(|_| report.unavailable.is_none());
     if report.unavailable.is_none() {
         let mine = known
             .iter()
@@ -384,6 +408,7 @@ pub async fn settle(
         from_machine.as_deref(),
         ceiling_bytes,
         &held_elsewhere,
+        earlier_refusal,
     )
 }
 
@@ -419,7 +444,7 @@ mod tests {
             not_synced: vec!["out/node_modules/".into()],
             ..ScratchSyncReport::default()
         };
-        let text = compose(&report, "fedora", Some("local"), 512 * MIB, &[]).unwrap();
+        let text = compose(&report, "fedora", Some("local"), 512 * MIB, &[], None).unwrap();
         assert!(
             text.starts_with(
                 "Scratch: brought current on fedora (+61.2 MB in 3.4 s from local); wrote back 1.2 MB in 0.3 s; 62.4 MB of 512 MiB."
@@ -456,7 +481,7 @@ mod tests {
             dirty: true,
             ..ScratchSyncReport::default()
         };
-        let text = compose(&report, "local", None, 512 * MIB, &[]).unwrap();
+        let text = compose(&report, "local", None, 512 * MIB, &[], None).unwrap();
         for named in [
             "cairn://p/rs/document",
             "3.7 GB",
@@ -494,7 +519,7 @@ mod tests {
             ],
             ..ScratchSyncReport::default()
         };
-        let text = compose(&report, "bgsrv-ub", None, 512 * MIB, &[]).unwrap();
+        let text = compose(&report, "bgsrv-ub", None, 512 * MIB, &[], None).unwrap();
         assert!(
             text.contains(
                 "present only on bgsrv-ub: `cairn-rust-tests-nextest-Urs14M/` (13.1 GB), `.venv/` (200.0 MB), `clone/`."
@@ -525,7 +550,7 @@ mod tests {
                 refused_bytes: Some(600 * MIB),
             },
         )];
-        let text = compose(&report, "fedora", None, 512 * MIB, &held).unwrap();
+        let text = compose(&report, "fedora", None, 512 * MIB, &held, None).unwrap();
         assert!(text.contains("already current on fedora"), "{text}");
         assert!(
             text.contains("Not included: bbs's writes refused by the ceiling"),
@@ -559,6 +584,7 @@ mod tests {
             None,
             512 * MIB,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -581,6 +607,7 @@ mod tests {
             None,
             512 * MIB,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -594,6 +621,7 @@ mod tests {
             None,
             512 * MIB,
             &[],
+            None,
         )
         .unwrap();
         assert!(
@@ -612,6 +640,132 @@ mod tests {
             bytes: 1_000,
             ..ScratchSyncReport::default()
         };
-        assert_eq!(compose(&report, "local", None, 512 * MIB, &[]), None);
+        assert_eq!(compose(&report, "local", None, 512 * MIB, &[], None), None);
+    }
+
+    /// The specimen of cairn/5910: a write-back refused past the ceiling, then
+    /// the oversized directory deleted. Each result says what its own batch's
+    /// write-back did, and the refusal is named once more only as cleared.
+    #[test]
+    fn a_refusal_then_a_fitting_scratch_says_refused_now_then_cleared_now() {
+        let refusal = ScratchRefusal {
+            owner_uri: "cairn://p/cairn/5878/1/builder".into(),
+            merged_bytes: 879_600_000,
+            ceiling_bytes: 512 * MIB,
+            largest: Vec::new(),
+            largest_directories: vec![ScratchEntrySize {
+                path: "cargo-installAbC123/".into(),
+                bytes: 879_600_000,
+            }],
+            oversized: Vec::new(),
+        };
+        let refused = ScratchSyncReport {
+            write_back: Some(ScratchWriteBackReport {
+                bytes: 0,
+                ms: 12,
+                outcome: ScratchWriteBackOutcome::Refused(refusal),
+            }),
+            bytes: 879_600_000,
+            dirty: true,
+            ..ScratchSyncReport::default()
+        };
+        // Refused now, with the same refusal already on record: refused, not
+        // cleared.
+        let now = compose(
+            &refused,
+            "bgsrv-win",
+            None,
+            512 * MIB,
+            &[],
+            Some(879_600_000),
+        )
+        .unwrap();
+        assert!(
+            now.contains("write-back refused; 879.6 MB of 512 MiB."),
+            "{now}"
+        );
+        assert!(now.contains("`cargo-installAbC123/`"), "{now}");
+        assert!(!now.contains("cleared"), "{now}");
+
+        // The directory deleted, nothing else written: nothing to write back.
+        let deleted = ScratchSyncReport::default();
+        let text = compose(
+            &deleted,
+            "bgsrv-win",
+            None,
+            512 * MIB,
+            &[],
+            Some(879_600_000),
+        )
+        .unwrap();
+        assert!(
+            text.starts_with(
+                "Scratch: already current on bgsrv-win; nothing to write back; 0 B of 512 MiB."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Scratch write-back refusal cleared: an earlier write-back from bgsrv-win was refused at 879.6 MB"),
+            "{text}"
+        );
+        assert!(!text.contains("Scratch write-back refused"), "{text}");
+        assert!(!text.contains("cargo-install"), "{text}");
+        assert!(!text.contains("until you delete enough"), "{text}");
+
+        // The directory deleted and a small file written: the write-back lands.
+        let landed = ScratchSyncReport {
+            write_back: Some(ScratchWriteBackReport {
+                bytes: 1_200,
+                ms: 300,
+                outcome: ScratchWriteBackOutcome::Applied {
+                    head: "a".repeat(40),
+                    conflicts: Vec::new(),
+                },
+            }),
+            bytes: 1_200,
+            ..ScratchSyncReport::default()
+        };
+        let text = compose(
+            &landed,
+            "bgsrv-win",
+            None,
+            512 * MIB,
+            &[],
+            Some(879_600_000),
+        )
+        .unwrap();
+        assert!(
+            text.contains("wrote back 1.2 KB in 0.3 s; 1.2 KB of 512 MiB."),
+            "{text}"
+        );
+        assert!(text.contains("refusal cleared"), "{text}");
+        assert!(!text.contains("Scratch write-back refused"), "{text}");
+
+        // Once cleared the record is gone, and the next result says nothing
+        // of it.
+        let after = compose(&landed, "bgsrv-win", None, 512 * MIB, &[], None).unwrap();
+        assert!(!after.contains("refus"), "{after}");
+    }
+
+    /// A write-back that failed after a refusal has not shown the scratch fits:
+    /// the writes are still held back, so nothing is called cleared.
+    #[test]
+    fn a_failed_write_back_does_not_clear_an_earlier_refusal() {
+        let report = ScratchSyncReport {
+            write_back: Some(ScratchWriteBackReport {
+                bytes: 0,
+                ms: 40,
+                outcome: ScratchWriteBackOutcome::Failed {
+                    stage: "upload".into(),
+                    detail: "scratch upload: connection reset".into(),
+                },
+            }),
+            bytes: 31_100_000,
+            dirty: true,
+            ..ScratchSyncReport::default()
+        };
+        let text = compose(&report, "fedora", None, 512 * MIB, &[], Some(600 * MIB)).unwrap();
+        assert!(text.contains("write-back failed"), "{text}");
+        assert!(!text.contains("cleared"), "{text}");
     }
 }

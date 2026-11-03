@@ -5501,6 +5501,16 @@ pub struct LearnedResourceEstimate {
 /// runner talking to an older executor gets nothing wrong: that executor runs
 /// the script it embeds, reports `Satisfied` as before, and gates nothing new.
 ///
+/// cairn/5910 does not move the number. A batch whose tree ends with nothing
+/// the head lacks no longer carries, in `ScratchSyncReport::write_back`, the
+/// refused or failed write-back its own start attempted for files it then
+/// deleted; that field already says this batch's write-back, and `None` there
+/// already meant nothing to write back. The runner's cleared-refusal sentence
+/// reads its own replica record and the existing `dirty` flag. No frame,
+/// variant or field changes, and a runner talking to an older executor gets
+/// nothing wrong: that executor still repeats the stale outcome, as before,
+/// and the runner renders it as it always has.
+///
 /// cairn/5917 does not move the number. The executor exports `SHLVL=1` into
 /// every cell command's environment, composed beside `PATH` from the
 /// executor's own facts, and drops a launch-declared `SHLVL` as it drops a
