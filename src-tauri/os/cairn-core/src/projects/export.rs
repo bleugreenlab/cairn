@@ -116,6 +116,7 @@ const EXPORT_ONLY: &[TableCopySpec] = &[
     // Shared lineage: predicates may subquery the shared tables directly.
     export_only("execution_gates", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     export_only("execution_supersessions", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
+    export_only("ask_conditions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     export_only("job_file_activity", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     export_only("job_presence", "project_id = ?1 OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     export_only("pack_catalog_backfill_attempts", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),

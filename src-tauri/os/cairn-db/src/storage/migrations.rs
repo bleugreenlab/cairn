@@ -2392,6 +2392,9 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // `held` from their presence -- so they share its scope.
     ("execution_gates", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
+    // cairn/5935: conditions on a pending ask (a deferred gated artifact). Read
+    // and written wherever the artifact they defer is, so they share its scope.
+    ("ask_conditions", TableScope::ProjectScoped),
     // cairn/5597: an execution's delegated packets, moved out of its snapshot.
     // Read and written wherever the execution is, so they share its scope.
     ("delegated_packets", TableScope::ProjectScoped),
@@ -3109,6 +3112,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "execution_gates",
         id_columns: &["id", "execution_id"],
+    },
+    RekeyTableManifest {
+        table: "ask_conditions",
+        id_columns: &["id", "ask_id", "job_id", "issue_id"],
     },
     RekeyTableManifest {
         table: "executions",

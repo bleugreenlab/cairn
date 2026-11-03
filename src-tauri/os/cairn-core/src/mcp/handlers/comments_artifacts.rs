@@ -365,7 +365,10 @@ pub(crate) async fn resolve_artifact_contract(
     let terminal_has_schema = terminal_schema.is_some();
     let (confirm_policy, validation_schema) = match ctx_self_target {
         Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
-        None => (terminal_policy, terminal_schema),
+        None => (
+            addressed_confirm_policy(artifact_name, terminal_name.as_deref(), terminal_policy),
+            terminal_schema,
+        ),
     };
 
     ResolvedArtifactContract {
@@ -374,6 +377,27 @@ pub(crate) async fn resolve_artifact_contract(
         is_ctx_self,
         terminal_name,
         terminal_has_schema,
+    }
+}
+
+/// The confirm policy for a write that is not a `context-self` living doc.
+///
+/// Only the terminal artifact is a gate: it is the one chain confirmation
+/// resolves (`confirm_latest_artifact_conn` targets the terminal name). A
+/// second name the node writes beside it takes the terminal's schema but not
+/// its `user` policy, or it would start an unconfirmed chain nothing can
+/// confirm, and every reader of "pending approval" (`execution::approvals`)
+/// relies on an unconfirmed newest version meaning the terminal one. The
+/// generic alias (no name) and an unnamed terminal contract keep the terminal
+/// policy, since there the addressed chain is the terminal one.
+fn addressed_confirm_policy(
+    artifact_name: Option<&str>,
+    terminal_name: Option<&str>,
+    terminal_policy: ConfirmPolicy,
+) -> ConfirmPolicy {
+    match (artifact_name, terminal_name) {
+        (Some(addressed), Some(terminal)) if addressed != terminal => ConfirmPolicy::Auto,
+        _ => terminal_policy,
     }
 }
 
@@ -1783,6 +1807,20 @@ mod tests {
     fn create_takes_policy() {
         assert!(!resolve_confirmed(false, None, ConfirmPolicy::User));
         assert!(resolve_confirmed(false, None, ConfirmPolicy::Auto));
+    }
+
+    #[test]
+    fn only_the_terminal_name_takes_a_user_policy() {
+        use super::addressed_confirm_policy as policy;
+        assert_eq!(policy(Some("plan"), Some("plan"), ConfirmPolicy::User), ConfirmPolicy::User);
+        assert_eq!(policy(None, Some("plan"), ConfirmPolicy::User), ConfirmPolicy::User);
+        assert_eq!(policy(Some("plan"), None, ConfirmPolicy::User), ConfirmPolicy::User);
+        assert_eq!(
+            policy(Some("notes"), Some("plan"), ConfirmPolicy::User),
+            ConfirmPolicy::Auto,
+            "a second chain beside the terminal is never a gate"
+        );
+        assert_eq!(policy(Some("notes"), Some("plan"), ConfirmPolicy::Auto), ConfirmPolicy::Auto);
     }
 
     #[test]

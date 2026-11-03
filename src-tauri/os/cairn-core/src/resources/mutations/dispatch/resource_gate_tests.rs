@@ -247,6 +247,19 @@ fn gate_rejects_escalate_on_a_channel_that_ignores_it() {
     assert!(failure.error.contains("`escalate`"), "{}", failure.error);
 }
 
+/// Deferring a gated artifact has to reach dispatch.
+#[test]
+fn gate_accepts_a_deferral_on_a_node_artifact() {
+    let it = item(
+        "cairn://p/cairn/1/1/planner/plan",
+        ChangeMode::Patch,
+        Some(serde_json::json!({
+            "defer": {"until": [{"fact": "issue_resolution", "issue": "cairn://p/cairn/2", "resolution": "merged"}]}
+        })),
+    );
+    assert!(gate(&it).is_ok(), "defer must gate in");
+}
+
 /// A declared alias is a promise: widening a key by alias would be worthless if
 /// the gate then refused the spelling it was widened for.
 #[test]

@@ -469,6 +469,99 @@ async fn a_blocked_review_opens_and_leaves_when_confirmed() {
     assert!(open_keys(&entries(&db).await).is_empty());
 }
 
+/// A planner stored `running` while its plan waits (as cairn/4527's was) is
+/// still awaiting review. Past a week undeferred it reads stale, and the list
+/// says when that happens so the cache rebuilds then.
+#[tokio::test]
+async fn a_running_job_with_a_pending_plan_awaits_review_and_turns_stale() {
+    let db = fixture().await;
+    let written = NOW - 3 * 86_400;
+    exec(
+        &db,
+        &format!(
+            "INSERT INTO artifacts (id, job_id, artifact_type, data, output_name, created_at,
+                                    updated_at, confirmed)
+             VALUES ('a1', 'j1', 'plan', '{{}}', 'plan', {written}, {written}, 0)"
+        ),
+    )
+    .await;
+
+    let snapshot = derive_snapshot(&db, &HoldRegistry::default(), "p", NOW, &HashMap::new())
+        .await
+        .unwrap();
+    let review = find(&snapshot.entries, "review:a1");
+    assert!(review.is_open());
+    assert_eq!(
+        review.at, written,
+        "the entry's time is the age of the wait"
+    );
+    assert!(!review.stale);
+    assert_eq!(review.deferred_until, None);
+    let stale_from = written + crate::execution::approvals::STALE_AFTER_SECS + 1;
+    assert_eq!(snapshot.next_change_at, Some(stale_from));
+
+    let later = derive_snapshot(
+        &db,
+        &HoldRegistry::default(),
+        "p",
+        stale_from,
+        &HashMap::new(),
+    )
+    .await
+    .unwrap();
+    let review = find(&later.entries, "review:a1");
+    assert!(review.stale);
+    let wire = serde_json::to_value(review).unwrap();
+    assert_eq!(wire["stale"], serde_json::json!(true));
+    assert!(
+        wire.get("deferredUntil").is_none(),
+        "absent while undeferred"
+    );
+}
+
+/// A deferred review stays listed, marked with its cause and never stale.
+/// Once the deferral fires it is a new occurrence: an earlier dismissal does
+/// not hide it.
+#[tokio::test]
+async fn a_deferred_review_is_marked_and_resurfaces_as_a_new_occurrence() {
+    let db = fixture().await;
+    exec(
+        &db,
+        "INSERT INTO artifacts (id, job_id, artifact_type, data, output_name, created_at,
+                                updated_at, confirmed)
+         VALUES ('a1', 'j1', 'plan', '{}', 'plan', 1, 1, 0)",
+    )
+    .await;
+    exec(
+        &db,
+        r#"INSERT INTO ask_conditions (id, ask_kind, ask_id, job_id, issue_id, effect, until_json, created_at)
+           VALUES ('c1', 'artifact', 'a1', 'j1', 'i7', 'resurface',
+                   '[{"fact":"issue_resolution","issue":"cairn://p/cairn/4526","resolution":"merged"}]', 2)"#,
+    )
+    .await;
+    let listed = entries(&db).await;
+    let review = find(&listed, "review:a1");
+    assert!(review.is_open(), "deferred, not hidden");
+    assert_eq!(
+        review.deferred_until.as_deref(),
+        Some("issue cairn://p/cairn/4526 merged")
+    );
+    assert!(!review.stale, "a deferral is its own explanation");
+
+    let dismissals = HashMap::from([("review:a1".to_string(), 3)]);
+    let listed = entries_with(&db, &HoldRegistry::default(), &dismissals).await;
+    assert!(open_keys(&listed).is_empty(), "dismissed while deferred");
+
+    exec(
+        &db,
+        "UPDATE ask_conditions SET fired_at = 4, fired_kind = 'satisfied', delivered_at = 4 WHERE id = 'c1'",
+    )
+    .await;
+    let listed = entries_with(&db, &HoldRegistry::default(), &dismissals).await;
+    assert_eq!(open_keys(&listed), vec!["review:a1:c1".to_string()]);
+    assert_eq!(find(&listed, "review:a1:c1").deferred_until, None);
+}
+
 /// The center lists only what waits on the operator. A thread's unread replies
 /// are the sidebar's badge, and a red check on a PR's node is its agent's to
 /// fix; neither is an entry.
@@ -639,6 +732,8 @@ fn the_wire_shape_is_camel_case_with_snake_case_kinds() {
             action_run_id: "j1".into(),
             merge_method: "squash".into(),
         }),
+        deferred_until: None,
+        stale: false,
     };
     assert_eq!(
         serde_json::to_value(&entry).unwrap(),

@@ -267,6 +267,11 @@ pub(crate) const CONFIRMED: KeySpec = KeySpec::new(
     KeyType::Bool,
     "set true to confirm a gated artifact and advance the DAG; omit to edit data",
 );
+pub(crate) const DEFER: KeySpec = KeySpec::new(
+    "defer",
+    KeyType::Object,
+    "{until:[gate clause, ...]} — defer a gated artifact pending on you until every clause holds, in the `after:` vocabulary (issue_resolution, pr_state, artifact_confirmed, check_verdict, clock, tenet_verdict); you are woken once when it comes true or can no longer come true. Deferring again replaces the last deferral (mutually exclusive with confirmed and action)",
+);
 pub(crate) const PR_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,

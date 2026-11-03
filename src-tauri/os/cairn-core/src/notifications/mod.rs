@@ -139,6 +139,14 @@ pub struct OperatorNotification {
     /// Unix seconds of the resolution or dismissal; `None` while open.
     pub state_at: Option<i64>,
     pub action: Option<NotificationAction>,
+    /// An awaiting-review entry the operator deferred: what it waits on, as
+    /// the held-execution census renders a gate. Shown, never hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred_until: Option<String>,
+    /// An awaiting-review entry pending past a week with no deferral. A mark,
+    /// never a wake.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 impl OperatorNotification {

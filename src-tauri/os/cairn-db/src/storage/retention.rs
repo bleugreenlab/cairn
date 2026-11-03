@@ -373,6 +373,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     owned("thread_compactions", "jobs"),
     owned("thread_era_children", "jobs"),
     owned("thread_eras", "jobs"),
+    owned("ask_conditions", "jobs"),
     owned("repl_exchanges", "job_repls"),
     owned("codex_watchdog_leases", "sessions"),
     owned("permission_requests", "runs"),

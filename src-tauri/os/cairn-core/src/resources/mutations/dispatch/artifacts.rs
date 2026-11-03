@@ -51,12 +51,46 @@ pub(super) async fn dispatch(
                 )
             })?;
             let artifact_label = name.as_deref().unwrap_or("artifact");
-            // A `patch` carrying the reserved `confirmed` key resolves the user
-            // gate (confirm the latest artifact + advance the DAG) instead of
-            // editing artifact data. `confirmed` is a column, never a real
-            // artifact schema field, so treating it as reserved can't collide
-            // with a data edit.
-            if matches!(mode, ChangeMode::Patch) && payload.get("action").is_some() {
+            // A `patch` carrying the reserved `defer` key sets a pending gate
+            // aside until a cause comes true, instead of editing artifact data.
+            if matches!(mode, ChangeMode::Patch) && payload.get("defer").is_some() {
+                let until = crate::execution::gates::ask_conditions::defer_until(payload)
+                    .map_err(|error| build_failure(index, item, error))?;
+                let job_id = crate::resources::resolve_node_or_task_job_id(
+                    &orch.db.local,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                    None,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                let db = orch.db.for_project(project).await;
+                let created_by = if request
+                    .payload
+                    .get("_cairn_origin")
+                    .and_then(|v| v.as_str())
+                    == Some("cli")
+                {
+                    Some("operator".to_string())
+                } else {
+                    crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+                        .await
+                        .ok()
+                };
+                crate::execution::gates::ask_conditions::defer(
+                    orch,
+                    &db,
+                    &job_id,
+                    name.as_deref(),
+                    until,
+                    created_by,
+                    dry_run,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
+            } else if matches!(mode, ChangeMode::Patch) && payload.get("action").is_some() {
                 // A `patch` carrying the reserved `action` key operates on the
                 // PR that this artifact's job produced (merge/close/refresh),
                 // rather than editing artifact data. PR-ness is detected at
@@ -188,6 +222,11 @@ pub(super) async fn dispatch(
                     }
                 }
             } else if matches!(mode, ChangeMode::Patch) && payload.get("confirmed").is_some() {
+                // A `patch` carrying the reserved `confirmed` key resolves the
+                // user gate (confirm the latest artifact + advance the DAG)
+                // instead of editing artifact data. `confirmed` is a column,
+                // never a real artifact schema field, so treating it as
+                // reserved can't collide with a data edit.
                 let confirmed = payload
                     .get("confirmed")
                     .and_then(|value| value.as_bool())

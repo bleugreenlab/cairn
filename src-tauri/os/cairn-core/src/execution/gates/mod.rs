@@ -6,6 +6,7 @@
 
 #[cfg(test)]
 mod admission_tests;
+pub mod ask_conditions;
 pub mod authoring;
 pub mod capacity;
 pub mod census;

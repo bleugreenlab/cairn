@@ -2570,13 +2570,26 @@ fn render_gated_artifact_actions(
     number: i32,
     exec_seq: i32,
     node_name: &str,
+    deferral: Option<&crate::execution::approvals::OpenDeferral>,
 ) -> String {
     let messages_uri = format!(
         "cairn://p/{}/{}/{}/{}/messages",
         project_key, number, exec_seq, node_name
     );
+    let deferred = deferral
+        .map(|deferral| {
+            let since = chrono::DateTime::from_timestamp(deferral.created_at, 0)
+                .map(|at| at.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| deferral.created_at.to_string());
+            format!(
+                "\n\n_Deferred until {} since {since}._",
+                deferral.until_rendered
+            )
+        })
+        .unwrap_or_default();
+    let facts = crate::execution::gates::ask_conditions::deferrable_facts().join(", ");
     format!(
-        "{body}\n\n## actions\n- [confirm]({artifact_uri}): patch with confirmed:true to approve this gated artifact and advance the DAG. e.g. write({{changes:[{{target:\"{artifact_uri}\",mode:\"patch\",payload:{{confirmed:true}}}}]}})\n- [continue]({messages_uri}): append a message to the producing node; it resumes with your feedback and revises (re-blocking on a new version). e.g. write({{changes:[{{target:\"{messages_uri}\",mode:\"append\",payload:{{content:\"...\"}}}}]}})"
+        "{body}{deferred}\n\n## actions\n- [confirm]({artifact_uri}): patch with confirmed:true to approve this gated artifact and advance the DAG. e.g. write({{changes:[{{target:\"{artifact_uri}\",mode:\"patch\",payload:{{confirmed:true}}}}]}})\n- [defer]({artifact_uri}): patch with defer:{{until:[...]}} to set it aside until a cause comes true, in the `after:` gate vocabulary ({facts}); you are woken once when every clause holds or one can never hold, and deferring again replaces the last deferral. e.g. write({{changes:[{{target:\"{artifact_uri}\",mode:\"patch\",payload:{{defer:{{until:[{{fact:\"issue_resolution\",issue:\"cairn://p/PROJECT/N\",resolution:\"merged\"}}]}}}}}}]}})\n- [continue]({messages_uri}): append a message to the producing node; it resumes with your feedback and revises (re-blocking on a new version). e.g. write({{changes:[{{target:\"{messages_uri}\",mode:\"append\",payload:{{content:\"...\"}}}}]}})"
     )
 }
 
@@ -2673,22 +2686,40 @@ pub(super) async fn read_node_artifact(
     let artifact_uri =
         build_node_artifact_uri_named(project_key, number, exec_seq, node_name, resolved_name);
 
-    // While the producing job is blocked, this artifact is a user gate awaiting
-    // a human (or external driver). The `confirmed` flag can't be plumbed into
-    // the read here, but `blocked` is the precise "gate open" signal — surface
-    // how to resolve it via `write`. This block is stateful, so it lives here
-    // rather than in the contract-derived `affordance_for_kind`.
-    let mut output = if job.status == "blocked" {
-        render_gated_artifact_actions(
+    // While this exact version waits on its approver, surface how to resolve
+    // it via `write`. Keyed on the one pending-approval definition, not on
+    // `blocked`: a planner whose plan waits can be stored `running`. This
+    // block is stateful, so it lives here rather than in the contract-derived
+    // `affordance_for_kind`.
+    let pending = crate::execution::approvals::pending_approvals(
+        db,
+        crate::execution::approvals::ApprovalScope::Jobs(vec![job.id.clone()]),
+    )
+    .await
+    .ok()
+    .and_then(|approvals| approvals.into_iter().next())
+    // The pending version is the newest of its chain, and a read shows a
+    // chain's newest, so the chain's name identifies it. An unnamed checkpoint
+    // chain is the only artifact its job has.
+    .filter(|approval| {
+        artifact.as_ref().is_some_and(|shown| {
+            approval
+                .output_name
+                .as_deref()
+                .is_none_or(|name| shown.schema_name() == Some(name))
+        })
+    });
+    let mut output = match pending {
+        Some(approval) => render_gated_artifact_actions(
             &body,
             &artifact_uri,
             project_key,
             number,
             exec_seq,
             node_name,
-        )
-    } else {
-        body
+            approval.deferral.as_ref(),
+        ),
+        None => body,
     };
 
     // If this artifact's job owns a PR (merge_requests row), append the live PR
@@ -3794,11 +3825,67 @@ mod gated_artifact_tests {
             2160,
             1,
             "planner",
+            None,
         );
 
         assert!(output.contains("[continue](cairn://p/cairn/2160/1/planner/messages)"));
         assert!(output.contains("target:\"cairn://p/cairn/2160/1/planner/messages\""));
         assert!(!output.contains("target:\"cairn://p/cairn/2160/1/planner\""));
+    }
+
+    #[test]
+    fn gated_artifact_actions_offer_defer_with_a_copy_paste_example() {
+        let output = render_gated_artifact_actions(
+            "body",
+            "cairn://p/cairn/2160/1/planner/plan",
+            "cairn",
+            2160,
+            1,
+            "planner",
+            None,
+        );
+        assert!(
+            output.contains("- [defer](cairn://p/cairn/2160/1/planner/plan)"),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "write({changes:[{target:\"cairn://p/cairn/2160/1/planner/plan\",mode:\"patch\",payload:{defer:{until:[{fact:\"issue_resolution\",issue:\"cairn://p/PROJECT/N\",resolution:\"merged\"}]}}}]})"
+            ),
+            "{output}"
+        );
+        for fact in [
+            "issue_resolution",
+            "pr_state",
+            "artifact_confirmed",
+            "clock",
+        ] {
+            assert!(output.contains(fact), "{fact}: {output}");
+        }
+        assert!(!output.contains("Deferred until"));
+    }
+
+    #[test]
+    fn an_open_deferral_is_shown_with_its_cause() {
+        let deferral = crate::execution::approvals::OpenDeferral {
+            condition_id: "c".into(),
+            until: Vec::new(),
+            until_rendered: "issue cairn://p/cairn/4526 merged".into(),
+            created_at: 1_786_000_000,
+        };
+        let output = render_gated_artifact_actions(
+            "body",
+            "cairn://p/cairn/4527/1/planner/plan",
+            "cairn",
+            4527,
+            1,
+            "planner",
+            Some(&deferral),
+        );
+        assert!(
+            output.contains("_Deferred until issue cairn://p/cairn/4526 merged since 2026-08-06._"),
+            "{output}"
+        );
     }
 }
 

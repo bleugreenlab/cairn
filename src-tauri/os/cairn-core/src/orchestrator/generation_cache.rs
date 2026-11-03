@@ -224,6 +224,7 @@ const OPERATOR_NOTIFICATION_INPUT_TABLES: &[&str] = &[
     "issues",
     "executions",
     "artifacts",
+    "ask_conditions",
     "action_runs",
     "threads",
     crate::notifications::DISMISSALS_TABLE,

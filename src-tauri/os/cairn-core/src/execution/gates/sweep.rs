@@ -173,6 +173,8 @@ pub struct SweepReport {
     /// Authored gates resolved this pass, by fact and outcome (`satisfied`,
     /// `refuted`, `no_evidence`, `foreclosed`).
     pub clauses: BTreeMap<(String, &'static str), usize>,
+    /// What the pass did with conditions on pending asks.
+    pub asks: super::ask_conditions::AskSweepReport,
 }
 
 /// Evaluate every held execution in every open database, as of now.
@@ -274,6 +276,9 @@ pub(crate) async fn sweep_with(
     // A released or superseded execution is no longer listed held, so its
     // stamp goes with this pass.
     orch.sweep_pulse.retain_evaluated(&held_ids);
+    // Conditions on pending asks (deferred approvals) resolve through the same
+    // vocabulary in the same pass; there is no second sweeper.
+    report.asks = super::ask_conditions::sweep_ask_conditions(orch, vocabulary, now).await;
     Ok(report)
 }
 
@@ -1097,13 +1102,85 @@ async fn latch_foreclosure(
 /// The id of a gate's foreclosure message: a UUID derived from the gate, so the
 /// message row itself records that the wake was delivered.
 fn foreclosure_message_id(gate_id: &str) -> String {
+    wake_message_id("gate-foreclosure", gate_id)
+}
+
+// ---------------------------------------------------------------------------
+// Exactly-once wakes, shared by gate foreclosure and ask conditions
+// ---------------------------------------------------------------------------
+
+/// A wake's message id: a UUID derived from `{domain}:{id}`, so the message
+/// row itself is the record that the wake was delivered. The push that
+/// carries it is not: dismissing a pending notification deletes the push and
+/// must not re-arm the wake.
+pub(crate) fn wake_message_id(domain: &str, id: &str) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("gate-foreclosure:{gate_id}").as_bytes());
+    let digest = Sha256::digest(format!("{domain}:{id}").as_bytes());
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     uuid::Builder::from_custom_bytes(bytes)
         .into_uuid()
         .to_string()
+}
+
+/// Whether the wake with this message id was already delivered. Check it in
+/// the same transaction as [`send_wake_conn`].
+pub(crate) async fn wake_already_sent_conn(
+    conn: &cairn_db::turso::Connection,
+    message_id: &str,
+) -> DbResult<bool> {
+    Ok(crate::storage::query_opt_text_conn(
+        conn,
+        "SELECT id FROM messages WHERE id = ?1",
+        params![message_id],
+    )
+    .await?
+    .is_some())
+}
+
+/// The run a wake to `recipient` addresses: its newest. `None` while the
+/// recipient has never run, which leaves the wake owed.
+pub(crate) async fn recipient_run_conn(
+    conn: &cairn_db::turso::Connection,
+    recipient: &str,
+) -> DbResult<Option<String>> {
+    crate::storage::query_opt_text_conn(
+        conn,
+        "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+        params![recipient],
+    )
+    .await
+}
+
+/// Insert the wake's message and its steering push.
+pub(crate) async fn send_wake_conn(
+    conn: &cairn_db::turso::Connection,
+    recipient: &str,
+    recipient_run: &str,
+    content: &str,
+    push_key: &str,
+    message_id: &str,
+) -> DbResult<()> {
+    cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
+        conn,
+        recipient,
+        recipient_run,
+        content,
+        DeliveryUrgency::Steer,
+        Some(push_key),
+        message_id,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// After the wake's transaction commits: nudge its recipient to take it.
+pub(crate) fn nudge_woken(orch: &Orchestrator, recipient: &str, what: &str) {
+    if let Err(error) =
+        crate::messages::delivery::nudge_job_for_urgency(orch, recipient, DeliveryUrgency::Steer)
+    {
+        log::warn!("{what} wake for {recipient} is queued but the nudge failed: {error}");
+    }
 }
 
 /// Wake whoever owns a foreclosed gate's judgment, unless that wake was
@@ -1157,14 +1234,7 @@ async fn deliver_foreclosure(
             Box::pin(async move {
                 let push_key = format!("gate:{gate_id}");
                 let message_id = foreclosure_message_id(&gate_id);
-                if crate::storage::query_opt_text_conn(
-                    conn,
-                    "SELECT id FROM messages WHERE id = ?1",
-                    params![message_id.as_str()],
-                )
-                .await?
-                .is_some()
-                {
+                if wake_already_sent_conn(conn, &message_id).await? {
                     return Ok(None);
                 }
                 let Some(issue_id) = execution.issue_id.as_deref() else {
@@ -1190,13 +1260,7 @@ async fn deliver_foreclosure(
                     }
                     return Ok(None);
                 };
-                let Some(recipient_run) = crate::storage::query_opt_text_conn(
-                    conn,
-                    "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
-                    params![recipient.as_str()],
-                )
-                .await?
-                else {
+                let Some(recipient_run) = recipient_run_conn(conn, &recipient).await? else {
                     if latched_now {
                         log::warn!(
                             "gate {gate_id} foreclosed, but its recipient has no run to address yet; the wake stays owed"
@@ -1214,13 +1278,12 @@ async fn deliver_foreclosure(
                     tenet_clause.as_ref(),
                 )
                 .await?;
-                cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
+                send_wake_conn(
                     conn,
                     &recipient,
                     &recipient_run,
                     &content,
-                    DeliveryUrgency::Steer,
-                    Some(&push_key),
+                    &push_key,
                     &message_id,
                 )
                 .await?;
@@ -1231,13 +1294,7 @@ async fn deliver_foreclosure(
         .map_err(|error| format!("failed to deliver gate foreclosure: {error}"))?;
 
     if let Some(recipient) = delivered {
-        if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
-            orch,
-            &recipient,
-            DeliveryUrgency::Steer,
-        ) {
-            log::warn!("gate foreclosure for {recipient} is queued but the nudge failed: {error}");
-        }
+        nudge_woken(orch, &recipient, "gate foreclosure");
     }
     Ok(())
 }
@@ -1374,7 +1431,14 @@ pub async fn next_gate_due_after(orch: &Orchestrator, now: i64) -> Option<i64> {
             }
         }
     }
-    soonest
+    // A `clock` deferral on a pending approval is due on the same bound.
+    match (
+        soonest,
+        super::ask_conditions::next_condition_due_after(orch, now).await,
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 #[cfg(test)]

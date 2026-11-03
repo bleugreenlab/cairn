@@ -1894,6 +1894,50 @@ struct ChildStatus {
     /// is not something the child waits on, so it earns no `held` marker and
     /// does not keep a failed child live.
     wont_start: Vec<String>,
+    /// Gated artifacts waiting on their approver (`execution::approvals`).
+    approvals: Vec<CensusApproval>,
+}
+
+/// One gated artifact a child's node waits on its approver for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CensusApproval {
+    /// The node it holds, as the node facet names it.
+    node: String,
+    /// What waits: `plan`, `create-pr`.
+    what: String,
+    /// `None` when the reader approves it. The census lists a thread's own
+    /// children, and a thread-parented child's gate routes to that thread's
+    /// session, so the reader is the approver unless the child also has a
+    /// parent issue, whose coordinator approves it instead (named by its
+    /// short reference). An operator approver cannot occur for a live reader.
+    approver: Option<String>,
+    artifact_uri: String,
+    pending_since: i64,
+    /// The open deferral's clauses, rendered as a held gate's are.
+    deferred_until: Option<String>,
+}
+
+impl CensusApproval {
+    fn who(&self) -> &str {
+        self.approver.as_deref().unwrap_or("you")
+    }
+
+    /// `plan awaiting you · 3d 2h`, `plan awaiting you · deferred until issue
+    /// … merged · 72d`, `plan awaiting you · 12d · stale`. The age uses the
+    /// same formatter as `active … ago`; `stale` is factual and last, and never
+    /// on a deferred gate, whose cause is its explanation.
+    fn facet(&self, now: i64) -> String {
+        let waited = now.saturating_sub(self.pending_since).max(0);
+        let age = crate::clock::format_elapsed(waited);
+        let head = format!("{} awaiting {}", self.what, self.who());
+        match &self.deferred_until {
+            Some(until) => format!("{head} · deferred until {until} · {age}"),
+            None if waited > crate::execution::approvals::STALE_AFTER_SECS => {
+                format!("{head} · {age} · stale")
+            }
+            None => format!("{head} · {age}"),
+        }
+    }
 }
 
 /// Statuses that end an issue. A child in one of these is history: its turns may
@@ -1917,8 +1961,15 @@ impl ChildStatus {
         // The held marker rides on the address line, not the detail block, so
         // a collapsed census that drops detail still says a child is held.
         let held = if self.held.is_empty() { "" } else { " · held" };
+        // An approval waiting on the reader is the same kind of fact as held,
+        // and rides the address line for the same reason.
+        let awaiting = self
+            .approvals
+            .first()
+            .map(|approval| format!(" · awaiting {}", approval.who()))
+            .unwrap_or_default();
         format!(
-            "- `{}` **{}**{held} · {}\n",
+            "- `{}` **{}**{held}{awaiting} · {}\n",
             self.uri,
             self.status,
             one_line(&self.title)
@@ -1935,7 +1986,16 @@ impl ChildStatus {
             facets.push(
                 self.nodes
                     .iter()
-                    .map(|(name, status)| format!("{name} {}", job_status_icon(status)))
+                    .map(|(name, status)| {
+                        // A node whose gated artifact waits is not running,
+                        // whatever its job row says: it gets its own glyph.
+                        let icon = if self.approvals.iter().any(|a| a.node == *name) {
+                            "⏸"
+                        } else {
+                            job_status_icon(status)
+                        };
+                        format!("{name} {icon}")
+                    })
                     .collect::<Vec<_>>()
                     .join(" "),
             );
@@ -1945,6 +2005,10 @@ impl ChildStatus {
         }
         if let Some(checks) = self.check_summary() {
             facets.push(checks);
+        }
+        // Blocked on the user: approvals first, then questions.
+        for approval in &self.approvals {
+            facets.push(approval.facet(now));
         }
         match self.unanswered_questions {
             0 => {}
@@ -2014,6 +2078,11 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
             if !detail.is_empty() {
                 out.push_str(&format!("  {detail}\n"));
             }
+            // The one census facet that is an action for the reader: the
+            // address to confirm, so approving is a copy rather than a read.
+            for approval in child.approvals.iter().filter(|a| a.approver.is_none()) {
+                out.push_str(&format!("  confirm {}\n", approval.artifact_uri));
+            }
             for line in child.held.iter().chain(&child.wont_start) {
                 out.push_str(&format!("  {line}\n"));
             }
@@ -2044,12 +2113,18 @@ async fn load_children(
 ) -> Result<Vec<ChildStatus>, String> {
     let mut children: Vec<ChildStatus> = Vec::new();
     let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // A child that also has a parent issue is approved by that issue's
+    // coordinator, not by the reading thread.
+    let mut approvers: HashMap<String, String> = HashMap::new();
 
     let mut rows = conn
         .query(
-            "SELECT child.id, p.key, child.number, child.title, child.status
+            "SELECT child.id, p.key, child.number, child.title, child.status,
+                    parent_project.key, parent.number
              FROM issues child
              JOIN projects p ON p.id = child.project_id
+             LEFT JOIN issues parent ON parent.id = child.parent_issue_id
+             LEFT JOIN projects parent_project ON parent_project.id = parent.project_id
              WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
              ORDER BY child.number ASC",
             params![job_id],
@@ -2060,6 +2135,11 @@ async fn load_children(
         let id = row.text(0).map_err(|error| error.to_string())?;
         let key = row.text(1).map_err(|error| error.to_string())?;
         let number = row.i64(2).map_err(|error| error.to_string())? as i32;
+        let parent_key = row.opt_text(5).map_err(|error| error.to_string())?;
+        let parent_number = row.opt_i64(6).map_err(|error| error.to_string())?;
+        if let (Some(key), Some(number)) = (parent_key, parent_number) {
+            approvers.insert(id.clone(), format!("{key}/{number}"));
+        }
         at.insert(id, children.len());
         children.push(ChildStatus {
             uri: cairn_common::uri::build_issue_uri(&key, number),
@@ -2072,6 +2152,7 @@ async fn load_children(
             last_activity_at: None,
             held: Vec::new(),
             wont_start: Vec::new(),
+            approvals: Vec::new(),
         });
     }
     if children.is_empty() {
@@ -2100,6 +2181,31 @@ async fn load_children(
                 .into_iter()
                 .map(|held| held.line)
                 .collect();
+        }
+    }
+
+    // Gated artifacts waiting on their approver: one keyed read, index-only on
+    // artifacts. Best-effort like the facets below.
+    if let Ok(approvals) = crate::execution::approvals::pending_approvals_conn(
+        conn,
+        &crate::execution::approvals::ApprovalScope::Issues(child_ids.clone()),
+    )
+    .await
+    {
+        for approval in approvals {
+            if let Some(child) = at
+                .get(&approval.issue_id)
+                .map(|index| &mut children[*index])
+            {
+                child.approvals.push(CensusApproval {
+                    node: approval.node_name.clone(),
+                    what: approval.what().to_string(),
+                    approver: approvers.get(&approval.issue_id).cloned(),
+                    artifact_uri: approval.artifact_uri.clone(),
+                    pending_since: approval.pending_since,
+                    deferred_until: approval.deferral.map(|deferral| deferral.until_rendered),
+                });
+            }
         }
     }
 
@@ -3129,6 +3235,112 @@ mod tests {
                 "- `cairn://p/prj/500` **failed** · held · Retry once green\n  exec 2 — {HELD_SUMMARY}\n"
             )),
             "the failed+held child lost its census: {}",
+            seed.content
+        );
+    }
+
+    /// A child whose planner waits on the reader to confirm its plan, its job
+    /// stored `running` as cairn/4527's was. The plan was written `age` seconds
+    /// before `now`; with `deferred_until` the reader deferred it on issue 22.
+    async fn child_with_pending_plan(db: &LocalDb, now: i64, age: i64, deferred: bool) {
+        let written = now - age;
+        db.execute_script(&format!(
+            "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+               VALUES ('i-plan','p',23,'Plan the backoff','active','none',1,1,'t-thread');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-plan','plan','i-plan','p','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('job-planner','e-plan','i-plan','p','running','planner','Planner',1,1);
+             INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, confirmed, created_at, updated_at)
+               VALUES ('a-plan','job-planner','plan','{{}}',1,'plan',0,{written},{written});"
+        ))
+        .await
+        .unwrap();
+        if deferred {
+            db.execute(
+                r#"INSERT INTO ask_conditions (id, ask_kind, ask_id, job_id, issue_id, effect, until_json, created_at)
+                   VALUES ('c-plan', 'artifact', 'a-plan', 'job-planner', 'i-plan', 'resurface',
+                           '[{"fact":"issue_resolution","issue":"cairn://p/prj/22","resolution":"merged"}]', ?1)"#,
+                (written,),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    const DAY: i64 = 86_400;
+
+    #[tokio::test]
+    async fn the_census_marks_a_childs_plan_awaiting_the_reader() {
+        let db = thread_fixture("thread-seed-awaiting.db").await;
+        let now = NOW + 100 * DAY;
+        child_with_pending_plan(&db, now, 3 * DAY + 2 * 3600 + 5 * 60, false).await;
+        let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+        assert!(
+            seed.content.contains(
+                "- `cairn://p/prj/23` **active** · awaiting you · Plan the backoff\n  \
+                 Planner ⏸ · plan awaiting you · 3d 2h 5m\n  \
+                 confirm cairn://p/prj/23/1/planner/plan\n"
+            ),
+            "the pending child's census is wrong: {}",
+            seed.content
+        );
+        assert!(!seed.content.contains("Planner ◐"), "{}", seed.content);
+    }
+
+    #[tokio::test]
+    async fn an_undeferred_approval_older_than_a_week_reads_stale() {
+        let db = thread_fixture("thread-seed-stale.db").await;
+        let now = NOW + 100 * DAY;
+        child_with_pending_plan(&db, now, 12 * DAY + 3 * 3600 + 5 * 60, false).await;
+        let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+        assert!(
+            seed.content
+                .contains("  Planner ⏸ · plan awaiting you · 12d 3h 5m · stale\n"),
+            "{}",
+            seed.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_approval_reads_like_held_and_is_never_stale() {
+        let db = thread_fixture("thread-seed-deferred.db").await;
+        let now = NOW + 100 * DAY;
+        child_with_pending_plan(&db, now, 72 * DAY, true).await;
+        let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+        assert!(
+            seed.content.contains(
+                "  Planner ⏸ · plan awaiting you · deferred until issue cairn://p/prj/22 merged · 72d\n"
+            ),
+            "{}",
+            seed.content
+        );
+        assert!(!seed.content.contains("stale"), "{}", seed.content);
+    }
+
+    /// A thread child that also has a parent issue is approved by that issue's
+    /// coordinator: the census names it, and offers the reader no confirm line.
+    #[tokio::test]
+    async fn an_approval_owed_to_a_parent_issue_names_it() {
+        let db = thread_fixture("thread-seed-parent-approver.db").await;
+        let now = NOW + 100 * DAY;
+        child_with_pending_plan(&db, now, 3600, false).await;
+        db.execute(
+            "UPDATE issues SET parent_issue_id = 'i-open' WHERE id = 'i-plan'",
+            (),
+        )
+        .await
+        .unwrap();
+        let seed = compose_thread_seed(&db, THREAD_JOB, now).await.unwrap();
+        assert!(
+            seed.content
+                .contains("- `cairn://p/prj/23` **active** · awaiting prj/21 · Plan the backoff\n  Planner ⏸ · plan awaiting prj/21 · 1h\n"),
+            "{}",
+            seed.content
+        );
+        assert!(
+            !seed.content.contains("confirm cairn://p/prj/23"),
+            "{}",
             seed.content
         );
     }

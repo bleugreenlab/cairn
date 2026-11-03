@@ -14,6 +14,7 @@
 pub mod accumulator;
 pub mod actions;
 pub mod advancement;
+pub mod approvals;
 pub mod artifact_revisions;
 pub mod branch_target;
 pub mod cache;

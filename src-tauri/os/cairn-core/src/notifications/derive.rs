@@ -173,6 +173,8 @@ fn entry(
         state_at: resolved_at,
         // A resolved entry has nothing left to act on.
         action: if open { action } else { None },
+        deferred_until: None,
+        stale: false,
     }
 }
 
@@ -229,9 +231,14 @@ pub(super) async fn from_sources(
     entries.extend(permissions(db, project, since).await?);
     entries.extend(tenets(db, project, since).await?);
     entries.extend(pull_requests(db, project, since).await?);
-    let (failures, next_change_at) = agent_failures(db, project, since, now).await?;
+    let (failures, failures_settle_at) = agent_failures(db, project, since, now).await?;
     entries.extend(failures);
-    entries.extend(awaiting_review(db, project).await?);
+    let (reviews, stale_at) = awaiting_review(db, project, now).await?;
+    entries.extend(reviews);
+    let next_change_at = match (failures_settle_at, stale_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     Ok((entries, next_change_at))
 }
 
@@ -651,51 +658,61 @@ pub(super) async fn agent_failures(
     Ok((entries, settles_at))
 }
 
-/// A node blocked on the operator's review of an artifact that is not a PR
-/// (PRs are [`pull_requests`]). Open only: the confirmation that clears it
-/// records no time of its own, so once reviewed the entry leaves the list.
+/// A gated artifact awaiting review that is not a PR (PRs are
+/// [`pull_requests`]), read through the one definition of a pending approval
+/// (`execution::approvals`), so a planner stored `running` while its plan
+/// waits is listed too. Open only: the confirmation that clears it records no
+/// time of its own, so once reviewed the entry leaves the list.
+///
+/// A deferred entry stays listed, marked with what it waits on; one undeferred
+/// past a week is marked stale. Neither sends anything. Once a deferral on the
+/// pending version has fired, the entry is keyed by that deferral too, so it
+/// re-surfaces as a new occurrence an earlier dismissal does not hide.
+///
+/// Also returns the soonest instant an undeferred entry turns stale, so the
+/// cached list is rebuilt then with no write to announce it.
 pub(super) async fn awaiting_review(
     db: &LocalDb,
     project: &ProjectRef,
-) -> Result<Vec<OperatorNotification>, String> {
-    let sql = format!(
-        "SELECT a.id, a.output_name, a.created_at, {PLACE_COLUMNS}
-           FROM jobs j
-           {PLACE_JOINS}
-           JOIN artifacts a ON a.id = (
-                SELECT a2.id FROM artifacts a2 WHERE a2.job_id = j.id
-                 ORDER BY a2.created_at DESC, a2.version DESC LIMIT 1)
-          WHERE j.project_id = ?1 AND j.status = 'blocked' AND a.confirmed = 0
-            AND NOT EXISTS (SELECT 1 FROM merge_requests mr WHERE mr.job_id = j.id)"
-    );
-    let rows = db
-        .query_all(sql, params![project.id.clone()], |row| {
-            Ok((
-                row.text(0)?,
-                row.opt_text(1)?,
-                row.i64(2)?,
-                JobPlace::read(row, 3)?,
-            ))
-        })
+    now: i64,
+) -> Result<(Vec<OperatorNotification>, Option<i64>), String> {
+    use crate::execution::approvals::{pending_approvals, ApprovalScope};
+    let approvals = pending_approvals(db, ApprovalScope::Project(project.id.clone()))
         .await
         .map_err(db_error)?;
-    Ok(rows
+    let stale_at = approvals
+        .iter()
+        .filter_map(|approval| approval.stale_from())
+        .filter(|at| *at > now)
+        .min();
+    let entries = approvals
         .into_iter()
-        .filter(|(.., place)| place.issue_resolved_at().is_none())
-        .map(|(artifact_id, output_name, created_at, place)| {
-            let what = output_name.as_deref().unwrap_or("output");
-            entry(
+        .map(|approval| {
+            let key = match &approval.resurfaced_by {
+                Some(condition) => format!("review:{}:{condition}", approval.artifact_id),
+                None => format!("review:{}", approval.artifact_id),
+            };
+            let mut review = entry(
                 project,
-                format!("review:{artifact_id}"),
+                key,
                 NotificationKind::AwaitingReview,
-                created_at,
-                format!("{}: {what} awaits your review", place.label()),
-                place.artifact_uri(&project.key, output_name.as_deref()),
+                approval.pending_since,
+                format!(
+                    "#{} {}: {} awaits your review",
+                    approval.issue_number,
+                    approval.node_name,
+                    approval.what()
+                ),
+                approval.artifact_uri.clone(),
                 None,
                 None,
-            )
+            );
+            review.stale = approval.is_stale(now);
+            review.deferred_until = approval.deferral.map(|deferral| deferral.until_rendered);
+            review
         })
-        .collect())
+        .collect();
+    Ok((entries, stale_at))
 }
 
 /// What the registered hold sources report for the project.

@@ -869,6 +869,64 @@ async fn blocked_artifact_read_surfaces_resolution_actions() {
     assert!(done.starts_with("the pr body"), "done: {done}");
 }
 
+/// A planner stored `running` while its plan waits (as cairn/4527's was) still
+/// offers confirm and defer; deferring it is recorded and shown on the read.
+#[tokio::test]
+async fn a_running_planners_pending_plan_offers_defer_and_shows_it() {
+    let fixture = gated_artifact_fixture("Gated plan").await;
+    fixture
+        .db
+        .execute(
+            "UPDATE jobs SET status = 'running' WHERE id = 'job-planner'",
+            (),
+        )
+        .await
+        .unwrap();
+    let project_id = fixture
+        .db
+        .query_opt_text("SELECT project_id FROM issues WHERE number = 1", ())
+        .await
+        .unwrap()
+        .unwrap();
+    insert_issue_with_status_and_time(&fixture.db, &project_id, 2, "Blocker", "active", 1).await;
+
+    let read = read_resource(&fixture.orch, "cairn://p/mcp/1/1/planner/plan".to_string()).await;
+    assert!(read.contains("confirmed:true"), "{read}");
+    assert!(
+        read.contains("[defer](cairn://p/mcp/1/1/planner/plan)"),
+        "{read}"
+    );
+
+    let deferred = apply_change(
+        &fixture.orch,
+        "cairn://p/mcp/1/1/planner/plan",
+        "patch",
+        json!({"defer": {"until": [{"fact": "issue_resolution", "issue": "cairn://p/mcp/2", "resolution": "merged"}]}}),
+    )
+    .await;
+    assert!(
+        deferred
+            .contains("Deferred cairn://p/mcp/1/1/planner/plan until issue cairn://p/mcp/2 merged"),
+        "{deferred}"
+    );
+
+    let read = read_resource(&fixture.orch, "cairn://p/mcp/1/1/planner/plan".to_string()).await;
+    assert!(
+        read.contains("_Deferred until issue cairn://p/mcp/2 merged since"),
+        "{read}"
+    );
+
+    let both = apply_change(
+        &fixture.orch,
+        "cairn://p/mcp/1/1/planner/plan",
+        "patch",
+        json!({"confirmed": true, "defer": {"until": []}}),
+    )
+    .await;
+    assert!(both.contains("mutually exclusive"), "{both}");
+    assert_eq!(job_status(&fixture.db, "job-planner").await, "running");
+}
+
 #[tokio::test]
 async fn confirm_change_with_confirmed_false_is_rejected() {
     let fixture = gated_artifact_fixture("Gated plan").await;
