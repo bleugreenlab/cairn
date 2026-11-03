@@ -411,6 +411,7 @@ impl CairnResource {
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage
+            | Self::ModelsSpend
             | Self::ModelsLadder
             | Self::ModelsSelection
             | Self::ModelsEmbeddings
@@ -642,6 +643,7 @@ impl CairnResource {
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage
+            | Self::ModelsSpend
             | Self::ModelsLadder
             | Self::ModelsSelection
             | Self::ModelsEmbeddings
@@ -841,6 +843,7 @@ impl CairnResource {
             | Self::ModelsAccounts
             | Self::ModelsAccount { .. }
             | Self::ModelsUsage
+            | Self::ModelsSpend
             | Self::ModelsLadder
             | Self::ModelsSelection
             | Self::ModelsEmbeddings

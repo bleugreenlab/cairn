@@ -46,6 +46,7 @@ mod responses;
 mod routes;
 mod services;
 mod settings;
+mod spend;
 pub(crate) mod sql_policy;
 pub(crate) mod sql_schema;
 pub(crate) mod symbols;

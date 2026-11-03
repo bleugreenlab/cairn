@@ -1001,6 +1001,70 @@ pub(crate) async fn cost_components(
     .await
 }
 
+/// One job's share of a (bucket, model, backend) cost group: the rows
+/// [`cost_components`] sums, split one level finer by `job_id`. The token-side
+/// measures range over rows with billable tokens and the cost-side measures over
+/// rows carrying a real cost, the same two populations the `tok` and `cost` CTEs
+/// of [`cost_components`] filter on. A job that only settled a cost in a group
+/// still appears (with zero tokens), because the group's exact sum includes it.
+/// Pricing these rows so they sum to the card is `spend::price_job_rows`.
+#[derive(Debug, Clone)]
+pub(crate) struct JobCostComponentRow {
+    pub bucket_start: i64,
+    pub model: Option<String>,
+    pub backend: String,
+    pub job_id: Option<String>,
+    pub usage: TieredUsage,
+    pub billable: i64,
+    /// Rollup rows of this job in the group that carried billable tokens; a
+    /// group with none across all its jobs is dropped, as the card drops it.
+    pub token_rows: i64,
+    pub exact_cost: f64,
+    pub exact_cost_count: i64,
+}
+
+pub(crate) async fn cost_components_by_job(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<JobCostComponentRow>> {
+    let bucket_expr = bucket.bucket_expr("tr.bucket_start");
+    let sql = format!(
+        "SELECT {bucket_expr} AS bucket_start,
+                tr.model,
+                tr.backend,
+                tr.job_id,
+                {usage},
+                SUM(CASE WHEN tr.token_event_count > 0 THEN tr.billable_tokens ELSE 0 END),
+                SUM(CASE WHEN tr.token_event_count > 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost ELSE 0.0 END),
+                SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost_count ELSE 0 END)
+         FROM token_rollup tr
+         WHERE (tr.token_event_count > 0 OR tr.exact_cost_count > 0) AND {filter}
+         GROUP BY {bucket_expr}, tr.model, tr.backend, tr.job_id
+         ORDER BY 1",
+        filter = ROLLUP_SCOPE_RANGE,
+        usage = usage_select(|column, alias| format!(
+            "SUM(CASE WHEN tr.token_event_count > 0 THEN tr.{column} ELSE 0 END) AS {alias}"
+        )),
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(JobCostComponentRow {
+            bucket_start: row.i64(0)?,
+            model: row.opt_text(1)?,
+            backend: row.text(2)?,
+            job_id: row.opt_text(3)?,
+            usage: usage_at(row, 4)?,
+            billable: row.i64(12)?,
+            token_rows: row.i64(13)?,
+            exact_cost: row.opt_f64(14)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(15)?,
+        })
+    })
+    .await
+}
+
 /// Event-scan variant of [`cost_components`]: the `#[cfg(test)]` oracle the
 /// rollup read is proven equal to (no longer a production path).
 #[cfg(test)]

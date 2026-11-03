@@ -31,6 +31,11 @@ impl TimeRange {
     pub fn new(start: Option<i64>, end: Option<i64>) -> Self {
         Self { start, end }
     }
+
+    /// The inclusive lower bound, if any.
+    pub fn start(&self) -> Option<i64> {
+        self.start
+    }
 }
 
 /// Trend bucketing granularity.
@@ -71,6 +76,126 @@ impl Bucket {
             _ => Bucket::Day,
         }
     }
+}
+
+/// A named analytics window: the agent-facing equivalent of the Analytics page's
+/// range selector. Mirrors `RANGES` and the start-floor in
+/// `src/components/settings/sections/AnalyticsSection.tsx`; keep the two in
+/// step so a window read here prices the same groups the page does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    H24,
+    D7,
+    D30,
+    D90,
+    All,
+}
+
+impl Window {
+    pub const ALL: [Window; 5] = [
+        Window::H24,
+        Window::D7,
+        Window::D30,
+        Window::D90,
+        Window::All,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Window::H24 => "24h",
+            Window::D7 => "7d",
+            Window::D30 => "30d",
+            Window::D90 => "90d",
+            Window::All => "all",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|w| w.as_str().eq_ignore_ascii_case(raw))
+    }
+
+    fn days(self) -> Option<i64> {
+        match self {
+            Window::H24 => Some(1),
+            Window::D7 => Some(7),
+            Window::D30 => Some(30),
+            Window::D90 => Some(90),
+            Window::All => None,
+        }
+    }
+
+    pub fn bucket(self) -> Bucket {
+        match self {
+            Window::H24 => Bucket::Hour,
+            Window::D7 | Window::D30 => Bucket::Day,
+            Window::D90 | Window::All => Bucket::Week,
+        }
+    }
+
+    /// The range and bucket the page would query at `now` (epoch seconds): the
+    /// start floored to the hour for 24h and to the day otherwise, open-ended.
+    pub fn scope_at(self, now: i64) -> (TimeRange, Bucket) {
+        let bucket = self.bucket();
+        let grain = if bucket == Bucket::Hour { 3600 } else { 86_400 };
+        let start = self
+            .days()
+            .map(|days| (now - days * 86_400).div_euclid(grain) * grain);
+        (TimeRange::new(start, None), bucket)
+    }
+}
+
+/// What one spend node is.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpendNodeKind {
+    Thread,
+    Issue,
+    /// A thread's or issue's direct spend, split out beside its children so
+    /// the children partition the parent.
+    Own,
+    Unparented,
+    Other,
+}
+
+/// Cost and billable tokens one model contributed to a spend node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSpend {
+    pub model: String,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+}
+
+/// One block of the spend-by-thread tree. `cost_usd` and `billable_tokens`
+/// equal the sum over `children` whenever there are children.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendNode {
+    /// A canonical URI for threads and issues; a stable synthetic id otherwise.
+    pub id: String,
+    pub kind: SpendNodeKind,
+    pub label: String,
+    pub project_key: Option<String>,
+    pub number: Option<i64>,
+    pub title: Option<String>,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+    /// Sorted by cost, descending.
+    pub models: Vec<ModelSpend>,
+    /// Sorted by cost, descending.
+    pub children: Vec<SpendNode>,
+}
+
+/// Spend for a window attributed to threads through the parent edges. The
+/// roots sum to the Analytics Cost card for the same scope and range.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendByThread {
+    pub total_cost_usd: f64,
+    pub billable_tokens: i64,
+    pub roots: Vec<SpendNode>,
 }
 
 /// One trend point of average billable tokens per session.

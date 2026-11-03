@@ -1732,6 +1732,7 @@ mod tests {
             ResourceKind::Models,
             ResourceKind::ModelsCatalog,
             ResourceKind::ModelsUsage,
+            ResourceKind::ModelsSpend,
         ] {
             let output = affordance_for_kind(kind);
             assert!(!output.contains("### actions"), "{kind:?}:\n{output}");

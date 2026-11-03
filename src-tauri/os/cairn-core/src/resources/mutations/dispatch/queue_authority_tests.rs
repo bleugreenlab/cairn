@@ -160,7 +160,12 @@ async fn grant(
                 issuer: "operator_prompt".to_string(),
                 ..Default::default()
             },
-            constraints: AuthorityConstraintSet::for_approval(card, lifetime).unwrap(),
+            constraints: AuthorityConstraintSet::for_approval(
+                card,
+                card.bind_act().as_ref(),
+                lifetime,
+            )
+            .unwrap(),
         },
     )
     .await
@@ -423,8 +428,12 @@ async fn the_asking_thread_comes_from_the_job_not_the_request() {
     // A grant minted from that card binds alpha, and beta's real run does not
     // inherit it.
     grant(&w, ALPHA, &card, AuthorityLifetimeKind::Standing).await;
-    let constraints =
-        AuthorityConstraintSet::for_approval(&card, AuthorityLifetimeKind::Standing).unwrap();
+    let constraints = AuthorityConstraintSet::for_approval(
+        &card,
+        card.bind_act().as_ref(),
+        AuthorityLifetimeKind::Standing,
+    )
+    .unwrap();
     assert!(constraints.constraints.contains(
         &cairn_common::authorization::AuthorityConstraint::ActingThread {
             thread_id: "ta".to_string()

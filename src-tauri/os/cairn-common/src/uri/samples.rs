@@ -458,6 +458,7 @@ resource_samples! {
     ModelsAccounts {} => Parser,
     ModelsAccount { id: "acc_7b58857c-d1db".to_string() } => Parser,
     ModelsUsage {} => Parser,
+    ModelsSpend {} => Parser,
     ModelsLadder {} => Parser,
     ModelsSelection {} => Parser,
     ModelsEmbeddings {} => Parser,

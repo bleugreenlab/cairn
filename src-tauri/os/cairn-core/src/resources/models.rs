@@ -61,6 +61,10 @@ const INDEX: &[(&str, &str)] = &[
         "each provider's capacity per account and pooled, as Settings → Analytics shows it",
     ),
     (
+        "cairn://models/spend",
+        "what each thread and its child issues cost over a window (?window=24h|7d|30d|90d|all, ?thread=<name>)",
+    ),
+    (
         "cairn://models/ladder",
         "the pools allotments name and the capability ladder they slice",
     ),
@@ -2083,6 +2087,8 @@ mod tests {
         "cairn://models/usage",
         "cairn://models/usage?provider=claude",
         "cairn://models/usage?view=requests",
+        "cairn://models/spend",
+        "cairn://models/spend?window=all&format=json",
         "cairn://models/embeddings",
         "cairn://models/sessions",
     ];

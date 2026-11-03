@@ -4187,7 +4187,7 @@ routeCallsViaOpenRouter: true
 
     // === The one-time conversion from the tier grid to `models` ===
 
-    use crate::allotment::{model_ref, parse_model_ref, AllotmentEntry, PoolKind};
+    use crate::allotment::{model_ref, parse_model_ref, AllotmentEntry};
 
     /// Each provider's effort scale as its catalog answers when discovery has
     /// not run: Claude's static four, Codex's static four (no `ultra`), Go's
@@ -4386,7 +4386,7 @@ routeCallsViaOpenRouter: true
         let notes = migrate(temp.path(), &["custom:bench"]).unwrap();
         let models = converted(temp.path());
         assert_eq!(models.ladder.len(), 1);
-        assert_eq!(band(&models, "lg"), ["custom:bench/qwen3-coder"]);
+        assert!(band(&models, "lg").is_empty());
         assert_eq!(band(&models, "myth"), ["custom:bench/qwen3-coder"]);
         assert!(
             notes.iter().any(|note| note.contains("several tiers")),
@@ -4578,13 +4578,7 @@ routeCallsViaOpenRouter: true
             .ladder
             .iter()
             .all(|rung| rung.model.backend != "codex"));
-        let PoolKind::Set { members } = &models.pool("myth").unwrap().kind else {
-            panic!("myth is a set pool");
-        };
-        assert_eq!(
-            members.iter().map(model_ref).collect::<Vec<_>>(),
-            ["claude/fable"]
-        );
+        assert_eq!(band(&models, "myth"), ["claude/fable"]);
         assert_eq!(converted(temp.path()), models);
     }
 }

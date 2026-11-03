@@ -1044,6 +1044,8 @@ pub enum CairnResource {
     },
     /// Pooled capacity per installed provider (the provider card).
     ModelsUsage,
+    /// Spend for a window attributed to threads through the parent edges.
+    ModelsSpend,
     /// The workspace's pools, bands, and capability ladder.
     ModelsLadder,
     /// What an allotment would select now: a preview, nothing stored.
@@ -1258,6 +1260,7 @@ impl CairnResource {
             Self::ModelsAccounts => ResourceKind::ModelsAccounts,
             Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
             Self::ModelsUsage => ResourceKind::ModelsUsage,
+            Self::ModelsSpend => ResourceKind::ModelsSpend,
             Self::ModelsLadder => ResourceKind::ModelsLadder,
             Self::ModelsSelection => ResourceKind::ModelsSelection,
             Self::ModelsEmbeddings => ResourceKind::ModelsEmbeddings,

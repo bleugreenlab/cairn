@@ -879,12 +879,15 @@ pub type PositionFn<'a> = &'a dyn Fn(&ModelSelection, &str) -> EffortPlacement;
 
 /// Convert a tier grid into pools and ladder entries.
 ///
-/// - Each seeded tier present (`sm`, `md`, `lg`) becomes a band pool starting
-///   at its index over the number present, carrying the seeded description.
-/// - Each other tier becomes a set pool of its cells on installed providers.
-/// - Every cell of a seeded tier on an installed provider becomes a ladder
-///   entry at its band's centre; a model in several tiers keeps the highest
-///   tier's level and options.
+/// - A grid's `tiers` list was always an ordered capability list, so every
+///   tier becomes a band pool, in list order, starting at its index over the
+///   number of tiers. A seeded id (`sm`, `md`, `lg`) carries the seeded
+///   description; any other tier says what it was converted from and which
+///   tier it sat above. Nothing in a grid expresses a reserved model, so no
+///   set pool is produced.
+/// - Every cell on an installed provider becomes a ladder entry at its
+///   band's centre; a model in several tiers keeps the highest tier's level
+///   and options.
 /// - A cell's `reasoningEffort` becomes a position on that model's scale; a
 ///   level off the scale (a mode, or a word the model does not use) becomes
 ///   the top, 1.0. Other options move across unchanged.
@@ -897,19 +900,20 @@ pub fn convert_tiers(
     position: PositionFn<'_>,
 ) -> Conversion {
     let mut notes: Vec<String> = Vec::new();
-    let seeded: Vec<(&str, &str)> = SEED_BANDS
-        .iter()
-        .copied()
-        .filter(|(id, _)| legacy.tiers.iter().any(|tier| tier == id))
-        .collect();
-    let mut pools: Vec<Pool> = seeded
+    let mut tiers: Vec<&str> = Vec::new();
+    for tier in legacy.tiers {
+        if !tiers.contains(&tier.as_str()) {
+            tiers.push(tier);
+        }
+    }
+    let pools: Vec<Pool> = tiers
         .iter()
         .enumerate()
-        .map(|(index, (id, description))| Pool {
+        .map(|(index, id)| Pool {
             id: id.to_string(),
-            description: description.to_string(),
+            description: band_description(id, index.checked_sub(1).map(|below| tiers[below])),
             kind: PoolKind::Band {
-                min: round2(index as f64 / seeded.len() as f64),
+                min: round2(index as f64 / tiers.len() as f64),
             },
         })
         .collect();
@@ -1038,52 +1042,6 @@ pub fn convert_tiers(
         }
     }
 
-    for tier in legacy.tiers {
-        if seeded.iter().any(|(id, _)| id == tier) {
-            continue;
-        }
-        let members: Vec<ModelSelection> = enabled
-            .iter()
-            .filter_map(|backend| {
-                cell(backend, tier)
-                    .map(|preset| ModelSelection::new(backend.clone(), preset.model.clone()))
-            })
-            .collect();
-        if members.is_empty() {
-            notes.push(format!(
-                "the '{tier}' tier had no model on an installed provider, so its pool is empty"
-            ));
-        }
-        for backend in enabled {
-            if let Some(preset) = cell(backend, tier) {
-                let selection = ModelSelection::new(backend.clone(), preset.model.clone());
-                let has_options =
-                    preset.options.contains_key(EFFORT_OPTION) || !options_of(preset).is_empty();
-                if has_options && !ladder.iter().any(|(_, rung, _)| rung.model == selection) {
-                    let mut effort_notes = Vec::new();
-                    let (effort, effort_level) = effort_of(&selection, preset, &mut effort_notes);
-                    notes.extend(effort_notes);
-                    ladder.push((
-                        usize::MAX,
-                        Rung {
-                            model: selection,
-                            level: None,
-                            effort,
-                            effort_level,
-                            options: options_of(preset),
-                        },
-                        Vec::new(),
-                    ));
-                }
-            }
-        }
-        pools.push(Pool {
-            id: tier.clone(),
-            description: format!("Converted from the custom '{tier}' tier."),
-            kind: PoolKind::Set { members },
-        });
-    }
-
     let decision_model = decision_model.map(|raw| {
         let converted = convert_decision_model(raw, legacy, &pools);
         if converted != raw {
@@ -1097,9 +1055,7 @@ pub fn convert_tiers(
     } else {
         bands
             .last()
-            .map(|band| band.id.clone())
-            .or_else(|| pools.first().map(|pool| pool.id.clone()))
-            .map(|id| vec![AllotmentEntry::Pool(id)])
+            .map(|band| vec![AllotmentEntry::Pool(band.id.clone())])
             .unwrap_or_else(default_default_models)
     };
 
@@ -1112,6 +1068,19 @@ pub fn convert_tiers(
         },
         decision_model,
         notes,
+    }
+}
+
+/// The description of the band a tier converts to: the seeded one for a
+/// seeded id, else where the tier came from and what it sat above, for the
+/// operator to rewrite.
+fn band_description(tier: &str, below: Option<&str>) -> String {
+    if let Some((_, seeded)) = SEED_BANDS.iter().find(|(id, _)| *id == tier) {
+        return seeded.to_string();
+    }
+    match below {
+        Some(below) => format!("Converted from the {tier} tier, above {below}."),
+        None => format!("Converted from the {tier} tier, the lowest."),
     }
 }
 
@@ -1164,8 +1133,8 @@ mod tests {
                 pool("sm", 0.0),
                 pool("md", 0.34),
                 Pool {
-                    id: "myth".into(),
-                    description: "the strongest".into(),
+                    id: "pinned".into(),
+                    description: "hand-picked for the work that names it".into(),
                     kind: PoolKind::Set {
                         members: vec![parse_model_ref("claude/fable").unwrap()],
                     },
@@ -1248,7 +1217,7 @@ mod tests {
 
     #[test]
     fn a_model_off_the_ladder_is_the_top_of_its_allotment() {
-        let expanded = config().expand(&entries(&["sm", "md", "myth"])).unwrap();
+        let expanded = config().expand(&entries(&["sm", "md", "pinned"])).unwrap();
         assert_eq!(expanded.top().unwrap().id, "md");
         let top: Vec<String> = expanded
             .in_band(Some("md"))
@@ -1331,7 +1300,7 @@ pools:
   - id: sm
     description: small
     band: { min: 0.0 }
-  - id: myth
+  - id: pinned
     description: hand-picked
     members: [claude/fable]
 ladder:
@@ -1464,10 +1433,10 @@ defaultModels: [sm]
             .collect()
     }
 
-    /// The operator's own grid: MD defaults to OpenCode Go's glm while
-    /// MD/Anthropic still says sonnet, plus a custom MYTH tier.
+    /// MD defaults to OpenCode Go's glm while MD/Anthropic still says sonnet,
+    /// plus a MYTH tier above LG.
     #[test]
-    fn the_operators_grid_puts_every_md_cell_in_the_md_band() {
+    fn every_md_cell_lands_in_the_md_band() {
         let converted = convert(
             &["sm", "md", "lg", "myth"],
             &[
@@ -1528,15 +1497,12 @@ defaultModels: [sm]
             (sonnet.effort, sonnet.effort_level.as_deref()),
             (None, Some("high"))
         );
-        // MYTH is a hand-picked pool, and fable keeps its options off the ladder.
-        let myth = models.pool("myth").unwrap();
-        assert!(
-            matches!(&myth.kind, PoolKind::Set { members } if model_ref(&members[0]) == "claude/fable")
-        );
+        // MYTH is the band above LG, and fable sits in it.
+        assert_eq!(band_models(models, "myth"), ["claude/fable"]);
         let fable = models
             .rung(&parse_model_ref("claude/fable").unwrap())
             .unwrap();
-        assert_eq!((fable.level.clone(), fable.effort), (None, Some(1.0)));
+        assert_eq!(fable.effort, Some(1.0));
         assert!(
             converted
                 .notes
@@ -1602,19 +1568,187 @@ defaultModels: [sm]
         );
         let models = &converted.models;
         assert_eq!(models.ladder.len(), 1);
-        assert_eq!(band_models(models, "lg"), ["custom:bench/qwen3-coder"]);
-        assert!(band_models(models, "sm").is_empty());
+        assert_eq!(band_models(models, "myth"), ["custom:bench/qwen3-coder"]);
+        for band in ["sm", "md", "lg"] {
+            assert!(band_models(models, band).is_empty(), "{band}");
+        }
         assert!(
-            converted
-                .notes
-                .iter()
-                .any(|n| n.contains("several tiers")
-                    && n.contains("custom:bench/sm, custom:bench/md")),
+            converted.notes.iter().any(|n| n.contains("several tiers")
+                && n.contains("custom:bench/sm, custom:bench/md, custom:bench/lg")),
             "{:?}",
             converted.notes
         );
-        let myth = models.pool("myth").unwrap();
-        assert!(matches!(&myth.kind, PoolKind::Set { members } if members.len() == 1));
+    }
+
+    /// The operator's settings as they stood before conversion, every cell of
+    /// them, with the providers the conversion is expected to see installed.
+    #[test]
+    fn the_operators_grid_converts_every_tier_to_a_band_in_order() {
+        let tiers = strings(&["sm", "md", "lg", "myth"]);
+        let tier_defaults: HashMap<String, String> = ["sm", "md", "lg", "myth"]
+            .iter()
+            .map(|tier| (tier.to_string(), "claude".to_string()))
+            .collect();
+        let mut backends = grid(&[
+            ("codex", "sm", "gpt-6-luna", Some("low")),
+            ("codex", "md", "gpt-6.1-terra", Some("medium")),
+            ("codex", "lg", "gpt-6-astra", Some("high")),
+            ("actual", "sm", "Qwen3.8-27B-Q4_0", None),
+            ("ollama", "sm", "qwen3.8:27b-mlx", None),
+            ("ollama", "md", "qwen3.8:latest", None),
+            (
+                "custom:acc_e0880682-8c8a-4a93-8437-d710ca583eda",
+                "sm",
+                "dsv4-flash",
+                None,
+            ),
+            ("opencode-go", "sm", "minimax-m3", None),
+            ("opencode-go", "md", "glm-5.3", Some("high")),
+            ("opencode-go", "lg", "kimi-k3", Some("max")),
+            ("openrouter", "sm", "~deepseek/deepseek-flash-latest", None),
+            (
+                "openrouter",
+                "md",
+                "anthropic/claude-haiku-5.5",
+                Some("medium"),
+            ),
+            ("openrouter", "lg", "meta/muse-spark-open", Some("high")),
+            ("openrouter", "myth", "moonshotai/kimi-k3", Some("xhigh")),
+            ("claude", "sm", "haiku", None),
+            ("claude", "md", "sonnet", Some("medium")),
+            ("claude", "lg", "opus", Some("high")),
+            ("claude", "myth", "fable", Some("high")),
+        ]);
+        for cell in backends.get_mut("codex").unwrap().values_mut() {
+            cell.options
+                .insert("fastMode".into(), PresetOptionValue::Bool(false));
+        }
+        let converted = convert_tiers(
+            &LegacyTiers {
+                tiers: &tiers,
+                tier_defaults: &tier_defaults,
+                backends: &backends,
+            },
+            &strings(&[
+                "claude",
+                "codex",
+                "openrouter",
+                "opencode-go",
+                "ollama",
+                "actual",
+            ]),
+            Some("typesafe/jev-1.14"),
+            &position,
+        );
+        let models = &converted.models;
+        models.validate().unwrap();
+
+        // Four bands, in the grid's order, each starting at index / count.
+        let shape: Vec<(String, f64)> = models
+            .bands()
+            .into_iter()
+            .map(|band| (band.id, band.min))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("sm".to_string(), 0.0),
+                ("md".to_string(), 0.25),
+                ("lg".to_string(), 0.5),
+                ("myth".to_string(), 0.75)
+            ]
+        );
+        assert!(models
+            .pools
+            .iter()
+            .all(|pool| matches!(pool.kind, PoolKind::Band { .. })));
+        assert_eq!(
+            models.pool("myth").unwrap().description,
+            "Converted from the myth tier, above lg."
+        );
+        assert_eq!(models.pool("lg").unwrap().description, SEED_BANDS[2].1);
+
+        // Fable and Kimi K3 are on the ladder, in MYTH, launching as before.
+        assert_eq!(
+            band_models(models, "myth"),
+            ["claude/fable", "openrouter/moonshotai/kimi-k3"]
+        );
+        let fable = models
+            .rung(&parse_model_ref("claude/fable").unwrap())
+            .unwrap();
+        assert_eq!(
+            fable.level,
+            Some(Level::seeded(0.88, "converted from the myth tier"))
+        );
+        assert_eq!(fable.effort_level.as_deref(), Some("high"));
+
+        // LG holds exactly the LG cells it held before, so an `lg` allotment
+        // selects among the same models and never reaches MYTH.
+        assert_eq!(
+            band_models(models, "lg"),
+            [
+                "claude/opus",
+                "codex/gpt-6-astra",
+                "openrouter/meta/muse-spark-open",
+                "opencode-go/kimi-k3"
+            ]
+        );
+        let astra = models
+            .rung(&parse_model_ref("codex/gpt-6-astra").unwrap())
+            .unwrap();
+        assert_eq!(
+            astra.options.get("fastMode"),
+            Some(&PresetOptionValue::Bool(false))
+        );
+        assert_eq!(
+            band_models(models, "md"),
+            [
+                "claude/sonnet",
+                "codex/gpt-6.1-terra",
+                "openrouter/anthropic/claude-haiku-5.5",
+                "opencode-go/glm-5.3",
+                "ollama/qwen3.8:latest"
+            ]
+        );
+        assert_eq!(
+            band_models(models, "sm"),
+            [
+                "claude/haiku",
+                "codex/gpt-6-luna",
+                "openrouter/~deepseek/deepseek-flash-latest",
+                "opencode-go/minimax-m3",
+                "ollama/qwen3.8:27b-mlx",
+                "actual/Qwen3.8-27B-Q4_0"
+            ]
+        );
+        // The custom account is not installed, so its cell is not carried.
+        assert_eq!(models.ladder.len(), 17);
+        assert!(models.ladder.iter().all(|rung| rung.level.is_some()));
+
+        assert_eq!(
+            converted.decision_model.as_deref(),
+            Some("typesafe/jev-1.14")
+        );
+        assert_eq!(models.default_models, entries(&["md"]));
+    }
+
+    #[test]
+    fn a_tier_below_every_other_says_it_was_the_lowest() {
+        let converted = convert(
+            &["tiny", "sm", "md"],
+            &[],
+            &[("claude", "tiny", "haiku", None)],
+            &["claude"],
+            Some("claude/tiny"),
+        );
+        let models = &converted.models;
+        assert_eq!(
+            models.pool("tiny").unwrap().description,
+            "Converted from the tiny tier, the lowest."
+        );
+        assert_eq!(models.band_of(0.0).unwrap().id, "tiny");
+        assert_eq!(band_models(models, "tiny"), ["claude/haiku"]);
+        assert_eq!(converted.decision_model.as_deref(), Some("claude/haiku"));
     }
 
     #[test]
@@ -1748,7 +1882,7 @@ defaultModels: [sm]
             .iter()
             .all(|rung| rung.model.backend != "claude"));
         assert!(
-            matches!(&base.pool("myth").unwrap().kind, PoolKind::Set { members } if members.is_empty())
+            matches!(&base.pool("pinned").unwrap().kind, PoolKind::Set { members } if members.is_empty())
         );
     }
 }

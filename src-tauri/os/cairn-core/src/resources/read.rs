@@ -2167,6 +2167,7 @@ async fn render_resource_body(
             }
         }
         CairnResource::ModelsUsage => crate::resources::models::render_usage(orch, &params),
+        CairnResource::ModelsSpend => crate::resources::spend::read_spend(orch, &params).await,
         CairnResource::ModelsLadder => {
             crate::resources::models::render_ladder(&params, || orch.models_ladder(None))
         }

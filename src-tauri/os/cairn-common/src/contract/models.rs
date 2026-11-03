@@ -325,6 +325,7 @@ pub(crate) const MODELS_CONTRACT: ResourceContract = ResourceContract {
         RelatedSpec { label: "speak text as an audio clip (a run target)", kind: ResourceKind::ModelsSpeak, actions: false },
         RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::ModelsAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false },
+        RelatedSpec { label: "spend by thread for a window, reconciled with the Analytics Cost card", kind: ResourceKind::ModelsSpend, actions: false },
         RelatedSpec { label: "pools, bands, and the capability ladder", kind: ResourceKind::ModelsLadder, actions: false },
         RelatedSpec { label: "what an allotment would select now", kind: ResourceKind::ModelsSelection, actions: false },
         RelatedSpec { label: "the embedding model and how far history is embedded in it", kind: ResourceKind::ModelsEmbeddings, actions: false },
@@ -475,6 +476,23 @@ pub(crate) const MODELS_USAGE_CONTRACT: ResourceContract = ResourceContract {
         ProjectionSpec { key: "hours", values: "N — with view=requests: how far back (default 24)" },
     ],
     related: &[RelatedSpec { label: "each account's windows", kind: ResourceKind::ModelsAccounts, actions: false }],
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const MODELS_SPEND_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ModelsSpend,
+    uri_template: "cairn://models/spend",
+    name: "Model spend",
+    description: "What each line of work cost over a window, as Settings → Analytics → Spend by thread shows it: every thread with its child issues nested beneath it, then unparented issues and other spend by kind (workflow, unplaced job, no job), each with its list-price cost, billable tokens, and per-model split. A run's cost belongs to the thread reached by following parent edges up from its issue (an issue parent first, then a thread parent), a sub-agent task's to the node that spawned it, and a thread session's to the thread itself; the edges are read at query time, so reparenting an issue moves its history with it. The total equals the Analytics Cost card for the same window and project.",
+    read_projections: &[
+        ProjectionSpec { key: "by", values: "thread (default) — the only grouping so far" },
+        ProjectionSpec { key: "window", values: "24h (default) | 7d | 30d | 90d | all — the Analytics page's ranges" },
+        ProjectionSpec { key: "thread", values: "NAME | KEY/NAME | unparented | other — one root's nested tree; a bare name several projects share is refused with the candidates" },
+        ProjectionSpec { key: "project", values: "KEY — only this project's spend, as the page's project scope" },
+        ProjectionSpec { key: "format", values: "markdown (default) | json — the serialized tree, or the one root with thread=" },
+    ],
+    related: &[RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::ModelsUsage, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
 };

@@ -6,10 +6,12 @@
 //! rule lives in [`queries`] (the `token_events` CTE); pricing lives in
 //! [`pricing`]; this module joins the two and normalizes roles.
 
+mod attribution;
 mod backfill;
 mod cost;
 mod economics;
 mod roles;
+mod spend;
 pub mod subscriptions;
 mod tokens;
 mod tools;
@@ -30,6 +32,7 @@ pub use cost::{
 pub use economics::{
     issue_lead_times, merged_pr_cost_trend, merged_pr_economics, model_role_economics,
 };
+pub use spend::spend_by_thread;
 pub use tokens::{
     avg_tokens_per_session, token_composition_timeseries, tokens_by_model_timeseries,
     tokens_per_loc,
@@ -40,9 +43,10 @@ pub use tools::{
 };
 pub use types::{
     BackendCostPoint, Bucket, CommandDurationRow, CostPoint, EconomicsRow, EffectiveCostPoint,
-    HeatmapCell, IssueLeadTimePoint, MergedPrEconomics, ModelRoleEconomics, ModelTokenPoint,
-    PrCostTrendPoint, PrEconomicsRow, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown,
-    TargetShapeRow, TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
-    TokensPerSessionPoint, ToolBackfillSummary, ToolCallsPerSessionPoint, ToolErrorRatePoint,
-    ToolMixPoint, ToolTimeMixPoint, TopTargetRow,
+    HeatmapCell, IssueLeadTimePoint, MergedPrEconomics, ModelRoleEconomics, ModelSpend,
+    ModelTokenPoint, PrCostTrendPoint, PrEconomicsRow, ProjectCost, Scope, SessionDurationPoint,
+    SpendByThread, SpendNode, SpendNodeKind, TargetBreakdown, TargetShapeRow, TimeCompositionPoint,
+    TimeRange, TokenCompositionPoint, TokensPerLocPoint, TokensPerSessionPoint,
+    ToolBackfillSummary, ToolCallsPerSessionPoint, ToolErrorRatePoint, ToolMixPoint,
+    ToolTimeMixPoint, TopTargetRow, Window,
 };

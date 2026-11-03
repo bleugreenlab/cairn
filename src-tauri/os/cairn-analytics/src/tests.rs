@@ -3561,3 +3561,328 @@ async fn every_claude_alias_keys_its_own_spellings_and_only_its_generation() {
     expected.sort();
     assert_eq!(rollup_models(&db).await, expected);
 }
+
+// --- Spend by thread ---
+
+/// An hour boundary (2023-11-14 22:00 UTC) the spend fixture's events sit
+/// after, two hours before a day boundary.
+const SPEND_T: i64 = 1_699_999_200;
+
+/// Seed a job/session/run triple with explicit placement. An empty `project`
+/// leaves the job off the run (a job-less run in `proj`).
+#[allow(clippy::too_many_arguments)]
+async fn seed_placed_run(
+    db: &LocalDb,
+    suffix: &str,
+    project: &str,
+    model: &str,
+    issue: Option<&str>,
+    thread: Option<&str>,
+    parent_job: Option<&str>,
+) {
+    let sql = |v: Option<&str>| v.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
+    db.execute_script(format!(
+        "INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id,
+                          issue_id, thread_id, parent_job_id, created_at, updated_at)
+          VALUES ('job-{suffix}', '{project}', 'running', '{model}', 'builder', 'builder',
+                  {issue}, {thread}, {parent}, 1, 1);
+         INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+          VALUES ('sess-{suffix}', 'job-{suffix}', 'claude', 'open', 1, 1, 1);
+         INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+          VALUES ('run-{suffix}', '{project}', 'job-{suffix}', 'exited', 'sess-{suffix}', 1, 1);",
+        issue = sql(issue),
+        thread = sql(thread),
+        parent = sql(parent_job),
+    ))
+    .await
+    .unwrap();
+}
+
+/// Two projects; thread `models` (PRJ) with child #1, grandchild #2 under #1,
+/// a stale sub-agent task under #2's builder, and the thread's own session;
+/// thread `general` (TWO) with child #1; unparented PRJ#3; a one-shot job; a
+/// workflow job; and a job-less run. The hour at `SPEND_T` holds a sonnet group
+/// mixing an unmetered job (#1), a metered one-shot ($0.05), and a cost-only
+/// settlement on #3 ($0.07) with no billable tokens of its own.
+async fn spend_db() -> LocalDb {
+    let db = cost_db().await;
+    db.execute_script(
+        "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES ('proj2', 'default', 'Two', 'TWO', '/tmp/two', 1, 1);
+         INSERT INTO threads(id, project_id, name, created_at, updated_at)
+          VALUES ('t-models', 'proj', 'models', 1, 1);
+         INSERT INTO threads(id, project_id, name, created_at, updated_at)
+          VALUES ('t-general', 'proj2', 'general', 1, 1);
+         INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at, parent_thread_id)
+          VALUES ('i1', 'proj', 1, 'Child', 'active', 1, 1, 't-models');
+         INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at, parent_issue_id)
+          VALUES ('i2', 'proj', 2, 'Grandchild', 'active', 1, 1, 'i1');
+         INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+          VALUES ('u3', 'proj', 3, 'Loose', 'active', 1, 1);
+         INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at, parent_thread_id)
+          VALUES ('g1', 'proj2', 1, 'Other project', 'active', 1, 1, 't-general');",
+    )
+    .await
+    .unwrap();
+    seed_placed_run(&db, "thread", "proj", "opus", None, Some("t-models"), None).await;
+    seed_placed_run(&db, "child", "proj", "sonnet", Some("i1"), None, None).await;
+    seed_placed_run(&db, "grand", "proj", "sonnet", Some("i2"), None, None).await;
+    seed_placed_run(&db, "task", "proj", "sonnet", None, None, Some("job-grand")).await;
+    seed_placed_run(&db, "loose", "proj", "sonnet", Some("u3"), None, None).await;
+    seed_placed_run(&db, "oneshot", "proj", "sonnet", None, None, None).await;
+    seed_placed_run(&db, "wf", "proj", "haiku", None, None, None).await;
+    seed_placed_run(&db, "two", "proj2", "haiku", Some("g1"), None, None).await;
+    db.execute_script(
+        "INSERT INTO workflow_run(run_id, job_id, workflow_id, script_path, args_json,
+                                  output_name, created_at)
+          VALUES ('wf-run', 'job-wf', 'wf', 'main.ts', '{}', 'out', 1);
+         INSERT INTO sessions(id, job_id, chat_id, backend, status, sequence, created_at, updated_at)
+          VALUES ('sess-nojob', NULL, 'chat-nojob', 'claude', 'open', 1, 1, 1);
+         INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+          VALUES ('run-nojob', 'proj', NULL, 'exited', 'sess-nojob', 1, 1);",
+    )
+    .await
+    .unwrap();
+
+    let t = SPEND_T;
+    // Hour 0: the mixed sonnet group, plus opus on the thread session.
+    add_event(
+        &db,
+        "s-child",
+        "child",
+        "assistant",
+        t + 10,
+        40_000,
+        2_000,
+        None,
+    )
+    .await;
+    add_event(
+        &db,
+        "s-one",
+        "oneshot",
+        "assistant",
+        t + 20,
+        1_000,
+        100,
+        Some(0.05),
+    )
+    .await;
+    add_event(
+        &db,
+        "s-loose",
+        "loose",
+        "result:success",
+        t + 30,
+        0,
+        0,
+        Some(0.07),
+    )
+    .await;
+    add_event(
+        &db,
+        "s-thread",
+        "thread",
+        "assistant",
+        t + 40,
+        30_000,
+        1_500,
+        None,
+    )
+    .await;
+    // Hour 1: unmetered sonnet across grandchild and its stale task; haiku on
+    // the other project, the workflow, and the job-less run.
+    add_event(
+        &db,
+        "s-grand",
+        "grand",
+        "assistant",
+        t + 3_610,
+        20_000,
+        900,
+        None,
+    )
+    .await;
+    add_event(
+        &db,
+        "s-task",
+        "task",
+        "assistant",
+        t + 3_620,
+        10_000,
+        400,
+        None,
+    )
+    .await;
+    add_event(
+        &db,
+        "s-two",
+        "two",
+        "assistant",
+        t + 3_630,
+        5_000,
+        300,
+        None,
+    )
+    .await;
+    add_event(&db, "s-wf", "wf", "assistant", t + 3_640, 7_000, 200, None).await;
+    add_event(
+        &db,
+        "s-nojob",
+        "nojob",
+        "assistant",
+        t + 3_650,
+        3_000,
+        50,
+        None,
+    )
+    .await;
+    // Next UTC day: more thread-session spend, so day buckets differ.
+    add_event(
+        &db,
+        "s-thread2",
+        "thread",
+        "assistant",
+        t + 7_300,
+        8_000,
+        600,
+        None,
+    )
+    .await;
+    db
+}
+
+fn assert_children_partition(node: &SpendNode) {
+    if node.children.is_empty() {
+        return;
+    }
+    let cost: f64 = node.children.iter().map(|c| c.cost_usd).sum();
+    let tokens: i64 = node.children.iter().map(|c| c.billable_tokens).sum();
+    assert!(
+        (cost - node.cost_usd).abs() < 1e-9,
+        "{} costs {} but its children sum to {cost}",
+        node.id,
+        node.cost_usd
+    );
+    assert_eq!(tokens, node.billable_tokens, "{} tokens", node.id);
+    node.children.iter().for_each(assert_children_partition);
+}
+
+fn spend_child<'a>(node: &'a SpendNode, id: &str) -> &'a SpendNode {
+    node.children
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("{} has no child {id}: {:#?}", node.id, node.children))
+}
+
+#[tokio::test]
+async fn spend_by_thread_roots_sum_to_the_cost_card() {
+    let db = spend_db().await;
+    let scopes = [Scope::new(None), Scope::new(Some("proj".into()))];
+    let ranges = [
+        TimeRange::default(),
+        TimeRange::new(Some(SPEND_T + 3_600), Some(SPEND_T + 7_200)),
+    ];
+    for bucket in [Bucket::Hour, Bucket::Day, Bucket::Week] {
+        for scope in &scopes {
+            for range in &ranges {
+                let spend = spend_by_thread(&db, scope, range, bucket).await.unwrap();
+                let card = cost_timeseries(&db, scope, range, bucket).await.unwrap();
+                let card_cost: f64 = card.iter().map(|p| p.cost_usd).sum();
+                let card_tokens: i64 = card.iter().map(|p| p.billable_tokens).sum();
+                let root_cost: f64 = spend.roots.iter().map(|r| r.cost_usd).sum();
+                let root_tokens: i64 = spend.roots.iter().map(|r| r.billable_tokens).sum();
+                let ctx = format!("{bucket:?} {scope:?} {range:?}");
+                assert!(card_cost > 0.0, "{ctx}: the fixture prices to something");
+                assert!(
+                    (root_cost - card_cost).abs() < 1e-9,
+                    "{ctx}: roots {root_cost} vs card {card_cost}"
+                );
+                assert!((spend.total_cost_usd - root_cost).abs() < 1e-12, "{ctx}");
+                assert_eq!(root_tokens, card_tokens, "{ctx}");
+                assert_eq!(spend.billable_tokens, card_tokens, "{ctx}");
+                spend.roots.iter().for_each(assert_children_partition);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn spend_by_thread_nests_issues_under_their_threads() {
+    let db = spend_db().await;
+    let spend = spend_by_thread(&db, &Scope::new(None), &TimeRange::default(), Bucket::Hour)
+        .await
+        .unwrap();
+    let root = |id: &str| {
+        spend
+            .roots
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("no root {id}: {:#?}", spend.roots))
+    };
+
+    // Two projects, so thread labels carry their project key.
+    let models = root("cairn://p/PRJ/models");
+    assert_eq!(models.kind, SpendNodeKind::Thread);
+    assert_eq!(models.label, "PRJ/models");
+    assert_eq!(root("cairn://p/TWO/general").label, "TWO/general");
+
+    // The thread's own session is split out beside its child issue.
+    let own = spend_child(models, "cairn://p/PRJ/models#own");
+    assert_eq!(own.kind, SpendNodeKind::Own);
+    assert_eq!(own.label, "thread session");
+    assert_eq!(own.models[0].model, "opus");
+    let child = spend_child(models, "cairn://p/PRJ/1");
+    assert_eq!(child.label, "#1 Child");
+    assert_eq!(child.number, Some(1));
+    // #1's only spend sits in the metered hour, so the group's exact cost
+    // leaves it at $0 with its tokens still counted.
+    let child_own = spend_child(child, "cairn://p/PRJ/1#own");
+    assert_eq!(child_own.label, "this issue's runs");
+    assert_eq!(child_own.cost_usd, 0.0);
+    assert_eq!(child_own.billable_tokens, 42_000);
+    // The grandchild carries its builder plus the stale task that walked
+    // parent_job_id up to it.
+    let grand = spend_child(child, "cairn://p/PRJ/2");
+    assert!(grand.children.is_empty());
+    assert_eq!(grand.billable_tokens, 20_900 + 10_400);
+
+    // The cost-only settlement on an unparented issue survives.
+    let loose = spend_child(root("unparented"), "cairn://p/PRJ/3");
+    assert!((loose.cost_usd - 0.07).abs() < 1e-12);
+    assert_eq!(loose.billable_tokens, 0);
+
+    let other = root("other");
+    assert!((spend_child(other, "other/unplaced").cost_usd - 0.05).abs() < 1e-12);
+    assert!(spend_child(other, "other/workflow").billable_tokens > 0);
+    assert!(spend_child(other, "other/no-job").billable_tokens > 0);
+
+    // A project scope drops the other project's thread and its key prefix.
+    let scoped = spend_by_thread(
+        &db,
+        &Scope::new(Some("proj".into())),
+        &TimeRange::default(),
+        Bucket::Hour,
+    )
+    .await
+    .unwrap();
+    let labels: Vec<&str> = scoped.roots.iter().map(|r| r.label.as_str()).collect();
+    assert!(labels.contains(&"models"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l.contains("general")), "{labels:?}");
+}
+
+#[test]
+fn window_scope_mirrors_the_page_range_selector() {
+    let now = SPEND_T + 1_234;
+    let (range, bucket) = Window::H24.scope_at(now);
+    assert_eq!(bucket, Bucket::Hour);
+    assert_eq!(range.start, Some(SPEND_T - 86_400));
+    assert_eq!(range.end, None);
+    let (range, bucket) = Window::D7.scope_at(now);
+    assert_eq!(bucket, Bucket::Day);
+    assert_eq!(range.start.unwrap() % 86_400, 0);
+    assert_eq!(Window::D90.scope_at(now).1, Bucket::Week);
+    assert_eq!(Window::All.scope_at(now).0.start, None);
+    assert_eq!(Window::parse("30D"), Some(Window::D30));
+    assert_eq!(Window::parse("1y"), None);
+}
