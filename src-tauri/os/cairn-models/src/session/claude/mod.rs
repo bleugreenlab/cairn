@@ -13,6 +13,7 @@ use cairn_platform::services::process::InheritedSecret;
 use cairn_platform::services::process::SpawnConfig;
 use serde_json::json;
 
+pub use crate::claude::api_key::API_KEY_ENV;
 use crate::claude::tokens::OAUTH_TOKEN_ENV;
 use crate::interface::session::{
     ApprovalMode, ClaudeMode, Cli, LaunchedSession, ProviderSpec, SecretEnv, SessionControl,
@@ -51,22 +52,38 @@ pub fn claude_session_env() -> [(&'static str, String); 4] {
 /// Every way a Claude CLI can be handed a credential through its environment.
 /// A launch carries exactly the ones its own secrets set; any other value
 /// inherited from Cairn's environment (an operator's API key, their own OAuth
-/// token, a host-credentials file) is removed, so a process can only ever
-/// authenticate as the account it was routed to.
-pub const CLAUDE_AUTH_ENV: [&str; 7] = [
-    "ANTHROPIC_API_KEY",
+/// token, a host-credentials file, a descriptor variable pointing at nothing
+/// Cairn opened) is removed, so a process can only ever authenticate as the
+/// account it was routed to.
+pub const CLAUDE_AUTH_ENV: [&str; 8] = [
+    API_KEY_ENV,
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    OAUTH_TOKEN_FD_ENV,
+    API_KEY_FD_ENV,
     "CLAUDE_CODE_HOST_CREDS_FILE",
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
 ];
 
-/// The variable that tells a Claude CLI which inherited descriptor holds its
-/// OAuth token, and the descriptor a launch puts it on.
+/// The variables that tell a Claude CLI which inherited descriptor holds its
+/// OAuth token or its API key, and the descriptor a launch puts either on.
 pub const OAUTH_TOKEN_FD_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR";
-pub const OAUTH_TOKEN_FD: i32 = 3;
+pub const API_KEY_FD_ENV: &str = "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR";
+pub const CREDENTIAL_FD: i32 = 3;
+
+/// Each credential the CLI reads from an inherited descriptor: the name a
+/// launch carries it under, and the variable naming its descriptor. A spawn
+/// hands over one descriptor, so a launch carries at most one of these.
+const DESCRIPTOR_CREDENTIALS: [(&str, &str); 2] = [
+    (OAUTH_TOKEN_ENV, OAUTH_TOKEN_FD_ENV),
+    (API_KEY_ENV, API_KEY_FD_ENV),
+];
+
+/// Why a launch that names no config directory is refused. Without one the CLI
+/// runs in `~/.claude`, where the operator's own hooks, `statusLine`, plugins,
+/// `CLAUDE.md` and MCP servers load inside the agent's process.
+const NO_CONFIG_DIR: &str = "a Claude launch must name its Cairn-owned config directory; it never runs in the user's ~/.claude";
 
 const CREDENTIAL_REQUEST_PREFIX: &str = "cairn-credential-";
 
@@ -105,6 +122,20 @@ impl ClaudeCli {
                 "a tool-free Claude session can only be a new one".to_string(),
             ));
         }
+        if !names_its_config_dir(spec) {
+            return Err(SessionError::Setup(NO_CONFIG_DIR.to_string()));
+        }
+        let carried: Vec<&str> = DESCRIPTOR_CREDENTIALS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| spec.secrets.names().any(|secret| secret == *name))
+            .collect();
+        if carried.len() > 1 {
+            return Err(SessionError::Setup(format!(
+                "a Claude launch authenticates one way, but this one carries {}",
+                carried.join(" and ")
+            )));
+        }
         let bidirectional = claude.mode == ClaudeMode::Interactive;
         let args = build_claude_args(&ClaudeArgsConfig {
             mcp_config: spec.mcp.as_ref().map_or_else(
@@ -134,12 +165,12 @@ impl ClaudeCli {
             config = config.env(name, value);
         }
         let mut secrets = spec.secrets.clone();
-        let (mut config, by_descriptor) = token_by_descriptor(&mut secrets, config);
+        let (mut config, descriptor_env) = credential_by_descriptor(&mut secrets, config);
         // Removals apply after every overlay, so only what this launch does not
-        // set is removed.
+        // set is removed. An inherited `CLAUDE_CONFIG_DIR` needs no removal:
+        // the launch's own, required above, overlays it.
         for name in CLAUDE_AUTH_ENV {
-            let set = secrets.names().any(|secret| secret == name)
-                || (by_descriptor && name == OAUTH_TOKEN_FD_ENV);
+            let set = secrets.names().any(|secret| secret == name) || descriptor_env == Some(name);
             if !set {
                 config = config.env_remove(name);
             }
@@ -148,32 +179,50 @@ impl ClaudeCli {
     }
 }
 
-/// Move the OAuth token, if `secrets` carries one, onto an inherited
-/// descriptor, and answer whether it moved.
-///
-/// A launch environment is readable by every same-user process for as long as
-/// the CLI lives, so the token never goes there. The CLI reads the descriptor
-/// once at startup and keeps the token in memory; a rotation is a stdin push
-/// (`ClaudeControl::update_credential`), which never rewrites the launch
-/// environment either.
-#[cfg(unix)]
-fn token_by_descriptor(secrets: &mut SecretEnv, config: SpawnConfig) -> (SpawnConfig, bool) {
-    match secrets.remove(OAUTH_TOKEN_ENV) {
-        Some(token) => (
-            config
-                .inherited_secret(InheritedSecret::new(OAUTH_TOKEN_FD, token))
-                .env(OAUTH_TOKEN_FD_ENV, &OAUTH_TOKEN_FD.to_string()),
-            true,
-        ),
-        None => (config, false),
-    }
+/// Whether the launch names a non-empty `CLAUDE_CONFIG_DIR` of its own.
+fn names_its_config_dir(spec: &SessionSpec) -> bool {
+    spec.secrets
+        .iter()
+        .chain(
+            spec.env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+        .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && !value.is_empty())
 }
 
-/// The Claude CLI reads no descriptor on Windows, so the token stays in the
-/// launch environment there: a named residual (`docs/backends.md`).
+/// Move the OAuth token or the API key, whichever `secrets` carries, onto an
+/// inherited descriptor, and answer which descriptor variable now names it.
+///
+/// A launch environment is readable by every same-user process for as long as
+/// the CLI lives, so the credential never goes there. The CLI reads the
+/// descriptor once at startup and keeps the credential in memory; an OAuth
+/// rotation is a stdin push (`ClaudeControl::update_credential`), which never
+/// rewrites the launch environment either.
+#[cfg(unix)]
+fn credential_by_descriptor(
+    secrets: &mut SecretEnv,
+    config: SpawnConfig,
+) -> (SpawnConfig, Option<&'static str>) {
+    for (name, descriptor_env) in DESCRIPTOR_CREDENTIALS {
+        if let Some(credential) = secrets.remove(name) {
+            let config = config
+                .inherited_secret(InheritedSecret::new(CREDENTIAL_FD, credential))
+                .env(descriptor_env, &CREDENTIAL_FD.to_string());
+            return (config, Some(descriptor_env));
+        }
+    }
+    (config, None)
+}
+
+/// The Claude CLI reads no descriptor on Windows, so the credential stays in
+/// the launch environment there: a named residual (`docs/identity.md`).
 #[cfg(not(unix))]
-fn token_by_descriptor(_secrets: &mut SecretEnv, config: SpawnConfig) -> (SpawnConfig, bool) {
-    (config, false)
+fn credential_by_descriptor(
+    _secrets: &mut SecretEnv,
+    config: SpawnConfig,
+) -> (SpawnConfig, Option<&'static str>) {
+    (config, None)
 }
 
 impl SessionProvider for ClaudeCli {
@@ -399,7 +448,7 @@ mod tests {
             cwd: "/tmp/worktree".to_string(),
             env: std::collections::BTreeMap::new(),
             mcp: Some(McpServers::new(vec![McpServer::cairn_http("http://o/mcp")]).unwrap()),
-            secrets: SecretEnv::new(),
+            secrets: SecretEnv::new().with("CLAUDE_CONFIG_DIR", "/cairn/claude-home"),
             account_id: None,
             provider: ProviderSpec::Claude(ClaudeSpec {
                 system_prompt: PlacedFile {
@@ -452,7 +501,7 @@ mod tests {
             cwd: "/tmp/scratch".to_string(),
             env: std::collections::BTreeMap::new(),
             mcp: None,
-            secrets: SecretEnv::new(),
+            secrets: SecretEnv::new().with("CLAUDE_CONFIG_DIR", "/cairn/claude-home"),
             account_id: Some("acct".to_string()),
             provider: ProviderSpec::Claude(ClaudeSpec {
                 system_prompt: PlacedFile {
@@ -597,7 +646,7 @@ mod tests {
             cwd: dir.to_string_lossy().into_owned(),
             env: std::collections::BTreeMap::new(),
             mcp: None,
-            secrets: SecretEnv::new(),
+            secrets: SecretEnv::new().with("CLAUDE_CONFIG_DIR", "/cairn/claude-home"),
             account_id: None,
             provider: ProviderSpec::Claude(ClaudeSpec {
                 system_prompt: PlacedFile {
@@ -669,7 +718,16 @@ mod tests {
         assert!(one_shot.update_credential(&env, 8).is_err());
     }
 
-    fn launch_spec(secrets: SecretEnv) -> SessionSpec {
+    /// A launch on `credential`, in the config dir `/cairn/claude-home`.
+    fn launch_spec(credential: SecretEnv) -> SessionSpec {
+        let mut secrets = SecretEnv::new().with("CLAUDE_CONFIG_DIR", CONFIG_DIR);
+        secrets.extend(credential);
+        bare_launch_spec(secrets)
+    }
+
+    const CONFIG_DIR: &str = "/cairn/claude-home";
+
+    fn bare_launch_spec(secrets: SecretEnv) -> SessionSpec {
         use crate::interface::session::{ApprovalMode, ClaudeSpec, PlacedFile};
         SessionSpec {
             start: SessionStart::New {
@@ -699,7 +757,8 @@ mod tests {
     }
 
     /// Every Claude credential variable is removed from what the CLI would
-    /// inherit, except the ones this launch sets itself.
+    /// inherit, except the ones this launch sets itself, and the CLI runs in
+    /// the config dir the launch named.
     fn assert_only_these_set(config: &SpawnConfig, set: &[&str]) {
         for name in CLAUDE_AUTH_ENV {
             assert_eq!(
@@ -708,6 +767,11 @@ mod tests {
                 "{name}: removed unless this launch sets it"
             );
         }
+        assert_eq!(
+            config.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(CONFIG_DIR)
+        );
+        assert!(!config.env_remove.contains(&"CLAUDE_CONFIG_DIR".to_string()));
     }
 
     /// A managed account's token reaches the CLI on its descriptor, announced
@@ -716,11 +780,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_managed_launch_hands_the_token_over_on_a_descriptor() {
-        let spec = launch_spec(
-            SecretEnv::new()
-                .with(OAUTH_TOKEN_ENV, "at-SENTINEL")
-                .with("CLAUDE_CONFIG_DIR", "/home"),
-        );
+        let spec = launch_spec(SecretEnv::new().with(OAUTH_TOKEN_ENV, "at-SENTINEL"));
         let config = ClaudeCli::spawn_config("/bin/claude", &spec, None, None).unwrap();
         assert!(!config.env.contains_key(OAUTH_TOKEN_ENV));
         assert!(!config.env.values().any(|value| value == "at-SENTINEL"));
@@ -732,12 +792,8 @@ mod tests {
             .inherited_secret
             .as_ref()
             .expect("an inherited token");
-        assert_eq!(secret.child_fd(), OAUTH_TOKEN_FD);
+        assert_eq!(secret.child_fd(), CREDENTIAL_FD);
         assert!(secret.is(b"at-SENTINEL"));
-        assert_eq!(
-            config.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some("/home")
-        );
         assert_only_these_set(&config, &[OAUTH_TOKEN_FD_ENV]);
     }
 
@@ -754,16 +810,100 @@ mod tests {
         assert_only_these_set(&config, &[OAUTH_TOKEN_ENV]);
     }
 
-    /// A launch on an API key takes only that key, from its environment.
+    /// An API key reaches the CLI the way a managed token does: on its
+    /// descriptor, announced by name, and never in its environment.
+    #[cfg(unix)]
     #[test]
-    fn an_api_key_launch_carries_only_its_key() {
-        let spec = launch_spec(SecretEnv::new().with("ANTHROPIC_API_KEY", "sk-SENTINEL"));
+    fn an_api_key_launch_hands_the_key_over_on_a_descriptor() {
+        let spec = launch_spec(SecretEnv::new().with(API_KEY_ENV, "sk-SENTINEL"));
         let config = ClaudeCli::spawn_config("/bin/claude", &spec, None, None).unwrap();
+        assert!(!config.env.contains_key(API_KEY_ENV));
+        assert!(!config.env.values().any(|value| value == "sk-SENTINEL"));
         assert_eq!(
-            config.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            config.env.get(API_KEY_FD_ENV).map(String::as_str),
+            Some("3")
+        );
+        let secret = config.inherited_secret.as_ref().expect("an inherited key");
+        assert_eq!(secret.child_fd(), CREDENTIAL_FD);
+        assert!(secret.is(b"sk-SENTINEL"));
+        assert_only_these_set(&config, &[API_KEY_FD_ENV]);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn an_api_key_launch_keeps_the_key_in_the_environment_where_no_descriptor_exists() {
+        let spec = launch_spec(SecretEnv::new().with(API_KEY_ENV, "sk-SENTINEL"));
+        let config = ClaudeCli::spawn_config("claude", &spec, None, None).unwrap();
+        assert_eq!(
+            config.env.get(API_KEY_ENV).map(String::as_str),
             Some("sk-SENTINEL")
         );
         assert!(config.inherited_secret.is_none());
-        assert_only_these_set(&config, &["ANTHROPIC_API_KEY"]);
+        assert_only_these_set(&config, &[API_KEY_ENV]);
+    }
+
+    /// Nothing can fall through to `~/.claude`: a launch that names no config
+    /// dir, or names an empty one, does not start.
+    #[test]
+    fn a_launch_without_a_config_dir_is_refused() {
+        for secrets in [
+            SecretEnv::new().with(API_KEY_ENV, "sk-SENTINEL"),
+            SecretEnv::new()
+                .with(API_KEY_ENV, "sk-SENTINEL")
+                .with("CLAUDE_CONFIG_DIR", ""),
+        ] {
+            let spec = bare_launch_spec(secrets);
+            match ClaudeCli::spawn_config("/bin/claude", &spec, None, None) {
+                Err(SessionError::Setup(reason)) => assert_eq!(reason, NO_CONFIG_DIR),
+                other => panic!("expected a refusal, got {:?}", other.map(|c| c.env)),
+            }
+        }
+    }
+
+    /// What Cairn's own environment holds never decides the CLI's home or its
+    /// credential: an inherited `CLAUDE_CONFIG_DIR` is overlaid by the launch's
+    /// own, and an inherited API-key descriptor variable is removed from a
+    /// launch that set none.
+    #[test]
+    fn an_inherited_config_dir_or_api_key_descriptor_never_reaches_the_child() {
+        let spec = launch_spec(SecretEnv::new().with(OAUTH_TOKEN_ENV, "at-SENTINEL"));
+        let config = ClaudeCli::spawn_config("/bin/claude", &spec, None, None).unwrap();
+        assert!(config.env_remove.contains(&API_KEY_FD_ENV.to_string()));
+        assert!(config.env_remove.contains(&API_KEY_ENV.to_string()));
+        assert_eq!(
+            config.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(CONFIG_DIR)
+        );
+
+        // The same holds when the config dir arrives in the plain environment
+        // rather than with the credential.
+        let mut spec = bare_launch_spec(SecretEnv::new().with(API_KEY_ENV, "sk-SENTINEL"));
+        spec.env
+            .insert("CLAUDE_CONFIG_DIR".to_string(), CONFIG_DIR.to_string());
+        let config = ClaudeCli::spawn_config("/bin/claude", &spec, None, None).unwrap();
+        assert!(config.env_remove.contains(&OAUTH_TOKEN_FD_ENV.to_string()));
+        assert_eq!(
+            config.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some(CONFIG_DIR)
+        );
+    }
+
+    /// One descriptor, one credential: a launch carrying both a managed token
+    /// and an API key is refused rather than one being silently chosen.
+    #[test]
+    fn a_launch_carrying_both_credentials_is_refused() {
+        let spec = launch_spec(
+            SecretEnv::new()
+                .with(OAUTH_TOKEN_ENV, "at-SENTINEL")
+                .with(API_KEY_ENV, "sk-SENTINEL"),
+        );
+        match ClaudeCli::spawn_config("/bin/claude", &spec, None, None) {
+            Err(SessionError::Setup(reason)) => {
+                assert!(reason.contains(API_KEY_ENV), "{reason}");
+                assert!(reason.contains(OAUTH_TOKEN_ENV), "{reason}");
+                assert!(!reason.contains("SENTINEL"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|c| c.env)),
+        }
     }
 }

@@ -121,6 +121,12 @@ pub enum ReadBudget {
     /// under [`CLIENT_TOOL_RESULT_BYTE_CEILING`], with a continue footer for
     /// whatever did not fit.
     Context,
+    /// [`Self::Context`] for a caller that frames the composed segments with
+    /// up to `frame_bytes` of its own text: a `run` item served as a read,
+    /// whose result carries item headers and labels the read did not. The
+    /// composed text keeps that much under the client byte ceiling, so the
+    /// framed result still lands below it.
+    FramedContext { frame_bytes: usize },
     /// The read lands in code that parses it, with no context window to
     /// protect and no agent to follow a footer. Every target renders whole; a
     /// target whose section would exceed `byte_ceiling` bytes is refused in
@@ -605,10 +611,27 @@ fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
     )
 }
 
+/// The label a composed read frames a rendered segment with: its URI and
+/// bracketed suffix, without the `=== … ===` fence. `meta` is the rendered
+/// segment's final metadata (an envelope's `segments`), whose `shown_units` and
+/// `truncated` are what the frame was rendered from, so this reproduces that
+/// frame's label exactly. For a caller that frames segments its own way.
+pub fn segment_label(meta: &SegmentMeta) -> String {
+    label_with_suffix(
+        meta,
+        segment_suffix(meta, meta.shown_units)
+            .or_else(|| meta.truncated.then(|| "truncated".into())),
+    )
+}
+
 fn header_with_suffix(meta: &SegmentMeta, suffix: Option<String>) -> String {
+    format!("=== {} ===", label_with_suffix(meta, suffix))
+}
+
+fn label_with_suffix(meta: &SegmentMeta, suffix: Option<String>) -> String {
     match meta.kind {
-        SegmentKind::Error => return format!("=== {} [error] ===", meta.uri),
-        SegmentKind::Duplicate => return format!("=== {} [duplicate] ===", meta.uri),
+        SegmentKind::Error => return format!("{} [error]", meta.uri),
+        SegmentKind::Duplicate => return format!("{} [duplicate]", meta.uri),
         _ => {}
     }
     // The revision leads: which tree answered comes before how much of it is
@@ -619,8 +642,8 @@ fn header_with_suffix(meta: &SegmentMeta, suffix: Option<String>) -> String {
         (None, suffix) => suffix,
     };
     match suffix {
-        Some(suffix) => format!("=== {} [{}] ===", meta.uri, suffix),
-        None => format!("=== {} ===", meta.uri),
+        Some(suffix) => format!("{} [{}]", meta.uri, suffix),
+        None => meta.uri.clone(),
     }
 }
 
@@ -1237,12 +1260,24 @@ fn assemble_inner(
     budget: ReadBudget,
     meter: &dyn TokenMeter,
 ) -> ReadBatchEnvelope {
-    if let ReadBudget::Whole { byte_ceiling } = budget {
-        return assemble_whole(&segments, include_bodies, byte_ceiling);
-    }
+    let ceiling = match budget {
+        ReadBudget::Whole { byte_ceiling } => {
+            return assemble_whole(&segments, include_bodies, byte_ceiling)
+        }
+        ReadBudget::Context => CLIENT_TOOL_RESULT_BYTE_CEILING,
+        ReadBudget::FramedContext { frame_bytes } => {
+            CLIENT_TOOL_RESULT_BYTE_CEILING.saturating_sub(frame_bytes)
+        }
+    };
     let meter = Metering::new(meter);
-    if let Some(envelope) = assemble_fitting(&segments, Carried::ALL, include_bodies, &meter, None)
-    {
+    if let Some(envelope) = assemble_fitting(
+        &segments,
+        Carried::ALL,
+        include_bodies,
+        &meter,
+        None,
+        ceiling,
+    ) {
         return envelope;
     }
 
@@ -1256,6 +1291,7 @@ fn assemble_inner(
             include_bodies,
             &meter,
             Some(AFFORDANCE_ELISION),
+            ceiling,
         ) {
             return envelope;
         }
@@ -1272,6 +1308,7 @@ fn assemble_inner(
             include_bodies,
             &meter,
             Some(METADATA_ELISION),
+            ceiling,
         ) {
             return envelope;
         }
@@ -1326,13 +1363,14 @@ fn assemble_fitting<'t>(
     include_bodies: bool,
     meter: &Metering<'t, '_>,
     marker: Option<&str>,
+    ceiling: usize,
 ) -> Option<ReadBatchEnvelope> {
     let finish = |mut envelope: ReadBatchEnvelope| {
         if let Some(marker) = marker {
             envelope.text.push_str("\n\n");
             envelope.text.push_str(marker);
         }
-        (envelope.text.len() <= CLIENT_TOOL_RESULT_BYTE_CEILING).then_some(envelope)
+        (envelope.text.len() <= ceiling).then_some(envelope)
     };
     let share = FairShare::new(segments, carried, meter);
     let at_budget =
@@ -2618,6 +2656,65 @@ mod tests {
         assert!(rendered.text.contains("required header exceeds"));
         assert_eq!(rendered.meta.uri, uri);
         assert!(rendered.meta.truncated);
+    }
+
+    /// A caller that frames segments itself labels each one exactly as the
+    /// composed read framed it, truncation suffix and all.
+    #[test]
+    fn segment_label_reproduces_each_composed_frame() {
+        let long = (1..=4_000)
+            .map(|line| format!("{line:>6}\tline {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let segments = vec![
+            file_seg("file:small.rs", "     1\tone", 1, 0),
+            file_seg("file:big.rs", &long, 4_000, 0),
+            error_segment("file:missing.rs", "Entered path does not exist"),
+        ];
+        let envelope = assemble_with_bodies(segments, ReadBudget::Context, &BYTE_METER);
+        let bodies = envelope.bodies.as_ref().unwrap();
+        for (meta, body) in envelope.segments.iter().zip(bodies) {
+            let frame = format!("=== {} ===", segment_label(meta));
+            let section = if body.is_empty() {
+                frame.clone()
+            } else {
+                format!("{frame}\n{body}")
+            };
+            assert!(
+                envelope.text.contains(&section),
+                "{frame} must frame its body in the composed text"
+            );
+        }
+        assert!(envelope.segments[1].truncated);
+        assert_eq!(
+            segment_label(&envelope.segments[2]),
+            "file:missing.rs [error]"
+        );
+    }
+
+    /// A framed composition leaves its caller's framing room under the client
+    /// ceiling, where an unframed one fills to the ceiling itself.
+    #[test]
+    fn framed_context_reserves_the_callers_framing_bytes() {
+        let body = (1..=20_000)
+            .map(|line| format!("{line:>6}\tline {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let segment = || file_seg("file:big.rs", &body, 20_000, 0);
+        // The byte meter makes the token budget a 20,000-byte one, so the
+        // reservation has to reach below it for the ceiling to be what binds.
+        let frame_bytes = 30_000;
+        let ceiling = CLIENT_TOOL_RESULT_BYTE_CEILING - frame_bytes;
+        let unframed = assemble(vec![segment()], ReadBudget::Context, &BYTE_METER);
+        let framed = assemble(
+            vec![segment()],
+            ReadBudget::FramedContext { frame_bytes },
+            &BYTE_METER,
+        );
+        assert!(unframed.text.len() > ceiling);
+        assert!(framed.text.len() <= ceiling);
+        assert!(framed.segments[0].truncated);
+        assert!(framed.text.contains("continue:"));
     }
 
     #[test]

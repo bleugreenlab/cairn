@@ -1101,6 +1101,18 @@ async fn run_repl_send(
     }
 }
 
+/// Close an item's body with its exit status, the way every failed item states
+/// it. A zero status says nothing.
+pub(super) fn append_exit_code(body: &mut String, code: i32) {
+    if code == 0 {
+        return;
+    }
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    body.push_str(&format!("Exit code: {code}"));
+}
+
 /// Format process output into the human-readable body shown for an item.
 fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
     let mut result = String::new();
@@ -1118,12 +1130,7 @@ fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
         result.push_str(&exec.stderr);
     }
     if let Some(code) = exec.exit_code {
-        if code != 0 {
-            if !result.is_empty() {
-                result.push_str("\n\n");
-            }
-            result.push_str(&format!("Exit code: {}", code));
-        }
+        append_exit_code(&mut result, code);
     }
     if let Some(note) = &exec.setuid_refusal {
         result.push_str("\n\n");

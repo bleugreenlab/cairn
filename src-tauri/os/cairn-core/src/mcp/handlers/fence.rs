@@ -377,6 +377,69 @@ pub(crate) async fn raise_fence_with_handoff(
     crossing: Crossing,
     handoff: Handoff,
 ) -> FenceDecision {
+    if let Some(decision) = decide_without_asking(orch, fence, &crossing) {
+        return decision;
+    }
+
+    // Stable tool_use id so the slow-path resume attaches the synthetic
+    // result to the verb call the agent is waiting on.
+    let tool_use_id = request
+        .tool_use_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Embed the originating request (with the resolved run_id) so resume
+    // can re-dispatch the exact verb call.
+    let mut embedded = request.clone();
+    embedded.run_id = Some(run_id.to_string());
+    embedded.tool_use_id = Some(tool_use_id.clone());
+
+    let tool_input = serde_json::json!({
+        "kind": crossing.kind.tag(),
+        "verb": crossing.verb,
+        "descriptor": crossing.descriptor,
+        "summary": crossing.summary,
+        "request": embedded,
+    });
+
+    match await_permission_decision(
+        orch,
+        run_id,
+        &tool_use_id,
+        crossing.verb,
+        &tool_input,
+        handoff,
+    )
+    .await
+    {
+        PermissionWait::Decided(response) => {
+            if response_is_allow(&response) {
+                FenceDecision::Allow
+            } else {
+                FenceDecision::Deny(format!(
+                    "Denied by logical namespace fence: {}",
+                    crossing.summary
+                ))
+            }
+        }
+        PermissionWait::Suspended => FenceDecision::Suspended,
+        PermissionWait::Unavailable(error) => FenceDecision::Unavailable(error),
+        PermissionWait::Withdrawn(cause) => FenceDecision::Unavailable(format!(
+            "the permission for this crossing was withdrawn: {}",
+            cause.sentence()
+        )),
+    }
+}
+
+/// The decision a crossing gets without asking anyone: refused, allowed by the
+/// fence policy, or allowed by a session grant. `None` means only a prompt can
+/// answer it, and nothing has been recorded yet, so a caller that must never
+/// ask (a `run` item served as a read) can decline the crossing here instead.
+pub(crate) fn decide_without_asking(
+    orch: &Orchestrator,
+    fence: Fence,
+    crossing: &Crossing,
+) -> Option<FenceDecision> {
     // A crossing that names a protected host path is refused outright, ahead of
     // the fence policy and ahead of the session-grant short circuit.
     //
@@ -395,7 +458,7 @@ pub(crate) async fn raise_fence_with_handoff(
         if let Some(refusal) =
             crate::authorization::protected::denied_path_refusal(&orch.config_dir, path)
         {
-            return FenceDecision::Deny(refusal.to_string());
+            return Some(FenceDecision::Deny(refusal.to_string()));
         }
     }
 
@@ -408,72 +471,26 @@ pub(crate) async fn raise_fence_with_handoff(
     // escape is spending nobody's attention, and its command does what it
     // says once unsandboxed.
     match fence {
-        Fence::Allow => FenceDecision::Allow,
-        Fence::Deny => FenceDecision::Deny(crossing.route_refusal().unwrap_or_else(|| {
-            format!(
-                "Denied by agent fence policy (fence: deny): {}",
-                crossing.summary
-            )
-        })),
+        Fence::Allow => Some(FenceDecision::Allow),
+        Fence::Deny => Some(FenceDecision::Deny(
+            crossing.route_refusal().unwrap_or_else(|| {
+                format!(
+                    "Denied by agent fence policy (fence: deny): {}",
+                    crossing.summary
+                )
+            }),
+        )),
         Fence::Ask => {
             if let Some(refusal) = crossing.route_refusal() {
-                return FenceDecision::Deny(refusal);
+                return Some(FenceDecision::Deny(refusal));
             }
             // A session grant for this descriptor short-circuits to allow.
             if let Ok(allowed) = orch.session_allowed_crossings.lock() {
                 if allowed.contains(&crossing.descriptor) {
-                    return FenceDecision::Allow;
+                    return Some(FenceDecision::Allow);
                 }
             }
-
-            // Stable tool_use id so the slow-path resume attaches the synthetic
-            // result to the verb call the agent is waiting on.
-            let tool_use_id = request
-                .tool_use_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-            // Embed the originating request (with the resolved run_id) so resume
-            // can re-dispatch the exact verb call.
-            let mut embedded = request.clone();
-            embedded.run_id = Some(run_id.to_string());
-            embedded.tool_use_id = Some(tool_use_id.clone());
-
-            let tool_input = serde_json::json!({
-                "kind": crossing.kind.tag(),
-                "verb": crossing.verb,
-                "descriptor": crossing.descriptor,
-                "summary": crossing.summary,
-                "request": embedded,
-            });
-
-            match await_permission_decision(
-                orch,
-                run_id,
-                &tool_use_id,
-                crossing.verb,
-                &tool_input,
-                handoff,
-            )
-            .await
-            {
-                PermissionWait::Decided(response) => {
-                    if response_is_allow(&response) {
-                        FenceDecision::Allow
-                    } else {
-                        FenceDecision::Deny(format!(
-                            "Denied by logical namespace fence: {}",
-                            crossing.summary
-                        ))
-                    }
-                }
-                PermissionWait::Suspended => FenceDecision::Suspended,
-                PermissionWait::Unavailable(error) => FenceDecision::Unavailable(error),
-                PermissionWait::Withdrawn(cause) => FenceDecision::Unavailable(format!(
-                    "the permission for this crossing was withdrawn: {}",
-                    cause.sentence()
-                )),
-            }
+            None
         }
     }
 }

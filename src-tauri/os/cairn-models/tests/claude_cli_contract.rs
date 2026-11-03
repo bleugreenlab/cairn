@@ -20,17 +20,25 @@
 //! [`ClaudeCli::spawn_config`], so the test pins Cairn's arguments rather
 //! than a copy of them.
 //!
-//! It also holds the CLI to how Cairn hands it the token: on an inherited
-//! descriptor (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`), so the token is in
-//! neither the CLI's launch environment, which every same-user process can
-//! read, nor anything the CLI starts, and no token endpoint is ever called.
+//! It also holds the CLI to how Cairn hands it a credential: on an inherited
+//! descriptor (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` for a managed
+//! account's token, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` for an API key), so
+//! the credential is in neither the CLI's launch environment, which every
+//! same-user process can read, nor anything the CLI starts, nor any file it
+//! writes, and no token endpoint is ever called.
+//!
+//! And it holds the CLI to the home Cairn names: every launch carries its own
+//! `CLAUDE_CONFIG_DIR`, and with it the operator's `~/.claude` (their hooks,
+//! `statusLine`, `CLAUDE.md`, and `~/.claude.json` MCP servers) loads into no
+//! launch.
 //!
 //! It runs the real `claude` from PATH, in a fresh home, against a loopback
 //! Messages API stub (and, for the tool surface, a loopback MCP server), with
 //! every HTTPS request sent to a proxy that records and refuses it. Every launch
 //! is Cairn's own: the arguments and environment of [`ClaudeCli::spawn_config`],
-//! the credential of [`ClaudeSessionCredential::for_launch`], spawned by
-//! [`RealProcessSpawner`]. Only dummy tokens are used. Where no `claude` is
+//! the credential and home of [`ClaudeSessionCredential::for_launch`] or
+//! [`api_key_launch`], spawned by [`RealProcessSpawner`]. Only dummy tokens
+//! and keys are used. Where no `claude` is
 //! installed it skips; where one is, a CLI upgrade that drops the contract
 //! fails here.
 //!
@@ -50,13 +58,14 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cairn_models::claude::api_key::{api_key_launch, API_KEY_ENV};
 use cairn_models::claude::tokens::{ClaudeOAuth, ClaudeSessionCredential, OAUTH_TOKEN_ENV};
 use cairn_models::interface::session::{
     ApprovalMode, ClaudeMode, ClaudeSpec, PlacedFile, ProviderSpec, SecretEnv, SessionControl,
     SessionSpec, SessionStart,
 };
 use cairn_models::session::claude::{
-    credential_push_generation, ClaudeCli, ClaudeControl, OAUTH_TOKEN_FD_ENV,
+    credential_push_generation, ClaudeCli, ClaudeControl, API_KEY_FD_ENV, OAUTH_TOKEN_FD_ENV,
 };
 use cairn_models::session::mcp::{McpServer, McpServers, McpTransport, MCP_TOKEN_ENV};
 use cairn_models::wire::claude_stream::send_user_message;
@@ -66,12 +75,18 @@ use serde_json::{json, Value};
 
 const WAIT: Duration = Duration::from_secs(90);
 
+/// A credential's variable and the variable naming its descriptor.
+const OAUTH: (&str, &str) = (OAUTH_TOKEN_ENV, OAUTH_TOKEN_FD_ENV);
+const API_KEY: (&str, &str) = (API_KEY_ENV, API_KEY_FD_ENV);
+
 /// A Messages API that answers every request whose bearer token it has not
-/// been told to refuse, and records which token each request carried and
-/// which tools it offered the model.
+/// been told to refuse, and records which token or API key each request
+/// carried, what it sent, and which tools it offered the model.
 struct Stub {
     base_url: String,
     seen: Arc<Mutex<Vec<(String, String)>>>,
+    api_keys: Arc<Mutex<Vec<(String, String)>>>,
+    inference_bodies: Arc<Mutex<Vec<String>>>,
     refused: Arc<Mutex<Vec<String>>>,
     offered: Arc<Mutex<Vec<Vec<String>>>>,
 }
@@ -193,12 +208,20 @@ impl Stub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let api_keys: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let inference_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let refused: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let offered: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
-        let (record, refuse, offer) = (seen.clone(), refused.clone(), offered.clone());
+        let shared = (
+            seen.clone(),
+            api_keys.clone(),
+            inference_bodies.clone(),
+            refused.clone(),
+            offered.clone(),
+        );
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let (record, refuse, offer) = (record.clone(), refuse.clone(), offer.clone());
+                let (record, record_key, keep_body, refuse, offer) = shared.clone();
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut request_line = String::new();
@@ -210,7 +233,8 @@ impl Stub {
                         .nth(1)
                         .unwrap_or("")
                         .to_string();
-                    let (mut length, mut token) = (0usize, String::new());
+                    let (mut length, mut token, mut api_key) =
+                        (0usize, String::new(), String::new());
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -222,17 +246,22 @@ impl Stub {
                                 length = value.parse().unwrap_or(0);
                             } else if name.eq_ignore_ascii_case("authorization") {
                                 token = value.trim_start_matches("Bearer ").to_string();
+                            } else if name.eq_ignore_ascii_case("x-api-key") {
+                                api_key = value.to_string();
                             }
                         }
                     }
                     let mut body = vec![0u8; length];
                     let _ = reader.read_exact(&mut body);
+                    let raw_body = String::from_utf8_lossy(&body).into_owned();
                     let body = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
                     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
                     let tools = offered_tools(&body);
                     record.lock().unwrap().push((path.clone(), token.clone()));
+                    record_key.lock().unwrap().push((path.clone(), api_key));
                     if path.starts_with("/v1/messages") && !path.contains("count_tokens") {
                         offer.lock().unwrap().push(tools.clone());
+                        keep_body.lock().unwrap().push(raw_body);
                     }
                     let structured = matches!(answer, Answer::StructuredOutput)
                         && tools.iter().any(|tool| tool == "StructuredOutput")
@@ -266,9 +295,32 @@ impl Stub {
         Self {
             base_url,
             seen,
+            api_keys,
+            inference_bodies,
             refused,
             offered,
         }
+    }
+
+    /// The API keys inference requests carried, in order (empty for one that
+    /// carried none).
+    fn inference_api_keys(&self) -> Vec<String> {
+        self.api_keys
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with("/v1/messages") && !path.contains("count_tokens"))
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+
+    /// Whether any inference request sent `needle` to the model.
+    fn sent_to_the_model(&self, needle: &str) -> bool {
+        self.inference_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|body| body.contains(needle))
     }
 
     /// The tool names each inference request offered the model, in order.
@@ -461,8 +513,13 @@ struct Home {
 
 impl Home {
     fn new() -> Self {
+        Self::with_config("claude-home")
+    }
+
+    /// A home whose CLI home is `relative` inside it.
+    fn with_config(relative: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("claude-home");
+        let config = dir.path().join(relative);
         std::fs::create_dir_all(&config).unwrap();
         Self { dir, config }
     }
@@ -545,29 +602,35 @@ impl Cli {
         self.until("a result", |event| event["type"] == "result")
     }
 
-    /// The CLI's launch environment holds none of `tokens` and does not name
-    /// the token variable; it does name the descriptor variable. The stub's
-    /// address, which the launch does put there, is the control that the
-    /// environment was read at all.
-    fn assert_launch_environment_holds_none_of(&self, tokens: &[&str], stub: &Stub) {
+    /// The CLI's launch environment holds none of `secrets` and does not name
+    /// the credential's variable; it does name the variable of the descriptor
+    /// that holds it (`credential` is the pair, [`OAUTH`] or [`API_KEY`]). The
+    /// stub's address, which the launch does put there, is the control that
+    /// the environment was read at all.
+    fn assert_launch_environment_holds_none_of(
+        &self,
+        secrets: &[&str],
+        stub: &Stub,
+        (credential_env, descriptor_env): (&str, &str),
+    ) {
         let env = LaunchEnvironment::of(self.child.id());
         assert!(
             env.holds(&stub.base_url),
             "the launch environment reader read nothing"
         );
-        for token in tokens {
+        for secret in secrets {
             assert!(
-                !env.holds(token),
-                "a token is in the CLI's launch environment"
+                !env.holds(secret),
+                "a credential is in the CLI's launch environment"
             );
         }
         assert!(
-            !env.names().any(|name| name == OAUTH_TOKEN_ENV),
-            "the CLI's launch environment names {OAUTH_TOKEN_ENV}"
+            !env.names().any(|name| name == credential_env),
+            "the CLI's launch environment names {credential_env}"
         );
         assert!(
-            env.names().any(|name| name == OAUTH_TOKEN_FD_ENV),
-            "the CLI was not told which descriptor holds its token"
+            env.names().any(|name| name == descriptor_env),
+            "the CLI was not told which descriptor holds its credential ({descriptor_env})"
         );
     }
 
@@ -748,6 +811,8 @@ fn launch_credential(token: &str, home: &Home) -> SecretEnv {
 /// Launch the CLI exactly as Cairn launches `spec`: the arguments and
 /// environment `ClaudeCli::spawn_config` gives it, spawned by Cairn's own
 /// spawner, with nothing inherited beyond the sealed environment and `env`.
+/// The CLI home is the one the spec's credential names, never one this harness
+/// overrides, so the launch runs where Cairn's would.
 fn launch_as_cairn(
     claude: &str,
     stub: &Stub,
@@ -758,10 +823,14 @@ fn launch_as_cairn(
 ) -> Cli {
     let proxy = refusing_proxy();
     let mut config = ClaudeCli::spawn_config(claude, spec, None, settings).unwrap();
+    assert_eq!(
+        config.env.get("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        Some(home.config.clone()),
+        "the launch runs in the home its credential names"
+    );
     let sealed = [
         ("PATH", std::env::var("PATH").unwrap_or_default()),
         ("HOME", home.path().display().to_string()),
-        ("CLAUDE_CONFIG_DIR", home.config.display().to_string()),
         ("ANTHROPIC_BASE_URL", stub.base_url.clone()),
         // The CLI sends everything through its proxy, plain HTTP included;
         // only the loopback stubs are exempt.
@@ -845,7 +914,7 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
     let home = Home::new();
     let spec = spec(
         &home,
-        "at-OLD",
+        launch_credential("at-OLD", &home),
         None,
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
@@ -861,7 +930,7 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
         stub.inference_tokens().last().map(String::as_str),
         Some("at-OLD")
     );
-    cli.assert_launch_environment_holds_none_of(&["at-OLD"], &stub);
+    cli.assert_launch_environment_holds_none_of(&["at-OLD"], &stub, OAUTH);
 
     // Between turns: the old token is now refused, and the pushed one is what
     // the next turn sends.
@@ -895,7 +964,7 @@ fn a_pushed_token_is_used_between_turns_and_rescues_a_turn_waiting_on_a_401() {
 
     // A push changes only the process's memory, never the block every
     // same-user process can read.
-    cli.assert_launch_environment_holds_none_of(&["at-OLD", "at-NEW", "at-NEWER"], &stub);
+    cli.assert_launch_environment_holds_none_of(&["at-OLD", "at-NEW", "at-NEWER"], &stub, OAUTH);
     cli.assert_no_token_was_fetched();
 }
 
@@ -910,6 +979,109 @@ else
 fi
 "#;
 
+/// Hooks and a stdio MCP server (which is how `cairn-cmd` runs) that each
+/// run [`PROBE`], recording into `probes` what they inherited.
+struct Probes {
+    probes: PathBuf,
+    settings: PathBuf,
+    servers: McpServers,
+}
+
+impl Probes {
+    fn in_home(home: &Home) -> Self {
+        let probes = home.path().join("probes");
+        std::fs::create_dir_all(&probes).unwrap();
+        let probe = home.path().join("probe.sh");
+        std::fs::write(&probe, PROBE).unwrap();
+        let (probe, probes_dir) = (probe.display().to_string(), probes.display().to_string());
+        let hook = |event: &str| json!([{"hooks": [{"type": "command", "command": format!("/bin/sh {probe} {probes_dir} hook-{event}")}]}]);
+        let settings = home.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            json!({"hooks": {
+                "SessionStart": hook("SessionStart"),
+                "UserPromptSubmit": hook("UserPromptSubmit"),
+                "Stop": hook("Stop"),
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let servers = McpServers::new(vec![McpServer {
+            name: "probe".to_string(),
+            transport: McpTransport::Stdio {
+                command: "/bin/sh".to_string(),
+                args: vec![probe, probes_dir, "mcp".to_string()],
+                env: Default::default(),
+                inherit_env: Vec::new(),
+            },
+            required_tools: Vec::new(),
+        }])
+        .unwrap();
+        Self {
+            probes,
+            settings,
+            servers,
+        }
+    }
+
+    fn settings(&self) -> Option<String> {
+        Some(self.settings.display().to_string())
+    }
+
+    /// The probes whose state file names start with `prefix`. Each probe
+    /// writes its state file last, so one that exists is complete.
+    fn states(&self, prefix: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.probes)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(prefix) && name.ends_with(".state")
+            })
+            .collect()
+    }
+
+    /// Every hook and the MCP server ran, and none of them inherited `secret`
+    /// or a variable named `credential_env`, or read `secret` from
+    /// descriptor 3. With `descriptor_closed`, none of them holds descriptor 3
+    /// at all.
+    fn assert_none_saw(&self, secret: &str, credential_env: &str, descriptor_closed: bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.states("hook-").is_empty() || self.states("mcp-").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the hooks and the MCP server never ran"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        for state in self.states("hook-").into_iter().chain(self.states("mcp-")) {
+            let who = state.file_stem().unwrap().to_string_lossy().into_owned();
+            let env = std::fs::read_to_string(state.with_extension("env")).unwrap();
+            assert!(
+                !env.contains(secret),
+                "{who}: the credential is in its environment"
+            );
+            assert!(
+                !env.lines()
+                    .any(|line| line.starts_with(&format!("{credential_env}="))),
+                "{who}: its environment names {credential_env}"
+            );
+            let fd3 = std::fs::read(state.with_extension("fd3")).unwrap();
+            assert!(
+                !fd3.windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "{who}: read the credential from descriptor 3"
+            );
+            let descriptor = std::fs::read_to_string(&state).unwrap();
+            eprintln!("{who}: descriptor 3 {}", descriptor.trim());
+            if descriptor_closed {
+                assert_eq!(descriptor.trim(), "closed", "{who}: holds descriptor 3");
+            }
+        }
+    }
+}
+
 /// What the CLI starts (its hooks, and a stdio MCP server, which is how
 /// `cairn-cmd` runs) never sees the token: not in its environment, and not on
 /// descriptor 3, which it either does not hold or finds already drained.
@@ -923,51 +1095,17 @@ fn nothing_the_cli_starts_sees_the_token() {
     const TOKEN: &str = "at-DESCRIPTOR";
     let stub = Stub::start();
     let home = Home::new();
-    let probes = home.path().join("probes");
-    std::fs::create_dir_all(&probes).unwrap();
-    let probe = home.path().join("probe.sh");
-    std::fs::write(&probe, PROBE).unwrap();
-    let (probe, probes_dir) = (probe.display().to_string(), probes.display().to_string());
-    let hook = |event: &str| json!([{"hooks": [{"type": "command", "command": format!("/bin/sh {probe} {probes_dir} hook-{event}")}]}]);
-    let settings = home.path().join("settings.json");
-    std::fs::write(
-        &settings,
-        json!({"hooks": {
-            "SessionStart": hook("SessionStart"),
-            "UserPromptSubmit": hook("UserPromptSubmit"),
-            "Stop": hook("Stop"),
-        }})
-        .to_string(),
-    )
-    .unwrap();
-    let servers = McpServers::new(vec![McpServer {
-        name: "probe".to_string(),
-        transport: McpTransport::Stdio {
-            command: "/bin/sh".to_string(),
-            args: vec![probe.clone(), probes_dir.clone(), "mcp".to_string()],
-            env: Default::default(),
-            inherit_env: Vec::new(),
-        },
-        required_tools: Vec::new(),
-    }])
-    .unwrap();
+    let probes = Probes::in_home(&home);
     let spec = spec(
         &home,
-        TOKEN,
-        Some(servers),
+        launch_credential(TOKEN, &home),
+        Some(probes.servers.clone()),
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
         None,
         Vec::new(),
     );
-    let mut cli = launch_as_cairn(
-        &claude,
-        &stub,
-        home,
-        &spec,
-        Some(settings.display().to_string()),
-        &[],
-    );
+    let mut cli = launch_as_cairn(&claude, &stub, home, &spec, probes.settings(), &[]);
 
     cli.send("turn one");
     let result = cli.turn_result();
@@ -976,59 +1114,254 @@ fn nothing_the_cli_starts_sees_the_token() {
         stub.inference_tokens().last().map(String::as_str),
         Some(TOKEN)
     );
-    cli.assert_launch_environment_holds_none_of(&[TOKEN], &stub);
+    cli.assert_launch_environment_holds_none_of(&[TOKEN], &stub, OAUTH);
+    probes.assert_none_saw(TOKEN, OAUTH_TOKEN_ENV, false);
+}
 
-    // Each probe writes its state file last, so one that exists is complete.
-    let states = |prefix: &str| -> Vec<PathBuf> {
-        std::fs::read_dir(&probes)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                let name = path.file_name().unwrap().to_string_lossy();
-                name.starts_with(prefix) && name.ends_with(".state")
-            })
-            .collect()
-    };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while states("hook-").is_empty() || states("mcp-").is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "the hooks and the MCP server never ran"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+/// A dummy key in the shape of a real Anthropic API key.
+const API_KEY_VALUE: &str = "sk-ant-api03-DUMMY-contract-key-000000000000000000000000-0000AA";
+
+/// The file under `dir` that holds `needle`, if any. Symlinks are not followed.
+fn file_holding(dir: &Path, needle: &[u8]) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            if let Some(found) = file_holding(&path, needle) {
+                return Some(found);
+            }
+        } else if kind.is_file()
+            && std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+        {
+            return Some(path);
+        }
     }
-    for state in states("hook-").into_iter().chain(states("mcp-")) {
-        let who = state.file_stem().unwrap().to_string_lossy().into_owned();
-        let env = std::fs::read_to_string(state.with_extension("env")).unwrap();
-        assert!(
-            !env.contains(TOKEN),
-            "{who}: the token is in its environment"
-        );
-        assert!(
-            !env.lines()
-                .any(|line| line.starts_with(&format!("{OAUTH_TOKEN_ENV}="))),
-            "{who}: its environment names {OAUTH_TOKEN_ENV}"
-        );
-        let fd3 = std::fs::read(state.with_extension("fd3")).unwrap();
-        assert!(
-            !fd3.windows(TOKEN.len())
-                .any(|window| window == TOKEN.as_bytes()),
-            "{who}: read the token from descriptor 3"
-        );
-        eprintln!(
-            "{who}: descriptor 3 {}",
-            std::fs::read_to_string(&state).unwrap().trim()
+    None
+}
+
+/// Neither the key nor the suffix the CLI keeps of an approved key is in any
+/// file under `dir`.
+fn assert_no_file_holds_the_key(dir: &Path) {
+    let suffix = &API_KEY_VALUE[API_KEY_VALUE.len() - 20..];
+    for needle in [API_KEY_VALUE, suffix] {
+        assert_eq!(
+            file_holding(dir, needle.as_bytes()),
+            None,
+            "a file holds the API key or its suffix"
         );
     }
 }
 
-/// A Claude session spec as Cairn's backends build one, on the managed-account
-/// credential for `token`, for the given servers, mode, approval, and output
-/// schema.
+/// An API key reaches the CLI the way a managed token does: on an inherited
+/// descriptor. The CLI authenticates with exactly that key, interactively and
+/// in print mode, while the key is in neither its launch environment, nor
+/// anything it starts, nor any file it writes.
+#[test]
+fn an_api_key_launch_authenticates_by_descriptor_and_nothing_sees_the_key() {
+    let Some((claude, version)) = installed_claude() else {
+        eprintln!("skipping: no `claude` on PATH");
+        return;
+    };
+    eprintln!("pinning the API-key descriptor against Claude CLI {version}");
+
+    // Interactive, two turns: the key is read once and serves both.
+    let stub = Stub::start();
+    let home = Home::new();
+    let probes = Probes::in_home(&home);
+    let interactive = spec(
+        &home,
+        api_key_launch(API_KEY_VALUE, &home.config),
+        Some(probes.servers.clone()),
+        ClaudeMode::Interactive,
+        ApprovalMode::Allow,
+        None,
+        Vec::new(),
+    );
+    let mut cli = launch_as_cairn(&claude, &stub, home, &interactive, probes.settings(), &[]);
+    for turn in ["turn one", "turn two"] {
+        cli.send(turn);
+        let result = cli.turn_result();
+        assert_eq!(result["subtype"], "success", "{result}");
+    }
+    let keys = stub.inference_api_keys();
+    assert!(keys.len() >= 2, "{} inference requests", keys.len());
+    assert!(
+        keys.iter().all(|key| key == API_KEY_VALUE),
+        "an inference request carried a different API key"
+    );
+    assert!(
+        stub.inference_tokens().iter().all(String::is_empty),
+        "an inference request carried a bearer token"
+    );
+    cli.assert_launch_environment_holds_none_of(&[API_KEY_VALUE], &stub, API_KEY);
+    probes.assert_none_saw(API_KEY_VALUE, API_KEY_ENV, true);
+    cli.assert_no_token_was_fetched();
+    assert_no_file_holds_the_key(cli.home.path());
+    drop(cli);
+
+    // Print mode, as a one-shot completion runs.
+    let stub = Stub::start();
+    let home = Home::new();
+    let one_shot = spec(
+        &home,
+        api_key_launch(API_KEY_VALUE, &home.config),
+        None,
+        ClaudeMode::OneShot {
+            prompt: "answer".to_string(),
+        },
+        ApprovalMode::Deny,
+        None,
+        Vec::new(),
+    );
+    let mut cli = launch_as_cairn(&claude, &stub, home, &one_shot, None, &[]);
+    cli.feed_and_close("what is the answer?");
+    let result = cli.turn_result();
+    assert_eq!(result["subtype"], "success", "{result}");
+    assert_eq!(
+        stub.inference_api_keys().last().map(String::as_str),
+        Some(API_KEY_VALUE)
+    );
+    cli.assert_launch_environment_holds_none_of(&[API_KEY_VALUE], &stub, API_KEY);
+    cli.assert_no_token_was_fetched();
+    assert_no_file_holds_the_key(cli.home.path());
+}
+
+/// A canary only the operator's own `CLAUDE.md` holds.
+const OPERATOR_CANARY: &str = "CANARY-operator-claude-md-7f3a";
+
+/// An operator's `~/.claude` under `home`: hooks and a `statusLine` that
+/// touch markers in `<home>/markers`, a `CLAUDE.md` holding
+/// [`OPERATOR_CANARY`], and a `~/.claude.json` declaring a user MCP server.
+/// Answers the markers directory.
+fn operator_claude_home(home: &Path) -> PathBuf {
+    let markers = home.join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    let touch = |name: &str| format!("touch {}", markers.join(name).display());
+    let hook = |name: &str| json!([{"hooks": [{"type": "command", "command": touch(name)}]}]);
+    let dot_claude = home.join(".claude");
+    std::fs::create_dir_all(&dot_claude).unwrap();
+    std::fs::write(
+        dot_claude.join("settings.json"),
+        json!({
+            "hooks": {
+                "SessionStart": hook("SessionStart"),
+                "UserPromptSubmit": hook("UserPromptSubmit"),
+            },
+            "statusLine": {"type": "command", "command": touch("statusLine")},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dot_claude.join("CLAUDE.md"),
+        format!("Always mention {OPERATOR_CANARY}.\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        json!({"mcpServers": {"operator-probe": {
+            "type": "stdio",
+            "command": "/bin/sh",
+            "args": ["-c", touch("mcp")],
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    markers
+}
+
+fn markers_in(markers: &Path) -> Vec<String> {
+    std::fs::read_dir(markers)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// An agent launch runs in its own home, so nothing the operator configured in
+/// `~/.claude` reaches it: no hook or `statusLine` runs, their `CLAUDE.md` is
+/// not sent to the model, and their MCP server does not start. The control, a
+/// launch that names `~/.claude` itself, shows the fixture is live.
+#[test]
+fn the_operators_claude_home_never_loads_into_a_launch() {
+    let Some((claude, version)) = installed_claude() else {
+        eprintln!("skipping: no `claude` on PATH");
+        return;
+    };
+    eprintln!("pinning config-dir isolation against Claude CLI {version}");
+    let launch = |home: Home| {
+        let stub = Stub::start();
+        let launched = spec(
+            &home,
+            api_key_launch(API_KEY_VALUE, &home.config),
+            None,
+            ClaudeMode::Interactive,
+            ApprovalMode::Allow,
+            None,
+            Vec::new(),
+        );
+        let mut cli = launch_as_cairn(&claude, &stub, home, &launched, None, &[]);
+        cli.send("turn one");
+        let init = cli.init();
+        let result = cli.turn_result();
+        assert_eq!(result["subtype"], "success", "{result}");
+        (cli, stub, init)
+    };
+
+    // Cairn's launch: its own home beside the operator's.
+    let home = Home::new();
+    let markers = operator_claude_home(home.path());
+    let (cli, stub, init) = launch(home);
+    // Hooks run as the turn starts; give a straggler a moment to land.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        markers_in(&markers),
+        Vec::<String>::new(),
+        "the operator's hooks, statusLine, or MCP server ran"
+    );
+    assert!(
+        !stub.sent_to_the_model(OPERATOR_CANARY),
+        "the operator's CLAUDE.md was sent to the model"
+    );
+    assert!(
+        !init["mcp_servers"].to_string().contains("operator-probe"),
+        "the operator's MCP server was configured: {}",
+        init["mcp_servers"]
+    );
+    drop(cli);
+
+    // The control: the same fixture, with the launch naming `~/.claude`, the
+    // home the CLI would otherwise default to.
+    let home = Home::with_config(".claude");
+    let markers = operator_claude_home(home.path());
+    let (_cli, stub, _) = launch(home);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !markers_in(&markers)
+        .iter()
+        .any(|marker| marker == "UserPromptSubmit")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the control's hooks never ran: {:?}",
+            markers_in(&markers)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        stub.sent_to_the_model(OPERATOR_CANARY),
+        "the control never sent the operator's CLAUDE.md"
+    );
+}
+
+/// A Claude session spec as Cairn's backends build one, on `secrets` (a
+/// managed account's [`launch_credential`] or an [`api_key_launch`]), for the
+/// given servers, mode, approval, and output schema.
 fn spec(
     home: &Home,
-    token: &str,
+    secrets: SecretEnv,
     mcp: Option<McpServers>,
     mode: ClaudeMode,
     approval: ApprovalMode,
@@ -1047,7 +1380,7 @@ fn spec(
         cwd: dir.clone(),
         env: std::collections::BTreeMap::new(),
         mcp,
-        secrets: launch_credential(token, home),
+        secrets,
         account_id: None,
         provider: ProviderSpec::Claude(ClaudeSpec {
             system_prompt: PlacedFile {
@@ -1109,7 +1442,7 @@ fn the_cli_offers_only_cairn_mcp_tools_under_tools_none() {
     let home = Home::new();
     let spec = spec(
         &home,
-        "at-SEALED",
+        launch_credential("at-SEALED", &home),
         Some(servers),
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
@@ -1179,7 +1512,7 @@ fn the_cli_sends_a_progress_token_on_tools_call() {
     let home = Home::new();
     let spec = spec(
         &home,
-        "at-SEALED",
+        launch_credential("at-SEALED", &home),
         Some(servers),
         ClaudeMode::Interactive,
         ApprovalMode::Allow,
@@ -1231,7 +1564,7 @@ fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
     let home = Home::new();
     let spec = spec(
         &home,
-        "at-ONE-SHOT",
+        launch_credential("at-ONE-SHOT", &home),
         None,
         ClaudeMode::OneShot {
             prompt: "answer".to_string(),
@@ -1275,6 +1608,6 @@ fn a_schema_constrained_call_keeps_structured_output_under_tools_none() {
         stub.inference_tokens().last().map(String::as_str),
         Some("at-ONE-SHOT")
     );
-    cli.assert_launch_environment_holds_none_of(&["at-ONE-SHOT"], &stub);
+    cli.assert_launch_environment_holds_none_of(&["at-ONE-SHOT"], &stub, OAUTH);
     cli.assert_no_token_was_fetched();
 }

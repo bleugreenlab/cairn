@@ -15,8 +15,8 @@ pub(crate) struct ObjectReadService {
 
 /// The read budget every store-native projection shares: tree depth, entry
 /// count, blob size, and wall clock. Callers that address the project overlay
-/// directly — an intercepted `run` search does — take their limits from here so
-/// they are bounded exactly as an [`ObjectReadService`] read would have been.
+/// directly take their limits from here so they are bounded exactly as an
+/// [`ObjectReadService`] read would have been.
 pub(crate) fn serve_limits() -> ObjectReadLimits {
     ObjectReadLimits::new(
         SERVE_MAX_DEPTH,

@@ -17,10 +17,10 @@ mod media;
 mod output;
 mod pace;
 mod process;
+mod read_equivalent;
 mod redact;
 mod resolve;
 mod sandbox_policy;
-mod search;
 mod selector;
 mod tip;
 mod types;
@@ -4108,9 +4108,9 @@ async fn prepare_and_run_batch(
         _ => None,
     };
 
-    // Resolve every item before any placement or managed-workspace preparation.
-    // This is the dispatch seam where process-shaped searches can be served by
-    // the in-process grep engine without consuming a build-slot admission.
+    // Resolve every item before any placement or managed-workspace preparation,
+    // so the dispatch seam below can serve a batch of reads without consuming a
+    // build-slot admission.
     let mut resolved: Vec<(String, Result<RunSpec, String>)> =
         Vec::with_capacity(payload.commands.len());
     for item in &payload.commands {
@@ -4243,20 +4243,31 @@ async fn prepare_and_run_batch(
         None
     };
 
-    // Item timeouts settle before the dispatch seam so a served search and a
+    // Item timeouts settle before the dispatch seam so a served read and a
     // real execution work to the same budget. `buildSlots.defaultTimeoutSeconds`
     // deliberately does not appear here: it bounds slot lifetime and the
     // executor watchdog, never an agent's command.
     apply_run_item_timeouts(&mut resolved);
 
-    // The dispatch seam. A search-shaped item is a read in run's clothing, so it
-    // is served here: after the head coordinate is known, so it reads the same
-    // content `read ?grep=` reads, and before any lease or slot admission
-    // exists, so it never enters the scheduler. A branch-scoped run is a verdict
-    // about another coordinate and executes for real, and a page call's command
-    // is never served against the project's content.
-    if branch_target.is_none() && !page_call {
-        if let Some(outcomes) = search::try_run_search_batch(
+    // The dispatch seam (tenet 1246). A read-shaped item with a read equivalent
+    // is served as that read here: after the head coordinate is known, so it
+    // reads the content `read` reads, and before any lease or slot admission
+    // exists, so it never enters the scheduler. A batch that needs a machine
+    // for any item runs whole on one, and each read-shaped item in it says why
+    // in a trailing note. A branch-scoped run is a verdict about another
+    // coordinate and runs on a machine; a page call's command is never served
+    // against the project's content, and is not an agent's to be told why.
+    let machine_notes: Vec<(usize, String)> = if page_call {
+        Vec::new()
+    } else {
+        let deadline =
+            cairn_common::run_contract::declared_need(declared_items(&payload), sequential)
+                .unwrap_or_else(|| {
+                    std::time::Duration::from_millis(
+                        batch_execution_budget_ms(&resolved, sequential).into(),
+                    )
+                });
+        match read_equivalent::try_serve_batch(
             orch,
             request,
             logical_resolution.as_ref(),
@@ -4264,13 +4275,21 @@ async fn prepare_and_run_batch(
             &resolved,
             sequential,
             stop_on_error,
+            branch_target.is_some(),
+            deadline,
         )
         .await
         {
-            let text = compose_run_output(&outcomes);
-            return run_envelope(text, collect_run_images(outcomes));
+            read_equivalent::BatchRoute::Served(outcomes) => {
+                let text = compose_run_output(&outcomes);
+                return run_envelope(text, collect_run_images(outcomes));
+            }
+            read_equivalent::BatchRoute::Machine(notes) => notes
+                .into_iter()
+                .map(|(index, reason)| (index, reason.note()))
+                .collect(),
         }
-    }
+    };
     let store_lock = logical_resolution
         .as_ref()
         .map(|resolution| resolution.repository_path.clone());
@@ -4698,6 +4717,7 @@ async fn prepare_and_run_batch(
                 vcs,
                 status_before,
                 marker_escape: marker_escape.clone(),
+                machine_notes,
             };
             return off_frame(|| {
                 run_routed_batch(orch, settlement, placement, batch, control, deadlines)
@@ -4740,6 +4760,7 @@ async fn prepare_and_run_batch(
         scratch_affinity: None,
         node_default: None,
         default_clear_notice: None,
+        machine_notes,
     };
     let suspendable = batch.may_outlive_grace();
     off_frame(|| run_host_batch(orch, settlement, batch, control, deadlines, suspendable)).await
@@ -5427,6 +5448,10 @@ struct RunBatchSettlement {
     /// The note that the fleet cleared the node's default, owed to this
     /// result's opening.
     default_clear_notice: Option<String>,
+    /// For each read-shaped item that ran here rather than being served as a
+    /// read, its index and the trailing `↳ machine:` line saying why
+    /// (`read_equivalent`).
+    machine_notes: Vec<(usize, String)>,
 }
 
 impl RunBatchSettlement {
@@ -7561,6 +7586,16 @@ async fn settle_run_batch(
             &mut outcome.body,
         )
         .await;
+    }
+    // Trailing, because the composer keeps an item's tail when it caps one.
+    for (index, note) in &s.machine_notes {
+        if let Some(outcome) = outcomes.get_mut(*index) {
+            outcome.body.truncate(outcome.body.trim_end().len());
+            if !outcome.body.is_empty() {
+                outcome.body.push('\n');
+            }
+            outcome.body.push_str(note);
+        }
     }
     let mut result = compose_run_output(&outcomes);
     if let Some(label) = &s.revision_label {
@@ -9987,6 +10022,7 @@ mod host_batch_tests {
             scratch_affinity: None,
             node_default: None,
             default_clear_notice: None,
+            machine_notes: Vec::new(),
         };
         let batch = HostBatch {
             request: request.clone(),

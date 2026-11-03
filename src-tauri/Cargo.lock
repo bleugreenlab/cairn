@@ -1345,7 +1345,6 @@ dependencies = [
  "cairn-toks",
  "chrono",
  "crossbeam-channel",
- "dirs 5.0.1",
  "libc",
  "log",
  "nix 0.29.0",

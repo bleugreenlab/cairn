@@ -755,13 +755,13 @@ fn authenticated_run_identity_never_resolves_from_cwd() {
     );
 }
 
-/// The canon invariant, pinned where it is decided. A search-shaped run item is
-/// a read in run's clothing: it must be served *below* head resolution, so it
-/// reads the same coordinate a read reads, and *above* both lease acquisition
-/// and slot placement, so no served search can admit a cell. Ordering in that
-/// function is the entire mechanism, and type checking cannot see it.
+/// The canon invariant (tenet 1246), pinned where it is decided. A read-shaped
+/// run item is served as a read: *below* head resolution, so it reads the same
+/// coordinate a read reads, and *above* both lease acquisition and slot
+/// placement, so no served read can admit a cell. Ordering in that function is
+/// the entire mechanism, and type checking cannot see it.
 #[test]
-fn search_interception_sits_below_head_resolution_and_above_admission() {
+fn read_equivalent_dispatch_sits_below_head_resolution_and_above_admission() {
     let source = core_source("mcp/handlers/run/mod.rs");
     let at = |needle: &str| {
         source
@@ -769,26 +769,26 @@ fn search_interception_sits_below_head_resolution_and_above_admission() {
             .unwrap_or_else(|| panic!("run dispatch no longer mentions {needle:?}"))
     };
     let head = at("resolve_current_for_read");
-    let interception = at("try_run_search_batch");
+    let interception = at("read_equivalent::try_serve_batch");
     let lease = at("acquire_job_residency");
     let placement = at("submit_run_batch");
 
     assert!(
         head < interception,
-        "a served search must read the resolved head coordinate, so interception belongs below head resolution"
+        "a served read must read the resolved head coordinate, so the dispatch belongs below head resolution"
     );
     assert!(
         interception < lease && interception < placement,
-        "a served search must not be able to take a lease or admit a cell, so interception belongs above both"
+        "a served read must not be able to take a lease or admit a cell, so the dispatch belongs above both"
     );
 }
 
 /// The other half of the same invariant: whatever the seam order says, the
 /// serving path itself must have no way to schedule anything.
 #[test]
-fn served_searches_have_no_scheduling_edges() {
+fn served_reads_have_no_scheduling_edges() {
     assert_absent(
-        "mcp/handlers/run/search.rs",
+        "mcp/handlers/run/read_equivalent.rs",
         &[
             "acquire_job_residency",
             "submit_run_batch",

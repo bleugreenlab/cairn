@@ -12,9 +12,11 @@ pub(crate) mod overlay;
 
 use cairn_common::read::ReadSegment;
 
-pub(crate) use batch::{handle_read_batch, read_batch};
+pub(crate) use batch::{
+    compose_read, handle_read_batch, read_batch, Composed, ReadCursorState, ReadOptions,
+};
 pub use file::handle_read_file;
-pub(crate) use file::produce_file_segment;
+pub(crate) use file::produce_file_segment_with;
 
 pub fn files_at_commit(
     repository_path: std::path::PathBuf,
@@ -60,6 +62,21 @@ mod archived_reconstruct_tests;
 pub(crate) enum Produced {
     Segment(ReadSegment),
     Suspended(String),
+    /// Under [`FenceAsk::Decline`], a crossing only a prompt could allow. No
+    /// permission was requested; the string says what would have been asked.
+    Declined(String),
+}
+
+/// Whether a read whose target crosses the logical fence may ask for permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FenceAsk {
+    /// Raise the crossing and suspend until it is answered: an agent's own read.
+    Ask,
+    /// Never prompt. A crossing only a prompt could allow is declined before any
+    /// permission is recorded: a `run` item served as a read must not raise a
+    /// question its caller never asked, because the same item placed on a
+    /// machine would meet its own containment instead.
+    Decline,
 }
 
 /// The mcp read layer's implementation of the archived-file render seam. Only

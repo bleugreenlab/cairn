@@ -134,6 +134,9 @@ fn repair_index() -> &'static Mutex<RepairIndex> {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RepairPass {
+    /// Whether the config dir holds a transcript for the session at all. A
+    /// resume without one is one the provider cannot resolve.
+    pub transcript_found: bool,
     pub bytes_read: u64,
     pub lines_parsed: usize,
     pub used_full_scan: bool,
@@ -178,14 +181,11 @@ pub struct TranscriptRepair {
     pub action: RepairAction,
 }
 
-/// Repair the transcript the CLI is about to replay, if it needs it. Called
-/// immediately before a `--resume` / `--fork-session` spawn, when no CLI process
-/// holds the file open.
-pub fn repair_before_resume(
-    config_dir: Option<&Path>,
-    working_dir: &Path,
-    backend_id: &str,
-) -> RepairPass {
+/// Repair the transcript the CLI is about to replay from `config_dir`, the
+/// launch's own `CLAUDE_CONFIG_DIR`, if it needs it. Called immediately before
+/// a `--resume` / `--fork-session` spawn, when no CLI process holds the file
+/// open.
+pub fn repair_before_resume(config_dir: &Path, working_dir: &Path, backend_id: &str) -> RepairPass {
     let Some(path) = transcript_path(config_dir, working_dir, backend_id) else {
         // A first resume after the transcript was pruned, or a backend id this
         // machine never ran. Nothing to repair; the CLI reports the miss.
@@ -196,7 +196,10 @@ pub fn repair_before_resume(
     let mut index = repair_index()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    repair_path(&path, backend_id, &mut index)
+    RepairPass {
+        transcript_found: true,
+        ..repair_path(&path, backend_id, &mut index)
+    }
 }
 
 fn repair_path(path: &Path, backend_id: &str, index: &mut RepairIndex) -> RepairPass {
@@ -486,11 +489,7 @@ fn marker_block() -> Value {
 /// name from its process cwd, so the path is computed the same way and then
 /// confirmed on disk; a miss falls back to searching for the id, since the
 /// mangling is the CLI's convention rather than a contract.
-fn transcript_path(
-    config_dir: Option<&Path>,
-    working_dir: &Path,
-    backend_id: &str,
-) -> Option<PathBuf> {
+fn transcript_path(config_dir: &Path, working_dir: &Path, backend_id: &str) -> Option<PathBuf> {
     // The id becomes a file name, so refuse anything that is not the uuid shape
     // the CLI issues rather than letting it walk the filesystem.
     if backend_id.is_empty()
@@ -500,7 +499,7 @@ fn transcript_path(
     {
         return None;
     }
-    let projects = claude_config_dir(config_dir)?.join("projects");
+    let projects = config_dir.join("projects");
     let file_name = format!("{backend_id}.jsonl");
 
     // The CLI records its cwd after the OS resolves it, so on macOS a `/var/…`
@@ -516,18 +515,6 @@ fn transcript_path(
         .flatten()
         .map(|entry| entry.path().join(&file_name))
         .find(|candidate| candidate.is_file())
-}
-
-/// The Claude CLI's config root: an explicit managed profile, else the ambient
-/// `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-fn claude_config_dir(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = explicit {
-        return Some(dir.to_path_buf());
-    }
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    dirs::home_dir().map(|home| home.join(".claude"))
 }
 
 /// The CLI's project-directory name for a cwd: every non-alphanumeric character
@@ -712,16 +699,16 @@ mod tests {
         std::fs::write(&transcript, "{}\n").unwrap();
 
         assert_eq!(
-            transcript_path(Some(&config), &cwd, "session-1"),
+            transcript_path(&config, &cwd, "session-1"),
             Some(transcript.clone())
         );
         // A session started under a different cwd is still found by id.
         assert_eq!(
-            transcript_path(Some(&config), temp.path(), "session-1"),
+            transcript_path(&config, temp.path(), "session-1"),
             Some(transcript)
         );
-        assert_eq!(transcript_path(Some(&config), &cwd, "missing"), None);
-        assert_eq!(transcript_path(Some(&config), &cwd, "../escape"), None);
+        assert_eq!(transcript_path(&config, &cwd, "missing"), None);
+        assert_eq!(transcript_path(&config, &cwd, "../escape"), None);
     }
 
     #[test]
@@ -736,7 +723,7 @@ mod tests {
         let path = project_dir.join("session-1.jsonl");
         std::fs::write(&path, poisoned_transcript()).unwrap();
 
-        repair_before_resume(Some(&config), &cwd, "session-1");
+        assert!(repair_before_resume(&config, &cwd, "session-1").transcript_found);
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains(ELISION_MARKER));
@@ -745,7 +732,7 @@ mod tests {
 
         // A second resume of the now-healthy session leaves the bytes alone.
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        repair_before_resume(Some(&config), &cwd, "session-1");
+        assert!(repair_before_resume(&config, &cwd, "session-1").transcript_found);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
     }
@@ -753,7 +740,8 @@ mod tests {
     #[test]
     fn a_missing_transcript_is_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
-        repair_before_resume(Some(temp.path()), temp.path(), "session-absent");
+        let pass = repair_before_resume(temp.path(), temp.path(), "session-absent");
+        assert!(!pass.transcript_found);
     }
 
     fn healthy_line(uuid: &str, text: &str) -> String {

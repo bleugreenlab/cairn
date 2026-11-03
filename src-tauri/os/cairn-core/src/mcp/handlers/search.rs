@@ -1271,36 +1271,12 @@ pub fn grep_search(
     deny_read: Vec<PathBuf>,
 ) -> Result<String, String> {
     let limits = GrepWalkLimits::for_payload(&payload);
-    grep_search_with_format(
+    grep_search_with_limits(
         payload,
         search_path,
         output_mode,
         show_line_numbers,
         deny_read,
-        false,
-        limits,
-    )
-}
-
-/// The same walk rendered the way ripgrep renders it (`path-N-text` context
-/// separators). This is the fallback engine behind a translated `run` search:
-/// whenever the warm index declines, the walk answers instead, so an index
-/// decline is a routing choice rather than a user-visible failure.
-pub(crate) fn grep_search_native(
-    payload: GrepPayload,
-    search_path: &Path,
-    output_mode: &str,
-    show_line_numbers: bool,
-    deny_read: Vec<PathBuf>,
-    limits: GrepWalkLimits,
-) -> Result<String, String> {
-    grep_search_with_format(
-        payload,
-        search_path,
-        output_mode,
-        show_line_numbers,
-        deny_read,
-        true,
         limits,
     )
 }
@@ -1344,82 +1320,14 @@ fn build_walk_types(file_type: Option<&str>) -> Result<Option<ignore::types::Typ
         .map_err(|error| format!("Invalid file type '{}': {}", file_type, error))
 }
 
-/// Whether one candidate path survives the glob and file-type filters. The
-/// filesystem walk gets this from `ignore`'s walker; entries handed over as
-/// bytes never touch a walker, so they are filtered against the same matchers
-/// here rather than against a second, drifting interpretation of the flags.
-fn entry_admitted(
-    path: &Path,
-    overrides: Option<&ignore::overrides::Override>,
-    types: Option<&ignore::types::Types>,
-) -> bool {
-    if overrides.is_some_and(|overrides| overrides.matched(path, false).is_ignore()) {
-        return false;
-    }
-    !types.is_some_and(|types| !types.matched(path, false).is_whitelist())
-}
-
-/// The native (ripgrep-shaped) render of a grep over content supplied as bytes
-/// instead of read from a filesystem walk.
-///
-/// This is the store-native content source behind an intercepted `run` search:
-/// the project overlay hands over `(repo-relative path, bytes)` at the job's
-/// head coordinate, and from there the matcher, the per-file collector, and the
-/// renderer are the ones [`grep_search_with_format`] uses. Only where the files
-/// come from differs, which is what lets the two agree byte for byte.
-///
-/// [`render_grep_lines`] sorts by path, so the order entries arrive in cannot
-/// affect the output.
-pub(crate) fn grep_search_native_entries(
-    payload: &GrepPayload,
-    files: &[(String, Vec<u8>)],
-    output_mode: &str,
-    show_line_numbers: bool,
-    limits: &GrepWalkLimits,
-) -> Result<String, String> {
-    let matcher = build_grep_matcher(payload)?;
-    let overrides = build_walk_overrides(Path::new(""), &limits.globs)?;
-    let types = build_walk_types(payload.file_type.as_deref())?;
-    let (before, after) = grep_context_window(payload);
-    let cap = GrepCap::new(limits.max_per_file, after);
-    let deadline = Instant::now() + limits.timeout;
-
-    let mut collected: Vec<GrepLine> = Vec::new();
-    for (relative, bytes) in files {
-        if limits.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
-            return Err(format!("grep timed out after {:?}", limits.timeout));
-        }
-        if !entry_admitted(Path::new(relative), overrides.as_ref(), types.as_ref()) {
-            continue;
-        }
-        let mut searcher = build_grep_searcher(payload);
-        grep_collect_into(
-            &mut searcher,
-            &matcher,
-            relative,
-            GrepSource::Bytes(bytes),
-            output_mode,
-            cap,
-            &mut collected,
-        )?;
-    }
-
-    Ok(render_grep_lines(
-        collected,
-        output_mode,
-        show_line_numbers,
-        true,
-        before > 0 || after > 0,
-    ))
-}
-
-fn grep_search_with_format(
+/// [`grep_search`] under explicit walk bounds, rendered in the read surface's
+/// heading form.
+fn grep_search_with_limits(
     payload: GrepPayload,
     search_path: &Path,
     output_mode: &str,
     show_line_numbers: bool,
     deny_read: Vec<PathBuf>,
-    native_output: bool,
     limits: GrepWalkLimits,
 ) -> Result<String, String> {
     let (before, after) = grep_context_window(&payload);
@@ -1428,7 +1336,7 @@ fn grep_search_with_format(
         collected,
         output_mode,
         show_line_numbers,
-        native_output,
+        false,
         before > 0 || after > 0,
     ))
 }
@@ -1636,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn native_grep_deadline_is_failure_not_partial_success() {
+    fn grep_deadline_is_failure_not_partial_success() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("match.txt"), "needle\n").unwrap();
         let payload = GrepPayload {
@@ -1656,7 +1564,7 @@ mod tests {
             multiline: Some(false),
         };
 
-        let result = grep_search_native(
+        let result = grep_search_with_limits(
             payload,
             dir.path(),
             "content",
@@ -1694,7 +1602,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_grep_skips_fifo_and_worker_terminates() {
+    fn grep_skips_fifo_and_worker_terminates() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("match.txt"), "needle\n").unwrap();
         let fifo = dir.path().join("blocked.fifo");
@@ -1723,7 +1631,7 @@ mod tests {
                 offset: None,
                 multiline: Some(false),
             };
-            let result = grep_search_native(
+            let result = grep_search_with_limits(
                 payload,
                 &root,
                 "content",
@@ -1743,34 +1651,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("virtual search worker must not block opening a FIFO")
             .unwrap();
-        assert!(result.contains("match.txt:1:needle"), "{result}");
+        assert!(result.contains("match.txt\n1:needle"), "{result}");
     }
 
     #[test]
-    fn native_grep_context_uses_ripgrep_separators() {
+    fn grep_context_renders_in_heading_form() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "before\nmatch\nafter\n").unwrap();
         let mut payload = grep_payload("match");
         payload.context_alias = Some(1);
         payload.output_mode = Some("content".to_string());
 
-        let native = grep_search_native(
-            payload.clone(),
-            dir.path(),
-            "content",
-            true,
-            Vec::new(),
-            GrepWalkLimits {
-                globs: Vec::new(),
-                max_per_file: None,
-                timeout: GREP_TIMEOUT,
-                cancelled: Arc::new(AtomicBool::new(false)),
-            },
-        )
-        .unwrap();
-        assert_eq!(native, "a.txt-1-before\na.txt:2:match\na.txt-3-after");
-
-        // The read surface renders the same walk in heading form instead.
         let cairn = grep_search(payload, dir.path(), "content", true, Vec::new()).unwrap();
         assert_eq!(cairn, "a.txt\n1-before\n2:match\n3-after");
     }
@@ -2254,179 +2145,6 @@ mod tests {
         let mut payload = grep_payload("NEEDLE");
         payload.output_mode = Some("files_with_matches".to_string());
         assert_single_file_grep_matches("NEEDLE\nhay\n", "f.txt", &payload);
-    }
-
-    /// The fixture the two content sources and real ripgrep all search.
-    fn parity_fixture() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("alpha.rs", "fn one() {}\nlet needle = 1;\nfn two() {}\n"),
-            (
-                "src/beta.rs",
-                "use std;\n// NEEDLE here\nlet x = 2;\nneedle again\n",
-            ),
-            ("src/deep/gamma.txt", "nothing\nneedle in text\ntail\n"),
-            ("delta.md", "no hits at all\n"),
-        ]
-    }
-
-    fn write_fixture(dir: &std::path::Path, files: &[(&str, &str)]) {
-        for (path, content) in files {
-            let full = dir.join(path);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(&full, content).unwrap();
-        }
-    }
-
-    fn parity_limits(globs: &[&str], max_per_file: Option<usize>) -> GrepWalkLimits {
-        GrepWalkLimits {
-            globs: globs.iter().map(|glob| (*glob).to_string()).collect(),
-            max_per_file,
-            timeout: Duration::from_secs(30),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// The store-native content source must agree with the filesystem walk on
-    /// every shape. An agent receives whichever one the router picked and must
-    /// not be able to tell which answered.
-    fn assert_entries_match_walk(
-        payload: &GrepPayload,
-        output_mode: &str,
-        globs: &[&str],
-        max_per_file: Option<usize>,
-    ) {
-        let files = parity_fixture();
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &files);
-        let show_line_numbers = payload.line_numbers.unwrap_or(true);
-
-        let walked = grep_search_native(
-            payload.clone(),
-            dir.path(),
-            output_mode,
-            show_line_numbers,
-            Vec::new(),
-            parity_limits(globs, max_per_file),
-        )
-        .expect("filesystem walk");
-
-        let entries: Vec<(String, Vec<u8>)> = files
-            .iter()
-            .map(|(path, content)| ((*path).to_string(), content.as_bytes().to_vec()))
-            .collect();
-        let served = grep_search_native_entries(
-            payload,
-            &entries,
-            output_mode,
-            show_line_numbers,
-            &parity_limits(globs, max_per_file),
-        )
-        .expect("store-native grep");
-
-        assert_eq!(
-            served, walked,
-            "store-native grep diverged from the filesystem walk \
-             (mode={output_mode}, globs={globs:?}, max_per_file={max_per_file:?})"
-        );
-    }
-
-    #[test]
-    fn store_native_grep_matches_the_walk_across_flag_shapes() {
-        let base = grep_payload("needle");
-
-        // Plain content with line numbers: `rg -n needle`.
-        assert_entries_match_walk(&base, "content", &[], None);
-        // `-l` and `-c` projections.
-        assert_entries_match_walk(&base, "files_with_matches", &[], None);
-        assert_entries_match_walk(&base, "count", &[], None);
-        // `rg needle` without line numbers.
-        let mut no_numbers = base.clone();
-        no_numbers.line_numbers = Some(false);
-        assert_entries_match_walk(&no_numbers, "content", &[], None);
-        // `-i`, which must pick up the uppercase NEEDLE.
-        let mut insensitive = base.clone();
-        insensitive.case_insensitive = Some(true);
-        assert_entries_match_walk(&insensitive, "content", &[], None);
-        assert_entries_match_walk(&insensitive, "files_with_matches", &[], None);
-        // `-A`, `-B`, and `-C`, including the `--` group separators.
-        let mut after = base.clone();
-        after.after_context = Some(1);
-        assert_entries_match_walk(&after, "content", &[], None);
-        let mut before = base.clone();
-        before.before_context = Some(1);
-        assert_entries_match_walk(&before, "content", &[], None);
-        let mut around = base.clone();
-        around.context = Some(1);
-        assert_entries_match_walk(&around, "content", &[], None);
-        // `--glob`, positive and negated.
-        assert_entries_match_walk(&base, "content", &["*.rs"], None);
-        assert_entries_match_walk(&base, "content", &["!*.rs"], None);
-        assert_entries_match_walk(&base, "content", &["**/*.txt"], None);
-        assert_entries_match_walk(&base, "files_with_matches", &["*.rs", "*.txt"], None);
-        // Slash-bearing globs are anchored at the search root, and store entries
-        // are matched against an empty root rather than an absolute walk root.
-        assert_entries_match_walk(&base, "files_with_matches", &["src/*.rs"], None);
-        assert_entries_match_walk(&base, "files_with_matches", &["src/**"], None);
-        assert_entries_match_walk(&base, "files_with_matches", &["!src/**"], None);
-        assert_entries_match_walk(&base, "content", &["*.rs", "!src/**"], None);
-        // `-m`, whose after-context window has its own rendering rule.
-        assert_entries_match_walk(&base, "content", &[], Some(1));
-        assert_entries_match_walk(&after, "content", &[], Some(1));
-        assert_entries_match_walk(&base, "count", &[], Some(1));
-        // A pattern nothing matches: both sources must render empty, which is
-        // what the caller turns into ripgrep's exit 1.
-        assert_entries_match_walk(&grep_payload("absent_pattern"), "content", &[], None);
-    }
-
-    /// The anchor for the whole contract: what the walk renders is what real
-    /// ripgrep renders. The test above chains the store-native source to this
-    /// one, so together they pin served output to the genuine article.
-    #[test]
-    fn native_grep_output_matches_real_ripgrep() {
-        let files = parity_fixture();
-        let dir = tempfile::tempdir().unwrap();
-        write_fixture(dir.path(), &files);
-
-        let Ok(real) = std::process::Command::new("rg")
-            .args(["-n", "--no-heading", "--color", "never", "needle", "."])
-            .current_dir(dir.path())
-            .output()
-        else {
-            eprintln!("skipping ripgrep parity: rg is not installed");
-            return;
-        };
-
-        // ripgrep prints `./`-prefixed paths for an explicit `.` root and does
-        // not order its output; the renderer sorts by path. Normalize both.
-        let mut expected: Vec<String> = String::from_utf8_lossy(&real.stdout)
-            .lines()
-            .map(|line| line.trim_start_matches("./").to_string())
-            .collect();
-        expected.sort();
-
-        let payload = grep_payload("needle");
-        let served = grep_search_native_entries(
-            &payload,
-            &files
-                .iter()
-                .map(|(path, content)| ((*path).to_string(), content.as_bytes().to_vec()))
-                .collect::<Vec<_>>(),
-            "content",
-            true,
-            &parity_limits(&[], None),
-        )
-        .expect("store-native grep");
-        let mut actual: Vec<String> = served.lines().map(str::to_string).collect();
-        actual.sort();
-
-        assert!(
-            !expected.is_empty(),
-            "ripgrep found nothing; the fixture no longer exercises the comparison"
-        );
-        assert_eq!(
-            actual, expected,
-            "store-native grep is not byte-faithful to real ripgrep"
-        );
     }
 
     #[test]

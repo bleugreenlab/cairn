@@ -34,6 +34,31 @@ pub(crate) enum Piece {
     Close,
 }
 
+/// A control operator between two simple commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operator {
+    /// `|`
+    Pipe,
+    /// `|&`: stdout and stderr both feed the next command.
+    PipeAll,
+    /// `&&`
+    And,
+    /// `||`
+    Or,
+    /// `;` or a newline.
+    Sequence,
+    /// `&`
+    Background,
+}
+
+/// One element of a command line, operators included, in the order the shell
+/// meets it.
+#[derive(Debug)]
+pub(crate) enum Element {
+    Piece(Piece),
+    Operator(Operator),
+}
+
 /// Reserved words that can open a simple command without being its program.
 /// `fi`, `done` and `}` close a construct and are read as ordinary programs
 /// that do nothing.
@@ -107,6 +132,21 @@ type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 /// command (an array, a function definition, a `case` pattern), or unbalanced
 /// quoting, substitution, or parentheses.
 pub(crate) fn simple_commands(command: &str) -> Option<Vec<Piece>> {
+    Some(
+        command_line(command)?
+            .into_iter()
+            .filter_map(|element| match element {
+                Element::Piece(piece) => Some(piece),
+                Element::Operator(_) => None,
+            })
+            .collect(),
+    )
+}
+
+/// [`simple_commands`] with the control operators between them kept, for a
+/// reader that must know how the commands are joined: whether a stage is piped,
+/// chained on success, or merely sequenced.
+pub(crate) fn command_line(command: &str) -> Option<Vec<Element>> {
     let mut pieces = Vec::new();
     let mut words: Vec<Word> = Vec::new();
     let mut word: Option<Word> = None;
@@ -114,9 +154,9 @@ pub(crate) fn simple_commands(command: &str) -> Option<Vec<Piece>> {
     let mut chars = command.chars().peekable();
 
     let end_word = |words: &mut Vec<Word>, word: &mut Option<Word>| words.extend(word.take());
-    let end_command = |pieces: &mut Vec<Piece>, words: &mut Vec<Word>| {
+    let end_command = |pieces: &mut Vec<Element>, words: &mut Vec<Word>| {
         if !words.is_empty() {
-            pieces.push(Piece::Command(std::mem::take(words)));
+            pieces.push(Element::Piece(Piece::Command(std::mem::take(words))));
         }
     };
 
@@ -170,18 +210,36 @@ pub(crate) fn simple_commands(command: &str) -> Option<Vec<Piece>> {
                     return None;
                 }
                 end_command(&mut pieces, &mut words);
-                pieces.push(Piece::Open);
+                pieces.push(Element::Piece(Piece::Open));
                 depth += 1;
             }
             ')' => {
                 end_word(&mut words, &mut word);
                 end_command(&mut pieces, &mut words);
                 depth = depth.checked_sub(1)?;
-                pieces.push(Piece::Close);
+                pieces.push(Element::Piece(Piece::Close));
             }
             ';' | '&' | '|' | '\n' => {
                 end_word(&mut words, &mut word);
                 end_command(&mut pieces, &mut words);
+                let operator = match (c, chars.peek()) {
+                    ('&', Some('&')) => {
+                        chars.next();
+                        Operator::And
+                    }
+                    ('&', _) => Operator::Background,
+                    ('|', Some('|')) => {
+                        chars.next();
+                        Operator::Or
+                    }
+                    ('|', Some('&')) => {
+                        chars.next();
+                        Operator::PipeAll
+                    }
+                    ('|', _) => Operator::Pipe,
+                    _ => Operator::Sequence,
+                };
+                pieces.push(Element::Operator(operator));
             }
             c if c.is_whitespace() => end_word(&mut words, &mut word),
             c => {
@@ -349,6 +407,48 @@ mod tests {
             assert_eq!(launcher_inner(command), None, "{command}");
             assert_eq!(command_for_classification(command), command, "{command}");
         }
+    }
+
+    #[test]
+    fn a_command_line_keeps_the_operators_between_its_commands() {
+        let shape = |command: &str| -> Vec<String> {
+            command_line(command)
+                .expect("parses")
+                .into_iter()
+                .map(|element| match element {
+                    Element::Piece(Piece::Command(words)) => words
+                        .iter()
+                        .map(|word| word.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    Element::Piece(Piece::Open) => "(".to_string(),
+                    Element::Piece(Piece::Close) => ")".to_string(),
+                    Element::Operator(operator) => format!("{operator:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape("cd src && rg -n 'a|b' | head -5"),
+            ["cd src", "And", "rg -n a|b", "Pipe", "head -5"]
+        );
+        assert_eq!(
+            shape("a || b; c & d |& e"),
+            [
+                "a",
+                "Or",
+                "b",
+                "Sequence",
+                "c",
+                "Background",
+                "d",
+                "PipeAll",
+                "e"
+            ]
+        );
+        // A redirection's ampersand is part of its word, never an operator.
+        assert_eq!(shape("rg x 2>&1 | wc -l"), ["rg x 2>&1", "Pipe", "wc -l"]);
+        // Operators drop out of the plain view, which is unchanged.
+        assert_eq!(simple_commands("a && b | c").expect("parses").len(), 3);
     }
 
     #[test]

@@ -226,30 +226,8 @@ async fn resolve_branch_direct_read(
     }
 }
 
-/// Read one ignored project path's bytes from the live materialization.
-///
-/// This is the CAIRN-3048 contract, reached by name so an intercepted `run`
-/// search over an ignored path routes exactly where the equivalent read routes,
-/// rather than growing a second interpretation of where ignored content lives.
-pub(crate) async fn read_ignored_path(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    project_id: &str,
-    repo_path: &str,
-    commit_id: &str,
-) -> Result<Vec<u8>, String> {
-    read_ignored_materialization(
-        orch,
-        request,
-        IgnoredMaterializationRead {
-            project_id: project_id.to_string(),
-            repo_path: repo_path.to_string(),
-            commit_id: commit_id.to_string(),
-        },
-    )
-    .await
-}
-
+/// Read one ignored project path's bytes from the live materialization: the
+/// CAIRN-3048 contract.
 async fn read_ignored_materialization(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -1323,8 +1301,17 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
                 .unwrap_or(&crate::token_meters::CLAUDE_TOKEN_METER);
             crate::mcp::handlers::read::view::render_segment_bounded(segment, meter).text
         }
-        Produced::Suspended(message) => message,
+        Produced::Suspended(message) | Produced::Declined(message) => message,
     }
+}
+
+/// [`produce_file_segment_with`] for an agent's own read, which may ask.
+pub(crate) async fn produce_file_segment(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: &ReadFilePayload,
+) -> Produced {
+    produce_file_segment_with(orch, request, payload, super::FenceAsk::Ask).await
 }
 
 /// Produce a structured [`ReadSegment`] for a `file:` read target.
@@ -1333,11 +1320,14 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
 /// image / directory arms. A fence suspension returns [`Produced::Suspended`] so
 /// the whole batch aborts and the permission flow can re-dispatch it; every
 /// other failure becomes an inline `Error`-kind segment so a partial failure
-/// never aborts the batch.
-pub(crate) async fn produce_file_segment(
+/// never aborts the batch. Under [`super::FenceAsk::Decline`] a crossing only a
+/// prompt could allow returns [`Produced::Declined`] instead, with nothing
+/// recorded.
+pub(crate) async fn produce_file_segment_with(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     payload: &ReadFilePayload,
+    fence_ask: super::FenceAsk,
 ) -> Produced {
     let uri = payload.path.clone();
     let split = match split_target_query(&payload.path) {
@@ -1393,6 +1383,20 @@ pub(crate) async fn produce_file_segment(
         {
             use crate::mcp::handlers::fence;
             match fence::resolve_run_fence(orch, request).await {
+                fence::RunFenceResolution::Resolved(_, fence_mode)
+                    if fence_ask == super::FenceAsk::Decline
+                        && fence::decide_without_asking(
+                            orch,
+                            fence_mode,
+                            &fence::Crossing::read_denied(&full),
+                        )
+                        .is_none() =>
+                {
+                    return Produced::Declined(format!(
+                        "reading {} would need a fence permission",
+                        full.display()
+                    ));
+                }
                 fence::RunFenceResolution::Resolved(run_id, fence_mode) => {
                     match fence::raise_fence(
                         orch,
@@ -2809,7 +2813,9 @@ mod tests {
         };
         match produce_file_segment(orch, &grep_request(worktree), &payload).await {
             Produced::Segment(seg) => seg,
-            Produced::Suspended(_) => panic!("unexpected fence suspension"),
+            Produced::Suspended(_) | Produced::Declined(_) => {
+                panic!("unexpected fence suspension")
+            }
         }
     }
 

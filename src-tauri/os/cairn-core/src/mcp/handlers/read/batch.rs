@@ -10,16 +10,16 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
-use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+use cairn_common::read::{NaturalUnit, ReadBatchEnvelope, ReadSegment, SegmentKind, SegmentMeta};
 use cairn_common::uri::{parse_uri, CairnResource};
 use serde::Deserialize;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 
-use super::{duplicate_segment, error_segment, view, Produced};
+use super::{duplicate_segment, error_segment, view, FenceAsk, Produced};
 
-type ReadCursorState = Mutex<HashMap<String, usize>>;
+pub(crate) type ReadCursorState = Mutex<HashMap<String, usize>>;
 
 #[derive(Debug, Deserialize)]
 struct ReadBatchPayload {
@@ -58,14 +58,70 @@ pub(crate) async fn read_batch(
         return "read_batch requires a non-empty `paths` array.".to_string();
     }
 
+    let options = ReadOptions {
+        budget,
+        include_bodies: payload.include_bodies,
+        fence_ask: FenceAsk::Ask,
+    };
+    match compose_read(orch, request, read_cursors, &payload.paths, options).await {
+        Composed::Envelope(envelope) => serde_json::to_string(&envelope)
+            .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}")),
+        Composed::Suspended(message)
+        | Composed::Declined {
+            reason: message, ..
+        } => message,
+    }
+}
+
+/// How one read composition is carried out.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadOptions {
+    pub(crate) budget: view::ReadBudget,
+    /// Keep each segment's final post-budget body in the envelope.
+    pub(crate) include_bodies: bool,
+    pub(crate) fence_ask: FenceAsk,
+}
+
+/// What a read composition produced.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Composed {
+    Envelope(ReadBatchEnvelope),
+    /// A fence crossing suspended the read pending permission.
+    Suspended(String),
+    /// Under [`FenceAsk::Decline`], `target` would have needed a permission
+    /// prompt. Nothing was recorded for any target.
+    Declined {
+        target: String,
+        reason: String,
+    },
+}
+
+/// Compose `paths` into one envelope: produce every segment, apply the
+/// per-turn dedup passes, promote images, and assemble under `options.budget`.
+/// `read` serializes the envelope; a `run` item served as a read renders it
+/// item by item, so both are the same read.
+pub(crate) async fn compose_read(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    read_cursors: &ReadCursorState,
+    paths: &[String],
+    options: ReadOptions,
+) -> Composed {
     // Produce every segment first. A fence suspension aborts the whole batch
     // before any dedup is recorded, so the permission flow's re-dispatch re-runs
     // the batch without the earlier targets being mistaken for duplicate calls.
-    let mut segments: Vec<ReadSegment> = Vec::with_capacity(payload.paths.len());
-    for path in &payload.paths {
-        match produce_segment(orch, request, read_cursors, path).await {
+    // A decline aborts it the same way, for the same reason.
+    let mut segments: Vec<ReadSegment> = Vec::with_capacity(paths.len());
+    for path in paths {
+        match produce_segment(orch, request, read_cursors, path, options.fence_ask).await {
             Produced::Segment(segment) => segments.push(segment),
-            Produced::Suspended(message) => return message,
+            Produced::Suspended(message) => return Composed::Suspended(message),
+            Produced::Declined(reason) => {
+                return Composed::Declined {
+                    target: path.clone(),
+                    reason,
+                }
+            }
         }
     }
 
@@ -162,13 +218,11 @@ pub(crate) async fn read_batch(
         .as_deref()
         .map(|run_id| crate::token_meters::meter_for_process(&orch.process_state, run_id))
         .unwrap_or(&crate::token_meters::CLAUDE_TOKEN_METER);
-    let envelope = if payload.include_bodies {
-        view::assemble_with_bodies(segments, budget, meter)
+    Composed::Envelope(if options.include_bodies {
+        view::assemble_with_bodies(segments, options.budget, meter)
     } else {
-        view::assemble(segments, budget, meter)
-    };
-    serde_json::to_string(&envelope)
-        .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}"))
+        view::assemble(segments, options.budget, meter)
+    })
 }
 
 /// Classify one resolved target and run its producer.
@@ -177,6 +231,7 @@ async fn produce_segment(
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
     target: &str,
+    fence_ask: FenceAsk,
 ) -> Produced {
     if is_web_target(target) {
         return Produced::Segment(produce_web_segment(orch, request, target).await);
@@ -193,7 +248,7 @@ async fn produce_segment(
             limit: None,
             issue_history: None,
         };
-        return super::produce_file_segment(orch, request, &file_payload).await;
+        return super::produce_file_segment_with(orch, request, &file_payload, fence_ask).await;
     }
     Produced::Segment(error_segment(
         target,

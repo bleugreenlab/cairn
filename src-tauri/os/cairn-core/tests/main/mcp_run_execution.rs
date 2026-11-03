@@ -44,79 +44,247 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
 const REACHED_PLACEMENT: &str = "environment could not be reached";
 const DURABLE_SUSPEND: &str = "Run handed off to durable suspend";
 
-/// The canon invariant, end to end: a search over tracked content is served
-/// from the job's head coordinate with no executor in the fleet at all. This
-/// orchestrator has nothing to place work onto, so if any part of the batch
-/// reached lease acquisition or slot placement it could not have succeeded.
-#[tokio::test]
-async fn managed_searches_are_served_without_any_executor() {
-    let (_temp, _db, orch, cwd) = setup_without_executor("run-search-served").await;
-
-    // Each expectation is what the real tool prints for that exact invocation
-    // with its output captured rather than attached to a terminal: ripgrep omits
-    // line numbers unless asked, grep's `-n` supplies them.
-    for (command, expected) in [
-        ("rg initial .", "./README.md:initial"),
-        ("grep -rn initial .", "./README.md:1:initial"),
-        ("rg -n initial .", "./README.md:1:initial"),
-    ] {
-        let result = handle_run(
-            &orch,
-            &request(
-                &cwd,
-                Some("run-search-served"),
-                json!({ "commands": [{ "command": command }] }),
-            ),
-        )
-        .await;
-        let text = run_text(&result);
-        assert!(
-            text.contains(expected),
-            "{command} should be served from the head coordinate as {expected:?}: {text}"
-        );
-        assert!(
-            !text.contains(REACHED_PLACEMENT),
-            "{command} must never reach placement: {text}"
-        );
-    }
+fn one_command(command: &str) -> Value {
+    json!({ "commands": [{ "command": command }] })
 }
 
-/// The same fixture proves the assertion above has teeth. Anything that cannot
-/// be reproduced exactly falls through to real execution, which here means it
-/// still needs the executor that does not exist — and it arrives there without
-/// any complaint about unsupported flags.
+/// The canon invariant (tenet 1246), end to end: a read-shaped item is served
+/// as a read from the job's head coordinate with no executor in the fleet at
+/// all. This orchestrator has nothing to place work onto, so if any part of a
+/// batch reached lease acquisition or slot placement it could not have
+/// succeeded.
 #[tokio::test]
-async fn unservable_shapes_fall_through_to_real_execution() {
-    let (_temp, _db, orch, cwd) = setup_without_executor("run-search-fallthrough").await;
+async fn read_shaped_items_are_served_as_labeled_reads_without_any_executor() {
+    let (_temp, _db, orch, cwd) = setup_without_executor("run-read-served").await;
+    let run = |payload: Value| {
+        let request = request(&cwd, Some("run-read-served"), payload);
+        let orch = &orch;
+        async move { run_text(&handle_run(orch, &request).await) }
+    };
+
+    for (command, label, content) in [
+        (
+            "rg initial .",
+            "↳ read file:?grep=initial&output_mode=content [1 matches in 1 files]",
+            "1:initial",
+        ),
+        (
+            "grep -rn initial .",
+            "↳ read file:?grep=initial&output_mode=content [1 matches in 1 files]",
+            "1:initial",
+        ),
+        ("cat README.md", "↳ read file:README.md", "initial"),
+        (
+            "find . -name '*.md'",
+            "↳ read file:?glob=**/*.md [1 files]",
+            "README.md",
+        ),
+    ] {
+        let text = run(one_command(command)).await;
+        assert!(
+            text.starts_with(label) && text.contains(content),
+            "{command} should be served under {label:?}: {text}"
+        );
+        assert!(
+            !text.contains(REACHED_PLACEMENT) && !text.contains("Exit code"),
+            "{command} must be served, successfully, without placement: {text}"
+        );
+    }
+
+    // Exit status follows the shell: a miss is 1, a pipeline is its last
+    // stage's 0, a search over a missing path is 2, a missing file is 1.
+    for (command, status) in [
+        ("rg nomatch .", Some(1)),
+        ("rg nomatch . | head -5", None),
+        ("rg initial missing/", Some(2)),
+        ("cat missing.txt", Some(1)),
+    ] {
+        let text = run(one_command(command)).await;
+        assert!(text.starts_with("↳ read "), "{command} is served: {text}");
+        match status {
+            Some(code) => assert!(
+                text.ends_with(&format!("Exit code: {code}")),
+                "{command} should exit {code}: {text}"
+            ),
+            None => assert!(!text.contains("Exit code"), "{command} exits 0: {text}"),
+        }
+    }
+
+    // Several items compose into one result, each under its own header.
+    let text = run(json!({ "commands": [
+        { "command": "rg initial ." },
+        { "command": "cat README.md" },
+    ] }))
+    .await;
+    assert!(
+        text.starts_with("=== rg initial . ===\n↳ read file:?grep=initial")
+            && text.contains("\n=== cat README.md ===\n↳ read file:README.md"),
+        "each item renders under its header: {text}"
+    );
+
+    // A sequential stop-on-error batch stops after its first failing read.
+    let text = run(json!({
+        "sequential": true,
+        "stop_on_error": true,
+        "commands": [{ "command": "rg nomatch ." }, { "command": "rg initial ." }],
+    }))
+    .await;
+    assert!(
+        text.ends_with("Exit code: 1") && !text.contains("1:initial"),
+        "the batch stops after the miss: {text}"
+    );
+}
+
+/// Read's per-turn dedup is for the model holding the earlier result, so a run
+/// item served as a read is deduped exactly when the run itself is model-facing
+/// (the `_cairn_origin: model` stamp): never for a program's run, which neither
+/// receives the stub nor records anything that would stub the model.
+#[tokio::test]
+async fn a_served_read_is_deduped_only_for_a_model_facing_run() {
+    use cairn_common::protocol::{stamp_callback_origin, MODEL_FACING_ORIGIN};
+
+    let run_id = "run-read-dedup";
+    let (_temp, _db, orch, cwd) = setup_without_executor(run_id).await;
+    orch.process_state.processes.lock().unwrap().register(
+        run_id.to_string(),
+        RunHandle::test_handle(Some("sess"), None),
+    );
+    assert!(orch.process_state.begin_turn(run_id, "turn-1"));
+    let run = |model_facing: bool| {
+        let mut payload = one_command("rg initial .");
+        if model_facing {
+            stamp_callback_origin(&mut payload, MODEL_FACING_ORIGIN);
+        }
+        let request = request(&cwd, Some(run_id), payload);
+        let orch = &orch;
+        async move { run_text(&handle_run(orch, &request).await) }
+    };
+
+    // An unstamped (SDK-shaped) run is served in full every time.
+    for attempt in 1..=2 {
+        let text = run(false).await;
+        assert!(
+            text.contains("1:initial") && !text.contains("[duplicate"),
+            "a program's run #{attempt} gets the whole read: {text}"
+        );
+    }
+
+    // The model's first run is fresh (the program's runs recorded nothing);
+    // its unchanged repeat is read's duplicate stub.
+    let first = run(true).await;
+    assert!(
+        first.contains("1:initial") && !first.contains("[duplicate"),
+        "{first}"
+    );
+    let repeat = run(true).await;
+    assert!(
+        repeat.contains("[duplicate") && !repeat.contains("1:initial"),
+        "the model's unchanged repeat is a duplicate: {repeat}"
+    );
+}
+
+/// The same fixture proves the assertion above has teeth. Anything without a
+/// read equivalent, and any batch holding one, still needs the executor that
+/// does not exist.
+#[tokio::test]
+async fn shapes_without_a_read_equivalent_reach_placement() {
+    let (_temp, _db, orch, cwd) = setup_without_executor("run-read-machine").await;
 
     let batches = [
-        // Not a search at all.
-        json!({ "commands": [{ "command": "echo hello" }] }),
-        // A search mixed with a build: the batch executes whole, because
-        // splitting it would break its ordering guarantees.
+        one_command("echo hello"),
+        // A read beside a non-read: one batch, one substrate.
         json!({ "commands": [{ "command": "rg initial ." }, { "command": "echo hello" }] }),
-        // A pipeline stage no post-filter can represent.
-        json!({ "commands": [{ "command": "rg initial . | awk '{print $1}'" }] }),
-        // `rg --files` has no grep projection to serve.
-        json!({ "commands": [{ "command": "rg --files" }] }),
+        one_command("rg initial . | awk '{print $1}'"),
+        one_command("rg -m1 initial ."),
+        one_command("rg initial . | sort"),
     ];
-
     for payload in batches {
         let result = handle_run(
             &orch,
-            &request(&cwd, Some("run-search-fallthrough"), payload.clone()),
+            &request(&cwd, Some("run-read-machine"), payload.clone()),
         )
         .await;
         let text = run_text(&result);
         assert!(
             text.contains(REACHED_PLACEMENT),
-            "{payload} must fall through to real execution: {text}"
-        );
-        assert!(
-            !text.to_lowercase().contains("does not yet support"),
-            "a fall-through must not report a coverage gap to the agent: {text}"
+            "{payload} must reach placement: {text}"
         );
     }
+}
+
+/// A read that only a fence permission could open is never asked about: the
+/// item runs on a machine instead, where its own containment applies, and no
+/// permission request is ever recorded.
+#[tokio::test]
+async fn a_read_that_would_need_a_fence_permission_goes_to_a_machine_unasked() {
+    let mut agent = agent_snapshot();
+    agent.fence = Some(Fence::Ask);
+    let (_temp, db, orch, cwd) = setup_with_agent("run-read-fence", false, agent).await;
+    let denied = cairn_sandbox::default_deny_read()
+        .into_iter()
+        .find(|path| path.ends_with(".ssh"))
+        .expect("~/.ssh is denied by default")
+        .join("cairn-run-read-probe");
+    // The deny list matches a path by where it resolves, so the probe has to
+    // exist inside the denied directory rather than resolve to its parent.
+    std::fs::create_dir_all(denied.parent().unwrap()).unwrap();
+    std::fs::write(&denied, "probe\n").unwrap();
+
+    let result = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some("run-read-fence"),
+            one_command(&format!("cat {}", denied.display())),
+        ),
+    )
+    .await;
+    let text = run_text(&result);
+    assert!(
+        text.contains(REACHED_PLACEMENT) && !text.contains(DURABLE_SUSPEND),
+        "a fenced read goes to a machine rather than suspending: {text}"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM permission_requests").await,
+        0,
+        "serving a run item as a read must never raise a permission request"
+    );
+}
+
+/// A read-shaped item that runs on a machine says why, in a trailing line; an
+/// item that is not read-shaped says nothing.
+#[tokio::test]
+async fn a_read_on_a_machine_ends_with_why() {
+    let (_temp, _db, orch, cwd) = setup("run-read-notes").await;
+    let run = |payload: Value| {
+        let request = request(&cwd, Some("run-read-notes"), payload);
+        let orch = &orch;
+        async move { run_text(&handle_run(orch, &request).await) }
+    };
+
+    let text = run(json!({ "commands": [
+        { "command": "grep -rn initial ." },
+        { "command": "echo hello" },
+    ] }))
+    .await;
+    assert!(
+        text.contains(
+            "README.md:1:initial\n↳ machine: item 2 (echo hello) needs one; a batch runs on one substrate\n=== echo hello"
+        ),
+        "the read names the sibling that needed a machine: {text}"
+    );
+    assert_eq!(
+        text.matches("↳ machine:").count(),
+        1,
+        "an item that is not read-shaped carries no note: {text}"
+    );
+
+    let text = run(one_command("grep -rn initial . | sort")).await;
+    assert!(
+        text.contains("README.md:1:initial")
+            && text.ends_with("↳ machine: | sort has no read equivalent"),
+        "a stage without a read equivalent runs for real and says so: {text}"
+    );
 }
 
 fn orchestrator_without_executor(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
@@ -198,10 +366,31 @@ fn agent_snapshot() -> AgentSnapshot {
 async fn seed_run(
     db: &LocalDb,
     project_id: &str,
+    worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+    run_id: &str,
+) {
+    seed_run_as(
+        db,
+        project_id,
+        worktree,
+        branch,
+        base_commit,
+        run_id,
+        agent_snapshot(),
+    )
+    .await;
+}
+
+async fn seed_run_as(
+    db: &LocalDb,
+    project_id: &str,
     _worktree: &Path,
     branch: &str,
     base_commit: &str,
     run_id: &str,
+    agent: AgentSnapshot,
 ) {
     let entity_id = |kind: &str| match run_id.split_once('~') {
         Some((team, _)) => format!("{team}~{}", uuid::Uuid::new_v4()),
@@ -211,7 +400,7 @@ async fn seed_run(
     let exec_id = entity_id("exec");
     let job_id = entity_id("job");
     let mut agents = HashMap::new();
-    agents.insert("agent-1".to_string(), agent_snapshot());
+    agents.insert("agent-1".to_string(), agent);
     let snapshot = ExecutionSnapshot::new(
         RecipeSnapshot {
             id: format!("recipe-{run_id}"),
@@ -298,6 +487,14 @@ async fn setup_with_executor(
     run_id: &str,
     attach_executor: bool,
 ) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    setup_with_agent(run_id, attach_executor, agent_snapshot()).await
+}
+
+async fn setup_with_agent(
+    run_id: &str,
+    attach_executor: bool,
+    agent: AgentSnapshot,
+) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
     // A suite run from inside a pinned Cairn batch inherits that batch's
     // `CAIRN_BATCH_EXECUTOR`, and the test executor's shells would inherit it
     // in turn, so a test asserting what a batch's own pin is would read its
@@ -311,7 +508,16 @@ async fn setup_with_executor(
     let worktree = temp.path().join("worktree");
     let branch = "agent/RHG-1-builder-0";
     let base_commit = common::head_sha(&project_repo);
-    seed_run(&db, &project_id, &worktree, branch, &base_commit, run_id).await;
+    seed_run_as(
+        &db,
+        &project_id,
+        &worktree,
+        branch,
+        &base_commit,
+        run_id,
+        agent,
+    )
+    .await;
     let orch = if attach_executor {
         orchestrator(&temp, db.clone())
     } else {

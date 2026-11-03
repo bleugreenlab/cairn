@@ -341,8 +341,15 @@ impl SessionProvider for RecordingClaude {
             assert!(claude.hook_settings.is_none());
             self.0.record("claude:tool_free");
             self.0.scratch_cwds.lock().unwrap().push(spec.cwd.clone());
+            // Every launch names its home; whose home it is follows from the
+            // credential it carries.
             if spec.secrets.names().any(|name| name == "CLAUDE_CONFIG_DIR") {
-                self.0.record("claude:managed_home");
+                let on_api_key = spec.secrets.names().any(|name| name == "ANTHROPIC_API_KEY");
+                self.0.record(if on_api_key {
+                    "claude:api_key_home"
+                } else {
+                    "claude:managed_home"
+                });
             }
             return Ok(LaunchedSession {
                 control: Box::new(RecordingControl {

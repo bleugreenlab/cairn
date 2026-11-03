@@ -56,19 +56,36 @@ pub use cairn_session::backends::claude::{
 /// Refusal shown only when no Claude credential is configured.
 pub(crate) const NO_CLAUDE_CREDENTIAL: &str = "No Claude account is configured. Sign in to a Claude account, or add an Anthropic API key, in Settings → Providers.";
 
-/// Settle a launch's credential as the process environment presents it,
-/// failing closed.
+/// What a Claude launch authenticates with, and the CLI home it runs in.
+/// `Debug` names the secrets' variables, never their values.
+#[derive(Debug)]
+pub(crate) struct ClaudeLaunchCredential {
+    /// The credential, and the `CLAUDE_CONFIG_DIR` naming the home.
+    pub(crate) secrets: SecretEnv,
+    /// Which rotation of a managed account's token the launch was fed. An API
+    /// key never rotates, so it has none.
+    pub(crate) generation: Option<u64>,
+    /// The home itself: where the CLI keeps the conversation a resume replays.
+    pub(crate) config_dir: std::path::PathBuf,
+}
+
+/// Settle a launch's credential and the CLI home it runs in, failing closed.
 ///
 /// A session that spawns without an explicit credential runs on whatever
 /// account is signed in at the user level: invisible to usage routing,
-/// unattributable, and impossible to switch away from when it runs out.
+/// unattributable, and impossible to switch away from when it runs out. One
+/// that spawns without a home of its own runs in the operator's `~/.claude`,
+/// with their hooks, plugins and MCP servers inside the agent's process, so
+/// every launch names one and the Claude provider refuses any that does not.
 ///
-/// The CLI reads an API key from its environment, so the plaintext is
-/// unavoidable; what the broker adds is that the value is a registered scrub
-/// target before it is injected, and that the injection appears in the lease
-/// inventory. A managed account's presentation comes from the installed
-/// subscription support, which is what refuses a managed account in a build
-/// without it.
+/// An API key is leased from the broker, so the value is a registered scrub
+/// target before it is handed over and the hand-over appears in the lease
+/// inventory. It runs in the API-key home every API-key account shares. The
+/// CLI reads the key from an inherited descriptor, never from its launch
+/// environment, except on Windows, which has no descriptor path
+/// (`docs/identity.md`). A managed account's presentation and home come from
+/// the installed subscription support, which is what refuses a managed
+/// account in a build without it.
 ///
 /// A managed account's credential is an access token with enough life left
 /// that the process never refreshes; the generation it was is returned beside
@@ -76,7 +93,8 @@ pub(crate) const NO_CLAUDE_CREDENTIAL: &str = "No Claude account is configured. 
 pub(crate) fn claude_launch_credential(
     orch: &Orchestrator,
     user: &crate::identity::UserIdentity,
-) -> Result<(SecretEnv, Option<u64>), String> {
+) -> Result<ClaudeLaunchCredential, String> {
+    use cairn_models::claude::api_key::{api_key_launch, prepare_api_key_home};
     const ANTHROPIC_PROVIDER: &str = "anthropic";
     match &user.claude_auth {
         Some(crate::credentials::ClaudeAuth::ApiKey(key)) => {
@@ -86,14 +104,45 @@ pub(crate) fn claude_launch_credential(
                 crate::security::broker::backend::CLAUDE_ROLE,
                 key,
             )?;
-            log::info!("Setting ANTHROPIC_API_KEY (len={})", leased.len());
-            Ok((SecretEnv::new().with("ANTHROPIC_API_KEY", leased), None))
+            log::info!("Leased an Anthropic API key (len={})", leased.len());
+            let home = prepare_api_key_home(orch.credential_store_handle().config_dir())?;
+            Ok(ClaudeLaunchCredential {
+                secrets: api_key_launch(&leased, &home),
+                generation: None,
+                config_dir: home,
+            })
         }
-        Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) => orch
-            .subscriptions()
-            .claude_session_credential(orch, account_id)
-            .map(|credential| (credential.env, Some(credential.generation))),
+        Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) => {
+            let subscriptions = orch.subscriptions();
+            let credential = subscriptions.claude_session_credential(orch, account_id)?;
+            let config_dir = subscriptions
+                .claude_home(orch, account_id)
+                .ok_or_else(|| format!("Claude profile {account_id} has no home"))?;
+            Ok(ClaudeLaunchCredential {
+                secrets: credential.env,
+                generation: Some(credential.generation),
+                config_dir,
+            })
+        }
         None => Err(NO_CLAUDE_CREDENTIAL.to_string()),
+    }
+}
+
+/// What a crashed resume reports when the provider could not resolve the
+/// conversation it was asked to replay. Deliberately descriptive rather than
+/// promissory: the digest-reseed fallback in `finalize_run` may decline (an
+/// already-attempted session, an active head turn), so the text must not
+/// guarantee a recovery.
+///
+/// `predates_api_key_home` is an API-key resume whose conversation Cairn's
+/// API-key home holds no transcript for. API-key launches used to run in the
+/// operator's `~/.claude`, and their conversations stayed there, so the reader
+/// is told why rather than left to take it for lost data.
+fn session_unresolvable_message(predates_api_key_home: bool) -> &'static str {
+    if predates_api_key_home {
+        "The provider could not resolve this session's conversation handle, so the resume produced no output. Cairn's own transcript is intact. API-key Claude sessions now keep their conversations in Cairn's own Claude directory instead of ~/.claude, so a conversation started before that change can't be resumed by the provider."
+    } else {
+        "The provider could not resolve this session's conversation handle, so the resume produced no output. Cairn's own transcript is intact."
     }
 }
 
@@ -1513,18 +1562,13 @@ impl AgentBackend for ClaudeBackend {
             .cloned()
             .or_else(|| orch.get_identity());
 
-        // The Cairn-managed Claude profile, when the identity carries one. It is
-        // also where the CLI keeps the conversation a resume replays, so the
-        // transcript repair below needs the same path.
+        // The Cairn-managed Claude profile, when the identity carries one.
         let managed_account = identity.as_ref().and_then(|user| match &user.claude_auth {
             Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) => {
                 Some(account_id.clone())
             }
             _ => None,
         });
-        let claude_config_dir = managed_account
-            .as_deref()
-            .and_then(|account_id| orch.subscriptions().claude_home(orch, account_id));
 
         // Fail closed. A session that spawns without an explicit credential
         // runs on whatever account is signed in at the user level: invisible to
@@ -1532,8 +1576,18 @@ impl AgentBackend for ClaudeBackend {
         // when it runs out. Refusing to start says so; starting anyway looks
         // like it worked and quietly spends someone else's subscription.
         let user = identity.ok_or_else(|| NO_CLAUDE_CREDENTIAL.to_string())?;
+        let on_api_key = matches!(
+            user.claude_auth,
+            Some(crate::credentials::ClaudeAuth::ApiKey(_))
+        );
         let mut secrets = SecretEnv::new().with(mcp_credential_var, mcp_credential);
-        let (credential, credential_generation) = claude_launch_credential(orch, &user)?;
+        // The home is also where the CLI keeps the conversation a resume
+        // replays, so the transcript repair below reads the same path.
+        let ClaudeLaunchCredential {
+            secrets: credential,
+            generation: credential_generation,
+            config_dir: claude_config_dir,
+        } = claude_launch_credential(orch, &user)?;
         secrets.extend(credential);
 
         log::info!(
@@ -1592,13 +1646,18 @@ impl AgentBackend for ClaudeBackend {
         // every later resume, including a well-formed operator message, fails
         // with the same 400 (CAIRN-3263). Repair it now, while no CLI process
         // holds the file open.
+        let mut resume_predates_api_key_home = false;
         if let Some(backend_id) = config.session_start.replayed_backend_id() {
             let repair_started = std::time::Instant::now();
             let repair = super::claude_transcript::repair_before_resume(
-                claude_config_dir.as_deref(),
+                &claude_config_dir,
                 std::path::Path::new(&config.working_dir),
                 backend_id,
             );
+            // An API-key conversation from before API-key launches had a home
+            // of their own is in the operator's `~/.claude`, which is never
+            // read: its absence here is the whole test.
+            resume_predates_api_key_home = on_api_key && !repair.transcript_found;
             let mut event =
                 crate::resume_timing::ResumeTimingEvent::new("claude_transcript_repair")
                     .elapsed(repair_started);
@@ -1739,6 +1798,7 @@ impl AgentBackend for ClaudeBackend {
                 &run_id,
                 thread_session_id,
                 confirm_backend_id_after_init,
+                resume_predates_api_key_home,
                 stdout,
                 stderr_watch,
                 run_db,
@@ -1930,8 +1990,9 @@ fn serve_one_shot(
     use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
     use cairn_models::session::one_shot::await_one_shot;
 
-    let (secrets, _) =
-        claude_launch_credential(orch, &selection.identity).map_err(CompletionError::Upstream)?;
+    let secrets = claude_launch_credential(orch, &selection.identity)
+        .map_err(CompletionError::Upstream)?
+        .secrets;
     // A subscription's cost figure is notional; only an API key's is spent.
     let metered = matches!(
         selection.identity.claude_auth,
@@ -2070,10 +2131,14 @@ fn usable_claude_credential(orch: &Orchestrator) -> Result<(), String> {
 
 #[cfg(test)]
 mod launch_contract_tests {
-    use super::{claude_launch_env, sanitize_mcp_diagnostic, validate_claude_init};
+    use super::{
+        claude_launch_env, sanitize_mcp_diagnostic, session_unresolvable_message,
+        validate_claude_init,
+    };
     use crate::backends::SessionStart;
     use crate::credentials::ClaudeAuth;
     use crate::identity::UserIdentity;
+    use cairn_models::claude::api_key::api_key_launch;
     use cairn_models::interface::session::{
         ApprovalMode, ClaudeMode, ClaudeSpec, PlacedFile, ProviderSpec, SecretEnv, SessionSpec,
     };
@@ -2145,8 +2210,30 @@ mod launch_contract_tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    /// An API-key launch's credential, in the API-key home under `/config`.
+    fn api_key_credential() -> SecretEnv {
+        api_key_launch(
+            "brokered-key",
+            std::path::Path::new("/config/claude-api-key"),
+        )
+    }
+
+    /// What an API-key launch's environment carries for its credential: the
+    /// descriptor naming the key where one exists, the key itself where none
+    /// does, and its home either way.
+    fn api_key_env() -> [(&'static str, &'static str); 2] {
+        [
+            ("CLAUDE_CONFIG_DIR", "/config/claude-api-key"),
+            if cfg!(unix) {
+                ("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "3")
+            } else {
+                ("ANTHROPIC_API_KEY", "brokered-key")
+            },
+        ]
+    }
+
     /// The environment every Claude launch has spawned with, byte for byte.
-    fn expected_env(credential: (&str, &str)) -> HashMap<String, String> {
+    fn expected_env(credential: &[(&str, &str)]) -> HashMap<String, String> {
         let tool_timeout_ms = cairn_common::callback_contract::AGENT_MCP_TOOL_TIMEOUT
             .as_millis()
             .to_string();
@@ -2164,9 +2251,9 @@ mod launch_contract_tests {
             ("GIT_AUTHOR_EMAIL", "agent@example.com"),
             ("GIT_COMMITTER_NAME", "Cairn Agent"),
             ("GIT_COMMITTER_EMAIL", "agent@example.com"),
-            credential,
         ]
         .into_iter()
+        .chain(credential.iter().copied())
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect()
     }
@@ -2182,7 +2269,7 @@ mod launch_contract_tests {
         ));
         assert_eq!(
             env,
-            expected_env(("CLAUDE_CONFIG_DIR", "/managed/claude/profile"))
+            expected_env(&[("CLAUDE_CONFIG_DIR", "/managed/claude/profile")])
         );
         let mcp_config = mcp().claude_mcp_config();
         assert_eq!(
@@ -2229,9 +2316,9 @@ mod launch_contract_tests {
                 backend_id: "backend-1".to_string(),
             },
             ClaudeMode::Interactive,
-            SecretEnv::new().with("ANTHROPIC_API_KEY", "brokered-key"),
+            api_key_credential(),
         ));
-        assert_eq!(env, expected_env(("ANTHROPIC_API_KEY", "brokered-key")));
+        assert_eq!(env, expected_env(&api_key_env()));
         let tail = &args[args.len() - 7..];
         assert_eq!(
             tail,
@@ -2258,7 +2345,7 @@ mod launch_contract_tests {
             ClaudeMode::OneShot {
                 prompt: "-starts-with-dash".to_string(),
             },
-            SecretEnv::new().with("ANTHROPIC_API_KEY", "brokered-key"),
+            api_key_credential(),
         ));
         assert!(!args.iter().any(|arg| arg == "--input-format"));
         assert!(!args
@@ -2275,6 +2362,20 @@ mod launch_contract_tests {
                 "--include-partial-messages",
             ])
         );
+    }
+
+    /// Only a resume that predates the API-key home is told its conversation
+    /// stayed behind in `~/.claude`; every other unresolvable resume keeps the
+    /// plain account.
+    #[test]
+    fn an_unresolvable_resume_names_the_api_key_home_only_when_it_predates_it() {
+        let plain = session_unresolvable_message(false);
+        let predating = session_unresolvable_message(true);
+        assert!(predating.starts_with(plain), "{predating}");
+        assert!(predating.contains("Cairn's own Claude directory"));
+        assert!(predating.contains("~/.claude"));
+        assert!(!plain.contains("~/.claude"));
+        assert!(!plain.contains("API-key"));
     }
 
     #[test]
@@ -2815,6 +2916,7 @@ mod flush_pending_tests {
                 "run-reader",
                 Some("session-1".to_string()),
                 false,
+                false,
                 stdout,
                 None,
                 run_db,
@@ -2971,6 +3073,7 @@ mod flush_pending_tests {
                 &emitter,
                 &run_id_thread,
                 Some("session-1".to_string()),
+                false,
                 false,
                 Box::new(std::io::Cursor::new(fixture.into_bytes())),
                 None,
@@ -3338,11 +3441,19 @@ impl ClaudeBackend {
         run_id: &str,
         session_id: Option<String>,
         confirm_backend_id_after_init: bool,
+        resume_predates_api_key_home: bool,
         stdout: Box<dyn BufRead + Send>,
         stderr_watch: Option<StderrWatch>,
         run_db: Arc<LocalDb>,
     ) {
-        let runtime = claude_runtime(orch, emitter, run_id, session_id.clone(), run_db.clone());
+        let runtime = launched_claude_runtime(
+            orch,
+            emitter,
+            run_id,
+            session_id.clone(),
+            run_db.clone(),
+            resume_predates_api_key_home,
+        );
         ClaudeRuntime::reader_thread(
             &runtime,
             run_id,
@@ -3354,10 +3465,25 @@ impl ClaudeBackend {
         );
     }
 }
-use super::transcript_host::SessionTranscriptHost as ClaudeReaderHost;
+/// The Claude reader's host: transcript publication, plus what the launch knew
+/// about the conversation it resumed.
+struct ClaudeReaderHost {
+    transcripts: super::transcript_host::SessionTranscriptHost,
+    /// The launch resumed, on an API key, a conversation the API-key home
+    /// holds no transcript for (see [`session_unresolvable_message`]).
+    resume_predates_api_key_home: bool,
+}
+
+impl std::ops::Deref for ClaudeReaderHost {
+    type Target = super::transcript_host::SessionTranscriptHost;
+    fn deref(&self) -> &Self::Target {
+        &self.transcripts
+    }
+}
+
 impl ClaudeHost for ClaudeReaderHost {
     fn transcripts(&self) -> &dyn cairn_session::transcripts::TranscriptHost {
-        self
+        &self.transcripts
     }
     fn error(&self, message: &str) {
         insert_error_event(
@@ -3634,11 +3760,7 @@ impl ClaudeHost for ClaudeReaderHost {
                 } else if saw_blocking_rate_limit {
                     "Process exited after the account rate limit was reached, but Cairn could not persist the account quarantine. The turn remains interrupted on its existing profile; retry after provider capacity returns."
                 } else if backend_failure == Some(BackendFailure::SessionUnresolvable) {
-                    // Deliberately descriptive rather than promissory: the
-                    // digest-reseed fallback in `finalize_run` may decline (an
-                    // already-attempted session, an active head turn), so this
-                    // text must not guarantee a recovery.
-                    "The provider could not resolve this session's conversation handle, so the resume produced no output. Cairn's own transcript is intact."
+                    session_unresolvable_message(self.resume_predates_api_key_home)
                 } else if backend_failure == Some(BackendFailure::SessionIdInUse) {
                     "Claude refused to start this session because an earlier, unconfirmed launch already created it under this id. Cairn's own transcript is intact."
                 } else {
@@ -3695,16 +3817,32 @@ pub fn claude_runtime(
     session_id: Option<String>,
     run_db: Arc<LocalDb>,
 ) -> ClaudeRuntime {
+    launched_claude_runtime(orch, emitter, run_id, session_id, run_db, false)
+}
+
+/// The runtime a launched process's reader runs with, knowing whether the
+/// launch resumed an API-key conversation its home holds no transcript for.
+fn launched_claude_runtime(
+    orch: &Orchestrator,
+    emitter: &Arc<dyn crate::services::EventEmitter>,
+    run_id: &str,
+    session_id: Option<String>,
+    run_db: Arc<LocalDb>,
+    resume_predates_api_key_home: bool,
+) -> ClaudeRuntime {
     ClaudeRuntime {
         process_state: orch.process_state.clone(),
         emitter: emitter.clone(),
         boot_id: orch.boot_at.to_string(),
         host: Arc::new(ClaudeReaderHost {
-            orch: orch.clone(),
-            emitter: emitter.clone(),
-            run_id: run_id.to_string(),
-            session_id: session_id.clone(),
-            run_db: run_db.clone(),
+            transcripts: super::transcript_host::SessionTranscriptHost {
+                orch: orch.clone(),
+                emitter: emitter.clone(),
+                run_id: run_id.to_string(),
+                session_id: session_id.clone(),
+                run_db: run_db.clone(),
+            },
+            resume_predates_api_key_home,
         }),
     }
 }
