@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -6,17 +6,25 @@ use std::pin::Pin;
 use cairn_common::uri::{parse_uri, CairnResource};
 use serde_json::{Map, Value};
 
+use super::decision::{self as decisions, DecisionRun};
+use super::definition::Bindable;
 use super::{
-    matches, ArgumentBinding, ChannelDestination, Fact, Presence, RouteFact, RouteGraph, RouteNode,
-    RouteNodeConfig, RouteSink,
+    explain_clause, matches, ArgumentBinding, ChannelDestination, Fact, GraphEdge, Presence,
+    RouteFact, RouteGraph, RouteNode, RouteNodeConfig, RouteSink,
 };
 use crate::{
+    models::decision::DecisionNode,
     orchestrator::Orchestrator,
     responses::{self, ResponseCaller},
     storage::NewRouteFiring,
 };
 
 const MAX_FIRINGS_PER_FACT: usize = 100;
+
+/// The most addresses one message sink delivers to on one firing when its
+/// target is bound to a list (a decision's admitted picks). Each address past
+/// it is journaled as dropped rather than silently ignored.
+pub const MAX_TARGETS_PER_SINK: usize = 8;
 
 /// A response whose backend never answers, for proving that a hung route
 /// delays nothing but its own row.
@@ -29,29 +37,126 @@ pub struct RouteContext<'a> {
     pub project_path: Option<&'a Path>,
 }
 
-fn resolve_message_target(target: &str) -> Result<(String, Option<i32>, String), String> {
+/// Where a message sink delivers: a project or issue stream, or a thread.
+#[derive(Debug, Clone, PartialEq)]
+enum MessageTarget {
+    Stream {
+        project: String,
+        number: Option<i32>,
+    },
+    Thread {
+        project: String,
+        name: String,
+    },
+}
+
+/// A message target and the canonical URI the journal records for it.
+fn resolve_message_target(target: &str) -> Result<(MessageTarget, String), String> {
     match parse_uri(target) {
         Some(CairnResource::Project { project }) => {
             let canonical = cairn_common::uri::build_project_uri(&project);
-            Ok((project, None, canonical))
+            Ok((
+                MessageTarget::Stream {
+                    project,
+                    number: None,
+                },
+                canonical,
+            ))
         }
         Some(CairnResource::Issue { project, number }) => {
             let canonical = cairn_common::uri::build_issue_uri(&project, number);
-            Ok((project, Some(number), canonical))
+            Ok((
+                MessageTarget::Stream {
+                    project,
+                    number: Some(number),
+                },
+                canonical,
+            ))
+        }
+        Some(CairnResource::Thread {
+            project,
+            name,
+            path,
+        }) if path.is_empty() => {
+            let canonical = cairn_common::uri::build_thread_uri(&project, &name);
+            Ok((MessageTarget::Thread { project, name }, canonical))
         }
         _ => Err(format!(
-            "message target must resolve to a project or issue: {target}"
+            "message target must resolve to a project, issue, or thread: {target}"
         )),
     }
 }
 
+/// Append a route's message to `target`, authored as the route.
+async fn deliver_message(
+    orch: &Orchestrator,
+    route_id: &str,
+    target: &MessageTarget,
+    text: &str,
+) -> Result<(), String> {
+    match target {
+        MessageTarget::Stream { project, number } => {
+            crate::mcp::handlers::messages::append_project_or_issue_message(
+                orch,
+                crate::mcp::handlers::messages::MessageAuthor::Route(route_id),
+                project,
+                *number,
+                text,
+            )
+            .await
+            .map(|_| ())
+        }
+        MessageTarget::Thread { project, name } => {
+            let db = orch.db.for_project(project).await;
+            let project_id = db
+                .query_text(
+                    "SELECT id FROM projects WHERE UPPER(key) = UPPER(?1) LIMIT 1",
+                    (project.clone(),),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("Project not found: {project}"))?;
+            let thread = crate::threads::crud::list(&db, &project_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|thread| thread.name == *name)
+                .ok_or_else(|| {
+                    format!(
+                        "Thread not found: {}",
+                        cairn_common::uri::build_thread_uri(project, name)
+                    )
+                })?;
+            crate::messages::delivery::append_thread_message(
+                orch,
+                &db,
+                &thread.id,
+                None,
+                &format!("route:{route_id}"),
+                text,
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+/// What a firing's journal row names as its sink: a sink node, or the
+/// decision whose answers matched no outgoing edge.
+#[derive(Clone, Copy)]
+enum FiringSink<'a> {
+    Route(&'a RouteSink),
+    Decision(&'a str),
+}
+
 /// One route's attempt on one fact, as the journal records it.
+#[derive(Clone, Copy)]
 struct Firing<'a> {
     route_id: &'a str,
     scope_key: &'a str,
     project_id: Option<&'a str>,
     fact: &'a RouteFact,
-    sink: &'a RouteSink,
+    sink: FiringSink<'a>,
     created_at: i64,
     fact_log_id: Option<i64>,
 }
@@ -79,6 +184,15 @@ impl Outcome {
         }
     }
 
+    fn sink_drop(drop: SinkDrop, payload: Option<String>) -> Self {
+        Self {
+            sink_ref: drop.sink_ref,
+            payload,
+            error: Some(drop.error),
+            ..Self::dropped(drop.reason)
+        }
+    }
+
     fn delivery(result: Result<String, String>, payload: Option<String>) -> Self {
         match result {
             Ok(sink_ref) => Self {
@@ -99,6 +213,179 @@ impl Outcome {
     }
 }
 
+/// Why a sink will not deliver to an address it resolved on a firing.
+#[derive(Debug, Clone, PartialEq)]
+struct SinkDrop {
+    /// `unbound_target`, `undeliverable`, or `fan_out_limit`.
+    reason: &'static str,
+    /// The address it resolved to, when it resolved to one.
+    sink_ref: Option<String>,
+    error: String,
+}
+
+impl SinkDrop {
+    fn new(reason: &'static str, sink_ref: Option<String>, error: String) -> Self {
+        Self {
+            reason,
+            sink_ref,
+            error,
+        }
+    }
+
+    fn preview(&self) -> Value {
+        serde_json::json!({"address": self.sink_ref, "dropped": self.reason, "error": self.error})
+    }
+}
+
+/// One address a message sink resolved to on a firing, or why not.
+#[derive(Debug, Clone, PartialEq)]
+enum TargetPlan {
+    Deliver {
+        target: MessageTarget,
+        canonical: String,
+    },
+    SinkDrop(SinkDrop),
+}
+
+fn describe_binding(binding: &ArgumentBinding) -> String {
+    match binding {
+        ArgumentBinding::Field { field } => format!("field '{field}'"),
+        ArgumentBinding::Node { from } => format!("node '{from}'"),
+        ArgumentBinding::Value { .. } => "the literal".to_string(),
+    }
+}
+
+/// The addresses a bound sink address resolved to on one firing's fields.
+fn bound_addresses(
+    bindings: &Bindings<'_>,
+    binding: &ArgumentBinding,
+) -> Result<Vec<String>, SinkDrop> {
+    let unbound = |error: String| SinkDrop::new("unbound_target", None, error);
+    let described = describe_binding(binding);
+    let addresses = match bindings.value(binding) {
+        Value::String(address) => vec![address],
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(address) => Ok(address),
+                other => Err(unbound(format!(
+                    "{described} resolved to a list holding {other}, which is not an address"
+                ))),
+            })
+            .collect::<Result<_, _>>()?,
+        Value::Null => return Err(unbound(format!("{described} resolved to nothing"))),
+        other => {
+            return Err(unbound(format!(
+                "{described} resolved to {other}, which is not an address"
+            )))
+        }
+    };
+    let mut seen = HashSet::new();
+    let addresses: Vec<String> = addresses
+        .into_iter()
+        .map(|address| address.trim().to_string())
+        .filter(|address| !address.is_empty() && seen.insert(address.clone()))
+        .collect();
+    if addresses.is_empty() {
+        return Err(unbound(format!("{described} resolved to no address")));
+    }
+    Ok(addresses)
+}
+
+/// Where a message sink delivers on one firing, address by address: its
+/// literal, or every address its binding resolved to up to
+/// [`MAX_TARGETS_PER_SINK`].
+fn message_targets(bindings: &Bindings<'_>, target: &Bindable<String>) -> Vec<TargetPlan> {
+    let addresses = match target {
+        Bindable::Fixed(target) => vec![target.clone()],
+        Bindable::Bound(binding) => match bound_addresses(bindings, binding) {
+            Ok(addresses) => addresses,
+            Err(drop) => return vec![TargetPlan::SinkDrop(drop)],
+        },
+    };
+    addresses
+        .into_iter()
+        .enumerate()
+        .map(|(position, address)| {
+            if position >= MAX_TARGETS_PER_SINK {
+                return TargetPlan::SinkDrop(SinkDrop::new(
+                    "fan_out_limit",
+                    Some(address),
+                    format!(
+                        "a message sink delivers to at most {MAX_TARGETS_PER_SINK} addresses per firing"
+                    ),
+                ));
+            }
+            match resolve_message_target(&address) {
+                Ok((target, canonical)) => TargetPlan::Deliver { target, canonical },
+                Err(error) => TargetPlan::SinkDrop(SinkDrop::new("undeliverable", Some(address), error)),
+            }
+        })
+        .collect()
+}
+
+/// The conversation a bound channel destination resolved to on one firing:
+/// one address, parsed, among the configured conversations, on a provider
+/// that can append to it.
+async fn bound_conversation(
+    orch: &Orchestrator,
+    bindings: &Bindings<'_>,
+    binding: &ArgumentBinding,
+) -> Result<crate::channels::ConversationAddress, SinkDrop> {
+    let described = describe_binding(binding);
+    let value = match bindings.value(binding) {
+        Value::String(value) if !value.trim().is_empty() => value,
+        Value::Array(_) => {
+            return Err(SinkDrop::new(
+                "unbound_target",
+                None,
+                format!(
+                "a channel destination takes one conversation, and {described} resolved to a list"
+            ),
+            ))
+        }
+        Value::Null | Value::String(_) => {
+            return Err(SinkDrop::new(
+                "unbound_target",
+                None,
+                format!("{described} resolved to nothing"),
+            ))
+        }
+        other => {
+            return Err(SinkDrop::new(
+                "unbound_target",
+                None,
+                format!("{described} resolved to {other}, which is not a conversation address"),
+            ))
+        }
+    };
+    let address: crate::channels::ConversationAddress = value.parse().map_err(|error| {
+        SinkDrop::new(
+            "undeliverable",
+            Some(value.clone()),
+            format!("'{value}' is not a conversation address: {error}"),
+        )
+    })?;
+    let rendered = address.to_string();
+    let configured = crate::resources::channels::configured_conversations(orch).await;
+    match configured
+        .iter()
+        .find(|row| row.address == rendered && !row.placeholder)
+    {
+        None => Err(SinkDrop::new(
+            "undeliverable",
+            Some(rendered.clone()),
+            format!("{rendered} is not a configured conversation"),
+        )),
+        Some(row) if !row.capabilities.append_to_conversation => Err(SinkDrop::new(
+            "undeliverable",
+            Some(rendered),
+            format!("{} does not support append_to_conversation", row.provider),
+        )),
+        Some(_) => Ok(address),
+    }
+}
+
 /* ------------------------------------------------------------- graph walk */
 
 /// How a response node's work is actually done. It is injected rather than
@@ -106,6 +393,11 @@ impl Outcome {
 /// along which path — can be exercised without a model backend.
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<String, String>> + Send>>;
 type RunResponse<'f> = &'f (dyn Fn(&str, Value) -> ResponseFuture + Sync);
+
+/// How a decision node's questions are asked, injected for the same reason.
+/// The production closure resolves option sources and calls the facet.
+type DecisionFuture = Pin<Box<dyn Future<Output = DecisionRun> + Send>>;
+type RunDecision<'f> = &'f (dyn Fn(&DecisionNode, String) -> DecisionFuture + Sync);
 
 /// What one sink node receives: the content its own path produced, and the
 /// record of the response nodes that produced it.
@@ -119,6 +411,16 @@ struct Delivery<'a> {
     transforms: Vec<Value>,
 }
 
+/// A decision whose answers matched none of its outgoing edges: the firing
+/// stops there and journals the answers, never a silent no-op.
+struct Unrouted<'a> {
+    node_id: &'a str,
+    /// The path's record up to and including the decision.
+    history: Vec<Value>,
+    /// What the decision judged.
+    input: String,
+}
+
 /// Everything one fact makes of one route's graph.
 struct Walk<'a> {
     deliveries: Vec<Delivery<'a>>,
@@ -126,6 +428,85 @@ struct Walk<'a> {
     /// read a specific node rather than only the content flowing into it.
     outputs: HashMap<usize, String>,
     nodes: Vec<Value>,
+    /// Every edge's verdict: whether its source was reached, whether it was
+    /// taken, and the failing tests when it was not.
+    edges: Vec<Value>,
+    unrouted: Vec<Unrouted<'a>>,
+}
+
+/// The content and record a path carries into the node below it.
+#[derive(Debug, Clone, Default)]
+struct Carried {
+    /// The content a response produced on this path; `None` keeps the fact's
+    /// own `text`.
+    text: Option<String>,
+    history: Vec<Value>,
+}
+
+/// The fields a node works on: the fact's, the content arriving on its path as
+/// `text`, and the `answers.*` of every decision that dominates it, nearest
+/// last so it wins a shared question name. This is the one definition of what
+/// a node can read, shared by edge clauses, bindings, and sink addresses.
+pub(crate) fn node_fields(
+    graph: &RouteGraph<'_>,
+    index: usize,
+    fact_fields: &BTreeMap<String, Value>,
+    text: Option<&str>,
+    answers: &HashMap<usize, BTreeMap<String, Value>>,
+) -> BTreeMap<String, Value> {
+    let mut fields = fact_fields.clone();
+    if let Some(text) = text {
+        fields.insert("text".into(), Value::String(text.to_owned()));
+    }
+    for (decision, _) in graph.dominating_decisions(index, false) {
+        if let Some(own) = answers.get(&decision) {
+            fields.extend(own.iter().map(|(key, value)| (key.clone(), value.clone())));
+        }
+    }
+    fields
+}
+
+/// Whether a fact standing at an edge's source with `fields` takes the edge,
+/// and, when it does not, each failing test.
+fn edge_verdict(
+    edge: &GraphEdge<'_>,
+    fact: &RouteFact,
+    presence: Presence,
+    fields: &BTreeMap<String, Value>,
+) -> (bool, Vec<String>) {
+    if edge.when.is_empty() {
+        return (true, Vec::new());
+    }
+    let at = Fact {
+        source: &fact.source,
+        fields,
+        presence,
+    };
+    if matches(edge.when, &at) {
+        return (true, Vec::new());
+    }
+    let failures = match edge.when {
+        [only] => explain_clause(only, &at, None),
+        clauses => clauses
+            .iter()
+            .enumerate()
+            .flat_map(|(position, clause)| {
+                explain_clause(clause, &at, None)
+                    .into_iter()
+                    .map(move |failure| format!("clause {}: {failure}", position + 1))
+            })
+            .collect(),
+    };
+    (false, failures)
+}
+
+/// A bound value as text for a decision to judge.
+fn text_value(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
 }
 
 /// How a node's argument bindings resolve on the path that reached it.
@@ -195,17 +576,27 @@ fn text_of(fields: &BTreeMap<String, Value>) -> &str {
 /// whatever its one producing predecessor made (validation guarantees there is
 /// at most one), which is what lets two sinks below the same trigger receive
 /// different things.
+///
+/// An edge is taken when its source was reached and its `when` holds over the
+/// source's fields; a node is reached when any edge into it was taken. A
+/// decision passes the content that reached it on unchanged and adds its
+/// answers to the fields of everything it dominates. A decision none of whose
+/// edges is taken is collected as unrouted, so the firing journals it.
 async fn walk<'a>(
     graph: &'a RouteGraph<'a>,
     fact: &RouteFact,
     presence: Presence,
     run: RunResponse<'_>,
+    decide: RunDecision<'_>,
 ) -> Walk<'a> {
-    let mut reached = vec![false; graph.nodes().len()];
     let mut outputs: HashMap<usize, String> = HashMap::new();
-    let mut histories: HashMap<usize, Vec<Value>> = HashMap::new();
+    let mut carried: HashMap<usize, Carried> = HashMap::new();
+    let mut answers: HashMap<usize, BTreeMap<String, Value>> = HashMap::new();
+    let mut taken: HashSet<(usize, usize)> = HashSet::new();
     let mut deliveries = Vec::new();
     let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut unrouted = Vec::new();
     let positions: HashMap<usize, usize> = graph
         .sinks()
         .enumerate()
@@ -214,85 +605,178 @@ async fn walk<'a>(
 
     for &index in graph.order() {
         let node = graph.node(index);
-        if node.config.is_trigger() {
-            reached[index] = trigger_matches(node, fact, presence);
-            let RouteNodeConfig::Trigger { when } = &node.config else {
-                unreachable!()
-            };
-            nodes.push(serde_json::json!({"nodeId":node.id,"kind":"trigger","reached":reached[index],"output":fact.fields,"failures":super::explain_clause(when, &Fact { source: &fact.source, fields: &fact.fields, presence }, None)}));
-            continue;
-        }
-        if !graph.incoming(index).iter().any(|&from| reached[from]) {
-            nodes.push(serde_json::json!({"nodeId":node.id,"kind":if node.config.is_sink(){"sink"}else{"response"},"reached":false}));
-            continue;
-        }
-        reached[index] = true;
-
-        let producer = graph.producers(index).find(|&from| reached[from]);
-        let mut fields = fact.fields.clone();
-        if let Some(text) = producer.and_then(|from| outputs.get(&from)) {
-            fields.insert("text".into(), Value::String(text.clone()));
-        }
-        // Only what a step produced is recorded: its input is the content above
-        // it on this path — the fact at the top, the previous step's output
-        // after that.
-        let mut history = producer
-            .and_then(|from| histories.get(&from))
-            .cloned()
-            .unwrap_or_default();
-
-        match &node.config {
-            RouteNodeConfig::Response { response, args } => {
-                let bindings = Bindings {
-                    graph,
-                    fields: &fields,
-                    outputs: &outputs,
-                };
-                let arguments = args
-                    .iter()
-                    .map(|(name, binding)| (name.clone(), bindings.value(binding)))
-                    .collect::<Map<_, _>>();
-                match run(response, Value::Object(arguments)).await {
-                    Ok(text) => {
-                        history.push(serde_json::json!({
-                            "response": response,
-                            "status": "ok",
-                            "output": crate::storage::firing_snapshot(&text),
-                        }));
-                        outputs.insert(index, text);
-                        nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"ok","output":outputs[&index]}));
-                    }
-                    Err(error) => {
-                        history.push(serde_json::json!({
-                            "response": response,
-                            "status": "failed",
-                            "error": error,
-                        }));
-                        // A failed step is recorded and the path continues with
-                        // the content that reached it.
-                        outputs.insert(index, text_of(&fields).to_owned());
-                        nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"failed","output":outputs[&index],"error":error}));
-                    }
+        let mut decision_input: Option<String> = None;
+        let reached = match &node.config {
+            RouteNodeConfig::Trigger { when } => {
+                let matched = trigger_matches(node, fact, presence);
+                nodes.push(serde_json::json!({"nodeId":node.id,"kind":"trigger","reached":matched,"output":fact.fields,"failures":explain_clause(when, &Fact { source: &fact.source, fields: &fact.fields, presence }, None)}));
+                if matched {
+                    carried.insert(index, Carried::default());
                 }
-                histories.insert(index, history);
+                matched.then(|| fact.fields.clone())
             }
-            RouteNodeConfig::Sink { sink } => {
-                nodes.push(serde_json::json!({"nodeId":node.id,"kind":"sink","reached":true,"output":fields}));
-                deliveries.push(Delivery {
-                    node_id: &node.id,
-                    sink,
-                    position: positions[&index],
-                    fields,
-                    transforms: history,
-                });
+            config => {
+                let arrivals: Vec<usize> = graph
+                    .incoming(index)
+                    .iter()
+                    .copied()
+                    .filter(|&from| taken.contains(&(from, index)))
+                    .collect();
+                if arrivals.is_empty() {
+                    nodes.push(serde_json::json!({"nodeId":node.id,"kind":config.type_name(),"reached":false}));
+                    None
+                } else {
+                    // The path that carried content wins; validation allows at
+                    // most one producer, so only plain fact paths can tie.
+                    let inherited = arrivals
+                        .iter()
+                        .filter_map(|from| carried.get(from))
+                        .max_by_key(|path| (path.text.is_some(), path.history.len()))
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut fields = node_fields(
+                        graph,
+                        index,
+                        &fact.fields,
+                        inherited.text.as_deref(),
+                        &answers,
+                    );
+                    let mut history = inherited.history.clone();
+                    match config {
+                        RouteNodeConfig::Response { response, args } => {
+                            let bindings = Bindings {
+                                graph,
+                                fields: &fields,
+                                outputs: &outputs,
+                            };
+                            let arguments = args
+                                .iter()
+                                .map(|(name, binding)| (name.clone(), bindings.value(binding)))
+                                .collect::<Map<_, _>>();
+                            match run(response, Value::Object(arguments)).await {
+                                Ok(text) => {
+                                    history.push(serde_json::json!({
+                                        "response": response,
+                                        "status": "ok",
+                                        "output": crate::storage::firing_snapshot(&text),
+                                    }));
+                                    outputs.insert(index, text);
+                                    nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"ok","output":outputs[&index]}));
+                                }
+                                Err(error) => {
+                                    history.push(serde_json::json!({
+                                        "response": response,
+                                        "status": "failed",
+                                        "error": error,
+                                    }));
+                                    // A failed step is recorded and the path
+                                    // continues with the content that reached it.
+                                    outputs.insert(index, text_of(&fields).to_owned());
+                                    nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"failed","output":outputs[&index],"error":error}));
+                                }
+                            }
+                            carried.insert(
+                                index,
+                                Carried {
+                                    text: Some(outputs[&index].clone()),
+                                    history,
+                                },
+                            );
+                        }
+                        RouteNodeConfig::Decision { decision, input } => {
+                            let input = match input {
+                                Some(binding) => text_value(
+                                    Bindings {
+                                        graph,
+                                        fields: &fields,
+                                        outputs: &outputs,
+                                    }
+                                    .value(binding),
+                                ),
+                                None => text_of(&fields).to_owned(),
+                            };
+                            let asked = decide(decision, input.clone()).await;
+                            let outcomes = decisions::outcomes(&asked.asked, &asked.result);
+                            let summary = decisions::summary(&outcomes);
+                            let error = asked.result.as_ref().err().map(ToString::to_string);
+                            // The questions as asked carry the resolved
+                            // options and their revisions, so every firing
+                            // beneath records which versions were chosen among.
+                            history.push(serde_json::json!({
+                                "decision": node.id,
+                                "status": if error.is_some() { "failed" } else { "ok" },
+                                "asked": asked.asked,
+                                "answers": summary,
+                                "error": error,
+                            }));
+                            nodes.push(serde_json::json!({"nodeId":node.id,"kind":"decision","reached":true,"input":crate::storage::firing_snapshot(&input),"asked":asked.asked,"answers":summary,"error":error}));
+                            let own = decisions::answer_fields(&outcomes);
+                            fields.extend(
+                                own.iter().map(|(key, value)| (key.clone(), value.clone())),
+                            );
+                            answers.insert(index, own);
+                            carried.insert(
+                                index,
+                                Carried {
+                                    text: inherited.text.clone(),
+                                    history,
+                                },
+                            );
+                            decision_input = Some(input);
+                        }
+                        RouteNodeConfig::Sink { sink } => {
+                            nodes.push(serde_json::json!({"nodeId":node.id,"kind":"sink","reached":true,"output":fields}));
+                            deliveries.push(Delivery {
+                                node_id: &node.id,
+                                sink,
+                                position: positions[&index],
+                                fields,
+                                transforms: history,
+                            });
+                            continue;
+                        }
+                        RouteNodeConfig::Trigger { .. } => {
+                            unreachable!("triggers are handled above")
+                        }
+                    }
+                    Some(fields)
+                }
             }
-            RouteNodeConfig::Trigger { .. } => unreachable!("triggers are handled above"),
+        };
+
+        let mut routed = false;
+        for edge in graph.outgoing_edges(index) {
+            let to = &graph.node(edge.to).id;
+            let Some(fields) = &reached else {
+                edges.push(
+                    serde_json::json!({"from":node.id,"to":to,"reached":false,"taken":false}),
+                );
+                continue;
+            };
+            let (matched, failures) = edge_verdict(edge, fact, presence, fields);
+            if matched {
+                taken.insert((edge.from, edge.to));
+                routed = true;
+            }
+            edges.push(serde_json::json!({"from":node.id,"to":to,"reached":true,"taken":matched,"failures":failures}));
+        }
+        if let (Some(input), false) = (decision_input, routed) {
+            unrouted.push(Unrouted {
+                node_id: &node.id,
+                history: carried
+                    .get(&index)
+                    .map(|path| path.history.clone())
+                    .unwrap_or_default(),
+                input,
+            });
         }
     }
     Walk {
         deliveries,
         outputs,
         nodes,
+        edges,
+        unrouted,
     }
 }
 
@@ -301,7 +785,86 @@ async fn walk<'a>(
 pub struct RouteTestResult {
     pub matched: bool,
     pub nodes: Vec<Value>,
+    /// Every edge's verdict: `{from, to, reached, taken, failures}`.
+    pub edges: Vec<Value>,
     pub sink_previews: Vec<Value>,
+}
+
+/// A decision runner that resolves option sources against `project_id` and
+/// asks through the orchestrator's one decide path.
+fn production_decide(
+    orch: &Orchestrator,
+    project_id: Option<&str>,
+) -> impl Fn(&DecisionNode, String) -> DecisionFuture + Sync {
+    let (orch, project_id) = (orch.clone(), project_id.map(str::to_owned));
+    move |decision: &DecisionNode, input: String| -> DecisionFuture {
+        let (orch, decision, project_id) = (orch.clone(), decision.clone(), project_id.clone());
+        Box::pin(
+            async move { decisions::run(&orch, project_id.as_deref(), &decision, input).await },
+        )
+    }
+}
+
+/// What a sink would do with one firing, without doing it: the address it
+/// resolved, or why it would drop.
+async fn sink_preview(
+    orch: &Orchestrator,
+    delivery: &Delivery<'_>,
+    bindings: &Bindings<'_>,
+) -> Value {
+    let fields = &delivery.fields;
+    let node_id = delivery.node_id;
+    match delivery.sink {
+        RouteSink::Channel {
+            destination,
+            initiated_by,
+        } => {
+            let mut preview = serde_json::json!({"nodeId":node_id,"kind":"channel","initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()});
+            match destination {
+                Bindable::Fixed(destination) => {
+                    preview["destination"] = serde_json::json!(destination)
+                }
+                Bindable::Bound(binding) => match bound_conversation(orch, bindings, binding).await
+                {
+                    Ok(address) => preview["destination"] = Value::String(address.to_string()),
+                    Err(drop) => {
+                        preview["destination"] = serde_json::json!(drop.sink_ref);
+                        preview["dropped"] = Value::String(drop.reason.into());
+                        preview["error"] = Value::String(drop.error);
+                    }
+                },
+            }
+            preview
+        }
+        RouteSink::Message { target } => {
+            let plans = message_targets(bindings, target);
+            let targets: Vec<Value> = plans
+                .iter()
+                .map(|plan| match plan {
+                    TargetPlan::Deliver { canonical, .. } => {
+                        serde_json::json!({"address": canonical})
+                    }
+                    TargetPlan::SinkDrop(drop) => drop.preview(),
+                })
+                .collect();
+            let first = plans.iter().find_map(|plan| match plan {
+                TargetPlan::Deliver { canonical, .. } => Some(canonical.clone()),
+                TargetPlan::SinkDrop(_) => None,
+            });
+            serde_json::json!({"nodeId":node_id,"kind":"message","target":first,"targets":targets,"text":text_of(fields)})
+        }
+        RouteSink::Label { issue, labels } => match bindings.string(issue) {
+            Ok(issue) => {
+                serde_json::json!({"nodeId":node_id,"kind":"label","issue":issue,"labels":labels})
+            }
+            Err(error) => {
+                serde_json::json!({"nodeId":node_id,"kind":"label","labels":labels,"error":error})
+            }
+        },
+        RouteSink::Issue { labels, recipe } => {
+            serde_json::json!({"nodeId":node_id,"kind":"issue","project":fields.get("project"),"title":fields.get("title").or_else(||fields.get("text")),"description":fields.get("body").or_else(||fields.get("description")),"labels":labels,"recipe":recipe})
+        }
+    }
 }
 
 /// Execute a supplied draft through real Responses while stopping before every
@@ -341,23 +904,24 @@ pub async fn test_definition(
             .map_err(|error| error.to_string())
         })
     };
-    let walked = walk(&graph, &fact, presence, &run).await;
+    let decide = production_decide(orch, context.project_id);
+    let walked = walk(&graph, &fact, presence, &run, &decide).await;
     let matched = graph
         .triggers()
         .any(|index| trigger_matches(graph.node(index), &fact, presence));
-    let sink_previews = walked.deliveries.iter().map(|delivery| {
-        let fields = &delivery.fields;
-        let bindings = Bindings { graph: &graph, fields, outputs: &walked.outputs };
-        match delivery.sink {
-            RouteSink::Channel { destination, initiated_by } => serde_json::json!({"nodeId":delivery.node_id,"kind":"channel","destination":destination,"initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()}),
-            RouteSink::Message { target } => serde_json::json!({"nodeId":delivery.node_id,"kind":"message","target":target,"text":text_of(fields)}),
-            RouteSink::Label { issue, labels } => match bindings.string(issue) { Ok(issue) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","issue":issue,"labels":labels}), Err(error) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","labels":labels,"error":error}) },
-            RouteSink::Issue { labels, recipe } => serde_json::json!({"nodeId":delivery.node_id,"kind":"issue","project":fields.get("project"),"title":fields.get("title").or_else(||fields.get("text")),"description":fields.get("body").or_else(||fields.get("description")),"labels":labels,"recipe":recipe}),
-        }
-    }).collect();
+    let mut sink_previews = Vec::with_capacity(walked.deliveries.len());
+    for delivery in &walked.deliveries {
+        let bindings = Bindings {
+            graph: &graph,
+            fields: &delivery.fields,
+            outputs: &walked.outputs,
+        };
+        sink_previews.push(sink_preview(orch, delivery, &bindings).await);
+    }
     Ok(RouteTestResult {
         matched,
         nodes: walked.nodes,
+        edges: walked.edges,
         sink_previews,
     })
 }
@@ -620,7 +1184,7 @@ async fn dispatch_into(
                         scope_key: &scope_key,
                         project_id: context.project_id,
                         fact,
-                        sink,
+                        sink: FiringSink::Route(sink),
                         created_at: now,
                         fact_log_id,
                     },
@@ -657,7 +1221,36 @@ async fn dispatch_into(
                 .map_err(|error| error.to_string())
             })
         };
-        let walked = walk(&graph, fact, presence, &run).await;
+        let decide = production_decide(orch, context.project_id);
+        let walked = walk(&graph, fact, presence, &run, &decide).await;
+
+        // A decision whose answers took no edge stops the firing there. It is
+        // journaled once, with the answers and what was judged, so a refusal
+        // or an abstention is visible rather than a silent nothing.
+        for unrouted in &walked.unrouted {
+            record(
+                orch,
+                Firing {
+                    route_id: &route.id,
+                    scope_key: &scope_key,
+                    project_id: context.project_id,
+                    fact,
+                    sink: FiringSink::Decision(unrouted.node_id),
+                    created_at: now,
+                    fact_log_id,
+                },
+                serde_json::to_string(&unrouted.history).ok(),
+                Outcome {
+                    error: Some(format!(
+                        "no edge out of decision '{}' matched its answers",
+                        unrouted.node_id
+                    )),
+                    payload: crate::storage::firing_snapshot(&unrouted.input),
+                    ..Outcome::dropped("unrouted")
+                },
+            )
+            .await?;
+        }
 
         // Each sink records its own outcome on its own path's content: one sink
         // failing neither blocks the others nor speaks for them, and the journal
@@ -668,17 +1261,43 @@ async fn dispatch_into(
                 scope_key: &scope_key,
                 project_id: context.project_id,
                 fact,
-                sink: delivery.sink,
+                sink: FiringSink::Route(delivery.sink),
                 created_at: now,
                 fact_log_id,
             };
             let transforms_json = serde_json::to_string(&delivery.transforms).ok();
             let fields = &delivery.fields;
+            let bindings = Bindings {
+                graph: &graph,
+                fields,
+                outputs: &walked.outputs,
+            };
             match delivery.sink {
                 RouteSink::Channel {
                     destination,
                     initiated_by,
                 } => {
+                    let destination = match destination {
+                        Bindable::Fixed(ChannelDestination::Subscriptions) => None,
+                        Bindable::Fixed(ChannelDestination::Conversation(address)) => {
+                            Some(address.clone())
+                        }
+                        Bindable::Bound(binding) => {
+                            match bound_conversation(orch, &bindings, binding).await {
+                                Ok(address) => Some(address),
+                                Err(drop) => {
+                                    record(
+                                        orch,
+                                        firing,
+                                        transforms_json,
+                                        Outcome::sink_drop(drop, text_payload(fields)),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
                     submissions.push(ChannelSubmission {
                         // The once-only delivery key. A second channel sink needs
                         // its own, so the position is appended — but the FIRST
@@ -709,46 +1328,34 @@ async fn dispatch_into(
                             .and_then(Value::as_str)
                             .map(str::to_owned),
                         initiated_by: initiated_by.clone(),
-                        destination: match destination {
-                            ChannelDestination::Subscriptions => None,
-                            ChannelDestination::Conversation(address) => Some(address.clone()),
-                        },
+                        destination,
                         fact_log_id,
                         provider: None,
                     });
                 }
                 RouteSink::Message { target } => {
-                    let delivered = match resolve_message_target(target) {
-                        Ok((project, number, canonical)) => {
-                            super::with_provenance(route.id.clone(), async {
-                                crate::mcp::handlers::messages::append_project_or_issue_message(
-                                    orch,
-                                    crate::mcp::handlers::messages::MessageAuthor::Route(&route.id),
-                                    &project,
-                                    number,
-                                    text_of(fields),
+                    // A bound list fans out here, one delivery and one journal
+                    // row per address, so a decision asked once can reach
+                    // several targets while every other sink still fires once.
+                    for plan in message_targets(&bindings, target) {
+                        let outcome = match plan {
+                            TargetPlan::Deliver { target, canonical } => {
+                                let delivered = super::with_provenance(
+                                    route.id.clone(),
+                                    deliver_message(orch, &route.id, &target, text_of(fields)),
                                 )
                                 .await
-                            })
-                            .await
-                            .map(|_| canonical)
-                        }
-                        Err(error) => Err(error),
-                    };
-                    record(
-                        orch,
-                        firing,
-                        transforms_json,
-                        Outcome::delivery(delivered, text_payload(fields)),
-                    )
-                    .await?;
+                                .map(|()| canonical);
+                                Outcome::delivery(delivered, text_payload(fields))
+                            }
+                            TargetPlan::SinkDrop(drop) => {
+                                Outcome::sink_drop(drop, text_payload(fields))
+                            }
+                        };
+                        record(orch, firing, transforms_json.clone(), outcome).await?;
+                    }
                 }
                 RouteSink::Label { issue, labels } => {
-                    let bindings = Bindings {
-                        graph: &graph,
-                        fields,
-                        outputs: &walked.outputs,
-                    };
                     let result = super::with_provenance(
                         route.id.clone(),
                         fire_label_sink(orch, bindings, issue, labels),
@@ -799,13 +1406,7 @@ pub async fn record_channel_outcome(
     submission: &ChannelSubmission,
     result: Result<String, String>,
 ) -> Result<(), String> {
-    let sink = RouteSink::Channel {
-        destination: submission.destination.clone().map_or(
-            ChannelDestination::Subscriptions,
-            ChannelDestination::Conversation,
-        ),
-        initiated_by: submission.initiated_by.clone(),
-    };
+    let sink = submission_sink(submission);
     record(
         orch,
         Firing {
@@ -813,7 +1414,7 @@ pub async fn record_channel_outcome(
             scope_key: &submission.scope_key,
             project_id: submission.project_id.as_deref(),
             fact: &submission.fact,
-            sink: &sink,
+            sink: FiringSink::Route(&sink),
             created_at: submission.created_at,
             fact_log_id: submission.fact_log_id,
         },
@@ -824,19 +1425,25 @@ pub async fn record_channel_outcome(
     Ok(())
 }
 
+/// The channel sink a submission was addressed by, as resolved: a bound
+/// destination is journaled as the conversation it resolved to.
+fn submission_sink(submission: &ChannelSubmission) -> RouteSink {
+    RouteSink::Channel {
+        destination: Bindable::Fixed(submission.destination.clone().map_or(
+            ChannelDestination::Subscriptions,
+            ChannelDestination::Conversation,
+        )),
+        initiated_by: submission.initiated_by.clone(),
+    }
+}
+
 /// Journal a channel submission that no provider was left to receive.
 pub(crate) async fn record_channel_drop(
     orch: &Orchestrator,
     submission: &ChannelSubmission,
     reason: &'static str,
 ) -> Result<(), String> {
-    let sink = RouteSink::Channel {
-        destination: submission.destination.clone().map_or(
-            ChannelDestination::Subscriptions,
-            ChannelDestination::Conversation,
-        ),
-        initiated_by: submission.initiated_by.clone(),
-    };
+    let sink = submission_sink(submission);
     record(
         orch,
         Firing {
@@ -844,7 +1451,7 @@ pub(crate) async fn record_channel_drop(
             scope_key: &submission.scope_key,
             project_id: submission.project_id.as_deref(),
             fact: &submission.fact,
-            sink: &sink,
+            sink: FiringSink::Route(&sink),
             created_at: submission.created_at,
             fact_log_id: submission.fact_log_id,
         },
@@ -864,16 +1471,19 @@ async fn record(
     // A sink's declared address is the fallback ref; a firing that reached the
     // sink reports the address it actually landed on.
     let (sink_kind, declared_ref) = match firing.sink {
-        RouteSink::Channel { destination, .. } => (
+        FiringSink::Route(RouteSink::Channel { destination, .. }) => (
             "channel",
-            Some(match destination {
+            destination.fixed().map(|destination| match destination {
                 ChannelDestination::Subscriptions => "subscriptions".to_string(),
                 ChannelDestination::Conversation(address) => address.to_string(),
             }),
         ),
-        RouteSink::Message { target } => ("message", Some(target.clone())),
-        RouteSink::Issue { .. } => ("issue", None),
-        RouteSink::Label { .. } => ("label", None),
+        FiringSink::Route(RouteSink::Message { target }) => ("message", target.fixed().cloned()),
+        FiringSink::Route(RouteSink::Issue { .. }) => ("issue", None),
+        FiringSink::Route(RouteSink::Label { .. }) => ("label", None),
+        // `sink_kind` is free text in the journal, so a decision that routed
+        // nowhere names itself without a schema change.
+        FiringSink::Decision(node_id) => ("decision", Some(node_id.to_string())),
     };
     crate::storage::insert_route_firing(
         &orch.db.local,
@@ -1023,7 +1633,7 @@ mod tests {
         let expected = fact.origin.clone();
         let run: RunResponse =
             &|_, _| -> ResponseFuture { Box::pin(async { Ok("rewritten".into()) }) };
-        let walked = walk(&graph, &fact, Presence::Away, run).await;
+        let walked = walk(&graph, &fact, Presence::Away, run, &never_decides).await;
         assert_eq!(text_of(&walked.deliveries[0].fields), "rewritten");
         assert_eq!(fact.origin, expected);
     }
@@ -1042,9 +1652,243 @@ mod tests {
     fn message_targets_resolve_to_useful_canonical_history_refs() {
         assert_eq!(
             resolve_message_target("cairn://p/cairn/42").unwrap(),
-            ("cairn".into(), Some(42), "cairn://p/cairn/42".into())
+            (
+                MessageTarget::Stream {
+                    project: "cairn".into(),
+                    number: Some(42)
+                },
+                "cairn://p/cairn/42".into()
+            )
+        );
+        assert_eq!(
+            resolve_message_target("cairn://p/cairn/devops").unwrap(),
+            (
+                MessageTarget::Thread {
+                    project: "cairn".into(),
+                    name: "devops".into()
+                },
+                "cairn://p/cairn/devops".into()
+            )
         );
         assert!(resolve_message_target("cairn://p/cairn/42/messages").is_err());
+        assert!(resolve_message_target("cairn://p/cairn/devops/messages").is_err());
+    }
+
+    fn never_decides(_: &DecisionNode, _: String) -> DecisionFuture {
+        unreachable!("this route asks no decision")
+    }
+
+    /// A decision runner that answers every question with `answer`, so the
+    /// walk's routing is exercised without a provider.
+    fn answering(
+        answer: crate::models::decision::DecisionAnswer,
+    ) -> impl Fn(&DecisionNode, String) -> DecisionFuture + Sync {
+        move |decision: &DecisionNode, _input: String| -> DecisionFuture {
+            let run = DecisionRun {
+                asked: decision.clone(),
+                result: Ok(crate::models::decision::Decision {
+                    provider: "fixture".into(),
+                    model: "jev".into(),
+                    answers: vec![answer.clone()],
+                    usage: Default::default(),
+                }),
+            };
+            Box::pin(async move { run })
+        }
+    }
+
+    fn target_choice(pick: &str, confidence: f64) -> crate::models::decision::DecisionAnswer {
+        crate::models::decision::DecisionAnswer::Choice {
+            name: "target".into(),
+            measured_by: crate::models::decision::MeasuredBy::Native,
+            pick: pick.into(),
+            confidence: Some(confidence),
+            probabilities: vec![],
+        }
+    }
+
+    fn channel_fact(text: &str) -> RouteFact {
+        RouteFact {
+            source: "channel_message".into(),
+            identity: "inbound:1".into(),
+            fields: BTreeMap::from([
+                ("project".into(), Value::String("cairn".into())),
+                ("provider".into(), Value::String("discord".into())),
+                ("conversation".into(), Value::String("discord:1/2".into())),
+                ("bindingKind".into(), Value::String("ambient".into())),
+                ("addressed".into(), Value::Bool(false)),
+                ("target".into(), Value::String("cairn://p/cairn".into())),
+                ("text".into(), Value::String(text.into())),
+            ]),
+            origin: None,
+            summary: Some(text.into()),
+            route_provenance: None,
+        }
+    }
+
+    fn no_response() -> impl Fn(&str, Value) -> ResponseFuture + Sync {
+        |_: &str, _: Value| -> ResponseFuture { Box::pin(async { Err("no responses".into()) }) }
+    }
+
+    #[tokio::test]
+    async fn fixture_a_delivers_to_the_admitted_pick_with_the_answers_in_its_fields() {
+        let definition = definition(crate::routes::definition::FIXTURE_A);
+        let graph = RouteGraph::new(&definition).unwrap();
+        let decide = answering(target_choice("cairn://p/cairn/34", 0.8));
+        let walked = walk(
+            &graph,
+            &channel_fact("the build is red"),
+            Presence::Away,
+            &no_response(),
+            &decide,
+        )
+        .await;
+        assert!(walked.unrouted.is_empty());
+        let [delivery] = walked.deliveries.as_slice() else {
+            panic!("one delivery: {}", walked.deliveries.len());
+        };
+        assert_eq!(delivery.fields["answers.target.pick"], "cairn://p/cairn/34");
+        assert_eq!(
+            text_of(&delivery.fields),
+            "the build is red",
+            "a decision passes content on"
+        );
+        assert_eq!(delivery.transforms[0]["decision"], "pick");
+        let bindings = Bindings {
+            graph: &graph,
+            fields: &delivery.fields,
+            outputs: &walked.outputs,
+        };
+        let RouteSink::Message { target } = delivery.sink else {
+            panic!("a message sink");
+        };
+        assert_eq!(
+            message_targets(&bindings, target),
+            vec![TargetPlan::Deliver {
+                target: MessageTarget::Stream {
+                    project: "cairn".into(),
+                    number: Some(34)
+                },
+                canonical: "cairn://p/cairn/34".into()
+            }]
+        );
+        let edge = walked
+            .edges
+            .iter()
+            .find(|edge| edge["from"] == "pick")
+            .unwrap();
+        assert_eq!(edge["taken"], true);
+    }
+
+    /// The route-side failure contract: a refusal, a pick below threshold, and
+    /// answers no edge accepts all fire nothing and are collected as unrouted
+    /// with the answers on the record.
+    #[tokio::test]
+    async fn a_refusal_a_low_pick_and_an_unmatched_edge_set_route_nowhere() {
+        let fixture = definition(crate::routes::definition::FIXTURE_A);
+        let narrowed = definition(&crate::routes::definition::FIXTURE_A.replace(
+            "when: { answers.target.outcome: admitted, answers.target.confidence: { gte: 0.6 } }",
+            "when: { answers.target.pick: 'cairn://p/cairn/12' }",
+        ));
+        let refusal = crate::models::decision::DecisionAnswer::Refusal {
+            name: "target".into(),
+            measured_by: crate::models::decision::MeasuredBy::Native,
+            reason: Some("policy".into()),
+        };
+        for (route, answer, outcome) in [
+            (&fixture, refusal, "refused"),
+            (
+                &fixture,
+                target_choice("cairn://p/cairn/34", 0.3),
+                "below_threshold",
+            ),
+            (
+                &narrowed,
+                target_choice("cairn://p/cairn/34", 0.9),
+                "admitted",
+            ),
+        ] {
+            let graph = RouteGraph::new(route).unwrap();
+            let decide = answering(answer);
+            let walked = walk(
+                &graph,
+                &channel_fact("hello"),
+                Presence::Away,
+                &no_response(),
+                &decide,
+            )
+            .await;
+            assert!(
+                walked.deliveries.is_empty(),
+                "{outcome}: nothing is delivered"
+            );
+            let [unrouted] = walked.unrouted.as_slice() else {
+                panic!("{outcome}: one unrouted decision");
+            };
+            assert_eq!(unrouted.node_id, "pick");
+            assert_eq!(unrouted.input, "hello");
+            assert_eq!(
+                unrouted.history[0]["answers"]["target"]["outcome"], outcome,
+                "{:?}",
+                unrouted.history
+            );
+            let edge = walked
+                .edges
+                .iter()
+                .find(|edge| edge["from"] == "pick")
+                .unwrap();
+            assert_eq!(edge["taken"], false);
+            assert!(!edge["failures"].as_array().unwrap().is_empty(), "{edge}");
+        }
+    }
+
+    #[test]
+    fn a_bound_list_fans_out_to_the_cap_and_drops_the_rest_by_name() {
+        let definition = definition(crate::routes::definition::FIXTURE_A);
+        let graph = RouteGraph::new(&definition).unwrap();
+        let addresses: Vec<Value> = (1..=MAX_TARGETS_PER_SINK + 2)
+            .map(|number| Value::String(format!("cairn://p/cairn/{number}")))
+            .chain([Value::String("not a uri".into())])
+            .collect();
+        let fields =
+            BTreeMap::from([("answers.target.picks".to_string(), Value::Array(addresses))]);
+        let outputs = HashMap::new();
+        let bindings = Bindings {
+            graph: &graph,
+            fields: &fields,
+            outputs: &outputs,
+        };
+        let plans = message_targets(
+            &bindings,
+            &Bindable::Bound(ArgumentBinding::Field {
+                field: "answers.target.picks".into(),
+            }),
+        );
+        let reasons: Vec<&str> = plans
+            .iter()
+            .map(|plan| match plan {
+                TargetPlan::Deliver { .. } => "deliver",
+                TargetPlan::SinkDrop(drop) => drop.reason,
+            })
+            .collect();
+        assert_eq!(
+            reasons.iter().filter(|r| **r == "deliver").count(),
+            MAX_TARGETS_PER_SINK
+        );
+        assert_eq!(reasons.iter().filter(|r| **r == "fan_out_limit").count(), 3);
+        let missing = message_targets(
+            &bindings,
+            &Bindable::Bound(ArgumentBinding::Field {
+                field: "answers.target.addresses".into(),
+            }),
+        );
+        assert!(matches!(
+            missing.as_slice(),
+            [TargetPlan::SinkDrop(SinkDrop {
+                reason: "unbound_target",
+                ..
+            })]
+        ));
     }
 
     /// The motivating branch: one trigger, one edge through a response node to a
@@ -1065,6 +1909,7 @@ mod tests {
             &thread_fact("the whole long message"),
             Presence::Away,
             run,
+            &never_decides,
         )
         .await;
 
@@ -1098,7 +1943,14 @@ mod tests {
             run(response, args)
         };
 
-        let walked = walk(&graph, &thread_fact("long"), Presence::Away, counted).await;
+        let walked = walk(
+            &graph,
+            &thread_fact("long"),
+            Presence::Away,
+            counted,
+            &never_decides,
+        )
+        .await;
         assert_eq!(walked.deliveries.len(), 2);
         assert!(walked
             .deliveries
@@ -1131,7 +1983,14 @@ mod tests {
             run(response, args)
         };
 
-        let walked = walk(&graph, &thread_fact("original"), Presence::Away, recording).await;
+        let walked = walk(
+            &graph,
+            &thread_fact("original"),
+            Presence::Away,
+            recording,
+            &never_decides,
+        )
+        .await;
         // The second step saw the first step's input, because the first failed.
         assert_eq!(
             seen.lock().unwrap()[1]["text"],
@@ -1155,7 +2014,14 @@ mod tests {
         let graph = RouteGraph::new(&definition).unwrap();
         let run: RunResponse =
             &|_: &str, _: Value| -> ResponseFuture { Box::pin(async { Ok(String::new()) }) };
-        let walked = walk(&graph, &thread_fact("hello"), Presence::Away, run).await;
+        let walked = walk(
+            &graph,
+            &thread_fact("hello"),
+            Presence::Away,
+            run,
+            &never_decides,
+        )
+        .await;
         assert_eq!(walked.deliveries.len(), 1);
         assert_eq!(walked.deliveries[0].position, 0);
     }
@@ -1443,6 +2309,341 @@ mod tests {
         );
         assert_eq!(
             db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    /* ------------------------------------------- decisions, end to end */
+
+    /// A workspace whose one decision offer is a native Decisions server
+    /// answering from `replies`, with the project, issues 12, 34 and 42, and
+    /// `routes` installed. Selection, the call, and admission all run for real.
+    async fn deciding_workspace(
+        replies: Vec<Value>,
+        routes: &[(&str, &str)],
+    ) -> (
+        Orchestrator,
+        Arc<crate::orchestrator::decide_fixtures::Scripted>,
+    ) {
+        let (orch, scripted, _) = crate::orchestrator::decide_fixtures::workspace_with_server(
+            crate::credentials::CustomProtocol::Decisions,
+            Some("gateway-key"),
+            "typesafe-ai/jev",
+            replies,
+        )
+        .await;
+        std::fs::create_dir_all(orch.config_dir.join("routes")).unwrap();
+        for (name, body) in routes {
+            std::fs::write(orch.config_dir.join(format!("routes/{name}.yaml")), body).unwrap();
+        }
+        orch.db.local.execute_batch(PROJECT_FIXTURE).await.unwrap();
+        orch.db
+            .local
+            .execute_batch(
+                "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+                   VALUES('i12', 'p', 12, 'Twelve', 'active', 1, 1), ('i34', 'p', 34, 'Thirty-four', 'active', 1, 1);",
+            )
+            .await
+            .unwrap();
+        (orch, scripted)
+    }
+
+    fn choice_reply(name: &str, choice: &str, probabilities: &[(&str, f64)]) -> Value {
+        serde_json::json!({
+            "model": "typesafe-ai/jev",
+            "answers": [{
+                "type": "choice", "name": name, "choice": choice,
+                "probabilities": probabilities.iter().map(|(value, probability)| serde_json::json!({"value": value, "probability": probability})).collect::<Vec<_>>()
+            }],
+            "usage": {"input_tokens": 30, "output_tokens": 0}
+        })
+    }
+
+    fn in_project() -> RouteContext<'static> {
+        RouteContext {
+            project_id: Some("p"),
+            project_path: None,
+        }
+    }
+
+    async fn issue_messages(orch: &Orchestrator, number: i32) -> Option<String> {
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT sender_name || ':' || content FROM messages WHERE channel_type = 'issue' AND channel_id = ?1",
+                (format!("cairn/{number}"),),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixture_a_fires_to_the_picked_issue_through_the_real_decide() {
+        let (orch, server) = deciding_workspace(
+            vec![choice_reply(
+                "target",
+                "cairn://p/cairn/34",
+                &[("cairn://p/cairn/12", 0.05), ("cairn://p/cairn/34", 0.95)],
+            )],
+            &[("pick-issue", crate::routes::definition::FIXTURE_A)],
+        )
+        .await;
+        dispatch(
+            &orch,
+            channel_fact("the build is red"),
+            Presence::Away,
+            in_project(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.calls(), 1, "one decision, asked once");
+        assert_eq!(
+            issue_messages(&orch, 34).await.as_deref(),
+            Some("route:pick-issue:the build is red")
+        );
+        assert_eq!(issue_messages(&orch, 12).await, None);
+        let firing =
+            crate::storage::list_route_firings(&orch.db.local, "workspace", "pick-issue", 5)
+                .await
+                .unwrap();
+        let [firing] = firing.as_slice() else {
+            panic!("one firing: {firing:?}");
+        };
+        assert_eq!(firing.status, "fired");
+        assert_eq!(firing.sink_ref.as_deref(), Some("cairn://p/cairn/34"));
+        assert!(firing
+            .transforms_json
+            .as_deref()
+            .unwrap()
+            .contains("\"outcome\":\"admitted\""));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_decision_delivers_nothing_and_journals_one_unrouted_row() {
+        let (orch, _) = deciding_workspace(
+            vec![serde_json::json!({
+                "model": "typesafe-ai/jev",
+                "answers": [{"type": "refusal", "name": "target"}],
+                "usage": {"input_tokens": 30, "output_tokens": 0}
+            })],
+            &[("pick-issue", crate::routes::definition::FIXTURE_A)],
+        )
+        .await;
+        dispatch(&orch, channel_fact("hello"), Presence::Away, in_project())
+            .await
+            .unwrap();
+        assert_eq!(issue_messages(&orch, 34).await, None);
+        assert_eq!(issue_messages(&orch, 12).await, None);
+        let firings =
+            crate::storage::list_route_firings(&orch.db.local, "workspace", "pick-issue", 5)
+                .await
+                .unwrap();
+        let [row] = firings.as_slice() else {
+            panic!("one row: {firings:?}");
+        };
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.drop_reason.as_deref(),
+                row.sink_kind.as_str(),
+                row.sink_ref.as_deref()
+            ),
+            ("dropped", Some("unrouted"), "decision", Some("pick"))
+        );
+        assert_eq!(row.payload_text.as_deref(), Some("hello"));
+        assert!(row
+            .transforms_json
+            .as_deref()
+            .unwrap()
+            .contains("\"outcome\":\"refused\""));
+    }
+
+    /// Fixture B (4896's shape): two chartered threads admitted by top-k, so
+    /// the deliver sink fans out to both thread URIs while the bound
+    /// acknowledgement goes to its conversation exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixture_b_fans_out_to_each_admitted_thread_and_acknowledges_once() {
+        let (orch, server) = deciding_workspace(
+            vec![choice_reply(
+                "thread",
+                "devops",
+                &[("devops", 0.5), ("docs", 0.4), ("ui", 0.1)],
+            )],
+            &[("ambient", crate::routes::definition::FIXTURE_B)],
+        )
+        .await;
+        orch.db
+            .local
+            .execute_batch(
+                "INSERT INTO threads(id, project_id, name, jurisdiction, status, attention, created_at, updated_at) VALUES
+                   ('t-devops', 'p', 'devops', 'How the project builds and ships.', 'active', 'none', 1, 1),
+                   ('t-docs', 'p', 'docs', 'The documentation.', 'active', 'none', 1, 1),
+                   ('t-ui', 'p', 'ui', 'The interface.', 'active', 'none', 1, 1),
+                   ('t-closed', 'p', 'old', 'Retired.', 'closed', 'none', 1, 1);",
+            )
+            .await
+            .unwrap();
+        // Merged into the settings the provider was saved in, not written
+        // over them, so the decision offer survives.
+        let mut settings = crate::config::settings::load_settings(&orch.config_dir);
+        settings.channels.discord.enabled = true;
+        crate::config::settings::save_settings(&orch.config_dir, &settings).unwrap();
+        assert!(crate::channels::ledger::bind_target(
+            &orch.db.local,
+            "discord",
+            "discord:1/2",
+            "cairn://p/cairn",
+            crate::channels::bindings::BindingKind::Ambient,
+            crate::channels::bindings::MESSAGE_CLASS_AGENT_TEXT,
+            1,
+            0,
+        )
+        .await
+        .unwrap());
+
+        let submissions = dispatch(
+            &orch,
+            channel_fact("who owns the release?"),
+            Presence::Away,
+            in_project(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.calls(), 1);
+        let destinations: Vec<String> = submissions
+            .iter()
+            .map(|submission| {
+                submission
+                    .destination
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            destinations,
+            ["discord:1/2"],
+            "exactly one acknowledgement, to the bound conversation"
+        );
+        let firings =
+            crate::storage::list_route_firings(&orch.db.local, "workspace", "ambient", 20)
+                .await
+                .unwrap();
+        let mut delivered: Vec<(&str, &str)> = firings
+            .iter()
+            .filter(|firing| firing.sink_kind == "message")
+            .map(|firing| {
+                (
+                    firing.status.as_str(),
+                    firing.sink_ref.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        delivered.sort();
+        assert_eq!(
+            delivered,
+            [
+                ("fired", "cairn://p/cairn/devops"),
+                ("fired", "cairn://p/cairn/docs")
+            ],
+            "{firings:?}"
+        );
+        for firing in firings
+            .iter()
+            .filter(|firing| firing.sink_kind == "message")
+        {
+            let record = firing.transforms_json.as_deref().unwrap();
+            assert!(
+                record.contains(&format!(
+                    "\"revision\":\"{}\"",
+                    crate::routes::decision::revision("How the project builds and ships.")
+                )),
+                "each delivery journals the options' revisions: {record}"
+            );
+        }
+        let thread_messages = orch
+            .db
+            .local
+            .query_opt_i64(
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'thread' AND sender_name = 'route:ambient'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(thread_messages, Some(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bound_conversation_that_is_not_configured_is_dropped_as_undeliverable() {
+        let route = "name: ack\ndescription: acknowledge in the conversation\nnodes:\n  - { id: inbound, type: trigger, when: { fact: channel_message } }\n  - { id: ack, type: sink, sink: { kind: channel, destination: { field: conversation } } }\nedges:\n  - { from: inbound, to: ack }\n";
+        let (orch, _) = deciding_workspace(vec![], &[("ack", route)]).await;
+        let submissions = dispatch(&orch, channel_fact("hi"), Presence::Away, in_project())
+            .await
+            .unwrap();
+        assert!(submissions.is_empty());
+        let firings = crate::storage::list_route_firings(&orch.db.local, "workspace", "ack", 5)
+            .await
+            .unwrap();
+        let [row] = firings.as_slice() else {
+            panic!("one row: {firings:?}");
+        };
+        assert_eq!(
+            (
+                row.status.as_str(),
+                row.drop_reason.as_deref(),
+                row.sink_ref.as_deref()
+            ),
+            ("dropped", Some("undeliverable"), Some("discord:1/2"))
+        );
+        assert!(row
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not a configured conversation"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_dry_run_asks_the_decision_but_delivers_and_journals_nothing() {
+        let (orch, server) = deciding_workspace(
+            vec![choice_reply(
+                "target",
+                "cairn://p/cairn/34",
+                &[("cairn://p/cairn/12", 0.05), ("cairn://p/cairn/34", 0.95)],
+            )],
+            &[],
+        )
+        .await;
+        let draft = definition(crate::routes::definition::FIXTURE_A);
+        let result = test_definition(
+            &orch,
+            &draft,
+            channel_fact("preview"),
+            Presence::Away,
+            in_project(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.calls(), 1);
+        assert_eq!(result.sink_previews[0]["target"], "cairn://p/cairn/34");
+        let decision_edge = result
+            .edges
+            .iter()
+            .find(|edge| edge["from"] == "pick")
+            .unwrap();
+        assert_eq!(decision_edge["taken"], true);
+        let decision = result
+            .nodes
+            .iter()
+            .find(|node| node["nodeId"] == "pick")
+            .unwrap();
+        assert_eq!(decision["answers"]["target"]["outcome"], "admitted");
+        assert_eq!(issue_messages(&orch, 34).await, None);
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
                 .await
                 .unwrap(),
             Some(0)

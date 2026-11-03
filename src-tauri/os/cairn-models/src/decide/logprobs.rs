@@ -76,7 +76,7 @@ impl<'a> Ask<'a> {
         let mut prompt = format!("{input}\n\n---\nQuestion: {}\n", question.instructions);
         match &question.kind {
             QuestionKind::Predicate => prompt.push_str("\nReply with only Yes or No."),
-            QuestionKind::Choice { options } => {
+            QuestionKind::Choice { options, .. } => {
                 prompt.push_str("\nOptions:\n");
                 for (label, option) in labels.iter().zip(options) {
                     prompt.push_str(&format!("{label}. {}", option.value));

@@ -146,6 +146,28 @@ impl std::fmt::Display for DecisionFailure {
     }
 }
 
+/// One decision node as its diagnostics name it, whichever consumer holds
+/// it: a recipe node or a route node.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NamedDecision<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub decision: &'a DecisionNode,
+}
+
+fn recipe_decisions(nodes: &[RecipeNode]) -> Vec<NamedDecision<'_>> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            Some(NamedDecision {
+                id: &node.id,
+                name: &node.name,
+                decision: node.decision_config.as_ref()?,
+            })
+        })
+        .collect()
+}
+
 /// What a decision node asks the catalog for: the `provider/model` selection
 /// chose for it, or, when it has no allotment, the best offer.
 fn decision_query(target: Option<&str>) -> OfferQuery<'_> {
@@ -418,6 +440,21 @@ impl Orchestrator {
         nodes: &[RecipeNode],
         project_id: Option<&str>,
     ) -> Vec<DecisionDiagnostic> {
+        self.diagnose_decisions(
+            &recipe_decisions(nodes),
+            project_id,
+            "Saving or launching the recipe",
+        )
+    }
+
+    /// [`Self::decision_diagnostics`] over any consumer's decision nodes.
+    /// `gate` names what will probe an offer not yet seen to answer.
+    pub(crate) fn diagnose_decisions(
+        &self,
+        nodes: &[NamedDecision<'_>],
+        project_id: Option<&str>,
+        gate: &str,
+    ) -> Vec<DecisionDiagnostic> {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
@@ -425,10 +462,10 @@ impl Orchestrator {
         nodes
             .iter()
             .filter_map(|node| {
-                let decision = node.decision_config.as_ref()?;
+                let decision = node.decision;
                 let report = |blocking: bool, rest: String| DecisionDiagnostic {
-                    node_id: node.id.clone(),
-                    node_name: node.name.clone(),
+                    node_id: node.id.to_string(),
+                    node_name: node.name.to_string(),
                     blocking,
                     message: format!("Decision node '{}' {rest}", node.name),
                 };
@@ -456,7 +493,7 @@ impl Orchestrator {
                     report(
                         false,
                         format!(
-                            "will be answered by {} on {} from logprobs, which has not been seen to answer yet. Saving or launching the recipe asks it one probe question first.",
+                            "will be answered by {} on {} from logprobs, which has not been seen to answer yet. {gate} asks it one probe question first.",
                             offer.model, offer.provider
                         ),
                     )
@@ -472,11 +509,21 @@ impl Orchestrator {
         nodes: &[RecipeNode],
         project_id: Option<&str>,
     ) -> Vec<String> {
+        self.named_decision_problems(&recipe_decisions(nodes), project_id)
+    }
+
+    /// [`Self::decision_problems`] over any consumer's decision nodes. May
+    /// probe an unconfirmed logprobs offer, so it blocks for up to
+    /// [`PROBE_TIMEOUT`].
+    pub(crate) fn named_decision_problems(
+        &self,
+        nodes: &[NamedDecision<'_>],
+        project_id: Option<&str>,
+    ) -> Vec<String> {
         nodes
             .iter()
             .filter_map(|node| {
-                let decision = node.decision_config.as_ref()?;
-                self.node_decision_offer(project_id, decision)
+                self.node_decision_offer(project_id, node.decision)
                     .err()
                     .map(|refusal| {
                         format!("Decision node '{}' can't be answered: {refusal}", node.name)

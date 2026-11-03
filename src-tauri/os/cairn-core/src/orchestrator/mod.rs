@@ -22,7 +22,7 @@ mod decide;
 mod subscription_periods;
 #[cfg(test)]
 pub(crate) use decide::tests as decide_fixtures;
-pub(crate) use decide::{DecideRequest, DecisionFailure};
+pub(crate) use decide::{DecideRequest, DecisionFailure, NamedDecision};
 pub(crate) mod base_branch_sync;
 pub(crate) mod complete;
 pub(crate) mod embed;

@@ -11,6 +11,7 @@
 //! same standard; without this the editor would be the lenient door, saving
 //! routes that fail only at fire time, when the operator is not watching.
 
+use super::definition::Bindable;
 use super::{ArgumentBinding, RouteDefinition, RouteGraph, RouteNodeConfig, RouteSink};
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::{parse_uri, CairnResource};
@@ -54,7 +55,10 @@ pub async fn validate_references(
             RouteNodeConfig::Sink { sink } => {
                 validate_sink_references(orch, sink, project_path).await?
             }
-            RouteNodeConfig::Trigger { .. } => {}
+            // A decision names a model, which the decision diagnostics check
+            // against the catalog, and option sources, which resolve per
+            // firing; neither is a reference this check can settle.
+            RouteNodeConfig::Trigger { .. } | RouteNodeConfig::Decision { .. } => {}
         }
     }
     Ok(())
@@ -75,7 +79,12 @@ async fn validate_sink_references(
             return Err(format!("Unknown recipe '{recipe}'"));
         }
     }
-    if let RouteSink::Message { target } = sink {
+    // A bound target is only known per firing, and an undeliverable one is
+    // journaled as dropped then; a literal one is checked now.
+    if let RouteSink::Message {
+        target: Bindable::Fixed(target),
+    } = sink
+    {
         let (project, number) = match parse_uri(target) {
             Some(CairnResource::Project { project }) => (project, None),
             Some(CairnResource::Issue { project, number }) => (project, Some(number)),

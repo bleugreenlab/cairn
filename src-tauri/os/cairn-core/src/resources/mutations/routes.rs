@@ -67,6 +67,29 @@ async fn context_path(
             .and_then(|(_, path)| path),
     )
 }
+/// The settings canvas and this door hold a route to one standard: a decision
+/// nothing in scope can answer is refused when it is written, not discovered
+/// when it fires.
+async fn refuse_unanswerable(
+    o: &Orchestrator,
+    route: &RouteDefinition,
+    project_key: Option<&str>,
+) -> Result<(), String> {
+    let project_id = match project_key {
+        Some(key) => {
+            o.db.local
+                .query_opt_text(
+                    "SELECT id FROM projects WHERE UPPER(key) = UPPER(?1)",
+                    (key.to_string(),),
+                )
+                .await
+                .map_err(|error| error.to_string())?
+        }
+        None => None,
+    };
+    crate::routes::decision::refuse_unanswerable_decisions(o, route, project_id.as_deref()).await
+}
+
 pub(super) async fn create(
     o: &Orchestrator,
     r: &McpCallbackRequest,
@@ -83,6 +106,7 @@ pub(super) async fn create(
     reject(r, &id, p)?;
     let context_path = context_path(o, r, p).await?;
     crate::routes::validate_references(o, &route, context_path.as_deref()).await?;
+    refuse_unanswerable(o, &route, p).await?;
     let path = root(o, p).await?.join(format!("{id}.yaml"));
     if path.exists() {
         return Err(format!("Route already exists: {id}"));
@@ -108,6 +132,7 @@ pub(super) async fn patch(
     let (_, text, route) = definition(pay)?;
     let context_path = context_path(o, r, p).await?;
     crate::routes::validate_references(o, &route, context_path.as_deref()).await?;
+    refuse_unanswerable(o, &route, p).await?;
     let path = root(o, p).await?.join(format!("{id}.yaml"));
     if !path.exists() {
         return Err(format!("Route not found: {id}"));

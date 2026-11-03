@@ -1,5 +1,6 @@
 //! Declarative fact routing.
 
+pub mod decision;
 mod definition;
 mod dispatcher;
 mod graph;
@@ -12,7 +13,7 @@ mod references;
 mod worker;
 
 pub use definition::{
-    parse_definition, ArgumentBinding, ChannelDestination, DedupeWindow, NodePosition,
+    parse_definition, ArgumentBinding, Bindable, ChannelDestination, DedupeWindow, NodePosition,
     RouteDefinition, RouteEdge, RouteNode, RouteNodeConfig, RouteSink,
 };
 #[cfg(test)]
@@ -20,16 +21,16 @@ pub(crate) use dispatcher::HANGING_RESPONSE;
 pub use dispatcher::{
     record_channel_outcome, test_definition, ChannelSubmission, RouteContext, RouteTestResult,
 };
-pub use graph::RouteGraph;
+pub use graph::{GraphEdge, RouteGraph};
 pub use index::{invalidate_trigger_index, FactLogHandle};
 pub use lifecycle::{mint_attention, spawn_attention_minter};
 pub use log::{mint, spawn_mint, spawn_mint_deferred, Mint, MintOwned};
 pub(crate) use mentions::structural_mentions;
 pub(crate) use predicate::value_matches;
 pub use predicate::{
-    explain_clause, matches, Audience, Fact, FactFieldShape, FactRegistry, FactSourceShape,
-    FactSurface, FieldKind, FieldSpec, FieldVocabulary, LogDedupe, Presence, SourceSpec,
-    TriggerClause,
+    clause_value_problem, explain_clause, matches, AddressKind, Audience, Fact, FactFieldShape,
+    FactRegistry, FactSourceShape, FactSurface, FieldKind, FieldSpec, FieldVocabulary, LogDedupe,
+    Presence, SourceSpec, TriggerClause, ANSWERS_PREFIX, COMPARISON_OPERATORS,
 };
 pub use references::validate_references;
 pub use worker::spawn_fact_log_worker;

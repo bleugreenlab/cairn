@@ -129,6 +129,14 @@ pub fn explain_clause(
                         field => fact.fields.get(field).cloned().unwrap_or(Value::Null),
                     };
                     Some(match (&actual, expected) {
+                        (_, Value::Object(operators)) => {
+                            let wanted = describe_comparison(operators);
+                            if actual.is_number() {
+                                format!("{key} expected {wanted}, observed {actual}")
+                            } else {
+                                format!("{key} expected {wanted}, observed {actual} (not a number)")
+                            }
+                        }
                         (Value::Array(_), Value::Array(_)) if !key.ends_with("Prefix") => {
                             format!("{key}: list {actual} does not intersect {expected}")
                         }
@@ -195,9 +203,33 @@ pub enum Audience {
     FollowersOf(&'static str),
 }
 
+/// What kind of address a field's value is, when it is one a sink can deliver
+/// to. A sink address bound to a field is refused at load unless the field
+/// carries the kind of address that sink takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressKind {
+    /// A channel conversation address (`telegram:123`), what a channel sink
+    /// delivers to.
+    Conversation,
+    /// A canonical cairn project, issue, or thread URI, what a message sink
+    /// delivers to.
+    Target,
+}
+
+impl AddressKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Target => "target",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldSpec {
     pub kind: FieldKind,
+    /// The kind of address this field's value is, when it is one.
+    pub address: Option<AddressKind>,
     /// Whether the fact log row carries this field. A field that is not stored
     /// is still matchable and bindable: the log worker restores it from the
     /// canonical record the row points at (`routes::log::hydrate`). Content, such
@@ -356,9 +388,29 @@ const HYDRATED: bool = false;
 fn fields(entries: &[(&'static str, FieldKind, bool)]) -> HashMap<&'static str, FieldSpec> {
     entries
         .iter()
-        .map(|&(name, kind, stored)| (name, FieldSpec { kind, stored }))
+        .map(|&(name, kind, stored)| {
+            (
+                name,
+                FieldSpec {
+                    kind,
+                    address: None,
+                    stored,
+                },
+            )
+        })
         .collect()
 }
+
+/// The fields whose values a sink can deliver to, by source. A message sink
+/// takes a canonical project, issue, or thread URI; a channel sink takes a
+/// conversation address. Other URIs (an event, a post, a GitHub URL) are not
+/// delivery targets and are not listed.
+const ADDRESS_FIELDS: &[(&str, &str, AddressKind)] = &[
+    ("attention", "detailUri", AddressKind::Target),
+    ("thread_stream", "threadUri", AddressKind::Target),
+    ("channel_message", "target", AddressKind::Target),
+    ("channel_message", "conversation", AddressKind::Conversation),
+];
 
 impl Default for FactRegistry {
     fn default() -> Self {
@@ -580,7 +632,16 @@ impl Default for FactRegistry {
         ]
         .into_iter()
         .enumerate()
-        .map(|(order, (fact, spec))| (fact, TriggerSource { order, spec }))
+        .map(|(order, (fact, mut spec))| {
+            for (source, field, address) in ADDRESS_FIELDS {
+                if *source == fact {
+                    if let Some(spec) = spec.fields.get_mut(field) {
+                        spec.address = Some(*address);
+                    }
+                }
+            }
+            (fact, TriggerSource { order, spec })
+        })
         .collect();
         Self {
             triggers,
@@ -603,6 +664,8 @@ pub struct FactFieldShape {
     pub name: &'static str,
     pub kind: FieldKind,
     pub vocabulary: FieldVocabulary,
+    /// The kind of address the field carries, when a sink can deliver to it.
+    pub address: Option<AddressKind>,
 }
 
 impl FactRegistry {
@@ -643,6 +706,7 @@ impl FactRegistry {
                     name,
                     kind,
                     vocabulary: vocabulary_for(fact, name),
+                    address: self.field_address(fact, name),
                 })
                 .collect();
             fields.sort_by_key(|field| field.name);
@@ -703,6 +767,12 @@ impl FactRegistry {
             .is_some_and(|gate| gate.fields().iter().any(|(name, _)| *name == field))
     }
 
+    /// The kind of address `field` carries on `source`, when it is a delivery
+    /// address.
+    pub fn field_address(&self, source: &str, field: &str) -> Option<AddressKind> {
+        self.triggers.get(source)?.spec.fields.get(field)?.address
+    }
+
     /// How the fact log stores and delivers one TRIGGER source. Gate facts are
     /// resolved by query, never logged, so they have no spec.
     pub fn source(&self, source: &str) -> Option<&SourceSpec> {
@@ -729,13 +799,21 @@ impl FactRegistry {
             .ok_or_else(|| format!("unknown fact source '{source}'"))?
             .spec
             .fields;
-        for key in clause.keys() {
+        for (key, value) in clause {
             if key == "fact" || key == "presence" {
                 continue;
+            }
+            if key.starts_with(ANSWERS_PREFIX) {
+                return Err(format!(
+                    "'{key}': answers.* is only known below a decision, so a trigger cannot test it"
+                ));
             }
             let base = key.strip_suffix("Prefix").unwrap_or(key);
             if !fields.contains_key(base) {
                 return Err(format!("unknown field '{key}' for fact '{source}'"));
+            }
+            if let Some(problem) = clause_value_problem(key, value) {
+                return Err(problem);
             }
         }
         if let Some(value) = clause.get("presence") {
@@ -769,11 +847,89 @@ fn clause_matches(clause: &BTreeMap<String, Value>, fact: &Fact<'_>) -> bool {
                 .zip(expected.as_str())
                 .is_some_and(|(actual, prefix)| actual.starts_with(prefix))
         }
-        field => fact
-            .fields
-            .get(field)
-            .is_some_and(|actual| value_matches(actual, expected)),
+        field => fact.fields.get(field).is_some_and(|actual| match expected {
+            Value::Object(operators) => compares(actual, operators),
+            expected => value_matches(actual, expected),
+        }),
     })
+}
+
+/// The prefix every decision answer field carries (`answers.<question>.<key>`).
+/// Registry fields never contain a dot, so the two can never collide.
+pub const ANSWERS_PREFIX: &str = "answers.";
+
+/// The comparison operators a clause value may use, as an operator object on
+/// the value side (`confidence: { gte: 0.2, lt: 0.6 }`). Several in one object
+/// all have to hold.
+pub const COMPARISON_OPERATORS: &[&str] = &["gt", "gte", "lt", "lte"];
+
+/// What is wrong with one clause value's shape, if anything: an operator
+/// object must name only known operators, each over a number, and a
+/// `...Prefix` key takes a string.
+pub fn clause_value_problem(key: &str, value: &Value) -> Option<String> {
+    let Value::Object(operators) = value else {
+        return None;
+    };
+    if key.ends_with("Prefix") {
+        return Some(format!("'{key}' takes a string prefix, not a comparison"));
+    }
+    if operators.is_empty() {
+        return Some(format!(
+            "'{key}' compares with an empty object; use gt, gte, lt, or lte"
+        ));
+    }
+    operators.iter().find_map(|(operator, operand)| {
+        if !COMPARISON_OPERATORS.contains(&operator.as_str()) {
+            Some(format!(
+                "'{key}' uses the unknown comparison '{operator}'; expected gt, gte, lt, or lte"
+            ))
+        } else if !operand.is_number() {
+            Some(format!(
+                "'{key}' compares {operator} {operand}, which is not a number"
+            ))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `actual` satisfies every operator in a comparison object. A value
+/// that is not a number satisfies none.
+fn compares(actual: &Value, operators: &serde_json::Map<String, Value>) -> bool {
+    let Some(actual) = actual.as_f64() else {
+        return false;
+    };
+    !operators.is_empty()
+        && operators.iter().all(|(operator, operand)| {
+            let Some(operand) = operand.as_f64() else {
+                return false;
+            };
+            match operator.as_str() {
+                "gt" => actual > operand,
+                "gte" => actual >= operand,
+                "lt" => actual < operand,
+                "lte" => actual <= operand,
+                _ => false,
+            }
+        })
+}
+
+/// A comparison object as a reader would write it: `> 0.5`, `≥ 0.2 and < 0.6`.
+fn describe_comparison(operators: &serde_json::Map<String, Value>) -> String {
+    operators
+        .iter()
+        .map(|(operator, operand)| {
+            let symbol = match operator.as_str() {
+                "gt" => ">",
+                "gte" => "≥",
+                "lt" => "<",
+                "lte" => "≤",
+                other => other,
+            };
+            format!("{symbol} {operand}")
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// One field test. An array on either side means membership: a list field
@@ -797,6 +953,94 @@ pub(crate) fn value_matches(actual: &Value, expected: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numeric_fact(fields: &BTreeMap<String, Value>) -> Fact<'_> {
+        Fact {
+            source: "file_changed",
+            fields,
+            presence: Presence::Away,
+        }
+    }
+
+    #[test]
+    fn a_comparison_clause_validates_matches_and_explains_its_failure() {
+        let clause: TriggerClause =
+            serde_yaml::from_str("{ fact: file_changed, additions: { gt: 200, lte: 500 } }")
+                .unwrap();
+        FactRegistry::default()
+            .validate_clause("file_changed", &clause)
+            .unwrap();
+        let fields = |additions: Value| BTreeMap::from([("additions".to_string(), additions)]);
+        let large = fields(Value::from(240));
+        assert!(matches(
+            std::slice::from_ref(&clause),
+            &numeric_fact(&large)
+        ));
+        let small = fields(Value::from(31));
+        assert!(!matches(
+            std::slice::from_ref(&clause),
+            &numeric_fact(&small)
+        ));
+        assert_eq!(
+            explain_clause(&clause, &numeric_fact(&small), None),
+            vec!["additions expected > 200 and ≤ 500, observed 31".to_string()]
+        );
+        let text = fields(Value::String("x".into()));
+        assert!(!matches(
+            std::slice::from_ref(&clause),
+            &numeric_fact(&text)
+        ));
+        assert_eq!(
+            explain_clause(&clause, &numeric_fact(&text), None),
+            vec!["additions expected > 200 and ≤ 500, observed \"x\" (not a number)".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_operator_or_a_string_operand_is_refused() {
+        let registry = FactRegistry::default();
+        let refuse = |yaml: &str| {
+            let clause: TriggerClause = serde_yaml::from_str(yaml).unwrap();
+            registry
+                .validate_clause("file_changed", &clause)
+                .unwrap_err()
+        };
+        assert!(refuse("{ fact: file_changed, additions: { above: 2 } }")
+            .contains("unknown comparison 'above'"));
+        assert!(refuse("{ fact: file_changed, additions: { gt: '2' } }").contains("not a number"));
+        assert!(refuse("{ fact: file_changed, additions: {} }").contains("empty object"));
+        assert!(refuse("{ fact: file_changed, pathPrefix: { gt: 2 } }").contains("string prefix"));
+        assert!(refuse("{ fact: file_changed, answers.q.pick: a }")
+            .contains("only known below a decision"));
+    }
+
+    #[test]
+    fn delivery_address_fields_are_described_with_their_kind() {
+        let registry = FactRegistry::default();
+        assert_eq!(
+            registry.field_address("channel_message", "conversation"),
+            Some(AddressKind::Conversation)
+        );
+        assert_eq!(
+            registry.field_address("channel_message", "target"),
+            Some(AddressKind::Target)
+        );
+        assert_eq!(registry.field_address("channel_message", "text"), None);
+        let channel = registry
+            .describe()
+            .into_iter()
+            .find(|source| source.fact == "thread_stream")
+            .unwrap();
+        assert_eq!(
+            channel
+                .fields
+                .iter()
+                .find(|field| field.name == "threadUri")
+                .unwrap()
+                .address,
+            Some(AddressKind::Target)
+        );
+    }
 
     #[test]
     fn predicates_are_or_of_ands_and_support_prefix_and_presence() {

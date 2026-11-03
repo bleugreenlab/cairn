@@ -481,7 +481,7 @@ async fn a_long_description_never_crowds_out_the_pull_request() {
 }
 
 async fn seed_era(db: &LocalDb, status: &str) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO thread_eras (job_id, seq, start_block, end_block, started_at, ended_at, summary,
              summary_status, summary_model, minted_generation, created_at)
            VALUES ('j-design', 1, 0, 10, 100, 200, 'mechanical', '{status}', NULL, 1, 300);
@@ -776,7 +776,7 @@ async fn each_candidate_is_one_choice_question_about_the_event_text() {
     );
     let [question] = call.questions.try_into().unwrap();
     assert_eq!(question.name, "tenet-12");
-    let QuestionKind::Choice { options } = &question.kind else {
+    let QuestionKind::Choice { options, .. } = &question.kind else {
         panic!("a choice question: {question:?}");
     };
     let values: Vec<_> = options.iter().map(|option| option.value.as_str()).collect();

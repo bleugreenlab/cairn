@@ -159,6 +159,12 @@ async fn graph(
                         .unwrap_or("trigger")
                         .to_string(),
                     RouteNodeConfig::Response { response, .. } => response.clone(),
+                    RouteNodeConfig::Decision { decision, .. } => decision
+                        .questions
+                        .iter()
+                        .map(|question| question.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     RouteNodeConfig::Sink { sink } => sink_kind(sink).to_string(),
                 }
             } else {
@@ -180,7 +186,11 @@ async fn graph(
             }
         }
         for edge in &v.definition.edges {
-            edges.push(serde_json::json!({"route":v.id,"from":scoped(&edge.from),"to":scoped(&edge.to),"recentFirings":count}));
+            let mut entry = serde_json::json!({"route":v.id,"from":scoped(&edge.from),"to":scoped(&edge.to),"recentFirings":count});
+            if !edge.when.is_empty() {
+                entry["when"] = serde_json::json!(edge.when);
+            }
+            edges.push(entry);
         }
     }
     format!(

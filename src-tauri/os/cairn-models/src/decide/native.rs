@@ -21,7 +21,7 @@ pub(super) fn wire_questions(questions: &[DecisionQuestion]) -> Vec<WireQuestion
             let instructions = question.instructions.clone();
             match &question.kind {
                 QuestionKind::Predicate => WireQuestion::Predicate { name, instructions },
-                QuestionKind::Choice { options } => WireQuestion::Choice {
+                QuestionKind::Choice { options, .. } => WireQuestion::Choice {
                     name,
                     instructions,
                     choices: options
@@ -93,7 +93,7 @@ pub(super) fn answers(
                     })
                 }
                 (
-                    QuestionKind::Choice { options },
+                    QuestionKind::Choice { options, .. },
                     WireAnswer::Choice {
                         choice,
                         confidence,

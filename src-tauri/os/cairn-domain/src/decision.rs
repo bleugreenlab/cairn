@@ -37,6 +37,9 @@ pub const MAX_SCORE_LEVELS: usize = 10;
 /// The name a recipe decision node's one routing question carries.
 pub const PORT_QUESTION_NAME: &str = "route";
 
+/// The most picks a `choice` question may admit at once (`topK`).
+pub const MAX_TOP_K: usize = 5;
+
 /// How an answer's probabilities were measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,11 +68,57 @@ impl fmt::Display for MeasuredBy {
 }
 
 /// One option of a `choice` question.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `address` and `revision` are the consumer's, never the model's: the wire
+/// builders send only `value` and `description`, so an option can carry where
+/// a pick of it is delivered and which version of its description was asked
+/// without either reaching a provider.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DecisionOption {
     pub value: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Where a pick of this option is delivered: a canonical cairn URI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// A digest of the text the option was resolved from, so a recorded
+    /// answer says which version of that text the model chose between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl DecisionOption {
+    pub fn new(value: impl Into<String>, description: Option<String>) -> Self {
+        Self {
+            value: value.into(),
+            description,
+            ..Self::default()
+        }
+    }
+}
+
+/// Where a `choice` question's options come from when they are not listed:
+/// a set the consumer resolves into ordinary options before the question is
+/// asked, so the facet only ever sees a literal question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionSource {
+    /// The project's active threads that declare a jurisdiction (charter).
+    CharteredThreads,
+}
+
+impl OptionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CharteredThreads => "chartered_threads",
+        }
+    }
+}
+
+impl fmt::Display for OptionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// One level of a `score` question, lowest first.
@@ -84,8 +133,20 @@ pub struct ScoreLevel {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum QuestionKind {
-    /// Pick one of 1-255 options.
-    Choice { options: Vec<DecisionOption> },
+    /// Pick one of 1-255 options, listed or drawn from a `source`.
+    #[serde(rename_all = "camelCase")]
+    Choice {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<DecisionOption>,
+        /// Draw the options from this set instead of listing them. Resolved
+        /// into `options` (and cleared) before the question is asked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<OptionSource>,
+        /// How many picks may be admitted, best first (see
+        /// [`Thresholds::admit_top`]). Unset admits one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_k: Option<u8>,
+    },
     /// Yes or no.
     Predicate,
     /// Place the input on 2-10 ordered levels.
@@ -106,26 +167,57 @@ impl DecisionQuestion {
     /// The question a recipe's question-and-ports pair always meant: one
     /// `choice` whose options are the port names.
     pub fn port_choice(instructions: &str, ports: &[String]) -> Self {
+        Self::choice(
+            PORT_QUESTION_NAME,
+            instructions,
+            ports
+                .iter()
+                .map(|port| DecisionOption::new(port.clone(), None))
+                .collect(),
+        )
+    }
+
+    /// A `choice` question over listed options, admitting one pick.
+    pub fn choice(
+        name: impl Into<String>,
+        instructions: impl Into<String>,
+        options: Vec<DecisionOption>,
+    ) -> Self {
         Self {
-            name: PORT_QUESTION_NAME.to_string(),
-            instructions: instructions.to_string(),
+            name: name.into(),
+            instructions: instructions.into(),
             kind: QuestionKind::Choice {
-                options: ports
-                    .iter()
-                    .map(|port| DecisionOption {
-                        value: port.clone(),
-                        description: None,
-                    })
-                    .collect(),
+                options,
+                source: None,
+                top_k: None,
             },
         }
     }
 
+    /// The most picks this question admits: its `topK`, else one.
+    pub fn top_k(&self) -> usize {
+        match &self.kind {
+            QuestionKind::Choice {
+                top_k: Some(top_k), ..
+            } => usize::from(*top_k).max(1),
+            _ => 1,
+        }
+    }
+
+    /// The source a choice draws its options from, when it declares one.
+    pub fn option_source(&self) -> Option<OptionSource> {
+        match &self.kind {
+            QuestionKind::Choice { source, .. } => *source,
+            _ => None,
+        }
+    }
+
     /// The answers this question can take, in authored order: option values,
-    /// level labels, or `yes`/`no`.
+    /// level labels, or `yes`/`no`. Empty for a choice whose options are
+    /// still a source.
     pub fn answer_values(&self) -> Vec<&str> {
         match &self.kind {
-            QuestionKind::Choice { options } => {
+            QuestionKind::Choice { options, .. } => {
                 options.iter().map(|option| option.value.as_str()).collect()
             }
             QuestionKind::Predicate => vec!["yes", "no"],
@@ -189,6 +281,59 @@ impl Thresholds {
             }
         }
         Ok(pick)
+    }
+
+    /// Up to `k` picks an answer may be acted on, best first, or why none may.
+    ///
+    /// The first is [`Self::admit`]'s. Each runner-up, taken from the reported
+    /// probabilities in descending order (ties in `declared` order), is
+    /// admitted while its own [`choice_confidence`] over the `declared`
+    /// options reaches the answer's method threshold, or, with no threshold
+    /// set, while it sits above an even split. The first runner-up that falls
+    /// short ends the list. An answer that reports no probabilities admits
+    /// only its pick.
+    pub fn admit_top<'a>(
+        &self,
+        answer: &'a DecisionAnswer,
+        declared: &[&str],
+        k: usize,
+    ) -> Result<Vec<&'a str>, Abstention> {
+        let first = self.admit(answer)?;
+        let mut admitted = vec![first];
+        let DecisionAnswer::Choice { probabilities, .. } = answer else {
+            return Ok(admitted);
+        };
+        let rank = |value: &str| {
+            declared
+                .iter()
+                .position(|declared| *declared == value)
+                .unwrap_or(usize::MAX)
+        };
+        let mut ranked: Vec<&OptionProbability> = probabilities
+            .iter()
+            .filter(|option| option.value != first)
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.probability
+                .total_cmp(&a.probability)
+                .then_with(|| rank(&a.value).cmp(&rank(&b.value)))
+        });
+        let floor = self.for_method(answer.measured_by());
+        for option in ranked {
+            if admitted.len() >= k {
+                break;
+            }
+            let confidence = choice_confidence(option.probability, declared.len());
+            let clears = match floor {
+                Some(floor) => confidence >= floor,
+                None => confidence > 0.0,
+            };
+            if !clears {
+                break;
+            }
+            admitted.push(option.value.as_str());
+        }
+        Ok(admitted)
     }
 }
 
@@ -560,7 +705,20 @@ impl DecisionNode {
     pub fn port_question(&self) -> Result<(&DecisionQuestion, &[DecisionOption]), String> {
         match self.questions.as_slice() {
             [question] => match &question.kind {
-                QuestionKind::Choice { options } => Ok((question, options)),
+                QuestionKind::Choice {
+                    source: Some(source),
+                    ..
+                } => Err(format!(
+                    "a recipe decision node routes to the ports it lists, and '{}' draws its options from {source}",
+                    question.name
+                )),
+                QuestionKind::Choice {
+                    top_k: Some(top_k), ..
+                } if *top_k > 1 => Err(format!(
+                    "a recipe decision node routes to one port, and '{}' admits up to {top_k} picks",
+                    question.name
+                )),
+                QuestionKind::Choice { options, .. } => Ok((question, options)),
                 _ => Err(format!(
                     "a recipe decision node routes on one choice question, and '{}' is not a choice",
                     question.name
@@ -581,10 +739,12 @@ impl DecisionNode {
             .unwrap_or_default()
     }
 
-    /// Every structural problem with this definition, as sentences naming the
-    /// question at fault. Empty means valid.
+    /// Every structural problem with this definition as authored, as
+    /// sentences naming the question at fault. Empty means valid. A choice
+    /// may still name an option source here; [`question_problems`] is the
+    /// check for questions about to be asked.
     pub fn problems(&self) -> Vec<String> {
-        let mut problems = question_problems(&self.questions);
+        let mut problems = questions_problems(&self.questions, Form::Authored);
         for (method, value) in [
             (MeasuredBy::Native, self.thresholds.native),
             (MeasuredBy::Logprobs, self.thresholds.logprobs),
@@ -601,9 +761,22 @@ impl DecisionNode {
     }
 }
 
+/// Which form of a question list is being checked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Form {
+    /// As written: a choice may draw its options from a source.
+    Authored,
+    /// About to be asked: every option is listed.
+    Asked,
+}
+
 /// Every structural problem with a question list, as sentences naming the
 /// question at fault. Empty means the list can be asked.
 pub fn question_problems(questions: &[DecisionQuestion]) -> Vec<String> {
+    questions_problems(questions, Form::Asked)
+}
+
+fn questions_problems(questions: &[DecisionQuestion], form: Form) -> Vec<String> {
     {
         let mut problems = Vec::new();
         if questions.is_empty() {
@@ -628,12 +801,44 @@ pub fn question_problems(questions: &[DecisionQuestion]) -> Vec<String> {
                 problems.push(format!("question '{name}' has no instructions"));
             }
             match &question.kind {
-                QuestionKind::Choice { options } => {
-                    if options.is_empty() || options.len() > MAX_CHOICE_OPTIONS {
-                        problems.push(format!(
-                            "choice question '{name}' needs between 1 and {MAX_CHOICE_OPTIONS} options, not {}",
-                            options.len()
-                        ));
+                QuestionKind::Choice {
+                    options,
+                    source,
+                    top_k,
+                } => {
+                    match source {
+                        Some(source) if !options.is_empty() => problems.push(format!(
+                            "choice question '{name}' declares both options and a source ({source}); give one or the other"
+                        )),
+                        Some(source) if form == Form::Asked => problems.push(format!(
+                            "choice question '{name}' draws its options from {source}, which must be resolved before it is asked"
+                        )),
+                        Some(_) => {}
+                        None => {
+                            if options.is_empty() || options.len() > MAX_CHOICE_OPTIONS {
+                                problems.push(format!(
+                                    "choice question '{name}' needs between 1 and {MAX_CHOICE_OPTIONS} options, not {}",
+                                    options.len()
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(top_k) = top_k {
+                        let top_k = usize::from(*top_k);
+                        if !(1..=MAX_TOP_K).contains(&top_k) {
+                            problems.push(format!(
+                                "choice question '{name}' may admit between 1 and {MAX_TOP_K} picks (topK), not {top_k}"
+                            ));
+                        } else if form == Form::Authored
+                            && source.is_none()
+                            && !options.is_empty()
+                            && top_k > options.len()
+                        {
+                            problems.push(format!(
+                                "choice question '{name}' admits up to {top_k} picks but lists only {} options",
+                                options.len()
+                            ));
+                        }
                     }
                     let mut seen = HashSet::new();
                     for option in options {
@@ -895,11 +1100,7 @@ mod tests {
     fn structural_problems_name_the_question_at_fault() {
         let node = DecisionNode {
             questions: vec![
-                DecisionQuestion {
-                    name: "a".into(),
-                    instructions: " ".into(),
-                    kind: QuestionKind::Choice { options: vec![] },
-                },
+                DecisionQuestion::choice("a", " ", vec![]),
                 DecisionQuestion {
                     name: "a".into(),
                     instructions: "x".into(),
@@ -932,6 +1133,203 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("'has space'")));
         assert!(
             problems.contains(&"the native threshold must be between 0 and 1, not 1.5".to_string())
+        );
+    }
+
+    fn sourced(top_k: Option<u8>) -> DecisionQuestion {
+        DecisionQuestion {
+            name: "thread".into(),
+            instructions: "Which thread owns this?".into(),
+            kind: QuestionKind::Choice {
+                options: vec![],
+                source: Some(OptionSource::CharteredThreads),
+                top_k,
+            },
+        }
+    }
+
+    fn spread(pick: &str, probabilities: &[(&str, f64)]) -> DecisionAnswer {
+        DecisionAnswer::Choice {
+            name: "thread".into(),
+            measured_by: MeasuredBy::Native,
+            pick: pick.into(),
+            confidence: probabilities
+                .iter()
+                .find(|(value, _)| *value == pick)
+                .map(|(_, p)| choice_confidence(*p, probabilities.len())),
+            probabilities: probabilities
+                .iter()
+                .map(|(value, probability)| OptionProbability {
+                    value: value.to_string(),
+                    probability: *probability,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn admit_top_admits_runner_ups_while_they_clear_the_floor() {
+        let declared = ["a", "b", "c", "d"];
+        // a: 0.5 -> 0.33, b: 0.4 -> 0.2, c: 0.1 -> 0, d: 0.
+        let answer = spread("a", &[("a", 0.5), ("b", 0.4), ("c", 0.1), ("d", 0.0)]);
+        let floor = Thresholds {
+            native: Some(0.15),
+            logprobs: None,
+        };
+        assert_eq!(floor.admit_top(&answer, &declared, 3), Ok(vec!["a", "b"]));
+        // A higher floor stops at the runner-up.
+        let strict = Thresholds {
+            native: Some(0.3),
+            logprobs: None,
+        };
+        assert_eq!(strict.admit_top(&answer, &declared, 3), Ok(vec!["a"]));
+        // With no floor, a runner-up must sit above an even split.
+        assert_eq!(
+            Thresholds::default().admit_top(&answer, &declared, 5),
+            Ok(vec!["a", "b"])
+        );
+        // k bounds the list.
+        assert_eq!(
+            Thresholds::default().admit_top(&answer, &declared, 1),
+            Ok(vec!["a"])
+        );
+    }
+
+    #[test]
+    fn admit_top_breaks_ties_in_declared_order_and_needs_probabilities() {
+        let declared = ["a", "b", "c", "d", "e"];
+        let tied = spread("a", &[("c", 0.3), ("b", 0.3), ("a", 0.4)]);
+        assert_eq!(
+            Thresholds::default().admit_top(&tied, &declared, 2),
+            Ok(vec!["a", "b"])
+        );
+        let bare = choice("a", Some(0.9), MeasuredBy::Native);
+        assert_eq!(
+            Thresholds::default().admit_top(&bare, &declared, 3),
+            Ok(vec!["a"])
+        );
+    }
+
+    #[test]
+    fn admit_top_never_admits_a_refusal_or_a_pick_below_threshold() {
+        let refusal = DecisionAnswer::Refusal {
+            name: "thread".into(),
+            measured_by: MeasuredBy::Native,
+            reason: None,
+        };
+        assert!(matches!(
+            Thresholds::default().admit_top(&refusal, &["a"], 3),
+            Err(Abstention::Refused { .. })
+        ));
+        let weak = spread("a", &[("a", 0.3), ("b", 0.3), ("c", 0.4)]);
+        let floor = Thresholds {
+            native: Some(0.5),
+            logprobs: None,
+        };
+        assert!(matches!(
+            floor.admit_top(&weak, &["a", "b", "c"], 3),
+            Err(Abstention::BelowThreshold { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sourced_choice_is_valid_as_authored_but_cannot_be_asked() {
+        let node = DecisionNode {
+            questions: vec![sourced(Some(2))],
+            models: None,
+            thresholds: Thresholds::default(),
+        };
+        assert!(node.problems().is_empty(), "{:?}", node.problems());
+        assert_eq!(
+            question_problems(&node.questions),
+            vec!["choice question 'thread' draws its options from chartered_threads, which must be resolved before it is asked".to_string()]
+        );
+        assert!(node
+            .port_question()
+            .unwrap_err()
+            .contains("chartered_threads"));
+    }
+
+    #[test]
+    fn options_and_a_source_together_and_top_k_out_of_range_are_refused() {
+        let mut both = sourced(None);
+        if let QuestionKind::Choice { options, .. } = &mut both.kind {
+            options.push(DecisionOption::new("devops", None));
+        }
+        let node = DecisionNode {
+            questions: vec![both],
+            models: None,
+            thresholds: Thresholds::default(),
+        };
+        assert!(node.problems()[0].contains("both options and a source"));
+
+        for (top_k, expected) in [
+            (0, "between 1 and 5 picks (topK), not 0"),
+            (6, "between 1 and 5 picks (topK), not 6"),
+        ] {
+            let node = DecisionNode {
+                questions: vec![sourced(Some(top_k))],
+                models: None,
+                thresholds: Thresholds::default(),
+            };
+            assert!(
+                node.problems()[0].contains(expected),
+                "{:?}",
+                node.problems()
+            );
+        }
+        let mut listed = DecisionQuestion::port_choice("Where?", &ports(&["a", "b"]));
+        if let QuestionKind::Choice { top_k, .. } = &mut listed.kind {
+            *top_k = Some(3);
+        }
+        let node = DecisionNode {
+            questions: vec![listed],
+            models: None,
+            thresholds: Thresholds::default(),
+        };
+        assert!(node.problems()[0].contains("lists only 2 options"));
+        assert!(node.port_question().unwrap_err().contains("up to 3 picks"));
+    }
+
+    #[test]
+    fn source_top_k_and_option_addresses_round_trip_and_old_json_still_reads() {
+        let question = sourced(Some(2));
+        let value = serde_json::to_value(&question).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "name": "thread",
+                "instructions": "Which thread owns this?",
+                "type": "choice",
+                "source": "chartered_threads",
+                "topK": 2
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DecisionQuestion>(value).unwrap(),
+            question
+        );
+        let old: DecisionQuestion = serde_json::from_value(json!({
+            "name": "route", "instructions": "x", "type": "choice",
+            "options": [{"value": "yes"}]
+        }))
+        .unwrap();
+        assert_eq!(old.top_k(), 1);
+        assert_eq!(old.option_source(), None);
+        let option = DecisionOption {
+            value: "devops".into(),
+            description: None,
+            address: Some("cairn://p/cairn/devops".into()),
+            revision: Some("0123456789ab".into()),
+        };
+        let value = serde_json::to_value(&option).unwrap();
+        assert_eq!(
+            value,
+            json!({"value": "devops", "address": "cairn://p/cairn/devops", "revision": "0123456789ab"})
+        );
+        assert_eq!(
+            serde_json::from_value::<DecisionOption>(value).unwrap(),
+            option
         );
     }
 

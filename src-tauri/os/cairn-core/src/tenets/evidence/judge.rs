@@ -11,7 +11,7 @@
 
 use crate::models::decision::{
     Decision, DecisionAnswer, DecisionNode, DecisionOption, DecisionQuestion, MeasuredBy,
-    QuestionKind, Thresholds,
+    Thresholds,
 };
 use crate::tenets::TenetView;
 
@@ -63,23 +63,18 @@ pub fn tenet_block(view: &TenetView) -> String {
 
 /// The question asked about one candidate tenet.
 pub fn question(view: &TenetView) -> DecisionQuestion {
-    DecisionQuestion {
-        name: question_name(view.row.number),
-        instructions: format!(
+    DecisionQuestion::choice(
+        question_name(view.row.number),
+        format!(
             "{PREAMBLE}\n\nTenet #{}\n{}",
             view.row.number,
             tenet_block(view)
         ),
-        kind: QuestionKind::Choice {
-            options: Sign::ALL
-                .into_iter()
-                .map(|sign| DecisionOption {
-                    value: sign.as_str().to_string(),
-                    description: Some(sign.description().to_string()),
-                })
-                .collect(),
-        },
-    }
+        Sign::ALL
+            .into_iter()
+            .map(|sign| DecisionOption::new(sign.as_str(), Some(sign.description().to_string())))
+            .collect(),
+    )
 }
 
 /// The decision asked about one event: one question per candidate, in

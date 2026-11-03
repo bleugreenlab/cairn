@@ -10,10 +10,22 @@
 //! dispatcher's traversal total.
 
 use super::definition::{RouteDefinition, RouteNode, RouteNodeConfig};
+use super::predicate::TriggerClause;
+use crate::models::decision::DecisionNode;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+
+/// One edge, resolved to node indexes, with the condition under which a fact
+/// that reached `from` goes on to `to`. An empty `when` is unconditional.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphEdge<'a> {
+    pub from: usize,
+    pub to: usize,
+    pub when: &'a [TriggerClause],
+}
 
 pub struct RouteGraph<'a> {
     nodes: &'a [RouteNode],
+    edges: Vec<GraphEdge<'a>>,
     incoming: Vec<Vec<usize>>,
     outgoing: Vec<Vec<usize>>,
     /// Every node exactly once, each after all of its predecessors.
@@ -38,6 +50,7 @@ impl<'a> RouteGraph<'a> {
 
         let mut incoming = vec![Vec::new(); nodes.len()];
         let mut outgoing = vec![Vec::new(); nodes.len()];
+        let mut edges: Vec<GraphEdge<'a>> = Vec::new();
         for edge in &definition.edges {
             let resolve = |id: &str| {
                 index
@@ -47,9 +60,22 @@ impl<'a> RouteGraph<'a> {
             };
             let (from, to) = (resolve(&edge.from)?, resolve(&edge.to)?);
             // The same edge written twice is one edge, not a second delivery.
-            if outgoing[from].contains(&to) {
-                continue;
+            // Written twice with different conditions, it would be two answers
+            // to one question, and a list of clauses already says "either".
+            if let Some(existing) = edges.iter().find(|e| e.from == from && e.to == to) {
+                if existing.when == edge.when.as_slice() {
+                    continue;
+                }
+                return Err(format!(
+                    "edges '{}' → '{}' are declared twice with different when clauses; give one edge a list of when clauses instead",
+                    edge.from, edge.to
+                ));
             }
+            edges.push(GraphEdge {
+                from,
+                to,
+                when: &edge.when,
+            });
             outgoing[from].push(to);
             incoming[to].push(from);
         }
@@ -115,6 +141,7 @@ impl<'a> RouteGraph<'a> {
 
         Ok(Self {
             nodes,
+            edges,
             incoming,
             outgoing,
             order,
@@ -154,14 +181,59 @@ impl<'a> RouteGraph<'a> {
         (0..self.nodes.len()).filter(|i| self.nodes[*i].config.is_sink())
     }
 
-    /// The predecessors that produce content of their own. A node's `text` is
-    /// whichever of these fed it, which is why more than one is a validation
-    /// error rather than a merge: there would be no answer to "whose text".
-    pub fn producers(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
-        self.incoming[index]
+    /// Every edge, in definition order, duplicates folded.
+    pub fn edges(&self) -> &[GraphEdge<'a>] {
+        &self.edges
+    }
+
+    /// The edges leaving `index`, in definition order.
+    pub fn outgoing_edges(&self, index: usize) -> impl Iterator<Item = &GraphEdge<'a>> + '_ {
+        self.edges.iter().filter(move |edge| edge.from == index)
+    }
+
+    /// The nodes above `index` that produce content of their own, looking
+    /// through any decision between them: a decision passes the content that
+    /// reached it on unchanged. A node's `text` is whichever of these fed it,
+    /// which is why more than one is a validation error rather than a merge:
+    /// there would be no answer to "whose text".
+    pub fn producers(&self, index: usize) -> Vec<usize> {
+        let mut found = BTreeSet::new();
+        let mut seen = HashSet::new();
+        let mut pending: Vec<usize> = self.incoming[index].clone();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let config = &self.nodes[current].config;
+            if config.produces_content() {
+                found.insert(current);
+            } else if config.is_decision() {
+                pending.extend(self.incoming[current].iter().copied());
+            }
+        }
+        found.into_iter().collect()
+    }
+
+    /// The decision nodes guaranteed to have run by the time `index` does,
+    /// nearest last, and `index` itself when `include_self` and it is one.
+    /// Their answers are what `answers.*` reads at `index`; conditional edges
+    /// only remove paths, so a dominating decision has always run.
+    pub fn dominating_decisions(
+        &self,
+        index: usize,
+        include_self: bool,
+    ) -> Vec<(usize, &'a DecisionNode)> {
+        self.order
             .iter()
             .copied()
-            .filter(|i| self.nodes[*i].config.produces_content())
+            .filter(|&candidate| {
+                self.dominates(candidate, index) || (include_self && candidate == index)
+            })
+            .filter_map(|candidate| match &self.nodes[candidate].config {
+                RouteNodeConfig::Decision { decision, .. } => Some((candidate, decision)),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn is_reachable(&self, index: usize) -> bool {

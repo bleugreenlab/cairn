@@ -7,8 +7,12 @@
 //! execution settings) would make states no route can execute representable in
 //! a route file, and validation would have to forbid them field by field.
 
+use super::decision::{answer_field, check_clause_value, split_answer_key, AnswerField};
 use super::graph::RouteGraph;
-use super::predicate::{FactRegistry, TriggerClause};
+use super::predicate::{
+    clause_value_problem, AddressKind, FactRegistry, TriggerClause, ANSWERS_PREFIX,
+};
+use crate::models::decision::{DecisionNode, DecisionQuestion, Thresholds};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -83,6 +87,16 @@ pub enum RouteNodeConfig {
         response: String,
         args: BTreeMap<String, ArgumentBinding>,
     },
+    /// Ask typed questions about the content and make the answers known to
+    /// everything below as `answers.<question>.*`. A decision selects and
+    /// generates nothing: the content that reached it passes on unchanged,
+    /// and its outgoing edges choose where by their `when` clauses.
+    Decision {
+        decision: DecisionNode,
+        /// The text the questions judge. Unset reads the content arriving on
+        /// the decision's path.
+        input: Option<ArgumentBinding>,
+    },
     Sink {
         sink: RouteSink,
     },
@@ -93,12 +107,17 @@ impl RouteNodeConfig {
         match self {
             Self::Trigger { .. } => "trigger",
             Self::Response { .. } => "response",
+            Self::Decision { .. } => "decision",
             Self::Sink { .. } => "sink",
         }
     }
 
     pub fn is_trigger(&self) -> bool {
         matches!(self, Self::Trigger { .. })
+    }
+
+    pub fn is_decision(&self) -> bool {
+        matches!(self, Self::Decision { .. })
     }
 
     pub fn is_sink(&self) -> bool {
@@ -117,6 +136,119 @@ impl RouteNodeConfig {
 pub struct RouteEdge {
     pub from: String,
     pub to: String,
+    /// When a fact that reached `from` goes on to `to`: clauses in the
+    /// trigger grammar, OR'd, over the fact's fields, the content (`text`),
+    /// and the `answers.*` of every decision above. Empty is unconditional.
+    /// One clause reads and writes as a bare map, several as a list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "edge_when")]
+    pub when: Vec<TriggerClause>,
+}
+
+impl RouteEdge {
+    pub fn new(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            when: Vec::new(),
+        }
+    }
+}
+
+mod edge_when {
+    use super::TriggerClause;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        when: &[TriggerClause],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match when {
+            [one] => one.serialize(serializer),
+            many => many.serialize(serializer),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<TriggerClause>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(TriggerClause),
+            Many(Vec<TriggerClause>),
+        }
+        match Raw::deserialize(deserializer) {
+            Ok(Raw::One(clause)) => Ok(vec![clause]),
+            Ok(Raw::Many(clauses)) => Ok(clauses),
+            Err(_) => Err(serde::de::Error::custom(
+                "an edge's when is one clause map or a list of clause maps",
+            )),
+        }
+    }
+}
+
+/// A sink address: a literal, written exactly as before, or bound like a
+/// response argument to a fact field or an upstream node's output and
+/// resolved per firing.
+///
+/// A literal serializes as the bare value, so a route that never binds an
+/// address reads and re-saves byte for byte as it did before addresses could
+/// be bound. `{ value: ... }` is the literal spelled as a binding, and reads
+/// as the literal.
+#[derive(Debug, Clone)]
+pub enum Bindable<T> {
+    Fixed(T),
+    Bound(ArgumentBinding),
+}
+
+impl<T> Bindable<T> {
+    pub fn fixed(&self) -> Option<&T> {
+        match self {
+            Self::Fixed(value) => Some(value),
+            Self::Bound(_) => None,
+        }
+    }
+
+    pub fn bound(&self) -> Option<&ArgumentBinding> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Bound(binding) => Some(binding),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Bindable<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed(value) => value.serialize(serializer),
+            Self::Bound(binding) => binding.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Bindable<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let fixed = |value: Value| {
+            T::deserialize(value)
+                .map(Self::Fixed)
+                .map_err(D::Error::custom)
+        };
+        match Value::deserialize(deserializer)? {
+            Value::Object(mut map) if map.len() == 1 && map.contains_key("value") => {
+                fixed(map.remove("value").unwrap_or(Value::Null))
+            }
+            Value::Object(map) if map.contains_key("field") || map.contains_key("from") => {
+                ArgumentBinding::deserialize(Value::Object(map))
+                    .map(Self::Bound)
+                    .map_err(D::Error::custom)
+            }
+            Value::Object(_) => Err(D::Error::custom(
+                "an address is a literal, or a binding: { field: <fact or answer field> } or { from: <node> }",
+            )),
+            other => fixed(other),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,12 +272,12 @@ pub enum ArgumentBinding {
 pub enum RouteSink {
     Channel {
         #[serde(alias = "register")]
-        destination: ChannelDestination,
+        destination: Bindable<ChannelDestination>,
         #[serde(default, rename = "initiatedBy")]
         initiated_by: Option<String>,
     },
     Message {
-        target: String,
+        target: Bindable<String>,
     },
     Issue {
         #[serde(default)]
@@ -261,7 +393,7 @@ impl RouteDefinition {
         for index in 0..self.nodes.len() {
             self.validate_node(&graph, index, registry)?;
         }
-        Ok(())
+        validate_edges(&graph, registry)
     }
 
     fn validate_node(
@@ -281,7 +413,7 @@ impl RouteDefinition {
         // A node's content is whichever producing node fed it. Two of them would
         // leave no answer to "whose text", so a merge is refused here rather
         // than resolved arbitrarily at fire time.
-        if graph.producers(index).count() > 1 {
+        if graph.producers(index).len() > 1 {
             return Err(format!(
                 "node '{id}' takes content from more than one response node, which leaves its input ambiguous"
             ));
@@ -311,6 +443,21 @@ impl RouteDefinition {
                     )?;
                 }
             }
+            RouteNodeConfig::Decision { decision, input } => {
+                let problems = decision.problems();
+                if !problems.is_empty() {
+                    return Err(format!("decision node '{id}': {}", problems.join("; ")));
+                }
+                if let Some(input) = input {
+                    validate_binding(
+                        graph,
+                        index,
+                        registry,
+                        input,
+                        &format!("decision node '{id}' input"),
+                    )?;
+                }
+            }
             RouteNodeConfig::Sink { sink } => {
                 if !graph.outgoing(index).is_empty() {
                     return Err(format!(
@@ -324,6 +471,182 @@ impl RouteDefinition {
     }
 }
 
+/// Why an `answers.*` key does not resolve at a node.
+enum AnswerLookup {
+    /// No decision guaranteed to have run there asks this question.
+    Undeclared(String),
+    Invalid(String),
+}
+
+/// The answer field `key` reads at `at`: a field of a question asked by a
+/// decision that dominates `at` (or is `at`, when `include_self`). Being
+/// merely above is not enough, for the same reason as a `{from}` binding: a
+/// path around the decision would reach `at` with the answer never asked.
+fn answer_at(
+    graph: &RouteGraph<'_>,
+    at: usize,
+    include_self: bool,
+    key: &str,
+) -> Result<AnswerField, AnswerLookup> {
+    let Some((question, rest)) = split_answer_key(key) else {
+        return Err(AnswerLookup::Invalid(format!(
+            "'{key}' is not an answer field; answer fields read answers.<question>.<field>"
+        )));
+    };
+    let declaring: Vec<&DecisionQuestion> = graph
+        .dominating_decisions(at, include_self)
+        .into_iter()
+        .filter_map(|(_, decision)| decision.questions.iter().find(|q| q.name == question))
+        .collect();
+    match declaring.as_slice() {
+        [] => Err(AnswerLookup::Undeclared(question.to_string())),
+        [only] => answer_field(only, rest).map_err(AnswerLookup::Invalid),
+        _ => Err(AnswerLookup::Invalid(format!(
+            "'{key}' is ambiguous: more than one decision above it asks '{question}'"
+        ))),
+    }
+}
+
+/// The refusal for an `answers.*` key that does not resolve, naming `what`.
+fn answer_refusal(what: &str, key: &str, lookup: AnswerLookup) -> String {
+    match lookup {
+        AnswerLookup::Undeclared(question) => {
+            format!("{what} reads {key}, but no decision above it asks '{question}'")
+        }
+        AnswerLookup::Invalid(problem) => format!("{what}: {problem}"),
+    }
+}
+
+/// Every edge's condition, checked against what reaches the node it leaves:
+/// a fact field must be carried by every fact source arriving there, and an
+/// `answers.*` key must be a field of a question some decision guaranteed to
+/// have run there asks. An edge leaving a decision must say when it is
+/// taken; a refusal or a failure then acts on nothing unless an edge says so.
+fn validate_edges(graph: &RouteGraph<'_>, registry: &FactRegistry) -> Result<(), String> {
+    for edge in graph.edges() {
+        let (from, to) = (graph.node(edge.from), graph.node(edge.to));
+        let name = format!("edge '{}' → '{}'", from.id, to.id);
+        if let RouteNodeConfig::Decision { decision, .. } = &from.config {
+            if edge.when.is_empty() {
+                let example = decision
+                    .questions
+                    .first()
+                    .map(|question| {
+                        format!(" (for example answers.{}.outcome: admitted)", question.name)
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{name} leaves a decision, so it needs a when clause{example}"
+                ));
+            }
+        }
+        for clause in edge.when {
+            if clause.is_empty() {
+                return Err(format!("{name} has an empty when clause"));
+            }
+            for (key, value) in clause {
+                validate_edge_test(graph, edge.from, registry, &name, key, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_edge_test(
+    graph: &RouteGraph<'_>,
+    from: usize,
+    registry: &FactRegistry,
+    name: &str,
+    key: &str,
+    value: &Value,
+) -> Result<(), String> {
+    if let Some(problem) = clause_value_problem(key, value) {
+        return Err(format!("{name}: {problem}"));
+    }
+    match key {
+        "fact" => {
+            let named = match value {
+                Value::Array(items) => items.iter().all(Value::is_string),
+                value => value.is_string(),
+            };
+            if !named {
+                return Err(format!("{name}: 'fact' names a fact source"));
+            }
+        }
+        "presence" => {
+            if !matches!(value.as_str(), Some("active" | "away")) {
+                return Err(format!("{name}: presence must be active or away"));
+            }
+        }
+        key if key.starts_with(ANSWERS_PREFIX) => {
+            let field = answer_at(graph, from, true, key)
+                .map_err(|lookup| answer_refusal(name, key, lookup))?;
+            check_clause_value(&field, value).map_err(|problem| format!("{name}: {problem}"))?;
+        }
+        key => {
+            let field = key.strip_suffix("Prefix").unwrap_or(key);
+            let available = graph
+                .fact_sources(from)
+                .iter()
+                .all(|source| registry.source_has_field(source, field));
+            if !available {
+                return Err(format!(
+                    "{name} tests '{key}', which is not available from every fact source reaching it"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A bound sink address must name something that can hold that kind of
+/// address: a fact field the registry marks as one, an answer field that
+/// carries message targets, or an upstream node's output, which is parsed
+/// when the firing resolves it.
+fn validate_bound_address(
+    graph: &RouteGraph<'_>,
+    index: usize,
+    registry: &FactRegistry,
+    binding: &ArgumentBinding,
+    kind: AddressKind,
+    what: &str,
+) -> Result<(), String> {
+    let carries = match kind {
+        AddressKind::Conversation => "conversation address",
+        AddressKind::Target => "message target",
+    };
+    match binding {
+        ArgumentBinding::Field { field } if field.starts_with(ANSWERS_PREFIX) => {
+            let answer = answer_at(graph, index, false, field)
+                .map_err(|lookup| answer_refusal(what, field, lookup))?;
+            if kind == AddressKind::Target && answer.address {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what} is bound to '{field}', which carries no {carries}"
+                ))
+            }
+        }
+        ArgumentBinding::Field { field } => {
+            let carried = graph
+                .fact_sources(index)
+                .iter()
+                .all(|source| registry.field_address(source, field) == Some(kind));
+            if carried {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{what} is bound to '{field}', which carries no {carries}"
+                ))
+            }
+        }
+        ArgumentBinding::Node { .. } => Ok(()),
+        ArgumentBinding::Value { .. } => Err(format!(
+            "{what} spells a literal as a binding; write the address itself"
+        )),
+    }
+}
+
 /// Every sink is validated on its own terms: one bad sink names itself
 /// rather than failing the route with a message about "the sink".
 fn validate_sink(
@@ -332,12 +655,13 @@ fn validate_sink(
     registry: &FactRegistry,
     sink: &RouteSink,
 ) -> Result<(), String> {
+    let id = &graph.node(index).id;
     match sink {
         RouteSink::Channel {
             destination,
             initiated_by,
         } => match destination {
-            ChannelDestination::Subscriptions => {
+            Bindable::Fixed(ChannelDestination::Subscriptions) => {
                 if initiated_by
                     .as_deref()
                     .is_some_and(|v| v != "operator_subscription" && v != "cairn_push")
@@ -345,7 +669,7 @@ fn validate_sink(
                     return Err("unknown channel initiatedBy value".into());
                 }
             }
-            ChannelDestination::Conversation(address) => {
+            Bindable::Fixed(ChannelDestination::Conversation(address)) => {
                 if initiated_by.is_some() {
                     return Err("a conversation channel sink is always Cairn-initiated and cannot declare initiatedBy".into());
                 }
@@ -358,17 +682,33 @@ fn validate_sink(
                     ));
                 }
             }
+            Bindable::Bound(binding) => {
+                if initiated_by.is_some() {
+                    return Err(format!("channel sink '{id}' binds its destination to a conversation, which is always Cairn-initiated and cannot declare initiatedBy"));
+                }
+                let what = format!("channel sink '{id}' destination");
+                validate_binding(graph, index, registry, binding, &what)?;
+                validate_bound_address(
+                    graph,
+                    index,
+                    registry,
+                    binding,
+                    AddressKind::Conversation,
+                    &what,
+                )?;
+            }
         },
-        RouteSink::Message { target }
-            if !matches!(
-                cairn_common::uri::parse_uri(target),
-                Some(
-                    cairn_common::uri::CairnResource::Project { .. }
-                        | cairn_common::uri::CairnResource::Issue { .. }
-                )
-            ) =>
-        {
-            return Err("message target must be a canonical project or issue URI".into())
+        RouteSink::Message {
+            target: Bindable::Fixed(target),
+        } if !super::decision::is_message_target(target) => {
+            return Err("message target must be a canonical project, issue, or thread URI".into())
+        }
+        RouteSink::Message {
+            target: Bindable::Bound(binding),
+        } => {
+            let what = format!("message sink '{id}' target");
+            validate_binding(graph, index, registry, binding, &what)?;
+            validate_bound_address(graph, index, registry, binding, AddressKind::Target, &what)?;
         }
         RouteSink::Issue { labels, .. } | RouteSink::Label { labels, .. } => {
             if labels.is_empty() {
@@ -414,6 +754,10 @@ fn validate_binding(
     what: &str,
 ) -> Result<(), String> {
     match binding {
+        ArgumentBinding::Field { field } if field.starts_with(ANSWERS_PREFIX) => {
+            answer_at(graph, index, false, field)
+                .map_err(|lookup| answer_refusal(what, field, lookup))?;
+        }
         ArgumentBinding::Field { field } => {
             let available = graph
                 .fact_sources(index)
@@ -473,6 +817,18 @@ impl Serialize for RouteNode {
                     map.serialize_entry("args", args)?;
                 }
             }
+            RouteNodeConfig::Decision { decision, input } => {
+                if let Some(input) = input {
+                    map.serialize_entry("input", input)?;
+                }
+                map.serialize_entry("questions", &decision.questions)?;
+                if let Some(models) = &decision.models {
+                    map.serialize_entry("models", models)?;
+                }
+                if !decision.thresholds.is_empty() {
+                    map.serialize_entry("thresholds", &decision.thresholds)?;
+                }
+            }
             RouteNodeConfig::Sink { sink } => map.serialize_entry("sink", sink)?,
         }
         map.end()
@@ -500,6 +856,14 @@ struct RawNode {
     #[serde(default)]
     args: Option<BTreeMap<String, ArgumentBinding>>,
     #[serde(default)]
+    input: Option<ArgumentBinding>,
+    #[serde(default)]
+    questions: Option<Vec<DecisionQuestion>>,
+    #[serde(default)]
+    models: Option<Vec<cairn_config::allotment::AllotmentEntry>>,
+    #[serde(default)]
+    thresholds: Option<Thresholds>,
+    #[serde(default)]
     sink: Option<RouteSink>,
 }
 
@@ -509,6 +873,10 @@ impl RawNode {
             ("when", self.when.is_some()),
             ("response", self.response.is_some()),
             ("args", self.args.is_some()),
+            ("input", self.input.is_some()),
+            ("questions", self.questions.is_some()),
+            ("models", self.models.is_some()),
+            ("thresholds", self.thresholds.is_some()),
             ("sink", self.sink.is_some()),
         ];
         let only = |allowed: &[&str]| -> Result<(), String> {
@@ -538,27 +906,27 @@ impl RawNode {
                     args: self.args.clone().unwrap_or_default(),
                 }
             }
+            "decision" => {
+                only(&["input", "questions", "models", "thresholds"])?;
+                RouteNodeConfig::Decision {
+                    decision: DecisionNode {
+                        questions: self.questions.clone().ok_or_else(|| missing("questions"))?,
+                        models: self.models.clone(),
+                        thresholds: self.thresholds.unwrap_or_default(),
+                    },
+                    input: self.input.clone(),
+                }
+            }
             "sink" => {
                 only(&["sink"])?;
                 RouteNodeConfig::Sink {
                     sink: self.sink.clone().ok_or_else(|| missing("sink"))?,
                 }
             }
-            // `agent` is the reserved fourth type: judgment routing, where a
-            // node's verdict selects among its outgoing edges. Naming it here
-            // rather than letting it fall through to "unknown type" is the
-            // reservation — and refusing it is what keeps a route that cannot
-            // fire from ever loading.
-            "agent" => {
-                return Err(format!(
-                    "agent node '{}' is reserved for judgment routing and is not executable yet",
-                    self.id
-                ))
-            }
             other => {
                 return Err(format!(
-                    "unknown route node type '{other}', expected trigger, response, agent, or sink"
-                ))
+                "unknown route node type '{other}', expected trigger, response, decision, or sink"
+            ))
             }
         };
         Ok(RouteNode {
@@ -680,12 +1048,7 @@ fn heal(
     }
 
     let mut edges = Vec::new();
-    let mut connect = |from: &str, to: &str| {
-        edges.push(RouteEdge {
-            from: from.to_owned(),
-            to: to.to_owned(),
-        })
-    };
+    let mut connect = |from: &str, to: &str| edges.push(RouteEdge::new(from, to));
     let after_triggers: Vec<&String> = match responses.first() {
         Some(head) => vec![head],
         None => sinks.iter().collect(),
@@ -754,9 +1117,317 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// The acceptance fixture: positions, literal URI options, and a message sink
+/// bound to the pick, behind an edge condition with a comparison.
+#[cfg(test)]
+pub(crate) const FIXTURE_A: &str = r#"name: Pick an issue
+description: Decide which issue should hear about an unaddressed channel message.
+nodes:
+  - { id: inbound, type: trigger, position: {x: 0, y: 0}, when: { fact: channel_message, addressed: false } }
+  - id: pick
+    type: decision
+    position: {x: 240, y: 0}
+    questions:
+      - name: target
+        type: choice
+        instructions: Which issue should hear about this?
+        options: [ { value: "cairn://p/cairn/12" }, { value: "cairn://p/cairn/34" } ]
+    thresholds: { native: 0.6 }
+  - { id: deliver, type: sink, position: {x: 480, y: 0}, sink: { kind: message, target: { field: answers.target.pick } } }
+edges:
+  - { from: inbound, to: pick }
+  - { from: pick, to: deliver, when: { answers.target.outcome: admitted, answers.target.confidence: { gte: 0.6 } } }
+"#;
+
+/// cairn/4896's ambient-routing shape: chartered-thread options with top-k,
+/// a delivery bound to the admitted addresses, and acknowledgements bound to
+/// the conversation, one per outcome.
+#[cfg(test)]
+pub(crate) const FIXTURE_B: &str = r#"name: Ambient routing
+description: Route unaddressed ambient channel messages to the threads that own them.
+nodes:
+  - { id: inbound, type: trigger, when: { fact: channel_message, bindingKind: ambient, addressed: false } }
+  - id: pick
+    type: decision
+    input: { field: text }
+    questions: [ { name: thread, type: choice, instructions: Which thread owns this?, source: chartered_threads, topK: 2 } ]
+  - { id: deliver, type: sink, sink: { kind: message, target: { field: answers.thread.addresses } } }
+  - { id: ack_routed, type: sink, sink: { kind: channel, destination: { field: conversation } } }
+  - { id: ack_unrouted, type: sink, sink: { kind: channel, destination: { field: conversation } } }
+  - { id: ack_refused, type: sink, sink: { kind: channel, destination: "discord:1/2" } }
+  - { id: ack_error, type: sink, sink: { kind: channel, destination: { field: conversation } } }
+edges:
+  - { from: inbound, to: pick }
+  - { from: pick, to: deliver, when: { answers.thread.outcome: admitted } }
+  - { from: pick, to: ack_routed, when: { answers.thread.outcome: admitted } }
+  - { from: pick, to: ack_unrouted, when: { answers.thread.outcome: below_threshold } }
+  - { from: pick, to: ack_refused, when: { answers.thread.outcome: refused } }
+  - { from: pick, to: ack_error, when: { answers.thread.outcome: [unanswerable, failed] } }
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::decision::{OptionSource, QuestionKind};
+
+    #[test]
+    fn fixture_a_parses_validates_and_round_trips_with_positions() {
+        let parsed = parse(FIXTURE_A).unwrap();
+        let pick = parsed.nodes.iter().find(|node| node.id == "pick").unwrap();
+        assert_eq!(pick.config.type_name(), "decision");
+        assert_eq!(pick.position, Some(NodePosition { x: 240.0, y: 0.0 }));
+        let RouteNodeConfig::Decision { decision, input } = &pick.config else {
+            panic!("a decision node");
+        };
+        assert!(input.is_none(), "an unset input reads the arriving content");
+        assert_eq!(decision.thresholds.native, Some(0.6));
+        assert_eq!(parsed.edges[1].when.len(), 1);
+        assert!(matches!(
+            sink_of(&parsed, "deliver"),
+            RouteSink::Message {
+                target: Bindable::Bound(ArgumentBinding::Field { .. })
+            }
+        ));
+
+        let emitted = serde_yaml::to_string(&parsed).unwrap();
+        assert!(emitted.contains("type: decision"), "{emitted}");
+        assert!(emitted.contains("field: answers.target.pick"), "{emitted}");
+        assert!(emitted.contains("gte: 0.6"), "{emitted}");
+        let reparsed = parse(&emitted).unwrap();
+        assert_eq!(serde_yaml::to_string(&reparsed).unwrap(), emitted);
+        // An unconditional edge writes no `when` at all.
+        assert_eq!(
+            serde_json::to_value(&reparsed.edges[0]).unwrap(),
+            serde_json::json!({"from": "inbound", "to": "pick"})
+        );
+    }
+
+    #[test]
+    fn fixture_b_loads_with_positions_omitted_and_a_declared_option_source() {
+        let parsed = parse(FIXTURE_B).unwrap();
+        assert!(parsed.nodes.iter().all(|node| node.position.is_none()));
+        let RouteNodeConfig::Decision { decision, input } = &parsed.nodes[1].config else {
+            panic!("a decision node");
+        };
+        assert!(matches!(input, Some(ArgumentBinding::Field { field }) if field == "text"));
+        let question = &decision.questions[0];
+        assert_eq!(
+            question.option_source(),
+            Some(OptionSource::CharteredThreads)
+        );
+        assert_eq!(question.top_k(), 2);
+        assert!(
+            matches!(&question.kind, QuestionKind::Choice { options, .. } if options.is_empty())
+        );
+        assert!(matches!(
+            sink_of(&parsed, "ack_refused"),
+            RouteSink::Channel {
+                destination: Bindable::Fixed(ChannelDestination::Conversation(_)),
+                ..
+            }
+        ));
+        let emitted = serde_yaml::to_string(&parsed).unwrap();
+        assert!(!emitted.contains("options"), "{emitted}");
+        assert!(emitted.contains("source: chartered_threads"), "{emitted}");
+        assert_eq!(
+            serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),
+            emitted
+        );
+    }
+
+    #[test]
+    fn answers_on_an_edge_no_declaring_decision_dominates_are_refused_by_name() {
+        // The sink takes a literal here, so the edge is the only reader of
+        // the answer that a path around the decision reaches.
+        let skipped = FIXTURE_A
+            .replace(
+                "target: { field: answers.target.pick }",
+                "target: 'cairn://p/cairn/12'",
+            )
+            .replace(
+                "  - { from: inbound, to: pick }\n",
+                "  - { from: inbound, to: pick }\n  - { from: inbound, to: deliver, when: { answers.target.outcome: admitted } }\n",
+            );
+        assert_eq!(
+            parse(&skipped).unwrap_err(),
+            "edge 'inbound' → 'deliver' reads answers.target.outcome, but no decision above it asks 'target'"
+        );
+        // The same key on the decision's own edge, under another name, is not
+        // a question it asks either.
+        let renamed = FIXTURE_A.replace("answers.target.outcome", "answers.goal.outcome");
+        assert!(parse(&renamed)
+            .unwrap_err()
+            .contains("no decision above it asks 'goal'"));
+        // A sink whose address reads the answer while a second path skips the
+        // decision cannot be sure it was asked.
+        let bypass = FIXTURE_A
+            .replace(
+                "  - { id: deliver,",
+                "  - { id: direct, type: trigger, when: { fact: channel_message } }\n  - { id: deliver,",
+            )
+            .replace(
+                "  - { from: inbound, to: pick }\n",
+                "  - { from: inbound, to: pick }\n  - { from: direct, to: deliver }\n",
+            );
+        assert!(parse(&bypass)
+            .unwrap_err()
+            .contains("reads answers.target.pick, but no decision above it asks 'target'"));
+        assert!(parse(
+            &graph_route("{ kind: channel, register: notify }", "").replace(
+                "when: { fact: attention }",
+                "when: { fact: attention, answers.q.pick: a }"
+            )
+        )
+        .unwrap_err()
+        .contains("answers.* is only known below a decision"));
+    }
+
+    #[test]
+    fn an_edge_leaving_a_decision_must_say_when_it_is_taken() {
+        let unconditional = FIXTURE_A.replace(
+            ", when: { answers.target.outcome: admitted, answers.target.confidence: { gte: 0.6 } }",
+            "",
+        );
+        assert_eq!(
+            parse(&unconditional).unwrap_err(),
+            "edge 'pick' → 'deliver' leaves a decision, so it needs a when clause (for example answers.target.outcome: admitted)"
+        );
+    }
+
+    #[test]
+    fn answer_clause_values_are_checked_against_the_question() {
+        let wrong_outcome = FIXTURE_A.replace("outcome: admitted", "outcome: raised");
+        assert!(parse(&wrong_outcome)
+            .unwrap_err()
+            .contains("is one of admitted"));
+        let compared_pick = FIXTURE_A.replace(
+            "answers.target.confidence: { gte: 0.6 }",
+            "answers.target.pick: { gte: 0.6 }",
+        );
+        assert!(parse(&compared_pick)
+            .unwrap_err()
+            .contains("is not a number"));
+        let unknown_operator =
+            FIXTURE_A.replace("confidence: { gte: 0.6 }", "confidence: { above: 0.6 }");
+        assert!(parse(&unknown_operator)
+            .unwrap_err()
+            .contains("unknown comparison 'above'"));
+        let undeclared_option = FIXTURE_A.replace(
+            "answers.target.confidence: { gte: 0.6 }",
+            "answers.target.probability.cairn://p/cairn/99: { gt: 0.5 }",
+        );
+        assert!(parse(&undeclared_option)
+            .unwrap_err()
+            .contains("has no answer"));
+    }
+
+    #[test]
+    fn a_bound_address_must_name_a_field_that_carries_one() {
+        let text_destination = FIXTURE_B.replacen(
+            "destination: { field: conversation }",
+            "destination: { field: text }",
+            1,
+        );
+        assert!(parse(&text_destination)
+            .unwrap_err()
+            .contains("channel sink 'ack_routed' destination is bound to 'text', which carries no conversation address"));
+        let answer_destination = FIXTURE_B.replacen(
+            "destination: { field: conversation }",
+            "destination: { field: answers.thread.address }",
+            1,
+        );
+        assert!(parse(&answer_destination)
+            .unwrap_err()
+            .contains("carries no conversation address"));
+        let pick_target = FIXTURE_B.replace(
+            "target: { field: answers.thread.addresses }",
+            "target: { field: answers.thread.pick }",
+        );
+        assert!(
+            parse(&pick_target)
+                .unwrap_err()
+                .contains("is bound to 'answers.thread.pick', which carries no message target"),
+            "a thread name is not an address"
+        );
+        let unknown_shape = FIXTURE_B.replace(
+            "target: { field: answers.thread.addresses }",
+            "target: { fiel: answers.thread.addresses }",
+        );
+        assert!(parse(&unknown_shape)
+            .unwrap_err()
+            .contains("an address is a literal, or a binding"));
+        // A literal spelled as a binding reads as the literal.
+        let spelled = parse(&graph_route(
+            "{ kind: message, target: { value: 'cairn://p/cairn/1' } }",
+            "",
+        ))
+        .unwrap();
+        assert!(serde_yaml::to_string(&spelled)
+            .unwrap()
+            .contains("target: cairn://p/cairn/1"));
+    }
+
+    #[test]
+    fn the_same_edge_with_two_conditions_is_refused_and_an_identical_one_folds() {
+        let doubled = FIXTURE_A.replace(
+            "  - { from: inbound, to: pick }\n",
+            "  - { from: inbound, to: pick }\n  - { from: pick, to: deliver, when: { answers.target.outcome: below_threshold } }\n",
+        );
+        assert!(parse(&doubled)
+            .unwrap_err()
+            .contains("give one edge a list of when clauses instead"));
+        let repeated = FIXTURE_A.replace(
+            "  - { from: inbound, to: pick }\n",
+            "  - { from: inbound, to: pick }\n  - { from: inbound, to: pick }\n",
+        );
+        assert!(parse(&repeated).is_ok());
+    }
+
+    #[test]
+    fn literal_sinks_and_the_core_pack_routes_load_and_re_save_unchanged() {
+        for yaml in [
+            include_str!("../../../../packs/core/routes/followed-thread-stream.yaml"),
+            include_str!("../../../../packs/core/routes/github-mention.yaml"),
+        ] {
+            let parsed = parse(yaml).unwrap();
+            let emitted = serde_yaml::to_string(&parsed).unwrap();
+            assert_eq!(
+                serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),
+                emitted
+            );
+            assert!(!emitted.contains("when: []"), "{emitted}");
+        }
+        let literal = parse(&graph_route(
+            "{ kind: message, target: 'cairn://p/cairn/1' }",
+            "",
+        ))
+        .unwrap();
+        let RouteNode { config, .. } = &literal.nodes[1];
+        let RouteNodeConfig::Sink { sink } = config else {
+            panic!("a sink");
+        };
+        // A literal serializes as the bare value it always was.
+        assert_eq!(
+            serde_json::to_value(sink).unwrap(),
+            serde_json::json!({"kind": "message", "target": "cairn://p/cairn/1"})
+        );
+        let channel = parse(&graph_route(
+            "{ kind: channel, destination: 'discord:12/34' }",
+            "",
+        ))
+        .unwrap();
+        let RouteNodeConfig::Sink { sink } = &channel.nodes[1].config else {
+            panic!("a sink");
+        };
+        assert_eq!(
+            serde_json::to_value(sink).unwrap(),
+            serde_json::json!({"kind": "channel", "destination": "discord:12/34", "initiatedBy": null})
+        );
+        assert_eq!(
+            serde_json::to_value(&literal.edges[0]).unwrap(),
+            serde_json::json!({"from": "trigger-1", "to": "sink-1"})
+        );
+    }
 
     /// A one-trigger, one-sink graph over `sink`, with `tail` appended as
     /// further top-level keys — a `dedupe` window, say. Tests that need a
@@ -908,16 +1579,34 @@ mod tests {
     }
 
     #[test]
-    fn agent_nodes_are_named_as_reserved_rather_than_unknown() {
+    fn agent_is_an_unknown_type_and_decision_is_the_fourth() {
         let error =
             parse("name: test\ndescription: test\nnodes:\n  - id: judge\n    type: agent\n")
                 .unwrap_err();
-        assert!(error.contains("reserved"), "error: {error}");
+        assert!(
+            error.contains(
+                "unknown route node type 'agent', expected trigger, response, decision, or sink"
+            ),
+            "error: {error}"
+        );
         let error = parse("name: test\ndescription: test\nnodes:\n  - id: n\n    type: sync\n")
             .unwrap_err();
         assert!(
-            error.contains("trigger, response, agent, or sink"),
+            error.contains("trigger, response, decision, or sink"),
             "error: {error}"
+        );
+        assert!(parse(FIXTURE_A).is_ok());
+        let error = parse("name: test\ndescription: test\nnodes:\n  - id: d\n    type: decision\n")
+            .unwrap_err();
+        assert!(
+            error.contains("decision node 'd' requires 'questions'"),
+            "{error}"
+        );
+        let error = parse("name: test\ndescription: test\nnodes:\n  - id: d\n    type: decision\n    questions: []\n    sink: { kind: channel, register: notify }\n")
+            .unwrap_err();
+        assert!(
+            error.contains("decision node 'd' cannot declare 'sink'"),
+            "{error}"
         );
     }
 
@@ -1063,7 +1752,12 @@ mod tests {
             "",
         ))
         .unwrap_err();
-        assert!(error.contains("canonical project or issue URI"));
+        assert!(error.contains("canonical project, issue, or thread URI"));
+        assert!(parse(&graph_route(
+            "{ kind: message, target: 'cairn://p/cairn/devops' }",
+            "",
+        ))
+        .is_ok());
     }
 
     #[test]

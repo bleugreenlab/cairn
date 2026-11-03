@@ -78,7 +78,7 @@ fn answer(
             })
         }
         (
-            QuestionKind::Choice { options },
+            QuestionKind::Choice { options, .. },
             SystemOneAnswer::Choice {
                 choice,
                 confidence,

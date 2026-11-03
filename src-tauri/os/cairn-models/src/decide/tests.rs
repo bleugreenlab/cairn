@@ -91,19 +91,14 @@ fn logprobs_route() -> DecisionRoute {
 }
 
 fn choice(name: &str, values: &[&str]) -> DecisionQuestion {
-    DecisionQuestion {
-        name: name.into(),
-        instructions: format!("{name}?"),
-        kind: QuestionKind::Choice {
-            options: values
-                .iter()
-                .map(|value| DecisionOption {
-                    value: value.to_string(),
-                    description: None,
-                })
-                .collect(),
-        },
-    }
+    DecisionQuestion::choice(
+        name,
+        format!("{name}?"),
+        values
+            .iter()
+            .map(|value| DecisionOption::new(*value, None))
+            .collect(),
+    )
 }
 
 fn predicate(name: &str) -> DecisionQuestion {

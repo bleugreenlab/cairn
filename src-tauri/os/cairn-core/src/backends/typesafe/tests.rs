@@ -118,33 +118,29 @@ fn live_listing_and_one_decision() {
     assert_eq!(error, None, "the key is accepted");
 
     let route = DecisionRoute::SystemOne(super::decision_endpoint(&api_key));
-    let option = |value: &str, description: &str| DecisionOption {
-        value: value.into(),
-        description: Some(description.into()),
-    };
+    let option =
+        |value: &str, description: &str| DecisionOption::new(value, Some(description.into()));
     let questions = vec![
         DecisionQuestion {
             name: "is_bug".into(),
             instructions: "Is the customer reporting a software defect?".into(),
             kind: QuestionKind::Predicate,
         },
-        DecisionQuestion {
-            name: "team".into(),
-            instructions: "Which team should own this ticket?".into(),
-            kind: QuestionKind::Choice {
-                options: vec![
-                    option("account", "Login, permissions, or profile issues."),
-                    option(
-                        "frontend",
-                        "Rendering, layout, or browser compatibility issues.",
-                    ),
-                    option(
-                        "payments",
-                        "Checkout, billing, or payment processing issues.",
-                    ),
-                ],
-            },
-        },
+        DecisionQuestion::choice(
+            "team",
+            "Which team should own this ticket?",
+            vec![
+                option("account", "Login, permissions, or profile issues."),
+                option(
+                    "frontend",
+                    "Rendering, layout, or browser compatibility issues.",
+                ),
+                option(
+                    "payments",
+                    "Checkout, billing, or payment processing issues.",
+                ),
+            ],
+        ),
         DecisionQuestion {
             name: "urgency".into(),
             instructions: "How urgent is this ticket?".into(),
