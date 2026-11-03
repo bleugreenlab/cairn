@@ -346,7 +346,6 @@ fn required_verdicts(
                 .to_string(),
         });
     }
-    let mut required = Vec::new();
     for check in &spec.checks {
         let Some(command) = checks.get(check) else {
             return Err(PinBumpRefusal::VerdictMisconfigured {
@@ -373,12 +372,12 @@ fn required_verdicts(
                 ),
             });
         }
-        required.extend(platforms.iter().map(|platform| RequiredVerdict {
-            check: check.clone(),
-            platform: platform.clone(),
-        }));
     }
-    Ok(required)
+    Ok(spec
+        .verdict_lanes()
+        .into_iter()
+        .map(|(check, platform)| RequiredVerdict { check, platform })
+        .collect())
 }
 
 /// Decide whether a merge is an admissible pin bump. See the module docs.

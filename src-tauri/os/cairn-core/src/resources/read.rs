@@ -18,7 +18,10 @@ use super::issue::{
 use super::labels::{read_label, read_labels};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
-use super::node::{parse_artifact_format, ArtifactCoordinates};
+use super::node::{
+    grep_node_chat, grep_node_chat_turn, grep_task_chat, grep_task_chat_turn,
+    parse_artifact_format, ArtifactCoordinates,
+};
 use super::node::{
     read_job_todos, read_node, read_node_artifact, read_node_calls, read_node_chat,
     read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
@@ -1406,6 +1409,14 @@ pub(crate) async fn produce_cairn_resource(
                     value: GREP_RECORD_RENDER_LIMIT.to_string(),
                 });
             }
+            if let Some(found) = grep_chat_transcript(orch, &resource, &body_params, &payload).await
+            {
+                return match found {
+                    Ok(window) => RenderedResource::grep(window, affordance),
+                    // A transcript that did not load is not a zero-match.
+                    Err(error) => RenderedResource::line(error, affordance, None, None),
+                };
+            }
             let rendered_body = if let CairnResource::ProjectIssues { project } = &resource {
                 let issues_db = orch.db.for_project(project).await;
                 let issues_db = &*issues_db;
@@ -1848,6 +1859,83 @@ fn attachment_metadata_body(file_name: &str, media_type: &str, size: usize, uri:
 /// Render a resolved resource's body content (no affordance: the producer
 /// attaches it). Universal `offset`/`limit` are already consumed upstream, so
 /// each arm only sees its own projections.
+/// `grep` on a transcript (`/chat` or `/chat/turn/N`, node or task) answers from
+/// the transcript's events, not from its rendered body: the digest's rows
+/// summarize what ran, so a grep of them could only say what the summary shows.
+/// `None` for every other resource, which greps its rendered body.
+async fn grep_chat_transcript(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+    params: &[QueryParam],
+    payload: &crate::mcp::handlers::search::GrepPayload,
+) -> Option<Result<crate::mcp::handlers::search::GrepWindow, String>> {
+    if !matches!(
+        resource,
+        CairnResource::NodeChat { .. }
+            | CairnResource::NodeChatTurn { .. }
+            | CairnResource::TaskChat { .. }
+            | CairnResource::TaskChatTurn { .. }
+    ) {
+        return None;
+    }
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let db = &*routed_db;
+    let found = match resource.clone() {
+        CairnResource::NodeChat {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => grep_node_chat(db, &project, number, exec_seq, &node_id, params, payload).await,
+        CairnResource::NodeChatTurn {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            turn_seq,
+        } => match reject_query_params("node chat turn", params) {
+            Some(error) => Err(error),
+            None => {
+                grep_node_chat_turn(db, &project, number, exec_seq, &node_id, turn_seq, payload)
+                    .await
+            }
+        },
+        CairnResource::TaskChat {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            grep_task_chat(
+                db, &project, number, exec_seq, &node_id, &task_name, params, payload,
+            )
+            .await
+        }
+        CairnResource::TaskChatTurn {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            turn_seq,
+        } => match reject_query_params("task chat turn", params) {
+            Some(error) => Err(error),
+            None => {
+                grep_task_chat_turn(
+                    db, &project, number, exec_seq, &node_id, &task_name, turn_seq, payload,
+                )
+                .await
+            }
+        },
+        _ => return None,
+    };
+    Some(found)
+}
+
 async fn render_resource_body(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -4714,5 +4802,195 @@ line2', X'0001020AFF', 2.5),
         // The regression: without threading, limit arrives null and only the
         // outer line window applies.
         assert_eq!(value["limit"], 3);
+    }
+}
+
+#[cfg(test)]
+mod transcript_grep_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    const NODE: &str = "cairn://p/prj/2/1/builder";
+    /// Appears only inside the `run` item's script, never in its description.
+    const COMMAND_TOKEN: &str = "force-with-lease";
+    /// Appears only in the tool result.
+    const RESULT_TOKEN: &str = "10992";
+
+    /// A builder node with one turn: a user message, a `run` call whose
+    /// description says nothing of what its script does, and that call's result.
+    async fn orch() -> Orchestrator {
+        let local = LocalDb::open_migrated_for_test(
+            tempfile::tempdir()
+                .unwrap()
+                .keep()
+                .join("transcript-grep.db"),
+        )
+        .await
+        .unwrap();
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',2,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j','e','i','p','running','builder','Builder',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, session_id, created_at, updated_at) VALUES ('run','j','i','sess',1,1)",
+            "INSERT INTO turns (id, session_id, run_id, sequence, created_at, updated_at) VALUES ('turn-1','sess','run',1,1,1)",
+        ] {
+            local.execute(sql, ()).await.unwrap();
+        }
+        let assistant = serde_json::json!({
+            "content": "Pushing the merged protocol file.",
+            "toolUses": [{
+                "id": "tu-1",
+                "name": "mcp__cairn__run",
+                "input": { "commands": [{
+                    "description": "three-way merge protocol file",
+                    "interpreter": "python",
+                    "code": "import subprocess\nsubprocess.run(['git', 'push', '--force-with-lease'])\n",
+                }]},
+            }],
+        });
+        let result = serde_json::json!({
+            "toolUseId": "tu-1",
+            "toolName": "mcp__cairn__run",
+            "toolResult": "=== run three-way merge protocol file ===\nPR head moved: tursodatabase/turso#10992\nExit code: 0",
+        });
+        let user = serde_json::json!({ "content": "Merge and push the protocol file." });
+        for (seq, kind, data) in [
+            (1_i64, "user", user),
+            (2, "assistant", assistant),
+            (3, "tool_result", result),
+        ] {
+            local
+                .execute(
+                    "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at, turn_id) VALUES (?1, 'run', ?2, ?2, ?3, ?4, ?2, 'turn-1')",
+                    (format!("ev-{seq}"), seq, kind, data.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build()
+    }
+
+    fn request() -> McpCallbackRequest {
+        McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            origin: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_on_a_transcript_finds_what_a_call_ran_and_received_under_its_row() {
+        let orch = orch().await;
+        let request = request();
+
+        // The digest shows the call by its description, so neither token is in
+        // the rendered body a universal grep would have searched.
+        let digest = produce_cairn_resource(&orch, &request, &format!("{NODE}/chat")).await;
+        assert!(
+            digest.content.contains("run three-way merge protocol file"),
+            "{}",
+            digest.content
+        );
+        for token in [COMMAND_TOKEN, RESULT_TOKEN] {
+            assert!(!digest.content.contains(token), "{}", digest.content);
+        }
+
+        for surface in ["chat", "chat/turn/1"] {
+            for (token, field, line) in [
+                (
+                    COMMAND_TOKEN,
+                    "  input:",
+                    "subprocess.run(['git', 'push', '--force-with-lease'])",
+                ),
+                (
+                    RESULT_TOKEN,
+                    "  result:",
+                    "PR head moved: tursodatabase/turso#10992",
+                ),
+            ] {
+                let uri = format!("{NODE}/{surface}?grep={token}");
+                let found = produce_cairn_resource(&orch, &request, &uri).await;
+                let body = &found.content;
+                assert_eq!(found.match_count, Some(1), "{uri}: {body}");
+                assert_eq!(found.grep_shown, None, "{uri}: {body}");
+                assert!(body.starts_with("## Turn 1"), "{uri}: {body}");
+
+                let row = body
+                    .find("· run three-way merge protocol file")
+                    .unwrap_or_else(|| panic!("{uri} renders the call's row: {body}"));
+                let label = body
+                    .find(&format!("\n{field}\n"))
+                    .unwrap_or_else(|| panic!("{uri} labels the field: {body}"));
+                let hit = body
+                    .lines()
+                    .find(|rendered| rendered.contains(token))
+                    .unwrap_or_else(|| panic!("{uri} renders the matching line: {body}"));
+                let numbered = hit
+                    .strip_prefix("    ")
+                    .unwrap_or_else(|| panic!("{uri} indents the line under its field: {body}"));
+                let text = numbered.trim_start_matches(|ch: char| ch.is_ascii_digit());
+                assert_eq!(text, format!(":{line}"), "{uri}: {body}");
+                assert!(
+                    row < label && label < body.find(hit).unwrap(),
+                    "{uri}: row, then field, then line: {body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transcript_grep_counts_every_match_and_never_reports_a_failure_as_zero() {
+        let orch = orch().await;
+        let request = request();
+
+        // `run` is in the call's script and its result; its row's verb is the
+        // summary's, not the call's content.
+        let capped = produce_cairn_resource(
+            &orch,
+            &request,
+            &format!("{NODE}/chat?grep=run&head_limit=1"),
+        )
+        .await;
+        assert_eq!(capped.match_count, Some(2), "{}", capped.content);
+        assert_eq!(capped.grep_shown, Some(1), "{}", capped.content);
+
+        let absent =
+            produce_cairn_resource(&orch, &request, &format!("{NODE}/chat?grep=never-ran")).await;
+        assert_eq!(absent.match_count, Some(0));
+        assert!(
+            absent.content.contains("Not searched:")
+                && absent
+                    .content
+                    .contains(&format!("{NODE}/chat/raw?format=json")),
+            "a zero-match names what it did not search: {}",
+            absent.content
+        );
+
+        let missing =
+            produce_cairn_resource(&orch, &request, &format!("{NODE}/chat/turn/9?grep=run")).await;
+        assert_eq!(missing.match_count, None, "{}", missing.content);
+        assert!(
+            missing.content.contains("Turn 9 not found"),
+            "{}",
+            missing.content
+        );
     }
 }

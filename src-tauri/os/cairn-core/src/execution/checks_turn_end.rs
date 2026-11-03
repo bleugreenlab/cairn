@@ -17,6 +17,11 @@
 //! question or task append) leaves the job mid-work, and the trigger
 //! (`lifecycle::review_push::spawn_turn_end_checks`) skips it — see the gate
 //! there for why, and `docs/checks.md` for the trade it makes.
+//!
+//! One exception rides beside the wave rather than in it: a head that changes a
+//! pin the target's `pinBumps` declares also gets that spec's checks, whatever
+//! their cadence, once per platform the spec names, so the `pinBump` merge gate
+//! finds every verdict it requires (`launch_pin_bump_lanes`).
 //! Selection reuses the write cadence's machinery
 //! ([`crate::execution::selection::plan_checks`], the impact gate, placeholder
 //! substitution) via [`crate::execution::checks::applicable_turn_end_checks`], and
@@ -89,10 +94,11 @@ use cairn_common::uri::{build_node_checks_uri, build_task_checks_uri};
 use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{
-    applicable_turn_end_checks, check_input_hashes, load_checks_contract_at_commit,
-    resolve_check_timeout_ms, run_planned_checks_with_board, submit_planned_check_batch,
-    CheckExecMode, CheckFailureKind, CheckOutcome, CheckStatusBoard, PlannedCheckBatchItem,
-    PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    applicable_turn_end_checks, check_input_hashes, execute_check_contract,
+    load_checks_contract_at_commit, resolve_check_contract_at_commit, resolve_check_timeout_ms,
+    run_planned_checks_with_board, submit_planned_check_batch, CheckExecMode, CheckFailureKind,
+    CheckOutcome, CheckRunProducer, CheckRunTarget, CheckStatusBoard, PlannedCheckBatchItem,
+    PlannedCheckBatchRequest, CHECKS_CONFIG_PATH, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
@@ -100,7 +106,7 @@ use crate::execution::inputs::{
 use crate::execution::selection::CheckPlan;
 use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::CellPriority;
-use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries};
+use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, GraphFileChange};
 use crate::orchestrator::{
     attention_push, Orchestrator, TurnEndCancel, TurnEndCancelReason, TurnEndSlot, TurnEndSuccessor,
 };
@@ -438,11 +444,41 @@ pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) 
 /// of here, including a panic, releases the slot through the guard.
 pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, slot: TurnEndSlot) {
     let attempt_id = slot.attempt_id().to_string();
+    let mut pin_bump_lanes = None;
     let result =
         match transition_turn_end_attempt(&orch, &job_id, &attempt_id, "runtime_started", None) {
-            Ok(()) => run_turn_end_checks_inner(&orch, &job_id, &attempt_id, slot.cancel()).await,
+            Ok(()) => {
+                run_turn_end_checks_inner(
+                    &orch,
+                    &job_id,
+                    &attempt_id,
+                    slot.cancel(),
+                    &mut pin_bump_lanes,
+                )
+                .await
+            }
             Err(error) => Err(error),
         };
+    // The wave holds its slot until its `pinBump` lanes have recorded too, so a
+    // checks-settled wait never reads a bump as settled while they still run.
+    // A withdrawn or cancelled wave's verdicts would validate a tree nobody
+    // will review again, so its lanes are dropped, which aborts them.
+    if let Some(lanes) = pin_bump_lanes {
+        if !matches!(
+            result,
+            Ok(TurnEndDisposition::Withdrawn(_) | TurnEndDisposition::Cancelled(_))
+        ) {
+            tokio::select! {
+                biased;
+                reason = slot.cancel().cancelled() => log::info!(
+                    "turn-end checks for job {}: abandoning its pinBump lanes because {}",
+                    short_id(&job_id),
+                    reason.describe()
+                ),
+                () = lanes.finish() => {}
+            }
+        }
+    }
     let (state, reason) = match result {
         Ok(disposition) => disposition.terminal(),
         Err(error) => {
@@ -1050,11 +1086,15 @@ fn record_settle(orch: &Orchestrator, job_id: &str, attempt_id: &str, state: &st
     }
 }
 
+/// The ordinary wave, plus the launch of any `pinBump` lanes the change owes
+/// into `pin_bump_lanes`. Those run in a task of their own beside this wave's
+/// batch, and the caller waits for them after this returns.
 async fn run_turn_end_checks_inner(
     orch: &Orchestrator,
     job_id: &str,
     attempt_id: &str,
     cancel: &TurnEndCancel,
+    pin_bump_lanes: &mut Option<PinBumpLanesTask>,
 ) -> Result<TurnEndDisposition, String> {
     // 1. Resolve the node's durable branch coordinate and base anchors.
     let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
@@ -1105,7 +1145,7 @@ async fn run_turn_end_checks_inner(
     // the branch was cut at and does not follow a base advance, so diffing from
     // it absorbs every commit the target merged in the meantime — which is how a
     // zero-delta planner selected a full review suite (CAIRN-3108).
-    let base = match crate::diff::live_job_branch_range(
+    let (base, target_head) = match crate::diff::live_job_branch_range(
         &orch.db.local,
         job_id,
         &orch.jj_binary_path,
@@ -1113,7 +1153,7 @@ async fn run_turn_end_checks_inner(
     )
     .await
     {
-        Ok(Some(range)) => range.base,
+        Ok(Some(range)) => (range.base, range.target_head),
         other => {
             log::warn!(
                 "turn-end checks for job {}: no live base coordinate ({}); nothing to run",
@@ -1195,6 +1235,46 @@ async fn run_turn_end_checks_inner(
             short_id(job_id)
         );
         return Ok(TurnEndDisposition::Skipped("changed-file set is empty"));
+    }
+
+    // 4b. The `pinBump` gate's lanes. A head that changes a pin the target's
+    // `pinBumps` declares will face a gate that needs each of that spec's
+    // checks verified on each of its platforms, and this wave's own batch runs
+    // on one machine. So each lane is requested here, on its own platform,
+    // through the producer `cairn check run --os` uses. The spec is read at the
+    // target's tip, as the gate reads it, so a branch cannot choose its lanes.
+    let config_jj = jj.clone();
+    let config_repository = logical_repository.clone();
+    let config_tip = target_head.clone();
+    let owed = tokio::task::spawn_blocking(move || {
+        crate::jj::text_at_revision(
+            &config_jj,
+            &config_repository,
+            &config_tip,
+            CHECKS_CONFIG_PATH,
+        )
+    })
+    .await
+    .map_err(|error| format!("the target config task failed: {error}"))
+    .and_then(|read| read)
+    .and_then(|text| pin_bump_lanes_owed(text.as_deref(), &changed));
+    match owed {
+        Ok(lanes) if lanes.is_empty() => {}
+        Ok(lanes) => {
+            *pin_bump_lanes = Some(launch_pin_bump_lanes(
+                orch,
+                owning_db.clone(),
+                job_id,
+                &coords,
+                &sealed_commit,
+                &target_head,
+                lanes,
+            ));
+        }
+        Err(error) => log::warn!(
+            "turn-end checks for job {}: the target's pinBumps at {target_head} are unreadable, so this wave requests no pinBump lanes: {error}",
+            short_id(job_id)
+        ),
     }
 
     // 5. Select the applicable turn-end checks (cadence + input gate). Resolving
@@ -1855,6 +1935,193 @@ async fn run_turn_end_checks_inner(
         }
     }
     Ok(TurnEndDisposition::CompletedWithDelivery)
+}
+
+/// One verdict the `pinBump` gate will require of a bump: a check on a platform.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PinBumpLane {
+    check: String,
+    platform: String,
+}
+
+impl std::fmt::Display for PinBumpLane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} on {}", self.check, self.platform)
+    }
+}
+
+/// The `pinBump` lanes a wave owes the change it checks: for every pin the
+/// target's `pinBumps` declares that `changed` touches, each of that spec's
+/// checks on each of its platforms (`PinBumpSpec::verdict_lanes`, the same
+/// enumeration the gate requires), deduplicated and sorted. Empty for a change
+/// that touches no declared pin, and for a target with no project config.
+///
+/// `target_config` is `.cairn/config.yaml` at the integration target's tip, never
+/// the head's, so a branch that edits `pinBumps` changes neither its gate nor
+/// its lanes.
+fn pin_bump_lanes_owed(
+    target_config: Option<&str>,
+    changed: &[GraphFileChange],
+) -> Result<Vec<PinBumpLane>, String> {
+    let Some(text) = target_config else {
+        return Ok(Vec::new());
+    };
+    let (settings, _) = crate::config::project_settings::parse_project_settings(text)?;
+    let touched = |pin: &str| {
+        changed
+            .iter()
+            .any(|file| file.path == pin || file.previous_path.as_deref() == Some(pin))
+    };
+    let lanes: BTreeSet<PinBumpLane> = settings
+        .pin_bumps
+        .unwrap_or_default()
+        .values()
+        .filter(|spec| touched(&spec.pin))
+        .flat_map(|spec| spec.verdict_lanes())
+        .map(|(check, platform)| PinBumpLane { check, platform })
+        .collect();
+    Ok(lanes.into_iter().collect())
+}
+
+/// A wave's `pinBump` lanes, running in a task of their own. Dropping this
+/// aborts them, so they never outlive the wave that requested them.
+struct PinBumpLanesTask(tokio::task::JoinHandle<()>);
+
+impl PinBumpLanesTask {
+    async fn finish(mut self) {
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for PinBumpLanesTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Where a wave's `pinBump` lanes run and record: the wave's own job and
+/// project, the head it sealed, and the target tip its diff was measured from.
+struct PinBumpLaneScope {
+    job_id: String,
+    project_id: String,
+    project_key: String,
+    repository_path: String,
+    head: String,
+    target_head: String,
+}
+
+fn launch_pin_bump_lanes(
+    orch: &Orchestrator,
+    db: std::sync::Arc<LocalDb>,
+    job_id: &str,
+    coords: &JobCoords,
+    head: &str,
+    target_head: &str,
+    lanes: Vec<PinBumpLane>,
+) -> PinBumpLanesTask {
+    log::info!(
+        "turn-end checks for job {}: the head changes a pin the target's pinBumps declares, so this wave also requests [{}], each on its own platform",
+        short_id(job_id),
+        lanes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let scope = PinBumpLaneScope {
+        job_id: job_id.to_string(),
+        project_id: coords.project_id.clone(),
+        project_key: coords.project_key.clone(),
+        repository_path: coords.repository_path.clone(),
+        head: head.to_string(),
+        target_head: target_head.to_string(),
+    };
+    let orch = orch.clone();
+    PinBumpLanesTask(tokio::spawn(async move {
+        let results = futures_util::future::join_all(
+            lanes
+                .iter()
+                .map(|lane| run_pin_bump_lane(&orch, db.clone(), &scope, lane)),
+        )
+        .await;
+        for (lane, result) in lanes.iter().zip(results) {
+            match result {
+                Ok(summary) => log::info!(
+                    "turn-end checks for job {}: pinBump lane {lane}: {summary}",
+                    short_id(&scope.job_id)
+                ),
+                Err(error) => log::warn!(
+                    "turn-end checks for job {}: pinBump lane {lane} recorded no verdict: {error}",
+                    short_id(&scope.job_id)
+                ),
+            }
+        }
+    }))
+}
+
+/// One `pinBump` lane, exactly as `cairn check run <check> --os <platform>`
+/// at the wave's head would run it: the contract its head declares, placement
+/// narrowed to the platform, reuse limited to that platform's verdicts, and the
+/// observation recorded against this job where the gate reads it. A platform
+/// with no machine waits or refuses the way any placed lane does.
+async fn run_pin_bump_lane(
+    orch: &Orchestrator,
+    db: std::sync::Arc<LocalDb>,
+    scope: &PinBumpLaneScope,
+    lane: &PinBumpLane,
+) -> Result<String, String> {
+    let placement = crate::execution::check_placement::CheckPlacementOverride::new(
+        cairn_common::executor_protocol::ExecutorSelector {
+            os: Some(lane.platform.clone()),
+            ..Default::default()
+        },
+        cairn_common::executor_protocol::CheckSelectorSource::Explicit,
+    )?;
+    let contract = resolve_check_contract_at_commit(
+        orch,
+        db.clone(),
+        CheckRunTarget {
+            job_id: scope.job_id.clone(),
+            project_id: scope.project_id.clone(),
+            project_key: scope.project_key.clone(),
+            repository_path: scope.repository_path.clone(),
+            attribution_target: scope.target_head.clone(),
+        },
+        scope.head.clone(),
+        &lane.check,
+        Some(&placement),
+    )
+    .await?;
+    let result = execute_check_contract(
+        orch,
+        db,
+        contract,
+        CheckRunProducer {
+            tool_use_id: format!(
+                "turn-checks:{}:pin-bump:{}:{}",
+                scope.job_id, lane.check, lane.platform
+            ),
+            node_kind: format!("pin-bump {}", lane.platform),
+            owner_job_id: Some(scope.job_id.clone()),
+            purpose: None,
+        },
+        false,
+        std::sync::Arc::new(|_| {}),
+    )
+    .await?;
+    let verdict = match &result.no_verdict {
+        Some(no_verdict) => format!("no verdict ({}: {})", no_verdict.kind, no_verdict.cause),
+        None if result.passed => "passed".to_string(),
+        None => "failed".to_string(),
+    };
+    Ok(format!(
+        "{verdict}, {} ({})",
+        result.disposition,
+        result
+            .observation_ref
+            .as_deref()
+            .unwrap_or("no observation recorded")
+    ))
 }
 
 const TURN_CHECK_FINGERPRINT_VERSION: &str = "turn-check-state-v3";
@@ -3915,6 +4182,130 @@ mod tests {
         // on a coordinate nobody resolved.
         coords.base_branch = None;
         assert_eq!(base_tree_coordinate(&coords), None);
+    }
+
+    const CODEX_PIN: &str = "src-tauri/os/cairn-models/codex-pin.json";
+
+    /// The target's config: the two pin checks run on the write cadence, so
+    /// no ordinary review wave plans them, beside one ordinary review check.
+    const PIN_BUMP_TARGET_CONFIG: &str = r#"
+checks:
+  codex-pin:
+    command: bun run codex:pin:check
+    when: write
+    verdictPlatforms: [linux, macos]
+  codex-contract:
+    command: bun run codex:contract
+    when: write
+    verdictPlatforms: [linux, macos]
+  typecheck:
+    command: bunx --bun tsc --noEmit
+    when: review
+pinBumps:
+  codex:
+    pin: src-tauri/os/cairn-models/codex-pin.json
+    frozen: [integration]
+    checks: [codex-pin, codex-contract]
+    platforms: [macos, linux]
+"#;
+
+    fn modified(path: &str) -> GraphFileChange {
+        GraphFileChange {
+            path: path.to_string(),
+            previous_path: None,
+            status: "modified".to_string(),
+            additions: 1,
+            deletions: 1,
+        }
+    }
+
+    fn lane(check: &str, platform: &str) -> PinBumpLane {
+        PinBumpLane {
+            check: check.to_string(),
+            platform: platform.to_string(),
+        }
+    }
+
+    /// Everything a wave plans for `changed` against `target_config`: the
+    /// ordinary review lanes by name, and the pinBump lanes the change owes.
+    fn wave_lanes(
+        target_config: Option<&str>,
+        changed: &[GraphFileChange],
+    ) -> (Vec<String>, Vec<PinBumpLane>) {
+        let (settings, _) =
+            crate::config::project_settings::parse_project_settings(PIN_BUMP_TARGET_CONFIG)
+                .unwrap();
+        let checks = settings.checks.unwrap();
+        let inputs = ResolvedInputs::resolve(
+            &checks,
+            &std::collections::HashMap::new(),
+            &TreeSnapshot::empty(),
+        );
+        let ordinary = applicable_turn_end_checks(&checks, &inputs, changed, Path::new("/repo"))
+            .into_iter()
+            .map(|plan| plan.name)
+            .collect();
+        (
+            ordinary,
+            pin_bump_lanes_owed(target_config, changed).unwrap(),
+        )
+    }
+
+    /// The 10-27 specimen: the review wave ran the pin checks on one platform,
+    /// so the gate refused until someone asked for the other by hand. A head
+    /// that changes the pin now plans each spec check on each spec platform,
+    /// beside the ordinary lanes.
+    #[test]
+    fn a_wave_on_a_pin_bump_plans_every_spec_check_on_every_spec_platform() {
+        let (ordinary, pin_bump) = wave_lanes(Some(PIN_BUMP_TARGET_CONFIG), &[modified(CODEX_PIN)]);
+        assert_eq!(ordinary, vec!["typecheck".to_string()]);
+        assert_eq!(
+            pin_bump,
+            vec![
+                lane("codex-contract", "linux"),
+                lane("codex-contract", "macos"),
+                lane("codex-pin", "linux"),
+                lane("codex-pin", "macos"),
+            ]
+        );
+
+        // A pin renamed away from the declared path still changes it.
+        let renamed = GraphFileChange {
+            path: "src-tauri/os/cairn-models/codex-pin.old.json".to_string(),
+            previous_path: Some(CODEX_PIN.to_string()),
+            status: "renamed".to_string(),
+            ..modified(CODEX_PIN)
+        };
+        assert_eq!(
+            wave_lanes(Some(PIN_BUMP_TARGET_CONFIG), &[renamed]).1.len(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_wave_on_any_other_change_plans_the_ordinary_lanes_only() {
+        for changed in [
+            vec![modified(
+                "src-tauri/os/cairn-models/src/session/codex/pin.rs",
+            )],
+            vec![modified(".cairn/config.yaml")],
+        ] {
+            assert_eq!(
+                wave_lanes(Some(PIN_BUMP_TARGET_CONFIG), &changed),
+                (vec!["typecheck".to_string()], Vec::new()),
+                "{changed:?}"
+            );
+        }
+
+        // The lanes come from the target's config alone. A target that
+        // declares no pinBumps owes a pin change nothing, whatever the head's
+        // own config says, and so does a target with no config at all.
+        let no_pin_bumps =
+            "checks:\n  typecheck:\n    command: bunx --bun tsc --noEmit\n    when: review\n";
+        assert!(wave_lanes(Some(no_pin_bumps), &[modified(CODEX_PIN)])
+            .1
+            .is_empty());
+        assert!(wave_lanes(None, &[modified(CODEX_PIN)]).1.is_empty());
     }
 
     fn uncached_plan(name: &str) -> (CheckPlan, String) {

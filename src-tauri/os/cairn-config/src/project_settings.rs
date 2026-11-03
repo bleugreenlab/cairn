@@ -166,6 +166,27 @@ pub struct PinBumpSpec {
     pub platforms: Vec<String>,
 }
 
+impl PinBumpSpec {
+    /// Every (check, platform) pair a bump of this pin is proven by: each of
+    /// `checks` in configuration order, on each of `platforms` sorted and
+    /// deduplicated. The `pinBump` merge gate requires a verdict for each pair,
+    /// and a review wave on a change to this pin requests a lane for each, so
+    /// the two cannot disagree about which verdicts a bump needs.
+    pub fn verdict_lanes(&self) -> Vec<(String, String)> {
+        let mut platforms = self.platforms.clone();
+        platforms.sort();
+        platforms.dedup();
+        self.checks
+            .iter()
+            .flat_map(|check| {
+                platforms
+                    .iter()
+                    .map(move |platform| (check.clone(), platform.clone()))
+            })
+            .collect()
+    }
+}
+
 /// The `landing` section of `.cairn/config.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

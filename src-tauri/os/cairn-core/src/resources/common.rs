@@ -364,6 +364,18 @@ pub(super) async fn visible_job_node_segment(
 /// `-A`/`-B`/`-C` documentation gap).
 const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` (caps MATCHES, not lines; a capped read reports the full total and marks itself partial) — line-number-prefixed matches over the rendered body; `offset` not allowed with grep unless a filter above makes it this resource's own record paging, which then chooses the page grep searches; `files_with_matches`/`count` need a tree\n";
 
+/// The transcript kinds, whose `grep` reads the events behind the digest rather
+/// than its rendered rows.
+const TRANSCRIPT_GREP_KINDS: [ResourceKind; 4] = [
+    ResourceKind::NodeChat,
+    ResourceKind::NodeChatTurn,
+    ResourceKind::TaskChat,
+    ResourceKind::TaskChatTurn,
+];
+
+/// What [`UNIVERSAL_GREP_FILTER`] means on a [`TRANSCRIPT_GREP_KINDS`] read.
+const TRANSCRIPT_GREP_FILTER: &str = "- on a transcript, `grep` matches every event's full content (message text, each tool input, each tool result), not the digest rows: a match renders under its row, labelled `message:`/`input:`/`result:`, with context applied inside that field\n";
+
 pub(super) fn affordance_spec_for_kind(
     kind: ResourceKind,
     current: Option<&CairnResource>,
@@ -430,6 +442,12 @@ pub(super) fn render_affordance(spec: &AffordanceSpec) -> String {
         sections.push_str(&format!("- `{}={}`\n", filter.key, filter.values));
     }
     sections.push_str(UNIVERSAL_GREP_FILTER);
+    if TRANSCRIPT_GREP_KINDS
+        .iter()
+        .any(|kind| kind.slug() == spec.kind)
+    {
+        sections.push_str(TRANSCRIPT_GREP_FILTER);
+    }
     sections.push('\n');
     if !spec.actions.is_empty() {
         sections.push_str("### actions\n");

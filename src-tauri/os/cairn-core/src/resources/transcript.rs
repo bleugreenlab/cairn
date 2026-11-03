@@ -67,7 +67,7 @@ pub(crate) async fn era_source_digest(
 }
 
 impl EventRow {
-    fn to_transcript_row(&self) -> crate::transcripts::TranscriptRow {
+    pub(super) fn to_transcript_row(&self) -> crate::transcripts::TranscriptRow {
         (
             self.run_id.clone(),
             self.sequence,
@@ -325,19 +325,25 @@ pub(super) async fn turn_event_rows(
     events
 }
 
-/// Reconstruct the rows [`turn_event_rows`] read into the
-/// `(run_id, sequence, event_type, data)` rows the transcript formatter takes.
-/// Takes `db` rather than a connection because reconstruction takes its own
-/// short read and then fetches from the content store, neither of which may
-/// happen inside the caller's read.
+/// Reconstruct the rows [`turn_event_rows`] read into [`EventRow`]s. Takes `db`
+/// rather than a connection because reconstruction takes its own short read and
+/// then fetches from the content store, neither of which may happen inside the
+/// caller's read.
 pub(super) async fn reconstruct_turn_events(
     db: &crate::storage::LocalDb,
     events: Vec<crate::models::Event>,
-) -> Vec<(String, i32, String, String)> {
+) -> Vec<EventRow> {
     crate::storage::reconstruct_events(db, events)
         .await
         .into_iter()
-        .map(|event| (event.run_id, event.sequence, event.event_type, event.data))
+        .map(|event| EventRow {
+            run_id: event.run_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            data: event.data,
+            turn_id: event.turn_id,
+            created_at: event.created_at,
+        })
         .collect()
 }
 
@@ -1472,6 +1478,72 @@ pub(super) fn format_transcript_digest_with(
     out
 }
 
+/// Grep a transcript over everything its events carry: message text, each tool
+/// call's whole input, and each tool result — not over the digest's rows, which
+/// summarize a call (a `run` item renders as its description) and so cannot
+/// answer what a transcript contains. A matching entry renders as its digest row
+/// with the matching lines of each field beneath it, labelled `message:`,
+/// `input:`, or `result:`; context applies within that field.
+///
+/// The matcher, its flags, and `head_limit` are the universal grep's own, and
+/// the counts are over the whole transcript, so the header reports every match
+/// even when the cap shows fewer. `opts` chooses which turns are searched and in
+/// what order. A zero-match names what was not searched and where it is.
+pub(super) fn grep_transcript_content(
+    events: &[EventRow],
+    turn_sequences: &HashMap<String, i32>,
+    clock: &crate::clock::HostClock,
+    opts: &DigestOptions,
+    payload: &crate::mcp::handlers::search::GrepPayload,
+    raw_uri: &str,
+) -> Result<crate::mcp::handlers::search::GrepWindow, String> {
+    use crate::mcp::handlers::search::{grep_materialized_body, grep_no_matches_body, GrepWindow};
+
+    // An unusable pattern is a failed search even when no field reaches the
+    // matcher; it must not come back as a zero-match.
+    grep_materialized_body("", payload)?;
+    let transcript = transcript_from_rows(events, "", turn_sequences);
+    let found = continuation::render_digest_matches(
+        &transcript,
+        cairn_tool_renderers(),
+        clock,
+        opts,
+        payload.head_limit.map(|limit| limit as usize),
+        |text, remaining| -> Result<continuation::FieldMatches, String> {
+            let mut field = payload.clone();
+            field.head_limit = remaining.map(|left| u32::try_from(left).unwrap_or(u32::MAX));
+            let window = grep_materialized_body(text, &field)?;
+            let matches = window.match_count.unwrap_or(0);
+            if matches == 0 {
+                return Ok(continuation::FieldMatches::default());
+            }
+            Ok(continuation::FieldMatches {
+                shown: window.shown.unwrap_or(matches),
+                matches,
+                rendered: window.body,
+            })
+        },
+    )?;
+    let body = if found.matches == 0 {
+        format!(
+            "{} in message text, tool inputs, or tool results.\n\
+             Not searched: system events (status, prompts, notices, errors) and the bodies \
+             of prior-context seeds; {raw_uri}?format=json carries every event.",
+            grep_no_matches_body(&payload.pattern)
+        )
+    } else {
+        found.body.trim_start_matches('\n').to_string()
+    };
+    Ok(GrepWindow {
+        body,
+        match_count: Some(found.matches),
+        file_count: 0,
+        shown: (found.shown < found.matches).then_some(found.shown),
+        unit_noun: "matches",
+        total_units: found.matches,
+    })
+}
+
 /// Cairn's stored events as the facet's neutral [`Transcript`]: one turn per
 /// [`group_turn_blocks`] block, including a block whose events all render
 /// nothing, so a turn's position stays the `/chat?offset=` coordinate.
@@ -2189,7 +2261,8 @@ mod tests {
         let rows = reconstruct_turn_events(&db, events).await;
         assert_eq!(rows.len(), 1);
         // The stub `data` was reconstructed back to the original event JSON.
-        assert_eq!(rows[0].3, original);
+        assert_eq!(rows[0].data, original);
+        assert_eq!(rows[0].turn_id.as_deref(), Some("turn-1"));
     }
 
     /// Parity guard for the deleted `grep_transcript`: the universal grep over a

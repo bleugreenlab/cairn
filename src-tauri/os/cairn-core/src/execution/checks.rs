@@ -647,6 +647,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_planned_checks_at_commit_with_coordinates<F, Fut, N, E>(
     db: Arc<LocalDb>,
@@ -8159,7 +8160,7 @@ async fn rekey_wave_onto_fix(
 }
 
 /// Where a project declares its checks, inside whatever tree is being read.
-const CHECKS_CONFIG_PATH: &str = ".cairn/config.yaml";
+pub(crate) const CHECKS_CONFIG_PATH: &str = ".cairn/config.yaml";
 
 /// A checks contract together with the commit that DECLARED it.
 ///

@@ -14,11 +14,12 @@ use super::common::{
     ResourceActionRun, ResourceArtifact, ResourceJob,
 };
 use super::transcript::{
-    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, load_job_events_ordered,
-    parse_raw_transcript_format, read_single_event, reconstruct_turn_events, render_single_event,
-    transcript_from_rows, turn_event_rows, DigestCoordinate, DigestMeta, RawTranscriptFormat,
-    StoredEvent,
+    format_raw_transcript, format_transcript_digest_with, get_nth_run_id, grep_transcript_content,
+    load_job_events_ordered, parse_raw_transcript_format, read_single_event,
+    reconstruct_turn_events, render_single_event, transcript_from_rows, turn_event_rows,
+    DigestCoordinate, DigestMeta, EventRow, RawTranscriptFormat, StoredEvent,
 };
+use crate::mcp::handlers::search::{GrepPayload, GrepWindow};
 use cairn_models::continuation::DigestOptions;
 use futures_util::future::BoxFuture;
 
@@ -2081,28 +2082,17 @@ async fn load_primary_session_turn_sequences(
     map
 }
 
-pub(super) async fn read_node_chat(
-    db: &LocalDb,
-    project_key: &str,
-    number: i32,
-    exec_seq: i32,
-    node_name: &str,
-    params: &[QueryParam],
-) -> String {
-    // `latest=true` flips turn order (newest turn first; events within a turn
-    // stay chronological). `offset`/`limit` page whole turns rather than rendered
-    // lines, so consume them here instead of letting the shared line view slice
-    // through a turn.
-    let latest = matches!(find_query_value(params, "latest"), Some("true") | Some("1"));
-    let turn_offset =
-        find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
-    let turn_limit =
-        find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
-    // Opt-in reseed-fidelity knobs: `messages=full` renders messages unabridged;
-    // `diffs=true` inlines each file write's change body beneath its row. Both
-    // default off so the digest stays byte-identical for the common case.
-    let unabridged = matches!(find_query_value(params, "messages"), Some("full"));
-    let inline_diffs = matches!(find_query_value(params, "diffs"), Some("true") | Some("1"));
+/// The digest options a node or task `/chat` read takes, or the rejection of a
+/// param it does not.
+///
+/// `latest=true` flips turn order (newest turn first; events within a turn stay
+/// chronological). `offset`/`limit` page whole turns rather than rendered lines,
+/// so they are consumed here instead of letting the shared line view slice
+/// through a turn. `messages=full` renders messages unabridged and `diffs=true`
+/// inlines each file write's change body beneath its row; both are opt-in
+/// reseed-fidelity knobs, off by default so the digest stays byte-identical for
+/// the common case.
+fn chat_digest_options(resource: &str, params: &[QueryParam]) -> Result<DigestOptions, String> {
     let leftover: Vec<QueryParam> = params
         .iter()
         .filter(|param| {
@@ -2113,10 +2103,47 @@ pub(super) async fn read_node_chat(
         })
         .cloned()
         .collect();
-    if let Some(error) = reject_query_params("node chat", &leftover) {
-        return error;
+    if let Some(error) = reject_query_params(resource, &leftover) {
+        return Err(error);
     }
+    Ok(DigestOptions {
+        latest: matches!(find_query_value(params, "latest"), Some("true") | Some("1")),
+        turn_offset: find_query_value(params, "offset").and_then(|value| value.parse().ok()),
+        turn_limit: find_query_value(params, "limit").and_then(|value| value.parse().ok()),
+        unabridged: matches!(find_query_value(params, "messages"), Some("full")),
+        inline_diffs: matches!(find_query_value(params, "diffs"), Some("true") | Some("1")),
+    })
+}
 
+/// A node's or task's whole transcript, loaded for one `/chat` read, with what
+/// a rendering of it addresses: `base_uri` is the `/chat` URI its turn links and
+/// header extend.
+struct LoadedChat {
+    rows: Vec<EventRow>,
+    turn_sequences: HashMap<String, i32>,
+    base_uri: String,
+    status: String,
+}
+
+impl LoadedChat {
+    fn raw_uri(&self) -> String {
+        format!("{}/raw", self.base_uri)
+    }
+}
+
+/// Load a node's transcript for `/chat`. A transcript with no events is an
+/// `Err`, so neither the digest nor a grep can present it as content.
+///
+/// The job resolves in its own short read, which has released before the
+/// transcript loads, so nothing holds a transaction across the load and the
+/// render (tenet 1260).
+async fn load_node_chat(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> Result<LoadedChat, String> {
     let read = read_node_rows(db, project_key, number, exec_seq, node_name, |conn, job| {
         Box::pin(async move {
             (
@@ -2125,64 +2152,95 @@ pub(super) async fn read_node_chat(
             )
         })
     });
-    let (job, (visible_segment, turn_sequences)) = match read.await {
-        Ok(read) => read,
+    let (job, (visible_segment, turn_sequences)) = read.await?;
+    let rows = load_job_events_ordered(db, &job.id)
+        .await
+        .map_err(|error| format!("Failed to read this node's transcript: {error}"))?;
+    if rows.is_empty() {
+        return Err("No runs found for this node.".to_string());
+    }
+    Ok(LoadedChat {
+        rows,
+        turn_sequences,
+        base_uri: build_node_chat_uri(project_key, number, exec_seq, &visible_segment),
+        status: job.status,
+    })
+}
+
+pub(super) async fn read_node_chat(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    params: &[QueryParam],
+) -> String {
+    let opts = match chat_digest_options("node chat", params) {
+        Ok(opts) => opts,
         Err(error) => return error,
     };
-
-    let base_uri = build_node_chat_uri(project_key, number, exec_seq, &visible_segment);
+    let chat = match load_node_chat(db, project_key, number, exec_seq, node_name).await {
+        Ok(chat) => chat,
+        Err(error) => return error,
+    };
     let meta = DigestMeta {
         label: node_name,
         project: project_key,
         coordinate: DigestCoordinate::Issue { number, exec_seq },
-        status: &job.status,
+        status: &chat.status,
     };
-    render_job_chat_digest(
-        db,
-        &job.id,
-        &turn_sequences,
-        &base_uri,
+    format_transcript_digest_with(
+        &chat.rows,
+        &chat.base_uri,
         &meta,
-        &DigestOptions {
-            latest,
-            turn_offset,
-            turn_limit,
-            unabridged,
-            inline_diffs,
-        },
+        &chat.turn_sequences,
+        crate::clock::host(),
+        &opts,
     )
-    .await
 }
 
-/// Canonical `/chat` digest render for an already-resolved job. `base_uri`/`meta`
-/// are caller-built (the cosmetic header line plus truncation drill-down link
-/// scaffolding).
-///
-/// Takes no connection: the caller finishes its own reads and releases it
-/// first, so nothing holds a transaction across the transcript load and the
-/// render (tenet 1260).
-async fn render_job_chat_digest(
+/// `grep` on a node's `/chat`: matches over the transcript's full content (see
+/// [`grep_transcript_content`]), across the turns the digest params select.
+pub(super) async fn grep_node_chat(
     db: &LocalDb,
-    job_id: &str,
-    turn_sequences: &HashMap<String, i32>,
-    base_uri: &str,
-    meta: &DigestMeta<'_>,
-    opts: &DigestOptions,
-) -> String {
-    let event_rows = match load_job_events_ordered(db, job_id).await {
-        Ok(rows) => rows,
-        Err(error) => return format!("Failed to read this node's transcript: {error}"),
-    };
-    if event_rows.is_empty() {
-        return "No runs found for this node.".to_string();
-    }
-    format_transcript_digest_with(
-        &event_rows,
-        base_uri,
-        meta,
-        turn_sequences,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    params: &[QueryParam],
+    payload: &GrepPayload,
+) -> Result<GrepWindow, String> {
+    let opts = chat_digest_options("node chat", params)?;
+    let chat = load_node_chat(db, project_key, number, exec_seq, node_name).await?;
+    grep_transcript_content(
+        &chat.rows,
+        &chat.turn_sequences,
         crate::clock::host(),
-        opts,
+        &opts,
+        payload,
+        &chat.raw_uri(),
+    )
+}
+
+/// `grep` over one turn's events, headed by the turn's own number.
+fn grep_turn_rows(
+    rows: &[EventRow],
+    turn_seq: i32,
+    payload: &GrepPayload,
+    raw_uri: &str,
+) -> Result<GrepWindow, String> {
+    let turn_sequences: HashMap<String, i32> = rows
+        .iter()
+        .filter_map(|row| row.turn_id.clone())
+        .map(|turn_id| (turn_id, turn_seq))
+        .collect();
+    grep_transcript_content(
+        rows,
+        &turn_sequences,
+        crate::clock::host(),
+        &DigestOptions::default(),
+        payload,
+        raw_uri,
     )
 }
 
@@ -2228,7 +2286,7 @@ pub(super) async fn read_node_chat_raw(
     render_job_chat_raw(db, &job.id, format).await
 }
 
-/// Takes no connection, for the same reason as [`render_job_chat_digest`].
+/// Takes no connection, for the same reason as [`load_node_chat`].
 pub(super) async fn render_job_chat_raw(
     db: &LocalDb,
     job_id: &str,
@@ -2262,6 +2320,47 @@ pub(super) async fn read_node_chat_turn(
     node_name: &str,
     turn_seq: i32,
 ) -> String {
+    match load_node_chat_turn(db, project_key, number, exec_seq, node_name, turn_seq).await {
+        // The full transcript projection: a focused turn slice is not truncated.
+        Ok(rows) => crate::transcripts::format_transcript_full(
+            &rows
+                .iter()
+                .map(EventRow::to_transcript_row)
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => error,
+    }
+}
+
+/// `grep` on a node's `/chat/turn/N`. A turn that does not resolve is an `Err`,
+/// never a zero-match.
+pub(super) async fn grep_node_chat_turn(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    turn_seq: i32,
+    payload: &GrepPayload,
+) -> Result<GrepWindow, String> {
+    let rows = load_node_chat_turn(db, project_key, number, exec_seq, node_name, turn_seq).await?;
+    let raw_uri = format!(
+        "{}/raw",
+        build_node_chat_uri(project_key, number, exec_seq, node_name)
+    );
+    grep_turn_rows(&rows, turn_seq, payload, &raw_uri)
+}
+
+/// The reconstructed events of turn `turn_seq` in a node's primary session, or
+/// the message for a turn that does not resolve or holds no events.
+async fn load_node_chat_turn(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    turn_seq: i32,
+) -> Result<Vec<EventRow>, String> {
     let label = node_name.to_owned();
     let read = read_node_rows(
         db,
@@ -2273,25 +2372,19 @@ pub(super) async fn read_node_chat_turn(
             Box::pin(async move { job_turn_rows(conn, &job.id, &label, turn_seq).await })
         },
     );
-    let events = match read.await {
-        Ok((_, Ok(events))) => events,
-        Ok((_, Err(missing))) => return missing,
-        Err(error) => return error,
-    };
+    let events = read.await?.1?;
 
     // Reconstruct after the read has released: it takes its own short read and
     // may fetch from the content store.
     let event_rows = reconstruct_turn_events(db, events).await;
 
     if event_rows.is_empty() {
-        return format!(
+        return Err(format!(
             "No events found for turn {} in node '{}'",
             turn_seq, node_name
-        );
+        ));
     }
-
-    // Format as full transcript (no truncation for focused turn slices)
-    crate::transcripts::format_transcript_full(&event_rows)
+    Ok(event_rows)
 }
 
 /// The stored events of turn `turn_seq` in a job's primary session. Statements
@@ -2830,29 +2923,63 @@ pub(super) async fn read_task_chat(
     task_name: &str,
     params: &[QueryParam],
 ) -> String {
-    // `latest=true` flips turn order; `offset`/`limit` page whole turns.
-    let latest = matches!(find_query_value(params, "latest"), Some("true") | Some("1"));
-    let turn_offset =
-        find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
-    let turn_limit =
-        find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
-    // Opt-in reseed-fidelity knobs, mirrored from the node chat digest.
-    let unabridged = matches!(find_query_value(params, "messages"), Some("full"));
-    let inline_diffs = matches!(find_query_value(params, "diffs"), Some("true") | Some("1"));
-    let leftover: Vec<QueryParam> = params
-        .iter()
-        .filter(|param| {
-            !matches!(
-                param.key.as_str(),
-                "latest" | "offset" | "limit" | "messages" | "diffs"
-            )
-        })
-        .cloned()
-        .collect();
-    if let Some(error) = reject_query_params("task chat", &leftover) {
-        return error;
-    }
+    let opts = match chat_digest_options("task chat", params) {
+        Ok(opts) => opts,
+        Err(error) => return error,
+    };
+    let chat = match load_task_chat(db, project_key, number, exec_seq, node_name, task_name).await {
+        Ok(chat) => chat,
+        Err(error) => return error,
+    };
+    let meta = DigestMeta {
+        label: task_name,
+        project: project_key,
+        coordinate: DigestCoordinate::Issue { number, exec_seq },
+        status: &chat.status,
+    };
+    format_transcript_digest_with(
+        &chat.rows,
+        &chat.base_uri,
+        &meta,
+        &chat.turn_sequences,
+        crate::clock::host(),
+        &opts,
+    )
+}
 
+/// `grep` on a task's `/chat`; see [`grep_node_chat`].
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn grep_task_chat(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    params: &[QueryParam],
+    payload: &GrepPayload,
+) -> Result<GrepWindow, String> {
+    let opts = chat_digest_options("task chat", params)?;
+    let chat = load_task_chat(db, project_key, number, exec_seq, node_name, task_name).await?;
+    grep_transcript_content(
+        &chat.rows,
+        &chat.turn_sequences,
+        crate::clock::host(),
+        &opts,
+        payload,
+        &chat.raw_uri(),
+    )
+}
+
+/// [`load_node_chat`] for a delegated task.
+async fn load_task_chat(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+) -> Result<LoadedChat, String> {
     let read = read_task_rows(
         db,
         project_key,
@@ -2869,40 +2996,19 @@ pub(super) async fn read_task_chat(
             })
         },
     );
-    let (_, task_job, (parent_segment, turn_sequences)) = match read.await {
-        Ok(read) => read,
-        Err(error) => return error,
-    };
-
-    let base_uri = build_task_chat_uri(project_key, number, exec_seq, &parent_segment, task_name);
-
-    let event_rows = match load_job_events_ordered(db, &task_job.id).await {
-        Ok(rows) => rows,
-        Err(error) => return format!("Failed to read this task's transcript: {error}"),
-    };
-    if event_rows.is_empty() {
-        return "No runs found for this task.".to_string();
+    let (_, task_job, (parent_segment, turn_sequences)) = read.await?;
+    let rows = load_job_events_ordered(db, &task_job.id)
+        .await
+        .map_err(|error| format!("Failed to read this task's transcript: {error}"))?;
+    if rows.is_empty() {
+        return Err("No runs found for this task.".to_string());
     }
-    let meta = DigestMeta {
-        label: task_name,
-        project: project_key,
-        coordinate: DigestCoordinate::Issue { number, exec_seq },
-        status: &task_job.status,
-    };
-    format_transcript_digest_with(
-        &event_rows,
-        &base_uri,
-        &meta,
-        &turn_sequences,
-        crate::clock::host(),
-        &DigestOptions {
-            latest,
-            turn_offset,
-            turn_limit,
-            unabridged,
-            inline_diffs,
-        },
-    )
+    Ok(LoadedChat {
+        rows,
+        turn_sequences,
+        base_uri: build_task_chat_uri(project_key, number, exec_seq, &parent_segment, task_name),
+        status: task_job.status,
+    })
 }
 
 pub(super) async fn read_task_chat_raw(
@@ -2947,6 +3053,67 @@ pub(super) async fn read_task_chat_turn(
     task_name: &str,
     turn_seq: i32,
 ) -> String {
+    match load_task_chat_turn(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        turn_seq,
+    )
+    .await
+    {
+        Ok(rows) => crate::transcripts::format_transcript_full(
+            &rows
+                .iter()
+                .map(EventRow::to_transcript_row)
+                .collect::<Vec<_>>(),
+        ),
+        Err(error) => error,
+    }
+}
+
+/// `grep` on a task's `/chat/turn/N`; see [`grep_node_chat_turn`].
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn grep_task_chat_turn(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    turn_seq: i32,
+    payload: &GrepPayload,
+) -> Result<GrepWindow, String> {
+    let rows = load_task_chat_turn(
+        db,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+        turn_seq,
+    )
+    .await?;
+    let raw_uri = format!(
+        "{}/raw",
+        build_task_chat_uri(project_key, number, exec_seq, node_name, task_name)
+    );
+    grep_turn_rows(&rows, turn_seq, payload, &raw_uri)
+}
+
+/// The reconstructed events of a task's turn `turn_seq`, or the message for a
+/// turn that does not resolve or holds no events.
+async fn load_task_chat_turn(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    turn_seq: i32,
+) -> Result<Vec<EventRow>, String> {
     let read = read_task_rows(
         db,
         project_key,
@@ -2958,22 +3125,21 @@ pub(super) async fn read_task_chat_turn(
             Box::pin(async move { task_turn_rows(conn, &task_job.id, turn_seq).await })
         },
     );
-    let events = match read.await {
-        Ok((_, _, TaskTurnRows::Events(events))) => events,
-        Ok((_, _, TaskTurnRows::NoSession)) => return "No session found for this task.".to_string(),
-        Ok((_, _, TaskTurnRows::Ambiguous)) => {
-            return format!(
+    let events = match read.await? {
+        (_, _, TaskTurnRows::Events(events)) => events,
+        (_, _, TaskTurnRows::NoSession) => return Err("No session found for this task.".to_string()),
+        (_, _, TaskTurnRows::Ambiguous) => {
+            return Err(format!(
                 "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}/{} because runs span multiple sessions",
                 task_name, node_name, project_key, number
-            )
+            ))
         }
-        Ok((_, _, TaskTurnRows::TurnMissing)) => {
-            return format!(
+        (_, _, TaskTurnRows::TurnMissing) => {
+            return Err(format!(
                 "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
                 turn_seq, task_name, node_name, project_key, number
-            )
+            ))
         }
-        Err(error) => return error,
     };
 
     // Reconstruct after the read has released: it takes its own short read and
@@ -2981,13 +3147,12 @@ pub(super) async fn read_task_chat_turn(
     let event_rows = reconstruct_turn_events(db, events).await;
 
     if event_rows.is_empty() {
-        return format!(
+        return Err(format!(
             "No events found for turn {} in task '{}' of node '{}' for issue {}/{}",
             turn_seq, task_name, node_name, project_key, number
-        );
+        ));
     }
-
-    crate::transcripts::format_transcript_full(&event_rows)
+    Ok(event_rows)
 }
 
 /// What a task turn URI resolves to.

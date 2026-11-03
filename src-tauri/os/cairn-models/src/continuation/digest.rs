@@ -1,5 +1,7 @@
-//! The two projections of a [`Transcript`]: the bounded digest a rebuilt
-//! session is seeded with, and the verbatim text native resume re-sends.
+//! The projections of a [`Transcript`]: the bounded digest a rebuilt session is
+//! seeded with, the verbatim text native resume re-sends, and the digest's
+//! match projection, which answers a search over everything the transcript
+//! carries rather than over what the digest shows.
 //!
 //! The digest is the text form of a flat-row tool model: turn-structured, one
 //! row per target, a right-pinned count figure, no inline JSON bodies. The host
@@ -202,46 +204,276 @@ pub fn render_digest(
     clock: &HostClock,
     opts: &DigestOptions,
 ) -> String {
-    let turns = &transcript.turns;
     let mut out = String::new();
-    let mut order: Vec<usize> = (0..turns.len()).collect();
+    let mut previous_local_date = first_local_date(transcript, clock);
+    for index in turn_window(transcript.turns.len(), opts) {
+        let turn = &transcript.turns[index];
+        out.push_str(&turn_heading(turn, index, clock, &mut previous_local_date));
+        render_turn(&mut out, turn, tools, opts);
+    }
+    out
+}
+
+/// The turn indices a digest renders, in render order: `latest` reverses the
+/// turns, then `turn_offset`/`turn_limit` page whole turns of that order.
+fn turn_window(len: usize, opts: &DigestOptions) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..len).collect();
     if opts.latest {
         order.reverse();
     }
     let start = match opts.turn_offset.unwrap_or(0) {
-        raw if raw < 0 => turns.len().saturating_sub(raw.unsigned_abs() as usize),
-        raw => (raw as usize).min(turns.len()),
+        raw if raw < 0 => len.saturating_sub(raw.unsigned_abs() as usize),
+        raw => (raw as usize).min(len),
     };
     let end = opts
         .turn_limit
-        .map(|limit| (start + limit).min(order.len()))
-        .unwrap_or(order.len());
-    let order = &order[start..end];
-    let mut previous_local_date = turns
+        .map(|limit| (start + limit).min(len))
+        .unwrap_or(len);
+    order[start..end].to_vec()
+}
+
+/// The local day turn headings are dated against before any has rendered: the
+/// first turn's, which is also the day a host header above the digest states.
+fn first_local_date(transcript: &Transcript, clock: &HostClock) -> Option<chrono::NaiveDate> {
+    transcript
+        .turns
         .first()
         .and_then(|turn| turn.started_at)
-        .and_then(|at| clock.local_date(at));
-    for &index in order {
-        let turn = &turns[index];
-        let label = turn
-            .number
-            .map_or_else(|| (index + 1).to_string(), |number| number.to_string());
-        match turn.started_at {
-            Some(at) => {
-                let time = clock
-                    .turn_stamp(at, previous_local_date)
-                    .map(|(stamp, date)| {
-                        previous_local_date = Some(date);
-                        stamp
-                    })
-                    .unwrap_or_default();
-                out.push_str(&format!("\n## Turn {} · {}\n", label, time));
-            }
-            None => out.push_str(&format!("\n## Turn {}\n", label)),
+        .and_then(|at| clock.local_date(at))
+}
+
+/// One turn's `\n## Turn …` heading, advancing `previous_local_date` to the day
+/// it stamps. Only headings that actually render may advance it, so a projection
+/// that skips turns still dates the next one it shows correctly.
+fn turn_heading(
+    turn: &Turn,
+    index: usize,
+    clock: &HostClock,
+    previous_local_date: &mut Option<chrono::NaiveDate>,
+) -> String {
+    let label = turn
+        .number
+        .map_or_else(|| (index + 1).to_string(), |number| number.to_string());
+    match turn.started_at {
+        Some(at) => {
+            let time = clock
+                .turn_stamp(at, *previous_local_date)
+                .map(|(stamp, date)| {
+                    *previous_local_date = Some(date);
+                    stamp
+                })
+                .unwrap_or_default();
+            format!("\n## Turn {} · {}\n", label, time)
         }
-        render_turn(&mut out, turn, tools, opts);
+        None => format!("\n## Turn {}\n", label),
     }
+}
+
+/// What a host's search found in one field of one entry: the matching lines
+/// with their context, already rendered, and how many matches the field holds
+/// against how many of them `rendered` carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldMatches {
+    pub rendered: String,
+    pub matches: usize,
+    pub shown: usize,
+}
+
+/// [`render_digest_matches`]'s result: the rendered body and the counts of the
+/// whole result, of which the body carries `shown`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DigestMatches {
+    pub body: String,
+    pub matches: usize,
+    pub shown: usize,
+}
+
+/// The digest's match projection: every entry with a field that matches, as
+/// its usual summary row followed by the matching lines of each field that
+/// matched, under the heading of the turn it belongs to. Entries and turns with
+/// no match are left out, as a grep leaves out lines.
+///
+/// The search runs over each entry's full content — message text, a tool
+/// call's whole input and result, a marker's longest form — not over its row.
+/// A row is a lossy summary (a `run` item renders as its description), so a
+/// search of the rendered digest answers a question about the summary, and its
+/// zero reads as "the transcript never contained this".
+///
+/// The host supplies the matcher: `search` is called once per non-empty field
+/// with how many more matches the body may still show (`None` is no cap), and
+/// reports how many matches the field holds in total. `head_limit` caps shown
+/// matches across the whole transcript; fields past it are still searched, so
+/// [`DigestMatches::matches`] is the complete count. Thinking has no field: no
+/// projection of a transcript carries it.
+pub fn render_digest_matches<E>(
+    transcript: &Transcript,
+    tools: &ToolRenderers,
+    clock: &HostClock,
+    opts: &DigestOptions,
+    head_limit: Option<usize>,
+    mut search: impl FnMut(&str, Option<usize>) -> Result<FieldMatches, E>,
+) -> Result<DigestMatches, E> {
+    let mut result = DigestMatches::default();
+    let mut previous_local_date = first_local_date(transcript, clock);
+    for index in turn_window(transcript.turns.len(), opts) {
+        let turn = &transcript.turns[index];
+        let mut section = String::new();
+        let mut seen_user = false;
+        for entry in &turn.entries {
+            // Decided for every entry, matched or not: whether a user entry is
+            // the turn's message or an injection depends on the ones before it.
+            let injection = match entry {
+                Entry::User(content) if !content.is_empty() => {
+                    let injection = seen_user || content.contains("<system-reminder>");
+                    seen_user |= !injection;
+                    injection
+                }
+                _ => false,
+            };
+            let mut blocks = String::new();
+            for (label, text) in searchable_fields(entry) {
+                if text.is_empty() {
+                    continue;
+                }
+                let remaining = head_limit.map(|limit| limit.saturating_sub(result.shown));
+                let found = search(&text, remaining)?;
+                result.matches += found.matches;
+                result.shown += found.shown;
+                if found.shown == 0 {
+                    continue;
+                }
+                blocks.push_str(&format!("  {label}:\n"));
+                for line in found.rendered.lines() {
+                    blocks.push_str("    ");
+                    blocks.push_str(line);
+                    blocks.push('\n');
+                }
+            }
+            if blocks.is_empty() {
+                continue;
+            }
+            section.push_str(&entry_summary(entry, injection, tools));
+            section.push_str(&blocks);
+        }
+        if !section.is_empty() {
+            result
+                .body
+                .push_str(&turn_heading(turn, index, clock, &mut previous_local_date));
+            result.body.push_str(&section);
+        }
+    }
+    Ok(result)
+}
+
+/// The fields of one entry a search reads, each named by where it lives.
+fn searchable_fields(entry: &Entry) -> Vec<(&'static str, String)> {
+    match entry {
+        Entry::User(content) | Entry::Assistant(content) => vec![("message", content.clone())],
+        Entry::Tool(call) => {
+            let mut fields = vec![("input", searchable_tool_input(&call.input))];
+            if let Some(outcome) = &call.outcome {
+                fields.push(("result", outcome.content.clone()));
+            }
+            fields
+        }
+        Entry::Error(message) => vec![("error", message.clone())],
+        Entry::Marker(marker) => marker
+            .full
+            .as_ref()
+            .or(marker.verbatim.as_ref())
+            .or(marker.skim.as_ref())
+            .map(|text| vec![("text", text.clone())])
+            .unwrap_or_default(),
+        Entry::Thinking(_) => Vec::new(),
+    }
+}
+
+/// The summary line(s) an entry renders as above its matches: a tool call's
+/// rows exactly as the lean digest renders them, and a one-line preview of
+/// anything whose digest form is prose.
+fn entry_summary(entry: &Entry, injection: bool, tools: &ToolRenderers) -> String {
+    let preview = |text: &str| single_line_preview(text, ROW_LABEL_PREVIEW);
+    let mut out = match entry {
+        Entry::User(content) if injection => format!("⚠ {}", preview(content)),
+        Entry::User(content) => format!("**User:** {}", preview(content)),
+        Entry::Assistant(content) => format!("**Assistant:** {}", preview(content)),
+        Entry::Tool(call) => tools
+            .rows(call, &RowContext::default())
+            .iter()
+            .map(DigestRow::render)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Entry::Error(message) => DigestRow {
+            error: true,
+            text: "error".to_string(),
+            detail: Some(single_line_preview(message, ERROR_LINE_PREVIEW)),
+            ..DigestRow::default()
+        }
+        .render(),
+        Entry::Marker(marker) => marker
+            .skim
+            .clone()
+            .or_else(|| {
+                marker
+                    .full
+                    .as_deref()
+                    .or(marker.verbatim.as_deref())
+                    .and_then(first_nonempty_line)
+                    .map(|line| preview(&line))
+            })
+            .unwrap_or_default(),
+        Entry::Thinking(_) => String::new(),
+    };
+    out.push('\n');
     out
+}
+
+/// A tool call's input as searchable text: a string input as is, and a
+/// structured one as a `path: value` line per leaf (`commands[0].code: …`).
+///
+/// A string leaf is written verbatim, so a multi-line command or script keeps
+/// its own lines instead of collapsing into one JSON-escaped line, and a match
+/// inside it reports the line it is on. Key paths are part of the text, so a
+/// search for a field name (`interpreter`) finds the calls that set it.
+pub fn searchable_tool_input(input: &Value) -> String {
+    fn leaf(out: &mut String, path: &str, text: &str) {
+        if !path.is_empty() {
+            out.push_str(path);
+            out.push_str(": ");
+        }
+        out.push_str(text);
+        out.push('\n');
+    }
+    fn flatten(out: &mut String, path: &str, value: &Value) {
+        match value {
+            Value::Object(map) if !map.is_empty() => {
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    flatten(out, &child_path, child);
+                }
+            }
+            Value::Array(items) if !items.is_empty() => {
+                for (index, child) in items.iter().enumerate() {
+                    flatten(out, &format!("{path}[{index}]"), child);
+                }
+            }
+            Value::String(text) => leaf(out, path, text),
+            other => leaf(out, path, &other.to_string()),
+        }
+    }
+    match input {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        structured => {
+            let mut out = String::new();
+            flatten(&mut out, "", structured);
+            out
+        }
+    }
 }
 
 fn render_turn(out: &mut String, turn: &Turn, tools: &ToolRenderers, opts: &DigestOptions) {
@@ -958,5 +1190,147 @@ mod tests {
         );
         assert!(!digest.contains("order-dependent"), "thinking leaked");
         assert!(verbatim_bytes(&transcript) > digest.len() as i64);
+    }
+
+    /// A stand-in for the host's grep: `N:line` for each line containing
+    /// `needle`, rendering at most `remaining` of them.
+    fn substring_search(
+        needle: &'static str,
+    ) -> impl FnMut(&str, Option<usize>) -> Result<FieldMatches, ()> {
+        move |text, remaining| {
+            let hits: Vec<String> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| line.contains(needle))
+                .map(|(index, line)| format!("{}:{line}", index + 1))
+                .collect();
+            let shown = remaining.map_or(hits.len(), |left| left.min(hits.len()));
+            Ok(FieldMatches {
+                rendered: hits[..shown].join("\n"),
+                matches: hits.len(),
+                shown,
+            })
+        }
+    }
+
+    fn turn(number: i64, entries: Vec<Entry>) -> Turn {
+        Turn {
+            number: Some(number),
+            link: None,
+            started_at: None,
+            entries,
+        }
+    }
+
+    fn hidden_command_transcript() -> Transcript {
+        Transcript {
+            turns: vec![
+                turn(1, vec![Entry::User("Look around.".to_string())]),
+                turn(
+                    2,
+                    vec![
+                        Entry::User("Run the tests.".to_string()),
+                        Entry::Tool(call(
+                            "Bash",
+                            json!({ "command": "cargo test --features HIDDEN", "description": "Run tests" }),
+                            Some(("compiling\nRESULT_ONLY passed", false)),
+                        )),
+                        Entry::Assistant("Done.".to_string()),
+                    ],
+                ),
+            ],
+        }
+    }
+
+    #[test]
+    fn matches_search_a_calls_full_input_and_result_and_render_under_its_row() {
+        let transcript = hidden_command_transcript();
+        let tools = ToolRenderers::new();
+        let digest = render_digest(&transcript, &tools, &clock(), &DigestOptions::default());
+        assert!(
+            !digest.contains("HIDDEN"),
+            "the row summarizes the call: {digest}"
+        );
+
+        let found = render_digest_matches(
+            &transcript,
+            &tools,
+            &clock(),
+            &DigestOptions::default(),
+            None,
+            substring_search("HIDDEN"),
+        )
+        .unwrap();
+        assert_eq!(
+            found.body,
+            "\n## Turn 2\n· Bash Run tests\n  input:\n    1:command: cargo test --features HIDDEN\n"
+        );
+        assert_eq!((found.matches, found.shown), (1, 1));
+
+        let found = render_digest_matches(
+            &transcript,
+            &tools,
+            &clock(),
+            &DigestOptions::default(),
+            None,
+            substring_search("RESULT_ONLY"),
+        )
+        .unwrap();
+        assert_eq!(
+            found.body,
+            "\n## Turn 2\n· Bash Run tests\n  result:\n    2:RESULT_ONLY passed\n"
+        );
+    }
+
+    #[test]
+    fn matches_render_messages_under_a_one_line_preview_and_skip_unmatched_turns() {
+        let found = render_digest_matches(
+            &hidden_command_transcript(),
+            &ToolRenderers::new(),
+            &clock(),
+            &DigestOptions::default(),
+            None,
+            substring_search("Run the"),
+        )
+        .unwrap();
+        assert_eq!(
+            found.body,
+            "\n## Turn 2\n**User:** Run the tests.\n  message:\n    1:Run the tests.\n"
+        );
+        assert!(!found.body.contains("## Turn 1"));
+    }
+
+    #[test]
+    fn a_capped_match_projection_shows_the_cap_and_counts_everything() {
+        let found = render_digest_matches(
+            &hidden_command_transcript(),
+            &ToolRenderers::new(),
+            &clock(),
+            &DigestOptions::default(),
+            Some(1),
+            substring_search("e"),
+        )
+        .unwrap();
+        // Every field still reports its matches; only the first one renders.
+        assert_eq!(found.shown, 1);
+        assert!(found.matches > 1, "{found:?}");
+        assert_eq!(found.body.matches("\n    ").count(), 1, "{}", found.body);
+    }
+
+    #[test]
+    fn searchable_tool_input_writes_one_line_per_leaf_and_keeps_string_lines() {
+        let input = json!({
+            "commands": [{ "code": "import os\nprint(os.name)", "timeout": 5 }],
+            "atomic": true,
+        });
+        let text = searchable_tool_input(&input);
+        assert!(
+            text.contains("commands[0].code: import os\nprint(os.name)\n"),
+            "{text}"
+        );
+        assert!(text.contains("commands[0].timeout: 5\n"), "{text}");
+        assert!(text.contains("atomic: true\n"), "{text}");
+        assert_eq!(searchable_tool_input(&json!("git status")), "git status");
+        assert_eq!(searchable_tool_input(&Value::Null), "");
     }
 }

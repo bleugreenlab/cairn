@@ -11,7 +11,9 @@
 //!   through [`TranscriptBuilder`];
 //! - [`render_digest`], the bounded projection a rebuilt session is seeded
 //!   with, and [`verbatim_bytes`], the measure of what native resume re-sends,
-//!   which together price a cold rebuild through [`price_cold_rebuild`].
+//!   which together price a cold rebuild through [`price_cold_rebuild`];
+//!   [`render_digest_matches`] is the digest's search projection, which matches
+//!   over every entry's full content and renders the matches under its rows.
 //!
 //! # Session replacement policy (CAIRN-2534, CAIRN-3388, CAIRN-4618, CAIRN-4757)
 //!
@@ -81,9 +83,10 @@ mod transcript;
 pub use digest::{
     cleaned_tool_name, count_prefixed_diff_lines, figure_for_read_result, figure_for_run_result,
     first_nonempty_line, first_result_line, generic_rows, json_value_to_display, line_count,
-    render_digest, render_verbatim, single_line_preview, summarize_scalar, summarize_tool_input,
-    truncate_with_info, verbatim_bytes, DigestOptions, DigestRow, RowContext, ToolRenderers,
-    ERROR_LINE_PREVIEW, ROW_LABEL_PREVIEW,
+    render_digest, render_digest_matches, render_verbatim, searchable_tool_input,
+    single_line_preview, summarize_scalar, summarize_tool_input, truncate_with_info,
+    verbatim_bytes, DigestMatches, DigestOptions, DigestRow, FieldMatches, RowContext,
+    ToolRenderers, ERROR_LINE_PREVIEW, ROW_LABEL_PREVIEW,
 };
 pub use transcript::{Entry, Marker, ToolCall, ToolOutcome, Transcript, TranscriptBuilder, Turn};
 
