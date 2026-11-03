@@ -364,10 +364,11 @@ async fn produce_schema_overview(
     params: &[QueryParam],
     affordance: Option<Affordance>,
     resource: &str,
+    writable: bool,
 ) -> RenderedResource {
     if let Some(unsupported) = params
         .iter()
-        .find(|param| !matches!(param.key.as_str(), "table" | "offset" | "limit"))
+        .find(|param| !matches!(param.key.as_str(), "table" | "offset" | "limit" | "format"))
     {
         return RenderedResource::line(
             format!(
@@ -394,16 +395,31 @@ async fn produce_schema_overview(
         Ok(value) => value.min(super::sql_schema::OVERVIEW_MAX_TABLES),
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
-    let overview = match super::sql_schema::render_overview(
-        db,
-        &super::sql_schema::OverviewParams {
-            table: find_query_value(params, "table").map(str::to_string),
-            offset,
-            limit,
-        },
-    )
-    .await
-    {
+    let json = match find_query_value(params, "format") {
+        None => false,
+        Some("json") => true,
+        Some(value) => {
+            return RenderedResource::line(
+                format!(
+                    "Invalid value for query parameter 'format': {value} (accepted: json; omit format for text)"
+                ),
+                affordance,
+                None,
+                None,
+            )
+        }
+    };
+    let overview_params = super::sql_schema::OverviewParams {
+        table: find_query_value(params, "table").map(str::to_string),
+        offset,
+        limit,
+    };
+    let overview = if json {
+        super::sql_schema::overview_document(db, &overview_params, resource, writable).await
+    } else {
+        super::sql_schema::render_overview(db, &overview_params).await
+    };
+    let overview = match overview {
         Ok(overview) => overview,
         Err(error) => {
             return RenderedResource::line(
@@ -431,14 +447,18 @@ async fn produce_schema_overview(
     }
 }
 
+/// A database's overview or a read-only SQL read. `writable` is whether the
+/// store takes row writes at all (a thread's own does; the application
+/// database never does), which the overview's JSON document reports.
 async fn produce_sql_resource(
     db: &LocalDb,
     params: &[QueryParam],
     affordance: Option<Affordance>,
     resource: &str,
+    writable: bool,
 ) -> RenderedResource {
     if find_query_value(params, "sql").is_none() {
-        return produce_schema_overview(db, params, affordance, resource).await;
+        return produce_schema_overview(db, params, affordance, resource, writable).await;
     }
     let projection = match parse_db_sql_projection_with(params, &[], resource) {
         Ok(projection) => projection,
@@ -471,7 +491,7 @@ async fn produce_db_sql_resource(
     params: &[QueryParam],
     affordance: Option<Affordance>,
 ) -> RenderedResource {
-    produce_sql_resource(&orch.db.local, params, affordance, "cairn://db").await
+    produce_sql_resource(&orch.db.local, params, affordance, "cairn://db", false).await
 }
 
 /// Resolve a thread by name and open its existing database. `Ok(None)` when the
@@ -520,6 +540,7 @@ async fn produce_thread_db_resource(
         params,
         affordance,
         &format!("cairn://p/{project}/{name}/db"),
+        true,
     )
     .await
 }

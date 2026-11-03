@@ -17,6 +17,7 @@ pub(crate) const DB_CONTRACT: ResourceContract =
             ProjectionSpec { key: "table", values: "NAME — one table's full column list and every index on it (columns or expressions, unique/partial marks, a partial index's WHERE predicate), no elision (overview only)" },
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
+            ProjectionSpec { key: "format", values: "json: with sql=, JSONL rows; without it, the overview as one document (with table=, every column's type, nullability, and key); omit for text" },
         ],
         related: &[RelatedSpec {
             label: "one table's rows, each addressed by primary key",

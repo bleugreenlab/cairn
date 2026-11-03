@@ -164,7 +164,7 @@ async fn seed_run(orch: &Orchestrator, run_id: &str, job_id: &str) {
         .unwrap();
 }
 
-async fn read(orch: &Orchestrator, uri: &str) -> String {
+pub(crate) async fn read(orch: &Orchestrator, uri: &str) -> String {
     crate::resources::read_cairn_resource(orch, &request(), uri).await
 }
 
@@ -1149,9 +1149,9 @@ async fn the_log_keeps_the_newest_rows_per_page_and_truncates_detail() {
 // ---------------------------------------------------------------------------
 
 const WRITE_PAGE: &str = "cairn://p/prj/roadmap/pages/board";
-const ATTEMPTS: &str = "cairn://p/prj/roadmap/db/attempts";
+pub(crate) const ATTEMPTS: &str = "cairn://p/prj/roadmap/db/attempts";
 
-fn operator() -> PageOperator {
+pub(crate) fn operator() -> PageOperator {
     use cairn_common::identity::{
         Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, CredentialRef,
         PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus,
@@ -1189,7 +1189,7 @@ fn operator() -> PageOperator {
 }
 
 /// The roadmap thread with an `attempts` table, and a page declaring it.
-async fn seeded_for_writes() -> (Orchestrator, Arc<CapturingEmitter>) {
+pub(crate) async fn seeded_for_writes() -> (Orchestrator, Arc<CapturingEmitter>) {
     let (orch, emitter) = seeded().await;
     write(
         &orch,
@@ -1224,7 +1224,7 @@ fn insert(table: &str, row: Value) -> Value {
     json!({"target": format!("cairn:~/db/{table}"), "mode": "append", "payload": row})
 }
 
-async fn attempt_count(orch: &Orchestrator) -> usize {
+pub(crate) async fn attempt_count(orch: &Orchestrator) -> usize {
     let rows = read(orch, &format!("{ATTEMPTS}?format=json")).await;
     // The JSON document leads the read; its affordance block follows it.
     let parsed: Value = serde_json::Deserializer::from_str(&rows)
@@ -1545,9 +1545,11 @@ async fn a_superseded_version_and_a_draft_cannot_write() {
 async fn a_page_origin_reaches_only_its_owners_rows_in_the_write_path() {
     let (orch, _) = seeded_for_writes().await;
     let operator = operator();
-    let origin = cairn_common::protocol::PageWriteOrigin {
-        page: WRITE_PAGE.to_string(),
-        version: 1,
+    let origin = cairn_common::protocol::RowWriteOrigin {
+        instrument: cairn_common::protocol::RowWriteInstrument::Page {
+            page: WRITE_PAGE.to_string(),
+            version: 1,
+        },
         owner_thread_id: crate::threads::crud::list(&orch.db.local, "p")
             .await
             .unwrap()
@@ -1567,7 +1569,7 @@ async fn a_page_origin_reaches_only_its_owners_rows_in_the_write_path() {
             let request = McpCallbackRequest {
                 tool: "write".to_string(),
                 payload,
-                origin: Some(cairn_common::protocol::DispatchOrigin::PageWrite(Box::new(
+                origin: Some(cairn_common::protocol::DispatchOrigin::RowWrite(Box::new(
                     origin,
                 ))),
                 ..request()
@@ -1611,6 +1613,28 @@ async fn a_page_origin_reaches_only_its_owners_rows_in_the_write_path() {
     );
 }
 
+/// The instrument is the door's, never the caller's: a page write naming
+/// another instrument, in its input or in a change, is refused whole, and an
+/// admitted page write is journaled through the page.
+#[tokio::test]
+async fn a_page_write_cannot_name_its_own_instrument() {
+    let (orch, _) = seeded_for_writes().await;
+    for input in [
+        json!({"changes": [insert("attempts", json!({"problem": "p"}))], "instrument": "browser"}),
+        json!({"changes": [{"target": "cairn:~/db/attempts", "mode": "append",
+                             "payload": {"problem": "p"}, "instrument": "db_browser"}]}),
+    ] {
+        let refused = page_write(&orch, &write_request(input.clone()), &operator())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, PageCallError::Refused(message) if message.contains("`instrument`")),
+            "{input}: {refused:?}"
+        );
+    }
+    assert_eq!(attempt_count(&orch).await, 0);
+}
+
 /// Without an origin, a run-less row write is still refused: the origin is
 /// the only thing that lends a request owner standing, and JSON cannot carry
 /// one (see `cairn_common::protocol`'s tests).
@@ -1621,7 +1645,7 @@ async fn a_runless_row_write_without_an_origin_is_refused() {
         "cwd": "",
         "tool": "write",
         "payload": {"changes": [{"target": ATTEMPTS, "mode": "append", "payload": {"problem": "p"}}]},
-        "origin": {"PageWrite": {"page": WRITE_PAGE}},
+        "origin": {"RowWrite": {"instrument": {"Page": {"page": WRITE_PAGE}}}},
     }))
     .unwrap();
     assert!(forged.origin.is_none());
@@ -2049,9 +2073,10 @@ export default function Recorder() {
 
 /// Only the invoke handler's path builds a page-write origin: the headless
 /// renderer, the read path, and every other module have no way to make a
-/// request that writes as the operator.
+/// request that writes as the operator: the one builder is `row_writes`, which
+/// only the page and database-browser doors call.
 #[test]
-fn only_page_write_builds_a_page_write_origin() {
+fn only_row_writes_builds_a_row_write_origin() {
     fn visit(dir: &std::path::Path, found: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -2060,7 +2085,7 @@ fn only_page_write_builds_a_page_write_origin() {
             } else if path.extension().is_some_and(|ext| ext == "rs")
                 && std::fs::read_to_string(&path)
                     .unwrap()
-                    .contains("DispatchOrigin::PageWrite(")
+                    .contains("DispatchOrigin::RowWrite(")
             {
                 found.push(path.display().to_string());
             }
@@ -2070,7 +2095,7 @@ fn only_page_write_builds_a_page_write_origin() {
     let mut found = Vec::new();
     visit(&src, &mut found);
     found.sort();
-    let expected: Vec<String> = ["pages/tests.rs", "pages/write.rs"]
+    let expected: Vec<String> = ["pages/tests.rs", "row_writes.rs"]
         .iter()
         .map(|file| src.join(file).display().to_string())
         .collect();

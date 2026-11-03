@@ -58,23 +58,46 @@ pub struct CallbackRequest {
 /// A non-run dispatcher of a [`CallbackRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOrigin {
-    /// A page's frame writing rows of its owning thread's database on the
-    /// verified operator's behalf. Boxed: the appearance snapshot is large, and
-    /// every request carries this field.
-    PageWrite(Box<PageWriteOrigin>),
+    /// The verified operator writing rows of one thread's database through an
+    /// instrument. Boxed: the appearance snapshot is large, and every request
+    /// carries this field.
+    RowWrite(Box<RowWriteOrigin>),
 }
 
-/// The verified actor behind a page write, and the page version it acted
-/// through.
+/// What an operator's row write was made through. The runner sets it from the
+/// door the request came in by (the `page_write` or `write_db_rows` invoke),
+/// never from anything the caller sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageWriteOrigin {
-    /// The canonical page URI.
-    pub page: String,
-    pub version: u32,
-    /// The owning thread's id: the one thread whose database this write may
-    /// touch.
+pub enum RowWriteInstrument {
+    /// A page's frame, at the page version it showed.
+    Page {
+        /// The canonical page URI.
+        page: String,
+        version: u32,
+    },
+    /// The app's database browser, in the operator's own webview.
+    DbBrowser,
+}
+
+impl RowWriteInstrument {
+    /// The instrument as a refusal names it.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            Self::Page { .. } => "a page",
+            Self::DbBrowser => "the database browser",
+        }
+    }
+}
+
+/// The verified actor behind an operator's row write, the instrument it acted
+/// through, and the one thread whose database it may touch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowWriteOrigin {
+    pub instrument: RowWriteInstrument,
+    /// The id of the one thread whose database this write may touch: a page's
+    /// owner, or the thread whose rows the browser is showing.
     pub owner_thread_id: String,
-    /// The owning thread's canonical URI.
+    /// That thread's canonical URI.
     pub owner: String,
     pub project_id: String,
     /// The principal the verified invoke appearance names.
@@ -83,10 +106,10 @@ pub struct PageWriteOrigin {
 }
 
 impl CallbackRequest {
-    /// The page write this request carries, if any.
-    pub fn page_write_origin(&self) -> Option<&PageWriteOrigin> {
+    /// The operator's row write this request carries, if any.
+    pub fn row_write_origin(&self) -> Option<&RowWriteOrigin> {
         match &self.origin {
-            Some(DispatchOrigin::PageWrite(origin)) => Some(&**origin),
+            Some(DispatchOrigin::RowWrite(origin)) => Some(&**origin),
             None => None,
         }
     }
@@ -128,12 +151,12 @@ mod tests {
             "cwd": "",
             "tool": "write",
             "payload": {"changes": []},
-            "origin": {"PageWrite": {"page": "cairn://p/cairn/t/pages/x", "version": 1}},
+            "origin": {"RowWrite": {"instrument": "DbBrowser", "owner_thread_id": "thread-1"}},
             "Origin": "page",
         });
         let request: CallbackRequest = serde_json::from_value(forged).unwrap();
         assert_eq!(request.origin, None);
-        assert!(request.page_write_origin().is_none());
+        assert!(request.row_write_origin().is_none());
     }
 
     #[test]
@@ -171,9 +194,11 @@ mod tests {
             AppearanceSnapshot::new(actor.clone(), evidence, Vec::new(), None).unwrap();
         let request = CallbackRequest {
             tool: "write".to_string(),
-            origin: Some(DispatchOrigin::PageWrite(Box::new(PageWriteOrigin {
-                page: "cairn://p/cairn/t/pages/x".to_string(),
-                version: 1,
+            origin: Some(DispatchOrigin::RowWrite(Box::new(RowWriteOrigin {
+                instrument: RowWriteInstrument::Page {
+                    page: "cairn://p/cairn/t/pages/x".to_string(),
+                    version: 1,
+                },
                 owner_thread_id: "thread-1".to_string(),
                 owner: "cairn://p/cairn/t".to_string(),
                 project_id: "project-1".to_string(),

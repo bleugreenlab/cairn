@@ -44,7 +44,7 @@ mod store;
 mod write;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub(crate) use data::{compose, validate_file_path};
 pub use data::{validate_page_name, MAX_PAGE_BYTES, PAGE_ARTIFACT_TYPE};

@@ -4,14 +4,15 @@
 //! candidate is written as a profile; what was left out is said with why.
 //!
 //! A machine's hardware comes from its executor's latest health: the GPU's
-//! vendor, name and memory, the machine's memory and CPU architecture. A
-//! machine that reports no GPU (an AMD card, which executors do not read yet)
-//! is refused by name unless the request states its hardware.
+//! vendor, name and memory, the machine's memory and CPU architecture, read
+//! from the GPUs a model runs on (its discrete cards when it has any). A
+//! machine that reports no GPU is refused by name unless the request states
+//! its hardware.
 
 use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
-    ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
+    model_gpus, ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
 };
 use cairn_inference::generate::{self, Arch, HwMemory, MachineHw, PoolHw};
 use cairn_inference::{AcceleratorFamily, Addresses, Inventory, MachineName, Network};
@@ -93,20 +94,30 @@ pub fn reported_hardware(
     let MeasurementReading::Measured { value: devices } = &snapshot.host.gpus.reading else {
         return Err(format!("{name} has not reported its GPUs"));
     };
-    let Some(device) = devices.first() else {
+    let gpus = model_gpus(devices);
+    let Some(device) = gpus.first() else {
         return Err(format!(
-            "{name} reports no GPU it can read (an AMD card reads as none); state its hardware in the request: hardware: {{\"{name}\": {{family, memoryGib, unified, arch}}}}"
+            "{name} reports no GPU it can read; state its hardware in the request: hardware: {{\"{name}\": {{family, memoryGib, unified, arch}}}}"
         ));
     };
     let family = match device.vendor {
         GpuVendor::Nvidia => AcceleratorFamily::Nvidia,
         GpuVendor::Apple => AcceleratorFamily::Apple,
+        GpuVendor::Amd => AcceleratorFamily::Amd,
     };
     let memory = match &device.memory {
         MeasurementReading::Measured {
-            value: GpuMemory::Discrete { total_bytes, .. },
+            value: GpuMemory::Discrete { .. },
         } => HwMemory::Discrete {
-            vram: total_bytes * devices.len() as u64,
+            vram: gpus
+                .iter()
+                .filter_map(|gpu| match &gpu.memory {
+                    MeasurementReading::Measured {
+                        value: GpuMemory::Discrete { total_bytes, .. },
+                    } => Some(*total_bytes),
+                    _ => None,
+                })
+                .sum(),
         },
         MeasurementReading::Measured {
             value: GpuMemory::Unified { .. },

@@ -15,7 +15,7 @@ use crate::threads::db_store::{
 
 fn thread_db_refusal(project: &str, name: &str) -> String {
     format!(
-        "cairn://p/{project}/{name}/db is thread '{name}'s own store, writable only by that thread and the tasks it spawns. You can read it with `?sql=`."
+        "cairn://p/{project}/{name}/db is thread '{name}'s own store, writable only by that thread and the tasks it spawns, or by the operator through a page it owns or the app's database browser. You can read it with `?sql=`."
     )
 }
 
@@ -108,11 +108,12 @@ async fn owned_thread_scope(
     })
 }
 
-/// The thread a write acts in, from exactly one source: a page write acts for
-/// the thread that owns the page (its typed origin, which only Rust sets and
-/// which never looks for a run), a project service's call acts for the thread
-/// its delegation names (a service's own standing run acts for none), and any
-/// other run acts in its own thread.
+/// The thread a write acts in, from exactly one source: an operator's row
+/// write acts for the one thread its typed origin names (a page's owner, or the
+/// thread the database browser is showing; only Rust sets it, and it never
+/// looks for a run), a project service's call acts for the thread its
+/// delegation names (a service's own standing run acts for none), and any other
+/// run acts in its own thread.
 async fn acting_thread_id(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -121,7 +122,7 @@ async fn acting_thread_id(
     project_id: &str,
 ) -> Option<String> {
     use crate::project_services::authority::ServiceRunRole;
-    if let Some(origin) = request.page_write_origin() {
+    if let Some(origin) = request.row_write_origin() {
         return Some(origin.owner_thread_id.clone());
     }
     let run_id = request.run_id.as_deref()?;
@@ -173,7 +174,7 @@ pub(super) async fn queue_orderer(
         .as_deref()
         .filter(|run| !run.is_empty())
         .is_none();
-    if no_run && request.page_write_origin().is_none() {
+    if no_run && request.row_write_origin().is_none() {
         return Ok((db, target, "the operator".to_string()));
     }
     let acting = acting_thread_id(orch, request, project, &db, &project_id).await;

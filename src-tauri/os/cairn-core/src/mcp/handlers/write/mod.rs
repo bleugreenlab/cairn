@@ -56,12 +56,17 @@ fn rebase_item_index(changes: &[crate::mcp::types::ChangeItem]) -> Option<usize>
 /// settings section, and not a `cairn:~/` shorthand that would need a run to
 /// resolve. Ownership of the named thread is then `owned_thread_scope`'s, which
 /// takes the owner from the same origin.
-fn page_origin_refusal(payload: &ChangePayload) -> Option<(usize, String)> {
+fn row_origin_refusal(
+    payload: &ChangePayload,
+    instrument: &cairn_common::protocol::RowWriteInstrument,
+) -> Option<(usize, String)> {
+    let noun = instrument.noun();
     if payload.commit_msg.is_some() || payload.branch.is_some() || payload.preview.is_some() {
         return Some((
             0,
-            "a page write carries only changes and atomic: commit_msg, branch and preview are refused"
-                .to_string(),
+            format!(
+                "a write through {noun} carries only changes and atomic: commit_msg, branch and preview are refused"
+            ),
         ));
     }
     payload.changes.iter().enumerate().find_map(|(index, item)| {
@@ -83,7 +88,7 @@ fn page_origin_refusal(payload: &ChangePayload) -> Option<(usize, String)> {
             (
                 index,
                 format!(
-                    "{}: a page writes only rows of its owning thread's tables (append to .../db/<table>, patch or delete .../db/<table>/<pk> or .../db/<table>?where=...)",
+                    "{}: {noun} writes only rows of one thread's tables (append to .../db/<table>, patch or delete .../db/<table>/<pk> or .../db/<table>?where=...)",
                     item.target
                 ),
             )
@@ -671,9 +676,11 @@ async fn handle_write_attempt(
         Ok(payload) => payload,
         Err(error) => return error,
     };
-    if request.page_write_origin().is_some() && !payload.changes.is_empty() {
-        if let Some((index, message)) = page_origin_refusal(&payload) {
-            return deny_change(&payload.changes, index, message);
+    if let Some(origin) = request.row_write_origin() {
+        if !payload.changes.is_empty() {
+            if let Some((index, message)) = row_origin_refusal(&payload, &origin.instrument) {
+                return deny_change(&payload.changes, index, message);
+            }
         }
     }
 
@@ -986,13 +993,16 @@ async fn handle_write_attempt(
         use crate::mcp::handlers::authority::{self, AuthorityGate};
         let deny =
             |index: usize, msg: String| -> String { deny_change(&payload.changes, index, msg) };
-        // A page has no one to ask and holds no grant: an approval boundary is
-        // closed to it rather than raised.
-        if request.page_write_origin().is_some() {
+        // An instrument has no one to ask and holds no grant: an approval
+        // boundary is closed to it rather than raised.
+        if let Some(origin) = request.row_write_origin() {
             let index = authority_requests[0].0;
             return deny(
                 index,
-                "Refused: a page write never crosses an approval boundary".to_string(),
+                format!(
+                    "Refused: a write through {} never crosses an approval boundary",
+                    origin.instrument.noun()
+                ),
             );
         }
         // An authenticated principal is the one hard requirement: a grant has to

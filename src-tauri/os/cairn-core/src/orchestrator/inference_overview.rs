@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cairn_common::executor_protocol::{
-    ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
+    model_gpus, ExecutorHealthSnapshot, GpuMemory, GpuVendor, MeasurementReading,
 };
 use cairn_inference::control::Phase;
 use cairn_inference::metrics::EngineSummary;
@@ -248,8 +248,9 @@ pub struct TryAnswer {
 /// One machine as the overview reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MachineFacts {
+    /// The GPUs a model runs on ([`model_gpus`]), named by the first.
     pub gpu: Option<String>,
-    /// Its first GPU's maker, which decides the profiles that suit it.
+    /// Their maker, which decides the profiles that suit it.
     pub family: Option<AcceleratorFamily>,
     /// Total and free bytes of the memory a model lives in.
     pub memory: Option<(u64, u64)>,
@@ -259,10 +260,10 @@ pub(crate) struct MachineFacts {
 
 impl MachineFacts {
     pub(crate) fn of(snapshot: &ExecutorHealthSnapshot) -> Self {
-        let devices = match &snapshot.host.gpus.reading {
+        let devices = model_gpus(match &snapshot.host.gpus.reading {
             MeasurementReading::Measured { value } => value.as_slice(),
             MeasurementReading::Unavailable { .. } => &[],
-        };
+        });
         let gpu = devices.first().map(|first| match devices.len() {
             1 => first.model.clone(),
             n => format!("{n}× {}", first.model),
@@ -270,6 +271,7 @@ impl MachineFacts {
         let family = devices.first().map(|first| match first.vendor {
             GpuVendor::Nvidia => AcceleratorFamily::Nvidia,
             GpuVendor::Apple => AcceleratorFamily::Apple,
+            GpuVendor::Amd => AcceleratorFamily::Amd,
         });
         let mut discrete: Option<(u64, u64)> = None;
         let mut allocated: Option<u64> = None;

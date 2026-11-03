@@ -19,7 +19,8 @@
 use std::collections::BTreeMap;
 
 use cairn_common::executor_protocol::{
-    GpuMemory, HostHealth, MachineModelResident, MeasurementReading, PlacementRejectionReason,
+    model_gpus, GpuMemory, HostHealth, MachineModelResident, MeasurementReading,
+    PlacementRejectionReason,
 };
 use cairn_inference::control::gib;
 
@@ -32,13 +33,15 @@ pub const DRAIN_BOUND_SECS: u64 = 300;
 
 /// The memory a machine's GPUs hold: the GPU-attributed share on a
 /// unified-memory machine, VRAM used on discrete cards. `None` when no GPU
-/// memory was measured.
+/// memory was measured. Only the GPUs a model runs on count
+/// ([`model_gpus`]), so an integrated GPU's system memory is never added to a
+/// card's VRAM.
 pub fn gpu_allocated_bytes(host: &HostHealth) -> Option<u64> {
     let MeasurementReading::Measured { value: devices } = &host.gpus.reading else {
         return None;
     };
     let mut allocated: Option<u64> = devices.is_empty().then_some(0);
-    for device in devices {
+    for device in model_gpus(devices) {
         match &device.memory {
             MeasurementReading::Measured {
                 value: GpuMemory::Discrete { used_bytes, .. },
@@ -498,6 +501,52 @@ mod tests {
 
     const T0: i64 = 1_000_000;
     const GIB: u64 = 1 << 30;
+
+    /// bbs: a 4090's VRAM in use, and an integrated Radeon's mapped system
+    /// memory beside it. The footprint a model on the card is measured by is
+    /// the card's alone; on an APU-only machine the GTT share is the figure.
+    #[test]
+    fn an_integrated_gpu_beside_a_card_adds_nothing_to_its_vram() {
+        use cairn_common::executor_protocol::{
+            GpuDevice, GpuVendor, Measurement, UnifiedAllocationSource, UnifiedPool,
+        };
+        let device = |vendor, memory| GpuDevice {
+            index: 0,
+            vendor,
+            model: String::new(),
+            uuid: None,
+            cores: None,
+            memory: MeasurementReading::Measured { value: memory },
+            utilization_millis: MeasurementReading::Measured { value: 0 },
+        };
+        let card = device(
+            GpuVendor::Nvidia,
+            GpuMemory::Discrete {
+                used_bytes: 18 * GIB,
+                total_bytes: 24 * GIB,
+            },
+        );
+        let integrated = device(
+            GpuVendor::Amd,
+            GpuMemory::Unified {
+                gpu_allocated_bytes: MeasurementReading::Measured { value: GIB },
+                source: UnifiedAllocationSource::AmdgpuGtt,
+                pool: MeasurementReading::Measured {
+                    value: UnifiedPool::HostMemory,
+                },
+                apertures: None,
+            },
+        );
+        let host = |devices| HostHealth {
+            gpus: Measurement::measured(T0 as u64, devices),
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            gpu_allocated_bytes(&host(vec![card, integrated.clone()])),
+            Some(18 * GIB)
+        );
+        assert_eq!(gpu_allocated_bytes(&host(vec![integrated])), Some(GIB));
+    }
 
     fn resident(phase: &str, held_gib: Option<u64>, unified: bool) -> MachineModelResident {
         MachineModelResident {

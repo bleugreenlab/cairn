@@ -41,7 +41,7 @@ use cairn_common::authorization::{
     AuthorityProvenance, AuthorityReason, AuthorityRequest, AuthorityScope,
 };
 use cairn_common::identity::AppearanceSnapshot;
-use cairn_common::protocol::PageWriteOrigin;
+use cairn_common::protocol::{RowWriteInstrument, RowWriteOrigin};
 use cairn_db::storage::authority as store;
 use cairn_db::storage::authority::NewAuthorizationEvent;
 
@@ -82,14 +82,14 @@ fn now() -> i64 {
 /// must treat that as "no authority to adjudicate this" and refuse, rather than
 /// proceeding unauthenticated.
 ///
-/// A request with a page-write origin resolves to the verified actor acting
-/// through that page, never to a run: see [`page_write_actor`].
+/// A request with a row-write origin resolves to the verified actor acting
+/// through its instrument, never to a run: see [`row_write_actor`].
 pub async fn resolve_actor(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Option<AuthorityActor> {
-    if let Some(origin) = request.page_write_origin() {
-        return Some(page_write_actor(orch, origin));
+    if let Some(origin) = request.row_write_origin() {
+        return Some(row_write_actor(orch, origin));
     }
     // The run's own rows may live in a team replica, so identity is resolved
     // through the router; the grants are not, so they are read from the private
@@ -124,24 +124,31 @@ pub async fn resolve_actor(
     })
 }
 
-/// The actor behind a page write: the verified principal, acting through the
-/// page version, with no run and no lifetime anchors.
+/// The actor behind an operator's row write: the verified principal, acting
+/// through its instrument (a page version, or the database browser), with no
+/// run and no lifetime anchors.
 ///
-/// It has no anchors on purpose. A page carries no turn or session to bind a
-/// grant to, and [`adjudicate`] refuses every approval boundary to an
+/// It has no anchors on purpose. An instrument carries no turn or session to
+/// bind a grant to, and [`adjudicate`] refuses every approval boundary to an
 /// instrument outright, so no grant of any lifetime ever answers for one.
-pub fn page_write_actor(orch: &Orchestrator, origin: &PageWriteOrigin) -> AuthorityActor {
+pub fn row_write_actor(orch: &Orchestrator, origin: &RowWriteOrigin) -> AuthorityActor {
+    let instrument = match &origin.instrument {
+        RowWriteInstrument::Page { page, version } => AuthorityInstrument::Page {
+            page: page.clone(),
+            version: *version,
+            owner: origin.owner.clone(),
+        },
+        RowWriteInstrument::DbBrowser => AuthorityInstrument::DbBrowser {
+            owner: origin.owner.clone(),
+        },
+    };
     AuthorityActor {
         principal: AuthorityPrincipal {
             node_uri: None,
             run_id: None,
             agent_id: None,
             actor: Some(origin.actor.clone()),
-            instrument: Some(AuthorityInstrument::Page {
-                page: origin.page.clone(),
-                version: origin.version,
-                owner: origin.owner.clone(),
-            }),
+            instrument: Some(instrument),
         },
         audience: AuthorityAudience::workspace(WORKSPACE_ID),
         context: AuthorityContext {

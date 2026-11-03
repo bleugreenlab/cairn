@@ -553,7 +553,8 @@ pub struct AuthorityPrincipal {
 
 /// The artifact an actor acted through. An instrument is context, not a
 /// principal: it holds no authority of its own and is never a delegation hop.
-/// "Actor X, through page P@v owned by thread T."
+/// "Actor X, through page P@v owned by thread T", or "actor X, through the
+/// database browser, in thread T's rows".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorityInstrument {
@@ -564,6 +565,12 @@ pub enum AuthorityInstrument {
         /// The canonical URI of the thread that owns the page and supplies its
         /// authority context. Owning a page is not evidence of authoring a
         /// particular version of it.
+        owner: String,
+    },
+    /// The app's database browser, which the operator used in their own
+    /// webview to write rows of a thread's database.
+    DbBrowser {
+        /// The canonical URI of the thread whose rows were written.
         owner: String,
     },
 }

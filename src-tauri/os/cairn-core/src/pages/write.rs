@@ -31,18 +31,17 @@
 //! event per row carrying the actor, its verified appearance, and the page as
 //! the instrument.
 
-use cairn_common::authorization::AuthorityMutation;
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
-use cairn_common::protocol::{DispatchOrigin, PageWriteOrigin};
-use cairn_common::uri::{canonical_project, parse_uri, CairnResource};
+use cairn_common::protocol::{RowWriteInstrument, RowWriteOrigin};
+use cairn_common::uri::canonical_project;
 use serde_json::{json, Value};
 
 use super::data::{write_scope_table, write_scopes};
 use super::log::{PageCallOutcome, PageCallVerb};
 use super::read::{log_call, resolve, PageCallError, ResolvedPage};
 use super::store::{load_page, PageAddress, PageOwner};
-use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
+use crate::row_writes::{self, GatedChange, InputError};
 
 /// `page_write`'s arguments. `input` is the SDK's write input as the frame
 /// sent it: `{changes, atomic?}`.
@@ -55,7 +54,8 @@ pub struct PageWriteRequest {
     pub input: Value,
 }
 
-/// The verified operator a page write is made as.
+/// The verified operator a row write is made as: through a page, or through
+/// the app's database browser.
 #[derive(Debug, Clone)]
 pub struct PageOperator {
     /// The principal the verified invoke appearance names.
@@ -65,13 +65,7 @@ pub struct PageOperator {
     pub log_actor: Value,
 }
 
-/// One gated change, canonical and ready to dispatch.
-struct GatedChange {
-    item: Value,
-    mutation: AuthorityMutation,
-    /// The canonical row collection the change writes into.
-    collection: String,
-}
+const PAGE_NOUN: &str = "a page";
 
 fn page_label(address: &PageAddress, version: i32) -> String {
     format!("{}@v{version}", address.name)
@@ -102,38 +96,22 @@ fn gate_write_targets(
     let mut gated = Vec::with_capacity(changes.len());
     let mut refusals = Vec::new();
     for change in changes {
-        let Some(object) = change.as_object() else {
-            refusals.push("each change is an object {target, mode, payload}".to_string());
-            continue;
+        let change = match row_writes::read_change(change, PAGE_NOUN) {
+            Ok(change) => change,
+            Err(refusal) => {
+                refusals.push(refusal);
+                continue;
+            }
         };
-        if let Some(key) = object
-            .keys()
-            .find(|key| !matches!(key.as_str(), "target" | "mode" | "payload"))
-        {
-            refusals.push(format!(
-                "a page's change carries target, mode and payload only, not `{key}`"
-            ));
-            continue;
-        }
-        let target = object
-            .get("target")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let mode = object
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let target = change.target.as_str();
         if target.starts_with("file:") {
             refusals.push(format!(
                 "{target}: file: targets are refused; a page writes rows of its own thread's tables, never a checkout"
             ));
             continue;
         }
-        let resolved = if crate::resources::mutations::is_home_relative_target(&target) {
-            match crate::resources::resolve_home_relative_against(&home, &target) {
+        let resolved = if crate::resources::mutations::is_home_relative_target(target) {
+            match crate::resources::resolve_home_relative_against(&home, target) {
                 Some(resolved) => resolved,
                 None => {
                     refusals.push(format!(
@@ -143,159 +121,43 @@ fn gate_write_targets(
                 }
             }
         } else if target.starts_with("cairn://") {
-            target.clone()
+            target.to_string()
         } else {
-            refusals.push(manifest_refusal(&target));
+            refusals.push(manifest_refusal(target));
             continue;
         };
-        if resolved.contains('#') {
-            refusals.push(format!("{target}: a write target carries no fragment"));
-            continue;
-        }
-        // A query is the `where=` that scopes a collection patch or delete,
-        // and nothing else; the write path parses and enforces it.
-        let scoped = match resolved.split_once('?') {
-            None => false,
-            Some((_, query)) => {
-                let only_where = cairn_common::query::parse_query_params(query)
-                    .is_ok_and(|params| params.iter().all(|param| param.key == "where"));
-                if !only_where {
-                    refusals.push(format!(
-                        "{target}: a write target's only query is where=, scoping a patch or delete of a table's rows"
-                    ));
-                    continue;
-                }
-                true
+        let row_target = match row_writes::row_target(&resolved, target) {
+            Ok(Some(row_target)) => row_target,
+            Ok(None) => {
+                refusals.push(manifest_refusal(target));
+                continue;
             }
-        };
-        let resource = parse_uri(&resolved)
-            .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
-        let (project, name, table, is_row) = match &resource {
-            Some(CairnResource::ThreadDbTable {
-                project,
-                name,
-                table,
-            }) => (project, name, table, false),
-            Some(CairnResource::ThreadDbRow {
-                project,
-                name,
-                table,
-                ..
-            }) => (project, name, table, true),
-            _ => {
-                refusals.push(manifest_refusal(&target));
+            Err(refusal) => {
+                refusals.push(refusal);
                 continue;
             }
         };
-        if *project != owner_project || name != thread || !declared.contains(&table.as_str()) {
-            refusals.push(manifest_refusal(&target));
+        if canonical_project(&row_target.project) != owner_project
+            || row_target.thread != thread
+            || !declared.contains(&row_target.table.as_str())
+        {
+            refusals.push(manifest_refusal(target));
             continue;
         }
-        let mutation = match (is_row, scoped, mode.as_str()) {
-            (false, false, "append") => AuthorityMutation::Create,
-            (true, false, "patch") | (false, true, "patch") => AuthorityMutation::Update,
-            (true, false, "delete") | (false, true, "delete") => AuthorityMutation::Delete,
-            _ => {
-                refusals.push(format!(
-                    "{target}: mode `{mode}` is refused; a page appends to cairn:~/db/<table>, and patches or deletes cairn:~/db/<table>/<pk> or cairn:~/db/<table>?where=..."
-                ));
-                continue;
-            }
+        let Some(mutation) = row_target.mutation(&change.mode) else {
+            refusals.push(format!(
+                "{target}: mode `{}` is refused; a page appends to cairn:~/db/<table>, and patches or deletes cairn:~/db/<table>/<pk> or cairn:~/db/<table>?where=...",
+                change.mode
+            ));
+            continue;
         };
-        let mut item = object.clone();
-        item.insert("target".to_string(), Value::String(resolved));
-        gated.push(GatedChange {
-            item: Value::Object(item),
-            mutation,
-            collection: cairn_common::uri::build_db_table_uri(
-                &format!("{}/db", cairn_common::uri::build_thread_uri(project, name)),
-                table,
-            ),
-        });
+        gated.push(GatedChange::new(&change, resolved, &row_target, mutation));
     }
     if refusals.is_empty() {
         Ok(gated)
     } else {
         Err(refusals)
     }
-}
-
-/// The write input's changes and atomic flag, refusing every other key.
-fn split_input(input: &Value) -> Result<(Vec<Value>, Option<bool>), PageCallError> {
-    let object = input.as_object().ok_or_else(|| {
-        PageCallError::BadRequest(
-            "a page write's input is an object {changes, atomic?}".to_string(),
-        )
-    })?;
-    let extra: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !matches!(*key, "changes" | "atomic"))
-        .collect();
-    if !extra.is_empty() {
-        return Err(PageCallError::Refused(format!(
-            "a page write carries only changes and atomic; {} refused",
-            extra
-                .iter()
-                .map(|key| format!("`{key}` is"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-    let changes = object
-        .get("changes")
-        .and_then(Value::as_array)
-        .filter(|changes| !changes.is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            PageCallError::BadRequest("page_write requires a non-empty `changes` array".to_string())
-        })?;
-    let atomic = match object.get("atomic") {
-        None | Some(Value::Null) => None,
-        Some(Value::Bool(atomic)) => Some(*atomic),
-        Some(_) => {
-            return Err(PageCallError::BadRequest(
-                "`atomic` is a boolean".to_string(),
-            ));
-        }
-    };
-    Ok((changes, atomic))
-}
-
-/// The URIs a change report names as written: each applied change's row URI
-/// (every row's, for a bulk append), or its target when it names none.
-fn written_uris(report: &Value) -> Vec<String> {
-    report
-        .get("applied")
-        .and_then(Value::as_array)
-        .map(|applied| {
-            applied
-                .iter()
-                .flat_map(|change| {
-                    let mut uris: Vec<String> = change
-                        .pointer("/data/uris")
-                        .and_then(Value::as_array)
-                        .map(|uris| {
-                            uris.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if uris.is_empty() {
-                        uris.extend(
-                            change
-                                .pointer("/data/uri")
-                                .or_else(|| change.get("target"))
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        );
-                    }
-                    uris
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 async fn refuse(
@@ -356,12 +218,12 @@ pub async fn page_write(
                 .collect()
         })
         .unwrap_or_default();
-    let (changes, atomic) = match split_input(&request.input) {
+    let (changes, atomic) = match row_writes::split_input(&request.input, "page_write", PAGE_NOUN) {
         Ok(split) => split,
-        Err(PageCallError::Refused(detail)) => {
+        Err(InputError::Refused(detail)) => {
             return Err(refuse(orch, &page, operator, &requested, detail).await);
         }
-        Err(error) => return Err(error),
+        Err(InputError::BadRequest(detail)) => return Err(PageCallError::BadRequest(detail)),
     };
 
     let owner_thread_id = match &page.owner {
@@ -401,31 +263,21 @@ pub async fn page_write(
 
     let version = u32::try_from(page.row.version)
         .map_err(|_| PageCallError::Failed("a stored page version is positive".to_string()))?;
-    let origin = PageWriteOrigin {
-        page: page.address.uri(),
-        version,
+    let origin = RowWriteOrigin {
+        instrument: RowWriteInstrument::Page {
+            page: page.address.uri(),
+            version,
+        },
         owner_thread_id,
         owner: page.address.home_uri(),
         project_id: page.project_id.clone(),
         actor: operator.actor.clone(),
         appearance: operator.appearance.clone(),
     };
-    let mut payload = json!({
-        "changes": gated.iter().map(|change| change.item.clone()).collect::<Vec<_>>(),
-    });
-    if let Some(atomic) = atomic {
-        payload["atomic"] = Value::Bool(atomic);
-    }
-    let dispatched = McpCallbackRequest {
-        tool: "write".to_string(),
-        payload,
-        origin: Some(DispatchOrigin::PageWrite(Box::new(origin.clone()))),
-        ..Default::default()
-    };
-    let raw = crate::mcp::handlers::write::handle_write(orch, &dispatched).await;
+    let raw = row_writes::dispatch(orch, &origin, &gated, atomic).await;
     let canonical: Vec<String> = gated
         .iter()
-        .filter_map(|change| change.item.get("target").and_then(Value::as_str))
+        .filter_map(GatedChange::target)
         .map(str::to_string)
         .collect();
     let actor = actor_record(&page, operator);
@@ -449,10 +301,7 @@ pub async fn page_write(
     };
     // Unreachable past the gate, and closed if it is ever reached: a page has
     // no one to answer a blocking append or an approval.
-    if report
-        .get("blocking")
-        .is_some_and(|blocking| !blocking.is_null())
-    {
+    if row_writes::is_blocking(&report) {
         let detail = "a page write cannot wait on an answer".to_string();
         log_call(
             orch,
@@ -467,29 +316,8 @@ pub async fn page_write(
         return Err(PageCallError::Refused(detail));
     }
 
-    let written = written_uris(&report);
-    let failures: Vec<String> = report
-        .get("failures")
-        .and_then(Value::as_array)
-        .map(|failures| {
-            failures
-                .iter()
-                .map(|failure| {
-                    format!(
-                        "{}: {}",
-                        failure
-                            .get("target")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default(),
-                        failure
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let written = row_writes::written_uris(&report);
+    let failures = row_writes::failures(&report);
     let (outcome, detail) = if failures.is_empty() {
         (
             PageCallOutcome::Ok,
@@ -522,47 +350,8 @@ pub async fn page_write(
     )
     .await;
 
-    let journaled = journal_entries(&report, &gated);
-    if !journaled.is_empty() {
-        let authority = crate::authorization::page_write_actor(orch, &origin);
-        crate::authorization::journal_instrumented_write(
-            &authority,
-            &operator.appearance,
-            &journaled,
-        )
-        .await;
-    }
+    row_writes::journal(orch, &origin, &report, &gated).await;
     Ok(json!({ "result": raw, "reminders": [] }))
-}
-
-/// One journal entry per applied change, matched to its gated change by index.
-fn journal_entries(
-    report: &Value,
-    gated: &[GatedChange],
-) -> Vec<crate::authorization::InstrumentedWrite> {
-    report
-        .get("applied")
-        .and_then(Value::as_array)
-        .map(|applied| {
-            applied
-                .iter()
-                .filter_map(|change| {
-                    let index = usize::try_from(change.get("index")?.as_u64()?).ok()?;
-                    let gated = gated.get(index)?;
-                    let summary = change
-                        .pointer("/data/uri")
-                        .or_else(|| change.get("target"))
-                        .and_then(Value::as_str)?
-                        .to_string();
-                    Some(crate::authorization::InstrumentedWrite {
-                        mutation: gated.mutation,
-                        collection: gated.collection.clone(),
-                        summary,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -575,13 +364,7 @@ pub(super) fn gate_for_test(
     gate_write_targets(address, version, scopes, changes).map(|gated| {
         gated
             .into_iter()
-            .filter_map(|change| {
-                change
-                    .item
-                    .get("target")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+            .filter_map(|change| change.target().map(str::to_string))
             .collect()
     })
 }

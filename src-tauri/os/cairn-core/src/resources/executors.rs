@@ -4077,6 +4077,7 @@ fn render_gpu_memory(
             gpu_allocated_bytes,
             source,
             pool,
+            apertures,
         } => {
             // The Memory reading is quoted as the pool only where the executor
             // says it measures the host. Under a cgroup limit it is the limit,
@@ -4117,8 +4118,30 @@ fn render_gpu_memory(
                         format!("GPU driver in use {}", bytes(*allocated))
                     })
                 }
+                UnifiedAllocationSource::AmdgpuGtt => gpu_field(
+                    "GPU-mapped system memory",
+                    gpu_allocated_bytes,
+                    |allocated| format!("GPU-mapped system memory (GTT) {}", bytes(*allocated)),
+                ),
             };
-            format!("unified memory, one pool with system memory: {pool}; {allocated}")
+            // `rocm-smi` and the firmware print both of these as the GPU's
+            // memory, so each is named for what it is: neither is room a model
+            // can be fitted into.
+            let apertures = apertures.as_ref().map_or(String::new(), |apertures| {
+                format!(
+                    "; {}; {}",
+                    gpu_field("carve-out", &apertures.carve_out, |carve_out| format!(
+                        "dedicated carve-out {} used of {}, reserved from RAM outside the pool and not a model budget",
+                        bytes(carve_out.used_bytes),
+                        bytes(carve_out.total_bytes)
+                    )),
+                    gpu_field("GTT limit", &apertures.mappable_limit_bytes, |limit| format!(
+                        "GTT limit {}, the most system memory the driver lets the GPU map, not memory it has",
+                        bytes(*limit)
+                    )),
+                )
+            });
+            format!("unified memory, one pool with system memory: {pool}; {allocated}{apertures}")
         }
     })
 }
@@ -8763,6 +8786,8 @@ mod tests {
             index: 0,
             vendor: if model.starts_with("Apple") {
                 GpuVendor::Apple
+            } else if model.starts_with("AMD") {
+                GpuVendor::Amd
             } else {
                 GpuVendor::Nvidia
             },
@@ -8791,6 +8816,7 @@ mod tests {
                 },
                 source: UnifiedAllocationSource::NvmlComputeProcesses,
                 pool,
+                apertures: None,
             },
             MeasurementReading::Measured { value: 350 },
         )
@@ -8990,6 +9016,7 @@ mod tests {
                     gpu_allocated_bytes: MeasurementReading::Measured { value: 172_130_304 },
                     source: UnifiedAllocationSource::AppleDriverInUse,
                     pool: host_pool(),
+                    apertures: None,
                 },
                 MeasurementReading::Unavailable {
                     reason: MeasurementGap::SamplingFailed,
@@ -9001,6 +9028,50 @@ mod tests {
         assert!(
             rendered.contains(
                 "- GPU 0 Apple M4 Pro (16 cores): unified memory, one pool with system memory: 8.0 GiB available of 64.0 GiB, the Memory reading above, not a second number; GPU driver in use 164.2 MiB; utilisation unavailable: sampling failed (PerformanceStatistics has no \"Device Utilization %\") (measured 2s ago)\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// fedora's Strix Halo: the pool is the Memory reading, the GPU's share
+    /// is GTT in use, and the carve-out and GTT limit are named beside it for
+    /// what they are, so neither can be read as the room a model has.
+    #[test]
+    fn an_amd_apu_names_its_carve_out_and_gtt_limit_beside_the_pool() {
+        use cairn_common::executor_protocol::{GpuApertures, GpuCarveOut};
+        let mut executor = inspection("fedora", false);
+        measured(&mut executor);
+        executor.health.host.gpus = Measurement::measured(
+            CAPTURED_AT - 2_000,
+            vec![gpu(
+                "AMD Radeon 8060S Graphics",
+                None,
+                None,
+                GpuMemory::Unified {
+                    gpu_allocated_bytes: MeasurementReading::Measured {
+                        value: 11_485_171_712,
+                    },
+                    source: UnifiedAllocationSource::AmdgpuGtt,
+                    pool: host_pool(),
+                    apertures: Some(GpuApertures {
+                        carve_out: MeasurementReading::Measured {
+                            value: GpuCarveOut {
+                                used_bytes: 286_277_632,
+                                total_bytes: 536_870_912,
+                            },
+                        },
+                        mappable_limit_bytes: MeasurementReading::Measured {
+                            value: 137_438_953_472,
+                        },
+                    }),
+                },
+                MeasurementReading::Measured { value: 0 },
+            )],
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- GPU 0 AMD Radeon 8060S Graphics: unified memory, one pool with system memory: 8.0 GiB available of 64.0 GiB, the Memory reading above, not a second number; GPU-mapped system memory (GTT) 10.7 GiB; dedicated carve-out 273.0 MiB used of 512.0 MiB, reserved from RAM outside the pool and not a model budget; GTT limit 128.0 GiB, the most system memory the driver lets the GPU map, not memory it has; utilisation 0% (measured 2s ago)\n"
             ),
             "{rendered}"
         );

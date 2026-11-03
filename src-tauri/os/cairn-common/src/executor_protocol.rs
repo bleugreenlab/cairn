@@ -6670,7 +6670,23 @@ pub struct LearnedResourceEstimate {
 /// The field, its meaning (one line for the executor's `/bin/sh -c`) and every
 /// frame are unchanged; only the text the runner puts there differs. An older
 /// executor runs that line as it runs any other, so it gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
+///
+/// Version 163 (cairn/5933) lets an executor read AMD GPUs. [`GpuVendor`]
+/// gains `Amd` and [`UnifiedAllocationSource`] gains `AmdgpuGtt`: a Linux
+/// executor now reads each display device bound to `amdgpu` from sysfs and
+/// reports it beside any NVML device. A 162 runner cannot decode a snapshot
+/// that names either value, and it decodes a snapshot frame whole, so it
+/// would drop every snapshot from a machine with an AMD GPU (fedora's Strix
+/// Halo, and bbs's integrated Radeon beside its 4090) for as long as a newer
+/// executor ran against it, which is why this is a version.
+/// [`GpuMemory::Unified`] also gains a defaulted `apertures`
+/// ([`GpuApertures`]): an integrated GPU's firmware carve-out and its
+/// driver's mapping limit, carried for diagnosis and never as a budget. An
+/// older executor leaves it out and an older runner ignores the key. A Linux
+/// machine whose PCI bus shows no NVIDIA display function no longer asks
+/// NVML, so one with no GPU at all reports an empty list where it reported
+/// "NVML not loadable".
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 163;
 
 /// The version `build.rs` derived from the paragraphs above
 /// [`EXECUTOR_PROTOCOL_VERSION`].
@@ -12921,10 +12937,10 @@ pub struct GpuDevice {
     pub index: u32,
     pub vendor: GpuVendor,
     /// The driver's marketing name: "NVIDIA GeForce RTX 4090", "NVIDIA GB10",
-    /// "Apple M4 Pro".
+    /// "Apple M4 Pro", "AMD Radeon 8060S Graphics".
     pub model: String,
-    /// NVML's UUID, the stable name a deployment uses for a device across
-    /// reboots and re-enumeration.
+    /// NVML's UUID or `amdgpu`'s `unique_id`, the stable name a deployment
+    /// uses for a device across reboots and re-enumeration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
     /// GPU core count, where the driver publishes one (Apple's
@@ -12942,6 +12958,35 @@ pub struct GpuDevice {
 pub enum GpuVendor {
     Nvidia,
     Apple,
+    /// A GPU on the `amdgpu` kernel driver, read from its sysfs directory.
+    Amd,
+}
+
+/// The GPUs a model on this machine would run on: its discrete devices when it
+/// has any, otherwise every device it reports.
+///
+/// An integrated GPU beside a discrete card (bbs's Radeon 610M beside its RTX
+/// 4090) drives a display. Its share of system memory is not VRAM, so counting
+/// it with the card would misname the machine and add host memory to a VRAM
+/// figure. A device whose memory is a gap counts only on a machine with no
+/// discrete device, where it cannot be told apart from the others.
+pub fn model_gpus(devices: &[GpuDevice]) -> Vec<&GpuDevice> {
+    let discrete: Vec<&GpuDevice> = devices
+        .iter()
+        .filter(|device| {
+            matches!(
+                device.memory,
+                MeasurementReading::Measured {
+                    value: GpuMemory::Discrete { .. }
+                }
+            )
+        })
+        .collect();
+    if discrete.is_empty() {
+        devices.iter().collect()
+    } else {
+        discrete
+    }
 }
 
 /// Where a GPU's memory lives, which decides what "GPU memory headroom" means.
@@ -12965,7 +13010,40 @@ pub enum GpuMemory {
         gpu_allocated_bytes: MeasurementReading<u64>,
         source: UnifiedAllocationSource,
         pool: MeasurementReading<UnifiedPool>,
+        /// What the driver reports about memory beside the GPU's share of the
+        /// pool. `None` where the driver reports nothing more (NVML, Apple)
+        /// and from an executor that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        apertures: Option<GpuApertures>,
     },
+}
+
+/// An integrated GPU's other memory figures, carried for diagnosis and never
+/// as a budget.
+///
+/// Both are numbers a reader will meet elsewhere (`rocm-smi`, the firmware
+/// setup screen), so the page names them for what they are rather than leaving
+/// either to be taken for the pool. The memory a model on a unified machine
+/// can take is the system memory the executor's brake already prices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuApertures {
+    /// Memory firmware set aside from RAM at boot for the GPU alone: what
+    /// `amdgpu` calls VRAM on an APU, 512 MiB on a Strix Halo by default. It
+    /// is outside the system memory reading.
+    pub carve_out: MeasurementReading<GpuCarveOut>,
+    /// The most system memory the driver lets the GPU map at once (`amdgpu`'s
+    /// GTT size). A configured ceiling rather than memory: it can exceed the
+    /// RAM installed, and every byte mapped under it is already in the system
+    /// memory reading.
+    pub mappable_limit_bytes: MeasurementReading<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuCarveOut {
+    pub used_bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// Whether the machine's memory reading is a unified GPU's pool.
@@ -12984,8 +13062,8 @@ pub enum UnifiedPool {
     CgroupLimited { limit_bytes: u64 },
 }
 
-/// What a unified GPU's allocated share counts, since the two drivers that
-/// report one do not count the same thing.
+/// What a unified GPU's allocated share counts, since the drivers that report
+/// one do not count the same thing.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum UnifiedAllocationSource {
@@ -12997,6 +13075,10 @@ pub enum UnifiedAllocationSource {
     /// across every process. Its `Alloc system memory` is the driver's pool
     /// reservation rather than use, and is deliberately not this.
     AppleDriverInUse,
+    /// `amdgpu`'s `mem_info_gtt_used`: system memory mapped into the GPU's
+    /// address space now, across every process. The firmware carve-out is not
+    /// in it, because it is not system memory; it travels in [`GpuApertures`].
+    AmdgpuGtt,
 }
 
 /// The host's storage stall, as Linux's pressure-stall information and block
@@ -21031,12 +21113,39 @@ mod tests {
                                 pool: MeasurementReading::Measured {
                                     value: UnifiedPool::CgroupLimited { limit_bytes: 4 },
                                 },
+                                apertures: None,
                             },
                         },
                         utilization_millis: MeasurementReading::Unavailable {
                             reason: MeasurementGap::SamplingFailed,
                             detail: Some("no Device Utilization %".into()),
                         },
+                    },
+                    GpuDevice {
+                        index: 0,
+                        vendor: GpuVendor::Amd,
+                        model: "AMD Radeon 8060S Graphics".into(),
+                        uuid: None,
+                        cores: None,
+                        memory: MeasurementReading::Measured {
+                            value: GpuMemory::Unified {
+                                gpu_allocated_bytes: MeasurementReading::Measured { value: 5 },
+                                source: UnifiedAllocationSource::AmdgpuGtt,
+                                pool: MeasurementReading::Measured {
+                                    value: UnifiedPool::HostMemory,
+                                },
+                                apertures: Some(GpuApertures {
+                                    carve_out: MeasurementReading::Measured {
+                                        value: GpuCarveOut {
+                                            used_bytes: 6,
+                                            total_bytes: 7,
+                                        },
+                                    },
+                                    mappable_limit_bytes: MeasurementReading::Measured { value: 8 },
+                                }),
+                            },
+                        },
+                        utilization_millis: MeasurementReading::Measured { value: 0 },
                     },
                 ],
             ),
@@ -22992,9 +23101,40 @@ mod tests {
                             pool: MeasurementReading::Measured {
                                 value: UnifiedPool::HostMemory,
                             },
+                            apertures: None,
                         },
                     },
                     utilization_millis: MeasurementReading::Measured { value: 350 },
+                },
+                GpuDevice {
+                    index: 0,
+                    vendor: GpuVendor::Amd,
+                    model: "AMD Radeon 8060S Graphics".into(),
+                    uuid: None,
+                    cores: None,
+                    memory: MeasurementReading::Measured {
+                        value: GpuMemory::Unified {
+                            gpu_allocated_bytes: MeasurementReading::Measured {
+                                value: 11_485_171_712,
+                            },
+                            source: UnifiedAllocationSource::AmdgpuGtt,
+                            pool: MeasurementReading::Measured {
+                                value: UnifiedPool::HostMemory,
+                            },
+                            apertures: Some(GpuApertures {
+                                carve_out: MeasurementReading::Measured {
+                                    value: GpuCarveOut {
+                                        used_bytes: 286_277_632,
+                                        total_bytes: 536_870_912,
+                                    },
+                                },
+                                mappable_limit_bytes: MeasurementReading::Measured {
+                                    value: 137_438_953_472,
+                                },
+                            }),
+                        },
+                    },
+                    utilization_millis: MeasurementReading::Measured { value: 0 },
                 },
             ],
         );
@@ -23008,12 +23148,95 @@ mod tests {
         assert_eq!(unified["source"], "nvmlComputeProcesses");
         assert_eq!(unified["gpuAllocatedBytes"]["reason"], "samplingFailed");
         assert_eq!(unified["pool"]["value"]["kind"], "hostMemory");
+        assert!(
+            unified.get("apertures").is_none(),
+            "a driver with nothing more to say sends no key: {unified}"
+        );
         assert_eq!(
             value["gpus"]["reading"]["value"][0]["memory"]["value"]["totalBytes"],
             25_757_220_864u64
         );
+        let amd = &value["gpus"]["reading"]["value"][2];
+        assert_eq!(amd["vendor"], "amd");
+        assert_eq!(amd["memory"]["value"]["source"], "amdgpuGtt");
+        let apertures = &amd["memory"]["value"]["apertures"];
+        assert_eq!(apertures["carveOut"]["value"]["totalBytes"], 536_870_912u64);
+        assert_eq!(apertures["mappableLimitBytes"]["value"], 137_438_953_472u64);
         let decoded: HostHealth = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.gpus, gpus);
+    }
+
+    /// What a runner reads from an executor that predates the apertures: the
+    /// same unified device, with nothing more said about it.
+    #[test]
+    fn a_unified_device_without_apertures_decodes_as_none() {
+        let memory: GpuMemory = serde_json::from_value(serde_json::json!({
+            "kind": "unified",
+            "gpuAllocatedBytes": { "kind": "measured", "value": 3 },
+            "source": "nvmlComputeProcesses",
+            "pool": { "kind": "measured", "value": { "kind": "hostMemory" } },
+        }))
+        .unwrap();
+        assert!(matches!(
+            memory,
+            GpuMemory::Unified {
+                apertures: None,
+                ..
+            }
+        ));
+    }
+
+    /// bbs carries an integrated Radeon beside its 4090: the card is what a
+    /// model runs on, and the integrated GPU's share of system memory is not
+    /// VRAM. A machine with only unified devices keeps them all.
+    #[test]
+    fn model_gpus_are_the_discrete_devices_when_a_machine_has_any() {
+        let device = |vendor, model: &str, memory| GpuDevice {
+            index: 0,
+            vendor,
+            model: model.into(),
+            uuid: None,
+            cores: None,
+            memory,
+            utilization_millis: MeasurementReading::Measured { value: 0 },
+        };
+        let card = device(
+            GpuVendor::Nvidia,
+            "NVIDIA GeForce RTX 4090",
+            MeasurementReading::Measured {
+                value: GpuMemory::Discrete {
+                    used_bytes: 1,
+                    total_bytes: 2,
+                },
+            },
+        );
+        let integrated = device(
+            GpuVendor::Amd,
+            "AMD Radeon 610M",
+            MeasurementReading::Measured {
+                value: GpuMemory::Unified {
+                    gpu_allocated_bytes: MeasurementReading::Measured { value: 3 },
+                    source: UnifiedAllocationSource::AmdgpuGtt,
+                    pool: MeasurementReading::Measured {
+                        value: UnifiedPool::HostMemory,
+                    },
+                    apertures: None,
+                },
+            },
+        );
+        let unread = device(
+            GpuVendor::Amd,
+            "AMD GPU 0x1234 rev 0x00",
+            MeasurementReading::Unavailable {
+                reason: MeasurementGap::UnsupportedPlatform,
+                detail: None,
+            },
+        );
+        let bbs = [integrated.clone(), card.clone(), unread.clone()];
+        assert_eq!(model_gpus(&bbs), vec![&card]);
+        let halo = [integrated.clone(), unread.clone()];
+        assert_eq!(model_gpus(&halo), vec![&integrated, &unread]);
+        assert!(model_gpus(&[]).is_empty());
     }
 
     fn sample_outcome() -> CellOutcome {

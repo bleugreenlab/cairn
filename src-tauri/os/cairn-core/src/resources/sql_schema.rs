@@ -257,6 +257,127 @@ async fn describe_table(
     .await
 }
 
+/// The overview as one JSON document, for a program that lays a database out
+/// (the app's database browser) rather than a reader. The listing names each
+/// table with its size and primary key; with `table`, that table carries every
+/// column (declared type, nullability, default, whether it is the key, whether
+/// SQLite generates it, whether an insert must name it) and every index.
+/// Columns are computed by the row engine's own [`TableShape`], so the document
+/// says exactly what a row write will be held to. A table's size is its rowid
+/// high-water, as in [`render_overview`] and for the same reason, never a
+/// count; it is null for an empty table and for one a declared `rowid` column
+/// shadows. `root` is the store's canonical URI, and `writable` whether it takes
+/// row writes at all.
+pub(crate) async fn overview_document(
+    db: &LocalDb,
+    params: &OverviewParams,
+    root: &str,
+    writable: bool,
+) -> DbResult<SchemaOverview> {
+    let mut catalog = read_catalog(db).await?;
+    let total_tables = catalog.tables.len();
+    let detail = params.table.is_some();
+    let selected: Vec<String> = match &params.table {
+        Some(table) => catalog
+            .tables
+            .into_iter()
+            .filter(|name| name == table)
+            .collect(),
+        None => catalog
+            .tables
+            .into_iter()
+            .skip(params.offset)
+            .take(params.limit)
+            .collect(),
+    };
+    let mut tables = Vec::with_capacity(selected.len());
+    for table in &selected {
+        let indexes = catalog.indexes.remove(table).unwrap_or_default();
+        if let Some(entry) = table_document(db, table.clone(), indexes, detail).await? {
+            tables.push(entry);
+        }
+    }
+    let shown_tables = tables.len();
+    let total = if detail { shown_tables } else { total_tables };
+    let document = serde_json::json!({
+        "uri": root,
+        "writable": writable,
+        "total": total,
+        "offset": if detail { 0 } else { params.offset },
+        "limit": params.limit,
+        "tables": tables,
+    });
+    Ok(SchemaOverview {
+        body: document.to_string(),
+        total_tables: total,
+        shown_tables,
+    })
+}
+
+/// One table's entry in the overview document, read in a read of its own.
+async fn table_document(
+    db: &LocalDb,
+    table: String,
+    indexes: Vec<IndexEntry>,
+    detail: bool,
+) -> DbResult<Option<serde_json::Value>> {
+    use super::db_rows::TableShape;
+    use serde_json::{json, Value};
+
+    db.read(move |conn| {
+        Box::pin(async move {
+            let Some(shape) = TableShape::load(conn, &table).await? else {
+                return Ok(None);
+            };
+            let shadowed = shape
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case("rowid"));
+            let max_rowid = if shadowed {
+                None
+            } else {
+                let mut rows = conn
+                    .query(rowid_high_water_sql(&quote_identifier(&table)), ())
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => row.get::<Option<i64>>(0)?,
+                    None => None,
+                }
+            };
+            let mut entry = json!({
+                "name": table,
+                "maxRowid": max_rowid,
+                "primaryKey": shape.primary_key().map(|column| column.name.clone()),
+            });
+            if detail {
+                let columns: Vec<Value> = shape
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        json!({
+                            "name": column.name,
+                            "type": column.decl_type,
+                            "notNull": column.not_null,
+                            "default": column.default,
+                            "primaryKey": column.pk > 0,
+                            "generated": shape.is_rowid_alias(column),
+                            "requiredForInsert": shape.required_for_insert(column),
+                        })
+                    })
+                    .collect();
+                let mut rendered = Vec::with_capacity(indexes.len());
+                for (name, sql) in indexes {
+                    rendered.push(Value::String(render_index(conn, &name, sql).await?));
+                }
+                entry["columns"] = Value::Array(columns);
+                entry["indexes"] = Value::Array(rendered);
+            }
+            Ok(Some(entry))
+        })
+    })
+    .await
+}
+
 /// One index as `[unique] [partial] index NAME (TERMS) [WHERE PREDICATE]`.
 async fn render_index(
     conn: &cairn_db::turso::Connection,
@@ -716,6 +837,86 @@ mod tests {
             "{}",
             listing.body
         );
+    }
+
+    #[tokio::test]
+    async fn the_overview_document_lists_tables_and_details_one_with_the_row_engines_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("document.db")).await.unwrap();
+        db.execute_batch(
+            "CREATE TABLE attempts(id INTEGER PRIMARY KEY, problem TEXT NOT NULL, code TEXT, created_at INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX attempts_problem ON attempts(problem);
+             CREATE TABLE commits(sha TEXT PRIMARY KEY, subject TEXT NOT NULL);
+             CREATE TABLE pairs(a TEXT, b TEXT, PRIMARY KEY (a, b));
+             INSERT INTO attempts(problem) VALUES ('p'), ('q');",
+        )
+        .await
+        .unwrap();
+        let params = |table: Option<&str>| OverviewParams {
+            table: table.map(str::to_string),
+            offset: 0,
+            limit: OVERVIEW_DEFAULT_TABLES,
+        };
+        let root = "cairn://p/cairn/t/db";
+
+        let before = db.read_transaction_count();
+        let listing = overview_document(&db, &params(None), root, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.read_transaction_count() - before,
+            3,
+            "one read per table, as the text overview"
+        );
+        let listing: serde_json::Value = serde_json::from_str(&listing.body).unwrap();
+        assert_eq!(listing["uri"], root);
+        assert_eq!(listing["writable"], true);
+        assert_eq!(listing["total"], 3);
+        assert_eq!(
+            listing["tables"],
+            serde_json::json!([
+                {"name": "attempts", "maxRowid": 2, "primaryKey": "id"},
+                {"name": "commits", "maxRowid": null, "primaryKey": "sha"},
+                {"name": "pairs", "maxRowid": null, "primaryKey": null},
+            ])
+        );
+
+        let detail = overview_document(&db, &params(Some("attempts")), root, false)
+            .await
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail.body).unwrap();
+        assert_eq!(detail["writable"], false);
+        let columns = &detail["tables"][0]["columns"];
+        assert_eq!(
+            columns[0],
+            serde_json::json!({"name": "id", "type": "INTEGER", "notNull": false, "default": null,
+                               "primaryKey": true, "generated": true, "requiredForInsert": false})
+        );
+        assert_eq!(columns[1]["requiredForInsert"], true, "{columns}");
+        assert_eq!(columns[2]["requiredForInsert"], false, "{columns}");
+        assert_eq!(
+            columns[3]["requiredForInsert"], false,
+            "a default answers for a NOT NULL column: {columns}"
+        );
+        assert_eq!(
+            detail["tables"][0]["indexes"],
+            serde_json::json!(["index attempts_problem (problem)"])
+        );
+
+        let commits = overview_document(&db, &params(Some("commits")), root, true)
+            .await
+            .unwrap();
+        let commits: serde_json::Value = serde_json::from_str(&commits.body).unwrap();
+        assert_eq!(
+            commits["tables"][0]["columns"][0]["requiredForInsert"], true,
+            "a text key is the row's address, so an insert names it"
+        );
+
+        let missing = overview_document(&db, &params(Some("nope")), root, true)
+            .await
+            .unwrap();
+        let missing: serde_json::Value = serde_json::from_str(&missing.body).unwrap();
+        assert_eq!(missing["tables"], serde_json::json!([]));
     }
 
     #[tokio::test]
