@@ -1685,17 +1685,158 @@ fn a_capacity_refused_lane_is_due_only_once_room_appears() {
     assert!(!capacity_relief_is_due(&forecast(30_000)));
     assert!(capacity_relief_is_due(&forecast(0)));
     assert!(capacity_relief_is_due(&MachineOccupancy::Idle));
+}
 
-    // Occupancy cannot see a model that took the machine, so a preempted
-    // lane is told apart by its own diagnostic and waits on the fleet.
-    use crate::execution::checks::{
-        is_preemption_diagnostic, SubstrateFailure, SubstrateFailureShape,
+/// One review-cadence capacity failure of `check` at `input`, as the runner
+/// records it: signed, carrying the placement facts it met and the substrate
+/// shape it concluded, beside whatever diagnostic it stored.
+#[allow(clippy::too_many_arguments)]
+async fn insert_capacity_observation(
+    db: &LocalDb,
+    id: &str,
+    check: &str,
+    tree: &str,
+    ran_at: i64,
+    placement_facts: &str,
+    substrate_shape: &str,
+    output_tail: &str,
+) {
+    db.execute(
+        "INSERT INTO check_result_observations
+           (id, project_id, commit_sha, tree_hash, check_name, input_hash,
+            environment_fingerprint, exit_code, verdict, failure_kind, complete, reusable,
+            parser_version, result_schema_version, ran_at, duration_ms, job_id, cadence,
+            output_tail, runner_build_id, failure_signature, placement_facts, substrate_shape)
+         VALUES(?1,'p-rev','commit',?2,?3,'input','',-1,'failed','capacity',0,0,
+                1,?4,?5,0,'j-prod','review',?6,?7,'sig-capacity',?8,?9)",
+        (
+            id,
+            tree,
+            check,
+            crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+            ran_at,
+            output_tail,
+            cairn_checkenv::implementation_identity(),
+            placement_facts,
+            substrate_shape,
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// cairn/5921. Occupancy counts only Cairn's own cells, so it cannot see an
+/// inference model that preempted a lane; a preempted dormant lane must wait
+/// on a verdict or moved placement facts, never on the room rule. Which rule a
+/// lane gets is read from the shape the runner stored, so rewording the
+/// preemption sentence moves nothing: a preemption under a reworded lead
+/// still waits, and a plain capacity refusal whose tail carries today's
+/// preemption sentence still takes the room rule.
+///
+/// Main's database holds no preempted observation to copy (none had been
+/// recorded when this was written), so the stored tail is composed by the
+/// runner's own path for the preemption it reports
+/// (`SubstrateFailure::agent_message` over `Preemption::sentence`).
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_preempted_dormant_lane_is_ruled_by_its_stored_shape_not_its_wording() {
+    use crate::execution::checks::{SubstrateFailure, SubstrateFailureShape};
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
     };
-    let preempted = SubstrateFailure::new(SubstrateFailureShape::CommandPreempted, "model load")
-        .agent_message();
-    let no_room = SubstrateFailure::new(SubstrateFailureShape::Capacity, "no room").agent_message();
-    assert!(is_preemption_diagnostic(&preempted), "{preempted}");
-    assert!(!is_preemption_diagnostic(&no_room), "{no_room}");
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let platform = foreign_platform();
+    let lane = dormant_lane(
+        &orch,
+        &bin,
+        "frontend-tests",
+        &format!(
+            "checks:\n  frontend-tests:\n    command: bun run test:frontend\n    executor:\n      requiredToolchains:\n      - rust\n    verdictPlatforms:\n    - {platform}\n    when: review\n"
+        ),
+    )
+    .await;
+    attach_machine(&orch, "fleet-a", platform);
+    insert_failed_check(&orch.db.local, "capacity", 1).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1, check_name='frontend-tests', \
+             environment_fingerprint=?2 WHERE job_id='j-prod'",
+            (
+                lane.tree_hash.as_str(),
+                crate::execution::cache::infra_suppression_scope("j-prod", &lane.commit),
+            ),
+        )
+        .await
+        .unwrap();
+    let facts = review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check)
+        .await
+        .placement_facts();
+    let recorded = SubstrateFailure::new(
+        SubstrateFailureShape::CommandPreempted,
+        "Preempted to load DeepSeek-V4-Flash (inference deployment dsv4f-tp2) on bginf-sp1, which needed 100.0 GiB there with 60.0 GiB free while this work held 35.0 GiB, measured.",
+    )
+    .agent_message();
+    let (_, failing_step) = recorded
+        .split_once("\nFailing step:\n")
+        .expect("a substrate message names its failing step");
+    let reworded = format!(
+        "An inference model needed this machine's memory, so Cairn ended the check early.\nFailing step:\n{failing_step}"
+    );
+    assert!(!reworded.contains("to make room for an inference model"));
+
+    // A plain capacity refusal whose stored tail happens to carry today's
+    // preemption sentence: the room rule answers it, and the machine is idle.
+    insert_capacity_observation(
+        &orch.db.local,
+        "obs-no-room",
+        "frontend-tests",
+        &lane.tree_hash,
+        1,
+        &facts,
+        SubstrateFailureShape::Capacity.stored(),
+        &recorded,
+    )
+    .await;
+    assert_eq!(
+        dormant_ticks(&orch, 1).await,
+        1,
+        "a capacity refusal re-arms once room appears, whatever its tail says"
+    );
+    orch.release_turn_end_slot_for_test("j-prod");
+
+    // That wave was preempted, and its lead sentence has since been reworded.
+    insert_capacity_observation(
+        &orch.db.local,
+        "obs-preempted",
+        "frontend-tests",
+        &lane.tree_hash,
+        2,
+        &facts,
+        SubstrateFailureShape::CommandPreempted.stored(),
+        &reworded,
+    )
+    .await;
+    assert_eq!(
+        dormant_ticks(&orch, 60).await,
+        0,
+        "an idle machine is not room for a lane a model preempted"
+    );
+    assert!(!wave_scheduled(&orch, "j-prod"));
+
+    attach_machine(&orch, "fleet-b", platform);
+    assert_ne!(
+        review_wave_scopes(&orch, &lane.repo_path, &lane.commit, &lane.check)
+            .await
+            .placement_facts(),
+        facts
+    );
+    assert!(
+        rearm_one_bounded_failed_review(&orch).await,
+        "moved placement facts are what earn a preempted lane its wave"
+    );
 }
 
 /// cairn/5357 comment 1. A restart re-spawns a wave only where one is owed: a

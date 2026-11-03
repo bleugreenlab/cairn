@@ -1485,6 +1485,7 @@ pub(crate) mod test_support {
             infra_reset_scopes: Vec::new(),
             failure_signature: None,
             placement_facts: None,
+            substrate_shape: None,
             selection: None,
             deferred_count: 0,
             phases: None,

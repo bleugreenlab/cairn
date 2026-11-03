@@ -1146,7 +1146,16 @@ async fn bounded_rearm_candidates_in_db(
 /// - `not_placeable`: a machine that could take the lane has attached or
 ///   enrolled.
 /// - `capacity`: room has appeared on the machines the wave would ask
-///   ([`capacity_relief_is_due`]).
+///   ([`capacity_relief_is_due`]). A preemption is the exception: an inference
+///   model took the machine, which occupancy (Cairn's own cells only) cannot
+///   see, so a lane whose newest review failure stored the
+///   `CommandPreempted` shape waits on the `infrastructure` rule instead. The
+///   shape is read from the observation's `substrate_shape` column. A row
+///   written before that column existed has none and takes the room rule: its
+///   shape is hashed into the failure signature but cannot be recovered
+///   without re-parsing the stored prose, which is the coupling the column
+///   removes, and the one wave that costs at most writes a row that carries
+///   the shape.
 /// - `infrastructure`: a genuine verdict for the same input has landed since
 ///   the newest failure, or the lane's placement facts (its fleet scope and
 ///   every eligible machine's repair identity) differ from the ones that
@@ -1315,9 +1324,12 @@ pub(super) async fn bounded_candidate_is_due(
         return Ok(true);
     }
     // Occupancy counts only Cairn's own cells, so it cannot see a model that
-    // preempted the lane; that lane waits on the placement facts instead.
+    // preempted the lane; that lane waits on the placement facts instead. Read
+    // from the shape the runner stored, never from the diagnostic's wording.
     if let Some(occupancy) = occupancy.as_ref() {
-        if !crate::execution::checks::is_preemption_diagnostic(&failure.output_tail) {
+        if failure.substrate_shape
+            != Some(crate::execution::checks::SubstrateFailureShape::CommandPreempted)
+        {
             return Ok(capacity_relief_is_due(occupancy));
         }
     }

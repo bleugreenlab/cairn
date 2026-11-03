@@ -289,8 +289,11 @@ pub(crate) struct ReviewFailureFacts {
     /// A genuine verdict for the same input, runner build, and verdict
     /// environment has been recorded since.
     pub(crate) answered_since: bool,
-    /// The failure's stored diagnostic, which names its substrate shape.
-    pub(crate) output_tail: String,
+    /// The substrate shape the runner concluded for that failure, as stored on
+    /// the observation. `None` for a failure the classifier read from the
+    /// command's output, for a row written before the shape was persisted, and
+    /// for a token this build does not know.
+    pub(crate) substrate_shape: Option<crate::execution::checks::SubstrateFailureShape>,
 }
 
 /// The facts of the newest review-cadence failure of `failure_kind` for
@@ -308,7 +311,7 @@ pub(crate) async fn newest_review_failure_conn(
     let mut failures = conn
         .query(
             "SELECT ran_at, runner_build_id, verdict_environment_hash, placement_facts,
-                    output_tail
+                    substrate_shape
                FROM check_result_observations
               INDEXED BY idx_check_result_observations_reusable_lookup
               WHERE project_id=?1 AND check_name=?2 AND input_hash=?3
@@ -320,13 +323,16 @@ pub(crate) async fn newest_review_failure_conn(
     let Some(row) = failures.next().await? else {
         return Ok(None);
     };
-    let (ran_at, runner_build, environment, placement_facts, output_tail) = (
+    let (ran_at, runner_build, environment, placement_facts, substrate_shape) = (
         row.i64(0)?,
         row.opt_text(1)?,
         row.opt_text(2)?,
         row.opt_text(3)?,
-        row.text(4)?,
+        row.opt_text(4)?,
     );
+    let substrate_shape = substrate_shape
+        .as_deref()
+        .and_then(crate::execution::checks::SubstrateFailureShape::from_stored);
     drop(failures);
     // A failure that never reached a machine has no verdict environment, so
     // any verdict at this runner build answers it.
@@ -355,7 +361,7 @@ pub(crate) async fn newest_review_failure_conn(
     Ok(Some(ReviewFailureFacts {
         placement_facts,
         answered_since,
-        output_tail,
+        substrate_shape,
     }))
 }
 

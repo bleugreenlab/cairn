@@ -1,0 +1,14 @@
+-- lineage: shared
+-- cairn/5921: the substrate shape the runner concluded for a failing check
+-- observation, stored as its own fact (`SubstrateFailureShape::stored`, a
+-- snake_case token such as `command_preempted`). 0329's `failure_signature`
+-- hashes the shape in, but a hash cannot be read back, so the dormant review
+-- re-arm told a preempted lane from a capacity refusal by matching the stored
+-- diagnostic's lead sentence. It reads this column instead.
+--
+-- Written only on observations whose run ended with a failure kind that
+-- Cairn's own machinery produced; NULL for verdicts, for failures the
+-- classifier read from the command's output, and on every row recorded
+-- before it. Reads seek `idx_check_result_observations_reusable_lookup`, so no
+-- new index is needed.
+ALTER TABLE check_result_observations ADD COLUMN substrate_shape TEXT;

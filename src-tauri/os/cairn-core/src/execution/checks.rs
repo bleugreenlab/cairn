@@ -5110,6 +5110,62 @@ impl SubstrateFailureShape {
         }
     }
 
+    /// The token this shape is stored under on a failing observation
+    /// (`check_result_observations.substrate_shape`), so a reader of the record
+    /// learns what the runner concluded without reading its prose.
+    ///
+    /// Spelled out per variant rather than derived from the variant's name: rows
+    /// already on disk keep their meaning through a rename, and a new shape
+    /// cannot compile until it is given a token here and in [`Self::from_stored`].
+    pub(crate) fn stored(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Capacity => "capacity",
+            Self::MachineUnreachable => "machine_unreachable",
+            Self::NoReachableMachine => "no_reachable_machine",
+            Self::Draining => "draining",
+            Self::NoMachine => "no_machine",
+            Self::Preparation => "preparation",
+            Self::EnvironmentRetired => "environment_retired",
+            Self::Result => "result",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Storage => "storage",
+            Self::RunnerFault => "runner_fault",
+            Self::CommandStalled => "command_stalled",
+            Self::CommandPreempted => "command_preempted",
+            Self::CommandOomKilled => "command_oom_killed",
+            Self::BuildVolumeAbsent => "build_volume_absent",
+            Self::BuildVolumeLost => "build_volume_lost",
+            Self::MeasurementBlind => "measurement_blind",
+        }
+    }
+
+    /// The shape a stored token names; `None` for a token this build does not
+    /// know, which only a newer build could have written.
+    pub(crate) fn from_stored(token: &str) -> Option<Self> {
+        Some(match token {
+            "dispatch" => Self::Dispatch,
+            "capacity" => Self::Capacity,
+            "machine_unreachable" => Self::MachineUnreachable,
+            "no_reachable_machine" => Self::NoReachableMachine,
+            "draining" => Self::Draining,
+            "no_machine" => Self::NoMachine,
+            "preparation" => Self::Preparation,
+            "environment_retired" => Self::EnvironmentRetired,
+            "result" => Self::Result,
+            "outcome_unknown" => Self::OutcomeUnknown,
+            "storage" => Self::Storage,
+            "runner_fault" => Self::RunnerFault,
+            "command_stalled" => Self::CommandStalled,
+            "command_preempted" => Self::CommandPreempted,
+            "command_oom_killed" => Self::CommandOomKilled,
+            "build_volume_absent" => Self::BuildVolumeAbsent,
+            "build_volume_lost" => Self::BuildVolumeLost,
+            "measurement_blind" => Self::MeasurementBlind,
+            _ => return None,
+        })
+    }
+
     /// Whether presenting this work again could plausibly change the answer.
     ///
     /// Two conditions qualify, and both because something outside the check
@@ -9021,13 +9077,6 @@ pub(crate) fn suppressed_check_message(suppressed: &SuppressedCheck) -> String {
     }
 }
 
-/// Whether a stored capacity diagnostic is a preemption: an inference model
-/// took the machine's memory. Machine occupancy counts only Cairn's own cells,
-/// so it reads such a machine as idle; a preempted lane cannot wait on room.
-pub(crate) fn is_preemption_diagnostic(output_tail: &str) -> bool {
-    output_tail.contains(SubstrateFailureShape::CommandPreempted.lead())
-}
-
 /// The one sentence a held review lane is named by, on every surface: how
 /// many identical failures tripped it, the persisted signature they share and
 /// the line it was computed from, and the facts that release it.
@@ -9401,6 +9450,7 @@ fn fresh_observation_write(
         // Set by the runner, which holds the classification and the scopes.
         failure_signature: None,
         placement_facts: None,
+        substrate_shape: None,
     }
 }
 
@@ -10646,6 +10696,9 @@ where
                                     &evidence,
                                 ));
                             observation.placement_facts = Some(infra_scopes.placement_facts());
+                            observation.substrate_shape = substrate_failure
+                                .as_ref()
+                                .map(|failure| failure.shape().stored().to_string());
                         }
                         let identity = crate::execution::cache::RecordedCheckObservation {
                             id: observation.id.clone(),
@@ -18942,6 +18995,31 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::MeasurementBlind,
     ];
 
+    /// A failing observation stores its shape as a token, and rows already on
+    /// disk must keep their meaning: every shape round-trips, no two share a
+    /// token, and the token the dormant re-arm reads is pinned literally, so a
+    /// rename of the variant cannot move it.
+    #[test]
+    fn every_shape_round_trips_through_its_stored_token() {
+        let mut seen = std::collections::HashSet::new();
+        for shape in ALL_SUBSTRATE_SHAPES {
+            assert!(seen.insert(shape.stored()), "{shape:?} shares a token");
+            assert_eq!(
+                SubstrateFailureShape::from_stored(shape.stored()),
+                Some(shape)
+            );
+        }
+        assert_eq!(
+            SubstrateFailureShape::CommandPreempted.stored(),
+            "command_preempted"
+        );
+        assert_eq!(
+            SubstrateFailureShape::from_stored("CommandPreempted"),
+            None,
+            "the token is not the variant's Debug name"
+        );
+    }
+
     /// The bound is on the COMPOSED message, so it has to hold for every lead
     /// and for an attribution of any length — not for the one shape a specimen
     /// happens to exercise. The ten leads differ by tens of characters, and a
@@ -19927,6 +20005,7 @@ cairn-common = { path = "../cairn-common" }
             infra_reset_scopes: Vec::new(),
             failure_signature: None,
             placement_facts: None,
+            substrate_shape: None,
             selection: None,
             deferred_count: 0,
             phases: None,

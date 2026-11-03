@@ -2163,6 +2163,10 @@ pub(crate) struct FreshCheckObservationWrite {
     /// Where a run that ended with a failure kind could have been placed
     /// ([`InfraScopes::placement_facts`]). `None` for a verdict.
     pub placement_facts: Option<String>,
+    /// The substrate shape the runner concluded for a failure its own
+    /// machinery produced (`SubstrateFailureShape::stored`). `None` for a
+    /// verdict and for a failure the classifier read from the command's output.
+    pub substrate_shape: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2596,6 +2600,7 @@ pub(crate) fn record_fresh_check_observation(
                         .and_then(|jobs| serde_json::to_string(&jobs).ok()),
                     "failureSignature": observation.failure_signature,
                     "placementFacts": observation.placement_facts,
+                    "substrateShape": observation.substrate_shape,
                 })
                 .to_string();
                 let mut existing = conn
@@ -2634,7 +2639,8 @@ pub(crate) fn record_fresh_check_observation(
                            AND build_jobs IS json_extract(?31,'$.buildJobs')
                            AND build_jobs_json IS json_extract(?31,'$.buildJobsJson')
                            AND failure_signature IS json_extract(?31,'$.failureSignature')
-                           AND placement_facts IS json_extract(?31,'$.placementFacts')",
+                           AND placement_facts IS json_extract(?31,'$.placementFacts')
+                           AND substrate_shape IS json_extract(?31,'$.substrateShape')",
                         params![observation.id.as_str(), observation.project_id.as_str(),
                             observation.commit_sha.as_str(), observation.tree_hash.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
@@ -2698,7 +2704,7 @@ pub(crate) fn record_fresh_check_observation(
                         phase_publish_ms, phase_origin, compiled_units, phase_passes_json,
                         execution_warmth, cell_origin_kind, cell_origin_distance_files,
                         cell_origin_distance_crates, build_jobs, build_jobs_json,
-                        failure_signature, placement_facts
+                        failure_signature, placement_facts, substrate_shape
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
                               ?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,
                               json_extract(?31,'$.definedByCommitSha'),
@@ -2723,7 +2729,8 @@ pub(crate) fn record_fresh_check_observation(
                               json_extract(?31,'$.buildJobs'),
                               json_extract(?31,'$.buildJobsJson'),
                               json_extract(?31,'$.failureSignature'),
-                              json_extract(?31,'$.placementFacts'))
+                              json_extract(?31,'$.placementFacts'),
+                              json_extract(?31,'$.substrateShape'))
                        ON CONFLICT(id) DO NOTHING",
                     Vec::<cairn_db::turso::Value>::from([
                         observation.id.as_str().into(), observation.project_id.as_str().into(),
@@ -3636,6 +3643,7 @@ mod tests {
             infra_reset_scopes: Vec::new(),
             failure_signature: None,
             placement_facts: None,
+            substrate_shape: None,
             selection: None,
             deferred_count: 0,
             phases: None,
@@ -5793,6 +5801,52 @@ mod tests {
             shown(db.clone(), true).await.is_none(),
             "and the projection says so"
         );
+    }
+
+    /// cairn/5921. The substrate shape the runner concluded is an immutable
+    /// fact of the observation: it is stored, it is part of the row's identity
+    /// (a re-record with another shape is refused), and the dormant re-arm's
+    /// read returns it as the shape rather than as prose to be matched.
+    #[tokio::test]
+    async fn a_failing_observation_stores_the_substrate_shape_it_concluded() {
+        use crate::execution::checks::SubstrateFailureShape;
+        let db = cache_db().await;
+        let mut preempted = lane_failure("p1", 100, "review", "in", "sig-p", "facts-a");
+        preempted.failure_kind = Some("capacity".to_string());
+        preempted.non_reusable_reason = Some("capacity".to_string());
+        preempted.output_tail = "wording that names no shape".to_string();
+        preempted.substrate_shape = Some(SubstrateFailureShape::CommandPreempted.stored().into());
+        record_fresh_check_observation(db.clone(), preempted.clone()).unwrap();
+        record_fresh_check_observation(db.clone(), preempted.clone())
+            .expect("the identical record is idempotent");
+        let mut reshaped = preempted.clone();
+        reshaped.substrate_shape = Some(SubstrateFailureShape::Capacity.stored().into());
+        assert!(
+            record_fresh_check_observation(db.clone(), reshaped).is_err(),
+            "the shape is one of the row's immutable fields"
+        );
+
+        let newest = db
+            .read(|conn| {
+                Box::pin(async move {
+                    crate::execution::lane_breaker::newest_review_failure_conn(
+                        conn,
+                        "project-a",
+                        "rust",
+                        "in",
+                        "capacity",
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("the capacity failure is the newest");
+        assert_eq!(
+            newest.substrate_shape,
+            Some(SubstrateFailureShape::CommandPreempted)
+        );
+        assert_eq!(newest.placement_facts.as_deref(), Some("facts-a"));
     }
 
     #[tokio::test]
