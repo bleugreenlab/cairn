@@ -130,6 +130,13 @@ pub trait ListenerRotationControl: Send + Sync {
     fn undeclared_holds(&self) -> Result<std::collections::BTreeMap<String, String>, String>;
 }
 
+/// Why an untargeted request is refused at once when the runner has no
+/// colocated executor and nothing to wait for. The main cadence's stall-window
+/// grouper reads this text out of failing tests' excerpts (`BOUND_ENDINGS` in
+/// `execution/checks_main.rs`), and a test there fails when the two part.
+pub(crate) const NO_COLOCATED_EXECUTOR: &str =
+    "no colocated executor is configured, enrolled, or being supervised";
+
 fn residency_runtime_config_request(residency: &CellResidency) -> CellRequest {
     residency_placement_request(&ResidencyAcquireRequest {
         holder: residency.holder.clone(),
@@ -13368,9 +13375,9 @@ impl Fleet {
             // better evidence of something to wait for than any substrate
             // declaration.
             if transient.is_none() && !targeted && parked_on.is_empty() {
-                return Err(executor_unavailable(generation_held.unwrap_or_else(|| {
-                    "no colocated executor is configured, enrolled, or being supervised".into()
-                })));
+                return Err(executor_unavailable(
+                    generation_held.unwrap_or_else(|| NO_COLOCATED_EXECUTOR.into()),
+                ));
             }
             let remaining = request.wait_horizon_unix_ms.saturating_sub(now);
             if remaining == 0 {

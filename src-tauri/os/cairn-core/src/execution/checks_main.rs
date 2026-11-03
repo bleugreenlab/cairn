@@ -1558,9 +1558,9 @@ pub(crate) struct Failure {
     pub(crate) signature: String,
     /// The machine condition the excerpt names, if any: see [`host_condition`].
     pub(crate) host_condition: Option<&'static HostCondition>,
-    /// Whether the excerpt says a time bound ended the test: see
+    /// The bound the excerpt says ended the test, if one did: see
     /// [`BOUND_ENDINGS`].
-    pub(crate) bounded: bool,
+    pub(crate) ending: Option<BoundEnding>,
     /// Where the test ran on its lane's timeline, when the row recorded its
     /// start.
     pub(crate) span: Option<Span>,
@@ -1571,7 +1571,7 @@ impl Failure {
         Self {
             signature: failure_signature(excerpt),
             host_condition: host_condition(excerpt),
-            bounded: ended_at_a_bound(excerpt),
+            ending: bound_ending(excerpt),
             span: None,
         }
     }
@@ -2384,29 +2384,61 @@ impl HostCondition {
     }
 }
 
-/// Lowercase spellings of a test ended by a time bound rather than by what it
-/// asserted: nextest's slow-timeout termination as the rust-tests runner
+/// How a bound ended a test rather than what it asserted: see
+/// [`BOUND_ENDINGS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BoundEnding {
+    /// A time bound expired while the test ran.
+    Timeout,
+    /// A batch the test ran was refused because no executor was there to run
+    /// it, so the test failed on the refusal in the reply it asserted on.
+    Refused,
+}
+
+/// The fleet's refusal when the runner has no colocated executor to place a
+/// batch on (`fleet::NO_COLOCATED_EXECUTOR`), as a test that asserted on the
+/// batch's reply carries it.
+const REFUSED_NO_COLOCATED_EXECUTOR: &str =
+    "no colocated executor is configured, enrolled, or being supervised";
+
+/// Lowercase spellings of a test ended by a bound rather than by what it
+/// asserted, each with the kind of ending it is.
+///
+/// Time bounds: nextest's slow-timeout termination as the rust-tests runner
 /// spells it (`NEXTEST_TIMEOUT_EXCERPT` in scripts/lib/structured-test-result.ts,
 /// which must change with it), vitest's timeout and the frontend runner's
 /// rewrite of it, and tokio's `Elapsed` (its `Debug`, then its `Display`) from
-/// a test's own bounded wait. A host that stops scheduling ends every test in
-/// flight at whichever bound each carries, so these are what
-/// [`stall_windows`] dates.
-const BOUND_ENDINGS: &[&str] = &[
-    "nextest terminated this test at its slow-timeout bound",
-    "test timed out in ",
-    "timeout: vitest terminated this test",
-    "elapsed(())",
-    "deadline has elapsed",
+/// a test's own bounded wait.
+///
+/// Refusals: [`REFUSED_NO_COLOCATED_EXECUTOR`], the fleet's placement refusal
+/// when no colocated executor exists. The ledger keeps every row's excerpt as
+/// it was recorded, so when the fleet's text changes its new spelling joins
+/// this list beside the old one rather than replacing it; a unit test fails
+/// until it does.
+///
+/// A host that stops scheduling ends every test in flight at whichever time
+/// bound each carries, and a host whose executor is gone refuses every batch
+/// in flight, so these are what [`stall_windows`] dates.
+const BOUND_ENDINGS: &[(&str, BoundEnding)] = &[
+    (
+        "nextest terminated this test at its slow-timeout bound",
+        BoundEnding::Timeout,
+    ),
+    ("test timed out in ", BoundEnding::Timeout),
+    ("timeout: vitest terminated this test", BoundEnding::Timeout),
+    ("elapsed(())", BoundEnding::Timeout),
+    ("deadline has elapsed", BoundEnding::Timeout),
+    (REFUSED_NO_COLOCATED_EXECUTOR, BoundEnding::Refused),
 ];
 
-/// Whether a failure excerpt says a time bound ended the test: see
+/// The bound a failure excerpt says ended the test, if one did: see
 /// [`BOUND_ENDINGS`].
-fn ended_at_a_bound(excerpt: &str) -> bool {
+fn bound_ending(excerpt: &str) -> Option<BoundEnding> {
     let excerpt = excerpt.to_ascii_lowercase();
     BOUND_ENDINGS
         .iter()
-        .any(|spelling| excerpt.contains(spelling))
+        .find(|(spelling, _)| excerpt.contains(spelling))
+        .map(|(_, ending)| *ending)
 }
 
 /// The test file a per-test id names. A vitest id is `<file> > <full name>`
@@ -2843,8 +2875,7 @@ struct HostConditionGroup<'a> {
 enum HostCause {
     /// One error naming the machine, in every excerpt.
     Error(&'static HostCondition),
-    /// Runs that overlapped and ended at their time bounds: see
-    /// [`stall_windows`].
+    /// Runs that overlapped and ended at their bounds: see [`stall_windows`].
     Stall(StallWindow),
 }
 
@@ -2860,6 +2891,8 @@ struct StallWindow {
     /// The group's first `bounded` tests ended at a bound; the rest failed some
     /// other way while running through the window.
     bounded: usize,
+    /// How many of the `bounded` were refused rather than timed out.
+    refused: usize,
 }
 
 impl HostConditionGroup<'_> {
@@ -2908,8 +2941,21 @@ impl HostConditionGroup<'_> {
                 ),
             },
             HostCause::Stall(window) => {
+                let (ended, machine) = match window.refused {
+                    0 => ("ran into a time bound".to_string(), "stalling"),
+                    refused if refused == window.bounded => (
+                        format!("were refused with `{REFUSED_NO_COLOCATED_EXECUTOR}`"),
+                        "losing its executor",
+                    ),
+                    refused => (
+                        format!(
+                            "ran into a time bound or were refused with `{REFUSED_NO_COLOCATED_EXECUTOR}` ({refused} refused)"
+                        ),
+                        "stalling",
+                    ),
+                };
                 let mut reading = format!(
-                    "{} tests in {} unrelated files ran into a time bound while their runs overlapped, which is this machine stalling, not the tree",
+                    "{} tests in {} unrelated files {ended} while their runs overlapped, which is this machine {machine}, not the tree",
                     window.bounded,
                     files(&self.tests[..window.bounded])
                 );
@@ -2934,8 +2980,8 @@ impl HostConditionGroup<'_> {
     }
 }
 
-/// The stall windows of a row: failures that ended at a time bound
-/// ([`BOUND_ENDINGS`]) whose runs overlapped one another, in at least
+/// The stall windows of a row: failures that ended at a bound, a time bound
+/// or a refusal ([`BOUND_ENDINGS`]), whose runs overlapped one another, in at least
 /// [`HOST_CONDITION_MIN`] test files, so the host stopped running them rather
 /// than one file hanging on itself. Each window then also holds every other
 /// failure whose run overlapped it: a test that failed its assertion after the
@@ -2953,32 +2999,35 @@ fn stall_windows<'a>(row: &'a CadenceRow, taken: &HashSet<&str>) -> Vec<HostCond
             _ => None,
         })
         .collect();
-    let mut bounded: Vec<(&str, Span)> = timed
+    let mut bounded: Vec<(&str, Span, BoundEnding)> = timed
         .iter()
-        .filter(|(_, failure, _)| failure.bounded)
-        .map(|(test, _, span)| (*test, *span))
+        .filter_map(|(test, failure, span)| failure.ending.map(|ending| (*test, *span, ending)))
         .collect();
-    bounded.sort_by_key(|(test, span)| (span.start_ms, *test));
+    bounded.sort_by_key(|(test, span, _)| (span.start_ms, *test));
     // Maximal runs of transitively overlapping spans, so two windows never
     // overlap each other.
-    let mut clusters: Vec<Vec<(&str, Span)>> = Vec::new();
+    let mut clusters: Vec<Vec<(&str, Span, BoundEnding)>> = Vec::new();
     let mut reach = i64::MIN;
-    for (test, span) in bounded {
+    for (test, span, ending) in bounded {
         match clusters.last_mut() {
-            Some(cluster) if span.start_ms <= reach => cluster.push((test, span)),
-            _ => clusters.push(vec![(test, span)]),
+            Some(cluster) if span.start_ms <= reach => cluster.push((test, span, ending)),
+            _ => clusters.push(vec![(test, span, ending)]),
         }
         reach = reach.max(span.end_ms);
     }
     let mut joined: HashSet<&str> = HashSet::new();
     let mut windows = Vec::new();
     for cluster in clusters {
-        let mut tests: Vec<&str> = cluster.iter().map(|(test, _)| *test).collect();
+        let mut tests: Vec<&str> = cluster.iter().map(|(test, _, _)| *test).collect();
         if files(&tests) < HOST_CONDITION_MIN {
             continue;
         }
-        let starts = cluster.iter().map(|(_, span)| span.start_ms);
-        let ends = cluster.iter().map(|(_, span)| span.end_ms);
+        let refused = cluster
+            .iter()
+            .filter(|(_, _, ending)| *ending == BoundEnding::Refused)
+            .count();
+        let starts = cluster.iter().map(|(_, span, _)| span.start_ms);
+        let ends = cluster.iter().map(|(_, span, _)| span.end_ms);
         let (from_ms, latest_start) = (starts.clone().min(), starts.max());
         let (earliest_end, to_ms) = (ends.clone().min(), ends.max());
         let (Some(from_ms), Some(latest_start), Some(earliest_end), Some(to_ms)) =
@@ -2988,7 +3037,7 @@ fn stall_windows<'a>(row: &'a CadenceRow, taken: &HashSet<&str>) -> Vec<HostCond
         };
         let bounded = tests.len();
         for &(test, failure, span) in &timed {
-            if !failure.bounded && span.overlaps(from_ms, to_ms) && joined.insert(test) {
+            if failure.ending.is_none() && span.overlaps(from_ms, to_ms) && joined.insert(test) {
                 tests.push(test);
             }
         }
@@ -2998,6 +3047,7 @@ fn stall_windows<'a>(row: &'a CadenceRow, taken: &HashSet<&str>) -> Vec<HostCond
                 to_ms,
                 together: (latest_start <= earliest_end).then_some((latest_start, earliest_end)),
                 bounded,
+                refused,
             }),
             tests,
         });
@@ -4828,6 +4878,138 @@ mod tests {
         let text = render(&undated, None);
         assert!(text.contains("5 failed — 5 newly red"), "{text}");
         assert!(!text.contains("HOST CONDITION"), "{text}");
+    }
+
+    /// Specimen cairn/5859 (799ab564, bgsrv-mac): three tests in
+    /// `mcp_run_execution` failed together when their own colocated executor
+    /// fixture never came up. Two asserted on a batch reply carrying the
+    /// fleet's refusal; the third failed its own assertion while they waited.
+    /// In one module that is the file hanging on its own fixture and stays
+    /// three reds; the same refusals in two modules are one window.
+    #[test]
+    fn overlapping_refusals_are_a_stall_window_only_across_files() {
+        const SECOND: i64 = 1_000;
+        const START: i64 = 40 * 60 * SECOND;
+        const REFUSAL: &str = r#"{"text":"This run could not execute: this job's environment could not be reached (select execution environment executor: no colocated executor is configured, enrolled, or being supervised). No commands ran.","images":[]}"#;
+        let resumes = "thread 'mcp_run_execution::the_turn_resumes_only_after_the_last_batch_settles' (189096284) panicked at os/cairn-core/tests/main/mcp_run_execution.rs:2232:5: fewer than 1 suspensions ever recorded a result; rows were [(\"toolu-quick\", \"pending\", None), (\"toolu-slow\", \"pending\", None)]".to_string();
+        let partial = format!(
+            "test mcp_run_execution::timed_out_code_item_is_killed_with_partial_output has been running for over 60 seconds  thread 'mcp_run_execution::timed_out_code_item_is_killed_with_partial_output' (189100590) panicked at os/cairn-core/tests/main/mcp_run_execution.rs:3070:5: missing partial output: {REFUSAL}"
+        );
+        let subtask = format!(
+            "test mcp_run_execution::timed_out_item_in_subtask_job_creates_no_terminal has been running for over 60 seconds  thread 'mcp_run_execution::timed_out_item_in_subtask_job_creates_no_terminal' (189103165) panicked at os/cairn-core/tests/main/mcp_run_execution.rs:2552:5: expected timeout: {REFUSAL}"
+        );
+        assert_eq!(bound_ending(&resumes), None);
+        assert_eq!(bound_ending(&partial), Some(BoundEnding::Refused));
+        assert_eq!(bound_ending(&subtask), Some(BoundEnding::Refused));
+
+        let render = |subtask_module: &str| {
+            let names = [
+                "cairn-core::main$mcp_run_execution::the_turn_resumes_only_after_the_last_batch_settles".to_string(),
+                "cairn-core::main$mcp_run_execution::timed_out_code_item_is_killed_with_partial_output".to_string(),
+                format!("cairn-core::main${subtask_module}::timed_out_item_in_subtask_job_creates_no_terminal"),
+            ];
+            let passing: Vec<(&str, TestOutcome)> = names
+                .iter()
+                .map(|name| (name.as_str(), TestOutcome::Passed))
+                .collect();
+            let previous = on("bgsrv-mac", row("prev", "aaaaaaaaaaaaaaaa", HOUR, &passing));
+            let failing = [
+                (names[0].as_str(), failed_at(&resumes, START, 33_877)),
+                (
+                    names[1].as_str(),
+                    failed_at(&partial, START + 5 * SECOND, 75_413),
+                ),
+                (
+                    names[2].as_str(),
+                    failed_at(&subtask, START + 6 * SECOND, 75_565),
+                ),
+            ];
+            report(
+                &CadenceVerdict::Complete(on(
+                    "bgsrv-mac",
+                    row("cur", "bbbbbbbbbbbbbbbb", 5 * HOUR, &failing),
+                )),
+                &same(&previous),
+                &Bracket::default(),
+            )
+        };
+
+        // The row as it was: one module hanging on its own fixture.
+        let text = render("mcp_run_execution");
+        assert!(text.contains("3 failed — 3 newly red"), "{text}");
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+        assert!(!text.contains("stall window"), "{text}");
+
+        // The same refusals in two modules are the machine.
+        let text = render("mcp_run_subtasks");
+        assert!(
+            text.contains("3 failed — 3 tests failed inside one stall window, 40m 05s to 41m 22s into the lane — 0 newly red"),
+            "{text}"
+        );
+        assert_eq!(text.matches("**HOST CONDITION").count(), 1, "{text}");
+        assert!(
+            text.contains("— 2 tests in 2 unrelated files were refused with `no colocated executor is configured, enrolled, or being supervised` while their runs overlapped, which is this machine losing its executor, not the tree; 1 more failed while running through the same window"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- All 2 that ended at a bound were in flight together from 40m 06s to 41m 20s into the lane"),
+            "{text}"
+        );
+    }
+
+    /// A refusal next to a timeout names both endings.
+    #[test]
+    fn a_window_of_timeouts_and_refusals_names_the_refusal() {
+        const TIMEOUT: &str = "TIMEOUT: nextest terminated this test at its slow-timeout bound (src-tauri/.config/nextest.toml)";
+        let refusal = format!("expected timeout: {}", crate::fleet::NO_COLOCATED_EXECUTOR);
+        let previous = on(
+            "fedora",
+            row(
+                "prev",
+                "aaaaaaaaaaaaaaaa",
+                HOUR,
+                &[
+                    ("c::m$a::x", TestOutcome::Passed),
+                    ("c::m$b::y", TestOutcome::Passed),
+                ],
+            ),
+        );
+        let current = on(
+            "fedora",
+            row(
+                "cur",
+                "bbbbbbbbbbbbbbbb",
+                5 * HOUR,
+                &[
+                    ("c::m$a::x", failed_at(TIMEOUT, 0, 600_000)),
+                    ("c::m$b::y", failed_at(&refusal, 1_000, 75_000)),
+                ],
+            ),
+        );
+        let text = report(
+            &CadenceVerdict::Complete(current),
+            &same(&previous),
+            &Bracket::default(),
+        );
+        assert!(
+            text.contains("2 tests in 2 unrelated files ran into a time bound or were refused with `no colocated executor is configured, enrolled, or being supervised` (1 refused) while their runs overlapped, which is this machine stalling, not the tree"),
+            "{text}"
+        );
+    }
+
+    /// The grouper reads the refusal in the fleet's own words. When the fleet
+    /// rewords it, the new spelling joins [`BOUND_ENDINGS`] beside the old one,
+    /// which stored rows still carry.
+    #[test]
+    fn the_fleets_no_colocated_executor_refusal_is_a_bound_ending() {
+        assert_eq!(
+            bound_ending(crate::fleet::NO_COLOCATED_EXECUTOR),
+            Some(BoundEnding::Refused)
+        );
+        assert_eq!(
+            bound_ending(&crate::fleet::NO_COLOCATED_EXECUTOR.to_ascii_uppercase()),
+            Some(BoundEnding::Refused)
+        );
     }
 
     #[test]

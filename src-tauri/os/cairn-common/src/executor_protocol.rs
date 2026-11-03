@@ -6617,6 +6617,13 @@ pub struct LearnedResourceEstimate {
 /// variant or field changes. A runner talking to an older colocated executor
 /// gets nothing wrong: that executor reports the identity it started with, as
 /// it always did.
+///
+/// cairn/5859 does not move the number. The runner's refusal of an untargeted
+/// request when it has no colocated executor becomes the named constant
+/// `fleet::NO_COLOCATED_EXECUTOR`, with the same text, so the main cadence's
+/// stall-window grouper can read it. The runner alone composes and sends that
+/// diagnostic; no frame, variant, field or serialized form changes, and a
+/// runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
