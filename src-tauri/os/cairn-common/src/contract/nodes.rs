@@ -161,6 +161,11 @@ pub(crate) const NODE_CHAT_EVENT_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+/// Label of the node-artifact `patch` mutation. Affordance renderers and
+/// tests in other crates match this text exactly, so they reference the
+/// constant rather than repeating the literal.
+pub const PR_ARTIFACT_ACTION_LABEL: &str = "edit, confirm, defer, or act on a PR artifact";
+
 pub(crate) const NODE_ARTIFACT_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::NodeArtifact,
@@ -196,7 +201,7 @@ pub(crate) const NODE_ARTIFACT_CONTRACT: ResourceContract =
                     PR_METHOD,
                     PR_PRECONDITION,
                 ],
-                label: "edit, confirm, defer, or act on a PR artifact",
+                label: PR_ARTIFACT_ACTION_LABEL,
                 example: "field merge: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{content:\"...\"}}]}) | text replacement: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{old_string:\"old\",new_string:\"new\",field:\"content\"}}]}) | confirm a gated artifact: write({changes:[{target:\"cairn:~/plan\",mode:\"patch\",payload:{confirmed:true}}]}) | defer a gated artifact: write({changes:[{target:\"cairn://p/PROJECT/N/1/planner/plan\",mode:\"patch\",payload:{defer:{until:[{fact:\"issue_resolution\",issue:\"cairn://p/PROJECT/M\",resolution:\"merged\"}]}}}]}) | merge a PR artifact: write({changes:[{target:\"cairn:~/pr\",mode:\"patch\",payload:{action:\"merge\",method:\"squash\"}}]})",
             },
         ],

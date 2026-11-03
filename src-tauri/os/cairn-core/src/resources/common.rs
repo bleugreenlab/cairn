@@ -1696,7 +1696,10 @@ mod tests {
             .find("[append one open question in the thread database]")
             .unwrap();
         let generic = block
-            .find("[edit, confirm, or act on a PR artifact]")
+            .find(&format!(
+                "[{}]",
+                cairn_common::contract::PR_ARTIFACT_ACTION_LABEL
+            ))
             .unwrap();
         assert!(propose < question && question < generic, "{block}");
         assert!(block.contains("cairn:@/tenets"));

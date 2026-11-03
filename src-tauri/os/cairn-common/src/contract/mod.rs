@@ -34,6 +34,7 @@ mod types;
 mod vcs;
 mod workspace;
 
+pub use nodes::PR_ARTIFACT_ACTION_LABEL;
 pub use specs::BROWSER_ACTIONS;
 pub use types::*;
 
