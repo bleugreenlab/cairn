@@ -1718,6 +1718,13 @@ impl LocalDb {
             .unwrap_or(0)
     }
 
+    /// Whether a TRUNCATE attempt is still running in the engine, past the
+    /// pass that started it. Optional work that would add reads to a database
+    /// in that state (the daily storage census) waits for it to clear.
+    pub fn checkpoint_in_flight(&self) -> bool {
+        self.checkpoint_in_engine.load(Ordering::SeqCst)
+    }
+
     /// Fold the logical log back into the main database, creating the quiet
     /// instant it needs rather than waiting to be handed one.
     ///

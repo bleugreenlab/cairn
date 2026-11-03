@@ -2108,7 +2108,7 @@ async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
     let (_temp, orch) = common::test_orchestrator().await;
     let db = &orch.db.local;
     let project_id = common::create_project(db, "queued-recovery").await;
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq) VALUES ('exec-q', 'r', '{project_id}', 'running', 1, 1);
          INSERT INTO jobs (id, execution_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('job-q', 'exec-q', '{project_id}', 'running', 'Builder', 'builder', 1, 1);
          INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('session-q', 'job-q', 'claude', 'open', 1, 1, 1);
@@ -2118,9 +2118,9 @@ async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
          INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at) VALUES
            ('req-queued','private-runtime','lane','ordinary:run-queued','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,1,'queued',NULL,0,NULL,1,1),
            ('req-active','private-runtime','lane','ordinary:run-active','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,2,'active','ordinary-session-promoter',1,9999999999,1,1);
-         INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES
-           ('req-queued','job-q','run-queued','session-q','t-q','exec-q','e','p','resume','{{}}','','null','{{}}',1),
-           ('req-active','job-q','run-active','session-q','t-a','exec-q','e','p','resume','{{}}','','null','{{}}',1);"
+         INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES
+           ('req-queued','job-q','run-queued','session-q','t-q','exec-q','p','resume','{{}}','','null','{{}}',1),
+           ('req-active','job-q','run-active','session-q','t-a','exec-q','p','resume','{{}}','','null','{{}}',1);"
     ))
     .await
     .unwrap();

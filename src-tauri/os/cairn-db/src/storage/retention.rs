@@ -73,6 +73,32 @@ pub enum Retention {
     },
 }
 
+impl Retention {
+    /// The rule's class, for grouping tables by what bounds them.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Retention::Keep(_) => "keep",
+            Retention::Owned { .. } => "owned",
+            Retention::Tiered { .. } => "tiered",
+            Retention::Evict(_) => "evict",
+            Retention::OwnedBy { .. } => "owned_by",
+            Retention::Undecided { .. } => "undecided",
+        }
+    }
+
+    /// One line naming what deletes the table's rows, for census reports.
+    pub fn summary(&self) -> String {
+        match self {
+            Retention::Keep(_) => "kept".to_string(),
+            Retention::Owned { parent } => format!("deleted with {parent}"),
+            Retention::Tiered { owner } => format!("tiered with history ({owner})"),
+            Retention::Evict(eviction) => format!("evicted: {}", eviction.name()),
+            Retention::OwnedBy { owner, rule } => format!("{rule} ({owner})"),
+            Retention::Undecided { owner, .. } => format!("undecided ({owner})"),
+        }
+    }
+}
+
 /// One table's rule and the payload budget the daily census holds it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableRetention {
@@ -288,6 +314,12 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "cairn-workflow journal",
         "deleted with its workflow run",
     ),
+    owned_by(
+        "storage_census",
+        "cairn-db storage::census::record",
+        "the newest KEPT_CENSUSES censuses",
+    )
+    .budget(32),
     // Undecided, each with an owner (the tables cairn/5585's census named).
     undecided(
         "cas_cache",

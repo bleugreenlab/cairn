@@ -124,23 +124,25 @@ fn resume_warm_race(
                 .map_err(|e| e.to_string())
         }
     })?;
-    let (run_status, turn_state, project_id, event_data) = run_db({
+    let (run_status, turn_awaits_launch, project_id) = run_db({
         let db = owning.clone();
         let run = snapshot.run_id.clone();
         let turn = snapshot.turn_id.clone();
-        let event = snapshot.launch_event_id.clone();
         async move {
             db.query_opt(
-                "SELECT r.status,t.state,j.project_id,e.data FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 JOIN events e ON e.id=?3 WHERE r.id=?1",
-                (run, turn, event),
-                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?)),
+                format!(
+                    "SELECT r.status,{},j.project_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
+                    super::TURN_AWAITS_LAUNCH_SQL
+                ),
+                (run, turn),
+                |row| Ok((row.text(0)?, row.i64(1)? != 0, row.text(2)?)),
             )
             .await
             .map_err(|e| e.to_string())
         }
     })?
     .ok_or_else(|| "prepared ordinary warm continuation is no longer durable".to_string())?;
-    if run_status != "starting" || turn_state != "pending" {
+    if run_status != "starting" || !turn_awaits_launch {
         return withdraw_unlaunched(
             orch,
             lease,
@@ -149,10 +151,6 @@ fn resume_warm_race(
             "run or turn is no longer launchable",
         );
     }
-    let prompt = serde_json::from_str::<crate::agent_process::stream::TranscriptEvent>(&event_data)
-        .map_err(|e| format!("decode ordinary launch event: {e}"))?
-        .content
-        .ok_or_else(|| "prepared ordinary launch event has no content".to_string())?;
 
     // The process that won the race already owns capacity. Release this unused
     // generation before delivery and never install it as a pending process claim.
@@ -169,10 +167,8 @@ fn resume_warm_race(
         orch,
         &owning,
         warm_run_id,
-        &snapshot.session_id,
-        &snapshot.turn_id,
+        snapshot,
         &project_id,
-        prompt,
     ) {
         return_undelivered_attention(
             orch,
@@ -548,7 +544,6 @@ pub(super) fn enqueue_or_start(
         session_id: prepared.session_id.clone(),
         turn_id: prepared.turn_id.clone(),
         execution_id: prepared.execution_id.clone().unwrap_or_default(),
-        launch_event_id: prepared.launch_event_id.clone(),
         prompt: prepared.prompt.clone(),
         reason: prepared.start_reason.clone(),
         session_start,
@@ -678,7 +673,7 @@ fn start_stateless_now(
     identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<(), String> {
     super::start_ordinary_session_now(orch, prepared, identity_override)?;
-    super::start_turn(orch, &prepared.turn_id, &prepared.run_id)?;
+    super::start_prepared_turn(orch, &prepared.turn_id, &prepared.run_id, &prepared.run_id)?;
     orch.process_state
         .set_current_turn_id(&prepared.run_id, Some(&prepared.turn_id));
     Ok(())
@@ -713,7 +708,6 @@ fn defer_stateless_start(
         artifact_schema_info: prepared.artifact_schema_info.clone(),
         execution_id: prepared.execution_id.clone(),
         turn_id: prepared.turn_id.clone(),
-        launch_event_id: prepared.launch_event_id.clone(),
         start_reason: prepared.start_reason.clone(),
         origin: prepared.origin,
         launch_claim: Some(claim),
@@ -1178,9 +1172,12 @@ fn start_leased_inner(
         let turn = snapshot.turn_id.clone();
         async move {
             db.query_opt(
-                "SELECT r.status,t.state,j.project_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
+                format!(
+                    "SELECT r.status,{},j.project_id FROM runs r JOIN jobs j ON j.id=r.job_id JOIN turns t ON t.id=?2 WHERE r.id=?1",
+                    super::TURN_AWAITS_LAUNCH_SQL
+                ),
                 (run, turn),
-                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+                |row| Ok((row.text(0)?, row.i64(1)? != 0, row.text(2)?)),
             )
             .await
             .map_err(|e| e.to_string())
@@ -1188,8 +1185,8 @@ fn start_leased_inner(
     })?;
     let launchable = launch_state
         .as_ref()
-        .is_some_and(|(run_status, turn_state, _)| {
-            run_status == "starting" && turn_state == "pending"
+        .is_some_and(|(run_status, turn_awaits_launch, _)| {
+            run_status == "starting" && *turn_awaits_launch
         });
     let Some((_, _, project_id)) = launch_state.filter(|_| launchable) else {
         return withdraw_unlaunched(
@@ -1312,7 +1309,12 @@ fn start_leased_inner(
     drop(claim);
     match result {
         Ok(()) => {
-            super::start_turn(orch, &snapshot.turn_id, &snapshot.run_id)?;
+            super::start_prepared_turn(
+                orch,
+                &snapshot.turn_id,
+                &snapshot.run_id,
+                &snapshot.run_id,
+            )?;
             orch.process_state
                 .set_current_turn_id(&snapshot.run_id, Some(&snapshot.turn_id));
             crate::orchestrator::lifecycle::notify_watchdog_successor_started(
@@ -1422,7 +1424,9 @@ fn settle_unlaunched_run(orch: &Orchestrator, run_id: &str, turn_id: &str) -> Re
                             return Ok(false);
                         }
                         conn.execute(
-                            "UPDATE turns SET state='cancelled', end_reason=?3, ended_at=?4, updated_at=?4 WHERE id=?1 AND run_id=?2 AND state='pending'",
+                            // Every turn the launch would have started: pending, or
+                            // a retry reserved on this run (`TURN_AWAITS_LAUNCH_SQL`).
+                            "UPDATE turns SET state='cancelled', end_reason=?3, ended_at=?4, updated_at=?4 WHERE id=?1 AND run_id=?2 AND (state='pending' OR (state='running' AND start_reason='retry'))",
                             cairn_db::turso::params![
                                 turn_id.as_str(),
                                 run_id.as_str(),
@@ -2157,7 +2161,6 @@ mod tests {
         launch.run_id = format!("r{n}");
         launch.session_id = format!("s{n}");
         launch.turn_id = format!("t{n}");
-        launch.launch_event_id = format!("ev{n}");
         launch.session_start = crate::storage::PreparedSessionStart::New {
             session_id: format!("s{n}"),
         };
@@ -2735,7 +2738,6 @@ mod tests {
             artifact_schema_info: None,
             execution_id: Some("e".into()),
             turn_id: "t".into(),
-            launch_event_id: "ev".into(),
             start_reason: crate::models::TurnStartReason::FollowUp,
             origin: crate::storage::LaunchOrigin::Background,
             launch_claim: Some(orch.claim_job_launch("j", "cold")),
@@ -2886,7 +2888,6 @@ mod tests {
                 artifact_schema_info: None,
                 execution_id: Some("e".into()),
                 turn_id: "t".into(),
-                launch_event_id: "ev".into(),
                 start_reason: crate::models::TurnStartReason::FollowUp,
                 origin: crate::storage::LaunchOrigin::Background,
                 launch_claim: Some(enqueuer.claim_job_launch("j", "cold")),
@@ -2974,7 +2975,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let snapshot = crate::storage::PreparedOrdinaryLaunch {
-            request_id: "req".into(), job_id: "j".into(), run_id: "cold".into(), session_id: "s".into(), turn_id: "t".into(), execution_id: "e".into(), launch_event_id: "ev".into(), prompt: "queued hello".into(), reason: crate::models::TurnStartReason::FollowUp,
+            request_id: "req".into(), job_id: "j".into(), run_id: "cold".into(), session_id: "s".into(), turn_id: "t".into(), execution_id: "e".into(), prompt: "queued hello".into(), reason: crate::models::TurnStartReason::FollowUp,
             session_start: crate::storage::PreparedSessionStart::New { session_id: "s".into() }, model: String::new(), agent_config: serde_json::Value::Null, output_schema: None,
             runtime_capability: serde_json::from_value(serde_json::json!({"class":"dedicated_process","lane":"lane","host_requirement":{"requirement":"resident_on","host_kind":"runner"},"claim":{"resident_process_units":1,"server_instance_key":null,"logical_stream_units":1,"estimated_memory_bytes":null},"supports_warm_reuse":true})).unwrap(),
             provider_account_id: None, identity_override: None, origin: crate::storage::LaunchOrigin::Background, created_at: 1,
@@ -3358,6 +3359,58 @@ mod tests {
             )
             .await,
             "exited:warm_race_reused"
+        );
+    }
+
+    /// cairn/5050: an automatic retry reserves its turn `running` on its launch
+    /// run before admission, so a launch withdrawn before any process settles
+    /// that reserved turn too instead of leaving it running on an exited run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withdrawn_retry_launch_settles_the_turn_it_reserved() {
+        let (orch, request, snapshot) = lifecycle_fixture("ordinary-withdrawn-retry.db").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE turns SET state='running', start_reason='retry', started_at=1 WHERE id='t'",
+                (),
+            )
+            .await
+            .unwrap();
+        orch.process_state
+            .register_process(
+                "existing".into(),
+                crate::agent_process::process::RunHandle::test_handle(Some("s"), Some("j")),
+            )
+            .unwrap();
+        orch.process_state.begin_turn("existing", "existing-turn");
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::orchestrator::session::install_test_session_backend(Box::new(CountingBackend(
+            starts.clone(),
+        )));
+
+        assert!(
+            !super::start_leased(&orch, super::OrdinaryLease::Private(request), snapshot).unwrap()
+        );
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            request_state(&orch, "req").await,
+            (
+                "cancelled".to_string(),
+                Some("same-session process is not warm and idle".to_string())
+            )
+        );
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT state || ':' || COALESCE(end_reason, '') FROM turns WHERE id='t'"
+            )
+            .await,
+            format!("cancelled:{}", crate::models::TurnEndReason::LaunchRefused)
+        );
+        assert_eq!(
+            text(&orch, "SELECT status FROM runs WHERE id='cold'").await,
+            "exited"
         );
     }
 
@@ -3843,7 +3896,6 @@ mod tests {
             artifact_schema_info: None,
             execution_id: Some("e".into()),
             turn_id: "t".into(),
-            launch_event_id: "ev".into(),
             start_reason: crate::models::TurnStartReason::FollowUp,
             origin: crate::storage::LaunchOrigin::Background,
             launch_claim: Some(orch.claim_job_launch("j", "cold")),

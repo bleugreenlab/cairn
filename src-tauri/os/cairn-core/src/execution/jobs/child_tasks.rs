@@ -163,7 +163,7 @@ pub fn create_child_task(
     // ---- Store the launch prompt ----------------------------------------
     // A sub-task's prompt is written by the agent that spawned it, which is the
     // clearest case of all for keeping it out of the `user` role (CAIRN-3408).
-    let launch_event_id = store_launch_event_with_turn(
+    store_launch_event_with_turn(
         orch,
         &run_id,
         &session_id,
@@ -198,7 +198,6 @@ pub fn create_child_task(
             artifact_schema_info: Some(output_schema),
             execution_id,
             turn_id,
-            launch_event_id,
             start_reason: TurnStartReason::Initial,
             origin: crate::storage::LaunchOrigin::Background,
             launch_claim: None,

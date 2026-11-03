@@ -18,6 +18,10 @@
 //!   fold <db>                            TRUNCATE-checkpoint the clone's logical log
 //!   tables <db> <as_of_unix_s>           per-table rows, payload bytes, 30-day growth
 //!   history <db> <as_of_unix_s>          history bytes by owner class and resolution age
+//!   sample <db> <as_of_unix_s>           the daily live census (`storage::census`), for
+//!                                        scoring its estimates against `tables`
+//!   sample-days <db> <as_of> <days>      that many daily censuses replayed on the clone,
+//!                                        to score the pooled estimates
 //!   sql <db> <statement>                 one ad-hoc statement, rows as JSON
 //!   vacuum <db> <dest> --unbounded-memory   time VACUUM INTO, then fold the image
 //!   delete-probe <db> <pages> [rows]     delete the oldest events a page per write,
@@ -37,7 +41,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use cairn_db::storage::{db_set_paths, db_set_size, DrainBudget, LocalDb, TrackedConnection};
+use cairn_db::storage::census::{payload_expr, quote_identifier as quote, Column};
+use cairn_db::storage::retention::retention_for;
+use cairn_db::storage::{
+    census, db_set_paths, db_set_size, DrainBudget, LocalDb, TrackedConnection,
+};
 use cairn_db::turso::Value;
 use serde_json::{json, Value as Json};
 
@@ -118,6 +126,8 @@ async fn main() {
         ["fold", db] => fold(db).await,
         ["tables", db, as_of] => tables(db, parse(as_of)).await,
         ["history", db, as_of] => history(db, parse(as_of)).await,
+        ["sample", db, as_of] => sample(db, parse(as_of)).await,
+        ["sample-days", db, as_of, days] => sample_days(db, parse(as_of), parse(days)).await,
         ["vacuum", db, dest, "--unbounded-memory"] => vacuum(db, dest).await,
         ["vacuum", ..] => Err(
             "vacuum holds the whole image in memory on the pinned Turso \
@@ -221,10 +231,6 @@ fn text(value: &Value) -> Option<String> {
     }
 }
 
-fn quote(ident: &str) -> String {
-    format!("\"{}\"", ident.replace('"', "\"\""))
-}
-
 fn log_bytes(path: &str) -> u64 {
     std::fs::metadata(format!("{path}-log"))
         .map(|m| m.len())
@@ -253,11 +259,6 @@ async fn fold(path: &str) -> Res<Json> {
     }))
 }
 
-struct Column {
-    name: String,
-    numeric: bool,
-}
-
 async fn table_names(conn: &TrackedConnection) -> Res<Vec<String>> {
     Ok(rows(
         conn,
@@ -279,30 +280,12 @@ async fn columns(conn: &TrackedConnection, table: &str) -> Res<Vec<Column>> {
         .await?
         .iter()
         .map(|r| {
-            let decl = text(&r[1]).unwrap_or_default().to_ascii_uppercase();
-            Column {
-                name: text(&r[0]).unwrap_or_default(),
-                numeric: decl.contains("INT") || decl.contains("REAL") || decl.contains("NUM"),
-            }
+            Column::new(
+                text(&r[0]).unwrap_or_default(),
+                &text(&r[1]).unwrap_or_default(),
+            )
         })
         .collect())
-}
-
-/// Stored-payload estimate for one row: the byte length of every text and
-/// blob value (cast to blob, since `length()` of text counts characters), four
-/// bytes per non-null number, and a fixed record header. Indexes and b-tree
-/// slack are not in it.
-fn payload_expr(cols: &[Column]) -> String {
-    let mut terms = vec![(cols.len() + 4).to_string()];
-    for col in cols {
-        let c = quote(&col.name);
-        if col.numeric {
-            terms.push(format!("(CASE WHEN {c} IS NULL THEN 0 ELSE 4 END)"));
-        } else {
-            terms.push(format!("coalesce(length(CAST({c} AS BLOB)), 0)"));
-        }
-    }
-    terms.join(" + ")
 }
 
 /// A table's age column, the multiplier that turns unix seconds into its unit,
@@ -416,8 +399,11 @@ async fn tables(path: &str, as_of: i64) -> Res<Json> {
             recent_rows += int(&r[2]);
             recent_bytes += int(&r[3]);
         }
+        let rule = retention_for(&table);
         out.push(json!({
             "table": table,
+            "rule": rule.map_or_else(|| "no rule".to_string(), |r| r.rule.summary()),
+            "budget_mb": rule.map(|r| r.budget_mb),
             "rows": count,
             "payload_bytes": bytes,
             "time_column": time.as_ref().map(|(c, _, _)| c.clone()),
@@ -920,6 +906,57 @@ async fn history(path: &str, as_of: i64) -> Res<Json> {
         // [age_days, events_rows, compressed_rows, events_bytes, derived_bytes, tokens, inline_pack_bytes]
         "resolved_executions": ages.iter().map(|(age, _, t, pack)| json!([age, t.events_rows, t.compressed_rows, t.events_bytes, t.derived_bytes, t.tokens, pack])).collect::<Vec<_>>(),
     }))
+}
+
+/// The live instrument (`storage::census`), run against the clone exactly as
+/// the runner runs it daily, so its estimates can be scored against `tables`.
+/// Its archive is a sibling `archive` directory of the clone, normally absent.
+async fn sample(path: &str, as_of: i64) -> Res<Json> {
+    let (db, open_s) = open(path).await?;
+    let archive = Path::new(path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("archive");
+    let report = census::take(&db, as_of, &archive)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut doc = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+    doc["open_s"] = json!(open_s);
+    Ok(doc)
+}
+
+/// `days` daily censuses ending at `as_of`, each taken after the ones before
+/// it, against the one clone. The data stays put while each day's windows land
+/// elsewhere, so the last census shows what pooling across days does to the
+/// sampling error. Prints the last census, with each day's duration, slowest
+/// read and payload.
+async fn sample_days(path: &str, as_of: i64, days: i64) -> Res<Json> {
+    let (db, open_s) = open(path).await?;
+    let archive = Path::new(path)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("archive");
+    let mut previous: Vec<census::CensusReport> = Vec::new();
+    let mut each = Vec::new();
+    for day in (0..days).rev() {
+        let now = as_of - day * DAY_S;
+        let report = census::take_after(&db, now, &archive, census::TIME_BUDGET, &previous)
+            .await
+            .map_err(|e| e.to_string())?;
+        each.push(json!({
+            "taken_at": now,
+            "duration_ms": report.duration_ms,
+            "slowest_read_ms": report.slowest_read_ms,
+            "reads_over_target": report.reads_over_target,
+            "payload_bytes": report.payload_bytes,
+            "bytes_per_event_row": report.history.as_ref().map(|h| h.bytes_per_event_row),
+        }));
+        previous.insert(0, report);
+    }
+    let mut doc = serde_json::to_value(&previous[0]).map_err(|e| e.to_string())?;
+    doc["open_s"] = json!(open_s);
+    doc["days"] = json!(each);
+    Ok(doc)
 }
 
 /// One read-only statement against the clone, rows as JSON arrays.

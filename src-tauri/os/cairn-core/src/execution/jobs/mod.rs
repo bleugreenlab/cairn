@@ -136,11 +136,11 @@ pub use workflow::restart_workflow;
 pub use workflow::{launch_standalone_workflow, LaunchedWorkflow};
 // The canonical, routing-aware turn-start. Host job-start paths call this
 // instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
-pub(crate) use turns::start_turn;
 pub(crate) use turns::{
     abandon_pending_retry_if_head_matches, claim_retry_successor_if_head_matches,
     claim_retry_turn_start, consecutive_retry_turn_count,
 };
+pub(crate) use turns::{start_prepared_turn, start_turn, TURN_AWAITS_LAUNCH_SQL};
 
 use config_loading::*;
 use inputs::*;
@@ -466,7 +466,6 @@ pub struct PreparedJob {
     pub artifact_schema_info: Option<OutputSchemaInfo>,
     pub execution_id: Option<String>,
     pub turn_id: String,
-    pub launch_event_id: String,
     pub start_reason: TurnStartReason,
     /// Who this launch serves. An operator launch is admitted as urgent, ahead
     /// of background work; see `ordinary_admission`.

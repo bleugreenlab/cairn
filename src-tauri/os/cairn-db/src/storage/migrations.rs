@@ -2262,6 +2262,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "ref_store_maintenance",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // The daily census of this install's own database file: what its tables
+    // hold and how fast they grow. Meaningless for any other database.
+    (
+        "storage_census",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     // The runner's own lifecycle facts: this process's stalls and this
     // machine's executor links, meaningless on any other installation.
     (

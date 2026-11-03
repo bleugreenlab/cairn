@@ -146,5 +146,6 @@ pub async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<turso::Value>) -> St
     .unwrap()
 }
 
+pub mod census;
 pub mod outbox;
 pub mod retention;

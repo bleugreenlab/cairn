@@ -103,10 +103,19 @@ pub(crate) async fn render_overview(
     };
 
     let detail = params.table.is_some();
+    // The newest storage census's live-row estimates, from one stored row; a
+    // database with no census (a thread's, or one too young) shows none.
+    let census = cairn_db::storage::census::latest_table_rows(db)
+        .await
+        .ok()
+        .flatten();
     let mut rendered = Vec::with_capacity(selected.len());
     for table in &selected {
         let indexes = catalog.indexes.remove(table).unwrap_or_default();
-        rendered.extend(describe_table(db, table.clone(), indexes, detail).await?);
+        let counted = census
+            .as_ref()
+            .and_then(|c| c.rows.get(table).map(|rows| (*rows, c.taken_at)));
+        rendered.extend(describe_table(db, table.clone(), indexes, detail, counted).await?);
     }
     if let Some(table) = &params.table {
         if selected.is_empty() {
@@ -175,12 +184,33 @@ fn rowid_high_water_sql(quoted_table: &str) -> String {
     format!("SELECT max(rowid) FROM {quoted_table}")
 }
 
-/// One table's overview lines, read in a read of its own.
+/// The size note beside a table: its rowid high-water, and the census's
+/// live-row estimate with the census's date when there is one. The high-water
+/// is an upper bound that drifts above the live rows as evictors delete.
+fn size_note(high_water: Option<i64>, counted: Option<(i64, i64)>) -> String {
+    let Some(rowid) = high_water else {
+        return " — empty".to_string();
+    };
+    match counted {
+        Some((rows, taken_at)) => {
+            let date = chrono::DateTime::from_timestamp(taken_at, 0).map_or_else(
+                || taken_at.to_string(),
+                |at| at.format("%Y-%m-%d").to_string(),
+            );
+            format!(" — max rowid {rowid}, ~{rows} rows as of {date}")
+        }
+        None => format!(" — max rowid {rowid}"),
+    }
+}
+
+/// One table's overview lines, read in a read of its own. `counted` is the
+/// storage census's `(rows, taken_at)` for the table.
 async fn describe_table(
     db: &LocalDb,
     table: String,
     indexes: Vec<IndexEntry>,
     detail: bool,
+    counted: Option<(i64, i64)>,
 ) -> DbResult<Vec<String>> {
     db.read(move |conn| {
         Box::pin(async move {
@@ -232,10 +262,7 @@ async fn describe_table(
                     Some(row) => row.get::<Option<i64>>(0)?,
                     None => None,
                 };
-                match high_water {
-                    Some(rowid) => format!(" — max rowid {rowid}"),
-                    None => " — empty".to_string(),
-                }
+                size_note(high_water, counted)
             };
             let mut lines = vec![format!("{table}({}){size}", columns.join(", "))];
 
@@ -664,6 +691,42 @@ mod tests {
             detail.body,
             "sparse(id INTEGER pk, value TEXT) — max rowid 1000"
         );
+    }
+
+    /// With a storage census recorded, a table's size note carries the
+    /// census's live-row estimate and date beside the high-water.
+    #[tokio::test]
+    async fn overview_prints_the_census_count_beside_the_high_water() {
+        let db = crate::storage::migrated_test_db("sql-schema-census.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
+             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws2','w',1,1);",
+        )
+        .await
+        .unwrap();
+        let taken_at = 1_793_677_584; // 2026-11-03 UTC
+        let report = cairn_db::storage::census::CensusReport {
+            taken_at,
+            tables: vec![cairn_db::storage::census::TableCensus {
+                table: "workspaces".to_string(),
+                rows: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cairn_db::storage::census::record(&db, &report)
+            .await
+            .unwrap();
+        let body = render_overview(&db, &detail("workspaces"))
+            .await
+            .unwrap()
+            .body;
+        let first = body.lines().next().unwrap();
+        assert!(first.ends_with(", ~2 rows as of 2026-11-03"), "{first}");
+        assert!(first.contains(" — max rowid "), "{first}");
+        // A table the census did not count keeps the bare high-water.
+        let turns = render_overview(&db, &detail("turns")).await.unwrap().body;
+        assert!(!turns.contains("rows as of"), "{turns}");
     }
 
     /// `(addr, opcode, p2)` of each instruction in `sql`'s compiled program.

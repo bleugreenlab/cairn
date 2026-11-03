@@ -88,8 +88,8 @@ pub async fn enqueue_prepared_ordinary_launch(
                 new.request_id
             };
             conn.execute(
-                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
+                "INSERT OR IGNORE INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![request_id.clone(),launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
             ).await?;
             let mut prepared = conn.query(
                 "SELECT 1 FROM prepared_ordinary_launches WHERE request_id=?1",
@@ -398,8 +398,8 @@ impl LaunchOrigin {
 }
 
 /// Immutable inputs required to reconstruct an ordinary session launch after restart.
-/// The prompt remains canonical in `launch_event_id`; provider credentials are resolved
-/// from `provider_account_id` only when the request is promoted.
+/// Provider credentials are resolved from `provider_account_id` only when the
+/// request is promoted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreparedOrdinaryLaunch {
     pub request_id: String,
@@ -408,9 +408,10 @@ pub struct PreparedOrdinaryLaunch {
     pub session_id: String,
     pub turn_id: String,
     pub execution_id: String,
-    pub launch_event_id: String,
-    /// Exact backend prompt. Continuations assemble this from multiple durable
-    /// transcript events, so no single event can reconstruct it losslessly.
+    /// Exact backend prompt, and the only copy of it: whichever process takes
+    /// the launch is sent this. Continuations assemble it from several durable
+    /// transcript events plus text no event stores (the resume stamp and
+    /// notes), so no event can stand in for it.
     pub prompt: String,
     pub reason: crate::models::TurnStartReason,
     pub session_start: PreparedSessionStart,
@@ -463,8 +464,8 @@ pub async fn persist_prepared_ordinary_launch(
         .map(|identity| encode_json(identity, "ordinary launch identity"))
         .transpose()?;
     db.execute(
-        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.launch_event_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
+        "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![launch.request_id,launch.job_id,launch.run_id,launch.session_id,launch.turn_id,launch.execution_id,launch.prompt,reason,session_start,launch.model,agent_config,output_schema,capability,launch.provider_account_id,identity_override,launch.created_at,launch.origin.as_str()],
     ).await?;
     db.provider_admission_changed();
     Ok(())
@@ -475,22 +476,22 @@ pub async fn get_prepared_ordinary_launch(
     request_id: &str,
 ) -> DbResult<Option<PreparedOrdinaryLaunch>> {
     db.query_opt(
-        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin FROM prepared_ordinary_launches WHERE request_id=?1",
+        "SELECT request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,output_schema_json,runtime_capability_json,provider_account_id,identity_override_json,created_at,origin FROM prepared_ordinary_launches WHERE request_id=?1",
         (request_id.to_string(),),
         |row| {
-            let reason = format!("\"{}\"", row.text(8)?);
+            let reason = format!("\"{}\"", row.text(7)?);
             Ok(PreparedOrdinaryLaunch {
                 request_id: row.text(0)?, job_id: row.text(1)?, run_id: row.text(2)?,
                 session_id: row.text(3)?, turn_id: row.text(4)?, execution_id: row.text(5)?,
-                launch_event_id: row.text(6)?, prompt: row.text(7)?, reason: decode_json(&reason, "ordinary launch reason")?,
-                session_start: decode_json(&row.text(9)?, "ordinary session start")?, model: row.text(10)?,
-                agent_config: decode_json(&row.text(11)?, "ordinary agent config")?,
-                output_schema: row.opt_text(12)?.map(|value| decode_json(&value, "ordinary output schema")).transpose()?,
-                runtime_capability: decode_json(&row.text(13)?, "ordinary runtime capability")?,
-                provider_account_id: row.opt_text(14)?,
-                identity_override: row.opt_text(15)?.map(|value| decode_json(&value, "ordinary launch identity")).transpose()?,
-                created_at: row.i64(16)?,
-                origin: LaunchOrigin::parse(&row.text(17)?)?,
+                prompt: row.text(6)?, reason: decode_json(&reason, "ordinary launch reason")?,
+                session_start: decode_json(&row.text(8)?, "ordinary session start")?, model: row.text(9)?,
+                agent_config: decode_json(&row.text(10)?, "ordinary agent config")?,
+                output_schema: row.opt_text(11)?.map(|value| decode_json(&value, "ordinary output schema")).transpose()?,
+                runtime_capability: decode_json(&row.text(12)?, "ordinary runtime capability")?,
+                provider_account_id: row.opt_text(13)?,
+                identity_override: row.opt_text(14)?.map(|value| decode_json(&value, "ordinary launch identity")).transpose()?,
+                created_at: row.i64(15)?,
+                origin: LaunchOrigin::parse(&row.text(16)?)?,
             })
         },
     ).await
@@ -1568,7 +1569,6 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
         session_id: "s".into(),
         turn_id: "t".into(),
         execution_id: "x".into(),
-        launch_event_id: "e".into(),
         prompt: "durable prompt".into(),
         reason: crate::models::TurnStartReason::Retry,
         session_start: PreparedSessionStart::Fork {
@@ -2574,8 +2574,8 @@ mod tests {
             db.execute_script(format!(
                 "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_generation,created_at,updated_at)
                    VALUES('req-{run}','team:t','lane','ordinary:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'queued',0,1,1);
-                 INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
-                   VALUES('req-{run}','j','{run}','s','t-{run}','x','e','p','resume','{{}}','','null','{{}}',1);",
+                 INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
+                   VALUES('req-{run}','j','{run}','s','t-{run}','x','p','resume','{{}}','','null','{{}}',1);",
                 seq = if run == "run-waiting" { 1 } else { 2 },
             ))
             .await
@@ -2831,8 +2831,8 @@ mod tests {
             db.execute_script(format!(
                 "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,created_at,updated_at)
                    VALUES('req-{run}','private-runtime','lane','ordinary:{run}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{seq},'{state}','owner',1,1,1);
-                 INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
-                   VALUES('req-{run}','j','{run}','s','t-{run}','x','e','p','resume','{{}}','','null','{{}}',1);"
+                 INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
+                   VALUES('req-{run}','j','{run}','s','t-{run}','x','p','resume','{{}}','','null','{{}}',1);"
             ))
             .await
             .unwrap();

@@ -208,6 +208,76 @@ pub(crate) fn claim_retry_turn_start(
     Ok(claimed)
 }
 
+/// Whether a prepared launch's turn `t` still waits for the launch run `r` to
+/// start it: `pending`, or an automatic retry already reserved `running` on that
+/// run (see [`start_prepared_turn`]).
+pub(crate) const TURN_AWAITS_LAUNCH_SQL: &str =
+    "(t.state = 'pending' OR (t.state = 'running' AND t.start_reason = 'retry' AND t.run_id = r.id))";
+
+/// Start a prepared launch's turn on `run_id`, the run whose process now holds
+/// its prompt. `launch_run_id` is the run the launch was prepared for, which
+/// differs from `run_id` when a warm process for the session overtook it.
+///
+/// A prepared turn waits `pending`, except an automatic retry's. That one was
+/// reserved `running` on its launch run before the launch was prepared
+/// ([`claim_retry_turn_start`]), so a continuation arriving while the launch
+/// waits in admission queues as steering instead of launching the same turn
+/// again. The reservation already is the start, so a reserved turn only
+/// follows its prompt to `run_id`.
+pub(crate) fn start_prepared_turn(
+    orch: &Orchestrator,
+    turn_id: &str,
+    launch_run_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let (db, reserved) = run_db({
+        let dbs = orch.db.clone();
+        let turn_id = turn_id.to_string();
+        let launch_run_id = launch_run_id.to_string();
+        let run_id = run_id.to_string();
+        async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            let reserved = db
+                .write(|conn| {
+                    let turn_id = turn_id.clone();
+                    let launch_run_id = launch_run_id.clone();
+                    let run_id = run_id.clone();
+                    Box::pin(async move {
+                        let now = chrono::Utc::now().timestamp() as i32;
+                        let changed = conn
+                            .execute(
+                                "UPDATE turns SET run_id = ?1, updated_at = ?2
+                                  WHERE id = ?3 AND run_id = ?4
+                                    AND state = 'running' AND start_reason = 'retry'",
+                                params![
+                                    run_id.as_str(),
+                                    now,
+                                    turn_id.as_str(),
+                                    launch_run_id.as_str()
+                                ],
+                            )
+                            .await?;
+                        Ok(changed > 0)
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((db, reserved))
+        }
+    })?;
+    if !reserved {
+        return start_turn(orch, turn_id, run_id);
+    }
+    let change = run_db({
+        let turn_id = turn_id.to_string();
+        async move { Ok(crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await) }
+    })?;
+    let _ = orch.services.emitter.emit("db-change", change);
+    Ok(())
+}
+
 async fn supersede_pending_retry_conn(
     conn: &cairn_db::turso::Connection,
     turn_id: &str,

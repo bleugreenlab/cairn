@@ -580,7 +580,7 @@ mod tests {
              INSERT INTO runs(id,project_id,job_id,session_id,status,created_at,updated_at) VALUES('run-1','p','job-1','session-1','crashed',1,1);
              INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('turn-1','session-1','run-1','job-1',1,'pending','follow_up',1,1);
              INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at) VALUES('brief','run-1','session-1','turn-1',1,1,'attention:briefing','{}',1);
-             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES('request-1','job-1','run-1','session-1','turn-1','','brief','hello','initial','{}','','null','{}',1);",
+             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES('request-1','job-1','run-1','session-1','turn-1','','hello','initial','{}','','null','{}',1);",
         )
         .await
         .unwrap();
@@ -729,7 +729,7 @@ mod tests {
         let db = crate::storage::migrated_test_db("team-terminal-retry.db").await;
         db.execute_script(
             "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,created_at,updated_at) VALUES('request-1','team:team-1','codex','ordinary:run-1','{}',0,1,'queued',1,1);\n\
-             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES('request-1','job-1','run-1','session-1','turn-1','','event-1','hello','initial','{}','','null','{}',1);"
+             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES('request-1','job-1','run-1','session-1','turn-1','','hello','initial','{}','','null','{}',1);"
         ).await.unwrap();
         crate::storage::persist_team_ordinary_lease(
             &db,

@@ -413,16 +413,16 @@ async fn insert_admission(db: &LocalDb, run_id: &str, state: &str, prepared: boo
     } else {
         "'ordinary-session-promoter'"
     };
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at)
            VALUES('req-{run_id}','private-runtime','lane','ordinary:{run_id}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,1,'{state}',{owner},1,9999999999,1,1);"
     ))
     .await
     .unwrap();
     if prepared {
-        db.execute_script(&format!(
-            "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
-               VALUES('req-{run_id}','job-1','{run_id}','session-1','turn-pending','exec-1','ev','p','resume','{{}}','','null','{{}}',1);"
+        db.execute_script(format!(
+            "INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at)
+               VALUES('req-{run_id}','job-1','{run_id}','session-1','turn-pending','exec-1','p','resume','{{}}','','null','{{}}',1);"
         ))
         .await
         .unwrap();

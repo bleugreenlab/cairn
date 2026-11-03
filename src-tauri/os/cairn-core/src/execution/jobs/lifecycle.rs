@@ -41,13 +41,12 @@ pub(super) fn deliver_prepared_warm_continuation(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     run_id: &str,
-    session_id: &str,
-    turn_id: &str,
+    launch: &crate::storage::PreparedOrdinaryLaunch,
     project_id: &str,
-    prompt: String,
 ) -> Result<(), String> {
+    let turn_id = launch.turn_id.as_str();
     orch.process_state.transition_to_active(run_id);
-    start_turn(orch, turn_id, run_id)?;
+    super::start_prepared_turn(orch, turn_id, &launch.run_id, run_id)?;
     orch.process_state
         .set_current_turn_id(run_id, Some(turn_id));
 
@@ -62,6 +61,7 @@ pub(super) fn deliver_prepared_warm_continuation(
         }
     })?;
     let image_project_id = project_id.to_string();
+    let prompt = launch.prompt.clone();
     let message_content = crate::storage::run_db_blocking(move || async move {
         crate::agent_process::stdin::resolve_stable_images(
             &orch.db,
@@ -75,7 +75,7 @@ pub(super) fn deliver_prepared_warm_continuation(
         &orch.process_state,
         run_id,
         &message_content,
-        session_id,
+        &launch.session_id,
         None,
     )?;
     Ok(())
@@ -1704,8 +1704,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // Under the namespaced `user:launch` type, not `user`: this prompt is
     // composed from the issue's resolved inputs, so a watching parent must never
     // be shown its own issue description as something a person said (CAIRN-3408).
-    let launch_event_id =
-        store_launch_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
+    store_launch_event_with_turn(orch, &run_id, &session_id, &prompt, now, Some(&turn_id))?;
 
     // ---- Emit system message for job start ------------------------------
     crate::messages::system::emit_job_event(
@@ -1727,7 +1726,6 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         artifact_schema_info,
         execution_id: job.execution_id,
         turn_id,
-        launch_event_id,
         start_reason: TurnStartReason::Initial,
         // A cold start is background work unless the operator's own start
         // command marks it otherwise (the transport's `start_job` handler).
@@ -3312,9 +3310,14 @@ fn continue_job_launch_locked(
         }
         None => None,
     };
-    // The owned-wait successor IS the intended (pending) active turn; reconcile
-    // would cancel it, and the yielded predecessor leaves nothing else stale.
-    if existing_run_id.is_none() && precreated_turn_id.is_none() && !resuming_owned_wait {
+    // An owned-wait successor or an automatic retry's turn IS the intended
+    // (pending) active turn; reconcile would cancel it, and the predecessor it
+    // follows already ended, so nothing else is stale.
+    if existing_run_id.is_none()
+        && precreated_turn_id.is_none()
+        && !resuming_owned_wait
+        && preclaimed_retry_turn_id.is_none()
+    {
         let _ = reconcile_stale_active_turn_for_continue(orch, job_id, &session_id)?;
     }
     let (run_id, is_process_reuse) = if let Some(existing_id) = existing_run_id {
@@ -3849,20 +3852,6 @@ fn continue_job_launch_locked(
         stamped_pushes.delivered();
         true
     } else {
-        let launch_event_id = run_db({
-            let db = owning_db.clone();
-            let run = run_id.clone();
-            let turn = turn_id.clone();
-            async move {
-                db.query_opt_text(
-                    "SELECT id FROM events WHERE run_id=?1 AND turn_id=?2 ORDER BY created_at DESC,id DESC LIMIT 1",
-                    (run, turn),
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-        })?
-        .ok_or_else(|| "cold continuation has no durable launch event".to_string())?;
         // Durable admission is now the launch owner. It may remain queued, and
         // promotion reacquires this same lock before its final state recheck.
         drop(launch_guard.take());
@@ -3880,7 +3869,6 @@ fn continue_job_launch_locked(
                 artifact_schema_info,
                 execution_id: job.execution_id.clone(),
                 turn_id: turn_id.clone(),
-                launch_event_id,
                 start_reason: TurnStartReason::FollowUp,
                 origin: continuation_origin(has_queued, prompt_resume.as_ref(), &drained_pushes),
                 launch_claim: None,
@@ -6381,6 +6369,225 @@ mod tests {
             )
             .await,
             (0, "background".to_string())
+        );
+    }
+
+    /// Records every byte a test process's stdin receives.
+    #[derive(Clone)]
+    struct CapturedStdin(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedStdin {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The admission row of the job's newest prepared launch, once it has left
+    /// the queue: its state and failure detail.
+    async fn settled_admission(orch: &Orchestrator) -> (String, Option<String>) {
+        use crate::storage::RowExt as _;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let row = orch
+                .db
+                .local
+                .query_opt(
+                    "SELECT r.state, r.failure_detail FROM runtime_admission_requests r JOIN prepared_ordinary_launches p USING(request_id) WHERE p.job_id='j' ORDER BY r.enqueue_seq DESC LIMIT 1",
+                    (),
+                    |row| Ok((row.text(0)?, row.opt_text(1)?)),
+                )
+                .await
+                .unwrap()
+                .expect("a cold continuation enqueues an admission row");
+            if !["queued", "leased", "starting"].contains(&row.0.as_str()) {
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the launch never left admission: {row:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// cairn/5050: a warm process for the same session that overtakes a queued
+    /// cold wake takes the wake, and what it is sent is the prompt admission
+    /// prepared. That prompt is assembled from several durable events on the
+    /// turn plus the resume stamp, so no one event holds it: a bare passive
+    /// wake's newest event is its session boundary, which carries no prompt, and
+    /// a passive wake carrying a push has the briefing's wake card as its newest.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_warm_process_overtaking_a_queued_cold_wake_receives_the_prepared_prompt() {
+        use crate::storage::RowExt as _;
+        for with_push in [false, true] {
+            let mut orch = idle_cold_job(&format!("warm-overtakes-cold-wake-{with_push}")).await;
+            // Held before readiness, the launch waits durably in the queue.
+            orch.startup_readiness = crate::orchestrator::StartupReadiness::pending();
+            if with_push {
+                direct_message(&orch, "m-peer", Some("peer-run")).await;
+            }
+            continue_cold(
+                &orch,
+                None,
+                Some(super::ResumeContext {
+                    suppress_user_event: true,
+                    suppress_self_suspend_note: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let (cold_run, prompt, holders, briefings) = orch
+                .db
+                .local
+                .query_opt(
+                    "SELECT p.run_id, p.prompt,
+                            (SELECT COUNT(*) FROM events e WHERE e.turn_id=p.turn_id AND json_extract(e.data,'$.content')=p.prompt),
+                            (SELECT COUNT(*) FROM events e WHERE e.turn_id=p.turn_id AND e.event_type='attention:briefing')
+                       FROM prepared_ordinary_launches p WHERE p.job_id='j'",
+                    (),
+                    |row| Ok((row.text(0)?, row.text(1)?, row.i64(2)?, row.i64(3)?)),
+                )
+                .await
+                .unwrap()
+                .expect("the wake is prepared");
+            assert_eq!(holders, 0, "no event on the turn holds the prepared prompt");
+            assert_eq!(briefings, i64::from(with_push));
+
+            orch.db
+                .local
+                .execute(
+                    "INSERT INTO runs(id,job_id,session_id,status,started_at,start_mode,created_at,updated_at) VALUES('warm','j','sess-a','live',5,'resume',5,5)",
+                    (),
+                )
+                .await
+                .unwrap();
+            let stdin = Arc::new(Mutex::new(Vec::new()));
+            orch.process_state
+                .register_process(
+                    "warm".into(),
+                    RunHandle::new(
+                        Arc::new(Mutex::new(None)),
+                        Arc::new(Mutex::new(Some(
+                            cairn_models::session::claude::ClaudeControl::boxed(Box::new(
+                                CapturedStdin(stdin.clone()),
+                            )),
+                        ))),
+                        Some("sess-a".into()),
+                        Some("j".into()),
+                    ),
+                )
+                .unwrap();
+            orch.process_state.transition_to_warm("warm");
+            orch.mark_startup_recovery_ready();
+
+            let (state, detail) = settled_admission(&orch).await;
+            assert_eq!(
+                (state.as_str(), detail.as_deref()),
+                (
+                    "cancelled",
+                    Some("warm process won queued cold launch race")
+                ),
+                "with_push={with_push}: the warm process takes the wake"
+            );
+            // The race closes the lease before it delivers; settling the unused
+            // cold run is its last step.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let cold_outcome = loop {
+                let outcome = orch
+                    .db
+                    .local
+                    .query_opt(
+                        "SELECT status || ':' || COALESCE(exit_reason, '') FROM runs WHERE id=?1",
+                        (cold_run.clone(),),
+                        |row| row.text(0),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the cold run");
+                if outcome != "starting:" || std::time::Instant::now() >= deadline {
+                    break outcome;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            };
+            assert_eq!(cold_outcome, "exited:warm_race_reused");
+            let sent = String::from_utf8(stdin.lock().unwrap().clone()).unwrap();
+            let escaped = serde_json::to_string(&prompt).unwrap();
+            assert!(
+                sent.contains(&escaped[1..escaped.len() - 1]),
+                "with_push={with_push}: the warm process must be sent the prepared prompt {prompt:?}, got {sent:?}"
+            );
+        }
+    }
+
+    /// cairn/5050: an automatic retry reserves its turn `running` before it
+    /// launches, so an operator message arriving meanwhile queues as steering
+    /// instead of launching the same turn again. A retry whose process is gone
+    /// launches cold through admission, which must start the turn the retry
+    /// reserved rather than withdraw it as no longer launchable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_automatic_retry_starts_the_turn_it_reserved() {
+        use crate::storage::RowExt as _;
+        let orch = idle_cold_job("cold-automatic-retry").await;
+        orch.db
+            .local
+            .execute("UPDATE turns SET state='interrupted' WHERE id='turn-0'", ())
+            .await
+            .unwrap();
+        let claimer = orch.clone();
+        let retry = tokio::task::spawn_blocking(move || {
+            crate::execution::jobs::claim_retry_successor_if_head_matches(
+                &claimer,
+                claimer.db.local.clone(),
+                "j",
+                "sess-a",
+                "turn-0",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("an interrupted head takes a retry");
+        let _backend =
+            crate::orchestrator::session::install_orchestrator_test_session_backend(&orch, || {
+                Box::new(RegisteringBackend)
+            });
+
+        let launcher = orch.clone();
+        let retry_for_launch = retry.clone();
+        let run = tokio::task::spawn_blocking(move || {
+            super::continue_automatic_retry(&launcher, "j", &retry_for_launch)
+        })
+        .await
+        .unwrap()
+        .expect("the retry is admitted");
+
+        let (state, detail) = settled_admission(&orch).await;
+        assert_eq!(
+            (state.as_str(), detail.as_deref()),
+            ("active", None),
+            "admission starts the retry's process"
+        );
+        assert_eq!(orch.process_state.has_process(&run.id), Some(true));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt(
+                    "SELECT state || ':' || run_id FROM turns WHERE id=?1",
+                    (retry.clone(),),
+                    |row| row.text(0),
+                )
+                .await
+                .unwrap(),
+            Some(format!("running:{}", run.id)),
+            "the reserved turn runs on the run that launched it"
+        );
+        assert_eq!(
+            orch.process_state.get_occupancy(&run.id),
+            Some(RunOccupancy::ServingTurn(retry))
         );
     }
 
