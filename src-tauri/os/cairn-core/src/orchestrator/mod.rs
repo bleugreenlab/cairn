@@ -875,6 +875,7 @@ impl OrchestratorBuilder {
                 ),
             ),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            lane_claims: Arc::new(Default::default()),
             node_check_status_cache: Arc::new(
                 crate::execution::checks_status::NodeCheckStatusCache::default(),
             ),
@@ -1637,6 +1638,9 @@ pub struct Orchestrator {
     pub(crate) artifact_revisions: Arc<crate::execution::artifact_revisions::RevisionDeliveries>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
+    /// The write-check lanes being verified right now, by input key, so a fix
+    /// fold onto a moved head reuses the head's own verdicts. Runtime-only.
+    pub(crate) lane_claims: Arc<crate::execution::lane_claims::LaneClaims>,
     /// Exact settled node-check projection, generation-fenced and single-flight.
     pub(crate) node_check_status_cache: Arc<crate::execution::checks_status::NodeCheckStatusCache>,
     /// The one PR projection, keyed by the job that owns the merge request.

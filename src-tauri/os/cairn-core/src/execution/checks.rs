@@ -5808,6 +5808,7 @@ use crate::execution::check_parsers::{
     is_lint_parser, parse_check_output, reported_test, ParsedCheckResult, ReportedTest,
     ESLINT_PARSER, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
 };
+use crate::execution::lane_claims::{ClaimedElsewhere, LaneKey, WaveClaims};
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
 use crate::jj::{
     logical_changed_files, logical_tree_hash, read_blobs, tree_entries, GraphFileChange, JjEnv,
@@ -6981,6 +6982,9 @@ pub(crate) async fn run_write_checks_after_seal(
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?.clone();
     let guard = WriteChecksInFlightGuard::new(orch, &run_context.job_id);
+    // Opened before the wave is spawned, so a fold that finds the branch moved
+    // to this commit sees the wave planning from the moment the commit landed.
+    let claims = orch.lane_claims.open_wave(&run_context.job_id);
     let late_orch = orch.clone();
     let late_run_id = run_context.run_id.clone();
     let late_job_id = run_context.job_id.clone();
@@ -7001,6 +7005,7 @@ pub(crate) async fn run_write_checks_after_seal(
                 &tool_use_id,
                 sealed_resolution.as_ref(),
                 progress,
+                claims,
             )
             .await
         },
@@ -7429,6 +7434,9 @@ async fn run_write_checks_after_seal_inner(
     tool_use_id: &str,
     sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
     progress: tokio::sync::watch::Sender<WaveProgress>,
+    // Held until this function returns, which is after every verdict the wave
+    // records has been recorded.
+    mut claims: WaveClaims,
 ) -> Option<String> {
     // No run context ⇒ no run id to stream against and no job to anchor the diff.
     let run_context = run_context?;
@@ -7580,6 +7588,12 @@ async fn run_write_checks_after_seal_inner(
             .then_some(index)
         })
         .collect();
+    claims.claim(
+        miss_indices
+            .iter()
+            .map(|index| lane_key(&run_context.project_id, &keyed[*index])),
+        &sealed_commit,
+    );
     let status_notify = wave_status_notify(
         move |checks, phase_status| {
             let _ = emitter.emit(
@@ -7677,6 +7691,7 @@ async fn run_write_checks_after_seal_inner(
     let mut keyed = keyed;
     let mut tree_hash = tree_hash;
     let mut fixed = None;
+    let mut answered_elsewhere: Vec<ClaimedElsewhere> = Vec::new();
     if let Some(delta) = delta {
         let (Some(request), Some(store_dir)) = (request.as_ref(), store_dir.as_ref()) else {
             return Some(
@@ -7786,10 +7801,9 @@ async fn run_write_checks_after_seal_inner(
                 status_board: Some(status_board.clone()),
             },
             cwd,
-            &published.paths,
-            &published.commit,
-            published.landed_on_tested_base,
+            &published,
             &split.spilled,
+            &mut claims,
         )
         .await;
         let rekeyed = match rekeyed {
@@ -7817,6 +7831,7 @@ async fn run_write_checks_after_seal_inner(
         // the fixed commit, so it carries that commit's change.
         process_env = rekeyed.process_env;
         batched_results.extend(rekeyed.results);
+        answered_elsewhere.extend(rekeyed.answered_elsewhere);
         fixed = Some(published);
     }
     let observation_commit = fixed
@@ -7827,12 +7842,36 @@ async fn run_write_checks_after_seal_inner(
     // this wave lands and keyed on that tree. Running them beside the cell would
     // key a verdict to a tree a fix then replaced; ordering them after it makes
     // that impossible by construction rather than by timing.
-    if !split.spilled.is_empty() {
+    //
+    // After a fold they are keyed to the fixed commit, which the planning-time
+    // cache filter never saw, and on a moved head the head's own wave is
+    // usually verifying them already: they get the fold's hand-off too.
+    let spilled = if fixed.is_some() && !split.spilled.is_empty() {
+        let (left, answered) = lanes_left_to_run(
+            orch.db.local.clone(),
+            &mut claims,
+            &run_context.project_id,
+            &keyed,
+            &split.spilled,
+            &process_env,
+            FOLD_HANDOFF_WAIT,
+        )
+        .await;
+        answered_elsewhere.extend(answered);
+        claims.claim(
+            left.iter()
+                .map(|index| lane_key(&run_context.project_id, &keyed[*index])),
+            observation_commit,
+        );
+        left
+    } else {
+        split.spilled.clone()
+    };
+    if !spilled.is_empty() {
         log::info!(
             "when:write checks: {} lane(s) declare platforms the write cell is not on; running them verdict-only at {observation_commit}: {:?}",
-            split.spilled.len(),
-            split
-                .spilled
+            spilled.len(),
+            spilled
                 .iter()
                 .map(|index| keyed[*index].0.name.as_str())
                 .collect::<Vec<_>>()
@@ -7845,7 +7884,7 @@ async fn run_write_checks_after_seal_inner(
                 checks: &checks,
                 extra_inputs: &extra_inputs,
                 keyed: &keyed,
-                order: &split.spilled,
+                order: &spilled,
                 timeouts: &timeouts,
                 sealed_commit: observation_commit,
                 cell_env: &cell_env,
@@ -8023,6 +8062,10 @@ async fn run_write_checks_after_seal_inner(
         return None;
     }
     let summary = format!("Checks: {}", format_check_summary(&results));
+    let summary = match format_answered_elsewhere(&answered_elsewhere) {
+        Some(line) => format!("{summary}\n{line}"),
+        None => summary,
+    };
     // The fix is attributed ONCE, at batch level: it is the wave's combined
     // delta, not any single check's, so no per-check annotation can honestly
     // claim it.
@@ -8245,6 +8288,115 @@ struct FixedWave {
     /// Each check process's environment at the fixed commit: the slot's, plus
     /// the transport of the fixed commit's own change.
     process_env: Vec<(String, String)>,
+    /// Invalidated lanes another wave verified at the same input key, whose
+    /// verdicts the fold reuses instead of running them again.
+    answered_elsewhere: Vec<ClaimedElsewhere>,
+}
+
+/// How long a fold waits for another write wave to record a lane it is
+/// verifying at the same input key. Longer than one lane's default budget plus
+/// its queueing, since the claimant's whole wave has to finish; past it, the
+/// fold runs the lane itself, which costs a duplicate and never a verdict.
+const FOLD_HANDOFF_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(2 * DEFAULT_WRITE_CHECK_TIMEOUT_MS as u64);
+
+fn lane_key(project_id: &str, (plan, input_hash): &(CheckPlan, String)) -> LaneKey {
+    LaneKey {
+        project_id: project_id.to_string(),
+        check_name: plan.name.clone(),
+        input_hash: input_hash.clone(),
+    }
+}
+
+/// Of `candidates`, the lanes a fold must still run itself, and the lanes
+/// another write wave answered.
+///
+/// A fold onto a head the branch moved to re-keys its lanes to that head, whose
+/// own wave is usually verifying the same lanes at the same keys. So the fold
+/// first waits for any other wave holding one of these keys to record, and only
+/// then asks the result cache what is still a miss. The cache, not the claim,
+/// decides: a claimant that recorded leaves a reusable verdict the fold's
+/// recording reuses and names, and one that left none (its lane died, or its own
+/// fold re-keyed the lane away) leaves the lane a miss the fold runs. Nothing is
+/// verified twice, and nothing goes unverified.
+async fn lanes_left_to_run(
+    db: Arc<LocalDb>,
+    claims: &mut WaveClaims,
+    project_id: &str,
+    keyed: &[(CheckPlan, String)],
+    candidates: &[usize],
+    effective_env: &[(String, String)],
+    bound: std::time::Duration,
+) -> (Vec<usize>, Vec<ClaimedElsewhere>) {
+    if candidates.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let keys: Vec<LaneKey> = candidates
+        .iter()
+        .map(|index| lane_key(project_id, &keyed[*index]))
+        .collect();
+    let elsewhere = claims.await_other_waves(&keys, bound).await;
+    let left: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|index| {
+            needs_execution(
+                db.clone(),
+                project_id,
+                &keyed[*index].0,
+                &keyed[*index].1,
+                effective_env,
+            )
+        })
+        .collect();
+    let answered: Vec<ClaimedElsewhere> = elsewhere
+        .into_iter()
+        .filter(|lane| {
+            !left
+                .iter()
+                .any(|index| keyed[*index].0.name == lane.check_name)
+        })
+        .collect();
+    if !answered.is_empty() {
+        log::info!(
+            "when:write checks: fold reuses {} lane(s) another wave verified at the same key: {:?}",
+            answered.len(),
+            answered
+                .iter()
+                .map(|lane| format!("{} @ {}", lane.check_name, lane.commit))
+                .collect::<Vec<_>>()
+        );
+    }
+    (left, answered)
+}
+
+/// The line a wave's summary carries for the lanes its fold reused from another
+/// wave, naming that wave's commit, or `None` when it reused none.
+fn format_answered_elsewhere(answered: &[ClaimedElsewhere]) -> Option<String> {
+    if answered.is_empty() {
+        return None;
+    }
+    let mut by_commit: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for lane in answered {
+        by_commit
+            .entry(lane.commit.as_str())
+            .or_default()
+            .push(lane.check_name.as_str());
+    }
+    let named = by_commit
+        .iter()
+        .map(|(commit, names)| {
+            format!(
+                "{} from the wave at {}",
+                names.join(", "),
+                commit.get(..12).unwrap_or(commit)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Reused, not run twice: {named}, which was already verifying the same inputs."
+    ))
 }
 
 /// What re-planning a wave against the fixed commit yields: every plan paired
@@ -8396,18 +8548,20 @@ fn replan_onto_fix(planning: FixReplanning) -> Result<Replan, String> {
 /// explains, or a check that was answered from the cache before the fix touched
 /// its inputs, falls back to running that check once against the fixed commit.
 ///
-/// Planning is bound to `fixed_commit`, the commit the fix was published as,
+/// Planning is bound to `fix.commit`, the commit the fix was published as,
 /// never to whatever the branch head is by the time this runs: a detached wave
 /// can outlive several later commits.
 async fn rekey_wave_onto_fix(
     orch: &Orchestrator,
     wave: WriteCheckBatchRequest<'_>,
     cwd: &str,
-    fixed_paths: &[String],
-    fixed_commit: &str,
-    fix_landed_on_tested_base: bool,
+    fix: &crate::mcp::handlers::run::PublishedSlotDelta,
     deferred: &[usize],
+    claims: &mut WaveClaims,
 ) -> Result<FixedWave, String> {
+    let fixed_paths = fix.paths.as_slice();
+    let fixed_commit = fix.commit.as_str();
+    let fix_landed_on_tested_base = fix.landed_on_tested_base;
     let logical = crate::mcp::handlers::branch::resolve_current_for_read(
         orch,
         &crate::mcp::types::McpCallbackRequest {
@@ -8460,23 +8614,40 @@ async fn rekey_wave_onto_fix(
             .map_err(|error| format!("join the post-fix planning unit: {error}"))??;
     let process_env = write_check_transport_env(wave.cell_env, transport);
 
+    let project_id = wave.run_context.project_id.as_str();
+    // The keys these lanes were planned under will never be recorded now, so no
+    // other fold should wait on them.
+    claims.release(
+        invalidated
+            .iter()
+            .map(|index| lane_key(project_id, &wave.keyed[*index])),
+    );
     // An invalidated verdict may still be answerable from the cache on the FIXED
-    // tree; only a genuine miss needs the slot. A deferred lane is never
-    // re-verified here: it has not run yet, it runs at the fixed commit once
-    // this returns, and the write cell is the one place it cannot run.
-    let misses: Vec<usize> = invalidated
+    // tree, including from another wave verifying the same key right now (the
+    // moved head's own wave, usually); only a genuine miss needs the slot. A
+    // deferred lane is never re-verified here: it has not run yet, it runs at
+    // the fixed commit once this returns, and the write cell is the one place it
+    // cannot run.
+    let candidates: Vec<usize> = invalidated
         .into_iter()
         .filter(|index| !deferred.contains(index))
-        .filter(|index| {
-            needs_execution(
-                orch.db.local.clone(),
-                &wave.run_context.project_id,
-                &rekeyed[*index].0,
-                &rekeyed[*index].1,
-                &process_env,
-            )
-        })
         .collect();
+    let (misses, answered_elsewhere) = lanes_left_to_run(
+        orch.db.local.clone(),
+        claims,
+        project_id,
+        &rekeyed,
+        &candidates,
+        &process_env,
+        FOLD_HANDOFF_WAIT,
+    )
+    .await;
+    claims.claim(
+        misses
+            .iter()
+            .map(|index| lane_key(project_id, &rekeyed[*index])),
+        &head,
+    );
     if misses.is_empty() {
         return Ok(FixedWave {
             keyed: rekeyed,
@@ -8484,6 +8655,7 @@ async fn rekey_wave_onto_fix(
             results: HashMap::new(),
             non_convergent: None,
             process_env,
+            answered_elsewhere,
         });
     }
     log::info!(
@@ -8512,6 +8684,7 @@ async fn rekey_wave_onto_fix(
         results: outcome.results,
         non_convergent: outcome.delta,
         process_env,
+        answered_elsewhere,
     })
 }
 
@@ -22706,6 +22879,177 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert_eq!(alias.evaluated_tree_hash, "tree-2");
     }
 
+    /// A fold onto a moved head re-keys a lane to the head's tree while the
+    /// head's own wave is verifying that same key (cairn/5932, where six lanes
+    /// ran twice at 8da684fc). The fold waits for that wave, runs nothing, and
+    /// records the head wave's verdict at the fix commit by reuse, so the fix
+    /// commit's row names the head's observation. A fix that changed no paths
+    /// publishes the head itself as the fix commit; one with paths publishes a
+    /// child of it. Both read the same way.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fold_onto_a_moved_head_reuses_the_heads_own_verdict_instead_of_running_it() {
+        for (fix_commit, fix_tree) in [("commit-h2", "tree-h2"), ("commit-fix", "tree-fix")] {
+            let db = cache_db().await;
+            let registry = Arc::new(crate::execution::lane_claims::LaneClaims::default());
+            let keyed = vec![(
+                plan("migrations", "bun run check:migrations"),
+                "IH2".to_string(),
+            )];
+            let environment = plan_environment_fingerprint(&keyed[0].0);
+
+            // H2's own wave planned first and is verifying migrations at IH2.
+            let mut head_wave = registry.open_wave("job-a");
+            head_wave.claim([lane_key("project-a", &keyed[0])], "commit-h2");
+            // H1's wave, folding, still holds the key it planned under at H1.
+            let mut fold = registry.open_wave("job-a");
+            fold.claim(
+                [LaneKey {
+                    project_id: "project-a".into(),
+                    check_name: "migrations".into(),
+                    input_hash: "IH1".into(),
+                }],
+                "commit-h1",
+            );
+
+            let mut observation =
+                reusable_observation_for("migrations", "IH2", environment.clone());
+            observation.id = "obs-h2".into();
+            observation.commit_sha = "commit-h2".into();
+            observation.defined_by_commit_sha = "commit-h2".into();
+            observation.tree_hash = "tree-h2".into();
+            observation.sealed_coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+                "commit-h2",
+                "commit-h2",
+                "tree-h2",
+                "IH2",
+            );
+            observation.verdict_environment_hash =
+                Some(effective_verdict_environment_hash(&keyed[0].0, &[]));
+            let recorder = db.clone();
+            let head_records = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                record_fresh_check_observation(recorder, observation).unwrap();
+                drop(head_wave);
+            });
+
+            let (left, answered) = lanes_left_to_run(
+                db.clone(),
+                &mut fold,
+                "project-a",
+                &keyed,
+                &[0],
+                &[],
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+            head_records.await.unwrap();
+            assert!(
+                left.is_empty(),
+                "the head's wave verified migrations at this key; the fold must not run it again"
+            );
+            assert_eq!(
+                answered,
+                vec![ClaimedElsewhere {
+                    check_name: "migrations".into(),
+                    commit: "commit-h2".into(),
+                }]
+            );
+            let line = format_answered_elsewhere(&answered).expect("the summary names the reuse");
+            assert!(
+                line.contains("migrations from the wave at commit-h2"),
+                "{line}"
+            );
+
+            // Recording the fold runs nothing: the head's verdict answers it.
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let outcomes = run_planned_checks_at_commit(
+                db.clone(),
+                "project-a",
+                CheckRunCommit {
+                    evaluated: fix_commit,
+                    defined_by: fix_commit,
+                },
+                fix_tree,
+                "job-a",
+                &keyed,
+                "tool",
+                CheckExecMode::Shared,
+                None,
+                move |_index, _command, _stream_id| {
+                    let counted = counted.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        exec_ok(Some(0), "ran")
+                    }
+                },
+                |_| {},
+            )
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "fix commit {fix_commit}");
+            assert!(
+                outcomes[0].passed && outcomes[0].cached,
+                "the lane is answered by reuse: {}",
+                outcomes[0].output_tail
+            );
+
+            let row = crate::execution::cache::get_check_result_observation(
+                db,
+                "project-a",
+                fix_commit,
+                "migrations",
+                &environment,
+                crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64,
+                None,
+                None,
+                1,
+                0,
+            )
+            .unwrap()
+            .expect("the fix commit is not blank");
+            assert_eq!(
+                row.source_commit_sha, "commit-h2",
+                "the fix commit's row names the head wave's observation"
+            );
+        }
+    }
+
+    /// The claim is a hint, never a verdict: a claimant that ends without
+    /// recording one (its lane died, or its own fold re-keyed it away) leaves
+    /// the lane a miss, and the fold runs it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fold_runs_the_lane_another_wave_left_without_a_verdict() {
+        let db = cache_db().await;
+        let registry = Arc::new(crate::execution::lane_claims::LaneClaims::default());
+        let keyed = vec![(
+            plan("migrations", "bun run check:migrations"),
+            "IH2".to_string(),
+        )];
+        let mut head_wave = registry.open_wave("job-a");
+        head_wave.claim([lane_key("project-a", &keyed[0])], "commit-h2");
+        let mut fold = registry.open_wave("job-a");
+        fold.claim([], "commit-h1");
+        let head_ends = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            drop(head_wave);
+        });
+        let (left, answered) = lanes_left_to_run(
+            db,
+            &mut fold,
+            "project-a",
+            &keyed,
+            &[0],
+            &[],
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        head_ends.await.unwrap();
+        assert_eq!(left, vec![0]);
+        assert!(answered.is_empty());
+    }
+
     /// The three abnormal deaths a check can suffer are each classified,
     /// persisted durably, and rendered as themselves — the core of this change.
     #[tokio::test]
@@ -25734,6 +26078,7 @@ mod write_check_stack_headroom {
             };
             let (progress, progress_seen) = tokio::sync::watch::channel(WaveProgress::default());
             let wave_orch = orch.clone();
+            let claims = orch.lane_claims.open_wave("job");
             let ceiling = std::time::Duration::from_secs(600);
             let summary = await_write_check_wave(
                 WriteChecksInFlightGuard::new(&orch, "job"),
@@ -25750,6 +26095,7 @@ mod write_check_stack_headroom {
                         "tool-use",
                         Some(&sealed_resolution),
                         progress,
+                        claims,
                     )
                     .await
                 },
