@@ -23,6 +23,7 @@ pub mod content_store;
 pub mod events;
 pub mod migration_files;
 pub mod pack_catalog;
+pub mod plan_audit;
 pub mod quarantine;
 pub mod render;
 pub mod served_api;
@@ -69,7 +70,7 @@ pub use route_firings::{
 };
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,
-    FromDbRow, RowExt,
+    FromDbRow, QueryConn, RowExt,
 };
 pub use runtime_admission::{
     admission_status, advance_team_mirror_phase, cancel_queued_admission,

@@ -600,7 +600,9 @@ pub const HELD_EXECUTIONS_SQL: &str = concat!(
 /// The order is load-bearing. Admission ranks by `queued_at`, so the order a
 /// burst is released in becomes the order it is admitted in; a nondeterministic
 /// order would turn a plan's implicit priority into a coin flip.
-pub async fn list_held_executions_conn(conn: &Connection) -> DbResult<Vec<HeldExecution>> {
+pub async fn list_held_executions_conn(
+    conn: &cairn_db::storage::TrackedConnection,
+) -> DbResult<Vec<HeldExecution>> {
     let mut rows = conn.query(HELD_EXECUTIONS_SQL, ()).await?;
     let mut held = Vec::new();
     while let Some(row) = rows.next().await? {

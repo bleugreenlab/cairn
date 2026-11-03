@@ -97,7 +97,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use cairn_db::turso::{params, Connection};
+use cairn_db::turso::params;
 use cairn_workflow::gates::store::{
     set_gate_detail_conn, set_gate_queue_key_conn, shift_queue_keys_conn, QUEUE_KEY_SCALE,
 };
@@ -108,7 +108,7 @@ use super::capacity::{
 };
 use crate::models::{CapacityHold, Pin, PinBy, PinKind};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbResult, LocalDb, RowExt};
+use crate::storage::{DbResult, LocalDb, RowExt, TrackedConnection};
 
 /// One unlatched capacity row of a queued execution: a place it occupies
 /// (blocking) or one it will wake on (dormant).
@@ -232,7 +232,7 @@ pub(super) const THREAD_HOLDS_SQL: &str = concat!(
 /// The thread's cap-held executions in queue order, each with its blocking
 /// and dormant capacity rows.
 pub(crate) async fn thread_queue_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     thread_id: &str,
 ) -> DbResult<Vec<ThreadQueued>> {
     let mut rows = conn.query(THREAD_QUEUE_SQL, params![thread_id]).await?;
@@ -299,7 +299,7 @@ pub(crate) struct Rotation {
 /// blocking row left without a place is numbered by the next sweep. Runs
 /// inside the caller's write transaction.
 pub(crate) async fn rotate_to_front_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     thread_id: &str,
     front: &[String],
     placed_by: &str,
@@ -398,7 +398,7 @@ pub(super) const AWAITS_AUTHORED_SQL: &str = concat!(
     " LIMIT 1"
 );
 
-async fn not_queued_reason(conn: &Connection, issue_id: &str) -> DbResult<String> {
+async fn not_queued_reason(conn: &TrackedConnection, issue_id: &str) -> DbResult<String> {
     let waits = crate::storage::query_opt_i64_conn(conn, AWAITS_AUTHORED_SQL, params![issue_id])
         .await?
         .is_some();
@@ -421,7 +421,7 @@ async fn not_queued_reason(conn: &Connection, issue_id: &str) -> DbResult<String
 /// order, or one line per offending entry. Each number expands to every
 /// cap-held execution of that child, in their current relative order.
 pub(crate) async fn resolve_order_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     thread_id: &str,
     thread_name: &str,
     order: &[serde_json::Value],
@@ -486,7 +486,7 @@ pub(crate) async fn resolve_order_conn(
 /// A thread's `order` patch, validated and applied in the caller's ONE write
 /// transaction: every offending entry, with nothing written, or the rotation.
 pub(crate) async fn order_thread_queue_conn(
-    conn: &Connection,
+    conn: &TrackedConnection,
     thread_id: &str,
     thread_name: &str,
     order: &[serde_json::Value],

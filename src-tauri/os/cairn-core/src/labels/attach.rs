@@ -101,7 +101,7 @@ pub(crate) async fn list_labels_for_issue(
 }
 
 pub(crate) async fn list_labels_for_issues(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     issue_ids: &[String],
 ) -> DbResult<HashMap<String, Vec<Label>>> {
     if issue_ids.is_empty() {

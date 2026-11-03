@@ -342,7 +342,7 @@ const fn as_str(bytes: &'static [u8]) -> &'static str {
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
     pub(crate) version: &'static str,
-    name: &'static str,
+    pub(crate) name: &'static str,
     sql: &'static str,
     /// When true, run this migration with foreign-key enforcement disabled.
     ///
@@ -428,6 +428,10 @@ pub(crate) fn chain_fingerprint(migrations: &[Migration]) -> String {
     }
     format!("{:x}", hasher.finalize())
 }
+
+/// This file, as a statement's `Location` names it. The plan audit skips the
+/// runner's statements by it: they run against a schema still being built.
+pub(crate) const RUNNER_FILE: &str = file!();
 
 /// A migration [`MigrationRunner::run_observed`] is about to apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +526,7 @@ impl MigrationRunner {
             }
         }
 
+        db.plan_audit().schema_changed();
         Ok(applied)
     }
 

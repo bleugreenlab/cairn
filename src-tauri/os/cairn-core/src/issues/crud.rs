@@ -254,14 +254,14 @@ enum RelationQuery {
 }
 
 async fn hydrate_issue_relations(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     issues: &mut [Issue],
 ) -> DbResult<()> {
     hydrate_issue_relations_with_observer(conn, issues, &mut |_| {}).await
 }
 
 async fn hydrate_issue_relations_with_observer(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     issues: &mut [Issue],
     observe_query: &mut impl FnMut(RelationQuery),
 ) -> DbResult<()> {
@@ -289,7 +289,7 @@ async fn hydrate_issue_relations_with_observer(
 }
 
 async fn load_optional_conn(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     id: &str,
 ) -> DbResult<Option<Issue>> {
     let sql = format!("SELECT {ISSUE_COLUMNS} FROM issues WHERE id = ?1");
@@ -305,7 +305,10 @@ async fn load_optional_conn(
     Ok(issue)
 }
 
-pub(crate) async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Issue> {
+pub(crate) async fn load_conn(
+    conn: &crate::storage::TrackedConnection,
+    id: &str,
+) -> DbResult<Issue> {
     load_optional_conn(conn, id)
         .await?
         .ok_or_else(|| db_internal(format!("issue not found: {id}")))

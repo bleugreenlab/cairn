@@ -20,6 +20,8 @@ use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 use tokio::time::{error::Elapsed, sleep, timeout};
 use turso::{params::IntoParams, Builder, Connection, Row};
 
+use super::plan_audit::{self, PlanAudit};
+
 const CONTENTION_ATTEMPT_THRESHOLD: usize = 1;
 const CONTENTION_BACKOFF_THRESHOLD: Duration = Duration::from_millis(10);
 
@@ -347,6 +349,9 @@ struct HolderShared {
     /// `query` whose [`TrackedRows`] are still alive. What tells a connection
     /// that is executing apart from one parked between statements.
     in_flight: AtomicUsize,
+    /// Set by [`TrackedConnection::exempt_from_plan_audit`] for the rest of
+    /// this call.
+    plan_audit_exempt: AtomicBool,
 }
 
 struct HolderState {
@@ -383,6 +388,7 @@ impl Holder {
                 handle: None,
             }),
             in_flight: AtomicUsize::new(0),
+            plan_audit_exempt: AtomicBool::new(false),
         }))
     }
 
@@ -422,10 +428,15 @@ impl Holder {
             label
         };
         runtime_regions::set_innermost_detail(STATEMENT_REGION, label);
+        super::plan_audit::record_raw_site(at);
     }
 
     fn statement(&self) -> Arc<str> {
         self.lock().statement.clone()
+    }
+
+    fn plan_audit_exempt(&self) -> bool {
+        self.0.plan_audit_exempt.load(Ordering::Relaxed)
     }
 
     fn start_statement(&self) -> InFlight {
@@ -1120,6 +1131,8 @@ impl LocalDb {
                 let changed = db.pull().await?;
                 if changed {
                     self.record_mutation();
+                    // Pulled pages can carry another replica's migrations.
+                    self.gate.plan_audit.schema_changed();
                 }
                 Ok(changed)
             }
@@ -1127,6 +1140,12 @@ impl LocalDb {
                 "pull() called on a local (non-synced) database",
             )),
         }
+    }
+
+    /// This database's plan audit, for the migration runner to say the schema
+    /// moved.
+    pub(crate) fn plan_audit(&self) -> &PlanAudit {
+        &self.gate.plan_audit
     }
 
     pub fn path(&self) -> &Path {
@@ -1399,6 +1418,9 @@ impl LocalDb {
                 // of it across an await, which would demand `F: Sync`.
                 let (conn_ref, sql) = (&conn, &sql);
                 let result: DbResult<Vec<T>> = async move {
+                    if let Some(audit) = conn_ref.plan_audit(caller, sql) {
+                        audit.await;
+                    }
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     let mut out = Vec::new();
                     while let Some(row) = rows.next().await? {
@@ -1468,6 +1490,9 @@ impl LocalDb {
                 // `move` for the same reason as in `query_all`.
                 let (conn_ref, sql) = (&conn, &sql);
                 let result: DbResult<Option<T>> = async move {
+                    if let Some(audit) = conn_ref.plan_audit(caller, sql) {
+                        audit.await;
+                    }
                     let mut rows = conn_ref.conn.query(sql, params).await?;
                     rows.next().await?.map(|row| map(&row)).transpose()
                 }
@@ -1591,7 +1616,12 @@ impl LocalDb {
             self.transaction_with_begin(caller, &holder, self.concurrent_begin(), move |conn| {
                 let sql = sql.clone();
                 let params = params.clone();
-                Box::pin(async move { Ok(conn.conn.execute(&sql, params).await?) })
+                Box::pin(async move {
+                    if let Some(audit) = conn.plan_audit(caller, &sql) {
+                        audit.await;
+                    }
+                    Ok(conn.conn.execute(&sql, params).await?)
+                })
             })
             .await
         })
@@ -1612,6 +1642,7 @@ impl LocalDb {
         DbCall::new(holder.clone(), move || async move {
             #[cfg(any(test, feature = "test-utils"))]
             self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
+            let schema_change = plan_audit::is_schema_change(&sql);
             self.transaction_with_begin(caller, &holder, self.concurrent_begin(), move |conn| {
                 let sql = sql.clone();
                 Box::pin(async move {
@@ -1619,7 +1650,11 @@ impl LocalDb {
                     Ok(())
                 })
             })
-            .await
+            .await?;
+            if schema_change {
+                self.gate.plan_audit.schema_changed();
+            }
+            Ok(())
         })
     }
 
@@ -1713,6 +1748,9 @@ impl LocalDb {
             if result.is_ok() {
                 self.release(conn);
                 self.record_mutation();
+                if plan_audit::is_schema_change(sql) {
+                    self.gate.plan_audit.schema_changed();
+                }
             }
             Ok(result?)
         })
@@ -1728,6 +1766,9 @@ impl LocalDb {
             let conn = self
                 .checkout(caller, HolderKind::PooledWrite, &holder)
                 .await?;
+            if let Some(audit) = conn.plan_audit(caller, sql) {
+                audit.await;
+            }
             let result = consume_on(&conn.conn, sql).await;
             if result.is_ok() {
                 self.release(conn);
@@ -2018,6 +2059,10 @@ impl LocalDb {
 /// application.
 #[derive(Debug)]
 pub(super) struct ConnectionGate {
+    /// What this database's statements have been explained as. On the gate
+    /// because the gate is the one object every connection to the database
+    /// reaches.
+    plan_audit: PlanAudit,
     state: Mutex<GateState>,
     /// Woken when the gate reopens, releasing everyone waiting to be admitted.
     reopened: Notify,
@@ -2051,6 +2096,7 @@ struct LiveConnection {
 impl ConnectionGate {
     fn new() -> Self {
         Self {
+            plan_audit: PlanAudit::new(),
             state: Mutex::new(GateState::default()),
             reopened: Notify::new(),
             drained: Notify::new(),
@@ -2237,15 +2283,20 @@ impl Drop for ConnectionSlot {
 /// Derefs to the connection, so a helper typed `&turso::Connection` takes one
 /// unchanged. The wrapper's first purpose is its `Drop`.
 ///
-/// Its own `query` and `execute` shadow the connection's to record each
-/// statement's call site and SQL head on the connection's gate record before
-/// running it, and to count the statement as in flight until it finishes (for
-/// a query, until its [`TrackedRows`] drop). That label is what the gate
-/// watch, a read-bound error, and the runtime stall line name. Everything else
-/// reaches the connection through `Deref`, which is `#[track_caller]` and
-/// records the borrowing line as `(raw connection; sql not captured)`: a
-/// helper called with `&conn` is named by its call site, and so is a `prepare`.
-/// A statement run that way is not counted as in flight.
+/// Its own `query`, `execute`, `prepare` and `execute_batch` shadow the
+/// connection's to record each statement's call site and SQL head on the
+/// connection's gate record before running it, and to count the statement as
+/// in flight until it finishes (for a query, until its [`TrackedRows`] drop).
+/// That label is what the gate watch, a read-bound error, and the runtime
+/// stall line name. `query`, `execute` and `prepare` also hand the statement to
+/// the plan audit (`storage::plan_audit`), which explains it the first time
+/// its call site issues it; `execute_batch` is labelled but not explained,
+/// since a script is many statements. Everything else reaches the connection
+/// through `Deref`, which is `#[track_caller]` and records the borrowing line
+/// as `(raw connection; sql not captured)`: a helper called with `&conn` is
+/// named by its call site, is not counted as in flight, and is invisible to
+/// the plan audit. Retyping such a helper to take `&TrackedConnection` is what
+/// brings its statements into view.
 pub struct TrackedConnection {
     conn: Connection,
     slot: ConnectionSlot,
@@ -2264,12 +2315,15 @@ impl TrackedConnection {
         sql: impl AsRef<str>,
         params: impl IntoParams,
     ) -> impl Future<Output = turso::Result<TrackedRows>> + Captures<&'_ ()> {
-        self.slot
-            .holder
-            .set_statement(Location::caller(), sql.as_ref());
+        let at = Location::caller();
+        self.slot.holder.set_statement(at, sql.as_ref());
+        let audit = self.plan_audit(at, sql.as_ref());
         let in_flight = self.slot.holder.start_statement();
         let running = self.conn.query(sql, params);
         async move {
+            if let Some(audit) = audit {
+                audit.await;
+            }
             let rows = running.await?;
             Ok(TrackedRows {
                 rows,
@@ -2286,16 +2340,88 @@ impl TrackedConnection {
         sql: impl AsRef<str>,
         params: impl IntoParams,
     ) -> impl Future<Output = turso::Result<u64>> + Captures<&'_ ()> {
-        self.slot
-            .holder
-            .set_statement(Location::caller(), sql.as_ref());
+        let at = Location::caller();
+        self.slot.holder.set_statement(at, sql.as_ref());
+        let audit = self.plan_audit(at, sql.as_ref());
         let in_flight = self.slot.holder.start_statement();
         let running = self.conn.execute(sql, params);
         async move {
+            if let Some(audit) = audit {
+                audit.await;
+            }
             let changed = running.await;
             drop(in_flight);
             changed
         }
+    }
+
+    /// [`Connection::prepare`], recording the statement and handing it to the
+    /// plan audit first. The prepared statement is not counted as in flight:
+    /// its runs happen through the statement, out of this wrapper's sight.
+    #[track_caller]
+    pub fn prepare(
+        &self,
+        sql: impl AsRef<str>,
+    ) -> impl Future<Output = turso::Result<turso::Statement>> + Captures<&'_ ()> {
+        let at = Location::caller();
+        self.slot.holder.set_statement(at, sql.as_ref());
+        let audit = self.plan_audit(at, sql.as_ref());
+        let preparing = self.conn.prepare(sql);
+        async move {
+            if let Some(audit) = audit {
+                audit.await;
+            }
+            preparing.await
+        }
+    }
+
+    /// [`Connection::execute_batch`], recording the script first and counting
+    /// it as running until it resolves. Not explained: `EXPLAIN` takes one
+    /// statement. A script that may change the schema tells the plan audit,
+    /// which reads the schema again at its next sighting.
+    #[track_caller]
+    pub fn execute_batch(
+        &self,
+        sql: impl AsRef<str>,
+    ) -> impl Future<Output = turso::Result<()>> + Captures<&'_ ()> {
+        self.slot
+            .holder
+            .set_statement(Location::caller(), sql.as_ref());
+        let schema_change = plan_audit::is_schema_change(sql.as_ref());
+        let in_flight = self.slot.holder.start_statement();
+        let running = self.conn.execute_batch(sql);
+        async move {
+            let ran = running.await;
+            drop(in_flight);
+            if schema_change && ran.is_ok() {
+                self.slot.gate.plan_audit.schema_changed();
+            }
+            ran
+        }
+    }
+
+    /// Leave every statement for the rest of this database call out of the
+    /// plan audit. For SQL an agent wrote (`cairn://db`): an ad hoc scan is
+    /// the reader's choice, not a defect in the codebase.
+    pub fn exempt_from_plan_audit(&self) {
+        self.slot
+            .holder
+            .0
+            .plan_audit_exempt
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// The plan audit's work for `sql` issued at `at`: an `EXPLAIN` the first
+    /// time this call site issues this SQL here, nothing after. Boxed, so the
+    /// statement future carries a pointer rather than the explain's state.
+    fn plan_audit(&self, at: Caller, sql: &str) -> Option<BoxFuture<'_, ()>> {
+        if self.slot.holder.plan_audit_exempt() {
+            return None;
+        }
+        let sighting = self.slot.gate.plan_audit.first_sighting(at, sql)?;
+        Some(Box::pin(
+            self.slot.gate.plan_audit.run(&self.conn, sighting),
+        ))
     }
 
     /// Take the bare connection back, ending its registration.
@@ -3215,11 +3341,29 @@ mod tests {
     /// --ignored --nocapture statement_overhead_probe`. Kept as the measurement
     /// the per-statement naming and bound were held to: a budget of about two
     /// microseconds per statement on top of what the engine itself costs.
+    ///
+    /// The `audited` line repeats the measurement on a database at a lineage
+    /// head, where every statement takes the plan audit's first-sighting check
+    /// (a hash and a set lookup) rather than stopping at its eligibility load.
+    /// Its difference from the first line is the audit's per-statement cost,
+    /// held to 0.3 us (cairn/5900).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "measurement probe; run explicitly in release"]
     async fn statement_overhead_probe() {
-        const CALLS: u32 = 20_000;
         let db = test_db().await.unwrap();
+        let (one, read) = overhead_of(&db).await;
+        println!("statement_overhead_probe: query_one={one}ns/call read={read}ns/call");
+        let temp = tempdir().unwrap();
+        let audited = LocalDb::open_migrated_for_test(temp.path().join("audited.db"))
+            .await
+            .unwrap();
+        let (one, read) = overhead_of(&audited).await;
+        println!("statement_overhead_probe: audited query_one={one}ns/call read={read}ns/call");
+    }
+
+    /// Best-of-five nanoseconds per `SELECT 1` through `query_one` and `read`.
+    async fn overhead_of(db: &LocalDb) -> (u128, u128) {
+        const CALLS: u32 = 20_000;
         for _ in 0..1_000 {
             db.query_one("SELECT 1", (), |row| row.i64(0))
                 .await
@@ -3237,11 +3381,11 @@ mod tests {
             best_one = best_one.min(started.elapsed().as_nanos() / u128::from(CALLS));
             let started = Instant::now();
             for _ in 0..CALLS {
-                query_i64(&db, "SELECT 1").await.unwrap();
+                query_i64(db, "SELECT 1").await.unwrap();
             }
             best_read = best_read.min(started.elapsed().as_nanos() / u128::from(CALLS));
         }
-        println!("statement_overhead_probe: query_one={best_one}ns/call read={best_read}ns/call");
+        (best_one, best_read)
     }
 
     /// One resource read's statements, as the hot resource readers issue them:

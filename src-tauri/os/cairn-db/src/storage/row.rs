@@ -1,6 +1,8 @@
+use std::future::Future;
+
 use turso::{params::IntoParams, Connection, Row, Rows, Value};
 
-use super::{DbError, DbResult};
+use super::{DbError, DbResult, TrackedConnection};
 
 pub trait FromDbRow: Sized {
     fn from_row(row: &Row) -> DbResult<Self>;
@@ -119,36 +121,109 @@ pub async fn next_i64(rows: &mut Rows, idx: usize) -> DbResult<Option<i64>> {
     rows.next().await?.map(|row| row.i64(idx)).transpose()
 }
 
-pub async fn query_text_conn<P>(conn: &Connection, sql: &str, params: P) -> DbResult<Option<String>>
-where
-    P: IntoParams,
-{
-    let mut rows = conn.query(sql, params).await?;
-    next_text(&mut rows, 0).await
+/// A connection the single-value helpers below can run on: the engine's own,
+/// or a [`TrackedConnection`], which records the statement's call site for the
+/// stall line and hands it to the plan audit.
+///
+/// The helpers take their SQL from the caller, so the statement's identity is
+/// the caller's line. They and this method are `#[track_caller]` functions
+/// returning futures rather than `async fn`s, which is what carries that line
+/// down to `TrackedConnection::query`.
+pub trait QueryConn: Sync {
+    /// Run `sql` and return its first row, if any.
+    #[track_caller]
+    fn query_first_row<'a, P>(
+        &'a self,
+        sql: &'a str,
+        params: P,
+    ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
+    where
+        P: IntoParams + Send + 'a;
 }
 
-pub async fn query_opt_text_conn<P>(
-    conn: &Connection,
-    sql: &str,
+impl QueryConn for Connection {
+    #[track_caller]
+    fn query_first_row<'a, P>(
+        &'a self,
+        sql: &'a str,
+        params: P,
+    ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
+    where
+        P: IntoParams + Send + 'a,
+    {
+        let rows = self.query(sql, params);
+        async move { Ok(rows.await?.next().await?) }
+    }
+}
+
+impl QueryConn for TrackedConnection {
+    #[track_caller]
+    fn query_first_row<'a, P>(
+        &'a self,
+        sql: &'a str,
+        params: P,
+    ) -> impl Future<Output = DbResult<Option<Row>>> + Send + 'a
+    where
+        P: IntoParams + Send + 'a,
+    {
+        let rows = self.query(sql, params);
+        async move { Ok(rows.await?.next().await?) }
+    }
+}
+
+/// The first row's column 0 as text, or `None` when there is no row.
+#[track_caller]
+pub fn query_text_conn<'a, C, P>(
+    conn: &'a C,
+    sql: &'a str,
     params: P,
-) -> DbResult<Option<String>>
+) -> impl Future<Output = DbResult<Option<String>>> + Send + 'a
 where
-    P: IntoParams,
+    C: QueryConn + ?Sized,
+    P: IntoParams + Send + 'a,
 {
-    let mut rows = conn.query(sql, params).await?;
-    next_opt_text(&mut rows, 0).await
+    let row = conn.query_first_row(sql, params);
+    async move { row.await?.map(|row| row.text(0)).transpose() }
 }
 
-pub async fn query_opt_i64_conn<P>(conn: &Connection, sql: &str, params: P) -> DbResult<Option<i64>>
+/// The first row's column 0 as optional text.
+#[track_caller]
+pub fn query_opt_text_conn<'a, C, P>(
+    conn: &'a C,
+    sql: &'a str,
+    params: P,
+) -> impl Future<Output = DbResult<Option<String>>> + Send + 'a
 where
-    P: IntoParams,
+    C: QueryConn + ?Sized,
+    P: IntoParams + Send + 'a,
 {
-    let mut rows = conn.query(sql, params).await?;
-    rows.next()
-        .await?
-        .map(|row| row.opt_i64(0))
-        .transpose()
-        .map(Option::flatten)
+    let row = conn.query_first_row(sql, params);
+    async move {
+        row.await?
+            .map(|row| row.opt_text(0))
+            .transpose()
+            .map(Option::flatten)
+    }
+}
+
+/// The first row's column 0 as an optional integer.
+#[track_caller]
+pub fn query_opt_i64_conn<'a, C, P>(
+    conn: &'a C,
+    sql: &'a str,
+    params: P,
+) -> impl Future<Output = DbResult<Option<i64>>> + Send + 'a
+where
+    C: QueryConn + ?Sized,
+    P: IntoParams + Send + 'a,
+{
+    let row = conn.query_first_row(sql, params);
+    async move {
+        row.await?
+            .map(|row| row.opt_i64(0))
+            .transpose()
+            .map(Option::flatten)
+    }
 }
 
 #[cfg(test)]

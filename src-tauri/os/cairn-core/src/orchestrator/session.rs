@@ -1669,7 +1669,7 @@ const CHANNEL_MESSAGES_SQL: &str = "SELECT rowid, sender_name, content, created_
 /// excluding every run of `exclude_job_id` (a recipient never hears its own
 /// posts) and, unless `include_system`, lifecycle messages.
 async fn recent_messages_for_run(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     project_key: &str,
     scope: ChannelScope<'_>,
     exclude_job_id: Option<&str>,
@@ -1824,7 +1824,7 @@ async fn session_and_job_id_for_run(
 }
 
 async fn read_channel_cursor(
-    conn: &cairn_db::turso::Connection,
+    conn: &crate::storage::TrackedConnection,
     session_id: &str,
 ) -> DbResult<Option<i64>> {
     let mut rows = conn

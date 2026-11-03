@@ -246,7 +246,12 @@ pub(super) const DB_SQL_MAX_LIMIT: usize = 1_000;
 /// validator (for `?sql=`), the row engine's generated SELECTs, and the read
 /// transaction are the durable safety layers; `query_only` prevents accidental
 /// writes if Turso supports the SQLite pragma in this build.
-pub(super) async fn enter_query_only(conn: &cairn_db::turso::Connection) {
+///
+/// It also leaves the read out of the plan audit: `cairn://db` SQL, which an
+/// agent wrote or the row engine built from its filters, is an ad hoc scan by
+/// the reader's choice, not a defect in the codebase.
+pub(super) async fn enter_query_only(conn: &crate::storage::TrackedConnection) {
+    conn.exempt_from_plan_audit();
     let _ = conn.execute("PRAGMA query_only = ON", ()).await;
 }
 
