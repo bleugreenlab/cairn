@@ -40,6 +40,10 @@ zeroize = "1"
 # Reading a scheduled task's exported definition, which `service install`
 # verifies field by field against the executor-task template.
 quick-xml = "0.38"
+# `archive::unpack_tar_gz`: the headless install's resource bundle and an
+# executor's managed tool trees, through one extractor.
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

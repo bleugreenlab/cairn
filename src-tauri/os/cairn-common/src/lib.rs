@@ -1,5 +1,6 @@
 pub mod abnormal_exit;
 pub mod approvals;
+pub mod archive;
 pub mod auth;
 pub mod authorization;
 pub mod build_identity;

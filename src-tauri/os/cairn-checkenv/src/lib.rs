@@ -742,6 +742,15 @@ mod tests {
         );
     }
 
+    /// npm is managed beside Node, but its version is a function of the Node
+    /// pin, so it enters neither the recorded identity nor any verdict key.
+    #[test]
+    fn npm_is_never_an_instrument() {
+        assert!(!RUNTIME_INSTRUMENTS.contains(&"npm"));
+        assert!(!KEYED_INSTRUMENTS.contains(&"npm"));
+        assert!(!identity(RUSTC_VERBOSE, "1.4.4").contains("npm"));
+    }
+
     #[test]
     fn a_three_instrument_identity_reads_each_and_drops_nodes_v() {
         let composed = identity_with_node(RUSTC_VERBOSE, "1.4.4", "v18.19.1");

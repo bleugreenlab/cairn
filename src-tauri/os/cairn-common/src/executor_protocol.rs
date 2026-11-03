@@ -6624,6 +6624,17 @@ pub struct LearnedResourceEstimate {
 /// stall-window grouper can read it. The runner alone composes and sends that
 /// diagnostic; no frame, variant, field or serialized form changes, and a
 /// runner talking to an older executor gets nothing wrong.
+///
+/// cairn/5889 does not move the number. `EXECUTOR_MANAGED_TOOLS` gains `npm`,
+/// the one name in the new [`EXECUTOR_TREE_TOOLS`]: its [`ToolArtifact`] is a
+/// tar.gz of the pinned Node's `node_modules/{npm,corepack}`, which the
+/// executor unpacks under its home and runs through wrappers in its bin.
+/// `ToolArtifact` and `ExecutorToolSelection` keep their shape, and which names
+/// are trees is fixed by name on both sides, never carried on the wire. An
+/// older executor skips a selected name it does not manage, so it installs no
+/// npm and its cells keep the host's, exactly as before; an older runner
+/// selects no npm, and a newer executor's npm probe says so. The toolchain
+/// identity does not grow: npm's version is a function of the Node pin.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -6722,15 +6733,19 @@ pub struct SidecarArtifact {
     pub version: String,
 }
 
-/// One pinned third-party tool (`jj`, `bun`, `uv`, `node`), re-hosted from the
-/// upstream release that `scripts/lib/pinned-tools.ts` pins and verifies at
-/// publish time. A headless runner installs jj, bun, and uv beside itself; an
-/// executor installs every [`EXECUTOR_MANAGED_TOOLS`] name into its own bin.
+/// One pinned third-party tool (`jj`, `bun`, `uv`, `node`, `npm`), re-hosted
+/// from the upstream release that `scripts/lib/pinned-tools.ts` pins and
+/// verifies at publish time. A headless runner installs jj, bun, and uv beside
+/// itself; an executor installs every [`EXECUTOR_MANAGED_TOOLS`] name into its
+/// own home.
 ///
-/// The bytes are a raw, already-extracted executable, never an archive. The
-/// digest lives here and nowhere else a checkout-less host could read, so the
-/// pins are never copied into Rust or shell. `version` is the upstream version;
-/// these binaries carry no Cairn stamp, so a consumer checks size and digest only.
+/// For a name in [`EXECUTOR_TREE_TOOLS`] the bytes are a deterministic tar.gz
+/// of a tree of plain files and directories; for every other name they are a
+/// raw, already-extracted executable, never an archive. The digest lives here
+/// and nowhere else a checkout-less host could read, so the pins are never
+/// copied into Rust or shell. `version` is the upstream version (for a tree,
+/// the version its source archive ships); these bytes carry no Cairn stamp, so
+/// a consumer checks size and digest only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolArtifact {
@@ -6748,10 +6763,14 @@ pub struct ToolArtifact {
 /// PATH. The same list as `PINNED_TOOLS` in `scripts/lib/pinned-tools.ts`, which
 /// `scripts/lib/pinned-tools.test.ts` holds it to.
 ///
-/// `node` is the bare executable only: npm, npx, and corepack are JavaScript
-/// trees beside it upstream and are not managed, so a host's npm, if any, runs
-/// under this Node through its `env node` shebang.
-pub const EXECUTOR_MANAGED_TOOLS: &[&str] = &["jj", "bun", "uv", "node"];
+/// In install order: `npm` runs under the `node` installed before it.
+pub const EXECUTOR_MANAGED_TOOLS: &[&str] = &["jj", "bun", "uv", "node", "npm"];
+
+/// The [`EXECUTOR_MANAGED_TOOLS`] whose [`ToolArtifact`] is a tar.gz of a tree
+/// rather than one executable. `npm` is the pinned Node's own npm and corepack
+/// JavaScript, which needs that Node to run. The same list as
+/// `PINNED_TREE_TOOLS` in `scripts/lib/pinned-tools.ts`.
+pub const EXECUTOR_TREE_TOOLS: &[&str] = &["npm"];
 
 /// What [`EXECUTOR_TOOL_SELECTION_PATH`] answers: the tools a runner's
 /// publication names for one target, each pointing at the runner itself.
