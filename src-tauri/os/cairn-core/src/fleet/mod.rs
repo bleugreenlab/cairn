@@ -11201,16 +11201,7 @@ impl Fleet {
             // What can: evidence that the check's tree has stopped making
             // progress. See `WRITE_CHECK_SILENCE_BOUND_MS`.
             item.silence_bound_ms = silence_bound_ms;
-            for (content_env, file_env) in [
-                (
-                    "CAIRN_CHECK_CHANGED_FILES_CONTENT",
-                    "CAIRN_CHECK_CHANGED_FILES",
-                ),
-                (
-                    "CAIRN_CHECK_BASE_CONTENT_CONTENT",
-                    "CAIRN_CHECK_BASE_CONTENT",
-                ),
-            ] {
+            for (content_env, file_env) in crate::execution::checks::CHECK_CONTENT_TRANSPORTS {
                 if let Some(index) = item.env.iter().position(|(key, _)| key == content_env) {
                     let (_, contents) = item.env.remove(index);
                     if !files.iter().any(|file| file.env == file_env) {

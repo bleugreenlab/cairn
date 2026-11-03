@@ -39,6 +39,7 @@ pub(crate) mod impact_slice;
 pub mod inputs;
 pub mod jobs;
 pub(crate) mod lane_breaker;
+pub(crate) mod lint_baseline;
 pub mod model_routing;
 pub mod operator_compact;
 pub mod ownership;

@@ -6578,6 +6578,14 @@ pub struct LearnedResourceEstimate {
 /// selects no Node, and a newer executor's node probe says so. An older
 /// executor's identity lacks the field, which a check-results row then omits;
 /// no verdict key carries Node, so reuse is unchanged either way.
+///
+/// cairn/5851 does not move the number. A branch's `lint` lane may carry one
+/// more `ProcessBatchFile`, `CAIRN_CHECK_LINT_BASELINE`, holding its merge
+/// base's recorded lint findings; the runner now reads the list of content
+/// transports it turns into files from one constant instead of an inline
+/// array. `ProcessBatch.files` keeps its shape, and an older executor already
+/// materializes every entry under the variable it names, whatever the name, so
+/// it hands the lint script its baseline exactly as a newer one does.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above

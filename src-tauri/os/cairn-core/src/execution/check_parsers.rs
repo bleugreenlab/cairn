@@ -62,13 +62,36 @@ pub(crate) const MAX_FAILURE_NAMES: usize = 5;
 /// rendered lines bounded regardless of a runner's stack-trace verbosity.
 const MESSAGE_CHARS: usize = 240;
 
-/// Cap on a structured result's `report`. Mirrors `RUST_LINT_REPORT_CHARS` in
-/// scripts/lib/rust-lint-result.ts; re-applied here because the file is input.
+/// Cap on a structured result's `report`. Mirrors `LINT_REPORT_CHARS` in
+/// scripts/lib/lint-report.ts; re-applied here because the file is input.
 const REPORT_CHARS: usize = 1_500;
 
 /// The `parser` a `scripts/check-rust.ts` result file names: a static lint
 /// verdict, not a test enumeration.
 pub(crate) const RUST_LINT_PARSER: &str = "rust-lint";
+
+/// The `parser` a `scripts/check-lint.ts` result file names: eslint's verdict,
+/// which on a branch is the findings it adds over its base.
+pub(crate) const ESLINT_PARSER: &str = "eslint";
+
+/// Every `parser` whose result is a static lint verdict: `failed` counts gating
+/// sites, and `complete` says whether the lint measured anything at all.
+const LINT_PARSERS: [&str; 2] = [RUST_LINT_PARSER, ESLINT_PARSER];
+
+/// Whether `parser` names a lint (see [`LINT_PARSERS`]).
+pub(crate) fn is_lint_parser(parser: &str) -> bool {
+    LINT_PARSERS.contains(&parser)
+}
+
+/// The most fingerprints a lint result may record as its tree's finding set.
+/// Mirrors `MAX_RECORDED_FINDINGS` in scripts/lib/eslint-lint-result.ts; a set
+/// past it is dropped rather than truncated, because a truncated baseline
+/// subtracts too little and charges a branch with its base's remainder.
+pub(crate) const MAX_LINT_TREE_FINDINGS: usize = 1_000;
+
+/// Cap on one recorded fingerprint. Deterministic, so a base and a branch cap
+/// the same finding to the same string.
+const FINGERPRINT_CHARS: usize = 1_000;
 
 /// The `parser` a `bun test` run is recorded under.
 pub(crate) const BUN_TEST_PARSER: &str = "bun-test";
@@ -147,6 +170,50 @@ pub struct ParsedCheckResult {
     /// unverified however complete the rest of the result is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) unverified: Option<String>,
+    /// The finding sets an `eslint` verdict was read from: the linted tree's own
+    /// set (what makes this row a baseline for a branch cut from its tree) and,
+    /// on a branch, the base it subtracted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lint_findings: Option<LintFindings>,
+}
+
+/// See [`ParsedCheckResult::lint_findings`] and `scripts/lib/eslint-lint-result.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LintFindings {
+    /// The `tool|rule|file|message` fingerprint of every finding in the linted
+    /// tree, whatever the verdict subtracted. `None` when the tree held more
+    /// than [`MAX_LINT_TREE_FINDINGS`], so the row can never be a baseline.
+    #[serde(default)]
+    pub(crate) tree: Option<Vec<String>>,
+    /// The base a branch verdict subtracted; absent for a whole-tree verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) baseline: Option<LintBaselineRecord>,
+}
+
+/// Which base a branch's lint verdict was computed against, so the verdict can
+/// be re-read with its baseline named.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LintBaselineRecord {
+    pub(crate) base: String,
+    pub(crate) commit: String,
+    pub(crate) tree: String,
+    pub(crate) input_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inherited: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved: Option<usize>,
+    /// Why the base had no finding set to subtract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) missing: Option<String>,
+}
+
+impl ParsedCheckResult {
+    /// The linted tree's whole finding set, when this result recorded one.
+    pub(crate) fn lint_tree_findings(&self) -> Option<&[String]> {
+        self.lint_findings.as_ref()?.tree.as_deref()
+    }
 }
 
 /// A lane's duration divided into phases on one timeline, so they sum to the
@@ -371,14 +438,15 @@ impl VerdictFacts<'_> {
         is_test_runner_parser(&self.parser)
     }
 
-    /// A `rust-lint` result whose lint did not run to completion: cargo was not
-    /// runnable, no crate was selected, or clippy died without a verdict. Such a
-    /// result measured nothing, so an exit 0 beside it is not a verified pass.
+    /// A lint result ([`LINT_PARSERS`]) whose lint did not run to completion:
+    /// cargo was not runnable, no crate was selected, clippy died without a
+    /// verdict, or eslint produced no report. Such a result measured nothing, so
+    /// an exit 0 beside it is not a verified pass.
     ///
     /// Deliberately not every non-test parse with `complete == false`: tsc sets
     /// `complete: false` to mean "not a test enumeration", not "never measured".
     pub(crate) fn is_incomplete_lint(&self) -> bool {
-        self.parser == RUST_LINT_PARSER && !self.complete
+        is_lint_parser(&self.parser) && !self.complete
     }
 
     /// Tests the runner actually executed: passed + failed. Skipped/ignored tests
@@ -539,6 +607,7 @@ pub(crate) fn parse_check_output(command: &str, output: &str) -> Option<ParsedCh
             report: None,
             phases: None,
             unverified: Some(reason),
+            lint_findings: None,
         },
     })
 }
@@ -594,13 +663,13 @@ pub(crate) fn declared_empty_selection(output: &str) -> bool {
 }
 
 /// Parse the result file. Only parsers this core understands are accepted: a
-/// per-test result from any [`TEST_RUNNER_PARSERS`] runner, or a `rust-lint`
-/// verdict. Anything else (an unknown parser, malformed JSON) returns `None` so
-/// command detection still gets its turn.
+/// per-test result from any [`TEST_RUNNER_PARSERS`] runner, or a
+/// [`LINT_PARSERS`] verdict. Anything else (an unknown parser, malformed JSON)
+/// returns `None` so command detection still gets its turn.
 fn parse_structured_artifact(clean: &str) -> Option<ParsedCheckResult> {
     let value = structured_artifact(clean)?;
     match value.get("parser")?.as_str()? {
-        RUST_LINT_PARSER => parse_rust_lint_artifact(&value),
+        parser if is_lint_parser(parser) => parse_lint_artifact(&value, parser),
         parser if is_test_runner_parser(parser) => parse_test_artifact(&value, parser),
         _ => None,
     }
@@ -656,14 +725,18 @@ fn parse_test_artifact(value: &serde_json::Value, parser: &str) -> Option<Parsed
         phases: CheckPhases::from_artifact(value),
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
-/// A `scripts/check-rust.ts` lint verdict. `complete` is taken from the file and
-/// read as `false` when missing, so a result that cannot vouch for a full lint
-/// never becomes a clean measurement. No test counts are invented: `failed` is
-/// the gating-site tally, as it is for tsc.
-fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResult> {
+/// A lint verdict (`scripts/check-rust.ts`, `scripts/check-lint.ts`).
+/// `complete` is taken from the file and read as `false` when missing, so a
+/// result that cannot vouch for a full lint never becomes a clean measurement.
+/// No test counts are invented: `failed` is the gating-site tally, as it is for
+/// tsc. An `eslint` result's finding sets are kept only when well formed and
+/// within [`MAX_LINT_TREE_FINDINGS`]; a set that is not is recorded as absent,
+/// never truncated.
+fn parse_lint_artifact(value: &serde_json::Value, parser: &str) -> Option<ParsedCheckResult> {
     #[derive(serde::Deserialize)]
     struct LintFailure {
         name: String,
@@ -686,6 +759,21 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         .and_then(|v| v.as_str())
         .map(|report| head_chars(report.trim_end(), REPORT_CHARS))
         .filter(|report| !report.trim().is_empty());
+    let lint_findings = (parser == ESLINT_PARSER)
+        .then(|| value.get("lintFindings"))
+        .flatten()
+        .and_then(|findings| serde_json::from_value::<LintFindings>(findings.clone()).ok())
+        .map(|mut findings| {
+            findings.tree = findings
+                .tree
+                .filter(|tree| tree.len() <= MAX_LINT_TREE_FINDINGS)
+                .map(|tree| {
+                    tree.iter()
+                        .map(|print| cap_chars(print, FINGERPRINT_CHARS))
+                        .collect()
+                });
+            findings
+        });
     Some(ParsedCheckResult {
         schema_version: 1,
         complete: value
@@ -695,7 +783,7 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         selection: "unknown".to_string(),
         tests: vec![],
         undeclared_skips: 0,
-        parser: RUST_LINT_PARSER.to_string(),
+        parser: parser.to_string(),
         passed: 0,
         failed: failures.len(),
         skipped: 0,
@@ -705,6 +793,7 @@ fn parse_rust_lint_artifact(value: &serde_json::Value) -> Option<ParsedCheckResu
         failures,
         report,
         unverified: None,
+        lint_findings,
     })
 }
 
@@ -749,6 +838,7 @@ fn parse_tsc(clean: &str) -> Option<ParsedCheckResult> {
         report: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -878,6 +968,7 @@ fn parse_vitest_json(clean: &str) -> Option<ParsedCheckResult> {
         phases: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -980,6 +1071,7 @@ fn parse_vitest_summary(clean: &str) -> Option<ParsedCheckResult> {
         phases: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -1128,6 +1220,7 @@ fn parse_bun_test(clean: &str) -> Option<ParsedCheckResult> {
         phases: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -1297,6 +1390,7 @@ fn parse_nextest(clean: &str) -> Option<ParsedCheckResult> {
         report: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -1396,6 +1490,7 @@ fn parse_cargo_test(clean: &str) -> Option<ParsedCheckResult> {
         report: None,
         failures,
         unverified: None,
+        lint_findings: None,
     })
 }
 
@@ -2129,6 +2224,73 @@ real work
         format!("{RESULT_ARTIFACT_JSON_MARKER}{value}")
     }
 
+    /// The builder in scripts/lib/eslint-lint-result.ts must produce exactly
+    /// this file for its specimen inputs (its test asserts so).
+    const ESLINT_FIXTURE: &str = include_str!("fixtures/eslint_lint_result.json");
+
+    #[test]
+    fn an_eslint_result_keeps_its_added_sites_its_tree_set_and_its_baseline() {
+        let output = format!("$ bun run check:lint\n{}\n", result_line(ESLINT_FIXTURE));
+        let parsed = parse_check_output("bun run check:lint", &output).unwrap();
+        assert_eq!(parsed.parser, ESLINT_PARSER);
+        assert!(parsed.complete && !parsed.is_test_runner() && !parsed.is_incomplete_lint());
+        assert_eq!(parsed.failed, 1, "only the site the branch added gates");
+        assert_eq!(
+            parsed.failures[0].name,
+            "src/components/settings/sections/ExecutionQueueSection.tsx:149 react-hooks/purity"
+        );
+        assert_eq!(parsed.lint_tree_findings().map(<[String]>::len), Some(2));
+        let baseline = parsed
+            .lint_findings
+            .as_ref()
+            .and_then(|findings| findings.baseline.as_ref())
+            .expect("a branch verdict names the base it subtracted");
+        assert_eq!(baseline.base, "main");
+        assert_eq!(baseline.tree, "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c");
+        assert_eq!((baseline.inherited, baseline.resolved), (Some(1), Some(0)));
+        assert!(parsed
+            .report
+            .as_deref()
+            .unwrap()
+            .contains("inherited from main: 1"));
+
+        // The stored document round-trips, so a later branch reads the set back.
+        let stored = serde_json::to_string(&parsed).unwrap();
+        assert!(stored.contains("\"lintFindings\""));
+        let reread: ParsedCheckResult = serde_json::from_str(&stored).unwrap();
+        assert_eq!(reread, parsed);
+    }
+
+    #[test]
+    fn an_eslint_tree_set_past_the_cap_is_dropped_never_truncated() {
+        let tree: Vec<String> = (0..=MAX_LINT_TREE_FINDINGS)
+            .map(|index| format!("eslint|r|src/f{index}.ts|m"))
+            .collect();
+        let json = serde_json::json!({
+            "schemaVersion": 1, "parser": "eslint", "complete": true, "failures": [],
+            "lintFindings": { "tree": tree }
+        })
+        .to_string();
+        let parsed = parse_check_output("bun run check:lint", &result_line(&json)).unwrap();
+        assert!(parsed.lint_findings.is_some());
+        assert_eq!(parsed.lint_tree_findings(), None);
+    }
+
+    #[test]
+    fn an_eslint_run_without_a_baseline_is_unverified() {
+        let json = r#"{"schemaVersion":1,"parser":"eslint","complete":true,"failures":[],"unverified":"no baseline for main tree 0f1e2d3c4b5a","lintFindings":{"tree":["eslint|r|f|m"]}}"#;
+        let parsed = parse_check_output("bun run check:lint", &result_line(json)).unwrap();
+        assert_eq!(
+            parsed.unverified.as_deref(),
+            Some("no baseline for main tree 0f1e2d3c4b5a")
+        );
+        assert_eq!(
+            parsed.lint_tree_findings(),
+            Some(&["eslint|r|f|m".to_string()][..]),
+            "an unverified branch run still records its tree's set"
+        );
+    }
+
     #[test]
     fn a_rust_lint_result_parses_whatever_the_command_is_spelled_like() {
         assert_eq!(detect_parser("bun run check:rust"), None);
@@ -2233,7 +2395,7 @@ real work
         );
         assert_eq!(parsed.failed, 3);
 
-        let unknown = r#"{"schemaVersion":1,"parser":"eslint","failures":[]}"#;
+        let unknown = r#"{"schemaVersion":1,"parser":"stylelint","failures":[]}"#;
         assert!(parse_check_output("bun run check:rust", &result_line(unknown)).is_none());
         let future = r#"{"schemaVersion":2,"parser":"rust-lint","failures":[]}"#;
         assert!(parse_check_output("bun run check:rust", &result_line(future)).is_none());
@@ -2351,6 +2513,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                     message: None,
                 })
                 .collect(),
+            lint_findings: None,
         };
         let s = format_failure_names(&parsed).unwrap();
         assert!(s.starts_with("8 failed: f0, f1, f2, f3, f4"));
@@ -2376,6 +2539,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
             report: None,
             failures: vec![],
             unverified: None,
+            lint_findings: None,
         };
         assert!(format_failure_names(&parsed).is_none());
     }
@@ -2558,6 +2722,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 message: Some("AssertionError: boom".to_string()),
             }],
             unverified: None,
+            lint_findings: None,
         };
         let e = format_failure_excerpt(Some(&with_msgs), "RAW TAIL");
         assert_eq!(e, "suite test: AssertionError: boom");
@@ -2582,6 +2747,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
                 message: None,
             }],
             unverified: None,
+            lint_findings: None,
         };
         assert_eq!(
             format_failure_excerpt(Some(&no_msgs), "panic at src/lib.rs"),

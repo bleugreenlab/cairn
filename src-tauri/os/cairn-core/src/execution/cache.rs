@@ -156,6 +156,60 @@ fn passing_row_sql() -> String {
     )
 }
 
+/// The newest recorded finding set an `eslint` lint result carries for one
+/// `(check, input hash)` lane, in any environment and of either verdict: the
+/// set describes the tree, not the verdict computed from it, so a branch run's
+/// red over its base and main's own whole-tree red record the same set for the
+/// same inputs. A row that recorded no set (written before sets were, or past
+/// the cap) is passed over rather than read as an empty one.
+pub(crate) fn latest_lint_tree_findings(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    check_name: &str,
+    input_hash: &str,
+) -> Result<Option<Vec<String>>, String> {
+    use crate::execution::check_parsers::{ParsedCheckResult, ESLINT_PARSER};
+    let keys = (
+        project_id.to_string(),
+        check_name.to_string(),
+        input_hash.to_string(),
+    );
+    let documents: Vec<String> = run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let keys = keys.clone();
+            Box::pin(async move {
+                let sql = format!(
+                    "SELECT target_results_json
+                       FROM check_result_cache INDEXED BY {CHECK_RESULT_CACHE_KEY_INDEX}
+                      WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                        AND {} AND failure_kind IS NULL AND target_results_json IS NOT NULL
+                      ORDER BY ran_at DESC",
+                    RowFamily::Verdict.predicate("row_family"),
+                );
+                let mut rows = conn
+                    .query(
+                        &sql,
+                        params![keys.0.as_str(), keys.1.as_str(), keys.2.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row.text(0)?);
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to load recorded lint findings: {e}"))
+    })?;
+    Ok(documents.iter().find_map(|document| {
+        let parsed: ParsedCheckResult = serde_json::from_str(document).ok()?;
+        (parsed.parser == ESLINT_PARSER && parsed.complete)
+            .then(|| parsed.lint_tree_findings().map(<[String]>::to_vec))
+            .flatten()
+    }))
+}
+
 /// The infrastructure rows of one lane under `scopes` scope strings.
 fn infra_rows_sql(scopes: usize) -> String {
     format!(

@@ -7,8 +7,8 @@ use crate::execution::cache::{
 };
 use crate::execution::check_parsers::{
     anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    is_test_runner_parser, report_excerpt, ParsedCheckResult, VerdictFacts, MAX_FAILURE_NAMES,
-    RUST_LINT_PARSER,
+    is_lint_parser, is_test_runner_parser, report_excerpt, ParsedCheckResult, VerdictFacts,
+    MAX_FAILURE_NAMES,
 };
 use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
@@ -1712,7 +1712,7 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
                 _ if status.declared_unverified.is_some() => {
                     status.declared_unverified.clone().unwrap_or_default()
                 }
-                _ if status.parser.as_deref() == Some(RUST_LINT_PARSER) => {
+                _ if status.parser.as_deref().is_some_and(is_lint_parser) => {
                     "the lint did not run to completion".to_string()
                 }
                 (Some("empty"), _, _) => "no tests matched the change".to_string(),
@@ -2199,6 +2199,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
             })
             .collect(),
         unverified: None,
+        lint_findings: None,
     };
     format_failure_names(&parsed)
 }
@@ -2617,6 +2618,7 @@ mod tests {
                 })
                 .collect(),
             unverified: None,
+            lint_findings: None,
         })
         .unwrap()
     }
@@ -3090,6 +3092,7 @@ mod tests {
             skipped: 0,
             failures: vec![],
             unverified: None,
+            lint_findings: None,
         };
         tsc.target_results_json = Some(serde_json::to_string(&parsed).unwrap());
         let status = status_from_row(
@@ -3113,7 +3116,7 @@ mod tests {
                 selection: "unknown".to_string(),
                 tests: vec![],
                 undeclared_skips: 0,
-                parser: RUST_LINT_PARSER.to_string(),
+                parser: crate::execution::check_parsers::RUST_LINT_PARSER.to_string(),
                 passed: 0,
                 failed: failures.len(),
                 skipped: 0,
@@ -3129,6 +3132,7 @@ mod tests {
                     })
                     .collect(),
                 unverified: None,
+                lint_findings: None,
             })
             .unwrap(),
         );

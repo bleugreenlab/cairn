@@ -1063,6 +1063,7 @@ async fn run_turn_end_checks_inner(
 
     // 4. Compute changed files between immutable logical coordinates.
     let wave_base = base.clone();
+    let baseline_base = base.clone();
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let changed_jj = jj.clone();
     let changed_repo = logical_repository.clone();
@@ -1394,7 +1395,42 @@ async fn run_turn_end_checks_inner(
     // already-computed agent delta remains the canonical attribution source.
     // Turn-end waves plan only `when: review` suites, and the executor-protocol
     // comparison is a write-cadence suite, so no base-content bundle rides here.
-    let extra_env = crate::execution::checks::check_transport_env(&changed, None);
+    // The lint lane's base finding set does: it is how a branch's lint verdict
+    // becomes a verdict about its diff (`execution::lint_baseline`).
+    let mut extra_env = crate::execution::checks::check_transport_env(&changed, None);
+    let planned: Vec<String> = to_run.iter().map(|(plan, _)| plan.name.clone()).collect();
+    if planned
+        .iter()
+        .any(|name| crate::execution::lint_baseline::subtracts_base_findings(name))
+    {
+        let (baseline_jj, object_repository, repository, head, db, project, label) = (
+            jj.clone(),
+            repo_root.clone(),
+            logical_repository.clone(),
+            sealed_commit.clone(),
+            db.clone(),
+            coords.project_id.clone(),
+            coords.base_branch.clone(),
+        );
+        let baseline = tokio::task::spawn_blocking(move || {
+            crate::execution::lint_baseline::lint_baseline_env(
+                &crate::execution::lint_baseline::LintBaselineSource {
+                    jj: &baseline_jj,
+                    object_repository: &object_repository,
+                    repository: &repository,
+                    base: &baseline_base,
+                    head: &head,
+                    base_label: label.as_deref(),
+                },
+                db,
+                &project,
+                planned.iter().map(String::as_str),
+            )
+        })
+        .await
+        .map_err(|error| format!("turn-end lint baseline task failed: {error}"))?;
+        extra_env.extend(baseline);
+    }
 
     // 12. Submit every remaining miss through one sequential pure-verdict lease,
     // then feed the keyed outcomes through the shared persistence, parsing, and

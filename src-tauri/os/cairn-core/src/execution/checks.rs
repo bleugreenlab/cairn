@@ -250,6 +250,19 @@ pub(crate) fn check_transport_env(
     env
 }
 
+/// Every `*_CONTENT` transport a check batch may carry, paired with the
+/// script-facing variable naming the file the fleet writes its content to.
+/// The fleet and the impact slice both read this one list, so a transport added
+/// here reaches the script whichever way the lane runs.
+pub(crate) const CHECK_CONTENT_TRANSPORTS: [(&str, &str); 3] = [
+    (CHANGED_FILES_CONTENT_ENV, "CAIRN_CHECK_CHANGED_FILES"),
+    (BASE_CONTENT_CONTENT_ENV, "CAIRN_CHECK_BASE_CONTENT"),
+    (
+        crate::execution::lint_baseline::LINT_BASELINE_CONTENT_ENV,
+        crate::execution::lint_baseline::LINT_BASELINE_ENV,
+    ),
+];
+
 /// Whether a check compares the executor protocol against its base, and so needs
 /// the base-content bundle in its transport.
 fn needs_executor_base_content(check_name: &str) -> bool {
@@ -1250,6 +1263,10 @@ pub(crate) async fn resolve_check_contract_at_commit(
 /// an error: substituting another base would produce a verdict about a
 /// different change. The runner computes this because the script cannot: a
 /// remote cell's checkout is a detached head with no base ref to ask.
+///
+/// With `baseline_store` (the store and project the run records into), a check
+/// judged against its base's findings also carries that base's recorded set
+/// ([`crate::execution::lint_baseline`]).
 async fn base_relative_transport(
     jj_binary_path: &str,
     config_dir: &Path,
@@ -1257,6 +1274,7 @@ async fn base_relative_transport(
     head: &str,
     target: &str,
     check_name: &str,
+    baseline_store: Option<(Arc<LocalDb>, String)>,
 ) -> Result<Vec<(String, String)>, String> {
     let jj = crate::jj::environment(jj_binary_path, config_dir);
     let repository = {
@@ -1277,6 +1295,9 @@ async fn base_relative_transport(
         .base;
     let head = head.to_string();
     let carries_protocol_base = needs_executor_base_content(check_name);
+    let check_name = check_name.to_string();
+    let target = target.to_string();
+    let object_repository = project_repository.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let changed = logical_changed_files(&jj, &repository, &base, &head).map_err(|error| {
             format!("the changed files of {base}..{head} could not be read: {error}")
@@ -1285,7 +1306,24 @@ async fn base_relative_transport(
             .then(|| executor_base_content_bundle(&jj, &repository, &base, &changed))
             .transpose()
             .map_err(|error| format!("executor protocol base content from {base}: {error}"))?;
-        Ok(check_transport_env(&changed, base_content))
+        let mut env = check_transport_env(&changed, base_content);
+        if let Some((db, project_id)) = baseline_store {
+            let source = crate::execution::lint_baseline::LintBaselineSource {
+                jj: &jj,
+                object_repository: &object_repository,
+                repository: &repository,
+                base: &base,
+                head: &head,
+                base_label: Some(&target),
+            };
+            env.extend(crate::execution::lint_baseline::lint_baseline_env(
+                &source,
+                db,
+                &project_id,
+                [check_name.as_str()],
+            ));
+        }
+        Ok(env)
     })
     .await
     .map_err(|error| format!("manual check transport task failed: {error}"))?
@@ -1703,6 +1741,7 @@ pub(crate) async fn execute_check_contract(
         &context.commit_sha,
         &contract.attribution_target,
         check_name,
+        Some((db.clone(), context.project_id.clone())),
     )
     .await
     .map_err(|error| {
@@ -4308,6 +4347,8 @@ async fn submit_single_planned_check_batch(
 struct WriteWavePlanning {
     jj: JjEnv,
     repository: PathBuf,
+    /// The object database contracts are read from, the base's included.
+    object_repository: PathBuf,
     /// The commit the wave evaluates: the one the triggering call sealed.
     head: String,
     base: String,
@@ -4340,6 +4381,7 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
     let WriteWavePlanning {
         jj,
         repository,
+        object_repository,
         head,
         base,
         // Unsupported checks are never planned, so planning has no use for them.
@@ -4395,7 +4437,20 @@ fn plan_write_wave(planning: WriteWavePlanning) -> Option<Result<PlannedWriteWav
     } else {
         None
     };
-    let transport = check_transport_env(&changed, base_content);
+    let mut transport = check_transport_env(&changed, base_content);
+    transport.extend(crate::execution::lint_baseline::lint_baseline_env(
+        &crate::execution::lint_baseline::LintBaselineSource {
+            jj: &jj,
+            object_repository: &object_repository,
+            repository: &repository,
+            base: &base,
+            head: &head,
+            base_label: None,
+        },
+        db.clone(),
+        &project_id,
+        plans.iter().map(|plan| plan.name.as_str()),
+    ));
     // The narrowing baseline is this JOB's last green run of each check, not the
     // project's most recent row of any status. Both qualifiers carry weight: a
     // sibling branch's tree is not an anchor on this branch's lineage, and a red
@@ -5312,8 +5367,8 @@ impl From<String> for CheckExecutionFailure {
 }
 use crate::execution::check_parsers::{
     anchored_tail, extract_running_tests, format_failure_excerpt, format_failure_names,
-    parse_check_output, reported_test, ParsedCheckResult, ReportedTest, MAX_FAILURE_NAMES,
-    RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
+    is_lint_parser, parse_check_output, reported_test, ParsedCheckResult, ReportedTest,
+    ESLINT_PARSER, MAX_FAILURE_NAMES, RESULT_ARTIFACT_JSON_MARKER, RUST_LINT_PARSER,
 };
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
 use crate::jj::{
@@ -6845,6 +6900,7 @@ async fn run_write_checks_after_seal_inner(
     let planning = WriteWavePlanning {
         jj: jj.clone(),
         repository: logical.repository_path,
+        object_repository: object_repository.clone(),
         head: logical.commit_id,
         base: live_base.unwrap_or(logical.default_commit_id),
         contract: ChecksContract {
@@ -8415,6 +8471,20 @@ fn check_reuse_decision(
     if parsed.is_incomplete_lint() {
         return reject("lint did not run to completion");
     }
+    // An eslint verdict over a tree with findings depends on the base it was
+    // read against: the same tree is red alone and green over a base holding
+    // the same errors. Served by input key, one would answer the other's
+    // question, and main's whole-tree red would land on a branch that added
+    // nothing (cairn/5851). A clean tree is clean over every base.
+    if parsed.parser == ESLINT_PARSER
+        && !parsed
+            .lint_tree_findings()
+            .is_some_and(|tree| tree.is_empty())
+    {
+        return reject(
+            "the linted tree has findings, so its verdict depends on the base it was read against",
+        );
+    }
     if !parsed.is_test_runner() {
         return CheckReuseDecision {
             reusable: true,
@@ -8649,7 +8719,7 @@ fn fresh_observation_write(
         // enumeration", so other non-test parses keep counting as complete.
         complete: parsed
             .map(|result| {
-                if result.parser == RUST_LINT_PARSER {
+                if is_lint_parser(&result.parser) {
                     result.complete
                 } else {
                     !result.is_test_runner() || result.complete
@@ -11065,7 +11135,39 @@ async fn run_prospective_tree_checks(
     };
     // Carry attribution and comparison content in the request itself. Coordinator-local
     // temporary paths are unreadable when this pure-verdict check spills to a remote cell.
-    let env = check_transport_env(attributed_changed, base_content);
+    let mut env = check_transport_env(attributed_changed, base_content);
+    let planned: Vec<String> = keyed.iter().map(|(plan, _)| plan.name.clone()).collect();
+    if planned
+        .iter()
+        .any(|name| crate::execution::lint_baseline::subtracts_base_findings(name))
+    {
+        let (jj, repository, base, head, db, project) = (
+            gate_jj.clone(),
+            gate_repository.clone(),
+            base_commit_id.to_string(),
+            commit_id.to_string(),
+            result_db.clone(),
+            project_id.to_string(),
+        );
+        let baseline = tokio::task::spawn_blocking(move || {
+            crate::execution::lint_baseline::lint_baseline_env(
+                &crate::execution::lint_baseline::LintBaselineSource {
+                    jj: &jj,
+                    object_repository: &repository,
+                    repository: &repository,
+                    base: &base,
+                    head: &head,
+                    base_label: None,
+                },
+                db,
+                &project,
+                planned.iter().map(String::as_str),
+            )
+        })
+        .await
+        .map_err(|error| format!("lint baseline task failed: {error}"))?;
+        env.extend(baseline);
+    }
     let timeouts: Vec<u32> = keyed
         .iter()
         .map(|(plan, _)| {
@@ -15420,6 +15522,7 @@ cairn-common = { path = "../cairn-common" }
                     message: None,
                 })
                 .collect(),
+            lint_findings: None,
         }
     }
 
@@ -21921,6 +22024,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             report: None,
             failures: Vec::new(),
             unverified: None,
+            lint_findings: None,
         }
     }
 
@@ -22776,6 +22880,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             skipped: 0,
             failures: Vec::new(),
             unverified: None,
+            lint_findings: None,
         }
     }
 
@@ -23065,6 +23170,49 @@ mod executor_base_content_tests {
         );
     }
 
+    /// A lint verdict over a tree with findings depends on its base, so it is
+    /// never served to another request by input key; a clean tree's is.
+    #[test]
+    fn only_a_clean_trees_eslint_verdict_is_reusable() {
+        let eslint = |tree: Option<Vec<String>>| ParsedCheckResult {
+            schema_version: 1,
+            complete: true,
+            selection: "unknown".to_string(),
+            tests: Vec::new(),
+            undeclared_skips: 0,
+            parser: ESLINT_PARSER.to_string(),
+            passed: 0,
+            failed: 0,
+            suite_failures: 0,
+            skipped: 0,
+            deferred: 0,
+            failures: Vec::new(),
+            report: None,
+            phases: None,
+            unverified: None,
+            lint_findings: Some(crate::execution::check_parsers::LintFindings {
+                tree,
+                baseline: None,
+            }),
+        };
+        let command = "bun run check:lint";
+        assert!(check_reuse_decision(command, None, Some(&eslint(Some(Vec::new())))).reusable);
+        let red_base = check_reuse_decision(
+            command,
+            None,
+            Some(&eslint(Some(vec!["eslint|r|f|m".to_string()]))),
+        );
+        assert!(
+            !red_base.reusable,
+            "a green over a red base is relative to it"
+        );
+        assert!(red_base.reason.unwrap().contains("depends on the base"));
+        assert!(
+            !check_reuse_decision(command, None, Some(&eslint(None))).reusable,
+            "an unrecorded set cannot vouch for a clean tree"
+        );
+    }
+
     #[test]
     fn only_the_protocol_comparison_needs_base_content() {
         assert!(needs_executor_base_content(EXECUTOR_PROTOCOL_CHECK));
@@ -23157,6 +23305,7 @@ mod manual_transport_tests {
             &head,
             manual_attribution_target(Some("feature"), "ignored", "main"),
             EXECUTOR_PROTOCOL_CHECK,
+            None,
         )
         .await
         .unwrap();
@@ -23204,6 +23353,7 @@ mod manual_transport_tests {
             &head,
             manual_attribution_target(None, "agent/parent", "main"),
             "rust-lint",
+            None,
         )
         .await
         .unwrap();
@@ -23213,6 +23363,134 @@ mod manual_transport_tests {
             BTreeSet::from(["child.rs".to_string()])
         );
         assert_eq!(value(&env, BASE_CONTENT_CONTENT_ENV), None);
+    }
+
+    const LINT_CONFIG: &str = "checks:\n  lint:\n    command: bun run check:lint\n    when: review\n    impact:\n    - src/**\n";
+
+    /// A branch's lint lane carries its fork point's recorded finding set, read
+    /// back from the store under the input key the base's own row was recorded
+    /// at. Before any row records one, it carries the named absence instead.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_branch_lint_lane_carries_its_fork_points_recorded_findings() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping: jj not resolvable");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path();
+        init_project(repo);
+        let base = commit(
+            repo,
+            &[
+                (".cairn/config.yaml", LINT_CONFIG),
+                ("src/Nav.tsx", "Date.now();\n"),
+            ],
+            "main with a lint error",
+        );
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        let head = commit(repo, &[("src/Queue.tsx", "Date.now();\n")], "another");
+        git(repo, &["checkout", "-q", "main"]);
+        commit(repo, &[("src/later.tsx", "x\n")], "main moves on");
+
+        let db = Arc::new(crate::storage::migrated_test_db("lint-baseline-transport.db").await);
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-a', 'default', 'Project A', 'PA', '/tmp/project-a', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let transport = || {
+            base_relative_transport(
+                &bin,
+                home.path(),
+                repo,
+                &head,
+                manual_attribution_target(Some("feature"), "ignored", "main"),
+                "lint",
+                Some((db.clone(), "project-a".to_string())),
+            )
+        };
+        let baseline = |env: &[(String, String)]| -> serde_json::Value {
+            serde_json::from_str(
+                value(
+                    env,
+                    crate::execution::lint_baseline::LINT_BASELINE_CONTENT_ENV,
+                )
+                .expect("a branch lint lane carries its base"),
+            )
+            .unwrap()
+        };
+
+        let missing = baseline(&transport().await.unwrap());
+        assert_eq!(missing["base"], "main");
+        assert_eq!(
+            missing["commit"],
+            base.as_str(),
+            "the fork point, not main's tip"
+        );
+        assert_eq!(missing["fingerprints"], serde_json::Value::Null);
+        assert!(missing["missing"]
+            .as_str()
+            .unwrap()
+            .contains("no recorded lint result"));
+
+        let fingerprint = "eslint|react-hooks/purity|src/Nav.tsx|Error: Cannot call impure function during render";
+        let document = serde_json::json!({
+            "schemaVersion": 1, "parser": "eslint", "complete": true, "selection": "unknown",
+            "passed": 0, "failed": 1, "skipped": 0, "failures": [],
+            "lintFindings": { "tree": [fingerprint] }
+        })
+        .to_string();
+        let insert = format!(
+            "INSERT INTO check_result_cache(project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                 output_tail, duration_ms, ran_at, target_results_json)
+             VALUES ('project-a', '{tree}', '{input}', 'lint', 1, 0, '', 1, 1, '{document}');",
+            tree = missing["tree"].as_str().unwrap(),
+            input = missing["inputHash"].as_str().unwrap(),
+        );
+        db.execute_script(&insert).await.unwrap();
+
+        let found = baseline(&transport().await.unwrap());
+        assert_eq!(found["fingerprints"], serde_json::json!([fingerprint]));
+        assert!(found.get("missing").is_none());
+    }
+
+    /// A run of the base against itself (main's cadence, a `--branch main`
+    /// baseline) carries no baseline: its verdict is the whole tree.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_lint_run_of_the_base_itself_carries_no_baseline() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping: jj not resolvable");
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let repo = project.path();
+        init_project(repo);
+        let head = commit(repo, &[(".cairn/config.yaml", LINT_CONFIG)], "main");
+        let db = Arc::new(crate::storage::migrated_test_db("lint-baseline-self.db").await);
+
+        let env = base_relative_transport(
+            &bin,
+            home.path(),
+            repo,
+            &head,
+            "main",
+            "lint",
+            Some((db, "project-a".to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            value(
+                &env,
+                crate::execution::lint_baseline::LINT_BASELINE_CONTENT_ENV
+            ),
+            None
+        );
     }
 
     /// An integration target that does not resolve refuses the run; it never
@@ -23237,6 +23515,7 @@ mod manual_transport_tests {
             &head,
             "agent/vanished-parent",
             EXECUTOR_PROTOCOL_CHECK,
+            None,
         )
         .await
         .unwrap_err();
@@ -23373,6 +23652,7 @@ mod write_wave_target_tests {
             let planning = WriteWavePlanning {
                 jj: jj.clone(),
                 repository: coordinates.clone(),
+                object_repository: repo.clone(),
                 head: head.to_string(),
                 base: base.clone(),
                 contract: contract.contract,

@@ -496,6 +496,7 @@ mod tests {
             skipped: 0,
             failures: vec![],
             unverified: None,
+            lint_findings: None,
         };
         assert_eq!(
             card_check_verdict(true, Some(&empty.verdict_facts())),
@@ -936,6 +937,7 @@ mod tests {
                 skipped,
                 failures: vec![],
                 unverified: None,
+                lint_findings: None,
             };
             Some(serde_json::to_string(&parsed).unwrap())
         };

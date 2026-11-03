@@ -314,7 +314,7 @@ fn a_transport_on_both_batch_and_item_is_spilled_once_with_the_item_winning() {
             .map(|(_, value)| value.as_str())
             .collect()
     };
-    for (content_env, _) in CONTENT_TRANSPORTS {
+    for (content_env, _) in crate::execution::checks::CHECK_CONTENT_TRANSPORTS {
         assert!(
             named(content_env).is_empty(),
             "{content_env} reached the env"

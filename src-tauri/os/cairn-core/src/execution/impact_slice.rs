@@ -292,19 +292,6 @@ fn write_entry(target: &Path, bytes: &[u8], mode: u16) -> std::io::Result<()> {
     }
 }
 
-/// The content transports a check may carry, each paired with the variable that
-/// names the file its content is written to.
-const CONTENT_TRANSPORTS: [(&str, &str); 2] = [
-    (
-        "CAIRN_CHECK_CHANGED_FILES_CONTENT",
-        "CAIRN_CHECK_CHANGED_FILES",
-    ),
-    (
-        "CAIRN_CHECK_BASE_CONTENT_CONTENT",
-        "CAIRN_CHECK_BASE_CONTENT",
-    ),
-];
-
 /// The environment a cell lane would get: the batch's variables overlaid by the
 /// item's own, with the `*_CONTENT` transports written to files beside (never
 /// inside) the slice, exactly as the fleet does for a cell.
@@ -322,7 +309,7 @@ fn lane_env(
     for (key, value) in batch.env.iter().chain(&item.env) {
         overlay(&mut env, key, value.clone());
     }
-    for (content_env, file_env) in CONTENT_TRANSPORTS {
+    for (content_env, file_env) in crate::execution::checks::CHECK_CONTENT_TRANSPORTS {
         if let Some(position) = env.iter().position(|(key, _)| key == content_env) {
             let (_, contents) = env.remove(position);
             let path = scratch.join(file_env.to_ascii_lowercase());

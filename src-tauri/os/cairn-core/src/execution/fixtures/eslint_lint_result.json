@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "parser": "eslint",
+  "complete": true,
+  "selection": "unknown",
+  "tests": [],
+  "undeclaredSkips": 0,
+  "failures": [
+    {
+      "name": "src/components/settings/sections/ExecutionQueueSection.tsx:149 react-hooks/purity",
+      "message": "Error: Cannot call impure function during render `Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component happens to re-render."
+    }
+  ],
+  "report": "❌ lint: adds 1 eslint error(s) over main @ 6de7c4d4aa11\n  src/components/settings/sections/ExecutionQueueSection.tsx:149 react-hooks/purity  Error: Cannot call impure function during render `Date.now` is an impure function. Calling an impure function can produ…\n  ℹ inherited from main: 1 (the base's own errors, not this branch's verdict)\nℹ️  subtracted main tree 0f1e2d3c4b5a (1 recorded finding(s))",
+  "lintFindings": {
+    "tree": [
+      "eslint|react-hooks/purity|src/components/Nav.tsx|Error: Cannot call impure function during render `Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component happens to re-render.",
+      "eslint|react-hooks/purity|src/components/settings/sections/ExecutionQueueSection.tsx|Error: Cannot call impure function during render `Date.now` is an impure function. Calling an impure function can produce unstable results that update unpredictably when the component happens to re-render."
+    ],
+    "baseline": {
+      "base": "main",
+      "commit": "6de7c4d4aa11bb22cc33dd44ee55ff6677889900",
+      "tree": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "inputHash": "input-6de7c4d4",
+      "inherited": 1,
+      "resolved": 0
+    }
+  }
+}
