@@ -1418,7 +1418,7 @@ mod host {
         host.heads.run(SP1, "turn", false, 2);
         host.heads.run(SP2, "check-beside", true, 4);
 
-        let handle = request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+        let handle = request_with(&db, &host, DSV4F, None, "agent-1", None, 1_000)
             .await
             .unwrap();
         let predicted = (122.0 * 0.9 * GIB as f64) as u64;
@@ -1475,7 +1475,7 @@ mod host {
         let host = sparks();
         host.heads.attach(SP1, 110, 0);
         host.heads.attach(SP2, 110, 0);
-        request_with(&db, &host, DSV4F, "agent-1", None, 1_000)
+        request_with(&db, &host, DSV4F, None, "agent-1", None, 1_000)
             .await
             .unwrap();
         let published = host.published.lock().unwrap().clone();
@@ -1503,7 +1503,7 @@ mod host {
         host.heads.attach(SP1, 110, 0);
         host.heads.run(SP1, "check", true, 40);
 
-        request_with(&db, &host, QWEN, "agent-1", None, 1_000)
+        request_with(&db, &host, QWEN, None, "agent-1", None, 1_000)
             .await
             .unwrap();
         let past = 1_000 + (super::super::room::DRAIN_BOUND_SECS as i64) * 1_000;
