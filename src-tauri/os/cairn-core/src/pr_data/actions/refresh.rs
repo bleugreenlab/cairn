@@ -399,6 +399,17 @@ pub(crate) struct PrSnapshot {
     pub(crate) heads: HeadComparison,
     pub(crate) conflict: Option<SourceConflictReport>,
     pub(crate) files: Vec<PrFile>,
+    /// When this snapshot began reading the world it describes: GitHub for a
+    /// bound pull request, origin and the branch store for an unbound change.
+    /// Taken before the first read, so it can understate how recent the facts
+    /// are but never overstate it.
+    ///
+    /// This is not `cache.fetched_at`. That carries the row's
+    /// `github_fetched_at`, which a refresh confirming nothing moved leaves
+    /// untouched (a timestamp-only write would re-excite every mounted reader),
+    /// so it records the last change-bearing fetch and cannot say when anyone
+    /// last looked. This value is never persisted or emitted.
+    pub(crate) read_at: i64,
     /// When this snapshot stops describing the live world on its own, or `None`
     /// for a settled change that only an exact invalidation can move.
     expires_at: Option<i64>,
@@ -608,6 +619,7 @@ pub(crate) async fn pr_snapshot_for_job(
 /// Nothing calls this directly — it runs inside the coordinator's single flight,
 /// so "one refresh" is enforced here rather than trusted at each call site.
 async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnapshot, String> {
+    let read_at = chrono::Utc::now().timestamp();
     // Route to the database that owns this job — the team replica for a team
     // execution, the private DB for a local one. The `merge_requests` row and its
     // producing job live wholly in that database; reading `orch.db.local` for a
@@ -655,6 +667,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
                         heads: HeadComparison::Unknown,
                         conflict: None,
                         files: Vec::new(),
+                        read_at,
                         observed: None,
                     });
                 }
@@ -756,6 +769,7 @@ async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnap
         heads,
         conflict,
         files,
+        read_at,
         observed,
     })
 }
@@ -1120,13 +1134,42 @@ pub async fn close_pr_for_job(
     Ok("PR closed successfully".to_string())
 }
 
+/// The line that dates a render's perishable facts: when the snapshot behind
+/// them read the world, and how long before this render that was.
+///
+/// The snapshot is shared across readers while the age is computed per render,
+/// so a reader served a cached snapshot sees the facts' true age rather than
+/// the moment of its own read — which is what tells it whether a refresh is
+/// worth asking for.
+fn checked_line(read_at: i64, now: i64) -> String {
+    let at = chrono::DateTime::from_timestamp(read_at, 0)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| read_at.to_string());
+    let age_ms = u64::try_from(now.saturating_sub(read_at))
+        .unwrap_or(0)
+        .saturating_mul(1_000);
+    format!(
+        "Checked: {at} ({} ago)\n",
+        crate::execution::checks_status::human_duration(age_ms)
+    )
+}
+
 /// The artifact section for a change with no pull request bound to it.
 ///
 /// It states what is true, why it is true, and — when an attempt was made and
 /// failed — what the failure said. It renders no pull-request number, and no
 /// mergeability verdict or change counts unless the change measured is the
 /// change the world can see.
-fn render_unbound_section(cache: &PrCache, unbound: &UnboundFacts, artifact_uri: &str) -> String {
+///
+/// It dates its facts only when the snapshot probed something: a merged or
+/// closed change is not probed, so claiming a check there would be false.
+fn render_unbound_section(
+    cache: &PrCache,
+    unbound: &UnboundFacts,
+    read_at: i64,
+    now: i64,
+    artifact_uri: &str,
+) -> String {
     let local_only = matches!(unbound.publication, Some(Publication::LocalOnly));
     let mut out = if local_only {
         String::from("## Local PR\n\n")
@@ -1137,6 +1180,7 @@ fn render_unbound_section(cache: &PrCache, unbound: &UnboundFacts, artifact_uri:
     out.push('\n');
     out.push_str(&format!("State: {}\n", cache.state));
     if let Some(publication) = unbound.publication.as_ref() {
+        out.push_str(&checked_line(read_at, now));
         out.push_str(&publication_summary(publication, &unbound.source_branch));
         out.push('\n');
     }
@@ -1228,8 +1272,15 @@ pub async fn render_live_pr_section(
         Err(e) => return Some(format!("## Pull Request\n\n(failed to refresh: {e})\n")),
     };
     let cache = &snapshot.cache;
+    let now = chrono::Utc::now().timestamp();
     if let Some(unbound) = snapshot.unbound.as_ref() {
-        return Some(render_unbound_section(cache, unbound, artifact_uri));
+        return Some(render_unbound_section(
+            cache,
+            unbound,
+            snapshot.read_at,
+            now,
+            artifact_uri,
+        ));
     }
     let pr_number = cache.pr_number.unwrap_or_default();
     let header = format!("## Pull Request\n\nPR #{}: {}\n", pr_number, cache.pr_url);
@@ -1247,6 +1298,7 @@ pub async fn render_live_pr_section(
         cache.state,
         if cache.is_draft { " (draft)" } else { "" }
     ));
+    out.push_str(&checked_line(snapshot.read_at, now));
     let expected_action = match cache.state {
         PrState::Merged => Some("merge"),
         PrState::Closed => Some("close"),
@@ -1569,6 +1621,61 @@ mod tests {
             section.contains("action:\"refresh\"") && !section.contains("action:\"merge\""),
             "offers the repair, not a merge: {section}"
         );
+        assert!(
+            section.contains("\nChecked: "),
+            "dates the probe its verdicts rest on: {section}"
+        );
+    }
+
+    /// The dating line names the read, not the render, and words an age a
+    /// reader can act on without arithmetic.
+    #[test]
+    fn the_checked_line_dates_the_read_and_its_age() {
+        assert_eq!(
+            checked_line(1_000, 1_042),
+            "Checked: 1970-01-01T00:16:40Z (42s ago)\n"
+        );
+        assert!(checked_line(1_000, 1_000 + 3_725).contains("(1h 2m ago)"));
+        // A clock that steps backwards between read and render must not
+        // produce a negative or wrapped age.
+        assert!(checked_line(1_000, 900).contains("(0s ago)"));
+    }
+
+    /// The read time belongs to the snapshot: it is taken before the read, and
+    /// every reader served that snapshot is shown the same moment, so a cached
+    /// render cannot pass off old facts as just checked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shared_snapshot_carries_the_time_it_read() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+
+        let before = chrono::Utc::now().timestamp();
+        let first = pr_snapshot_for_job(&orch, "job-c", None).await.unwrap();
+        let after = chrono::Utc::now().timestamp();
+        assert!(
+            before <= first.read_at && first.read_at <= after,
+            "read_at {} lies outside the computation [{before}, {after}]",
+            first.read_at
+        );
+
+        let joined = pr_snapshot_for_job(&orch, "job-c", None).await.unwrap();
+        assert_eq!(orch.pr_refresh_cache.counters().misses, 1);
+        assert_eq!(joined.read_at, first.read_at);
+    }
+
+    /// A merged or closed change with no pull request is not probed, so its
+    /// artifact must not claim a check that never happened.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_settled_unbound_change_claims_no_check() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        seed_closed_local_mr(&orch.db.local, "job-r").await;
+
+        let section = render_live_pr_section(&orch, "job-r", "cairn://x/pr", false)
+            .await
+            .expect("a job with a merge request yields a section");
+
+        assert!(section.contains("State: CLOSED"), "{section}");
+        assert!(!section.contains("Checked:"), "{section}");
     }
 
     /// A failed `gh pr create` records its error on the action run that ran it.

@@ -888,6 +888,10 @@ async fn render_live_pr_section_includes_actions_and_honors_diff_full() {
         .expect("PR artifact should yield a section");
     assert!(default.contains("## Pull Request"));
     assert!(default.contains("PR #5"));
+    assert!(
+        default.contains("\nChecked: "),
+        "dates the GitHub read its facts come from: {default}"
+    );
     assert!(default.contains("Changes: +12 -3"));
     assert!(default.contains("src/lib.rs"));
     // Open PR advertises actions.
