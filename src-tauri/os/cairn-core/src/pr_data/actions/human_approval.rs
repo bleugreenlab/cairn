@@ -42,7 +42,9 @@ use crate::approvals_client::{
     AssertionExpectation, ClaimOutcome, CompletionOutcome, EnrollmentState, InvalidationOutcome,
     ReportOutcome,
 };
-use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
+use crate::execution::checks_status::{
+    lane_existence, LaneExistence, NodeCheckState, NodeCheckStatus, WaveCadence,
+};
 use crate::storage::LocalDb;
 
 use super::merge::{journal_merge_attempt_event, JournalEntry, MergeAttemptJournal};
@@ -73,8 +75,15 @@ pub(super) struct CheckGate {
 
 /// Judge the check ledger for `source_tip`. `require_checks` is a signed fact
 /// on the phone, so it is enforced here, on the executing path: every
-/// `gate`-policy lane must have passed on exactly this tip. An unreadable
-/// ledger blocks.
+/// `gate`-policy lane must hold a passing verdict on exactly this tip. An
+/// unreadable ledger blocks.
+///
+/// A verdict is what [`lane_existence`] calls [`LaneExistence::Complete`], the
+/// classification every other merge gate and checks surface uses, so a script
+/// check's exit-zero green counts and a runner's green its own result disowns
+/// (an empty selection, a cut-short enumeration, a declared unverified run)
+/// does not. The advisory counts follow the same rule: a lane that ended
+/// without a verdict is counted in neither column.
 pub(super) fn gate_checks(statuses: Option<&[NodeCheckStatus]>, source_tip: &str) -> CheckGate {
     let Some(statuses) = statuses else {
         return CheckGate {
@@ -89,20 +98,31 @@ pub(super) fn gate_checks(statuses: Option<&[NodeCheckStatus]>, source_tip: &str
             .verified_on
             .as_ref()
             .is_none_or(|verified| verified.head == source_tip);
-        match lane.state {
-            NodeCheckState::Passed if on_tip => counts.passed += 1,
-            NodeCheckState::Failed => counts.failed += 1,
-            NodeCheckState::Running | NodeCheckState::Pending => counts.pending += 1,
+        let existence = lane_existence(lane, WaveCadence::default());
+        let green = match existence {
+            Some(LaneExistence::Complete) => Some(lane.state != NodeCheckState::Failed),
+            _ => None,
+        };
+        match (green, lane.state) {
+            (Some(true), _) if on_tip => counts.passed += 1,
+            (Some(false), _) => counts.failed += 1,
+            (None, NodeCheckState::Running | NodeCheckState::Pending) => counts.pending += 1,
             _ => {}
         }
-        let passed = lane.state == NodeCheckState::Passed && on_tip;
-        if lane.policy == "gate" && !passed && blocking.is_none() {
-            blocking = Some(format!(
-                "the gate check `{}` has not passed on {}",
-                lane.name,
-                short(source_tip)
-            ));
+        if lane.policy != "gate" || blocking.is_some() || (green == Some(true) && on_tip) {
+            continue;
         }
+        let why = match (green, &existence) {
+            (Some(true), _) => "it passed only on an earlier commit".to_string(),
+            (Some(false), _) => "it failed".to_string(),
+            (None, Some(existence)) => format!("it has no verdict: {}", existence.describe()),
+            (None, None) => "it has no verdict for this head".to_string(),
+        };
+        blocking = Some(format!(
+            "the gate check `{}` has not passed on {} ({why})",
+            lane.name,
+            short(source_tip)
+        ));
     }
     CheckGate { counts, blocking }
 }

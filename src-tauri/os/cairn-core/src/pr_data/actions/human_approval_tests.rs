@@ -680,6 +680,23 @@ fn lane(
     }
 }
 
+/// A test runner's lane with its parsed result's facts.
+fn runner_lane(
+    state: NodeCheckState,
+    selection: &str,
+    complete: bool,
+    passed: usize,
+) -> NodeCheckStatus {
+    let mut lane = lane("tests", "gate", state, None);
+    lane.parser = Some("vitest".into());
+    lane.selection = Some(selection.into());
+    lane.complete = Some(complete);
+    lane.passed = Some(passed);
+    lane.failed = Some(0);
+    lane.skipped = Some(0);
+    lane
+}
+
 #[test]
 fn gate_checks_require_every_gate_lane_passed_on_the_tip() {
     let tip = "22".repeat(20);
@@ -698,11 +715,26 @@ fn gate_checks_require_every_gate_lane_passed_on_the_tip() {
             pending: 1
         }
     );
+    let declared = {
+        let mut lane = runner_lane(NodeCheckState::Unverified, "full", true, 3);
+        lane.declared_unverified = Some("ran on a stale checkout".into());
+        lane
+    };
+    let died = {
+        let mut lane = lane("api", "gate", NodeCheckState::Failed, None);
+        lane.failure_kind = Some("infrastructure".into());
+        lane
+    };
     for blocking in [
         lane("api", "gate", NodeCheckState::Failed, None),
         lane("api", "gate", NodeCheckState::Pending, None),
         lane("api", "gate", NodeCheckState::Running, None),
-        lane("api", "gate", NodeCheckState::Unverified, None),
+        lane("api", "gate", NodeCheckState::NotApplicable, None),
+        lane("api", "gate", NodeCheckState::Unsupported, None),
+        runner_lane(NodeCheckState::Unverified, "empty", true, 0),
+        runner_lane(NodeCheckState::Unverified, "full", false, 3),
+        declared,
+        died,
         lane(
             "api",
             "gate",
@@ -727,6 +759,61 @@ fn gate_checks_require_every_gate_lane_passed_on_the_tip() {
         gate_checks(None, &tip).blocking.is_some(),
         "an unreadable ledger blocks"
     );
+}
+
+/// A script check records no structured result: its exit code is its verdict,
+/// as every other checks surface and merge gate reads it, so its green on the
+/// tip satisfies `require_checks`.
+#[test]
+fn a_script_gate_check_green_on_the_tip_satisfies_the_gate() {
+    let tip = "22".repeat(20);
+    let script = lane("smoke", "gate", NodeCheckState::Unverified, Some(&tip));
+    let gate = gate_checks(Some(std::slice::from_ref(&script)), &tip);
+    assert_eq!(gate.blocking, None);
+    assert_eq!(
+        gate.counts,
+        ApprovalCheckCounts {
+            passed: 1,
+            failed: 0,
+            pending: 0
+        }
+    );
+
+    let stale = lane(
+        "smoke",
+        "gate",
+        NodeCheckState::Unverified,
+        Some("an-earlier-head"),
+    );
+    let blocking = gate_checks(Some(std::slice::from_ref(&stale)), &tip)
+        .blocking
+        .unwrap();
+    assert!(
+        blocking.contains("`smoke`") && blocking.contains("earlier commit"),
+        "{blocking}"
+    );
+}
+
+/// A lane that ended without a verdict blocks the gate and says why, and is
+/// counted as neither passing nor failing on the phone.
+#[test]
+fn a_gate_lane_without_a_verdict_blocks_and_names_its_state() {
+    let tip = "22".repeat(20);
+    let mut died = lane("api", "gate", NodeCheckState::Failed, Some(&tip));
+    died.failure_kind = Some("infrastructure".into());
+    let gate = gate_checks(Some(std::slice::from_ref(&died)), &tip);
+    assert_eq!(gate.counts, ApprovalCheckCounts::default());
+    let blocking = gate.blocking.unwrap();
+    assert!(
+        blocking.contains("no verdict") && blocking.contains("died: infrastructure"),
+        "{blocking}"
+    );
+
+    let red = lane("api", "gate", NodeCheckState::Failed, Some(&tip));
+    let blocking = gate_checks(Some(std::slice::from_ref(&red)), &tip)
+        .blocking
+        .unwrap();
+    assert!(blocking.contains("it failed"), "{blocking}");
 }
 
 // ─── Refusals before execution ───
