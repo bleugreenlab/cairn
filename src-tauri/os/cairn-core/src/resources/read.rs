@@ -2252,10 +2252,17 @@ async fn render_resource_body(
                         |executor_id| orch.fleet.executor_name_for_text(executor_id),
                         captured_at,
                     ));
-                    match orch.private_lane_budgets().await {
-                        Ok(lanes) => rendered.push_str(
+                    let lanes = match orch.private_lane_budgets().await {
+                        Ok(sessions) => crate::execution::jobs::call_lane_budgets(orch)
+                            .await
+                            .map(|calls| (sessions, calls)),
+                        Err(error) => Err(error),
+                    };
+                    match lanes {
+                        Ok((sessions, calls)) => rendered.push_str(
                             &crate::resources::executors::render_session_admission(
-                                &lanes,
+                                &sessions,
+                                &calls,
                                 (captured_at / 1_000) as i64,
                             ),
                         ),

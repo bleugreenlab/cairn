@@ -72,21 +72,23 @@ pub(crate) fn render_blocked_questions(
     out
 }
 
-/// This runner's own private agent-session lanes. Kept at collection scope
-/// because sessions run on the runner, not on any executor; rendered from the
-/// promoter's last recorded decision, never a fresh probe.
+/// This runner's own private agent-session lanes and the ephemeral-call lanes
+/// that share their host memory. Kept at collection scope because both run on
+/// the runner, not on any executor; rendered from each promoter's last
+/// recorded decision, never a fresh probe.
 pub(crate) fn render_session_admission(
-    lanes: &[cairn_db::storage::LaneBudget],
+    sessions: &[cairn_db::storage::LaneBudget],
+    calls: &[crate::execution::jobs::CallLaneBudget],
     now_unix_secs: i64,
 ) -> String {
     let mut out = String::from(
-        "\n## Session admission\n\nPrivate agent sessions on this runner are admitted against measured host memory, keeping free the same reserve the warm-process collector keeps. An operator ceiling, when set, also bounds each lane.\n\n",
+        "\n## Session admission\n\nPrivate agent sessions on this runner are admitted against measured host memory, keeping free the same reserve the warm-process collector keeps. An operator ceiling, when set, also bounds each lane. Ephemeral calls draw on the same memory but yield to sessions: a call is admitted only while it leaves room above the reserve for the session launches queued here.\n\n",
     );
-    if lanes.is_empty() {
-        out.push_str("No session lane holds queued or running work.\n");
+    if sessions.is_empty() && calls.is_empty() {
+        out.push_str("No session or call lane holds queued or running work.\n");
         return out;
     }
-    for lane in lanes {
+    for lane in sessions {
         out.push_str(&format!(
             "- {}\n",
             crate::execution::jobs::describe_lane(lane, now_unix_secs)
@@ -96,6 +98,20 @@ pub(crate) fn render_session_admission(
                 "  - Queue head waiting because {}.\n",
                 crate::execution::jobs::describe_shortfall(shortfall)
             ));
+        }
+    }
+    for call in calls {
+        out.push_str(&format!(
+            "- {}\n",
+            crate::execution::jobs::describe_call_lane(&call.budget, now_unix_secs)
+        ));
+        if let Some(shortfall) = &call.budget.shortfall {
+            out.push_str(&format!(
+                "  - Last decision: held its queue head because {}.\n",
+                crate::execution::jobs::describe_shortfall(shortfall)
+            ));
+        } else if call.admitted {
+            out.push_str("  - Last decision: admitted its queue head.\n");
         }
     }
     out

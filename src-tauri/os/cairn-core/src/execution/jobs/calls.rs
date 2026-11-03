@@ -446,41 +446,72 @@ fn finish_call_lease(
 /// every session queued there, and a call lane with nothing in flight gets no
 /// exemption from that. The backend's count bounds apply only as the fan-out
 /// cap on a measured host and as the whole bound on an unmeasurable one.
+///
+/// A lease or a hold is recorded in the host's lane ledger for
+/// `cairn://executors`; an empty queue decides nothing about a call, so it
+/// leaves the last decision standing.
 fn lease_next_call(
     orch: &Orchestrator,
     lane: &str,
     concurrency: Option<crate::backends::CallConcurrency>,
 ) -> Result<Option<crate::storage::AdmissionRequest>, String> {
     let db = orch.db.local.clone();
-    let lane = lane.to_string();
+    let lane_owned = lane.to_string();
     let owner = call_lease_owner(orch);
-    let memory = super::private_lane::host_memory_envelope(orch);
-    let units = concurrency.map_or(usize::MAX, |bounds| bounds.units(memory.is_some()));
-    let now = chrono::Utc::now().timestamp();
-    run_db(async move {
+    let budget = call_lane_budget(orch, concurrency);
+    let now = budget.measured_at;
+    let decision = run_db(async move {
         crate::storage::lease_next_admission_within(
             &db,
             crate::storage::CALL_ADMISSION_WORKSPACE,
-            &lane,
+            &lane_owned,
             &owner,
             now,
             now + 300,
-            crate::storage::RuntimeResourceCapacity {
-                resident_process_units: u32::try_from(units).unwrap_or(u32::MAX),
-                logical_stream_units: u32::MAX,
-            },
-            memory,
+            budget.capacity(),
+            budget.memory,
             None,
             crate::storage::MemoryPriority::YieldsTo(super::private_lane::WORKSPACE),
         )
         .await
-        .map(|decision| match decision {
-            crate::storage::LeaseDecision::Leased(request) => Some(request),
-            crate::storage::LeaseDecision::Empty
-            | crate::storage::LeaseDecision::Blocked { .. } => None,
-        })
         .map_err(|e| e.to_string())
+    })?;
+    let record = |shortfall| {
+        orch.private_lanes.record(
+            crate::storage::CALL_ADMISSION_WORKSPACE,
+            lane,
+            budget,
+            shortfall,
+        )
+    };
+    Ok(match decision {
+        crate::storage::LeaseDecision::Leased(request) => {
+            record(None);
+            Some(request)
+        }
+        crate::storage::LeaseDecision::Blocked { shortfall, .. } => {
+            record(Some(shortfall));
+            None
+        }
+        crate::storage::LeaseDecision::Empty => None,
     })
+}
+
+/// What one call lease decides against, measured now: the shared host memory
+/// envelope, and as its ceiling the count bound the backend applies on such a
+/// host (the fan-out cap when memory is measured, the unmeasured-host bound
+/// otherwise; none when the backend declares no count).
+fn call_lane_budget(
+    orch: &Orchestrator,
+    concurrency: Option<crate::backends::CallConcurrency>,
+) -> super::private_lane::PrivateLaneBudget {
+    let memory = super::private_lane::host_memory_envelope(orch);
+    super::private_lane::PrivateLaneBudget {
+        ceiling: concurrency
+            .map(|bounds| u32::try_from(bounds.units(memory.is_some())).unwrap_or(u32::MAX)),
+        memory,
+        measured_at: chrono::Utc::now().timestamp(),
+    }
 }
 
 fn start_leased_call(
@@ -794,6 +825,12 @@ fn promote_next_call(
     // The row is durable before any pass reaches here, so a call held for
     // startup recovery waits queued for the drain that follows readiness.
     if !orch.startup_readiness.is_ready() {
+        orch.private_lanes.record(
+            crate::storage::CALL_ADMISSION_WORKSPACE,
+            lane,
+            call_lane_budget(orch, concurrency),
+            Some(crate::storage::LaneShortfall::StartupRecovery),
+        );
         return false;
     }
     loop {
@@ -2285,6 +2322,90 @@ mod restart_call_tests {
             0,
             "a second pass finds nothing"
         );
+    }
+
+    /// `cairn://executors`' Session admission section, as the read renders it.
+    async fn session_admission_section(orch: &Orchestrator) -> String {
+        crate::resources::executors::render_session_admission(
+            &super::super::private_lane_budgets(orch).await.unwrap(),
+            &super::super::call_lane_budgets(orch).await.unwrap(),
+            chrono::Utc::now().timestamp(),
+        )
+    }
+
+    /// cairn/6017: the call lane's last decision is named beside the ordinary
+    /// lane of the same name. A call held back so queued sessions keep room
+    /// says how much room it left them; once it leases, it reads as admitted.
+    #[tokio::test]
+    async fn the_session_admission_section_names_a_held_call_with_its_room_and_a_leased_one_as_admitted(
+    ) {
+        use crate::agent_process::memory::SystemMemory;
+        // 16 GiB total, 4 GiB available: a 2 GiB reserve and 2 GiB of headroom.
+        let orch = orch_with_db_and_probe(Some(SystemMemory {
+            total: 16 << 30,
+            available: 4 << 30,
+        }))
+        .await;
+        let db = orch.db.local.clone();
+        seed_call_project(&db).await;
+        seed_call_admission(&db, "call-run", "starting", "queued", None, 1).await;
+        // Two ordinary sessions queued on `claude-cli` in the private
+        // workspace: the call (1 GiB) must leave 1 GiB for each of them.
+        for n in 1..=2 {
+            db.execute_script(format!(
+                "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,priority,enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at)
+                   VALUES('session-{n}','private-runtime','claude-cli','ordinary:session-{n}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',0,{},'queued',NULL,0,NULL,1,1);",
+                10 + n
+            ))
+            .await
+            .unwrap();
+        }
+        let concurrency = call_lane_concurrency(None);
+
+        assert!(lease_next_call(&orch, "claude-cli", concurrency)
+            .unwrap()
+            .is_none());
+        let held = session_admission_section(&orch).await;
+        let session_line = held
+            .lines()
+            .find(|line| line.starts_with("- claude-cli: "))
+            .expect("the ordinary lane is listed");
+        assert!(
+            session_line.starts_with("- claude-cli: 0 active, 2 queued,")
+                && session_line.ends_with("; no admission pass has measured memory yet"),
+            "the ordinary lane keeps its own (absent) decision: {held}"
+        );
+        assert!(
+            held.contains("\n- claude-cli ephemeral calls: 0 active, 1 queued, fan-out cap 64; memory headroom 2.0 GiB above a 2.0 GiB reserve,"),
+            "{held}"
+        );
+        assert!(
+            held.contains("\n  - Last decision: held its queue head because it needs about 1.0 GiB and only 2.0 GiB is free above the 2.0 GiB reserve, of which it leaves 2.0 GiB for ordinary sessions.\n"),
+            "{held}"
+        );
+
+        // One session leaves the queue: the call now fits beside the room it
+        // still keeps for the other.
+        db.execute(
+            "UPDATE runtime_admission_requests SET state='cancelled' WHERE request_id='session-2'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(lease_next_call(&orch, "claude-cli", concurrency)
+            .unwrap()
+            .is_some());
+        let admitted = session_admission_section(&orch).await;
+        assert!(
+            admitted
+                .contains("\n- claude-cli ephemeral calls: 1 active, 0 queued, fan-out cap 64;"),
+            "{admitted}"
+        );
+        assert!(
+            admitted.contains("\n  - Last decision: admitted its queue head.\n"),
+            "{admitted}"
+        );
+        assert!(!admitted.contains("held its queue head"), "{admitted}");
     }
 
     /// Regression for CAIRN-2526: a call must not be left at the default `Idle`

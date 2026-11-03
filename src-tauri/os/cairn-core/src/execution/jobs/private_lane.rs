@@ -165,11 +165,16 @@ struct BootRamp {
     ended: bool,
 }
 
-/// The last decision each private lane's promoter made. Surfaces read this
-/// rather than probing, so what they display is what was decided.
+/// The last decision each of this host's process lanes made: the private
+/// ordinary-session lanes and the ephemeral-call lanes that share their memory
+/// envelope. Surfaces read this rather than probing, so what they display is
+/// what was decided.
 #[derive(Default)]
 pub struct PrivateLaneLedger {
-    decisions: Mutex<HashMap<String, LaneDecision>>,
+    /// Keyed by `(workspace, lane)`: a lane name alone is ambiguous, since
+    /// `claude-cli` is a lane of both the ordinary-session workspace and the
+    /// call workspace.
+    decisions: Mutex<HashMap<(String, String), LaneDecision>>,
     memory_evictions: Mutex<HashMap<String, Instant>>,
     boot_ramp: Mutex<BootRamp>,
     /// Serializes, across every pass on every private lane, a ramp pass's
@@ -323,17 +328,25 @@ impl PrivateLaneLedger {
 
     pub(crate) fn record(
         &self,
+        workspace: &str,
         lane: &str,
         budget: PrivateLaneBudget,
         shortfall: Option<LaneShortfall>,
     ) {
         if let Ok(mut decisions) = self.decisions.lock() {
-            decisions.insert(lane.to_string(), LaneDecision { budget, shortfall });
+            decisions.insert(
+                (workspace.to_string(), lane.to_string()),
+                LaneDecision { budget, shortfall },
+            );
         }
     }
 
-    fn decision(&self, lane: &str) -> Option<LaneDecision> {
-        self.decisions.lock().ok()?.get(lane).cloned()
+    fn decision(&self, workspace: &str, lane: &str) -> Option<LaneDecision> {
+        self.decisions
+            .lock()
+            .ok()?
+            .get(&(workspace.to_string(), lane.to_string()))
+            .cloned()
     }
 
     /// Claim the lane's memory-eviction slot unless one was used recently.
@@ -526,34 +539,89 @@ pub(crate) async fn private_lane_budgets_from(
     Ok(occupancy
         .into_iter()
         .map(|lane| {
-            let decision = ledger.decision(&lane.lane);
-            let memory = decision
+            let decision = ledger.decision(WORKSPACE, &lane.lane);
+            lane_budget(lane, decision, host_in_flight, current_ceiling, boot_ramp)
+        })
+        .collect())
+}
+
+/// One lane's occupancy joined with the decision its promoter last recorded.
+/// `current_ceiling` stands in for the bound when no pass has decided yet.
+fn lane_budget(
+    lane: crate::storage::LaneOccupancy,
+    decision: Option<LaneDecision>,
+    host_in_flight: u64,
+    current_ceiling: Option<u32>,
+    boot_ramp: Option<SpawnWindow>,
+) -> LaneBudget {
+    let memory = decision
+        .as_ref()
+        .and_then(|decision| decision.budget.memory);
+    let unmeasured = memory.map_or(DEFAULT_SPAWN_RSS, |memory| memory.unmeasured_claim_bytes);
+    LaneBudget {
+        in_flight_bytes: host_in_flight,
+        ceiling: decision
+            .as_ref()
+            .map_or(current_ceiling, |decision| decision.budget.ceiling),
+        memory,
+        measured_at: decision
+            .as_ref()
+            .map(|decision| decision.budget.measured_at),
+        per_process_bytes: lane.typical_claim_bytes.unwrap_or(unmeasured),
+        // A recorded shortfall describes a head; with nothing queued there is
+        // no head left to describe.
+        shortfall: decision
+            .and_then(|decision| decision.shortfall)
+            .filter(|_| lane.queued > 0),
+        lane: lane.lane,
+        active_units: lane.active_units,
+        queued: lane.queued,
+        boot_ramp,
+    }
+}
+
+/// An ephemeral-call lane's occupancy and the last decision its promoter
+/// recorded. The call promoter records only a lease or a hold, never an empty
+/// queue, so a recorded decision with no shortfall is an admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallLaneBudget {
+    /// `ceiling` is the count bound the last lease applied: the fan-out cap on
+    /// a measured host, the unmeasured-host bound otherwise. `shortfall` is
+    /// why the head was held, while it still waits.
+    pub budget: LaneBudget,
+    /// The last pass leased the lane's head.
+    pub admitted: bool,
+}
+
+/// Every ephemeral-call lane holding a non-terminal admission row, with the
+/// last decision its promoter recorded. Read from the ledger the lease writes,
+/// never a fresh probe, and never part of the provider snapshot.
+pub(crate) async fn call_lane_budgets_from(
+    db: &crate::storage::LocalDb,
+    ledger: &PrivateLaneLedger,
+) -> crate::storage::DbResult<Vec<CallLaneBudget>> {
+    let workspace = crate::storage::CALL_ADMISSION_WORKSPACE;
+    let occupancy = crate::storage::lane_occupancy(db, workspace).await?;
+    let host_in_flight = crate::storage::host_in_flight_bytes(db, DEFAULT_SPAWN_RSS).await?;
+    Ok(occupancy
+        .into_iter()
+        .map(|lane| {
+            let decision = ledger.decision(workspace, &lane.lane);
+            let admitted = decision
                 .as_ref()
-                .and_then(|decision| decision.budget.memory);
-            let unmeasured =
-                memory.map_or(DEFAULT_SPAWN_RSS, |memory| memory.unmeasured_claim_bytes);
-            LaneBudget {
-                in_flight_bytes: host_in_flight,
-                ceiling: decision
-                    .as_ref()
-                    .map_or(current_ceiling, |decision| decision.budget.ceiling),
-                memory,
-                measured_at: decision
-                    .as_ref()
-                    .map(|decision| decision.budget.measured_at),
-                per_process_bytes: lane.typical_claim_bytes.unwrap_or(unmeasured),
-                // A recorded shortfall describes a head; with nothing queued
-                // there is no head left to describe.
-                shortfall: decision
-                    .and_then(|decision| decision.shortfall)
-                    .filter(|_| lane.queued > 0),
-                lane: lane.lane,
-                active_units: lane.active_units,
-                queued: lane.queued,
-                boot_ramp,
+                .is_some_and(|decision| decision.shortfall.is_none());
+            CallLaneBudget {
+                budget: lane_budget(lane, decision, host_in_flight, None, None),
+                admitted,
             }
         })
         .collect())
+}
+
+pub(crate) async fn call_lane_budgets(
+    orch: &Orchestrator,
+) -> crate::storage::DbResult<Vec<CallLaneBudget>> {
+    call_lane_budgets_from(&orch.db.local, &orch.private_lanes).await
 }
 
 fn gib(bytes: u64) -> String {
@@ -563,14 +631,37 @@ fn gib(bytes: u64) -> String {
 /// One lane's budget in one line, shared by every surface that displays it so
 /// they all describe the same decision in the same words.
 pub(crate) fn describe_lane(budget: &LaneBudget, now: i64) -> String {
-    let mut line = format!(
-        "{}: {} active, {} queued",
-        budget.lane, budget.active_units, budget.queued
-    );
-    line.push_str(&match budget.ceiling {
+    let bound = match budget.ceiling {
         Some(ceiling) => format!(", operator ceiling {ceiling}"),
         None => ", no unit ceiling".to_string(),
-    });
+    };
+    lane_line(&budget.lane, &bound, budget, now)
+}
+
+/// An ephemeral-call lane's budget in the same shape as [`describe_lane`],
+/// named apart from the ordinary-session lane that shares its lane name.
+pub(crate) fn describe_call_lane(budget: &LaneBudget, now: i64) -> String {
+    let bound = match (budget.measured_at, budget.ceiling, budget.memory) {
+        // No pass has decided yet, so the bound it would apply is not known.
+        (None, _, _) => String::new(),
+        (Some(_), Some(cap), Some(_)) => format!(", fan-out cap {cap}"),
+        (Some(_), Some(bound), None) => format!(", at most {bound} while memory is unmeasured"),
+        (Some(_), None, _) => ", no count bound".to_string(),
+    };
+    lane_line(
+        &format!("{} ephemeral calls", budget.lane),
+        &bound,
+        budget,
+        now,
+    )
+}
+
+fn lane_line(name: &str, bound: &str, budget: &LaneBudget, now: i64) -> String {
+    let mut line = format!(
+        "{name}: {} active, {} queued",
+        budget.active_units, budget.queued
+    );
+    line.push_str(bound);
     if let Some(ramp) = budget.boot_ramp {
         line.push_str(&format!(
             ", boot ramp: {} of {} warming",

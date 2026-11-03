@@ -915,6 +915,7 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
         // readiness (`Orchestrator::mark_startup_recovery_ready`).
         if !orch.startup_readiness.is_ready() {
             orch.private_lanes.record(
+                WORKSPACE,
                 lane,
                 super::private_lane::private_lane_budget(orch),
                 Some(crate::storage::LaneShortfall::StartupRecovery),
@@ -950,11 +951,11 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
         })?;
         let lease = match decision {
             crate::storage::LeaseDecision::Leased(lease) => {
-                orch.private_lanes.record(lane, budget, None);
+                orch.private_lanes.record(WORKSPACE, lane, budget, None);
                 lease
             }
             crate::storage::LeaseDecision::Empty => {
-                orch.private_lanes.record(lane, budget, None);
+                orch.private_lanes.record(WORKSPACE, lane, budget, None);
                 drop(ramp_admission);
                 // Ephemeral calls yield to queued sessions, so a drained queue
                 // is when a call held back for one may admit.
@@ -967,7 +968,7 @@ pub(super) fn promote_private_lane_blocking(orch: &Orchestrator, lane: &str) -> 
                 in_flight_requests,
             } => {
                 orch.private_lanes
-                    .record(lane, budget, Some(shortfall.clone()));
+                    .record(WORKSPACE, lane, budget, Some(shortfall.clone()));
                 // A ramp hold waits for a warming spawn to speak. Evicting a warm
                 // process frees memory, not a warm-up slot, and the release that
                 // frees one promotes again.

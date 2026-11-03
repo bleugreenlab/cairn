@@ -16,7 +16,7 @@ mod diff;
 mod eras;
 pub(crate) mod event_endpoints;
 pub(crate) mod events;
-mod executors;
+pub(crate) mod executors;
 pub(crate) mod feed;
 mod files;
 pub mod grants;
