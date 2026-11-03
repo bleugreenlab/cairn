@@ -40,6 +40,7 @@ use crate::mcp::handlers::branch::BranchResolution;
 use crate::mcp::handlers::search_translate::{
     translate_search_command_detailed, PostFilter, TranslatedSearch, TranslatedSearchPipeline,
 };
+use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::mcp::handlers::{read, search};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -113,8 +114,12 @@ pub(super) async fn try_run_search_batch(
 /// `stop_on_error` promise. `None` means "execute this batch for real", and no
 /// path out of here reports a coverage gap to the agent.
 fn plan_search_batch(resolved: &[(String, Result<RunSpec, String>)]) -> Option<Vec<SearchPlan>> {
+    // A whole-line `bash -lc 'rg …'` searches exactly as its script does, so
+    // the translation reads the script; the plan still reports the item as
+    // written.
     let has_search = resolved.iter().any(|(_, spec)| {
-        matches!(spec, Ok(RunSpec::Shell { command, .. }) if search_command_identity(command).is_some())
+        matches!(spec, Ok(RunSpec::Shell { command, .. })
+            if search_command_identity(&command_for_classification(command)).is_some())
     });
     if !has_search {
         return None;
@@ -134,9 +139,10 @@ fn plan_search_batch(resolved: &[(String, Result<RunSpec, String>)]) -> Option<V
         if !args.is_empty() {
             return None;
         }
-        search_command_identity(command)?;
+        let classified = command_for_classification(command);
+        search_command_identity(&classified)?;
         let TranslatedSearchPipeline { search, post } =
-            match translate_search_command_detailed(command) {
+            match translate_search_command_detailed(&classified) {
                 Ok(translated) => translated,
                 Err(reason) => {
                     log::debug!(
@@ -1159,6 +1165,22 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A whole-line launcher of a search is served as that search, and the
+    /// plan still names the item as the agent wrote it.
+    #[test]
+    fn a_whole_line_launcher_of_a_search_is_served_as_written() {
+        let wrapped = "bash -lc 'rg foo src'";
+        let plans = plan_search_batch(&[shell(wrapped)]).expect("the launcher runs a search");
+        assert_eq!(plans[0].header, wrapped);
+        assert_eq!(plans[0].command, wrapped);
+        let expected = translate_search_command_detailed("rg foo src").unwrap();
+        assert!(matches!(plans[0].search, TranslatedSearch::Grep { .. }));
+        assert_eq!(plans[0].search, expected.search);
+        assert_eq!(plans[0].post, expected.post);
+
+        assert!(plan_search_batch(&[shell("bash -c 'rg foo src' && echo done")]).is_none());
     }
 
     /// Every shape that cannot be reproduced exactly executes for real, and

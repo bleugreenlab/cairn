@@ -6655,6 +6655,13 @@ pub struct LearnedResourceEstimate {
 /// rejection. Such a machine's credential-less fetch is still stored as
 /// `infrastructure` naming it, by the runner's classifier, so its lane
 /// re-places.
+///
+/// cairn/5916 does not move the number. A native-shell item's command line in
+/// `ProcessBatchItem.args[0]` is now the agent's command exactly as written,
+/// where the runner used to strip a leading `bash -lc '…'` launcher first.
+/// The field, its meaning (one line for the executor's `/bin/sh -c`) and every
+/// frame are unchanged; only the text the runner puts there differs. An older
+/// executor runs that line as it runs any other, so it gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above

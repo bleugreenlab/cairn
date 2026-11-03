@@ -6,6 +6,7 @@ use super::sandbox_policy::{resolve_run_confinement, RunConfinement};
 use super::types::{ItemOutcome, McpCallSpec, RunCompletePayload, RunOutputPayload, RunSpec};
 use crate::config::mcp_servers::McpServerConfigExt;
 use crate::mcp::gateway::{McpCallOutcome, McpResourceDef};
+use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::mcp::handlers::{normalize_command, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -1535,10 +1536,13 @@ async fn execute_process(
             (true, true) => String::new(),
         };
         let ssh_crossing = command_scoped_fallback
-            && (shell_command.is_some_and(|command| command.trim_start().starts_with("ssh "))
-                || std::path::Path::new(program)
-                    .file_name()
-                    .is_some_and(|name| name == "ssh"));
+            && (shell_command.is_some_and(|command| {
+                command_for_classification(command)
+                    .trim_start()
+                    .starts_with("ssh ")
+            }) || std::path::Path::new(program)
+                .file_name()
+                .is_some_and(|name| name == "ssh"));
         if ssh_crossing && exit_code != Some(0) {
             combined.push_str("\nPermission denied while reading SSH credentials");
         }
@@ -1888,6 +1892,75 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An orchestrator whose process spawner really spawns, so a host item's
+    /// output is the shell's own.
+    async fn real_spawn_orchestrator() -> Orchestrator {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+
+        cairn_common::scratch::testing::pin_private_root();
+        let root = tempfile::tempdir().unwrap().keep();
+        let db = LocalDb::open_migrated_for_test(root.join("orch.db"))
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let services = TestServicesBuilder::new()
+            .with_process(crate::services::RealProcessSpawner)
+            .build();
+        Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(db), search)),
+            Arc::new(services),
+            root.join("config"),
+        )
+        .build()
+    }
+
+    /// Resolve a `command` item and run it through the host spawn path, as an
+    /// ambient `run` with no run context does.
+    async fn run_command_item(orch: &Orchestrator, command: &str) -> ItemOutcome {
+        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
+        let request = McpCallbackRequest {
+            answer_bound_ms: None,
+            thread_id: None,
+            cwd: cwd.clone(),
+            run_id: None,
+            tool: "run".to_string(),
+            tool_use_id: None,
+            payload: serde_json::json!({}),
+            origin: None,
+        };
+        let item: super::super::types::RunItem =
+            serde_json::from_value(serde_json::json!({ "command": command })).unwrap();
+        let (header, spec) =
+            super::super::resolve::resolve_run_item(orch, &request, None, &item).await;
+        run_one(orch, &request, &cwd, "tool-use", None, header, spec, None).await
+    }
+
+    /// A command item runs exactly as written: the shell it names runs, a
+    /// chain that begins with a launcher stays a chain, and the header is the
+    /// command the agent wrote.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_item_executes_exactly_as_written() {
+        let orch = real_spawn_orchestrator().await;
+        for (command, expected) in [
+            ("bash -c 'echo a' && echo 'b   c'", "a\nb   c"),
+            ("sh -c \"echo x\" | tr x y", "y"),
+            // The named `sh` runs it, not the host's outer `bash -c`.
+            ("sh -c 'echo $0'", "sh"),
+        ] {
+            let outcome = run_command_item(&orch, command).await;
+            assert!(outcome.succeeded, "{command}: {}", outcome.body);
+            assert_eq!(outcome.header, command);
+            assert_eq!(outcome.body.trim_end(), expected, "{command}");
+        }
+
+        let outcome = run_command_item(&orch, "bash -c 'echo $BASH_VERSION'").await;
+        assert!(outcome.succeeded, "{}", outcome.body);
+        assert!(!outcome.body.trim().is_empty(), "bash reports its version");
+    }
 
     /// The floor's setuid explanation is appended, never substituted: the
     /// command's stderr and its exit status reach the agent exactly as before.

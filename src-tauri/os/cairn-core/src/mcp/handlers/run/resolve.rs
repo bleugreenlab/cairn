@@ -5,7 +5,7 @@ use base64::Engine as _;
 
 use super::types::{McpCallSpec, RunItem, RunSpec};
 use crate::config::mcp_servers::McpServerConfig;
-use crate::mcp::handlers::{skills_resources, unwrap_shell_launcher, RunContext};
+use crate::mcp::handlers::{skills_resources, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::uri::CairnResource;
@@ -55,19 +55,14 @@ pub(super) async fn resolve_run_item(
             )),
         ),
         ["command"] => {
+            // Executed exactly as written: a leading `bash -lc '…'` runs that
+            // bash. Classifiers read a whole-line launcher's inner command
+            // through `shell_words::command_for_classification` instead.
             let command = item.command.as_deref().unwrap_or_default();
-            // Unwrap launcher forms (e.g. `bash -lc '...'`) like the old path did.
-            let unwrapped = unwrap_shell_launcher(command);
-            let command = if command.trim() != unwrapped {
-                unwrapped
-            } else {
-                command.to_string()
-            };
-            let header = item_header(item, &command);
             (
-                header,
+                item_header(item, command),
                 Ok(RunSpec::Shell {
-                    command,
+                    command: command.to_string(),
                     timeout: item.timeout,
                     args: Vec::new(),
                 }),
@@ -649,17 +644,6 @@ mod tests {
         assert!(error.contains("bglab-ub/look"), "{error}");
     }
 
-    #[test]
-    fn test_handle_run_command_unwrap_uses_semantic_inner_command() {
-        assert_eq!(
-            unwrap_shell_launcher(r#"/bin/zsh -lc "sed -n '120,520p' src/app.tsx""#),
-            "sed -n '120,520p' src/app.tsx"
-        );
-        assert_eq!(
-            unwrap_shell_launcher("bash -lc 'git status --short'"),
-            "git status --short"
-        );
-    }
     #[test]
     fn resolve_interpreter_prefers_env_shebang() {
         let dir = tempfile::tempdir().unwrap();

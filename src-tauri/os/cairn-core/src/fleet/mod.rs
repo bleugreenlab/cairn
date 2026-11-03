@@ -21248,6 +21248,40 @@ mod tests {
         );
     }
 
+    /// A launcher-wrapped command reaches the executor byte for byte, so the
+    /// shell the agent named is the one that runs.
+    #[test]
+    fn a_placed_shell_batch_carries_a_wrapped_command_as_written() {
+        let command = "bash -lc 'set -e; echo \"$0\"' && echo 'b   c'";
+        let batch = serialize_process_batch(
+            ResolvedRunBatch {
+                request: Default::default(),
+                run_context: None,
+                resolved: vec![(
+                    command.to_string(),
+                    Ok(RunSpec::Shell {
+                        command: command.to_string(),
+                        timeout: None,
+                        args: Vec::new(),
+                    }),
+                )],
+                tool_use_id: "tool-use".to_string(),
+                stop_on_error: true,
+                originally_sequential: true,
+                execution_residency: None,
+                node_scratch: None,
+            },
+            &[],
+            "runner-context".to_string(),
+            ProcessSandboxMode::Unconfined,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(batch.items[0].header, command);
+        assert_eq!(batch.items[0].args, [command]);
+    }
+
     #[test]
     fn the_sdk_travels_with_javascript_batches_by_either_route() {
         let item = |execution, program: &str, args: Vec<&str>| ProcessBatchItem {
@@ -40715,26 +40749,32 @@ mod handoff_tests {
     #[tokio::test]
     async fn a_relayed_git_index_write_is_refused_without_raising_a_permission() {
         let orch = fence_orchestrator(true).await;
-        let result = orch
-            .fleet
-            .handle_runner_callback(
-                &orch,
-                RunnerCallback::SandboxDenied {
-                    runner_context_id: "ctx".into(),
-                    // Native-shell items are relayed as `program` (empty) plus
-                    // the raw command, hence the leading space.
-                    command: " git mv src-tauri/a src-tauri/b && git status --short".into(),
-                    cwd: "/tmp/worktree".into(),
-                    denial: SandboxDenial::Command,
-                    reported_denial: None,
-                },
-            )
-            .await;
-        match result {
-            RunnerCallbackResult::Rejected { diagnostic } => {
-                assert!(diagnostic.contains("plain `mv`"), "{diagnostic}");
+        // Native-shell items are relayed as `program` (empty) plus the raw
+        // command, hence the leading space. A whole-line launcher arrives as
+        // written and is read through to the script it runs.
+        for command in [
+            " git mv src-tauri/a src-tauri/b && git status --short",
+            " sh -c 'git mv a b'",
+        ] {
+            let result = orch
+                .fleet
+                .handle_runner_callback(
+                    &orch,
+                    RunnerCallback::SandboxDenied {
+                        runner_context_id: "ctx".into(),
+                        command: command.into(),
+                        cwd: "/tmp/worktree".into(),
+                        denial: SandboxDenial::Command,
+                        reported_denial: None,
+                    },
+                )
+                .await;
+            match result {
+                RunnerCallbackResult::Rejected { diagnostic } => {
+                    assert!(diagnostic.contains("plain `mv`"), "{command}: {diagnostic}");
+                }
+                other => panic!("{command}: expected the instructive refusal, got {other:?}"),
             }
-            other => panic!("expected the instructive refusal, got {other:?}"),
         }
         assert_eq!(permission_rows(&orch).await, 0);
         assert!(!orch.park_slots.armed(RUN));
@@ -40782,7 +40822,9 @@ mod handoff_tests {
                         &orch,
                         RunnerCallback::SandboxDenied {
                             runner_context_id: "ctx".into(),
-                            command: " sh -c 'git mv a b'".into(),
+                            // Positional arguments make the launcher's
+                            // script unreadable, so this stays unrecognized.
+                            command: " sh -c 'git mv \"$1\" b' _ a".into(),
                             cwd: "/tmp/worktree".into(),
                             denial: SandboxDenial::Command,
                             reported_denial: None,

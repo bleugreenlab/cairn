@@ -29,6 +29,7 @@ pub(crate) mod run_context;
 pub mod search;
 pub(crate) mod search_translate;
 pub mod search_web;
+pub(crate) mod shell_words;
 pub mod skills_resources;
 pub mod slug;
 pub(crate) mod target;
@@ -77,77 +78,10 @@ where
     serde_json::from_value(request.payload.clone()).map_err(|e| format!("Invalid payload: {e}"))
 }
 
-/// Strip a shell launcher wrapper and return the semantic inner command when possible.
-pub(crate) fn unwrap_shell_launcher(cmd: &str) -> String {
-    let trimmed = cmd.trim();
-    let prefixes = [
-        "/bin/zsh -lc ",
-        "/bin/bash -lc ",
-        "/bin/sh -lc ",
-        "zsh -lc ",
-        "bash -lc ",
-        "sh -lc ",
-        "/bin/zsh -c ",
-        "/bin/bash -c ",
-        "/bin/sh -c ",
-        "zsh -c ",
-        "bash -c ",
-        "sh -c ",
-    ];
-
-    for prefix in prefixes {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let rest = rest.trim();
-            if rest.len() >= 2 {
-                if let Some(inner) = rest
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .map(|s| {
-                        let mut out = String::with_capacity(s.len());
-                        let mut chars = s.chars();
-                        while let Some(ch) = chars.next() {
-                            if ch == '\\' {
-                                if let Some(next) = chars.next() {
-                                    match next {
-                                        '\\' | '"' | '$' | '`' => out.push(next),
-                                        '\n' => {}
-                                        other => {
-                                            out.push('\\');
-                                            out.push(other);
-                                        }
-                                    }
-                                } else {
-                                    out.push('\\');
-                                }
-                            } else {
-                                out.push(ch);
-                            }
-                        }
-                        out
-                    })
-                {
-                    return inner;
-                }
-
-                if let Some(inner) = rest
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-                    .map(ToOwned::to_owned)
-                {
-                    return inner;
-                }
-            }
-
-            return rest.to_string();
-        }
-    }
-
-    trimmed.to_string()
-}
-
-/// Normalize command for matching: strip shell launchers, trim, collapse whitespace.
+/// Normalize a command for matching: read through a whole-line shell launcher
+/// ([`shell_words::command_for_classification`]), then collapse whitespace.
 pub(crate) fn normalize_command(cmd: &str) -> String {
-    unwrap_shell_launcher(cmd)
+    shell_words::command_for_classification(cmd)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

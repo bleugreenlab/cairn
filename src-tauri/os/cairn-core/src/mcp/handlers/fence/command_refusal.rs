@@ -11,7 +11,8 @@
 //! operator's attention.
 //!
 //! The recognizer is deliberately narrow and fails safe. It reads the agent's
-//! raw command, splits it into the simple commands the shell would run, notes
+//! command (through a whole-line launcher, see below), splits it into the
+//! simple commands the shell would run ([`simple_commands`]), notes
 //! which of them run inside a `( ... )` subshell, and looks for an explicit git
 //! subcommand. What matters is that a recognized git step runs against the
 //! working directory's repository, so two shapes are read rather than given up
@@ -24,10 +25,16 @@
 //! Anything it cannot read with confidence -- process substitution, a heredoc,
 //! a substitution or `case` where a program name belongs, a `git` global
 //! option, a redirected `GIT_*` variable, a `cd`, `eval` or `source` that may
-//! leave the working directory, a launcher such as `sh -c` -- yields no
-//! refusal, and the crossing falls through to the ordinary fence policy
-//! exactly as before. A missed recognition costs what the prompt always cost;
-//! a wrong one would refuse work that could have been approved.
+//! leave the working directory, a launcher inside a chain or given positional
+//! arguments (`sh -c 'git mv "$1" b' _ a`) -- yields no refusal, and the
+//! crossing falls through to the ordinary fence policy exactly as before. A
+//! missed recognition costs what the prompt always cost; a wrong one would
+//! refuse work that could have been approved.
+//!
+//! A launcher that is the whole line with one literal script
+//! (`sh -c 'git mv a b'`) is read through to that script
+//! ([`command_for_classification`]), because the script is
+//! exactly what the named shell runs.
 //!
 //! A git writer later in a chain (`... && git mv a b`) is still recognized. The
 //! step is blocked wherever it appears, so naming it is true regardless of what
@@ -40,13 +47,17 @@
 //! when no path was recovered. Either answers with one generic refusal when the
 //! path is a write to git's staging records or refs ([`is_git_internal_write`]).
 
+use crate::mcp::handlers::shell_words::{
+    command_for_classification, is_reserved_prefix, simple_commands, Piece, Word,
+};
+
 /// The refusal for a blocked command whose blocked step has an ordinary route
 /// inside the sandbox, or `None` to leave the crossing to the fence policy.
 pub(crate) fn denied_command_refusal(command: &str) -> Option<String> {
     // For each enclosing subshell, innermost last: whether a step inside it
     // may have left the working directory.
     let mut subshells: Vec<bool> = Vec::new();
-    for piece in simple_commands(command)? {
+    for piece in simple_commands(&command_for_classification(command))? {
         match piece {
             Piece::Open => subshells.push(false),
             Piece::Close => {
@@ -56,10 +67,8 @@ pub(crate) fn denied_command_refusal(command: &str) -> Option<String> {
                 Step::GitWrite(write) if !subshells.contains(&true) => {
                     return Some(write.refusal());
                 }
-                Step::MayLeaveWorktree => match subshells.last_mut() {
-                    Some(left) => *left = true,
-                    None => return None,
-                },
+                // At top level a step that may leave ends recognition.
+                Step::MayLeaveWorktree => *subshells.last_mut()? = true,
                 Step::Unreadable => return None,
                 Step::GitWrite(_) | Step::Other => {}
             },
@@ -339,17 +348,6 @@ enum Step {
     Other,
 }
 
-/// Reserved words that can open a simple command without being its program.
-/// `fi`, `done` and `}` close a construct and are read as ordinary programs
-/// that do nothing.
-const RESERVED_PREFIXES: &[&str] = &[
-    "if", "then", "elif", "else", "while", "until", "do", "!", "{", "time",
-];
-
-fn is_reserved_prefix(word: &Word) -> bool {
-    word.plain && RESERVED_PREFIXES.contains(&word.text.as_str())
-}
-
 /// The words after any leading options (`time -p`, `command -p`).
 fn skip_options(words: &[Word]) -> &[Word] {
     let options = words
@@ -433,229 +431,6 @@ fn stays_inside(dir: &str) -> bool {
         && !dir.split('/').any(|part| part == "..")
 }
 
-/// One shell word, with its quoting removed.
-#[derive(Debug)]
-struct Word {
-    text: String,
-    /// Written without quoting, escaping, or substitution, so the shell can
-    /// read it as a reserved word.
-    plain: bool,
-    /// Contains a command substitution, whose expansion is unknown.
-    substituted: bool,
-}
-
-/// One element of a command, in the order the shell meets it.
-#[derive(Debug)]
-enum Piece {
-    /// The words of one simple command.
-    Command(Vec<Word>),
-    /// `(`: a subshell begins. A `cd` inside it lasts until the matching `)`.
-    Open,
-    Close,
-}
-
-/// The word being built, started on its first character.
-fn word_at(word: &mut Option<Word>) -> &mut Word {
-    word.get_or_insert_with(|| Word {
-        text: String::new(),
-        plain: true,
-        substituted: false,
-    })
-}
-
-type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
-
-/// Split a command into its simple commands, separated by `;`, `&&`, `||`,
-/// `|`, `&` and newlines, with `( ... )` subshells marked. Quotes are
-/// honoured, so a `git mv` inside a `sed` expression is a word, not a
-/// command, and a command substitution is kept whole as part of its word: its
-/// separators and parentheses belong to the subshell it runs in, not to this
-/// command. `{ ... }` groups run in the current shell, so their braces are
-/// ordinary words.
-///
-/// Returns `None` for any construct whose effect cannot be read from the text:
-/// process substitution, a heredoc, a parenthesis that does not open a
-/// command (an array, a function definition, a `case` pattern), or unbalanced
-/// quoting, substitution, or parentheses.
-fn simple_commands(command: &str) -> Option<Vec<Piece>> {
-    let mut pieces = Vec::new();
-    let mut words: Vec<Word> = Vec::new();
-    let mut word: Option<Word> = None;
-    let mut depth = 0usize;
-    let mut chars = command.chars().peekable();
-
-    let end_word = |words: &mut Vec<Word>, word: &mut Option<Word>| words.extend(word.take());
-    let end_command = |pieces: &mut Vec<Piece>, words: &mut Vec<Word>| {
-        if !words.is_empty() {
-            pieces.push(Piece::Command(std::mem::take(words)));
-        }
-    };
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                let word = word_at(&mut word);
-                word.plain = false;
-                loop {
-                    match chars.next()? {
-                        '\'' => break,
-                        ch => word.text.push(ch),
-                    }
-                }
-            }
-            '"' => {
-                let word = word_at(&mut word);
-                word.plain = false;
-                double_quoted(&mut chars, word)?;
-            }
-            '\\' => match chars.next()? {
-                '\n' => {}
-                escaped => {
-                    let word = word_at(&mut word);
-                    word.plain = false;
-                    word.text.push(escaped);
-                }
-            },
-            '`' => backquoted(&mut chars, word_at(&mut word))?,
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                substitution(&mut chars, word_at(&mut word))?;
-            }
-            '<' | '>' if chars.peek() == Some(&'(') => return None,
-            '<' if chars.peek() == Some(&'<') => return None,
-            '#' if word.is_none() => {
-                while chars.peek().is_some_and(|&next| next != '\n') {
-                    chars.next();
-                }
-            }
-            // `2>&1`, `>&2`, `&>file`: redirections, not separators.
-            '&' if word
-                .as_ref()
-                .is_some_and(|word| word.text.ends_with(['>', '<']))
-                || chars.peek() == Some(&'>') =>
-            {
-                word_at(&mut word).text.push(c);
-            }
-            '(' => {
-                if word.is_some() || !words.iter().all(is_reserved_prefix) {
-                    return None;
-                }
-                end_command(&mut pieces, &mut words);
-                pieces.push(Piece::Open);
-                depth += 1;
-            }
-            ')' => {
-                end_word(&mut words, &mut word);
-                end_command(&mut pieces, &mut words);
-                depth = depth.checked_sub(1)?;
-                pieces.push(Piece::Close);
-            }
-            ';' | '&' | '|' | '\n' => {
-                end_word(&mut words, &mut word);
-                end_command(&mut pieces, &mut words);
-            }
-            c if c.is_whitespace() => end_word(&mut words, &mut word),
-            c => word_at(&mut word).text.push(c),
-        }
-    }
-    end_word(&mut words, &mut word);
-    end_command(&mut pieces, &mut words);
-    (depth == 0).then_some(pieces)
-}
-
-/// Read the rest of a double-quoted span whose opening `"` was just read.
-fn double_quoted(chars: &mut Chars<'_>, word: &mut Word) -> Option<()> {
-    loop {
-        match chars.next()? {
-            '"' => return Some(()),
-            '`' => backquoted(chars, word)?,
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                substitution(chars, word)?;
-            }
-            '\\' => match chars.next()? {
-                '\n' => {}
-                escaped @ ('"' | '\\' | '$' | '`') => word.text.push(escaped),
-                other => {
-                    word.text.push('\\');
-                    word.text.push(other);
-                }
-            },
-            ch => word.text.push(ch),
-        }
-    }
-}
-
-/// Read the rest of a `$( ... )` or `$(( ... ))` whose opening `$(` was just
-/// read, keeping its text in the word. Nested quotes and substitutions are
-/// honoured so that a `)` inside them does not end it.
-fn substitution(chars: &mut Chars<'_>, word: &mut Word) -> Option<()> {
-    word.plain = false;
-    word.substituted = true;
-    word.text.push_str("$(");
-    let mut depth = 1usize;
-    while depth > 0 {
-        let c = chars.next()?;
-        match c {
-            '\'' => {
-                word.text.push(c);
-                loop {
-                    let ch = chars.next()?;
-                    word.text.push(ch);
-                    if ch == '\'' {
-                        break;
-                    }
-                }
-                continue;
-            }
-            '"' => {
-                word.text.push(c);
-                double_quoted(chars, word)?;
-                word.text.push(c);
-                continue;
-            }
-            '`' => {
-                backquoted(chars, word)?;
-                continue;
-            }
-            '\\' => {
-                word.text.push(c);
-                word.text.push(chars.next()?);
-                continue;
-            }
-            '<' if matches!(chars.peek(), Some('<' | '(')) => return None,
-            '>' if chars.peek() == Some(&'(') => return None,
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        word.text.push(c);
-    }
-    Some(())
-}
-
-/// Read the rest of a backquoted substitution whose opening backquote was
-/// just read, keeping its text in the word.
-fn backquoted(chars: &mut Chars<'_>, word: &mut Word) -> Option<()> {
-    word.plain = false;
-    word.substituted = true;
-    word.text.push('`');
-    loop {
-        match chars.next()? {
-            '`' => break,
-            '\\' => {
-                word.text.push('\\');
-                word.text.push(chars.next()?);
-            }
-            '<' if matches!(chars.peek(), Some('<' | '(')) => return None,
-            '>' if chars.peek() == Some(&'(') => return None,
-            ch => word.text.push(ch),
-        }
-    }
-    word.text.push('`');
-    Some(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,6 +485,10 @@ mod tests {
             (" git rm -q crates/tm-oracle/tests/face_down.rs && git status --short | head", "rm"),
             ("git commit -qm wip", "commit"),
             ("git stash", "stash"),
+            // A whole-line launcher runs its one literal script.
+            ("sh -c 'git mv a b'", "mv"),
+            ("bash -c \"git add .\"", "add"),
+            (" bash -lc 'cd docs && git rm -q old.md'", "rm"),
             (
                 "git diff --binary 0fe4e354 12deb8e7 | git apply --index && git diff --cached --stat | tail -1 && test -z \"$(git diff HEAD 12deb8e7 --stat)\" && echo tree-equals-main",
                 "apply",
@@ -746,9 +525,12 @@ mod tests {
     #[test]
     fn unreadable_shapes_fall_through() {
         for command in [
-            // A launcher: the git step is a quoted argument, not a command.
-            "sh -c 'git mv a b'",
-            "bash -c \"git add .\"",
+            // A launcher that is not the whole line, or whose script the
+            // outer shell or its arguments change: the git step is a quoted
+            // argument, not a command.
+            "sh -c 'git mv \"$1\" b' _ a",
+            "bash -c 'git add .' && true",
+            "bash -c \"git add $X\"",
             // An alias or wrapper is a different program.
             "g mv a b",
             "xargs git add",

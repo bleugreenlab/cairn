@@ -2,6 +2,7 @@
 //! live-checkout regime and the jj workspace-refresh carveout.
 
 use crate::mcp::handlers::normalize_command;
+use crate::mcp::handlers::shell_words::command_for_classification;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 use crate::services::sandbox;
@@ -176,6 +177,13 @@ pub(crate) async fn resolve_run_confinement(
 ) -> RunConfinement {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
+    // Exemptions and carveouts match what the command runs, so a whole-line
+    // `bash -lc '<cmd>'` is read as `<cmd>`; anything else as written. The
+    // session grant below reads the same view through `normalize_command`, so
+    // it is handed the raw command, keyed exactly like the crossing descriptor.
+    let classified = command_for_grant.map(command_for_classification);
+    let classified = classified.as_deref();
+
     // The checkout decides the fenced profile's shape. The live checkout is
     // read-only for a fenced agent and non-grantable with it: run_one routes a
     // denial there to a plain explanation rather than a fence prompt, since no
@@ -199,7 +207,7 @@ pub(crate) async fn resolve_run_confinement(
     // self-grant an unconfined run by committing its own check or package script.
     // See `crate::config::check_exemption` and docs/worktree-fence.md.
     if !readonly_non_worktree {
-        if let (Some(cmd), Some(pid)) = (command_for_grant, project_id) {
+        if let (Some(cmd), Some(pid)) = (classified, project_id) {
             let main_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, pid)
                 .await
                 .ok()
@@ -250,12 +258,8 @@ pub(crate) async fn resolve_run_confinement(
     // is read-only and non-negotiable, so a command grant must never re-open it
     // to writes. The grant answers the fence's question, so the operator
     // credential boundary stays.
-    if !readonly_non_worktree {
-        if let Some(cmd) = command_for_grant {
-            if granted.contains(&normalize_command(cmd)) {
-                return RunConfinement::CredentialFloor;
-            }
-        }
+    if !readonly_non_worktree && session_grant_covers(&granted, command_for_grant) {
+        return RunConfinement::CredentialFloor;
     }
 
     let deny_read = orch.sandbox_deny_read();
@@ -265,7 +269,7 @@ pub(crate) async fn resolve_run_confinement(
     // profile, restoring the user's normal shell state and external credential
     // access; the operator credential is not one of those. Live checkouts retain
     // their structural read-only wrapper.
-    let accepted_command = match (command_for_grant, project_id) {
+    let accepted_command = match (classified, project_id) {
         (Some(command), Some(project_id)) => {
             let accepted = crate::config::settings::load_accepted_fence_commands(&orch.config_dir)
                 .remove(project_id)
@@ -296,10 +300,16 @@ pub(crate) async fn resolve_run_confinement(
         sandbox::SandboxPolicy::for_run(checkout, &granted, deny_read)
     };
     if !readonly_non_worktree {
-        apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, command_for_grant);
+        apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, classified);
     }
 
     RunConfinement::Fenced { policy, fence }
+}
+
+/// Whether a command-scoped session grant covers `command`, keyed identically
+/// to the crossing descriptor the fence raises for it.
+fn session_grant_covers(granted: &[String], command: Option<&str>) -> bool {
+    command.is_some_and(|command| granted.contains(&normalize_command(command)))
 }
 
 #[cfg(test)]
@@ -326,6 +336,33 @@ mod tests {
         ));
         assert!(!is_safe_jj_workspace_refresh_status_command(
             "jj workspace update-stale && jj log"
+        ));
+    }
+
+    /// A grant names what a command runs: a whole-line launcher of the granted
+    /// command is covered, and a chain that merely starts with one is not.
+    #[test]
+    fn a_session_grant_covers_a_whole_line_launcher_of_its_command_only() {
+        let granted = vec![normalize_command("git status --short")];
+        assert!(session_grant_covers(&granted, Some("git status --short")));
+        assert!(session_grant_covers(
+            &granted,
+            Some("bash -lc 'git status --short'")
+        ));
+        assert!(!session_grant_covers(
+            &granted,
+            Some("bash -c 'git status --short' && echo x")
+        ));
+        assert!(!session_grant_covers(&granted, None));
+
+        let fence_descriptor = crate::mcp::handlers::fence::Crossing::shell_command(
+            String::new(),
+            "bash -lc 'git status --short'",
+        )
+        .descriptor;
+        assert!(session_grant_covers(
+            &[fence_descriptor],
+            Some("bash -lc 'git status --short'")
         ));
     }
 
