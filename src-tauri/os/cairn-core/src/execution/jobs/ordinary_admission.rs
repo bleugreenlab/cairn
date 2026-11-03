@@ -374,7 +374,13 @@ async fn recover_team_launch(
 }
 
 fn backend_for(prepared: &PreparedJob) -> std::sync::Arc<dyn crate::backends::AgentBackend> {
-    let name = crate::backends::effective_backend_name(
+    crate::backends::backend_for_name(Some(&backend_key_for(prepared))).into()
+}
+
+/// The provider key `backend_for` resolves: the same key the usage pool and
+/// account surfaces are addressed by.
+fn backend_key_for(prepared: &PreparedJob) -> String {
+    crate::backends::effective_backend_name(
         prepared
             .agent_config
             .as_ref()
@@ -384,8 +390,8 @@ fn backend_for(prepared: &PreparedJob) -> std::sync::Arc<dyn crate::backends::Ag
             .as_ref()
             .and_then(|config| config.backend_preference.as_deref()),
         prepared.job_model.as_ref().map(Model::as_str),
-    );
-    crate::backends::backend_for_name(name.as_deref()).into()
+    )
+    .unwrap_or_else(|| crate::backends::CLAUDE_FAMILY_BACKEND.to_string())
 }
 
 /// Reclaim process-owned leases lost with the prior host and restart promotion
@@ -483,11 +489,12 @@ pub(super) fn enqueue_or_start(
 
     let request_id = format!("ordinary-admission:{}", prepared.run_id);
     let now = chrono::Utc::now().timestamp();
-    let runtime_capability = serde_json::from_value(
+    let mut runtime_capability: crate::storage::PreparedRuntimeCapability = serde_json::from_value(
         serde_json::to_value(&capability)
             .map_err(|error| format!("serialize ordinary runtime capability: {error}"))?,
     )
     .map_err(|error| format!("convert ordinary runtime capability: {error}"))?;
+    runtime_capability.provider = Some(backend_key_for(prepared));
     let session_start = match &prepared.session_start {
         crate::backends::SessionStart::New { session_id } => {
             crate::storage::PreparedSessionStart::New {

@@ -397,14 +397,18 @@ pub(crate) fn prepared_call_provider_metadata(
     crate::storage::RuntimeResourceCapacity,
 )> {
     let prepared = decode_prepared_call(prepared_json)?;
-    let backend = crate::backends::backend_for_name(admission_backend_name(&prepared).as_deref());
+    let backend_name = admission_backend_name(&prepared);
+    let backend = crate::backends::backend_for_name(backend_name.as_deref());
     let capability = backend
         .runtime_launch_capability(&crate::backends::RuntimeLaunch {
             is_ephemeral_call: true,
             server_instance_key,
         })
         .ok()?;
-    let capability = serde_json::from_value(serde_json::to_value(capability).ok()?).ok()?;
+    let mut capability: crate::storage::PreparedRuntimeCapability =
+        serde_json::from_value(serde_json::to_value(capability).ok()?).ok()?;
+    capability.provider =
+        Some(backend_name.unwrap_or_else(|| crate::backends::CLAUDE_FAMILY_BACKEND.to_string()));
     let ceiling = call_lane_ceiling(Some(&prepared));
     Some((
         capability,

@@ -13,6 +13,7 @@
 //!
 //! `RunRegistry` replaces the raw HashMap, adding a session_id index for O(1) lookups.
 
+use cairn_common::process_identity::ProcessAnchor;
 use cairn_platform::services::process::ChildProcess;
 #[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
@@ -20,7 +21,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use cairn_models::claude::feeds::FeedRegistration;
@@ -400,6 +401,9 @@ pub struct RunHandle {
     /// retained while the process is starting, active, awaiting its host, and
     /// warm; terminal lifecycle paths consume it exactly once.
     admission_claim: Option<ProcessAdmissionClaim>,
+    /// The attached child's pid and kernel start time, read at registration.
+    /// A tree reading starts here and confers nothing on a recycled pid.
+    leader: Option<ProcessAnchor>,
 }
 
 /// Durable admission identity carried by a dedicated ordinary process.
@@ -459,7 +463,23 @@ impl RunHandle {
             pending_suspend: Arc::new(Mutex::new(None)),
             seen_affordances: Arc::new(Mutex::new(HashSet::new())),
             admission_claim: None,
+            leader: None,
         }
+    }
+
+    /// A handle whose leader identity is already known, as registration would
+    /// read it from an attached child.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_leader(mut self, leader: ProcessAnchor) -> Self {
+        self.leader = Some(leader);
+        self
+    }
+
+    /// The attached child's identity, read from the kernel now.
+    fn read_leader(&self) -> Option<ProcessAnchor> {
+        let pid = self.child.lock().ok()?.as_ref()?.id();
+        let start_token = cairn_common::process_identity::process_start_token(pid)?;
+        Some(ProcessAnchor { pid, start_token })
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -676,6 +696,61 @@ pub struct WarmProcess {
     pub job_id: Option<String>,
 }
 
+/// A live agent process tree to measure: its run and its leader's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTree {
+    pub run_id: String,
+    pub leader: ProcessAnchor,
+}
+
+/// Announces that an agent process registered, so a sampler parked on an
+/// empty registry wakes for it. A counter rather than a flag, so a wake that
+/// lands between a read of the registry and the wait is not lost.
+#[derive(Default)]
+pub struct LiveTreeSignal {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl LiveTreeSignal {
+    pub fn generation(&self) -> u64 {
+        self.generation.lock().map(|g| *g).unwrap_or(0)
+    }
+
+    pub fn notify(&self) {
+        if let Ok(mut generation) = self.generation.lock() {
+            *generation = generation.wrapping_add(1);
+        }
+        self.changed.notify_all();
+    }
+
+    /// Block until the generation moves past `seen`, or until `deadline` when
+    /// one is given. Returns the generation it woke at.
+    pub fn wait_past(&self, seen: u64, deadline: Option<Instant>) -> u64 {
+        let Ok(mut generation) = self.generation.lock() else {
+            return seen;
+        };
+        while *generation == seen {
+            match deadline {
+                None => match self.changed.wait(generation) {
+                    Ok(next) => generation = next,
+                    Err(_) => return seen,
+                },
+                Some(deadline) => {
+                    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match self.changed.wait_timeout(generation, left) {
+                        Ok((next, _)) => generation = next,
+                        Err(_) => return seen,
+                    }
+                }
+            }
+        }
+        *generation
+    }
+}
+
 /// State for tracking active agent processes
 pub struct AgentProcessState {
     /// Active processes keyed by run_id
@@ -701,6 +776,8 @@ pub struct AgentProcessState {
     /// moves into RunHandle at registration, so warm reuse cannot acquire or
     /// attach a second claim.
     pending_admission_claims: Mutex<HashMap<String, ProcessAdmissionClaim>>,
+    /// Raised on every registration, for the agent memory sampler.
+    live_tree_signal: LiveTreeSignal,
 }
 
 impl AgentProcessState {
@@ -978,6 +1055,28 @@ impl AgentProcessState {
         warm.sort_by_key(|w| w.seconds_since_activity);
 
         warm
+    }
+
+    /// Every registered process with an attached child, warm or working, by
+    /// run id and leader identity. Reads no process: the identity was taken
+    /// at registration.
+    pub fn live_trees(&self) -> Vec<LiveTree> {
+        let Ok(processes) = self.processes.lock() else {
+            return Vec::new();
+        };
+        processes
+            .iter()
+            .filter_map(|(run_id, process)| {
+                Some(LiveTree {
+                    run_id: run_id.clone(),
+                    leader: process.leader.clone()?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn live_tree_signal(&self) -> &LiveTreeSignal {
+        &self.live_tree_signal
     }
 
     /// Count GC-safe (idle) processes.
@@ -1414,10 +1513,19 @@ impl AgentProcessState {
         if let Ok(mut claims) = self.pending_admission_claims.lock() {
             handle.admission_claim = claims.remove(&run_id);
         }
+        // Read before the registry lock. The child is attached and not yet
+        // waited on, so its pid cannot have been handed to another process.
+        if handle.leader.is_none() {
+            handle.leader = handle.read_leader();
+        }
+        let measurable = handle.leader.is_some();
         let displaced = {
             let mut processes = self.processes.lock().map_err(|e| e.to_string())?;
             processes.register(run_id, handle)
         };
+        if measurable {
+            self.live_tree_signal.notify();
+        }
         if let Some(displaced) = displaced {
             if let Ok(mut child_guard) = displaced.child.lock() {
                 if let Some(child) = child_guard.as_mut() {
@@ -1456,6 +1564,7 @@ impl Default for AgentProcessState {
             workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
             workflow_leases: Mutex::new(std::collections::HashMap::new()),
             pending_admission_claims: Mutex::new(HashMap::new()),
+            live_tree_signal: LiveTreeSignal::default(),
         }
     }
 }

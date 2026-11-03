@@ -894,6 +894,10 @@ mod tests {
             effective_capacity: None,
             runtime_host: None,
             host_constraint: Some(crate::storage::PreparedRuntimeHostRequirement::None),
+            session_id: None,
+            model: None,
+            account_id: None,
+            provider: None,
         };
         assert_eq!(
             render_launch_line(&projection(1, None)).unwrap(),

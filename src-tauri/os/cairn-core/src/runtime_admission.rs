@@ -50,6 +50,11 @@ pub struct ProviderAdmissionSnapshot {
     pub revision: String,
     pub authorities: Vec<ProviderAdmissionAuthority>,
     pub records: Vec<crate::storage::ProviderAdmissionRecord>,
+    /// The identity this runner stamps on the hosts it runs, so a surface can
+    /// tell its own team-admitted processes from another runner's. Fixed for
+    /// the life of the process; `None` where the runner has no identity.
+    #[serde(default)]
+    pub local_runner_id: Option<String>,
 }
 
 /// Equality excludes observation clocks: refreshing an unchanged authority must
@@ -301,6 +306,7 @@ async fn compose_provider_admission_snapshot(
         revision: String::new(),
         authorities,
         records,
+        local_runner_id: None,
     }
 }
 
@@ -347,6 +353,8 @@ async fn rebuild_provider_admission_snapshot(
                 record.owner.project_id = old.owner.project_id.clone();
                 record.owner.issue_id = old.owner.issue_id.clone();
                 record.owner.thread_id = old.owner.thread_id.clone();
+                record.owner.issue_number = old.owner.issue_number;
+                record.owner.node_kind = old.owner.node_kind.clone();
             }
             if record.state.is_none() {
                 record.enqueue_sequence = old.enqueue_sequence;
@@ -378,18 +386,27 @@ async fn rebuild_provider_admission_snapshot(
             serde_json::to_string(&jobs.keys().collect::<Vec<_>>()).expect("job ids serialize");
         owner_query(&scope);
         let owners = db.query_all(
-            "SELECT id,project_id,issue_id,thread_id FROM jobs WHERE id IN (SELECT value FROM json_each(?1))",
+            "SELECT j.id,j.project_id,j.issue_id,j.thread_id,i.number,j.node_name FROM jobs j LEFT JOIN issues i ON i.id=j.issue_id WHERE j.id IN (SELECT value FROM json_each(?1))",
             (ids,),
-            |row| Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?, row.opt_text(3)?)),
+            |row| Ok((
+                row.text(0)?,
+                row.opt_text(1)?,
+                row.opt_text(2)?,
+                row.opt_text(3)?,
+                row.opt_i64(4)?.and_then(|number| i32::try_from(number).ok()),
+                row.opt_text(5)?.filter(|kind| !kind.is_empty()),
+            )),
         ).await;
         match owners {
             Ok(owners) => {
-                for (job, project, issue, thread) in owners {
+                for (job, project, issue, thread, issue_number, node_kind) in owners {
                     for &index in &jobs[&job] {
                         let owner = &mut snapshot.records[index].owner;
                         owner.project_id = project.clone();
                         owner.issue_id = issue.clone();
                         owner.thread_id = thread.clone();
+                        owner.issue_number = issue_number;
+                        owner.node_kind = node_kind.clone();
                     }
                 }
             }
@@ -475,6 +492,8 @@ pub(crate) fn provider_admission_cache(
                         .into_iter()
                         .map(|call| (call.request_id, call.prepared_json))
                         .collect();
+                let runner_id = std::env::var("CAIRN_RUNNER_ID").ok();
+                snapshot.local_runner_id = runner_id.clone();
                 for record in &mut snapshot.records {
                     if let Some(prepared_json) = calls.get(&record.request_id) {
                         if let Some((capability, capacity)) =
@@ -490,6 +509,7 @@ pub(crate) fn provider_admission_cache(
                                 record.runtime_class = capability.class;
                                 record.host_constraint = Some(capability.host_requirement);
                                 record.effective_capacity = Some(capacity);
+                                record.provider = capability.provider;
                             }
                         }
                     }
@@ -503,12 +523,13 @@ pub(crate) fn provider_admission_cache(
                             )
                         )
                     {
-                        record.runtime_host = std::env::var("CAIRN_RUNNER_ID").ok().map(|id| {
-                            crate::storage::RuntimeHostIdentity {
-                                kind: crate::storage::PreparedRuntimeHostKind::Runner,
-                                id,
-                            }
-                        });
+                        record.runtime_host =
+                            runner_id
+                                .clone()
+                                .map(|id| crate::storage::RuntimeHostIdentity {
+                                    kind: crate::storage::PreparedRuntimeHostKind::Runner,
+                                    id,
+                                });
                     }
                     let warm = record
                         .owner
@@ -1221,6 +1242,10 @@ mod tests {
             }),
             runtime_host: None,
             host_constraint: Some(crate::storage::PreparedRuntimeHostRequirement::None),
+            session_id: Some("session".into()),
+            model: Some("gpt-5.6-sol".into()),
+            account_id: Some("account".into()),
+            provider: Some("codex".into()),
         }
     }
 
@@ -1388,6 +1413,7 @@ mod tests {
     #[test]
     fn provider_revision_and_encoding_ignore_observation_clock_only() {
         let snapshot = ProviderAdmissionSnapshot {
+            local_runner_id: None,
             captured_at_unix_ms: 1,
             revision: String::new(),
             authorities: vec![ProviderAdmissionAuthority {
@@ -1663,8 +1689,8 @@ mod tests {
                     continue;
                 }
                 sql.push_str(&format!(
-                    "INSERT INTO jobs(id,project_id,issue_id,status,created_at,updated_at)
-                     VALUES('{team}~00000000-0000-4000-8000-{i:012}','{team}-project','{team}-issue','running',1,1);"
+                    "INSERT INTO jobs(id,project_id,issue_id,node_name,status,created_at,updated_at)
+                     VALUES('{team}~00000000-0000-4000-8000-{i:012}','{team}-project','{team}-issue','builder','running',1,1);"
                 ));
             }
             db.execute_script(&sql).await.unwrap();
@@ -1746,6 +1772,8 @@ mod tests {
                 .unwrap();
             assert_eq!(record.owner.project_id, Some(format!("{team}-project")));
             assert_eq!(record.owner.issue_id, Some(format!("{team}-issue")));
+            assert_eq!(record.owner.issue_number, Some(1));
+            assert_eq!(record.owner.node_kind.as_deref(), Some("builder"));
             assert_eq!(record.owner.execution_id.as_deref(), Some("execution"));
         }
         cache.invalidate(PROVIDER_ADMISSION_KEY, "test-refresh");
@@ -1915,6 +1943,7 @@ mod tests {
                             revision: String::new(),
                             authorities: Vec::new(),
                             records: vec![projection()],
+                            local_runner_id: None,
                         })
                     }
                 }

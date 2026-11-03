@@ -6,6 +6,7 @@
 
 pub(crate) mod completion;
 pub mod gc;
+pub mod live_memory;
 pub mod memory;
 pub mod orphan;
 pub mod process;

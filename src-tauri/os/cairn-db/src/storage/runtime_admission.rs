@@ -355,6 +355,12 @@ pub struct PreparedRuntimeCapability {
     pub host_requirement: PreparedRuntimeHostRequirement,
     pub claim: RuntimeResourceClaim,
     pub supports_warm_reuse: bool,
+    /// The provider backend key (`claude`, `codex`, `custom:<id>`, …) the
+    /// launch resolved to. Lanes do not map one-to-one to providers, so the
+    /// lane alone cannot say whose accounts and usage a session draws on.
+    /// Absent on rows prepared before the key was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Who asked for an ordinary launch. An operator launch serves content an
@@ -692,6 +698,9 @@ pub struct ProviderAdmissionOwner {
     pub execution_id: Option<String>,
     pub job_id: Option<String>,
     pub run_id: Option<String>,
+    pub issue_number: Option<i32>,
+    /// The owning node's kind (`builder`, `planner`, …), from `jobs.node_name`.
+    pub node_kind: Option<String>,
 }
 
 /// One durable provider claim. Position is the current scheduler candidate order
@@ -717,6 +726,17 @@ pub struct ProviderAdmissionRecord {
     pub effective_capacity: Option<RuntimeResourceCapacity>,
     pub runtime_host: Option<RuntimeHostIdentity>,
     pub host_constraint: Option<PreparedRuntimeHostRequirement>,
+    /// Launch coordinates fixed when the request was prepared. A failover
+    /// re-pin creates a new run and so a new request; none of these change
+    /// under a live request, so they never cause a republish on their own.
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    /// The provider account the session pinned at preparation
+    /// (`prepared_ordinary_launches.provider_account_id`). Never a credential.
+    pub account_id: Option<String>,
+    /// The provider backend key whose accounts and usage pool this session
+    /// draws on; see [`PreparedRuntimeCapability::provider`].
+    pub provider: Option<String>,
 }
 
 /// Read only the public admission facts from reconstruction records. In
@@ -744,11 +764,15 @@ pub async fn provider_admission_records(
            p.runtime_capability_json,r.workspace_key,r.resource_lane,r.enqueue_seq,
            r.position,r.population,
            COALESCE(p.execution_id,json_extract(call.prepared_json,'$.execution_id')),
-           j.project_id,j.issue_id,j.thread_id
+           j.project_id,j.issue_id,j.thread_id,
+           COALESCE(p.session_id,json_extract(call.prepared_json,'$.session_id')),
+           COALESCE(NULLIF(p.model,''),json_extract(call.prepared_json,'$.selected_model')),
+           p.provider_account_id,i.number,j.node_name
          FROM ranked r
          LEFT JOIN prepared_ordinary_launches p ON p.request_id=r.request_id
          LEFT JOIN prepared_runtime_calls call ON call.request_id=r.request_id
          LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,json_extract(call.prepared_json,'$.job_id'))
+         LEFT JOIN issues i ON i.id=j.issue_id
          WHERE p.request_id IS NOT NULL OR call.request_id IS NOT NULL
          ORDER BY r.workspace_key,r.resource_lane,
            CASE WHEN r.state='queued' THEN 0 ELSE 1 END,
@@ -768,6 +792,7 @@ pub async fn provider_admission_records(
                     PreparedRuntimeClass::StatelessHttp
                 }
             });
+            let provider = capability.as_ref().and_then(|value| value.provider.clone());
             let constraint = capability.map(|value| value.host_requirement);
             let workspace = row.text(7)?;
             let lane = row.text(8)?;
@@ -785,6 +810,8 @@ pub async fn provider_admission_records(
                     execution_id: row.opt_text(12)?.filter(|id| !id.is_empty()),
                     job_id: row.opt_text(1)?,
                     run_id: row.opt_text(2)?,
+                    issue_number: row.opt_i64(19)?.and_then(|number| i32::try_from(number).ok()),
+                    node_kind: row.opt_text(20)?.filter(|kind| !kind.is_empty()),
                 },
                 authority_key: if workspace.starts_with("team:") { workspace.clone() } else { format!("private:{workspace}") },
                 workspace_id: workspace,
@@ -805,6 +832,10 @@ pub async fn provider_admission_records(
                 // Lease owner is a boot-scoped promoter, not a machine identity.
                 runtime_host: None,
                 host_constraint: constraint,
+                session_id: row.opt_text(16)?.filter(|id| !id.is_empty()),
+                model: row.opt_text(17)?.filter(|model| !model.is_empty()),
+                account_id: row.opt_text(18)?.filter(|id| !id.is_empty()),
+                provider,
             })
         },
     ).await
@@ -1560,6 +1591,7 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
                 estimated_memory_bytes: Some(1024),
             },
             supports_warm_reuse: true,
+            provider: Some("codex".into()),
         },
         provider_account_id: Some("account-1".into()),
         origin: LaunchOrigin::Operator,
@@ -1733,6 +1765,22 @@ async fn prepared_ordinary_launch_round_trips_and_is_immutable() {
     let projected = &projected[0];
     assert_eq!(projected.owner.job_id.as_deref(), Some("j"));
     assert_eq!(projected.owner.project_id.as_deref(), Some("p"));
+    // Immutable launch coordinates come from the prepared launch itself.
+    assert_eq!(
+        (
+            projected.session_id.as_deref(),
+            projected.model.as_deref(),
+            projected.account_id.as_deref(),
+            projected.provider.as_deref(),
+        ),
+        (
+            Some("s"),
+            Some("gpt-5.6-sol"),
+            Some("account-1"),
+            Some("codex")
+        )
+    );
+    assert_eq!(projected.owner.issue_number, None);
     assert_eq!(
         projected.reason,
         Some(RuntimeAdmissionReason::WaitingForRuntimeCapacity)
@@ -3048,6 +3096,7 @@ async fn provider_records_include_prepared_calls_and_follow_lane_cursor() {
                 request_id: id.into(),
                 run_id: format!("run:{id}"),
                 prepared_json: serde_json::json!({"job_id":"job", "execution_id":"execution",
+                "session_id":format!("session:{id}"), "selected_model":"haiku",
                 "prompt":"secret prompt", "agent_config":{"credential":"secret"}})
                 .to_string(),
             },
@@ -3072,6 +3121,14 @@ async fn provider_records_include_prepared_calls_and_follow_lane_cursor() {
     assert_eq!(rows[0].owner.job_id.as_deref(), Some("job"));
     assert_eq!(rows[0].owner.execution_id.as_deref(), Some("execution"));
     assert_eq!(rows[0].host_constraint, None);
+    // A call's session and model come from its prepared packet; a call pins
+    // no account, and its provider is resolved from the packet above this layer.
+    assert_eq!(rows[0].session_id.as_deref(), Some("session:urgent"));
+    assert_eq!(rows[0].model.as_deref(), Some("haiku"));
+    assert_eq!(
+        (rows[0].account_id.as_deref(), rows[0].provider.as_deref()),
+        (None, None)
+    );
     let wire = serde_json::to_string(&rows).unwrap();
     assert!(!wire.contains("secret"));
     assert!(!wire.contains("agent_config"));
