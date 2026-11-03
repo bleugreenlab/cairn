@@ -155,7 +155,7 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
 
     let blank = refuse(proposal("   ")).await;
     assert!(blank.contains("non-empty statement"), "{blank}");
-    assert_eq!(MAX_STATEMENT_CHARS, 200);
+    assert_eq!(MAX_STATEMENT_CHARS, 250);
     let over = refuse(proposal(&"x".repeat(MAX_STATEMENT_CHARS + 1))).await;
     assert!(over.starts_with(OVER_LENGTH_REFUSAL), "{over}");
     assert!(
@@ -164,7 +164,10 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
         ),
         "the refusal says where the essay goes: {over}"
     );
-    assert!(over.contains("this statement is 201 characters"), "{over}");
+    assert!(
+        over.contains("this statement is 251 characters; it may be at most 250"),
+        "{over}"
+    );
     // The rationale's bound is for abuse, not prose.
     assert_eq!(MAX_RATIONALE_CHARS, 32_768);
     let long_rationale = refuse(with_rationale(
@@ -182,6 +185,31 @@ async fn a_proposal_is_refused_when_its_statement_is_blank_or_too_long() {
         "a refused proposal writes nothing"
     );
     assert_eq!(pending_count(&db, PROJECT).await.unwrap(), 0);
+}
+
+/// The statement cap is one number stated in two crates and a prompt: the
+/// contract note an agent reads before proposing, the refusal it gets past
+/// the cap, and the thread agent prompt that teaches the shape. Each names the
+/// enforcing constant, so moving the cap moves all of them or fails here.
+#[test]
+fn the_statement_cap_reads_as_one_number_wherever_it_is_stated() {
+    use cairn_common::contract::{mutation_spec, ChangeMode, ResourceKind};
+
+    let cap = format!("at most {MAX_STATEMENT_CHARS} characters");
+    let note = mutation_spec(ResourceKind::ProjectTenets, ChangeMode::Append)
+        .and_then(|spec| spec.required.iter().find(|key| key.key == "statement"))
+        .expect("the tenets append contract requires `statement`")
+        .note();
+    assert!(note.ends_with(&cap), "{note}");
+    assert!(
+        OVER_LENGTH_REFUSAL.contains(&format!("(≤{MAX_STATEMENT_CHARS} chars)")),
+        "{OVER_LENGTH_REFUSAL}"
+    );
+    let prompt = include_str!("../../../../packs/core/agents/thread.md");
+    assert!(
+        prompt.contains(&cap),
+        "the thread agent prompt states the cap"
+    );
 }
 
 /// A rationale is as long as the argument needs: one far past the statement's

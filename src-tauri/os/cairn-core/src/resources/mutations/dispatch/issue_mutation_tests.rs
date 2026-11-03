@@ -3623,7 +3623,7 @@ async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them(
         &tenet_item(
             "cairn://p/cairn/tenets",
             ChangeMode::Append,
-            serde_json::json!({"statement": "x".repeat(201)}),
+            serde_json::json!({"statement": "x".repeat(crate::tenets::MAX_STATEMENT_CHARS + 1)}),
         ),
         &run,
     )

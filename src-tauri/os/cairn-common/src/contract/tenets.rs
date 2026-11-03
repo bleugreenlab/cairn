@@ -5,7 +5,7 @@ use super::types::*;
 const TENET_STATEMENT: KeySpec = KeySpec::new(
     "statement",
     KeyType::Str,
-    "one sentence of how the project does things, as the project's handbook would put it, for the operator to answer yes or no at a glance; no URIs and no reasoning; at most 200 characters",
+    "one sentence of how the project does things, as the project's handbook would put it, for the operator to answer yes or no at a glance; no URIs and no reasoning; at most 250 characters",
 );
 const TENET_RATIONALE: KeySpec = KeySpec::new(
     "rationale",

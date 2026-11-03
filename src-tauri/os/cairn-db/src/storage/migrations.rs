@@ -5182,104 +5182,57 @@ mod tests {
     }
 
     /// Deleting an event runs the `message_streams.final_event_id` foreign-key
-    /// action, `UPDATE message_streams SET final_event_id = NULL WHERE
-    /// final_event_id = ?`. Turso hides that action from `EXPLAIN`, so this pins
-    /// the plan of the equivalent statement: it must seek
-    /// `idx_message_streams_final_event`, not scan every stream (cairn/5584).
-    #[tokio::test]
-    async fn final_event_set_null_seeks_its_index() {
-        let db = migrated_db().await.unwrap();
-        let plan = explain_plan(
-            &db,
-            "UPDATE message_streams SET final_event_id = NULL WHERE final_event_id = 'e'",
-        )
-        .await;
-        assert!(
-            plan.iter()
-                .any(|step| step.contains("idx_message_streams_final_event")),
-            "the final_event_id SET NULL action must seek its index, got {plan:?}"
-        );
-        assert!(
-            !plan
-                .iter()
-                .any(|step| step.contains("SCAN message_streams")),
-            "the final_event_id SET NULL action must not scan message_streams, got {plan:?}"
-        );
-    }
-
-    /// The plan pin above covers the statement; this covers the hidden action
-    /// itself. Deleting events whose streams name them as `final_event_id` must
-    /// cost the same however many other streams exist. In a debug build, 500
-    /// deletes take about 80 ms with the index. Without it each delete scans all
-    /// 40,500 streams, and the 500 deletes take about 2.6 s.
+    /// action (`ON DELETE SET NULL`), which Turso compiles into a subprogram.
+    /// `EXPLAIN` lists every subprogram's opcodes after the delete's own, so the
+    /// action's access path is part of the delete's program: it must open
+    /// `idx_message_streams_final_event` and never `Rewind` (scan) the streams
+    /// table (cairn/5584). Turso keeps no table statistics, so the program is
+    /// the same however many streams exist; no fixture size or timing is needed
+    /// to see a scan.
     #[tokio::test]
     async fn deleting_events_with_final_streams_does_not_scan_streams() {
-        const BACKGROUND: usize = 40_000;
-        const DELETED: usize = 500;
-        const BATCH: usize = 500;
+        async fn delete_program(db: &LocalDb) -> Vec<(String, String)> {
+            db.query_all("EXPLAIN DELETE FROM events WHERE id = 'e'", (), |row| {
+                Ok((row.text(1)?, row.text(7)?))
+            })
+            .await
+            .unwrap()
+        }
+        fn scans_streams(program: &[(String, String)]) -> bool {
+            program
+                .iter()
+                .any(|(opcode, comment)| opcode == "Rewind" && comment.contains("message_streams"))
+        }
 
         let db = migrated_db().await.unwrap();
-        db.write(move |conn| {
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO runs(id, status, created_at, updated_at) VALUES ('r', 'running', 1, 1)",
-                    (),
-                )
-                .await?;
-                let total = BACKGROUND + DELETED;
-                for start in (0..total).step_by(BATCH) {
-                    let rows = start..(start + BATCH).min(total);
-                    let events = rows
-                        .clone()
-                        .map(|i| format!("('e{i}', 'r', 's', {i}, 1, 'assistant', '{{}}', 1)"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let streams = rows
-                        .map(|i| format!("('m{i}', 'r', 'b', {i}, 'finalized', 'e{i}', 1, 1)"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    conn.execute(
-                        &format!(
-                            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, \
-                             event_type, data, created_at) VALUES {events}"
-                        ),
-                        (),
-                    )
-                    .await?;
-                    conn.execute(
-                        &format!(
-                            "INSERT INTO message_streams(id, run_id, backend, sequence, status, \
-                             final_event_id, created_at, updated_at) VALUES {streams}"
-                        ),
-                        (),
-                    )
-                    .await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-
-        let start = std::time::Instant::now();
-        db.write(move |conn| {
-            Box::pin(async move {
-                for i in BACKGROUND..BACKGROUND + DELETED {
-                    conn.execute("DELETE FROM events WHERE id = ?1", (format!("e{i}"),))
-                        .await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-        let elapsed = start.elapsed();
+        let program = delete_program(&db).await;
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "deleting {DELETED} events beside {BACKGROUND} streams took {elapsed:?}; \
-             the final_event_id foreign-key action is scanning message_streams"
+            program.iter().any(|(opcode, comment)| opcode == "OpenRead"
+                && comment.contains("index=idx_message_streams_final_event")),
+            "the final_event_id SET NULL action must seek its index: {program:#?}"
+        );
+        assert!(
+            !scans_streams(&program),
+            "deleting an event must not scan message_streams: {program:#?}"
         );
 
+        // The action runs: enforcement is on, and it clears only the deleted
+        // events' streams.
+        db.execute_script(
+            "INSERT INTO runs(id, status, created_at, updated_at) VALUES ('r', 'running', 1, 1);
+             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('e0', 'r', 's', 0, 1, 'assistant', '{}', 1),
+                      ('e1', 'r', 's', 1, 1, 'assistant', '{}', 1),
+                      ('e2', 'r', 's', 2, 1, 'assistant', '{}', 1);
+             INSERT INTO message_streams(id, run_id, backend, sequence, status, final_event_id,
+                                         created_at, updated_at)
+               VALUES ('m0', 'r', 'b', 0, 'finalized', 'e0', 1, 1),
+                      ('m1', 'r', 'b', 1, 'finalized', 'e1', 1, 1),
+                      ('m2', 'r', 'b', 2, 'finalized', 'e2', 1, 1);
+             DELETE FROM events WHERE id IN ('e1', 'e2');",
+        )
+        .await
+        .unwrap();
         let nulled = db
             .query_one(
                 "SELECT COUNT(*) FROM message_streams WHERE final_event_id IS NULL",
@@ -5298,8 +5251,19 @@ mod tests {
             .unwrap();
         assert_eq!(
             (nulled, kept),
-            (DELETED as i64, BACKGROUND as i64),
+            (2, 1),
             "deleted events' streams survive with final_event_id cleared; the rest are untouched"
+        );
+
+        // Without the index the same delete scans, so the assertions above can
+        // tell the difference.
+        db.execute("DROP INDEX idx_message_streams_final_event", ())
+            .await
+            .unwrap();
+        let unindexed = delete_program(&db).await;
+        assert!(
+            scans_streams(&unindexed),
+            "without its index the action must scan message_streams: {unindexed:#?}"
         );
     }
 

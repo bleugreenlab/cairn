@@ -60,8 +60,12 @@ pub const TABLE: &str = "tenets";
 pub const TENET_GATE_FACT: &str = "tenet_verdict";
 
 /// The ceiling on a proposal's statement, in characters: one sentence the
-/// operator answers at a glance.
-pub const MAX_STATEMENT_CHARS: usize = 200;
+/// operator answers at a glance. A precise sentence naming Cairn things by
+/// their real names (a URI shape, a package, a verb) runs to about 250; a
+/// paragraph starts near 300, so this refuses the paragraph, not the names.
+/// The contract's `statement` note and the thread agent prompt state the same
+/// number, pinned by a test.
+pub const MAX_STATEMENT_CHARS: usize = 250;
 
 /// An abuse bound on a proposal's rationale, in characters, not a prose limit:
 /// the rationale is where the argument behind a tenet survives whole, and it is
@@ -71,7 +75,7 @@ pub const MAX_STATEMENT_CHARS: usize = 200;
 /// runaway payload (a pasted file) would multiply.
 pub const MAX_RATIONALE_CHARS: usize = 32 * 1024;
 
-pub const OVER_LENGTH_REFUSAL: &str = "a tenet statement is one sentence the operator answers at a glance (≤200 chars); put the reasoning, rejected alternatives, and provenance links in `rationale`";
+pub const OVER_LENGTH_REFUSAL: &str = "a tenet statement is one sentence the operator answers at a glance (≤250 chars); put the reasoning, rejected alternatives, and provenance links in `rationale`";
 
 pub const RATIONALE_OVER_LENGTH_REFUSAL: &str = "a tenet's rationale is the argument behind it, not an attached document; this one is past the 32768-character bound, which exists only to stop a runaway payload";
 
