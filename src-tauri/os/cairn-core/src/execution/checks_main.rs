@@ -3124,9 +3124,58 @@ struct RowDiff<'a> {
     red_now_skipped: usize,
     /// Red in both rows.
     still_red: usize,
+    /// The still-red failures of each group sharing a host condition's error
+    /// that did not read as the host. Counted in `still_red` too; these are
+    /// the ones it lists.
+    shared_still_red: Vec<SharedRed<'a>>,
 }
 
-fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> RowDiff<'a> {
+/// Failures that share one host condition's error, red at the compared row
+/// too, whose group the discriminator refused: an intermittent in the tree,
+/// listed under the error they share.
+#[derive(Debug)]
+struct SharedRed<'a> {
+    condition: &'static HostCondition,
+    tests: Vec<&'a str>,
+    /// The window's other host, when it failed the same tests on the same error.
+    elsewhere: Option<&'a CadenceRow>,
+}
+
+/// Whether `row` failed `test` on `condition`'s error.
+fn failed_on(row: &CadenceRow, test: &str, condition: &HostCondition) -> bool {
+    matches!(
+        row.tests.get(test),
+        Some(TestOutcome::Failed(Failure {
+            host_condition: Some(other),
+            ..
+        })) if other.face == condition.face
+    )
+}
+
+/// The diff of `current` against the comparison's row, with the failures the
+/// host explains held apart.
+///
+/// Failures sharing a host condition's error read as the host only when the
+/// discriminator holds: at least [`HOST_CONDITION_MIN`] of them (by the
+/// condition's [`Spread`]) passed on this host at the compared row, and the
+/// window's other host failed none of them on the same error. Otherwise the
+/// error travels with the tree, not the machine (cairn/5888: four `database is
+/// locked` reds on fedora were red there one tip earlier and on bgsrv-mac in
+/// between), so the group's failures are ordinary reds signed by the error they
+/// share. Without a row on this host there is nothing to separate the host from
+/// the tree, and no group reads as the host. Either way a failure already red at
+/// the compared row is never held under a host label: it is still red.
+fn row_diff<'a>(current: &'a CadenceRow, comparison: &'a Comparison) -> RowDiff<'a> {
+    let previous = comparison.previous();
+    let (same_host, neighbour) = match comparison {
+        Comparison::SameExecutor {
+            previous,
+            neighbour,
+        } => (Some(previous), neighbour.as_deref()),
+        _ => (None, None),
+    };
+    let red_before =
+        |test: &str| previous.is_some_and(|previous| passed_in(previous, test) == Some(false));
     let mut diff = RowDiff::default();
     let mut faces: BTreeMap<&'static str, (&'static HostCondition, Vec<&str>)> = BTreeMap::new();
     for (test, outcome) in &current.tests {
@@ -3143,20 +3192,49 @@ fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> Ro
         }
     }
     faces.retain(|_, (condition, tests)| condition.breadth(tests) >= HOST_CONDITION_MIN);
-    diff.host_conditions = faces
-        .into_values()
-        .map(|(condition, tests)| HostConditionGroup {
-            cause: HostCause::Error(condition),
-            tests,
-        })
-        .collect();
-    let on_error: HashSet<&str> = diff
-        .host_conditions
-        .iter()
-        .flat_map(|group| group.tests.iter().copied())
-        .collect();
-    diff.host_conditions
-        .extend(stall_windows(current, &on_error));
+    // Failures signed by the error they share rather than by their own line.
+    let mut shared: HashMap<&str, &'static str> = HashMap::new();
+    for (condition, tests) in faces.into_values() {
+        let passed_here_before: Vec<&str> = tests
+            .iter()
+            .copied()
+            .filter(|test| same_host.is_some_and(|row| passed_in(row, test) == Some(true)))
+            .collect();
+        let elsewhere =
+            neighbour.filter(|row| tests.iter().any(|test| failed_on(row, test, condition)));
+        if elsewhere.is_none() && condition.breadth(&passed_here_before) >= HOST_CONDITION_MIN {
+            diff.host_conditions.push(HostConditionGroup {
+                cause: HostCause::Error(condition),
+                tests: tests.into_iter().filter(|test| !red_before(test)).collect(),
+            });
+            continue;
+        }
+        shared.extend(tests.iter().map(|test| (*test, condition.face)));
+        let still: Vec<&str> = tests.into_iter().filter(|test| red_before(test)).collect();
+        if !still.is_empty() {
+            diff.shared_still_red.push(SharedRed {
+                condition,
+                tests: still,
+                elsewhere,
+            });
+        }
+    }
+    if same_host.is_some() {
+        let mut taken: HashSet<&str> = diff
+            .host_conditions
+            .iter()
+            .flat_map(|group| group.tests.iter().copied())
+            .chain(shared.keys().copied())
+            .collect();
+        taken.extend(
+            current
+                .tests
+                .keys()
+                .map(String::as_str)
+                .filter(|test| red_before(test)),
+        );
+        diff.host_conditions.extend(stall_windows(current, &taken));
+    }
     let on_host: HashSet<&str> = diff
         .host_conditions
         .iter()
@@ -3175,7 +3253,10 @@ fn row_diff<'a>(current: &'a CadenceRow, previous: Option<&'a CadenceRow>) -> Ro
         match outcome {
             TestOutcome::Failed(_) if on_host.contains(test) => {}
             TestOutcome::Failed(failure) => {
-                let signature = failure.signature.as_str();
+                let signature = shared
+                    .get(test)
+                    .copied()
+                    .unwrap_or(failure.signature.as_str());
                 match before {
                     Some(None) => first_red.entry(signature).or_default().push(test),
                     _ if was_red => diff.still_red += 1,
@@ -3381,6 +3462,39 @@ fn render_host_conditions(
     }
 }
 
+/// Each still-red group sharing a host condition's error that the
+/// discriminator refused: the error, what put it on the tree, and its tests.
+fn render_shared_reds(
+    out: &mut String,
+    row: &CadenceRow,
+    groups: &[SharedRed<'_>],
+    previous: &CadenceRow,
+) {
+    for group in groups {
+        let count = group.tests.len();
+        let mut evidence = format!("red on `{}` at the compared row too", host(previous));
+        if let Some(elsewhere) = group.elsewhere {
+            evidence.push_str(&format!(
+                " and on `{}` in the same window ({})",
+                host(elsewhere),
+                elsewhere.reference
+            ));
+        }
+        out.push_str(&format!(
+            "- **{count} test{}** — `{}` · {evidence}, so it is an intermittent in the tree, not a host condition on `{}`\n",
+            plural(count),
+            group.condition.face,
+            host(row)
+        ));
+        for test in group.tests.iter().take(MAX_IDS_PER_GROUP) {
+            out.push_str(&format!("  - `{test}`\n"));
+        }
+        if count > MAX_IDS_PER_GROUP {
+            out.push_str(&format!("  - … and {} more\n", count - MAX_IDS_PER_GROUP));
+        }
+    }
+}
+
 /// The "Compared with" line: which row the diff is against, and on which host.
 fn render_basis(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRow) {
     let (baseline, cross_host) = match report.kind {
@@ -3507,7 +3621,7 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
         Comparison::OtherExecutor { previous } => (None, Some(host(previous))),
         Comparison::Baseline | Comparison::AnyExecutor { .. } => (None, None),
     };
-    let diff = row_diff(row, previous);
+    let diff = row_diff(row, report.comparison);
     let newly_red = group_size(&diff.newly_red);
     let first_red = group_size(&diff.first_red);
     let mut headline = verdict_clause(row, LaneVerdict::PerTest);
@@ -3602,13 +3716,24 @@ fn render_complete(out: &mut String, report: &CadenceReport<'_>, row: &CadenceRo
             if one { "it is" } else { "they are" }
         ));
     }
-    if previous.is_some() {
+    if let Some(previous) = previous {
         let label = if cross_host.is_some() {
             "Red on both hosts"
         } else {
             "Still red"
         };
-        out.push_str(&format!("\n**{label}:** {} (not listed)\n", diff.still_red));
+        let listed: usize = diff
+            .shared_still_red
+            .iter()
+            .map(|group| group.tests.len())
+            .sum();
+        let listing = match listed {
+            0 => "not listed".to_string(),
+            all if all == diff.still_red => "listed below".to_string(),
+            some => format!("{some} listed below"),
+        };
+        out.push_str(&format!("\n**{label}:** {} ({listing})\n", diff.still_red));
+        render_shared_reds(out, row, &diff.shared_still_red, previous);
     }
     if let Comparison::SameExecutor {
         previous,
@@ -4672,6 +4797,137 @@ mod tests {
         );
         assert!(text.contains("1 failed — 1 newly red"), "{text}");
         assert!(!text.contains("HOST CONDITION"), "{text}");
+    }
+
+    /// Specimen c20b8a9a (cairn/5888): main's rust-tests for 872ff563 on fedora
+    /// held four `mcp_attachment_resources` reds on `database is locked` as a
+    /// host condition while its own discriminator read 0 of 4 passed on fedora
+    /// at the compared row, and the same four were red on bgsrv-mac in the
+    /// window (cairn/5348). An error that travels with the tree is an
+    /// intermittent: still red and listed, never hidden under a host label.
+    #[test]
+    fn a_shared_error_the_discriminator_refuses_is_a_tree_intermittent_not_the_host() {
+        let names = [
+            "cairn-core::main$mcp_attachment_resources::reads_an_attachment",
+            "cairn-core::main$mcp_attachment_resources::lists_attachments",
+            "cairn-core::main$mcp_attachment_resources::reads_an_image",
+            "cairn-core::main$mcp_attachment_resources::refuses_a_foreign_attachment",
+        ];
+        // Each under its own path, so only the shared error can group them.
+        let locked = |n: usize| {
+            failed(&format!(
+                "called `Result::unwrap()` on an `Err` value: database is locked at /tmp/cairn-attachments-{n:04}/cairn.db"
+            ))
+        };
+        let red: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .enumerate()
+            .map(|(n, name)| (*name, locked(n)))
+            .collect();
+        let passing: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .map(|name| (*name, TestOutcome::Passed))
+            .collect();
+        let render = |previous: &[(&str, TestOutcome)],
+                      neighbour: Option<&[(&str, TestOutcome)]>| {
+            report(
+                &CadenceVerdict::Complete(on(
+                    "fedora",
+                    row("cur", "872ff563872ff563", 5 * HOUR, &red),
+                )),
+                &Comparison::SameExecutor {
+                    previous: on("fedora", row("prev", "aaaaaaaaaaaaaaaa", HOUR, previous)),
+                    neighbour: neighbour.map(|tests| {
+                        Box::new(on(
+                            "bgsrv-mac",
+                            row("mac", "cccccccccccccccc", 4 * HOUR, tests),
+                        ))
+                    }),
+                },
+                &Bracket::default(),
+            )
+        };
+        let listed = |text: &str| {
+            for name in names {
+                assert!(text.contains(&format!("  - `{name}`\n")), "{name}: {text}");
+            }
+        };
+
+        // The specimen: red here one tip earlier, and red on the other host.
+        let text = render(&red, Some(&red));
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+        assert!(
+            text.contains("4 failed — 0 newly red, 0 newly green"),
+            "{text}"
+        );
+        assert!(text.contains("**Still red:** 4 (listed below)"), "{text}");
+        assert!(
+            text.contains("- **4 tests** — `database is locked` · red on `fedora` at the compared row too and on `bgsrv-mac` in the same window (cairn://p/cairn/check-observations/mac), so it is an intermittent in the tree, not a host condition on `fedora`"),
+            "{text}"
+        );
+        listed(&text);
+
+        // The discriminator failing is enough without another host.
+        let text = render(&red, None);
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+        assert!(
+            text.contains("**Still red:** 4 (listed below)\n- **4 tests** — `database is locked` · red on `fedora` at the compared row too, so it is"),
+            "{text}"
+        );
+
+        // Passing here one tip earlier is not enough when the other host
+        // failed them on the same error: newly red, signed by that error.
+        let text = render(&passing, Some(&red));
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+        assert!(
+            text.contains(
+                "**NEWLY RED: 4 tests in 1 failure group**\n- **4 tests** — `database is locked`\n"
+            ),
+            "{text}"
+        );
+        listed(&text);
+
+        // The other host failing them some other way says nothing of this error.
+        let other_red: Vec<(&str, TestOutcome)> = names
+            .iter()
+            .map(|name| (*name, failed("assertion `left == right` failed")))
+            .collect();
+        let text = render(&passing, Some(&other_red));
+        assert!(
+            text.contains("**HOST CONDITION on `fedora`: 4 tests failed on `database is locked`**"),
+            "{text}"
+        );
+
+        // A test already red here stays still red; the rest, which passed
+        // here one tip earlier, are the host.
+        let mut one_red = passing.clone();
+        one_red[0].1 = locked(0);
+        let text = render(&one_red, None);
+        assert!(
+            text.contains(
+                "4 failed — 3 tests failed on one host condition: database is locked — 0 newly red"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Discriminator: 3 of 3 passed on `fedora`"),
+            "{text}"
+        );
+        assert!(text.contains("**Still red:** 1 (not listed)"), "{text}");
+
+        // With no row on this host, nothing separates the host from the tree.
+        let text = report(
+            &CadenceVerdict::Complete(on("fedora", row("cur", "872ff563872ff563", 5 * HOUR, &red))),
+            &Comparison::Baseline,
+            &Bracket::default(),
+        );
+        assert!(!text.contains("HOST CONDITION"), "{text}");
+        assert!(
+            text.contains(
+                "**NEWLY RED: 4 tests in 1 failure group**\n- **4 tests** — `database is locked`\n"
+            ),
+            "{text}"
+        );
     }
 
     /// Specimen cairn/5574: frontend-tests on a host at load 53-56 dropped

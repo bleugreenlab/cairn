@@ -180,22 +180,41 @@ fn manual_check_plan(
     Ok((plan, key))
 }
 
-fn producer_failure_marker(lines: &[&str]) -> Option<(usize, CheckFailureKind)> {
+/// The line a producer script wrote to say how its process failed
+/// (`nonDiagnosticFailureMessage` in scripts/lib/rust-process-outcome.ts):
+/// `<MARKER>: <tool> exited <code> on <host>` at the start of a line, then
+/// `Cause (verbatim):`. A marker quoted anywhere else (a test named after it,
+/// a fixture echoed to stdout) is evidence about nothing.
+///
+/// A prerequisite step exits with the code its line states
+/// (`prerequisiteFailureReport`), so its marker also needs the run's exit code
+/// to be that code, as `CAIRN_INFRASTRUCTURE_EXIT` needs exit 75: a quoted
+/// prerequisite failure must never make a red unreusable. The other markers
+/// state the inner tool's code, which the script may exit past (a targeted
+/// selection that matched nothing exits its own code), so only their shape
+/// binds them.
+fn producer_failure_marker(
+    lines: &[&str],
+    exit_code: Option<i32>,
+) -> Option<(usize, CheckFailureKind)> {
     lines.windows(2).enumerate().find_map(|(index, pair)| {
-        if pair[1] != "Cause (verbatim):"
-            || !pair[0].contains(" exited ")
-            || !pair[0].contains(" on ")
-        {
+        if pair[1] != "Cause (verbatim):" {
             return None;
         }
-        [
+        let (prefix, kind) = [
             ("CAIRN_ENVIRONMENT_EXIT: ", CheckFailureKind::Environment),
             ("CAIRN_UNCLASSIFIED_EXIT: ", CheckFailureKind::Unclassified),
             ("CAIRN_SELECTION_EXIT: ", CheckFailureKind::Selection),
             ("CAIRN_PREREQUISITE_EXIT: ", CheckFailureKind::Prerequisite),
         ]
         .into_iter()
-        .find_map(|(prefix, kind)| pair[0].starts_with(prefix).then_some((index, kind)))
+        .find(|(prefix, _)| pair[0].starts_with(prefix))?;
+        let (_, after_exited) = pair[0][prefix.len()..].split_once(" exited ")?;
+        let (stated, _host) = after_exited.split_once(" on ")?;
+        if kind == CheckFailureKind::Prerequisite && stated.parse::<i32>().ok() != exit_code {
+            return None;
+        }
+        Some((index, kind))
     })
 }
 
@@ -5813,11 +5832,13 @@ fn classify_check_failure(
         line.to_ascii_lowercase()
             .contains("memory map must have a non-zero length")
     });
+    // A script's own marker is the exit code it left with and the line it
+    // wrote, which opens with the marker; the literal elsewhere is a quotation.
     let explicit_infrastructure = (exit_code == Some(75))
         .then(|| {
             lines
                 .iter()
-                .position(|line| line.contains("CAIRN_INFRASTRUCTURE_EXIT"))
+                .position(|line| line.starts_with("CAIRN_INFRASTRUCTURE_EXIT: "))
         })
         .flatten();
     // The run computed a pass and the executor's result destination refused
@@ -5827,10 +5848,10 @@ fn classify_check_failure(
         .then(|| {
             lines
                 .iter()
-                .position(|line| line.contains("CAIRN_HANDOFF_FAILED_EXIT"))
+                .position(|line| line.starts_with("CAIRN_HANDOFF_FAILED_EXIT: "))
         })
         .flatten();
-    let producer_failure = producer_failure_marker(&lines);
+    let producer_failure = producer_failure_marker(&lines, exit_code);
     let cache_or_sandbox_denial = lines.iter().position(|line| {
         let line = line.replace('\\', "/").to_ascii_lowercase();
         line.contains("sccache: encountered fatal error")
@@ -22198,26 +22219,30 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             .map(|classification| classification.kind),
             Some(CheckFailureKind::Infrastructure)
         );
-        for (marker, expected) in [
+        for (marker, exit, expected) in [
             (
                 "CAIRN_ENVIRONMENT_EXIT: clippy exited 101 on bglab-sp1\nCause (verbatim):\ncannot find -lglib-2.0",
+                1,
                 CheckFailureKind::Environment,
             ),
             (
                 "CAIRN_UNCLASSIFIED_EXIT: clippy exited 1 on runner-a\nCause (verbatim):\nprocess exited without explanation",
+                1,
                 CheckFailureKind::Unclassified,
             ),
             (
                 "CAIRN_SELECTION_EXIT: cargo nextest exited 4 on runner-a\nCause (verbatim):\nno tests matched",
+                1,
                 CheckFailureKind::Selection,
             ),
             (
                 "CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora\nCause (verbatim):\nerror[E0603]: function `unix_time_ms` is private",
+                101,
                 CheckFailureKind::Prerequisite,
             ),
         ] {
             assert_eq!(
-                classify_check_failure(opaque, Some(1), false, false, None, marker)
+                classify_check_failure(opaque, Some(exit), false, false, None, marker)
                     .map(|classification| classification.kind),
                 Some(expected)
             );
@@ -22341,6 +22366,98 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             ),
             None
         );
+    }
+
+    /// cairn/5888 (tenet 707): a marker the run quotes is not the marker a
+    /// script wrote. `rust-process-outcome.test.ts` names its cases after the
+    /// markers and its fixtures print them, so a run quoting one is classified
+    /// as whatever it actually was; only the step's exit with the line it
+    /// wrote is a prerequisite failure.
+    #[test]
+    fn a_quoted_producer_marker_never_classifies_the_run() {
+        let fixture = "CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora\n\
+             Cause (verbatim):\n\
+             error[E0603]: function `unix_time_ms` is private";
+        let passing_row =
+            " ✓ scripts/lib/rust-process-outcome.test.ts > prerequisiteFailureReport > \
+             CAIRN_PREREQUISITE_EXIT: sidecar build exited 1 on fedora 0ms\n\
+             Cause (verbatim):";
+
+        // A Vitest run that failed over an escaped error, quoting the marker in
+        // a passing row and in a fixture it echoed: a runner error.
+        let output = format!(
+            "{passing_row}\n{fixture}\n Unhandled Errors \n\
+             ReferenceError: window is not defined\n\
+             error: script \"test:frontend:scoped\" exited with code 1"
+        );
+        let classification = classify_check_failure(
+            FRONTEND_COMMAND,
+            Some(1),
+            false,
+            false,
+            Some(&parsed("vitest", 4210, 0)),
+            &output,
+        )
+        .expect("an abnormal Vitest exit");
+        assert_eq!(classification.kind, CheckFailureKind::RunnerError);
+
+        // An ordinary red that echoed the fixture: the run did not exit with
+        // the code the quoted line states, so it is the suite's own red.
+        let command = "bun run codex:pin:check";
+        let output = format!(
+            "{passing_row}\n{fixture}\nerror: script \"codex:pin:check\" exited with code 1"
+        );
+        assert_eq!(
+            classify_check_failure(command, Some(1), false, false, None, &output),
+            None
+        );
+        assert!(check_reuse_decision(command, None, None).reusable);
+
+        // The marker inside a log line is a quotation even under the exit it
+        // states.
+        let quoted = "docs/checks.md: the step prints CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora\n\
+             Cause (verbatim):\n\
+             error: script \"codex:pin:check\" exited with code 101";
+        assert_eq!(
+            classify_check_failure(command, Some(101), false, false, None, quoted),
+            None
+        );
+
+        // The step's own exit with the line it wrote is the prerequisite
+        // failure, and never the suite's reusable verdict.
+        let real = format!(
+            "{passing_row}\n{fixture}\nerror: script \"codex:pin:check\" exited with code 101"
+        );
+        let classification =
+            classify_check_failure(command, Some(101), false, false, None, &real).unwrap();
+        assert_eq!(classification.kind, CheckFailureKind::Prerequisite);
+        assert_eq!(
+            real.lines().nth(classification.evidence_line.unwrap()),
+            Some("CAIRN_PREREQUISITE_EXIT: sidecar build exited 101 on fedora"),
+            "the evidence is the line the step wrote, not the passing row"
+        );
+        assert!(!check_reuse_decision(command, Some(classification.kind), None).reusable);
+
+        // The infrastructure and handoff markers are read the same way: the
+        // exit they own and the line opening with them.
+        for (marker, exit) in [
+            ("CAIRN_INFRASTRUCTURE_EXIT", 75),
+            ("CAIRN_HANDOFF_FAILED_EXIT", 74),
+        ] {
+            let quoted = format!("note: a script exits {exit} after printing {marker}: its reason");
+            assert_eq!(
+                classify_check_failure(command, Some(exit), false, false, None, &quoted),
+                None,
+                "{marker} quoted mid-line"
+            );
+            let written = format!("{marker}: its reason");
+            assert_eq!(
+                classify_check_failure(command, Some(exit), false, false, None, &written)
+                    .map(|classification| classification.kind),
+                Some(CheckFailureKind::Infrastructure),
+                "{marker} as its script writes it"
+            );
+        }
     }
 
     #[test]
