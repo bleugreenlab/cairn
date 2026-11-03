@@ -278,29 +278,34 @@ fn memory_review_turn_count_for_job(
     })
 }
 
+/// The newest Memory Review direct any of a job's runs received. The read starts
+/// from the job's runs and seeks each run's directs in `idx_messages_recipient`
+/// (restating its partial clause so it qualifies); naming the index is what puts
+/// `runs` first, since left to itself Turso walks every direct in the workspace
+/// through `idx_messages_channel_created`.
+const LATEST_MEMORY_REVIEW_DIRECT_SQL: &str = "SELECT m.id
+     FROM runs r
+     JOIN messages m INDEXED BY idx_messages_recipient ON m.recipient_run_id = r.id
+     WHERE r.job_id = ?1
+       AND m.recipient_run_id IS NOT NULL
+       AND m.channel_type = 'direct'
+       AND m.sender_name = 'system'
+       AND (
+           m.content LIKE 'Before you finish, review the memories%'
+           OR m.content LIKE 'Before you finish, take a moment to reflect:%'
+       )
+     ORDER BY m.created_at DESC
+     LIMIT 1";
+
 fn latest_memory_review_direct_message_id(
     db: std::sync::Arc<LocalDb>,
     job_id: &str,
 ) -> Result<Option<String>, String> {
     let job_id = job_id.to_string();
     crate::execution::advancement::run_advancement_db(async move {
-        db.query_opt_text(
-            "SELECT m.id
-             FROM messages m
-             JOIN runs r ON r.id = m.recipient_run_id
-             WHERE r.job_id = ?1
-               AND m.channel_type = 'direct'
-               AND m.sender_name = 'system'
-               AND (
-                   m.content LIKE 'Before you finish, review the memories%'
-                   OR m.content LIKE 'Before you finish, take a moment to reflect:%'
-               )
-             ORDER BY m.created_at DESC
-             LIMIT 1",
-            (job_id,),
-        )
-        .await
-        .map_err(|e| e.to_string())
+        db.query_opt_text(LATEST_MEMORY_REVIEW_DIRECT_SQL, (job_id,))
+            .await
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -691,6 +696,27 @@ fn job_has_artifacts_or_review_state(db: Arc<LocalDb>, job_id: &str) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::send_memory_review_on_idle;
+
+    /// The Memory Review lookup seeks the job's runs and then each run's
+    /// directs; driven from `messages` it reads every direct in the workspace.
+    #[tokio::test]
+    async fn the_memory_review_lookup_seeks_the_jobs_runs() {
+        let db = crate::storage::migrated_test_db("memory-review-plan.db").await;
+        let plan = crate::storage::query_plan(
+            &db,
+            super::LATEST_MEMORY_REVIEW_DIRECT_SQL,
+            vec![cairn_db::turso::Value::Text("j".into())],
+        )
+        .await;
+        let runs_first = plan
+            .find("SEARCH r USING INDEX idx_runs_job_id (job_id=?)")
+            .unwrap_or_else(|| panic!("the job's runs drive the read:\n{plan}"));
+        let then_messages = plan
+            .find("SEARCH m USING INDEX idx_messages_recipient (recipient_run_id=?)")
+            .unwrap_or_else(|| panic!("each run seeks its own directs:\n{plan}"));
+        assert!(runs_first < then_messages, "{plan}");
+        assert!(!plan.contains("idx_messages_channel_created"), "{plan}");
+    }
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;

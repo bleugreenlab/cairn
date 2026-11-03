@@ -98,7 +98,7 @@ pub(super) async fn read_project_messages(
     match crate::messages::db::query_channel(
         db,
         &crate::models::ChannelType::Project,
-        Some(&project_ctx.project_key),
+        &project_ctx.project_key,
         before.as_deref(),
         after.as_deref(),
         since,
@@ -208,7 +208,7 @@ pub(super) async fn read_issue_messages(
     match crate::messages::db::query_channel(
         db,
         &crate::models::ChannelType::Issue,
-        Some(&issue_key),
+        &issue_key,
         before.as_deref(),
         after.as_deref(),
         since,

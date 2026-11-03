@@ -122,5 +122,28 @@ pub async fn migrated_test_db(name: &str) -> LocalDb {
     LocalDb::open_migrated_for_test(path).await.unwrap()
 }
 
+/// The `EXPLAIN QUERY PLAN` detail lines for `sql` bound with `binds`, one step
+/// per line. Turso plans without statistics, and a weaker access path still
+/// returns the right rows, so only an assertion on this text witnesses a plan
+/// regression.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<turso::Value>) -> String {
+    let sql = format!("EXPLAIN QUERY PLAN {sql}");
+    db.read(move |conn| {
+        let sql = sql.clone();
+        let binds = binds.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(&sql, binds).await?;
+            let mut steps = Vec::new();
+            while let Some(row) = rows.next().await? {
+                steps.push(row.text(3)?);
+            }
+            Ok(steps.join("\n"))
+        })
+    })
+    .await
+    .unwrap()
+}
+
 pub mod outbox;
 pub mod retention;

@@ -92,12 +92,21 @@ async fn load_message_by_id(conn: &cairn_db::turso::Connection, id: &str) -> DbR
         .ok_or_else(|| DbError::Row(format!("inserted message not found: {}", id)))
 }
 
-async fn cursor_created_at(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Option<i64>> {
+/// Where a cursor message sits in its channel's order: `(created_at, rowid)`.
+async fn cursor_position(
+    conn: &cairn_db::turso::Connection,
+    id: &str,
+) -> DbResult<Option<(i64, i64)>> {
     let mut rows = conn
-        .query("SELECT created_at FROM messages WHERE id = ?1", params![id])
+        .query(
+            "SELECT created_at, rowid FROM messages WHERE id = ?1",
+            params![id],
+        )
         .await?;
-
-    crate::storage::next_i64(&mut rows, 0).await
+    rows.next()
+        .await?
+        .map(|row| Ok((row.i64(0)?, row.i64(1)?)))
+        .transpose()
 }
 
 async fn collect_messages(rows: &mut cairn_db::turso::Rows) -> DbResult<Vec<Message>> {
@@ -385,18 +394,19 @@ pub async fn insert_external_reply(
 /// - `since`: only messages created at or after this unix timestamp
 /// - `limit`: max results (default 50)
 ///
-/// Returns messages in chronological order (oldest first).
+/// Returns messages in chronological order (oldest first); messages written in
+/// the same second keep the order they were written in.
 pub(crate) fn query_channel(
     db: &LocalDb,
     channel_type: &ChannelType,
-    channel_id: Option<&str>,
+    channel_id: &str,
     before: Option<&str>,
     after: Option<&str>,
     since: Option<i64>,
     limit: Option<i64>,
 ) -> Result<Vec<Message>, String> {
     let channel_type = channel_type.clone();
-    let channel_id = channel_id.map(str::to_string);
+    let channel_id = channel_id.to_string();
     let before = before.map(str::to_string);
     let after = after.map(str::to_string);
 
@@ -404,7 +414,7 @@ pub(crate) fn query_channel(
         query_channel_async(
             db,
             &channel_type,
-            channel_id.as_deref(),
+            &channel_id,
             before.as_deref(),
             after.as_deref(),
             since,
@@ -414,10 +424,28 @@ pub(crate) fn query_channel(
     })
 }
 
+/// One page of a channel. `idx_messages_channel` holds a channel in
+/// `(created_at, rowid)` order, so the page walks its one channel in order and
+/// stops at the limit; same-second ties break by rowid for the same reason, so
+/// no sorter is needed. The index is named because, with the channel bound as
+/// parameters, Turso prefers `idx_messages_channel_created` and reads every
+/// message of the channel's type.
+fn channel_page_sql() -> String {
+    format!(
+        "SELECT {MESSAGE_COLUMNS} FROM messages INDEXED BY idx_messages_channel
+          WHERE channel_type = ?1 AND channel_id = ?2
+            AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND rowid < ?4))
+            AND (?5 IS NULL OR created_at > ?5 OR (created_at = ?5 AND rowid > ?6))
+            AND (?7 IS NULL OR created_at >= ?7)
+          ORDER BY created_at ASC, rowid ASC
+          LIMIT ?8"
+    )
+}
+
 async fn query_channel_async(
     db: &LocalDb,
     channel_type: &ChannelType,
-    channel_id: Option<&str>,
+    channel_id: &str,
     before: Option<&str>,
     after: Option<&str>,
     since: Option<i64>,
@@ -425,7 +453,7 @@ async fn query_channel_async(
 ) -> Result<Vec<Message>, String> {
     let limit = limit.unwrap_or(50).min(200);
     let channel_type = channel_type.to_string();
-    let channel_id = channel_id.map(str::to_string);
+    let channel_id = channel_id.to_string();
     let before = before.map(str::to_string);
     let after = after.map(str::to_string);
 
@@ -435,36 +463,25 @@ async fn query_channel_async(
         let before = before.clone();
         let after = after.clone();
         Box::pin(async move {
-            let before_ts = match before.as_deref() {
-                Some(id) => cursor_created_at(conn, id).await?,
+            let before = match before.as_deref() {
+                Some(id) => cursor_position(conn, id).await?,
                 None => None,
             };
-            let after_ts = match after.as_deref() {
-                Some(id) => cursor_created_at(conn, id).await?,
+            let after = match after.as_deref() {
+                Some(id) => cursor_position(conn, id).await?,
                 None => None,
             };
 
-            let sql = format!(
-                "SELECT {} FROM messages
-                     WHERE channel_type = ?1
-                       AND ((?2 IS NULL AND channel_id IS NULL) OR channel_id = ?2)
-                       AND (?3 IS NULL OR (created_at < ?3 OR (created_at = ?3 AND id < ?4)))
-                       AND (?5 IS NULL OR (created_at > ?5 OR (created_at = ?5 AND id > ?6)))
-                       AND (?7 IS NULL OR created_at >= ?7)
-                     ORDER BY created_at ASC, id ASC
-                     LIMIT ?8",
-                MESSAGE_COLUMNS
-            );
             let mut rows = conn
                 .query(
-                    &sql,
+                    &channel_page_sql(),
                     params![
                         channel_type.as_str(),
-                        channel_id.as_deref(),
-                        before_ts,
-                        before_ts.and(before.as_deref()),
-                        after_ts,
-                        after_ts.and(after.as_deref()),
+                        channel_id.as_str(),
+                        before.map(|(at, _)| at),
+                        before.map(|(_, rowid)| rowid),
+                        after.map(|(at, _)| at),
+                        after.map(|(_, rowid)| rowid),
                         since,
                         limit
                     ],
@@ -531,6 +548,10 @@ async fn query_for_issue_async(
 /// long-lived recipient's history outgrows any page and an oldest-first window
 /// never reaches what was said recently. With `since` the window opens at that
 /// instant and reads forward, so a reader can page through older history.
+///
+/// The stream is read one side at a time ([`directs_for_job_sql`]) and merged
+/// here; a direct between two of the job's own runs comes back from both sides
+/// and appears once.
 pub(crate) fn query_directs_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -555,30 +576,72 @@ async fn query_directs_for_job_async(
     db.read(|conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
-            let order = if since.is_some() { "ASC" } else { "DESC" };
-            let sql = format!(
-                "SELECT {MESSAGE_COLUMNS} FROM messages
-                     WHERE channel_type = 'direct'
-                       AND (
-                            recipient_run_id IN (SELECT id FROM runs WHERE job_id = ?1)
-                         OR sender_run_id IN (SELECT id FROM runs WHERE job_id = ?1)
-                       )
-                       AND (?2 IS NULL OR created_at >= ?2)
-                     ORDER BY created_at {order}, id {order}
-                     LIMIT ?3"
-            );
-            let mut rows = conn
-                .query(&sql, params![job_id.as_str(), since, limit])
-                .await?;
-            let mut messages = collect_messages(&mut rows).await?;
-            if since.is_none() {
-                messages.reverse();
+            let newest_first = since.is_none();
+            let mut messages = Vec::new();
+            for side in [DirectSide::Received, DirectSide::Sent] {
+                let mut rows = conn
+                    .query(
+                        &directs_for_job_sql(side, newest_first),
+                        params![job_id.as_str(), since, limit],
+                    )
+                    .await?;
+                messages.extend(collect_messages(&mut rows).await?);
+            }
+            messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+            messages.dedup_by(|a, b| a.id == b.id);
+            let window = usize::try_from(limit).unwrap_or(0);
+            if newest_first {
+                messages.drain(..messages.len().saturating_sub(window));
+            } else {
+                messages.truncate(window);
             }
             Ok(messages)
         })
     })
     .await
     .map_err(|error| db_error("Failed to query node messages", error))
+}
+
+/// The two halves of a job's direct stream: what its runs received and what
+/// they sent.
+#[derive(Clone, Copy)]
+enum DirectSide {
+    Received,
+    Sent,
+}
+
+/// One side of a job's direct stream, the `?3` newest (or, reading forward from
+/// `?2`, oldest). The read starts from the job's runs and seeks each run's
+/// directs in the side's run-id index; naming the index is what puts `runs`
+/// first, since left to itself Turso walks every direct in the workspace
+/// through `idx_messages_channel_created`. Both indexes are partial on the run
+/// id being set, which the statement restates so the index qualifies. The
+/// ordering sorts only the job's own directs.
+fn directs_for_job_sql(side: DirectSide, newest_first: bool) -> String {
+    let (column, index) = match side {
+        DirectSide::Received => ("recipient_run_id", "idx_messages_recipient"),
+        DirectSide::Sent => ("sender_run_id", "idx_messages_sender"),
+    };
+    let order = if newest_first { "DESC" } else { "ASC" };
+    let columns = qualified_message_columns("m");
+    format!(
+        "SELECT {columns} FROM runs r
+           JOIN messages m INDEXED BY {index} ON m.{column} = r.id
+          WHERE r.job_id = ?1 AND m.{column} IS NOT NULL
+            AND m.channel_type = 'direct'
+            AND (?2 IS NULL OR m.created_at >= ?2)
+          ORDER BY m.created_at {order}, m.id {order}
+          LIMIT ?3"
+    )
+}
+
+/// [`MESSAGE_COLUMNS`] qualified by a table alias, for a read that joins.
+fn qualified_message_columns(alias: &str) -> String {
+    MESSAGE_COLUMNS
+        .split(',')
+        .map(|column| format!("{alias}.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -661,17 +724,10 @@ mod tests {
         assert_eq!(msg.content, "taking src/api/");
         assert!(matches!(msg.channel_type, ChannelType::Project));
 
-        let results = query_channel_async(
-            &db,
-            &ChannelType::Project,
-            Some("proj-1"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let results =
+            query_channel_async(&db, &ChannelType::Project, "proj-1", None, None, None, None)
+                .await
+                .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, msg.id);
     }
@@ -718,7 +774,7 @@ mod tests {
         let after_first = query_channel_async(
             &db,
             &ChannelType::Issue,
-            Some("CRN/1"),
+            "CRN/1",
             None,
             Some(&msg1.id),
             None,
@@ -733,7 +789,7 @@ mod tests {
         let before_last = query_channel_async(
             &db,
             &ChannelType::Issue,
-            Some("CRN/1"),
+            "CRN/1",
             Some(&msg3.id),
             None,
             None,
@@ -786,5 +842,138 @@ mod tests {
 
         assert!(matches!(msg.channel_type, ChannelType::Direct));
         assert_eq!(msg.recipient_run_id.as_deref(), Some("run-2"));
+    }
+
+    /// Messages written in the same second page in the order they were written,
+    /// whatever their ids, and a cursor inside the tie resumes after it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_second_messages_page_in_write_order() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO messages(id,channel_type,channel_id,sender_name,content,created_at)
+               VALUES('c','issue','CRN/1','a','first',1000),
+                     ('a','issue','CRN/1','a','second',1000),
+                     ('b','issue','CRN/1','a','third',1000),
+                     ('z','issue','CRN/2','a','elsewhere',1000);",
+        )
+        .await
+        .unwrap();
+        let page = |after: Option<&'static str>| {
+            let db = &db;
+            async move {
+                query_channel_async(db, &ChannelType::Issue, "CRN/1", None, after, None, None)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| message.content)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(page(None).await, ["first", "second", "third"]);
+        assert_eq!(page(Some("c")).await, ["second", "third"]);
+    }
+
+    /// A job's direct stream is what any of its runs received or sent, each
+    /// message once even when it went between two of the job's own runs, and
+    /// nothing of another job's.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jobs_directs_merge_both_sides_once() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,created_at,updated_at) VALUES('j','p','running',1,1),('other','p','running',1,1);
+             INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at)
+               VALUES('r1','j','p','crashed',1,1),('r2','j','p','live',2,2),('o1','other','p','live',1,1);
+             INSERT INTO messages(id,channel_type,sender_run_id,sender_name,recipient_run_id,content,created_at) VALUES
+               ('m1','direct','o1','peer','r1','received',100),
+               ('m2','direct','r2','me','o1','sent',101),
+               ('m3','direct','r1','me','r2','to myself',102),
+               ('m4','direct','o1','peer','o1','not mine',103),
+               ('m5','direct',NULL,'system','r2','nudge',104),
+               ('m6','issue','r1','me',NULL,'not a direct',105);",
+        )
+        .await
+        .unwrap();
+        let contents = |messages: Vec<Message>| {
+            messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+        };
+
+        let newest = query_directs_for_job_async(&db, "j", None, None)
+            .await
+            .unwrap();
+        assert_eq!(contents(newest), ["received", "sent", "to myself", "nudge"]);
+
+        let newest_two = query_directs_for_job_async(&db, "j", None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(contents(newest_two), ["to myself", "nudge"]);
+
+        let forward_two = query_directs_for_job_async(&db, "j", Some(101), Some(2))
+            .await
+            .unwrap();
+        assert_eq!(contents(forward_two), ["sent", "to myself"]);
+    }
+
+    /// The channel page seeks its one channel through `idx_messages_channel`
+    /// and reads it in index order. A plan on `channel_type` alone reads every
+    /// message of that type, and a sorter reads the whole channel before the
+    /// limit applies.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_channel_page_seeks_its_channel_in_index_order() {
+        use cairn_db::turso::Value;
+        let db = migrated_db().await;
+        let mut binds = vec![Value::Text("issue".into()), Value::Text("CRN/1".into())];
+        binds.extend([Value::Integer(1000), Value::Integer(7)]);
+        binds.extend([Value::Null, Value::Null, Value::Null, Value::Integer(50)]);
+        let plan = crate::storage::query_plan(&db, &channel_page_sql(), binds).await;
+
+        assert!(
+            plan.contains("idx_messages_channel (channel_type=? AND channel_id=?)"),
+            "the page must seek its one channel:\n{plan}"
+        );
+        assert!(!plan.contains("SORTER"), "{plan}");
+        assert!(!plan.contains("SCAN messages"), "{plan}");
+    }
+
+    /// Each side of a job's direct stream starts from the job's runs and seeks
+    /// each run's directs by run id. Driven from `messages` instead, it reads
+    /// every direct in the workspace (~98k on the 11-02 production clone).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jobs_directs_seek_each_of_its_runs() {
+        use cairn_db::turso::Value;
+        let db = migrated_db().await;
+        for (side, seek) in [
+            (
+                DirectSide::Received,
+                "SEARCH m USING INDEX idx_messages_recipient (recipient_run_id=?)",
+            ),
+            (
+                DirectSide::Sent,
+                "SEARCH m USING INDEX idx_messages_sender (sender_run_id=?)",
+            ),
+        ] {
+            for newest_first in [true, false] {
+                let binds = vec![Value::Text("j".into()), Value::Null, Value::Integer(50)];
+                let plan = crate::storage::query_plan(
+                    &db,
+                    &directs_for_job_sql(side, newest_first),
+                    binds,
+                )
+                .await;
+                let runs_first = plan
+                    .find("SEARCH r USING INDEX idx_runs_job_id (job_id=?)")
+                    .unwrap_or_else(|| panic!("the job's runs drive the read:\n{plan}"));
+                let then_messages = plan
+                    .find(seek)
+                    .unwrap_or_else(|| panic!("each run seeks its own directs:\n{plan}"));
+                assert!(runs_first < then_messages, "{plan}");
+                assert!(!plan.contains("idx_messages_channel_created"), "{plan}");
+            }
+        }
     }
 }
