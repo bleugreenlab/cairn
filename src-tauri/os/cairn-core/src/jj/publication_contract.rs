@@ -24,6 +24,15 @@ const AGENT_COMMIT_VERBS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Paths that push a managed branch on their own initiative rather than at an
+/// explicit publication barrier (opening or re-saving a pull request). Each must
+/// ask the same publication rule the commit verbs ask, or it becomes a second
+/// definition of when a branch belongs on origin.
+const AUTOMATIC_PUBLISHERS: &[(&str, &str)] = &[(
+    "base-advance reconciler",
+    include_str!("../orchestrator/base_advance.rs"),
+)];
+
 const MANAGED_PUSH_TRIGGERS: &[(&str, &str)] = &[
     ("run", include_str!("../mcp/handlers/run/mod.rs")),
     ("write", include_str!("../mcp/handlers/write/mod.rs")),
@@ -72,6 +81,18 @@ fn both_commit_verbs_climb_the_same_ladder() {
                  made through it."
             );
         }
+    }
+}
+
+#[test]
+fn automatic_publishers_consult_the_commit_verbs_rule() {
+    for (name, source) in AUTOMATIC_PUBLISHERS {
+        assert!(
+            source.contains("publication_requirement_for_managed_branch"),
+            "{name} publishes a managed branch without asking \
+             `publication_requirement_for_managed_branch`, so it would push branches the \
+             commit verbs deliberately keep local."
+        );
     }
 }
 

@@ -14,6 +14,9 @@ use crate::execution::checks::{
     check_input_hashes, head_verdicts, head_verdicts_conn, load_checks_contract_at_commit,
     ChangeBasis, CheckFailureKind,
 };
+use crate::execution::checks_base::{
+    attribute_lanes, failing_tests, recorded_base, BaseAttribution,
+};
 use crate::execution::checks_turn_end::{
     read_turn_end_log_tail, resolve_job_coords, JobCoords, WavePlan,
 };
@@ -659,6 +662,7 @@ pub(crate) fn test_status(
         notice: None,
         declared_unverified: None,
         progress: None,
+        base_attribution: None,
     }
 }
 
@@ -781,6 +785,12 @@ pub struct NodeCheckStatus {
     /// lane holds a verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) progress: Option<LaneProgress>,
+    /// A failing test lane's failures read against main at the branch's base:
+    /// which are red on main there, which are the branch's, and which no main
+    /// row observed ([`crate::execution::checks_base`]). `None` for any other
+    /// lane, and for one the ledger could not answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) base_attribution: Option<BaseAttribution>,
 }
 
 /// Where one member of a running review wave stands. The members run in order
@@ -950,6 +960,7 @@ fn unsupported_lanes<'a>(
             notice: Some(check.notice.clone()),
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         }
     })
 }
@@ -1089,6 +1100,15 @@ async fn live_statuses(
 
     let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
     clock.lap("head_verdicts");
+    let attributions = attribute_lanes(
+        orch,
+        db,
+        coords,
+        &plan.base,
+        rows.iter().map(|lane| &lane.row),
+    )
+    .await;
+    clock.lap("base_attribution");
     // Only a base replay that kept the branch's patch moves the head without
     // withdrawing the wave, so a wave pinned to an earlier head is answering
     // for the same change on the base that head was on, and its lanes say which
@@ -1117,6 +1137,7 @@ async fn live_statuses(
         LaneVerdicts {
             rows: rows_by_name(rows),
             verified_on,
+            attributions,
         },
         Some(&plan.applicable_names),
         &status.request_ids,
@@ -1244,6 +1265,14 @@ async fn retired_statuses(
 ) -> Option<Vec<NodeCheckStatus>> {
     let plan = retired.plan.as_ref()?;
     let rows = plan_verdict_rows(db, &coords.project_id, job_id, plan).await;
+    let attributions = attribute_lanes(
+        orch,
+        db,
+        coords,
+        &plan.base,
+        rows.iter().map(|lane| &lane.row),
+    )
+    .await;
     let statuses = assemble_statuses(
         orch,
         job_id,
@@ -1251,6 +1280,7 @@ async fn retired_statuses(
         LaneVerdicts {
             rows: rows_by_name(rows),
             verified_on: HashMap::new(),
+            attributions,
         },
         Some(&plan.applicable_names),
         &orch.recent_turn_end_check_request_ids(job_id),
@@ -1300,6 +1330,7 @@ async fn settled_statuses(
             .ok()
             .flatten();
     clock.lap("live_range");
+    let live_base = live_range.as_ref().map(|range| range.base.clone());
     // The status a node renders must be the suite its own cadences plan, so the
     // contract comes from the node's logical head — the same commit the cadences
     // read it from. Reading the project checkout here would show a node checks
@@ -1458,6 +1489,20 @@ async fn settled_statuses(
         .ok()?;
     clock.lap("blocking");
     clock.record("blocking.head_verdicts", verdicts_elapsed);
+    let attributions = match live_base.as_deref() {
+        Some(base) => {
+            attribute_lanes(
+                orch,
+                db,
+                coords,
+                base,
+                rows_by_name.values().map(|lane| &lane.row),
+            )
+            .await
+        }
+        None => HashMap::new(),
+    };
+    clock.lap("base_attribution");
 
     let statuses = assemble_statuses(
         orch,
@@ -1466,6 +1511,7 @@ async fn settled_statuses(
         LaneVerdicts {
             rows: rows_by_name,
             verified_on,
+            attributions,
         },
         applicable_names.as_ref(),
         &orch.recent_turn_end_check_request_ids(job_id),
@@ -1491,6 +1537,7 @@ fn rows_by_name(rows: Vec<LaneRow>) -> HashMap<String, LaneRow> {
 struct LaneVerdicts {
     rows: HashMap<String, LaneRow>,
     verified_on: HashMap<String, VerifiedHead>,
+    attributions: HashMap<String, BaseAttribution>,
 }
 
 /// One status row per configured check, in name order, from what the branch
@@ -1512,6 +1559,7 @@ fn assemble_statuses(
     let LaneVerdicts {
         rows: rows_by_name,
         verified_on,
+        attributions,
     } = verdicts;
     let mut names = checks.keys().cloned().collect::<Vec<_>>();
     names.sort();
@@ -1542,6 +1590,7 @@ fn assemble_statuses(
                         .map(|id| orch.fleet.executor_name_for_text(id)),
                 );
                 status.verified_on = verified_on.get(&name).cloned();
+                status.base_attribution = attributions.get(&name).cloned();
                 status.notice = newer_attempt_note(lane);
                 if let Some(held) = &lane.held {
                     // Held, not red: the breaker's count is the lane's
@@ -1615,6 +1664,7 @@ fn assemble_statuses(
                 notice: None,
                 declared_unverified: None,
                 progress,
+                base_attribution: None,
             }
         })
         .collect()
@@ -1809,6 +1859,7 @@ fn status_from_row(
         notice: None,
         declared_unverified: parsed.and_then(|p| p.unverified),
         progress: None,
+        base_attribution: None,
     }
 }
 
@@ -2018,12 +2069,37 @@ pub(crate) async fn check_wake_body(orch: &Orchestrator, job_id: &str) -> Option
             BTreeMap::new()
         });
     match crate::execution::cache::latest_check_results_for_job(&db, job_id).await {
-        Ok(lanes) => format_check_wake_body(&lanes, &unsupported),
+        Ok(lanes) => {
+            let attributions = wake_attributions(orch, &db, job_id, &lanes).await;
+            format_check_wake_body(&lanes, &unsupported, &attributions)
+        }
         Err(error) => {
             log::debug!("check wake body for job {job_id}: {error}");
             None
         }
     }
+}
+
+/// The base attribution of every failing test lane a wake reports, against
+/// the base the job's last review wave planned on: the wake resolves no branch
+/// of its own. Empty when no lane is a test runner's red, which costs one pass
+/// over the rows already read.
+async fn wake_attributions(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+    lanes: &[LaneRow],
+) -> HashMap<String, BaseAttribution> {
+    if !lanes.iter().any(|lane| failing_tests(&lane.row).is_some()) {
+        return HashMap::new();
+    }
+    let Some(base) = recorded_base(db, job_id).await else {
+        return HashMap::new();
+    };
+    let Ok(Some(coords)) = resolve_job_coords(db, job_id).await else {
+        return HashMap::new();
+    };
+    attribute_lanes(orch, db, &coords, &base, lanes.iter().map(|lane| &lane.row)).await
 }
 
 /// The checks the newest recorded wave plan for `job_id` declared that this
@@ -2060,12 +2136,17 @@ async fn latest_planned_unsupported(
 /// and counted in neither. The headline's failing count is therefore only ever
 /// reds about the change, and the passing list only ever greens that judged it.
 ///
+/// A red test lane in `attributions` is counted by its failures charged to the
+/// branch: one with none (every failure red on main at the base, or observed
+/// by no main row) is red, and listed, but not counted as failing.
+///
 /// A check in `unsupported` is listed by its notice, exactly as `/checks` lists
 /// it, and whatever row it last recorded is set aside: that row is about a tree
 /// before the head, and the head has no verdict for it, red or green.
 pub(crate) fn format_check_wake_body(
     lanes: &[LaneRow],
     unsupported: &BTreeMap<String, UnsupportedCheck>,
+    attributions: &HashMap<String, BaseAttribution>,
 ) -> Option<String> {
     let mut lanes: Vec<&LaneRow> = lanes
         .iter()
@@ -2076,6 +2157,7 @@ pub(crate) fn format_check_wake_body(
     }
     lanes.sort_by(|left, right| left.row.check_name.cmp(&right.row.check_name));
     let mut failing: Vec<&CheckResultCacheEntry> = Vec::new();
+    let mut uncharged: Vec<&CheckResultCacheEntry> = Vec::new();
     let mut no_verdict: Vec<(&CheckResultCacheEntry, LaneExistence)> = Vec::new();
     let mut passing: Vec<String> = Vec::new();
     let mut not_applicable: Vec<String> = Vec::new();
@@ -2095,14 +2177,35 @@ pub(crate) fn format_check_wake_body(
         }
         match entry_existence(row) {
             LaneExistence::Complete if row.passed => passing.push(row.check_name.clone()),
-            LaneExistence::Complete => failing.push(row),
+            LaneExistence::Complete => match attributions.get(&row.check_name) {
+                Some(attribution) if attribution.charged() == 0 => uncharged.push(row),
+                _ => failing.push(row),
+            },
             LaneExistence::NoSelectableWork => not_applicable.push(row.check_name.clone()),
             existence => no_verdict.push((row, existence)),
         }
     }
-    let judged = passing.len() + failing.len() + no_verdict.len();
-    let clean = failing.is_empty() && no_verdict.is_empty();
+    let judged = passing.len() + failing.len() + uncharged.len() + no_verdict.len();
+    let clean = failing.is_empty() && uncharged.is_empty() && no_verdict.is_empty();
     let mut out = match (failing.len(), no_verdict.len()) {
+        (failed, silent) if !uncharged.is_empty() => {
+            let failed = match failed {
+                0 => "none failing".to_string(),
+                failed => format!("{failed} of {judged} failing"),
+            };
+            let silent = match silent {
+                0 => String::new(),
+                silent => format!(", {silent} without a verdict"),
+            };
+            let lanes = match uncharged.len() {
+                1 => "1 lane".to_string(),
+                red => format!("{red} lanes"),
+            };
+            format!(
+                "Project checks on this node: {failed}{silent}; {lanes} red with no failure \
+                 charged to this branch.\n"
+            )
+        }
         (0, 0) if passing.is_empty() => "Project checks on this node: no lane holds a verdict.".to_string(),
         (0, 0) => format!(
             "Project checks on this node: all {} passing ({}).",
@@ -2117,15 +2220,17 @@ pub(crate) fn format_check_wake_body(
             "Project checks on this node: {failed} of {judged} failing, {silent} without a verdict.\n"
         ),
     };
-    for row in failing.iter().take(WAKE_DETAILED_FAILURES) {
+    // Charged reds first: the lanes the headline counts.
+    let reds: Vec<&CheckResultCacheEntry> = failing.iter().chain(&uncharged).copied().collect();
+    for row in reds.iter().take(WAKE_DETAILED_FAILURES) {
         out.push_str(&format!(
             "\n- \u{2717} {} \u{2014} {}",
             row.check_name,
-            wake_failure_detail(row)
+            wake_failure_detail(row, attributions.get(&row.check_name))
         ));
     }
-    if failing.len() > WAKE_DETAILED_FAILURES {
-        let rest: Vec<String> = failing
+    if reds.len() > WAKE_DETAILED_FAILURES {
+        let rest: Vec<String> = reds
             .iter()
             .skip(WAKE_DETAILED_FAILURES)
             .map(|row| row.check_name.clone())
@@ -2204,7 +2309,7 @@ fn wake_no_verdict_detail(row: &CheckResultCacheEntry, existence: &LaneExistence
         LaneExistence::Died { .. } => {
             format!(
                 "died without a verdict \u{2014} {}",
-                wake_failure_detail(row)
+                wake_failure_detail(row, None)
             )
         }
         LaneExistence::Empty => {
@@ -2224,8 +2329,13 @@ fn wake_no_verdict_detail(row: &CheckResultCacheEntry, existence: &LaneExistence
 
 /// What one failing lane, or one that died, says for itself in a wake body: the
 /// sentence for how it ended, then the concrete failures — named tests when the
-/// runner named them, and the tail of the output when it did not.
-fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
+/// runner named them, and the tail of the output when it did not. Named tests
+/// with an `attribution` are listed by bucket under a tally of how many are the
+/// branch's.
+fn wake_failure_detail(
+    row: &CheckResultCacheEntry,
+    attribution: Option<&BaseAttribution>,
+) -> String {
     let parsed = row
         .target_results_json
         .as_deref()
@@ -2257,10 +2367,16 @@ fn wake_failure_detail(row: &CheckResultCacheEntry) -> String {
     // names alone do not. The output tail is the fallback for a lane that named
     // nothing at all.
     let named = kind != Some(CheckFailureKind::TimedOut) && !names.is_empty();
-    let header = if named {
-        format!("{annotation}: {}", join_capped(&names, MAX_FAILURE_NAMES))
-    } else {
-        annotation
+    let header = match attribution.filter(|_| named) {
+        Some(attribution) => {
+            let mut header = format!("{annotation}; {}", attribution.charge_clause());
+            for line in attribution.bucket_lines() {
+                header.push_str(&format!("\n    {line}"));
+            }
+            header
+        }
+        None if named => format!("{annotation}: {}", join_capped(&names, MAX_FAILURE_NAMES)),
+        None => annotation,
     };
     let report = parsed
         .as_ref()
@@ -2347,7 +2463,7 @@ pub(crate) fn failed_annotation(
 }
 
 /// Comma-join check or test names, capped so a wide fan-out doesn't flood a line.
-fn join_capped(names: &[String], max: usize) -> String {
+pub(crate) fn join_capped(names: &[String], max: usize) -> String {
     let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
     let more = names.len().saturating_sub(shown.len());
     if more > 0 {
@@ -2816,7 +2932,7 @@ mod tests {
     /// A wake body over rows that each answer their own lane.
     fn wake(rows: impl IntoIterator<Item = CheckResultCacheEntry>) -> Option<String> {
         let lanes: Vec<LaneRow> = rows.into_iter().map(LaneRow::from).collect();
-        format_check_wake_body(&lanes, &BTreeMap::new())
+        format_check_wake_body(&lanes, &BTreeMap::new(), &HashMap::new())
     }
 
     /// A check the head declares with a key this build does not know, as a
@@ -2858,7 +2974,7 @@ mod tests {
         .map(LaneRow::from)
         .collect();
 
-        let body = format_check_wake_body(&lanes, &unsupported).unwrap();
+        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new()).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: all 1 passing (rust-fmt)."),
@@ -2891,7 +3007,7 @@ mod tests {
             .map(LaneRow::from)
             .collect();
 
-        let body = format_check_wake_body(&lanes, &unsupported).unwrap();
+        let body = format_check_wake_body(&lanes, &unsupported, &HashMap::new()).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: 1 of 2 failing."),
@@ -2903,13 +3019,16 @@ mod tests {
             "{body}"
         );
 
-        let only_unsupported = format_check_wake_body(&[], &unsupported).unwrap();
+        let only_unsupported = format_check_wake_body(&[], &unsupported, &HashMap::new()).unwrap();
         assert!(
             only_unsupported.starts_with("Project checks on this node: no lane holds a verdict."),
             "{only_unsupported}"
         );
         assert!(only_unsupported.contains("- dead-code: needs a newer Cairn"));
-        assert_eq!(format_check_wake_body(&[], &BTreeMap::new()), None);
+        assert_eq!(
+            format_check_wake_body(&[], &BTreeMap::new(), &HashMap::new()),
+            None
+        );
     }
 
     /// A row that ended without a verdict, recorded `ran_at` after the epoch.
@@ -3066,7 +3185,7 @@ mod tests {
         ])
         .unwrap();
 
-        let body = format_check_wake_body(&[lane], &BTreeMap::new()).unwrap();
+        let body = format_check_wake_body(&[lane], &BTreeMap::new(), &HashMap::new()).unwrap();
 
         assert!(
             body.starts_with("Project checks on this node: all 1 passing (frontend-tests)."),
@@ -3103,6 +3222,92 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("✓ passing: lint, rust-fmt"), "{body}");
+    }
+
+    /// A test lane's failures are read against main at the branch's base: the
+    /// wake names each bucket with the base commit and the main row's URI, and
+    /// counts only the failure that was green on main as the branch's.
+    #[test]
+    fn a_wake_charges_the_branch_only_with_failures_main_passed_at_its_base() {
+        use crate::execution::checks_base::{partition, tests::main_row};
+        let mut failing = verdict_row("rust-tests", false);
+        failing.target_results_json = Some(parsed_json(
+            897,
+            &["core decide::flaky", "core mine::broke", "core mine::new"],
+        ));
+        let base = "4a52d52e5f5f6a6a";
+        let main = main_row(
+            base,
+            &[
+                ("core decide::flaky", "failed"),
+                ("core mine::broke", "passed"),
+            ],
+        );
+        let failures: Vec<String> = ["core decide::flaky", "core mine::broke", "core mine::new"]
+            .map(String::from)
+            .to_vec();
+        let attributions = HashMap::from([(
+            "rust-tests".to_string(),
+            partition(base, &failures, Some(&main)),
+        )]);
+        let lanes: Vec<LaneRow> = [failing, verdict_row("lint", true)]
+            .into_iter()
+            .map(LaneRow::from)
+            .collect();
+
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions).unwrap();
+
+        assert!(
+            body.starts_with("Project checks on this node: 1 of 2 failing."),
+            "{body}"
+        );
+        assert!(
+            body.contains("✗ rust-tests — 3 of 900 failed; 1 is this branch's"),
+            "{body}"
+        );
+        for line in [
+            "    1 red on main at `4a52d52e5f5f` (cairn://p/cairn/check-observations/e884003b), \
+             charged to the base: core decide::flaky",
+            "    1 not red on main at `4a52d52e5f5f` (cairn://p/cairn/check-observations/e884003b), \
+             this branch's: core mine::broke",
+            "    1 not observed by main's row at `4a52d52e5f5f` \
+             (cairn://p/cairn/check-observations/e884003b) (new, or skipped there): core mine::new",
+        ] {
+            assert!(body.contains(line), "missing {line:?} in {body}");
+        }
+    }
+
+    /// A test lane whose every failure is main's is red, and listed, but the
+    /// headline does not count it as failing the branch.
+    #[test]
+    fn a_lane_red_only_where_main_is_is_not_counted_as_failing() {
+        use crate::execution::checks_base::{partition, tests::main_row};
+        let mut failing = verdict_row("rust-tests", false);
+        failing.target_results_json = Some(parsed_json(10, &["core decide::flaky"]));
+        let main = main_row("base", &[("core decide::flaky", "failed")]);
+        let attributions = HashMap::from([(
+            "rust-tests".to_string(),
+            partition("base", &["core decide::flaky".to_string()], Some(&main)),
+        )]);
+        let lanes: Vec<LaneRow> = [failing, verdict_row("lint", true)]
+            .into_iter()
+            .map(LaneRow::from)
+            .collect();
+
+        let body = format_check_wake_body(&lanes, &BTreeMap::new(), &attributions).unwrap();
+
+        assert!(
+            body.starts_with(
+                "Project checks on this node: none failing; 1 lane red with no failure charged \
+                 to this branch."
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("✗ rust-tests — 1 of 11 failed; none is this branch's"),
+            "{body}"
+        );
+        assert!(body.contains("✓ passing: lint"), "{body}");
     }
 
     /// A compiler or linter names no test, so without its output tail the lane
@@ -3595,6 +3800,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3662,6 +3868,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3757,6 +3964,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3801,6 +4009,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3854,6 +4063,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3938,6 +4148,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -4040,6 +4251,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),

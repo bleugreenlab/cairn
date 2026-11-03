@@ -1317,19 +1317,27 @@ impl EvictorBudget {
     /// The orchestrator's pass, every [`PASS_INTERVAL`]. Each fold closes the
     /// connection gate for its drain plus about half a second of work.
     ///
-    /// One fold a pass, not the eight the clone rehearsal sized: the first
-    /// build carrying the evictor wedged twice in the minute a pass folded
-    /// (cairn/5644), and the engine condition behind it is not yet named. The
-    /// checkpoint's attempt bound now caps what a stuck fold costs, and this
-    /// caps how often a pass can meet the condition. A pass that needs a second
-    /// fold ends `FoldBudget` and leaves its unfolded pages to the next pass,
-    /// which folds them before it deletes more. Raise it once the condition
-    /// is named and fixed; a backlog clears more slowly meanwhile, steady state
-    /// (a page or two per rule) not at all.
+    /// One fold a pass, not the eight the clone rehearsal sized. The cap came
+    /// in after the first build carrying the evictor wedged in the minute a
+    /// pass folded (cairn/5644). What made those folds dangerous has since
+    /// changed. A fold that is merely slow keeps the gate shut until it
+    /// returns, so it costs a pause rather than a burst of `database is
+    /// locked`, and only a two-minute backstop gives an attempt up. The
+    /// periodic pass folds at 64 MiB, so a pass no longer starts against ten
+    /// minutes of other writers' log. And the checkpoint thread runs at the
+    /// runtime workers' QoS, which on the 11-03 clone kept a 256 MiB fold under
+    /// a CPU and fsync storm at 1.5 s where it had taken 23 s (cairn/5655). The
+    /// cap stays until a clone run of production passes under that storm shows
+    /// no fold abandoned (`examples/retention_clone.rs passes`).
+    ///
+    /// Meanwhile a pass deletes about one page: its first fold settles the page
+    /// the last pass left unfolded, and the next fold due ends it. The rotation
+    /// in [`run_pass`] makes that page a different rule's each pass, where the
+    /// cap used to leave every rule after the first unserved.
     pub const PRODUCTION: Self = Self {
         pass_time: Duration::from_secs(90),
         pass_rows: 200_000,
-        fold_at_log_bytes: 64 * 1024 * 1024,
+        fold_at_log_bytes: super::FOLD_AT_LOG_BYTES,
         fold_work_target: Some(Duration::from_millis(500)),
         folds_per_pass: 1,
     };
@@ -1364,15 +1372,31 @@ const MAX_PAGES_PER_FOLD: usize = 64;
 /// deleted page, and folds before the pages it has not folded are expected to
 /// cost more than [`EvictorBudget::fold_work_target`]. A rule it has not
 /// measured yet folds after its first page.
+///
+/// It learns only from folds whose window its own pages filled. A pass's first
+/// fold, made before the pass has deleted anything, covers whatever log other
+/// writers left since the last fold, and pages carried over from an earlier
+/// pass. Charging that to the carried-over pages made one page look like
+/// twenty seconds of work, which clamped every rule to a fold per page and so
+/// to a fold-due check after every page (cairn/5655). That fold settles the
+/// log and teaches nothing.
 #[derive(Debug, Default)]
 pub struct EvictorState {
     /// Fold work per deleted page, per rule.
     fold_ms_per_page: HashMap<Eviction, f64>,
     /// Deleted pages no fold has covered yet, and the rule that wrote them.
     unfolded: Option<(Eviction, usize)>,
+    /// The index in [`Eviction::ALL`] the next [`run_pass`] starts at.
+    start: usize,
 }
 
 impl EvictorState {
+    /// The fold work per page learned for `eviction`, in milliseconds, or
+    /// `None` before its first measured fold.
+    pub fn fold_ms_per_page(&self, eviction: Eviction) -> Option<f64> {
+        self.fold_ms_per_page.get(&eviction).copied()
+    }
+
     /// How many unfolded pages of `eviction` one fold may cover.
     fn pages_per_fold(&self, eviction: Eviction, target: Duration) -> usize {
         match self.fold_ms_per_page.get(&eviction) {
@@ -1410,6 +1434,35 @@ impl EvictorState {
             };
             self.fold_ms_per_page.insert(rule, estimate);
         }
+    }
+
+    /// A fold covered the unfolded pages without measuring them.
+    fn settled(&mut self) {
+        self.unfolded = None;
+    }
+
+    /// Where the pass after `report` starts, given the order `rules` this one
+    /// ran in. A pass that finished starts the next from the first rule. One
+    /// that ended early starts the next at the rule it was serving, so a rule
+    /// cut off mid-backlog resumes first, unless that rule is the one this pass
+    /// began with: then it alone spent the budget, and the next pass starts at
+    /// the rule after it. However small the budget, every rule is served within
+    /// [`Eviction::ALL`]`.len()` passes.
+    fn advance(&mut self, rules: &[Eviction], report: &PassReport) {
+        self.start = match (report.end, report.rules.last()) {
+            (PassEnd::Complete, _) | (_, None) => 0,
+            (_, Some(last)) => {
+                let index = Eviction::ALL
+                    .iter()
+                    .position(|rule| *rule == last.eviction)
+                    .unwrap_or(0);
+                if rules.first() == Some(&last.eviction) {
+                    (index + 1) % Eviction::ALL.len()
+                } else {
+                    index
+                }
+            }
+        };
     }
 }
 
@@ -1531,15 +1584,26 @@ impl std::fmt::Display for PassReport {
 
 /// Run every [`Eviction`] once over `db` at `now` (unix seconds), within
 /// `budget`. Each rule's error is recorded in its report and the pass moves to
-/// the next rule. `state` carries what earlier passes learned and any pages
-/// they left unfolded.
+/// the next rule. `state` carries what earlier passes learned, any pages they
+/// left unfolded, and the rule this pass starts at.
+///
+/// The order rotates rather than always starting at the first rule, because a
+/// pass that ends early otherwise ends in the same rule every time. With one
+/// fold a pass that was all of them: every pass from 10-31 to 11-03 served
+/// `done_outbox` alone, while `message_stream_chunks` grew to 1.4 GB against a
+/// 256 MB budget (cairn/5655). Rotating keeps a fold window to one rule, which
+/// is what lets each fold measure one rule's cost.
 pub async fn run_pass(
     db: &LocalDb,
     now: i64,
     budget: EvictorBudget,
     state: &mut EvictorState,
 ) -> PassReport {
-    run_rules(db, now, budget, state, &Eviction::ALL).await
+    let mut rules = Eviction::ALL;
+    rules.rotate_left(state.start % Eviction::ALL.len());
+    let report = run_rules(db, now, budget, state, &rules).await;
+    state.advance(&rules, &report);
+    report
 }
 
 /// [`run_pass`] restricted to `rules`, in the order given.
@@ -1559,6 +1623,7 @@ pub async fn run_rules(
         end: PassEnd::Complete,
     };
     let mut rows_total = 0usize;
+    let mut deleted_this_pass = false;
     'rules: for &eviction in rules {
         let mut rule = RuleReport {
             eviction,
@@ -1576,7 +1641,9 @@ pub async fn run_rules(
                 report.end = PassEnd::TimeBudget;
             } else if rows_total >= budget.pass_rows {
                 report.end = PassEnd::RowBudget;
-            } else if let Some(end) = fold_if_due(db, budget, state, eviction, &mut report).await {
+            } else if let Some(end) =
+                fold_if_due(db, budget, state, eviction, !deleted_this_pass, &mut report).await
+            {
                 report.end = end;
             }
             if report.end != PassEnd::Complete {
@@ -1587,6 +1654,7 @@ pub async fn run_rules(
                 Ok(page) => {
                     rule.select_ms.push(page.select.as_millis() as u64);
                     if page.rows > 0 {
+                        deleted_this_pass = true;
                         state.deleted_page(eviction);
                         rule.pages += 1;
                         rule.rows += page.rows;
@@ -1615,12 +1683,15 @@ pub async fn run_rules(
 
 /// Fold before `next` deletes another page when the log has passed the
 /// budget's threshold or the unfolded pages would cost more than the fold
-/// target. Returns why the pass must end, if it must.
+/// target. A `settling` fold, one made before this pass has deleted a page,
+/// counts against the fold budget like any other but does not train the
+/// estimate (see [`EvictorState`]). Returns why the pass must end, if it must.
 async fn fold_if_due(
     db: &LocalDb,
     budget: EvictorBudget,
     state: &mut EvictorState,
     next: Eviction,
+    settling: bool,
     report: &mut PassReport,
 ) -> Option<PassEnd> {
     let log_bytes = db.logical_log_bytes();
@@ -1662,7 +1733,9 @@ async fn fold_if_due(
             false,
         ),
     };
-    if succeeded {
+    if succeeded && settling {
+        state.settled();
+    } else if succeeded {
         state.folded(record.work());
     }
     report.folds.push(record);

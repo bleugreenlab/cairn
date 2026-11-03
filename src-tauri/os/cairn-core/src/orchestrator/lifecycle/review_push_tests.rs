@@ -123,6 +123,7 @@ fn waited_on_lanes(
                 notice: None,
                 declared_unverified: None,
                 progress: None,
+                base_attribution: None,
             },
         )
         .collect();
@@ -3586,7 +3587,7 @@ async fn attempts(db: &LocalDb, job_id: &str) -> Vec<(String, String, Option<Str
 /// its review wave. Fault-injection tests use one of these: the fault seam is
 /// keyed by job id, and no other test uses these ids.
 async fn insert_shipping_builder(db: &LocalDb, job_id: &str) {
-    db.execute_script(&format!(
+    db.execute_script(format!(
         "INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
            VALUES('{job_id}','e-rev','p-rev','i-rev','complete','{job_id}','builder','b',1,1);
          INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)

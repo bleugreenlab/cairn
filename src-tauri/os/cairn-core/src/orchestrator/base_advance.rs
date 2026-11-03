@@ -19,6 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::execution::routing::{owning_db_for_job, owning_db_for_project};
+use crate::merge_requests::queries::{
+    publication_requirement_for_managed_branch, PublicationRequirement,
+};
 use crate::messages::delivery::{
     latest_run_for_job, queue_system_direct, queue_system_direct_once,
     queue_system_direct_once_confirmed, DirectQueueDisposition,
@@ -1694,7 +1697,8 @@ async fn reconcile_store_default_bookmark(
 /// Bring origin's advanced default branch into the shared store and reconcile
 /// everything downstream of it: the default bookmark and every in-flight
 /// sibling, which is auto-rebased onto the new
-/// tip — cleanly-rebased ones pushed, conflicts recorded non-blocking, and each
+/// tip — cleanly-rebased ones pushed when a pull request needs them, conflicts
+/// recorded non-blocking, and each
 /// sibling this reconcile actually rewrote notified (a waking `Steer` note when
 /// conflicted, a passive ride-along note when clean; the before/after commit-id
 /// guard in `reconcile_base_advance` gates both).
@@ -3390,6 +3394,32 @@ async fn reopen_reconcile_intent(
     Ok(())
 }
 
+/// Whether a replayed branch must reach origin now, asked of the one rule every
+/// managed-branch advance consults, once per live job on the branch: any job's
+/// open pull request requires it. A branch with no job here is still judged by
+/// the pull requests that name it.
+async fn branch_publication_requirement(
+    db: &LocalDb,
+    project_id: &str,
+    siblings: &[SiblingJob],
+    branch: &str,
+) -> PublicationRequirement {
+    let owners = siblings_for_branch(siblings, branch);
+    let job_ids: Vec<&str> = if owners.is_empty() {
+        vec![""]
+    } else {
+        owners.iter().map(|owner| owner.id.as_str()).collect()
+    };
+    for job_id in job_ids {
+        if publication_requirement_for_managed_branch(db, job_id, project_id, branch).await
+            == PublicationRequirement::RequiredForOpenPr
+        {
+            return PublicationRequirement::RequiredForOpenPr;
+        }
+    }
+    PublicationRequirement::DeferredUntilPublication
+}
+
 fn siblings_for_branch(siblings: &[SiblingJob], branch: &str) -> Vec<SiblingJob> {
     siblings
         .iter()
@@ -3989,9 +4019,13 @@ async fn execute_reconcile_claim(
         }
 
         // Origin transfer and durable lineage persistence are deliberately
-        // outside the jj mutex.
-        let publish =
-            item_report.rebased_clean.contains(branch) && !item_report.silent.contains(branch);
+        // outside the jj mutex. A clean replay reaches origin only when the
+        // branch's publication rule requires it; otherwise it stays local, as a
+        // commit would, until opening its pull request publishes it.
+        let publish = item_report.rebased_clean.contains(branch)
+            && !item_report.silent.contains(branch)
+            && branch_publication_requirement(db, &claim.project_id, &siblings, branch).await
+                == PublicationRequirement::RequiredForOpenPr;
         if publish {
             if let Err(error) = publish_managed_branch(orch, &store, branch).await {
                 item_report
@@ -9137,6 +9171,167 @@ mod tests {
         .expect("a fresh job must spawn off `main` with no human in the loop");
     }
 
+    /// Base advance publishes a replayed branch by the rule the commit verbs
+    /// consult. Three live siblings of `main` are replayed onto an advance made
+    /// on origin: one no pull request needs, one with its own open pull request,
+    /// and an integration branch an open child pull request targets. Only the
+    /// latter two reach origin. The first stays a local rebased head until
+    /// opening its pull request crosses the publication barrier, which pushes it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn base_advance_publishes_only_branches_a_pull_request_needs() {
+        use crate::jj::tests::{git, git_stdout, init_project, jj_bin};
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping base_advance_publishes_only_branches_a_pull_request_needs: no jj");
+            return;
+        };
+        const LOCAL: &str = "agent/local";
+        const OPEN: &str = "agent/open";
+        const INTEGRATION: &str = "agent/integration";
+
+        let home = tempfile::tempdir().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let workspaces = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+
+        let db = Arc::new(migrated_db().await);
+        db.execute_script(format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1', 'default', 'Project', 'proj', '{repo}', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO jobs (id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+               VALUES ('job-local', 'issue-1', 'proj-1', 'running', '{LOCAL}', 'main', 1, 1),
+                      ('job-open', 'issue-1', 'proj-1', 'running', '{OPEN}', 'main', 1, 1),
+                      ('job-coordinator', 'issue-1', 'proj-1', 'running', '{INTEGRATION}', 'main', 1, 1),
+                      ('job-child', 'issue-1', 'proj-1', 'running', 'agent/child', '{INTEGRATION}', 1, 1);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch,
+                status, github_state, is_local, opened_at, updated_at)
+             VALUES
+               ('mr-open', 'job-open', 'proj-1', 'issue-1', 'Open', '{OPEN}', 'main',
+                'open', 'OPEN', 0, 1, 1),
+               ('mr-child', 'job-child', 'proj-1', 'issue-1', 'Child', 'agent/child', '{INTEGRATION}',
+                'open', 'OPEN', 0, 1, 1);",
+            repo = proj.path().to_string_lossy().replace('\'', "''"),
+        ))
+        .await
+        .unwrap();
+
+        let mut git_client = MockGitClient::new();
+        git_client
+            .expect_fetch_origin_branch()
+            .returning(|repo, branch| {
+                crate::services::GitClient::fetch_origin_branch(
+                    &crate::services::RealGitClient,
+                    repo,
+                    branch,
+                )
+            });
+        git_client.expect_remote_get_url().returning(|repo| {
+            crate::services::GitClient::remote_get_url(&crate::services::RealGitClient, repo)
+        });
+        let root = home.path().to_path_buf();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().with_git(git_client).build()),
+            root.clone(),
+        )
+        .jj_binary_path(bin.clone())
+        .build();
+        let jj = crate::jj::environment(&bin, &root);
+        let store = crate::jj::project_store_dir(&root, proj.path());
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        for branch in [LOCAL, OPEN, INTEGRATION] {
+            let workspace = workspaces.path().join(branch.replace('/', "-"));
+            crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+            std::fs::write(
+                workspace.join(format!("{}.rs", branch.replace('/', "-"))),
+                "work\n",
+            )
+            .unwrap();
+            crate::jj::seal(&jj, &workspace, &format!("work on {branch}"), None).unwrap();
+            let tip = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+            crate::jj::export_git_verified(&jj, &store, true, "test commit", &[(branch, &tip)])
+                .unwrap();
+        }
+        // What already needed origin before the advance is already there: the
+        // open PR's head, and the base its child PR was opened against.
+        for branch in [OPEN, INTEGRATION] {
+            publish_managed_branch(&orch, &store, branch).await.unwrap();
+        }
+        let origin_head = |branch: &str| {
+            git_stdout(
+                origin.path(),
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+        };
+        assert_eq!(
+            origin_head(LOCAL),
+            "",
+            "no commit has published the PR-less branch"
+        );
+
+        // A PR merges on GitHub: origin's default branch advances.
+        git(proj.path(), &["checkout", "-q", "--detach"]);
+        std::fs::write(proj.path().join("landed.rs"), "landed\n").unwrap();
+        git(proj.path(), &["add", "-A"]);
+        git(proj.path(), &["commit", "-q", "-m", "squash merge (#1)"]);
+        let landed = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+        git(proj.path(), &["push", "-q", "-f", "origin", "HEAD:main"]);
+
+        reconcile_default_advance(&orch, "proj-1", "main")
+            .await
+            .unwrap();
+        super::real_store_collision_tests::wait_for_reconcile_workers(&db).await;
+
+        let store_tip = |branch: &str| crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+        for branch in [LOCAL, OPEN, INTEGRATION] {
+            assert_eq!(
+                crate::jj::revset_commit(&jj, &store, &format!("{landed} & ::{branch}")).as_deref(),
+                Some(landed.as_str()),
+                "{branch} is replayed onto the advance whether or not it is published"
+            );
+        }
+        assert_eq!(
+            origin_head(LOCAL),
+            "",
+            "a branch no pull request needs keeps its rebased head local"
+        );
+        assert_eq!(
+            origin_head(OPEN),
+            store_tip(OPEN),
+            "an open pull request's head follows its replay"
+        );
+        assert_eq!(
+            origin_head(INTEGRATION),
+            store_tip(INTEGRATION),
+            "the base child pull requests target stays current on origin"
+        );
+
+        // Opening a pull request publishes first (`PrVcs::publish`), through
+        // this barrier, so the head base advance left local reaches origin then.
+        publish_managed_branch(&orch, &store, LOCAL)
+            .await
+            .expect("a branch base advance left local publishes when its pull request opens");
+        assert_eq!(origin_head(LOCAL), store_tip(LOCAL));
+    }
+
     /// A branch that is NOT the project default is never reset onto origin: a
     /// Coordinator integration branch and an agent branch legitimately hold sealed
     /// work origin has not seen. The gate lives in the reconciler so no call site
@@ -9575,10 +9770,13 @@ mod real_store_collision_tests {
     /// loaded machine running the whole suite in parallel one pass has been
     /// measured past two minutes.
     async fn wait_for_worker(r: &Replay) {
+        wait_for_reconcile_workers(&r.db).await;
+    }
+
+    pub(super) async fn wait_for_reconcile_workers(db: &LocalDb) {
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_secs(600) {
-            let running = r
-                .db
+            let running = db
                 .query_text(
                     "SELECT CAST(COUNT(*) AS TEXT) FROM jj_reconcile_intents WHERE status = 'running'",
                     (),

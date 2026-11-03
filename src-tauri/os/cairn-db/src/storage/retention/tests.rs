@@ -368,6 +368,130 @@ async fn a_pass_folds_a_grown_log_and_ends_at_its_fold_budget() {
     assert_eq!(report.rows(), 1);
 }
 
+/// A pass capped at one fold ends after its first page. The next pass starts
+/// at the rule after the one that spent the budget, so a cap on folds is never
+/// a cap on which rules run.
+#[tokio::test]
+async fn a_capped_pass_rotates_so_every_rule_gets_a_page() {
+    let (_temp, db) = private_db().await;
+    seed_owners(&db).await;
+    let old = NOW - 3 * 24 * HOUR;
+    insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
+    insert_stream(&db, "finalized-old", "finalized", old, Some(old), 2).await;
+    let budget = EvictorBudget {
+        fold_at_log_bytes: 0,
+        folds_per_pass: 1,
+        ..UNBOUNDED
+    };
+    let mut state = EvictorState::default();
+
+    let served = |report: &PassReport| -> Vec<&'static str> {
+        report
+            .rules
+            .iter()
+            .filter(|rule| rule.rows > 0)
+            .map(|rule| rule.eviction.name())
+            .collect()
+    };
+    let first = run_pass(&db, NOW, budget, &mut state).await;
+    assert_eq!(first.end, PassEnd::FoldBudget, "{first}");
+    assert_eq!(served(&first), vec!["done_outbox"], "{first}");
+
+    let second = run_pass(&db, NOW, budget, &mut state).await;
+    assert_eq!(second.end, PassEnd::FoldBudget, "{second}");
+    assert_eq!(
+        second.rules[0].eviction,
+        Eviction::TerminalStreams,
+        "{second}"
+    );
+    assert_eq!(served(&second), vec!["terminal_streams"], "{second}");
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM message_streams").await, 0);
+}
+
+/// The rotation's step on its own: a finished pass starts the next at the
+/// first rule, one cut short mid-rule resumes that rule, and one whose first
+/// rule spent the whole budget moves past it.
+#[test]
+fn the_next_pass_starts_where_this_one_was_cut_short() {
+    let rule = |eviction| RuleReport {
+        eviction,
+        pages: 1,
+        rows: 1,
+        max_page_rows: 1,
+        select_ms: Vec::new(),
+        write_ms: Vec::new(),
+        finished: false,
+        error: None,
+    };
+    let report = |end, served: &[Eviction]| PassReport {
+        rules: served.iter().map(|eviction| rule(*eviction)).collect(),
+        folds: Vec::new(),
+        log_peak_bytes: 0,
+        duration: Duration::ZERO,
+        end,
+    };
+    let mut rules = Eviction::ALL;
+    rules.rotate_left(2);
+    let mut state = EvictorState::default();
+
+    state.advance(&rules, &report(PassEnd::Complete, &rules));
+    assert_eq!(state.start, 0);
+    state.advance(&rules, &report(PassEnd::FoldBudget, &rules[..3]));
+    assert_eq!(state.start, 4, "resumes the rule it was cut short in");
+    state.advance(&rules, &report(PassEnd::TimeBudget, &rules[..1]));
+    assert_eq!(state.start, 3, "moves past a first rule that spent it all");
+    let last = Eviction::ALL.len() - 1;
+    state.advance(
+        &Eviction::ALL[last..],
+        &report(PassEnd::RowBudget, &Eviction::ALL[last..]),
+    );
+    assert_eq!(state.start, 0, "wraps past the end");
+}
+
+/// A fold before the pass deletes anything covers other writers' log and pages
+/// carried over from the previous pass, so it clears them without teaching the
+/// estimate. A fold over the pass's own pages does teach it.
+#[tokio::test]
+async fn a_settling_fold_does_not_train_the_estimate() {
+    let (_temp, db) = private_db().await;
+    let budget = EvictorBudget {
+        fold_work_target: Some(Duration::from_millis(500)),
+        folds_per_pass: 2,
+        ..UNBOUNDED
+    };
+
+    let mut state = EvictorState::default();
+    state.deleted_page(Eviction::DoneOutbox);
+    let settling = run_rules(&db, NOW, budget, &mut state, &[Eviction::DoneOutbox]).await;
+    assert_eq!(settling.folds.len(), 1, "{settling}");
+    assert!(settling.folds[0].succeeded, "{settling}");
+    assert!(state.unfolded.is_none());
+    assert_eq!(state.fold_ms_per_page(Eviction::DoneOutbox), None);
+
+    insert_outbox(
+        &db,
+        "done-old",
+        "done",
+        NOW - 3 * 24 * HOUR,
+        NOW - 2 * 24 * HOUR,
+    )
+    .await;
+    let trained = run_rules(
+        &db,
+        NOW,
+        budget,
+        &mut state,
+        &[Eviction::DoneOutbox, Eviction::AppliedSearchOutbox],
+    )
+    .await;
+    assert_eq!(trained.folds.len(), 1, "{trained}");
+    assert_eq!(trained.rows(), 1, "{trained}");
+    assert!(
+        state.fold_ms_per_page(Eviction::DoneOutbox).is_some(),
+        "a fold over the pass's own page trains its rule"
+    );
+}
+
 async fn insert_stream(
     db: &LocalDb,
     id: &'static str,

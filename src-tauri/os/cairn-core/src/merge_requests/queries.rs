@@ -10,10 +10,17 @@ pub(crate) enum PublicationRequirement {
     RequiredForOpenPr,
 }
 
-/// Resolve publication from both durable owners of a managed branch. A remote,
-/// open PR attached either to the routed job or to the branch makes publication
-/// mandatory. Query failure is intentionally left to callers to classify as
-/// `RequiredForOpenPr`; uncertainty must never make a possibly-public branch local-only.
+/// Resolve publication from every durable owner of a managed branch: the one
+/// rule for whether a managed branch's head must reach origin now, consulted by
+/// every path that advances one (the commit verbs and the base-advance replay).
+/// A remote, open PR makes publication mandatory when it is attached to the
+/// routed job, when the branch is its head, or when the branch is its base.
+/// The base counts because GitHub presents a child PR against its base's copy on
+/// origin: an integration branch child PRs target must stay current there even
+/// though no PR of its own exists yet. The project's default branch is excluded
+/// from that clause, because only a landing ever moves its origin copy. Query
+/// failure is intentionally left to callers to classify as `RequiredForOpenPr`;
+/// uncertainty must never make a possibly-public branch local-only.
 pub(crate) async fn publication_requirement_for_managed_branch(
     db: &LocalDb,
     job_id: &str,
@@ -24,7 +31,10 @@ pub(crate) async fn publication_requirement_for_managed_branch(
         .query_all(
             "SELECT is_local, status, github_state
              FROM merge_requests
-             WHERE job_id = ?1 OR (project_id = ?2 AND source_branch = ?3)",
+             WHERE job_id = ?1
+                OR (project_id = ?2 AND source_branch = ?3)
+                OR (project_id = ?2 AND target_branch = ?3
+                    AND ?3 IS NOT (SELECT default_branch FROM projects WHERE id = ?2))",
             params![job_id, project_id, branch],
             |row| {
                 Ok((
@@ -123,6 +133,64 @@ mod publication_requirement_tests {
             publication_requirement_for_managed_branch(&db, "job-b", "p-b", "agent/shared").await,
             PublicationRequirement::RequiredForOpenPr
         );
+    }
+
+    /// A Coordinator's integration branch has no pull request of its own while
+    /// its children's pull requests target it on GitHub, which presents each
+    /// child against origin's copy of that base. The base is therefore one a
+    /// pull request needs. The default branch is the base of nearly every pull
+    /// request and is never published by this rule: only a landing moves it.
+    #[tokio::test]
+    async fn a_base_that_open_pull_requests_target_requires_publication() {
+        let db = crate::storage::migrated_test_db("publication-base-branch.db").await;
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('p', 'default', 'Project', 'P', '/repo/p', 'main', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO merge_requests
+             (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at)
+             VALUES
+             ('mr-child', 'job-child', 'p', 'Child', 'agent/child', 'agent/integration', 'open', 0, 1, 1),
+             ('mr-local-child', 'job-local', 'p', 'Local child', 'agent/local-child', 'agent/local-base', 'open', 1, 1, 1),
+             ('mr-merged-child', 'job-merged', 'p', 'Merged child', 'agent/merged-child', 'agent/finished', 'merged', 0, 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        for (branch, expected, reason) in [
+            (
+                "agent/integration",
+                PublicationRequirement::RequiredForOpenPr,
+                "an open remote child PR targets it",
+            ),
+            (
+                "main",
+                PublicationRequirement::DeferredUntilPublication,
+                "the default branch is published only by landing",
+            ),
+            (
+                "agent/local-base",
+                PublicationRequirement::DeferredUntilPublication,
+                "a local merge request is not on GitHub",
+            ),
+            (
+                "agent/finished",
+                PublicationRequirement::DeferredUntilPublication,
+                "a merged child no longer needs its base",
+            ),
+        ] {
+            assert_eq!(
+                publication_requirement_for_managed_branch(&db, "job-coordinator", "p", branch)
+                    .await,
+                expected,
+                "{branch}: {reason}"
+            );
+        }
     }
 }
 

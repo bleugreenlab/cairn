@@ -49,7 +49,8 @@ pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEE
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, Caller, CheckpointReport,
     DbCall, DrainBudget, DrainReport, HolderActivity, HolderKind, LocalDb, OverdueHolder,
-    RetryConfig, TrackedConnection, TrackedRows, CHECKPOINT_ATTEMPTS_BOUND, READ_STATEMENT_BOUND,
+    RetryConfig, TrackedConnection, TrackedRows, CHECKPOINT_SLOW_AFTER, CHECKPOINT_WEDGE_BACKSTOP,
+    FOLD_AT_LOG_BYTES, READ_STATEMENT_BOUND,
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,

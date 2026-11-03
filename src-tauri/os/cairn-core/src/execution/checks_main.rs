@@ -2176,7 +2176,7 @@ async fn take_interruptions(db: &LocalDb) -> Result<Vec<(String, Interruption)>,
 }
 
 /// Resolves a recorded executor identity to its public name.
-type ExecutorNames<'a> = &'a (dyn Fn(&str) -> String + Sync);
+pub(crate) type ExecutorNames<'a> = &'a (dyn Fn(&str) -> String + Sync);
 
 async fn load_row(
     db: &LocalDb,
@@ -2302,10 +2302,28 @@ impl MainChain {
     fn depth(&self, commit: &str) -> Option<usize> {
         self.depth.get(commit).copied()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.depth.is_empty()
+    }
 }
 
 fn main_chain(orch: &Orchestrator, repository: &Path, tip: &str) -> Result<MainChain, String> {
-    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    first_parent_ancestry(
+        &crate::jj::environment(&orch.jj_binary_path, &orch.config_dir),
+        repository,
+        tip,
+    )
+}
+
+/// `tip` and its first-parent ancestors, back [`BRACKET_SCAN`] landings, tip
+/// first. Read from main's tip it is the trees main has held; read from a
+/// branch's base on main it is the trees main held at or before that base.
+pub(crate) fn first_parent_ancestry(
+    jj: &crate::jj::JjEnv,
+    repository: &Path,
+    tip: &str,
+) -> Result<MainChain, String> {
     let revset = format!("first_ancestors({tip}, {BRACKET_SCAN})");
     jj.run(
         repository,
@@ -2353,12 +2371,20 @@ struct RowFilter<'a> {
     /// the nearest tree wins. Without it only the cadence's own rows qualify,
     /// newest finish first.
     main_chain: Option<&'a MainChain>,
+    /// Only rows on `main_chain`, the cadence's own included. Set when the
+    /// chain was read from a base rather than main's tip: a cadence row off it
+    /// observed a tree main held after the base.
+    chain_only: bool,
 }
 
 /// How many recorded rows [`latest_complete_row`] reads before placing them on
 /// main's chain: rows on agent branches and narrowed selections share the
 /// table, so the newest few by finish time are not enough.
 const CANDIDATE_SCAN: i64 = 64;
+
+/// [`CANDIDATE_SCAN`] for a chain read from a branch's base: every main row
+/// recorded since the base is newer than the rows that can answer it.
+const BASE_CANDIDATE_SCAN: i64 = 256;
 
 /// The newest whole-suite row for `lane` that classifies as complete and
 /// passes `filter`.
@@ -2412,7 +2438,11 @@ async fn latest_complete_row(
                 filter.input_hash.unwrap_or("").to_string(),
                 filter.executor_id.unwrap_or("").to_string(),
                 i64::from(filter.main_chain.is_some()),
-                CANDIDATE_SCAN,
+                if filter.chain_only {
+                    BASE_CANDIDATE_SCAN
+                } else {
+                    CANDIDATE_SCAN
+                },
                 filter.commit.unwrap_or("").to_string(),
                 filter.other_than_executor.unwrap_or("").to_string(),
             ),
@@ -2424,7 +2454,7 @@ async fn latest_complete_row(
         .into_iter()
         .filter_map(|(id, commit, cadence)| {
             let depth = filter.main_chain.and_then(|chain| chain.depth(&commit));
-            if depth.is_none() && cadence != "main" {
+            if depth.is_none() && (filter.chain_only || cadence != "main") {
                 return None;
             }
             Some((id, depth.unwrap_or(usize::MAX)))
@@ -2441,6 +2471,40 @@ async fn latest_complete_row(
         }
     }
     Ok(None)
+}
+
+/// The nearest complete whole-suite row of the per-test `check` on `platform`
+/// whose tree is on `chain`, in [`tree_order`]. With `chain` read from a
+/// branch's base, this is the main row the base is judged by: the nearest at or
+/// before it, whoever armed it, and never one recorded on a later main tree.
+pub(crate) async fn nearest_row_on_chain(
+    db: &LocalDb,
+    project_id: &str,
+    project_key: &str,
+    check: &str,
+    platform: &str,
+    chain: &MainChain,
+    names: ExecutorNames<'_>,
+) -> Result<Option<CadenceRow>, String> {
+    let lane = CadenceLane {
+        check: check.to_string(),
+        platform: platform.to_string(),
+        notify: String::new(),
+        verdict: LaneVerdict::PerTest,
+    };
+    latest_complete_row(
+        db,
+        project_id,
+        project_key,
+        &lane,
+        RowFilter {
+            main_chain: Some(chain),
+            chain_only: true,
+            ..RowFilter::default()
+        },
+        names,
+    )
+    .await
 }
 
 /// What a cadence attempt is measured against. Two hosts of one platform
@@ -6670,6 +6734,61 @@ mod tests {
             text.contains("Compared with: cairn://p/cairn/check-observations/h-man-f, the previous manual row on `fedora`"),
             "{text}"
         );
+    }
+
+    /// A base is judged by the nearest whole-suite row at or before it: a main
+    /// cadence row on a later tip is off the base's chain and never answers,
+    /// and a row on an agent branch never observed main.
+    #[tokio::test]
+    async fn a_base_is_judged_by_the_nearest_row_at_or_before_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        let names = |executor: &str| executor.to_string();
+        let red: &[(&str, &str)] = &[("a", "failed")];
+        let green: &[(&str, &str)] = &[("a", "passed")];
+        for (id, ran_at, cadence, commit, tests) in [
+            ("cad-old", 1, "main", "old", red),
+            ("man-q", 2, "manual", "q", red),
+            // Main moved on and the test went green there after the base.
+            ("cad-tip", 5, "main", "tip", green),
+            ("side", 6, "review", "side", green),
+        ] {
+            store(
+                &db,
+                Stored {
+                    id,
+                    executor: "bbs",
+                    ran_at,
+                    cadence,
+                    commit,
+                    selection: "full",
+                    failure_kind: None,
+                    tests,
+                },
+            )
+            .await;
+        }
+        // Main's first-parent chain read from the base, which no row observed.
+        let chain = MainChain::from_log("base\nq\nold\n");
+        let row = nearest_row_on_chain(&db, "p", "cairn", "rust-tests", "linux", &chain, &names)
+            .await
+            .unwrap()
+            .expect("a row behind the base");
+        assert_eq!(row.id, "man-q");
+        assert!(matches!(row.tests.get("a"), Some(TestOutcome::Failed(_))));
+
+        let none = nearest_row_on_chain(
+            &db,
+            "p",
+            "cairn",
+            "rust-tests",
+            "linux",
+            &MainChain::from_log("base\n"),
+            &names,
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none(), "no row at or before the base: {none:?}");
     }
 
     #[test]

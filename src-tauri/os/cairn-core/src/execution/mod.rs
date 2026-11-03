@@ -25,6 +25,7 @@ pub mod check_placement;
 pub mod checkpoint_runs;
 pub mod checkpoints;
 pub mod checks;
+pub mod checks_base;
 pub mod checks_main;
 pub mod checks_settlement;
 pub mod checks_status;

@@ -304,9 +304,19 @@ impl ChecksSnapshot {
                     NodeCheckState::Pending if self.settlement.is_settled() => "no verdict",
                     NodeCheckState::Pending => "pending",
                 };
-                match format_status_annotation(status) {
+                let line = match format_status_annotation(status) {
                     Some(annotation) => format!("- {} [{state}] {annotation}", status.name),
                     None => format!("- {} [{state}]", status.name),
+                };
+                // The buckets themselves are on `/checks`; the resume says only
+                // how much of the red is the branch's.
+                match &status.base_attribution {
+                    Some(attribution) => format!(
+                        "{line}; {} at base `{}`",
+                        attribution.charge_clause(),
+                        attribution.base.get(..12).unwrap_or(&attribution.base)
+                    ),
+                    None => line,
                 }
             })
             .collect()
@@ -613,6 +623,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         }
     }
 

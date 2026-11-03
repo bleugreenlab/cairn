@@ -204,8 +204,23 @@ const CHECKPOINT_THRESHOLD_DISABLED: i64 = -1;
 /// that within this pass.
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long one checkpoint pass's TRUNCATE attempts may keep the connection
-/// gate shut once the drain has finished.
+/// How long a pass's TRUNCATE attempts run, once the drain has finished,
+/// before the pass logs that the fold is slow. The gate stays shut past it.
+///
+/// A fold that is merely slow must be waited out, not abandoned. On the pinned
+/// engine a transaction that begins while a TRUNCATE is still running gets
+/// `database is locked` rather than waiting, so reopening the gate onto a
+/// running fold turns a pause every caller has already paid into a failure for
+/// every caller that arrives next: on 11-03 a 236 MiB fold that ran 36.6 s
+/// under a CPU storm failed 62 calls that way, in a boot that had no other
+/// `database is locked` (cairn/5655). Production folds of 150 to 236 MiB took
+/// 3.5 to 6 s when the host was healthy, so twenty seconds is a fold worth
+/// naming, and the line that names it is the one a wedge watcher samples on.
+pub const CHECKPOINT_SLOW_AFTER: Duration = Duration::from_secs(20);
+
+/// How long a pass's TRUNCATE attempts may keep the connection gate shut, once
+/// the drain has finished, before the pass gives them up as a suspected engine
+/// wedge and reopens the gate.
 ///
 /// The pinned Turso runs an MVCC `PRAGMA wal_checkpoint(TRUNCATE)` to the end
 /// inside a single poll: `op_checkpoint` drives the checkpoint state machine in
@@ -213,14 +228,33 @@ const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 /// yields to the runtime. An attempt that does not finish therefore blocks its
 /// thread rather than parking a future, and a timeout wrapped around that
 /// future would never be polled again. So each attempt runs on its own OS
-/// thread, and the pass waits for it at most this long. Past the bound the pass
-/// gives the attempt up, the gate reopens, and the thread is left to finish in
-/// the engine (see [`LocalDb::checkpoint`]).
+/// thread, and the pass waits for it at most this long. Past the backstop the
+/// pass gives the attempt up, the gate reopens, and the thread is left to
+/// finish in the engine (see [`LocalDb::checkpoint`]).
 ///
-/// Production folds take one to four seconds. The bound plus the drain ceiling
-/// must stay inside `db_maintenance`'s shortest retry, which that module
-/// asserts.
-pub const CHECKPOINT_ATTEMPTS_BOUND: Duration = Duration::from_secs(20);
+/// Two minutes covers a 256 MiB fold at the worst production throughput yet
+/// measured (6.5 MB/s) three times over, and stays far inside every caller's
+/// own bound ([`READ_STATEMENT_BOUND`], the MCP socket's 795 s), so a real
+/// wedge still reopens the gate before any caller gives up on it. Reaching it
+/// is the specimen of a fold that blocks rather than runs slowly; the three
+/// wedges of 10-30 (cairn/5644) are the only ones yet seen.
+pub const CHECKPOINT_WEDGE_BACKSTOP: Duration = Duration::from_secs(120);
+
+/// Logical-log size at which a running process folds: the periodic
+/// checkpoint pass (`db_maintenance`) and the retention evictor
+/// (`retention::EvictorBudget::PRODUCTION`) both act at it, so one number
+/// decides when the log is big enough to fold.
+///
+/// The gate's pause is the fold, so the size is chosen for the fold's length:
+/// at the 15 to 23 MB a minute production writes, 64 MiB comes round every
+/// three to four minutes, folds in about a second on a healthy host, and in
+/// about ten at the worst production throughput yet measured (6.5 MB/s).
+pub const FOLD_AT_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+const _: () = assert!(
+    CHECKPOINT_SLOW_AFTER.as_millis() < CHECKPOINT_WEDGE_BACKSTOP.as_millis(),
+    "a fold must be reported slow before it is abandoned"
+);
 
 /// The source line that asked for a database connection: the caller of a
 /// public [`LocalDb`] entry point, captured with `#[track_caller]`.
@@ -688,7 +722,7 @@ pub struct LocalDb {
     checkpoint_lock: AsyncMutex<()>,
     /// Set while a TRUNCATE attempt runs on its checkpoint thread, and cleared
     /// by that thread when the engine returns. A pass that finds it set follows
-    /// one whose attempt outlived [`CHECKPOINT_ATTEMPTS_BOUND`], and must
+    /// one whose attempt outlived [`CHECKPOINT_WEDGE_BACKSTOP`], and must
     /// neither start a second TRUNCATE beside it nor close the gate for an
     /// attempt it cannot make.
     checkpoint_in_engine: Arc<AtomicBool>,
@@ -1222,6 +1256,9 @@ impl LocalDb {
     /// drain behind it is bounded by a budget. A nested call arriving while the
     /// gate is shut costs its caller a bounded pause and denies maintenance the
     /// quiet instant it was after; it cannot wait on its own caller forever.
+    /// The pause is the drain plus the pass's losing attempts, each bounded by
+    /// [`CHECKPOINT_BUSY_TIMEOUT`], because the outer call's open transaction
+    /// makes the engine report busy rather than fold.
     ///
     /// A pooled read's connection gets the read bound as its engine deadline
     /// and a write's gets none, set on every checkout because pooled
@@ -1813,25 +1850,30 @@ impl LocalDb {
     /// So this closes the [`ConnectionGate`] first, holding new connections at
     /// the door while the ones already open finish, and only then attempts. The
     /// hold reopens the gate when it drops, on every path out of this function
-    /// including a panic inside the engine, so a caller waiting at the gate waits
-    /// at most `drain.ceiling` plus [`CHECKPOINT_ATTEMPTS_BOUND`]. How long the
-    /// drain waits within that ceiling is [`DrainBudget::for_open`] of the number
-    /// of connections open at the moment the gate closed.
+    /// including a panic inside the engine. A caller waiting at the gate waits
+    /// for the drain and then for the fold, however long the fold takes, up to
+    /// [`CHECKPOINT_WEDGE_BACKSTOP`]: no caller is ever handed `database is
+    /// locked` because a fold is running. How long the drain waits within
+    /// `drain.ceiling` is [`DrainBudget::for_open`] of the number of connections
+    /// open at the moment the gate closed. A pass whose drain could not finish
+    /// meets an engine that reports busy, so it costs the drain plus its losing
+    /// attempts, each bounded by [`CHECKPOINT_BUSY_TIMEOUT`].
     ///
     /// Dropping the hold is only enough if this function gets to return, and an
     /// engine call that never comes back would keep it from returning: the
     /// TRUNCATE runs synchronously inside one poll (see
-    /// [`CHECKPOINT_ATTEMPTS_BOUND`]), so a stuck attempt on a runtime worker
+    /// [`CHECKPOINT_WEDGE_BACKSTOP`]), so a stuck attempt on a runtime worker
     /// shuts every database call in the process out for good. Each attempt
     /// therefore runs on its own `cairn-checkpoint` thread with the private
-    /// connection moved onto it, and the pass waits for the result at most until
-    /// the bound. An attempt that has not returned by then is abandoned: the pass
-    /// reports `checkpoint attempt exceeded ...`, warns, and reopens the gate.
-    /// The engine's own checkpoint lock still keeps correctness, since a
-    /// transaction that begins while the abandoned attempt holds it gets
-    /// `database is locked` rather than a torn read. Until that thread returns,
-    /// later passes report the attempt still running and neither close the gate
-    /// nor issue a second TRUNCATE.
+    /// connection moved onto it. Past [`CHECKPOINT_SLOW_AFTER`] the pass warns
+    /// once that the fold is still running and keeps waiting, with the gate
+    /// shut. An attempt that has not returned by the backstop is abandoned as a
+    /// suspected wedge: the pass reports `checkpoint attempt exceeded ...`,
+    /// warns, and reopens the gate. The engine's own checkpoint lock still keeps
+    /// correctness, since a transaction that begins while the abandoned attempt
+    /// holds it gets `database is locked` rather than a torn read. Until that
+    /// thread returns, later passes report the attempt still running and neither
+    /// close the gate nor issue a second TRUNCATE.
     ///
     /// The attempt is made whether or not the drain completed. A drain that
     /// expires means a long-lived transaction is still open and the attempt will
@@ -1863,20 +1905,21 @@ impl LocalDb {
             max_attempts,
             between_attempts,
             drain_budget,
-            CHECKPOINT_ATTEMPTS_BOUND,
+            AttemptBounds::PRODUCTION,
             Arc::new(truncate_attempt),
         )
         .await
     }
 
-    /// [`Self::checkpoint`] with the attempts' bound and the attempt itself
-    /// supplied, so a test can stand in an engine call that never returns.
+    /// [`Self::checkpoint`] with the attempts' bounds and the attempt itself
+    /// supplied, so a test can stand in an engine call that is slow or never
+    /// returns.
     async fn checkpoint_bounded(
         &self,
         max_attempts: usize,
         between_attempts: Duration,
         drain_budget: DrainBudget,
-        attempts_bound: Duration,
+        bounds: AttemptBounds,
         attempt: CheckpointAttempt,
     ) -> DbResult<CheckpointReport> {
         // `checkpoint` is public and callers are not required to coordinate.
@@ -1894,6 +1937,7 @@ impl LocalDb {
                 log_bytes_after: self.logical_log_bytes(),
                 duration: started.elapsed(),
                 drain: DrainReport::not_closed(),
+                slow: false,
             });
         }
 
@@ -1905,10 +1949,13 @@ impl LocalDb {
         let mut conn = Some(conn);
 
         let (hold, drain) = self.gate.close(drain_budget).await;
-        let deadline = Instant::now() + attempts_bound;
+        let attempts_started = Instant::now();
+        let slow_at = attempts_started + bounds.slow_after;
+        let deadline = attempts_started + bounds.backstop;
         let mut attempts = 0;
         let mut error = None;
         let mut abandoned = false;
+        let mut slow = false;
 
         for attempt_number in 1..=max_attempts.max(1) {
             if attempt_number > 1 && !between_attempts.is_zero() {
@@ -1919,15 +1966,26 @@ impl LocalDb {
                 break;
             };
             attempts = attempt_number;
-            match run_checkpoint_attempt(
+            let until_slow = (!slow).then(|| slow_at.saturating_duration_since(Instant::now()));
+            let (outcome, became_slow) = run_checkpoint_attempt(
                 attempt_conn,
                 attempt.clone(),
+                until_slow,
                 remaining,
                 &self.checkpoint_in_engine,
                 logical_log_path(&self.path),
+                || {
+                    log::warn!(
+                        "Checkpoint attempt still running after {:?}; the gate stays shut until \
+                         it returns: {drain} log_mib_before={:.1}",
+                        bounds.slow_after,
+                        log_bytes_before as f64 / (1024.0 * 1024.0),
+                    );
+                },
             )
-            .await
-            {
+            .await;
+            slow |= became_slow;
+            match outcome {
                 AttemptOutcome::Returned(_, Ok(())) => {
                     error = None;
                     break;
@@ -1941,7 +1999,7 @@ impl LocalDb {
                     }
                 }
                 AttemptOutcome::Exceeded => {
-                    error = Some(format!("checkpoint attempt exceeded {attempts_bound:?}"));
+                    error = Some(format!("checkpoint attempt exceeded {:?}", bounds.backstop));
                     abandoned = true;
                     break;
                 }
@@ -1960,12 +2018,15 @@ impl LocalDb {
             log_bytes_after: self.logical_log_bytes(),
             duration: started.elapsed(),
             drain,
+            slow,
         };
         if abandoned {
             log::warn!(
-                "Checkpoint pass abandoned its TRUNCATE attempt and reopened the connection \
-                 gate; the attempt's `cairn-checkpoint` thread is still inside the engine, and \
-                 its stack names what it waits on: {report}"
+                "Checkpoint pass abandoned its TRUNCATE attempt at the {:?} wedge backstop and \
+                 reopened the connection gate. This is the suspected engine wedge cairn/5644 \
+                 guards against: the attempt's `cairn-checkpoint` thread is still inside the \
+                 engine, and its stack names what it waits on: {report}",
+                bounds.backstop,
             );
         }
         Ok(report)
@@ -2053,10 +2114,11 @@ impl LocalDb {
 /// [`Self::close`] returns a [`GateHold`] that reopens the gate in its `Drop`,
 /// so the gate reopens on every exit path — early return, error, panic — and the
 /// drain itself is bounded by a budget. A caller waiting at the gate therefore
-/// waits at most that budget plus [`CHECKPOINT_ATTEMPTS_BOUND`]. That property is what makes
-/// gating the whole process tractable: a call path this design failed to
-/// anticipate costs a bounded pause and a wasted maintenance pass, not a wedged
-/// application.
+/// waits for that budget and then for the fold, up to
+/// [`CHECKPOINT_WEDGE_BACKSTOP`]. That property is what makes gating the whole
+/// process tractable: a call path this design failed to anticipate costs a
+/// bounded pause and a wasted maintenance pass, not a wedged application, and a
+/// fold that is merely slow costs a longer pause, never a failed call.
 #[derive(Debug)]
 pub(super) struct ConnectionGate {
     /// What this database's statements have been explained as. On the gate
@@ -2619,6 +2681,20 @@ fn truncate_attempt(conn: &Connection) -> DbResult<()> {
     runtime.block_on(consume_on(conn, "PRAGMA wal_checkpoint(TRUNCATE)"))
 }
 
+/// When a pass's attempts are reported slow, and when they are given up.
+#[derive(Debug, Clone, Copy)]
+struct AttemptBounds {
+    slow_after: Duration,
+    backstop: Duration,
+}
+
+impl AttemptBounds {
+    const PRODUCTION: Self = Self {
+        slow_after: CHECKPOINT_SLOW_AFTER,
+        backstop: CHECKPOINT_WEDGE_BACKSTOP,
+    };
+}
+
 /// How one bounded attempt ended.
 enum AttemptOutcome {
     /// The engine returned, handing the connection back for a retry.
@@ -2647,7 +2723,16 @@ impl Drop for InEngine {
 }
 
 /// Run `attempt` on `conn` on a dedicated `cairn-checkpoint` thread and wait
-/// for it at most `bound`.
+/// for it at most `bound`, calling `on_slow` once if it is still running after
+/// `until_slow`. Returns how the attempt ended and whether it was slow.
+///
+/// The thread runs at the QoS the runtime's own workers run at. A spawned
+/// thread does not inherit its parent's QoS on macOS, so it would otherwise
+/// come up at default, a class below the workers, and the workers are what
+/// load the host when a fold meets a storm. On the clone that difference was
+/// most of the fold's throughput: a 64 MiB fold under twelve busy
+/// user-initiated threads ran at 15 to 18 MB/s at default and 146 to 239
+/// MB/s raised (cairn/5655).
 ///
 /// The marker is cleared before the result is sent, so a pass that has its
 /// connection back never reads its own attempt as still running. A panic
@@ -2661,15 +2746,18 @@ impl Drop for InEngine {
 async fn run_checkpoint_attempt(
     conn: Connection,
     attempt: CheckpointAttempt,
+    until_slow: Option<Duration>,
     bound: Duration,
     in_engine: &Arc<AtomicBool>,
     log_path: PathBuf,
-) -> AttemptOutcome {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
+    on_slow: impl FnOnce(),
+) -> (AttemptOutcome, bool) {
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
     let running = InEngine::enter(in_engine.clone());
     let spawned = std::thread::Builder::new()
         .name("cairn-checkpoint".to_string())
         .spawn(move || {
+            cairn_platform::priority::raise_current_thread_for_orchestration();
             let started = Instant::now();
             let result = attempt(&conn);
             drop(running);
@@ -2688,13 +2776,34 @@ async fn run_checkpoint_attempt(
             }
         });
     if let Err(error) = spawned {
-        return AttemptOutcome::Lost(format!("could not start the checkpoint thread: {error}"));
+        return (
+            AttemptOutcome::Lost(format!("could not start the checkpoint thread: {error}")),
+            false,
+        );
     }
-    match timeout(bound, receiver).await {
+    let started = Instant::now();
+    let mut slow = false;
+    let received = match until_slow.filter(|until| *until < bound) {
+        Some(until) => match timeout(until, &mut receiver).await {
+            Ok(received) => Some(received),
+            Err(_) => {
+                slow = true;
+                on_slow();
+                None
+            }
+        },
+        None => None,
+    };
+    let received = match received {
+        Some(received) => Ok(received),
+        None => timeout(bound.saturating_sub(started.elapsed()), receiver).await,
+    };
+    let outcome = match received {
         Ok(Ok((conn, result))) => AttemptOutcome::Returned(conn, result),
         Ok(Err(_)) => AttemptOutcome::Lost("the checkpoint attempt's thread panicked".to_string()),
         Err(_) => AttemptOutcome::Exceeded,
-    }
+    };
+    (outcome, slow)
 }
 
 /// What one [`LocalDb::checkpoint`] pass did: whether it won, what it cost, and
@@ -2718,11 +2827,23 @@ pub struct CheckpointReport {
     /// whose drain SUCCEEDED is a different and much more alarming thing, and
     /// only this field tells them apart.
     pub drain: DrainReport,
+    /// Whether the attempts ran past [`CHECKPOINT_SLOW_AFTER`] with the gate
+    /// shut. Read beside [`Self::fold_mib_per_s`]: a slow fold at a healthy
+    /// rate is a big log, a slow fold at a collapsed rate is a starved host.
+    pub slow: bool,
 }
 
 impl CheckpointReport {
     pub fn succeeded(&self) -> bool {
         self.error.is_none()
+    }
+
+    /// The fold's throughput: the log it started with over the time the
+    /// attempts took, the drain excluded. `None` unless the pass folded.
+    pub fn fold_mib_per_s(&self) -> Option<f64> {
+        let work = self.duration.saturating_sub(self.drain.waited);
+        (self.succeeded() && !work.is_zero())
+            .then(|| self.log_bytes_before as f64 / (1024.0 * 1024.0) / work.as_secs_f64())
     }
 }
 
@@ -2738,6 +2859,12 @@ impl std::fmt::Display for CheckpointReport {
             mib(self.log_bytes_after),
             self.drain,
         )?;
+        if let Some(rate) = self.fold_mib_per_s() {
+            write!(f, " fold_mib_per_s={rate:.1}")?;
+        }
+        if self.slow {
+            write!(f, " slow=true")?;
+        }
         match &self.error {
             Some(error) => write!(f, " outcome=failed error={error}"),
             None => write!(f, " outcome=checkpointed"),
@@ -5705,14 +5832,186 @@ mod tests {
         assert_eq!(db.live_connections(), 0);
     }
 
+    /// A fold that outlives the slow mark but returns before the backstop keeps
+    /// the gate shut the whole time, so a caller arriving mid-fold waits it out
+    /// and is served, rather than being admitted onto a running TRUNCATE and
+    /// handed `database is locked`.
+    #[tokio::test]
+    async fn a_slow_checkpoint_keeps_the_gate_shut_until_it_returns() {
+        let db = Arc::new(test_db().await.unwrap());
+        let entered = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let slow: CheckpointAttempt = {
+            let entered = entered.clone();
+            Arc::new(move |_conn| {
+                entered.notify_one();
+                let _ = released.lock().unwrap().recv();
+                Ok(())
+            })
+        };
+
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint_bounded(
+                    3,
+                    Duration::ZERO,
+                    DrainBudget::fixed(Duration::from_millis(50)),
+                    AttemptBounds {
+                        slow_after: Duration::from_millis(100),
+                        backstop: Duration::from_secs(5),
+                    },
+                    slow,
+                )
+                .await
+                .unwrap()
+            })
+        };
+        entered.notified().await;
+        sleep(Duration::from_millis(50)).await;
+
+        let mut caller = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                let result = db.query_one("SELECT 1", (), |row| row.i64(0)).await;
+                (result, Instant::now())
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(350), &mut caller)
+                .await
+                .is_err(),
+            "a caller was admitted while the fold was still running"
+        );
+        let released_at = Instant::now();
+        release.send(()).unwrap();
+
+        let (served, served_at) = tokio::time::timeout(Duration::from_secs(10), caller)
+            .await
+            .expect("the gate never reopened after the fold returned")
+            .unwrap();
+        assert_eq!(served.unwrap(), 1);
+        assert!(served_at >= released_at);
+
+        let report = checkpointing.await.unwrap();
+        assert!(report.succeeded(), "{report}");
+        assert!(report.slow, "{report}");
+        assert_eq!(report.attempts, 1, "{report}");
+        assert!(report.to_string().contains("slow=true"), "{report}");
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    /// The checkpoint thread runs at the runtime workers' QoS. A spawned thread
+    /// does not inherit its parent's on macOS, so without the explicit raise it
+    /// comes up at default, a class below the workers, and folds an order of
+    /// magnitude slower when they load the host.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_checkpoint_thread_runs_at_user_initiated_qos() {
+        extern "C" {
+            fn qos_class_self() -> u32;
+        }
+        const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+        let db = test_db().await.unwrap();
+        let observed = Arc::new(AtomicUsize::new(0));
+        let reading: CheckpointAttempt = {
+            let observed = observed.clone();
+            Arc::new(move |_conn| {
+                // SAFETY: reads the calling thread's own QoS class.
+                let qos = unsafe { qos_class_self() };
+                observed.store(qos as usize, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        let report = db
+            .checkpoint_bounded(
+                1,
+                Duration::ZERO,
+                DRAIN_BUDGET,
+                AttemptBounds::PRODUCTION,
+                reading,
+            )
+            .await
+            .unwrap();
+        assert!(report.succeeded(), "{report}");
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            QOS_CLASS_USER_INITIATED as usize
+        );
+    }
+
+    /// The longer hold is for a fold that runs. A pass whose drain cannot
+    /// finish, because a caller holds a transaction open while it awaits a
+    /// nested call, meets an engine that reports busy, and must reopen as
+    /// promptly as before: the drain, plus three attempts each bounded by
+    /// [`CHECKPOINT_BUSY_TIMEOUT`], plus slack.
+    #[tokio::test]
+    async fn a_busy_attempt_behind_a_nested_holder_still_reopens_promptly() {
+        let db = Arc::new(test_db().await.unwrap());
+        db.execute("INSERT INTO counters(id, value) VALUES ('nested', 7)", ())
+            .await
+            .unwrap();
+        let holder = db.connect().await.unwrap();
+        holder.execute(db.concurrent_begin(), ()).await.unwrap();
+        let mut rows = holder
+            .query("SELECT value FROM counters", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap();
+        drop(rows);
+
+        let drain = Duration::from_millis(100);
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint(3, Duration::from_millis(50), DrainBudget::fixed(drain))
+                    .await
+                    .unwrap()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !db.gate.lock().closed {
+            assert!(Instant::now() < deadline, "the pass never closed the gate");
+            tokio::task::yield_now().await;
+        }
+
+        let arrived = Instant::now();
+        let nested = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.query_one(
+                "SELECT value FROM counters WHERE id = 'nested'",
+                (),
+                |row| row.i64(0),
+            ),
+        )
+        .await
+        .expect("a nested call never got past a pass that could not fold")
+        .unwrap();
+        let waited = arrived.elapsed();
+        assert_eq!(nested, 7);
+        let bound = drain + 3 * CHECKPOINT_BUSY_TIMEOUT + 2 * Duration::from_millis(50);
+        assert!(
+            waited < bound + Duration::from_secs(1),
+            "the nested call waited {waited:?}, past {bound:?} plus slack"
+        );
+
+        let report = checkpointing.await.unwrap();
+        assert!(!report.drain.drained, "{report}");
+        assert!(!report.slow, "{report}");
+        holder.execute("ROLLBACK", ()).await.unwrap();
+        drop(holder);
+        assert_eq!(db.live_connections(), 0);
+    }
+
     /// An engine attempt that never returns must not keep the gate shut.
     ///
     /// The gate's other safety properties all rest on the checkpoint function
     /// returning, which drops the hold. This pins the one path where it would
-    /// not: the attempt is stuck inside the engine, and a read that arrives
-    /// while it is stuck is still served inside the bound. Until the stuck
-    /// attempt returns, a later pass must not close the gate or start a second
-    /// TRUNCATE; once it returns, checkpointing resumes.
+    /// not: the attempt is stuck inside the engine past the wedge backstop, and
+    /// a read that arrives while it is stuck is still served once the backstop
+    /// passes. Until the stuck attempt returns, a later pass must not close the
+    /// gate or start a second TRUNCATE; once it returns, checkpointing resumes.
     #[tokio::test]
     async fn the_gate_reopens_when_a_checkpoint_attempt_never_returns() {
         let db = Arc::new(test_db().await.unwrap());
@@ -5735,7 +6034,10 @@ mod tests {
                     3,
                     Duration::ZERO,
                     DrainBudget::fixed(Duration::from_millis(50)),
-                    Duration::from_millis(300),
+                    AttemptBounds {
+                        slow_after: Duration::from_millis(100),
+                        backstop: Duration::from_millis(300),
+                    },
                     stuck,
                 )
                 .await
@@ -5743,8 +6045,10 @@ mod tests {
             })
         };
         entered.notified().await;
+        let arrived = Instant::now();
 
-        // Arrives with the gate shut and the attempt stuck, and must be served.
+        // Arrives with the gate shut and the attempt stuck, and must be served
+        // once the backstop gives the attempt up.
         let served = tokio::time::timeout(
             Duration::from_secs(10),
             db.query_one("SELECT 1", (), |row| row.i64(0)),
@@ -5753,12 +6057,18 @@ mod tests {
         .expect("the gate never reopened: a caller blocked behind a stuck checkpoint attempt")
         .unwrap();
         assert_eq!(served, 1);
+        assert!(
+            arrived.elapsed() >= Duration::from_millis(200),
+            "the gate reopened before the backstop, at {:?}",
+            arrived.elapsed()
+        );
 
         let report = checkpointing.await.unwrap();
         assert_eq!(
             report.attempts, 1,
             "an abandoned attempt is not retried: {report}"
         );
+        assert!(report.slow, "{report}");
         assert_eq!(
             report.error.as_deref(),
             Some("checkpoint attempt exceeded 300ms"),

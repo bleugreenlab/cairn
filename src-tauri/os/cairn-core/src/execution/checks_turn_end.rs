@@ -2582,6 +2582,12 @@ fn push_check_lines(
                     .or_else(|| formatted_failure_names(status).map(|n| format!(" \u{2014} {n}")))
                     .unwrap_or_default();
                 out.push_str(&format!("- \u{2717} {}{annotation}\n", status.name));
+                if let Some(attribution) = &status.base_attribution {
+                    out.push_str(&format!("  - of these, {}\n", attribution.charge_clause()));
+                    for line in attribution.bucket_lines() {
+                        out.push_str(&format!("  - {line}\n"));
+                    }
+                }
                 if let Some(detail) = status
                     .output_tail
                     .as_deref()
@@ -3305,6 +3311,7 @@ mod tests {
             notice: None,
             declared_unverified: None,
             progress: None,
+            base_attribution: None,
         }
     }
 
@@ -3980,6 +3987,34 @@ mod tests {
     /// A rowless lane is `pending` only while a wave of its own cadence is in
     /// flight; with none, nothing is coming and it reads `absent`, the word the
     /// merge's verdict gate refuses with.
+    #[test]
+    fn section_lists_a_red_test_lanes_failures_by_their_status_on_main() {
+        use crate::execution::checks_base::{partition, tests::main_row};
+        let mut red = status("rust-tests", NodeCheckState::Failed);
+        red.failure_names = vec!["core a".to_string(), "core b".to_string()];
+        let main = main_row("base", &[("core a", "failed"), ("core b", "passed")]);
+        red.base_attribution = Some(partition("base", &red.failure_names, Some(&main)));
+
+        let section = format_checks_section(
+            &[red],
+            crate::execution::checks_status::WaveCadence::default(),
+        )
+        .unwrap();
+
+        assert!(
+            section.contains("  - of these, 1 is this branch's\n"),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "  - 1 red on main at `base` (cairn://p/cairn/check-observations/e884003b), \
+                 charged to the base: core a\n"
+            ),
+            "{section}"
+        );
+        assert!(section.contains("this branch's: core b\n"), "{section}");
+    }
+
     #[test]
     fn section_renders_not_run_states() {
         let lanes = [
