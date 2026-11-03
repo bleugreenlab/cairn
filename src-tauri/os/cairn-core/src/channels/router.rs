@@ -8480,19 +8480,30 @@ mod tests {
         let temp = tempfile::tempdir().unwrap().keep();
         let db = Arc::new(migrated_test_db(name).await);
         let search = Arc::new(SearchIndex::open_or_create(temp.join("search")).unwrap());
-        (
-            Orchestrator::builder(
-                Arc::new(DbState::new(db.clone(), search)),
-                Arc::new(
-                    TestServicesBuilder::new()
-                        .with_process(RecordingProcessSpawner::new().clone())
-                        .build(),
-                ),
-                temp.join("config"),
-            )
-            .build(),
-            db,
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(
+                TestServicesBuilder::new()
+                    .with_process(RecordingProcessSpawner::new().clone())
+                    .build(),
+            ),
+            temp.join("config"),
         )
+        .build();
+        // Building the orchestrator attaches the runner-event journal, whose own
+        // thread commits a `runner_started` row and a retention sweep to this
+        // database whenever the OS schedules it. Each commit advances the
+        // mutation generation the gate fence keys on, so a journal write landing
+        // between two of a test's sweeps is a mutation the test never made, and
+        // the fence correctly refreshes for it. Settle the journal first so the
+        // test is the database's only writer.
+        assert!(
+            orch.fleet
+                .runner_events()
+                .flush(std::time::Duration::from_secs(30)),
+            "the runner event journal settles its startup writes"
+        );
+        (orch, db)
     }
 
     #[tokio::test]
