@@ -11,7 +11,7 @@ pub(crate) const DB_CONTRACT: ResourceContract =
         kind: ResourceKind::Db,
         uri_template: "cairn://db",
         name: "Live database SQL projection",
-        description: "Read-only access to the running app's existing local database connection. Read it bare for a compact schema overview (tables, columns with types, row counts, index counts), or use ?sql= with offset/limit row windows. EXPLAIN and EXPLAIN QUERY PLAN are permitted for inspecting query plans. Write SQL verbatim: the sql value is taken literally, so a `%` (a LIKE wildcard) and spaces need no URL-encoding.",
+        description: "Read-only access to the running app's existing local database connection. Read it bare for a compact schema overview (tables, columns with types, each table's max rowid as a size that costs a seek rather than a count, index counts), or use ?sql= with offset/limit row windows. EXPLAIN and EXPLAIN QUERY PLAN are permitted for inspecting query plans. Write SQL verbatim: the sql value is taken literally, so a `%` (a LIKE wildcard) and spaces need no URL-encoding.",
         read_projections: &[
             ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA (verbatim; a literal % LIKE wildcard needs no encoding)" },
             ProjectionSpec { key: "table", values: "NAME — one table's full column list and every index on it (columns or expressions, unique/partial marks, a partial index's WHERE predicate), no elision (overview only)" },

@@ -75,43 +75,122 @@ pub(crate) struct SchemaOverview {
     pub shown_tables: usize,
 }
 
+/// Describe the user tables a page selects, without scanning any of them.
+///
+/// A table's size is its rowid high-water (`max(rowid)`, a seek to the last
+/// b-tree entry), never `COUNT(*)`: on the production file a count is a full
+/// walk of millions of rows through a cold page cache. Each table is described
+/// in its own short read, so no connection or snapshot is held across tables.
 pub(crate) async fn render_overview(
     db: &LocalDb,
     params: &OverviewParams,
 ) -> DbResult<SchemaOverview> {
-    let params = params.clone();
+    let mut catalog = read_catalog(db).await?;
+    let total_tables = catalog.tables.len();
+    let selected: Vec<String> = if let Some(table) = &params.table {
+        catalog
+            .tables
+            .into_iter()
+            .filter(|name| name == table)
+            .collect()
+    } else {
+        catalog
+            .tables
+            .into_iter()
+            .skip(params.offset)
+            .take(params.limit)
+            .collect()
+    };
+
+    let detail = params.table.is_some();
+    let mut rendered = Vec::with_capacity(selected.len());
+    for table in &selected {
+        let indexes = catalog.indexes.remove(table).unwrap_or_default();
+        rendered.extend(describe_table(db, table.clone(), indexes, detail).await?);
+    }
+    if let Some(table) = &params.table {
+        if selected.is_empty() {
+            rendered.push(format!("Table '{table}' not found"));
+        }
+    }
+    Ok(SchemaOverview {
+        body: if rendered.is_empty() {
+            "(no user tables)".to_string()
+        } else {
+            rendered.join("\n")
+        },
+        total_tables: if detail { selected.len() } else { total_tables },
+        shown_tables: selected.len(),
+    })
+}
+
+type IndexEntry = (String, Option<String>);
+
+struct Catalog {
+    /// User tables, by name.
+    tables: Vec<String>,
+    /// Every index in the catalog by its table, each list ordered by index
+    /// name. Read from `sqlite_schema` itself so no kind of index (non-unique,
+    /// partial, expression) is filtered out; constraint autoindexes have no
+    /// SQL text.
+    indexes: std::collections::HashMap<String, Vec<IndexEntry>>,
+}
+
+/// The user tables and every index, in one statement outside any transaction.
+async fn read_catalog(db: &LocalDb) -> DbResult<Catalog> {
+    let objects = db
+        .query_all(
+            format!(
+                "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+                 WHERE ({USER_TABLE_PREDICATE}) OR type = 'index' \
+                 ORDER BY name"
+            ),
+            (),
+            |row| {
+                Ok((
+                    row.get::<String>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<Option<String>>(3)?,
+                ))
+            },
+        )
+        .await?;
+    let mut catalog = Catalog {
+        tables: Vec::new(),
+        indexes: std::collections::HashMap::new(),
+    };
+    for (kind, name, table, sql) in objects {
+        if kind == "index" {
+            catalog.indexes.entry(table).or_default().push((name, sql));
+        } else {
+            catalog.tables.push(name);
+        }
+    }
+    Ok(catalog)
+}
+
+/// The statement that sizes a table: an index-only seek to the last rowid.
+fn rowid_high_water_sql(quoted_table: &str) -> String {
+    format!("SELECT max(rowid) FROM {quoted_table}")
+}
+
+/// One table's overview lines, read in a read of its own.
+async fn describe_table(
+    db: &LocalDb,
+    table: String,
+    indexes: Vec<IndexEntry>,
+    detail: bool,
+) -> DbResult<Vec<String>> {
     db.read(move |conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    &format!(
-                        "SELECT name FROM sqlite_schema WHERE {USER_TABLE_PREDICATE} ORDER BY name"
-                    ),
-                    (),
-                )
-                .await?;
+            let quoted = quote_identifier(&table);
             let mut names = Vec::new();
-            while let Some(row) = rows.next().await? {
-                names.push(row.get::<String>(0)?);
-            }
-            let total_tables = names.len();
-            let selected: Vec<String> = if let Some(table) = &params.table {
-                names.into_iter().filter(|name| name == table).collect()
-            } else {
-                names
-                    .into_iter()
-                    .skip(params.offset)
-                    .take(params.limit)
-                    .collect()
-            };
-
-            let mut rendered = Vec::with_capacity(selected.len());
-            for table in &selected {
-                let quoted = quote_identifier(table);
+            let mut columns = Vec::new();
+            {
                 let mut column_rows = conn
                     .query(&format!("PRAGMA table_info({quoted})"), ())
                     .await?;
-                let mut columns = Vec::new();
                 while let Some(row) = column_rows.next().await? {
                     let name = row.get::<String>(1)?;
                     let kind = row.get::<String>(2)?;
@@ -119,7 +198,7 @@ pub(crate) async fn render_overview(
                     let default = row.get::<Option<String>>(4)?;
                     let primary_key = row.get::<i64>(5)? != 0;
                     let mut column = if kind.is_empty() {
-                        name
+                        name.clone()
                     } else {
                         format!("{name} {kind}")
                     };
@@ -132,81 +211,50 @@ pub(crate) async fn render_overview(
                     if let Some(default) = default {
                         column.push_str(&format!(" default {default}"));
                     }
+                    names.push(name);
                     columns.push(column);
                 }
-                let all_columns = params.table.is_some();
-                let omitted = columns.len().saturating_sub(OVERVIEW_MAX_COLUMNS);
-                if !all_columns && omitted > 0 {
-                    columns.truncate(OVERVIEW_MAX_COLUMNS);
-                    columns.push(format!("… {omitted} more → ?table={table}"));
-                }
-
-                let mut count_rows = conn
-                    .query(&format!("SELECT COUNT(*) FROM {quoted}"), ())
-                    .await?;
-                let count = count_rows
-                    .next()
-                    .await?
-                    .expect("COUNT always returns one row")
-                    .get::<i64>(0)?;
-                rendered.push(format!("{table}({}) — {count} rows", columns.join(", ")));
-
-                let indexes = table_indexes(conn, table).await?;
-                if all_columns {
-                    for (name, sql) in indexes {
-                        rendered.push(format!("  {}", render_index(conn, &name, sql).await?));
-                    }
-                } else if !indexes.is_empty() {
-                    let noun = if indexes.len() == 1 {
-                        "index"
-                    } else {
-                        "indexes"
-                    };
-                    rendered.push(format!("  {} {noun} → ?table={table}", indexes.len()));
-                }
             }
-            if let Some(table) = &params.table {
-                if selected.is_empty() {
-                    rendered.push(format!("Table '{table}' not found"));
-                }
+            let omitted = columns.len().saturating_sub(OVERVIEW_MAX_COLUMNS);
+            if !detail && omitted > 0 {
+                columns.truncate(OVERVIEW_MAX_COLUMNS);
+                columns.push(format!("… {omitted} more → ?table={table}"));
             }
-            Ok(SchemaOverview {
-                body: if rendered.is_empty() {
-                    "(no user tables)".to_string()
+
+            // A declared column named `rowid` shadows the rowid, and its max
+            // would be a scan of an unindexed column; such a table goes
+            // unsized rather than scanned.
+            let size = if names.iter().any(|name| name.eq_ignore_ascii_case("rowid")) {
+                String::new()
+            } else {
+                let mut rows = conn.query(rowid_high_water_sql(&quoted), ()).await?;
+                let high_water = match rows.next().await? {
+                    Some(row) => row.get::<Option<i64>>(0)?,
+                    None => None,
+                };
+                match high_water {
+                    Some(rowid) => format!(" — max rowid {rowid}"),
+                    None => " — empty".to_string(),
+                }
+            };
+            let mut lines = vec![format!("{table}({}){size}", columns.join(", "))];
+
+            if detail {
+                for (name, sql) in indexes {
+                    lines.push(format!("  {}", render_index(conn, &name, sql).await?));
+                }
+            } else if !indexes.is_empty() {
+                let noun = if indexes.len() == 1 {
+                    "index"
                 } else {
-                    rendered.join("\n")
-                },
-                total_tables: if params.table.is_some() {
-                    selected.len()
-                } else {
-                    total_tables
-                },
-                shown_tables: selected.len(),
-            })
+                    "indexes"
+                };
+                lines.push(format!("  {} {noun} → ?table={table}", indexes.len()));
+            }
+            Ok(lines)
         })
     })
     .await
-}
-
-/// Every index on `table`, from the catalog itself, so no kind of index
-/// (non-unique, partial, expression) can be filtered out. Constraint
-/// autoindexes have no SQL text.
-async fn table_indexes(
-    conn: &cairn_db::turso::Connection,
-    table: &str,
-) -> DbResult<Vec<(String, Option<String>)>> {
-    let mut rows = conn
-        .query(
-            "SELECT name, sql FROM sqlite_schema \
-             WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
-            cairn_db::turso::params![table],
-        )
-        .await?;
-    let mut indexes = Vec::new();
-    while let Some(row) = rows.next().await? {
-        indexes.push((row.get::<String>(0)?, row.get::<Option<String>>(1)?));
-    }
-    Ok(indexes)
 }
 
 /// One index as `[unique] [partial] index NAME (TERMS) [WHERE PREDICATE]`.
@@ -392,7 +440,7 @@ mod tests {
         .unwrap();
         assert_eq!((listing.shown_tables, listing.total_tables), (1, 2));
         assert!(listing.body.contains("… 13 more → ?table=wide"));
-        assert!(listing.body.contains("— 1 rows"));
+        assert!(listing.body.contains("— max rowid 1"));
 
         let detail = render_overview(
             &db,
@@ -434,10 +482,114 @@ mod tests {
     }
 
     async fn catalog_indexes(db: &LocalDb, table: &str) -> Vec<(String, Option<String>)> {
-        let table = table.to_string();
-        db.read(move |conn| Box::pin(async move { super::table_indexes(conn, &table).await }))
+        db.query_all(
+            "SELECT name, sql FROM sqlite_schema \
+             WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+            cairn_db::turso::params![table.to_string()],
+            |row| Ok((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn overview_sizes_tables_by_rowid_high_water_one_read_per_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("sizes.db")).await.unwrap();
+        db.execute_batch(
+            "CREATE TABLE sparse(id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO sparse(id, value) VALUES (1, 'a'), (1000, 'b');
+             CREATE TABLE bare(value TEXT);
+             INSERT INTO bare(value) VALUES ('x'), ('y'), ('z');
+             CREATE TABLE vacant(value TEXT);
+             CREATE TABLE shadowed(rowid TEXT, value TEXT);
+             INSERT INTO shadowed(rowid, value) VALUES ('r', 'v');",
+        )
+        .await
+        .unwrap();
+
+        let before = db.read_transaction_count();
+        let listing = render_overview(
+            &db,
+            &OverviewParams {
+                table: None,
+                offset: 0,
+                limit: OVERVIEW_DEFAULT_TABLES,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.read_transaction_count() - before,
+            listing.shown_tables,
+            "each table is described in exactly one read of its own; the catalog in none"
+        );
+        let lines: Vec<&str> = listing.body.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "bare(value TEXT) — max rowid 3",
+                "shadowed(rowid TEXT, value TEXT)",
+                "sparse(id INTEGER pk, value TEXT) — max rowid 1000",
+                "vacant(value TEXT) — empty",
+            ],
+            "sizes are rowid high-waters, never counts: sparse holds 2 rows"
+        );
+
+        let before = db.read_transaction_count();
+        let detail = render_overview(&db, &detail("sparse")).await.unwrap();
+        assert_eq!(db.read_transaction_count() - before, 1);
+        assert_eq!(
+            detail.body,
+            "sparse(id INTEGER pk, value TEXT) — max rowid 1000"
+        );
+    }
+
+    /// `(addr, opcode, p2)` of each instruction in `sql`'s compiled program.
+    async fn program(db: &LocalDb, sql: &str) -> Vec<(i64, String, i64)> {
+        db.query_all(format!("EXPLAIN {sql}"), (), |row| {
+            Ok((
+                row.get::<i64>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(3)?,
+            ))
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Whether a program loops over rows: some `Next`/`Prev` back-edge whose
+    /// body has no unconditional `Goto` past it. The min/max fast path keeps a
+    /// back-edge but leaves the loop that way after the first row.
+    fn iterates_rows(program: &[(i64, String, i64)]) -> bool {
+        program.iter().any(|(edge, op, start)| {
+            (op == "Next" || op == "Prev")
+                && !program.iter().any(|(at, inner, to)| {
+                    inner == "Goto" && (*start..*edge).contains(at) && to > edge
+                })
+        })
+    }
+
+    /// The sizing statement compiles, on the pinned engine, to a jump to the
+    /// table's last row that reads one row. The unindexed `max(value)` control
+    /// proves the loop check sees a scan when there is one.
+    #[tokio::test]
+    async fn rowid_high_water_is_a_seek_not_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(dir.path().join("seek.db")).await.unwrap();
+        db.execute_batch("CREATE TABLE big(id INTEGER PRIMARY KEY, value TEXT);")
             .await
-            .unwrap()
+            .unwrap();
+
+        let seek = program(&db, &rowid_high_water_sql(&quote_identifier("big"))).await;
+        assert!(seek.iter().any(|(_, op, _)| op == "Last"), "{seek:?}");
+        assert!(
+            !iterates_rows(&seek),
+            "max(rowid) must read one row: {seek:?}"
+        );
+
+        let scan = program(&db, "SELECT max(value) FROM big").await;
+        assert!(iterates_rows(&scan), "control must iterate rows: {scan:?}");
     }
 
     #[tokio::test]
@@ -486,8 +638,8 @@ mod tests {
             .unwrap()
             .body;
         for expected in [
-            "\n  partial index idx_agent_waits_pending_deadline (deadline_ms) WHERE state = 'pending' AND deadline_ms IS NOT NULL",
-            "\n  partial index idx_agent_waits_pending_terminal (state) WHERE state = 'pending' AND deadline_ms IS NULL",
+            "\n  partial index idx_agent_waits_mcp_due (created_at, due_at_ms, next_poll_at_ms, deadline_ms, pending_prompt_id, id) WHERE state = 'pending' AND kind = 'mcp_continuation'",
+            "\n  partial index idx_agent_waits_resolving (resolving_at, created_at) WHERE state = 'resolving'",
             "\n  unique partial index idx_agent_waits_one_pending_call (job_id, tool_use_id) WHERE state IN ('pending', 'resolving')",
         ] {
             assert!(waits.contains(expected), "missing {expected:?} in:\n{waits}");
