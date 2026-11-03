@@ -3853,9 +3853,8 @@ async fn execute_reconcile_claim(
                     // it ran on. A replay that altered the patch (a conflict, a
                     // structural merge, an edit inside a hunk's context) leaves
                     // the wave answering a question nobody can ask any more:
-                    // cancelling it hands the slot to
-                    // `finish_superseded_turn_end_checks`, which arms one for
-                    // the new tree. A sibling with no wave in flight is
+                    // cancelling it releases the slot, and the release arms
+                    // one for the new tree (`arm_turn_end_successor`). A sibling with no wave in flight is
                     // untouched, and pays for no comparison: dormant branches
                     // are armed lazily, when someone waits on their checks.
                     if orch.turn_end_checks_in_flight(&sibling.id) {

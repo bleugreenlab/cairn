@@ -39,11 +39,13 @@ pub(crate) use finalize::{
     interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,
     release_and_stop_process,
 };
+pub(crate) use review_push::{
+    arm_turn_end_successor, arm_turn_end_successor_now, spawn_review_wave_unless_in_flight,
+};
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
-pub(crate) use review_push::{spawn_checks_settled_edge, spawn_turn_end_checks};
 #[cfg(test)]
 pub(crate) use stop::USER_STOP_TOOL_RESULT;
 pub(crate) use stop::{

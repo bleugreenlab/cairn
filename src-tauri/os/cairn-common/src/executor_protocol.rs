@@ -6598,6 +6598,15 @@ pub struct LearnedResourceEstimate {
 /// array. `ProcessBatch.files` keeps its shape, and an older executor already
 /// materializes every entry under the variable it names, whatever the name, so
 /// it hands the lint script its baseline exactly as a newer one does.
+///
+/// cairn/4690 does not move the number. The runner now names a
+/// `runner_context_id` on a turn-end review wave's process batch, which it
+/// previously left out when no agent run was attached, so the executor's
+/// existing `ProcessItemStarted` and `ProcessItemCompleted` callbacks reach the
+/// wave's status board. Every executor already sends those callbacks, and its
+/// process output events, to any batch that names a context, as it does for a
+/// write-check batch. No frame, variant or field changes, and a runner talking
+/// to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 162;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -384,6 +384,11 @@ pub struct CheckStatusEntry {
     /// True when this terminal verdict was reused rather than run for this commit.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) cached: bool,
+    /// When this entry last changed state, in Unix milliseconds, so a running
+    /// lane can say how long it has been running. `None` until the first
+    /// transition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) since_unix_ms: Option<u64>,
 }
 
 #[cfg(test)]

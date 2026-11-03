@@ -80,14 +80,21 @@ pub enum RowKey {
     Returned,
     /// The table has no single-column primary key, so the row has no URI.
     Unaddressed,
+    /// A collection patch or delete scoped by `where=`: any number of rows,
+    /// none named, and matching none is an answer (a count of 0), not a
+    /// refusal.
+    Matched,
 }
 
-/// The one row a structured statement touches.
+/// The row (or, for [`RowKey::Matched`], the rows) a structured statement
+/// touches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowTarget {
     pub table: String,
     pub action: RowAction,
     pub key: RowKey,
+    /// The row's index in a bulk append's `rows`, which a failure names.
+    pub position: Option<usize>,
 }
 
 /// One statement of a thread-database write, with its bound values. A
@@ -134,9 +141,14 @@ pub struct RowChange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOutcome {
     pub changed: u64,
-    /// Structured writes: one entry naming the row. SQL writes: one entry per
-    /// distinct (table, action), without a row.
+    /// What the write's `db-change` events announced. A single-row structured
+    /// write: one entry naming the row. Several structured rows of one table
+    /// and action (a bulk append), a `where=`-scoped write, and SQL: one entry
+    /// per distinct (table, action), without a row.
     pub changes: Vec<RowChange>,
+    /// Each structured statement's row URI, in statement order; `None` for a
+    /// row without one (a keyless table's, or a `where=`-scoped write's).
+    pub rows: Vec<Option<String>>,
 }
 
 /// The `table` every thread-database `db-change` carries. It is a pseudo-table
@@ -178,7 +190,18 @@ pub async fn apply_write(
     .map_err(sanitize_error)?;
 
     let root = scope.db_root();
+    // Rows of one (table, action) written by several structured statements (a
+    // bulk append) announce once, for the table: a page re-reads a table, not
+    // a row, and a thousand events would each re-read it.
+    let structured_rows = |table: &str, action: RowAction| {
+        statements
+            .iter()
+            .filter_map(|statement| statement.row.as_ref())
+            .filter(|target| target.table == table && target.action == action)
+            .count()
+    };
     let mut changes: Vec<RowChange> = Vec::new();
+    let mut rows: Vec<Option<String>> = Vec::new();
     for (statement, result) in statements.iter().zip(&executed.per_statement) {
         let change = match &statement.row {
             Some(target) => {
@@ -189,9 +212,13 @@ pub async fn apply_write(
                 };
                 let uri =
                     key.map(|key| cairn_common::uri::build_db_row_uri(&root, &target.table, &key));
-                // A structured update or delete that matched nothing changed
-                // nothing; it is refused rather than reported or announced.
-                if result.changed == 0 && target.action != RowAction::Insert {
+                // A structured update or delete of one named row that matched
+                // nothing changed nothing; it is refused rather than reported
+                // or announced. A `where=`-scoped one reports its count.
+                if result.changed == 0
+                    && target.action != RowAction::Insert
+                    && target.key != RowKey::Matched
+                {
                     return Err(format!(
                         "No row at {}",
                         uri.unwrap_or_else(|| cairn_common::uri::build_db_table_uri(
@@ -200,10 +227,11 @@ pub async fn apply_write(
                         ))
                     ));
                 }
+                rows.push(uri.clone());
                 RowChange {
                     table: Some(target.table.clone()),
                     action: target.action.as_str(),
-                    uri,
+                    uri: uri.filter(|_| structured_rows(&target.table, target.action) == 1),
                 }
             }
             None => match sql_policy::statement_target(&statement.sql) {
@@ -241,14 +269,12 @@ pub async fn apply_write(
             }),
         );
     }
-    let row_uris: Vec<String> = changes
-        .iter()
-        .filter_map(|change| change.uri.clone())
-        .collect();
+    let row_uris: Vec<String> = rows.iter().flatten().cloned().collect();
     crate::orchestrator::wakes::conditions::notify_thread_db_written(&scope.thread_id, &row_uris);
     Ok(WriteOutcome {
         changed: executed.changed,
         changes,
+        rows,
     })
 }
 
@@ -320,8 +346,12 @@ async fn execute_statements(
         per_statement: Vec::with_capacity(statements.len()),
     };
     for (index, statement) in statements.into_iter().enumerate() {
+        let position = statement.row.as_ref().and_then(|target| target.position);
         let failed = |error: cairn_db::turso::Error| {
-            crate::storage::DbError::Row(format!("statement {} failed: {error}", index + 1))
+            crate::storage::DbError::Row(match position {
+                Some(position) => format!("rows[{position}] failed: {error}"),
+                None => format!("statement {} failed: {error}", index + 1),
+            })
         };
         let returning = statement
             .row

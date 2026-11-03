@@ -215,8 +215,104 @@ fn job_ships_a_pr(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 /// Four guards skip it: a job whose work never ships a PR (the topology gate
 /// below), a trailing memory-review turn (not a work turn), a job still mid-work
 /// rather than at a real turn end (CAIRN-3154, see the gate below), and a run
-/// already in flight for the job (single-flight).
+/// already in flight for the job (single-flight). A turn end refused by
+/// single-flight is not dropped: the running wave owes the job one successor,
+/// armed when it releases if the head has moved past the commit it checked.
 pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
+    arm_review_wave(orch, job_id, WaveTrigger::TurnEnd);
+}
+
+/// Arm a review wave for a job from an edge that is NOT one of its turn ends:
+/// someone waiting on its checks, the boot re-arm, the bounded infrastructure
+/// re-arm, or a released wave's owed successor. Returns whether one was asked
+/// for.
+///
+/// A wave already in flight is left alone, and owes nothing for it. Its own
+/// release arms whatever successor its job is owed, so these edges never arm a
+/// wave for a job whose slot is held.
+pub(crate) fn spawn_review_wave_unless_in_flight(orch: &Orchestrator, job_id: &str) -> bool {
+    if orch.turn_end_checks_in_flight(job_id) {
+        log::debug!(
+            "review wave for job {}: one is already in flight; its release arms any successor",
+            &job_id[..job_id.len().min(8)]
+        );
+        return false;
+    }
+    arm_review_wave(orch, job_id, WaveTrigger::Recovery);
+    true
+}
+
+/// Which edge asked for a wave, which decides what a refused claim means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaveTrigger {
+    /// A turn end. Refused by single-flight, it leaves the holder owing one
+    /// successor.
+    TurnEnd,
+    /// Any other edge. Refused by single-flight, it owes nothing.
+    Recovery,
+}
+
+/// Arm a released wave's successor immediately. The ordinary gates still apply.
+pub(crate) fn arm_turn_end_successor_now(orch: &Orchestrator, job_id: &str) {
+    log::info!(
+        "turn-end checks for job {}: arming the successor a released wave owed",
+        &job_id[..job_id.len().min(8)]
+    );
+    spawn_review_wave_unless_in_flight(orch, job_id);
+}
+
+/// Arm whatever successor a released wave owes its job.
+///
+/// The one place a successor is armed, so a wave cancelled because its tree went
+/// stale and a wave that refused a later turn end are replaced by the same rule.
+/// An owed successor is armed only if the job's head moved past the commit the
+/// wave sealed: a turn end that changed nothing was answered by the wave that
+/// refused it. A head that cannot be resolved arms one, because skipping it
+/// could drop the review gate on the head the agent actually ended on.
+///
+/// Every ordinary gate still applies inside the arm: a job that ships no PR, a
+/// memory-review turn, a resolved issue, and a live turn all arm nothing. A live
+/// turn's own end arms its wave. A dormant PR owner has no future turn-end edge,
+/// so a wave it had in flight is replaced here; a dormant owner with NO wave in
+/// flight is armed when someone waits on its checks
+/// (`checks_settlement::arm_wave_for_waiter`).
+pub(crate) async fn arm_turn_end_successor(
+    orch: &Orchestrator,
+    job_id: &str,
+    successor: crate::orchestrator::TurnEndSuccessor,
+) {
+    use crate::orchestrator::TurnEndSuccessor;
+    match successor {
+        TurnEndSuccessor::None => {}
+        TurnEndSuccessor::Arm => arm_turn_end_successor_now(orch, job_id),
+        TurnEndSuccessor::IfHeadMoved { sealed } => {
+            match crate::execution::cache::resolve_job_logical_head(orch, job_id).await {
+                Ok(head) if head == sealed => log::debug!(
+                    "turn-end checks for job {}: the owed turn end left the head at {}, which the \
+                     released wave checked; no successor",
+                    &job_id[..job_id.len().min(8)],
+                    &sealed[..sealed.len().min(12)]
+                ),
+                Ok(_) => arm_turn_end_successor_now(orch, job_id),
+                Err(error) => {
+                    log::warn!(
+                        "turn-end checks for job {}: head unresolved after an owed turn end \
+                         ({error:?}); arming the successor rather than risk dropping its review",
+                        &job_id[..job_id.len().min(8)]
+                    );
+                    arm_turn_end_successor_now(orch, job_id);
+                }
+            }
+        }
+    }
+}
+
+/// The reason an attempt refused by single-flight records when it leaves the
+/// holder owing a successor.
+pub(crate) const OWED_SUCCESSOR_REASON: &str =
+    "a wave for an earlier head is running; one successor is owed";
+
+fn arm_review_wave(orch: &Orchestrator, job_id: &str, trigger: WaveTrigger) {
     let short = &job_id[..job_id.len().min(8)];
     let attempt_id = match crate::execution::checks_turn_end::request_turn_end_attempt(orch, job_id)
     {
@@ -304,12 +400,33 @@ pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
         log::debug!("turn-end checks for job {short}: skipped, {withdrawal}");
         return;
     }
-    // Claim the single-flight slot; a concurrent run for this job means skip. The
-    // returned handle is the lever a later merge/close pulls to quit this suite
-    // mid-flight (CAIRN-2648).
-    let cancel = match orch.try_begin_turn_end_checks(job_id) {
-        Some(cancel) => cancel,
-        None => {
+    // Claim the single-flight slot. The guard is the lever a later merge/close
+    // pulls to quit this suite mid-flight (CAIRN-2648), and the only thing that
+    // releases the slot. A turn end refused here leaves the holder owing one
+    // successor; the loop covers the holder releasing between the refusal and
+    // the debt being recorded, so a refused turn end is never silently lost.
+    let mut claim = orch.try_begin_turn_end_checks(job_id, &attempt_id);
+    for _ in 0..2 {
+        if claim.is_ok() {
+            break;
+        }
+        match trigger {
+            WaveTrigger::TurnEnd if orch.owe_turn_end_successor(job_id) => {
+                terminal("superseded", OWED_SUCCESSOR_REASON);
+                log::debug!(
+                    "turn-end checks for job {short}: a run is already in flight; it owes one successor"
+                );
+                return;
+            }
+            WaveTrigger::TurnEnd => {
+                claim = orch.try_begin_turn_end_checks(job_id, &attempt_id);
+            }
+            WaveTrigger::Recovery => break,
+        }
+    }
+    let slot = match claim {
+        Ok(slot) => slot,
+        Err(_) => {
             terminal(
                 "superseded",
                 "another turn-end check attempt already owns the slot",
@@ -325,73 +442,42 @@ pub(crate) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
         "claimed",
         None,
     ) {
-        log::error!("turn-end checks for job {short}: failed to persist claim; retaining single-flight ownership: {error}");
+        // Dropping the guard records the attempt failed and frees the slot.
+        log::error!("turn-end checks for job {short}: failed to persist claim: {error}");
+        drop(slot);
         return;
     }
     let orch_clone = orch.clone();
     let job_id_owned = job_id.to_string();
-    let cancel_for_rearm = cancel.clone();
-    let orch_for_rearm = orch.clone();
-    let job_id_for_rearm = job_id.to_string();
-    let orch_for_release = orch.clone();
-    let job_id_for_release = job_id.to_string();
+    let orch_for_failure = orch.clone();
+    let job_id_for_failure = job_id.to_string();
     let attempt_for_failure = attempt_id.clone();
     // On the orchestrator's runtime, not one built for this wave: the wave opens
     // shared executions and releases check refs whose sweeps must outlive it,
     // and a cancelled wave returning early would otherwise drop them with it.
-    // Cancellation itself is unchanged; `cancel` stops this wave's own lanes.
+    // Cancellation itself is unchanged; the slot's cancel handle stops this
+    // wave's own lanes.
     orch.spawn_detached_or(
-        async move {
-            crate::execution::checks_turn_end::run_turn_end_checks(
-                orch_clone,
-                job_id_owned,
-                attempt_id.clone(),
-                cancel,
-            )
-            .await;
-            finish_superseded_turn_end_checks(
-                &orch_for_rearm,
-                &job_id_for_rearm,
-                cancel_for_rearm.is_cancelled(),
-            );
-        },
+        crate::execution::checks_turn_end::run_turn_end_checks(orch_clone, job_id_owned, slot),
         move || {
-            // No runtime could be had, so the future above never reached
-            // `run_turn_end_checks` (which releases the single-flight slot itself
-            // on every path). This is the ONLY path where the slot would leak, so
-            // release it here to let a later turn-end retry.
-            match crate::execution::checks_turn_end::transition_turn_end_attempt(
-                &orch_for_release, &job_id_for_release, &attempt_for_failure, "failed",
+            // No runtime could be had, so the wave never ran. Record the specific
+            // reason; the guard inside the dropped future then releases the slot
+            // without overwriting it.
+            if let Err(error) = crate::execution::checks_turn_end::transition_turn_end_attempt(
+                &orch_for_failure,
+                &job_id_for_failure,
+                &attempt_for_failure,
+                "failed",
                 Some("detached runtime construction failed"),
             ) {
-                Ok(()) => orch_for_release.end_turn_end_checks(&job_id_for_release),
-                Err(error) => log::error!(
-                    "turn-end checks for job {}: detached-runtime failure was not persisted; retaining single-flight ownership: {}",
-                    &job_id_for_release[..job_id_for_release.len().min(8)], error
-                ),
+                log::error!(
+                    "turn-end checks for job {}: detached-runtime failure was not persisted: {}",
+                    &job_id_for_failure[..job_id_for_failure.len().min(8)],
+                    error
+                );
             }
         },
     );
-}
-
-/// Replace a review wave that was cancelled after its tree became stale.
-///
-/// The old runner releases its single-flight slot before returning, so this is
-/// the first safe point at which a successor can claim it. The ordinary spawn
-/// gates remain authoritative: issue resolution and job cancellation stop the
-/// replacement, while a live turn suppresses it until that turn's own end.
-/// A dormant PR owner has no future turn-end edge, so a wave it had in flight
-/// is replaced here. A dormant owner with NO wave in flight is not armed by a
-/// base advance at all; its wave is armed when someone waits on its checks
-/// (`checks_settlement::arm_wave_for_waiter`).
-pub(super) fn finish_superseded_turn_end_checks(
-    orch: &Orchestrator,
-    job_id: &str,
-    previous_wave_was_cancelled: bool,
-) {
-    if previous_wave_was_cancelled {
-        spawn_turn_end_checks(orch, job_id);
-    }
 }
 
 /// Why this job's turn-end wave must not be armed, if it must not be.
@@ -710,8 +796,10 @@ pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) -> usize {
             );
         }
     }
+    // A recovery edge: it never marks a held slot owed, even if a wave claims
+    // one between the filter above and here.
     for job_id in &waves {
-        spawn_turn_end_checks(orch, job_id);
+        spawn_review_wave_unless_in_flight(orch, job_id);
     }
     log::info!(
         "review-checks startup re-arm: re-derived the review wake for {} settled job(s); \
@@ -793,8 +881,7 @@ pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
         );
         return false;
     }
-    spawn_turn_end_checks(orch, &candidate.job_id);
-    true
+    spawn_review_wave_unless_in_flight(orch, &candidate.job_id)
 }
 
 /// How long a dormant lane's newest row must have stood before the maintenance

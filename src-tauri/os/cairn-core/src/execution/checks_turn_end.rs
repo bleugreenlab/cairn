@@ -90,9 +90,9 @@ use sha2::{Digest, Sha256};
 
 use crate::execution::checks::{
     applicable_turn_end_checks, check_input_hashes, load_checks_contract_at_commit,
-    resolve_check_timeout_ms, run_planned_checks_at_commit_with_coordinates,
-    submit_planned_check_batch, CheckExecMode, CheckFailureKind, CheckOutcome,
-    PlannedCheckBatchItem, PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    resolve_check_timeout_ms, run_planned_checks_with_board, submit_planned_check_batch,
+    CheckExecMode, CheckFailureKind, CheckOutcome, CheckStatusBoard, PlannedCheckBatchItem,
+    PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
@@ -101,7 +101,9 @@ use crate::execution::selection::CheckPlan;
 use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::CellPriority;
 use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries};
-use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel, TurnEndCancelReason};
+use crate::orchestrator::{
+    attention_push, Orchestrator, TurnEndCancel, TurnEndCancelReason, TurnEndSlot, TurnEndSuccessor,
+};
 use crate::storage::{LocalDb, RowExt};
 
 /// Internal batch input carrying newline-delimited changed paths to the executor,
@@ -114,6 +116,10 @@ pub(crate) struct TurnEndAttempt {
     pub id: String,
     pub state: String,
     pub reason: Option<String>,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds of the last state change.
+    pub updated_at: i64,
 }
 
 /// The immutable facts a review wave planned with: the head it pinned, the fork
@@ -303,6 +309,10 @@ pub(crate) fn transition_turn_end_attempt(
     let id = attempt_id.to_string();
     let state = state.to_string();
     let reason = reason.map(str::to_string);
+    #[cfg(test)]
+    if transition_faults::take(&job, &state) {
+        return Err(format!("injected {state} write failure for attempt {id}"));
+    }
     crate::storage::run_db_blocking(move || async move {
         let db = crate::execution::routing::owning_db_for_job(&dbs, &job)
             .await
@@ -324,14 +334,82 @@ pub(crate) fn transition_turn_end_attempt(
     })
 }
 
+/// Record `attempt_id` as `failed` for `reason`, but only while it is still
+/// moving. The guard of a wave that ended without an outcome calls this, and
+/// must never overwrite a terminal state somebody else already wrote, such as
+/// the spawn-failure path's own more specific reason. A row that is already
+/// terminal, or missing, is not an error.
+pub(crate) fn abandon_turn_end_attempt(
+    orch: &Orchestrator,
+    job_id: &str,
+    attempt_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if transition_faults::take(job_id, "abandoned") {
+        return Err(format!(
+            "injected abandoned-attempt write failure for attempt {attempt_id}"
+        ));
+    }
+    let dbs = orch.db.clone();
+    let job = job_id.to_string();
+    let id = attempt_id.to_string();
+    let reason = reason.to_string();
+    crate::storage::run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.execute(
+            "UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000
+              WHERE id=?2 AND job_id=?3
+                AND state IN ('requested','claimed','runtime_started','deferred','submitted')",
+            (reason.as_str(), id.as_str(), job.as_str()),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// A test-only fault seam on the attempt-state writes. Keyed by job id, because
+/// the attempt id a turn end mints is not known to the test in advance; a test
+/// that injects a fault gives its job an id no concurrently running test uses.
+/// `abandoned` names the guard's conditional write.
+#[cfg(test)]
+pub(crate) mod transition_faults {
+    use std::sync::Mutex;
+
+    static FAULTS: Mutex<Vec<(String, String, usize)>> = Mutex::new(Vec::new());
+
+    /// Fail the next `times` writes of `state` for `job_id`'s attempts.
+    pub(crate) fn fail(job_id: &str, state: &str, times: usize) {
+        FAULTS
+            .lock()
+            .unwrap()
+            .push((job_id.to_string(), state.to_string(), times));
+    }
+
+    pub(super) fn take(job_id: &str, state: &str) -> bool {
+        let mut faults = FAULTS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(fault) = faults
+            .iter_mut()
+            .find(|(job, s, left)| job == job_id && s == state && *left > 0)
+        else {
+            return false;
+        };
+        fault.2 -= 1;
+        true
+    }
+}
+
 pub(crate) async fn current_turn_end_attempt(
     db: &LocalDb,
     job_id: &str,
 ) -> Result<Option<TurnEndAttempt>, String> {
     db.read(|conn| { let job=job_id.to_string(); Box::pin(async move {
-        let mut rows=conn.query("SELECT a.id,a.state,a.reason FROM jobs j LEFT JOIN turn_end_check_attempts a ON a.id=j.turn_end_check_attempt_id WHERE j.id=?1",(job.as_str(),)).await?;
+        let mut rows=conn.query("SELECT a.id,a.state,a.reason,a.created_at,a.updated_at FROM jobs j LEFT JOIN turn_end_check_attempts a ON a.id=j.turn_end_check_attempt_id WHERE j.id=?1",(job.as_str(),)).await?;
         let Some(row)=rows.next().await? else{return Ok(None)}; let (Some(id),Some(state))=(row.opt_text(0)?,row.opt_text(1)?) else{return Ok(None)};
-        Ok(Some(TurnEndAttempt{id,state,reason:row.opt_text(2)?}))
+        Ok(Some(TurnEndAttempt{id,state,reason:row.opt_text(2)?,created_at:row.opt_i64(3)?.unwrap_or_default(),updated_at:row.opt_i64(4)?.unwrap_or_default()}))
     })}).await.map_err(|e|e.to_string())
 }
 
@@ -354,40 +432,66 @@ pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) 
     }
 }
 
-/// Background entry point: run the affected turn-end checks for a job, then
-/// release the single-flight slot. The caller ([`spawn_turn_end_checks`] in
-/// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
-/// function is responsible for releasing it on every path.
-pub(crate) async fn run_turn_end_checks(
-    orch: Orchestrator,
-    job_id: String,
-    attempt_id: String,
-    cancel: TurnEndCancel,
-) {
+/// Background entry point: run the affected turn-end checks for a job under the
+/// single-flight slot the caller ([`spawn_turn_end_checks`] in lifecycle)
+/// claimed, then finish the slot with the wave's terminal state. Every path out
+/// of here, including a panic, releases the slot through the guard.
+pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, slot: TurnEndSlot) {
+    let attempt_id = slot.attempt_id().to_string();
     let result =
         match transition_turn_end_attempt(&orch, &job_id, &attempt_id, "runtime_started", None) {
-            Ok(()) => run_turn_end_checks_inner(&orch, &job_id, &attempt_id, &cancel).await,
+            Ok(()) => run_turn_end_checks_inner(&orch, &job_id, &attempt_id, slot.cancel()).await,
             Err(error) => Err(error),
         };
-    let terminal = match result {
-        Ok(disposition) => {
-            let (state, reason) = disposition.terminal();
-            transition_turn_end_attempt(&orch, &job_id, &attempt_id, state, Some(&reason))
-        }
+    let (state, reason) = match result {
+        Ok(disposition) => disposition.terminal(),
         Err(error) => {
             log::warn!("turn-end checks for job {}: {}", short_id(&job_id), error);
-            transition_turn_end_attempt(&orch, &job_id, &attempt_id, "failed", Some(&error))
+            ("failed", error)
         }
     };
-    if let Err(error) = terminal {
-        log::error!("turn-end checks for job {}: terminal persistence failed; retaining single-flight ownership: {}",short_id(&job_id),error);
-        return;
+    slot.finish(state, &reason).await;
+}
+
+/// The status board a review wave narrates its members on.
+///
+/// Every transition both advances the node's check-status generation, so the
+/// next read recomputes, and announces a `check_result_cache` change, which is
+/// what a live view (the desktop checks panel) refetches on. A view does not
+/// poll while no lane reads as running, so without the announcement an open
+/// panel would keep the members it saw queued at submission for the whole
+/// wave. A member makes about two transitions, so the rate is trivial.
+pub(crate) fn review_wave_board(
+    orch: &Orchestrator,
+    job_id: &str,
+    plans: &[(CheckPlan, String)],
+) -> CheckStatusBoard {
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    CheckStatusBoard::for_review_wave(plans, move || {
+        orch.invalidate_node_check_status(&job_id, "turn-end-wave-progress");
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "check_result_cache", "action": "update"}),
+        );
+    })
+}
+
+/// What follows a released slot: the successor the wave owes, then the review
+/// readiness and checks-settled edges that a finished wave feeds.
+///
+/// The successor is armed first, so a waiter the settled edge wakes sees the
+/// successor's wave in flight rather than a node with nothing owed.
+pub(crate) async fn settle_released_turn_end_slot(
+    orch: &Orchestrator,
+    job_id: &str,
+    successor: TurnEndSuccessor,
+) {
+    crate::orchestrator::lifecycle::arm_turn_end_successor(orch, job_id, successor).await;
+    if let Some(issue_id) = issue_id_for_job(&orch.db.local, job_id).await {
+        crate::orchestrator::lifecycle::evaluate_review_readiness(orch, &issue_id).await;
     }
-    orch.end_turn_end_checks(&job_id);
-    if let Some(issue_id) = issue_id_for_job(&orch.db.local, &job_id).await {
-        crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id).await;
-    }
-    crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
+    crate::orchestrator::wakes::route_checks_settled_edge(orch, job_id).await;
 }
 
 /// What delivering one completed wave's outcomes decided: the identity it was
@@ -1208,7 +1312,7 @@ async fn run_turn_end_checks_inner(
         unsupported,
     });
     record_wave_plan(&owning_db, job_id, attempt_id, &plan).await;
-    cancel.set_runtime_status(plan);
+    cancel.set_runtime_status(attempt_id, plan);
 
     // 7. Loop-break gate: drop any plan whose INPUT hash (the content of just
     // that check's impact-matched files) is infrastructure-suppressed; every
@@ -1380,11 +1484,19 @@ async fn run_turn_end_checks_inner(
     );
 
     // 10. Prepare the host-readable, job-scoped log DIRECTORY (cleared for a fresh
-    // run) so the PR-node / `/checks` render can tail each check's OWN log live
-    // while the suite runs. One file per check keeps a running check's preview
-    // scoped to that check instead of the whole suite's interleaved output.
+    // run). Each check's output lands in its OWN file when the batch returns, so
+    // a lane's tail is scoped to that check instead of the whole suite's
+    // interleaved output.
     let log_dir = turn_end_log_dir(orch, job_id);
     prepare_log_dir(&log_dir);
+
+    // The wave's status board, published for the `/checks` projection. The
+    // members run in order in one cell, and the executor reports each one's
+    // start and finish against it by plan index, so the projection can say which
+    // member is executing, for how long, and which wait behind it. The engine
+    // records the verdicts onto the same board when the batch returns.
+    let board = review_wave_board(orch, job_id, &to_run);
+    cancel.set_wave_board(board.clone());
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
@@ -1472,8 +1584,6 @@ async fn run_turn_end_checks_inner(
             .iter()
             .map(|&index| {
                 let (plan, input_hash) = &to_run[index];
-                let log_path = turn_end_log_path(orch, job_id, &plan.name);
-                let _ = std::fs::write(log_path, b"");
                 PlannedCheckBatchItem {
                     index,
                     name: plan.name.clone(),
@@ -1523,7 +1633,7 @@ async fn run_turn_end_checks_inner(
             items,
             run_context: None,
             mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
-            status_board: None,
+            status_board: Some(board.clone()),
             // A turn-end wave answers for one node's own tip, so no other wave
             // is asking its question and there is nothing for it to displace.
             purpose: None,
@@ -1544,6 +1654,7 @@ async fn run_turn_end_checks_inner(
             return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
         }
         transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
+        cancel.mark_wave_submitted();
         let outcome = tokio::select! {
             biased;
             reason = cancel.cancelled() => {
@@ -1594,7 +1705,7 @@ async fn run_turn_end_checks_inner(
             )
         })
         .collect();
-    let outcomes = run_planned_checks_at_commit_with_coordinates(
+    let outcomes = run_planned_checks_with_board(
         db.clone(),
         &coords.project_id,
         crate::execution::checks::CheckRunCommit {
@@ -1609,6 +1720,9 @@ async fn run_turn_end_checks_inner(
         &checks_tool_id,
         CheckExecMode::Shared,
         Some(orch),
+        Some(board),
+        TURN_END_EFFECTIVE_ENV,
+        false,
         move |index, _command, _stream_id| {
             let batched_results = batched_results.clone();
             async move {
@@ -1960,17 +2074,108 @@ pub(crate) async fn render_turn_end_checks_section(
         return Some(format_retired_checks_section(&retired, statuses.as_deref()));
     }
     let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
-    format_checks_section(
+    let header = orch
+        .turn_end_check_runtime_status(job_id)
+        .map(|status| wave_header(&status, now_unix_ms()));
+    format_checks_section_under(
+        header.as_deref(),
         &statuses,
         crate::execution::checks_status::WaveCadence::of(orch, job_id),
     )
+}
+
+fn now_unix_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// The line above a running review wave's lanes: the head it checks, how long
+/// ago it reached the fleet, the attempt it answers for, and the machine that
+/// claimed it.
+fn wave_header(status: &crate::orchestrator::TurnEndCheckRuntimeStatus, now: u64) -> String {
+    use crate::execution::checks_status::human_duration;
+    let head = &status.plan.head[..status.plan.head.len().min(12)];
+    let attempt = &status.attempt_id;
+    match status.submitted_at_unix_ms {
+        Some(at) => {
+            let machine = status
+                .board
+                .as_ref()
+                .and_then(CheckStatusBoard::executor)
+                .map(|machine| format!(", on {machine}"))
+                .unwrap_or_default();
+            format!(
+                "Review wave for `{head}`: submitted {} ago (attempt `{attempt}`){machine}",
+                human_duration(now.saturating_sub(at))
+            )
+        }
+        None => format!(
+            "Review wave for `{head}`: planned {} ago, not yet submitted (attempt `{attempt}`)",
+            human_duration(now.saturating_sub(status.planned_at_unix_ms))
+        ),
+    }
+}
+
+/// Why a node's `/checks` has no section to show: what its latest turn-end
+/// attempt did and how long ago, the head-resolution error that kept the
+/// projection from reading anything, or that no review check applies.
+pub(crate) async fn turn_end_checks_absence(orch: &Orchestrator, job_id: &str) -> String {
+    use crate::execution::checks_status::human_duration;
+    if let Some(status) = orch.turn_end_check_runtime_status(job_id) {
+        if status.plan.applicable_names.is_empty() {
+            return "No review checks apply to this tree.".to_string();
+        }
+    }
+    if let Err(error) = crate::execution::cache::resolve_job_logical_head(orch, job_id).await {
+        return format!("No check results: the node's head could not be resolved ({error}).");
+    }
+    let db = match crate::execution::routing::owning_db_for_job(&orch.db, job_id).await {
+        Ok(db) => db,
+        Err(error) => {
+            return format!("No check results: the node's database is unreadable ({error}).")
+        }
+    };
+    match current_turn_end_attempt(&db, job_id).await {
+        Ok(Some(attempt)) => {
+            let age =
+                human_duration(now_unix_ms().saturating_sub(attempt.updated_at.max(0) as u64));
+            let reason = attempt
+                .reason
+                .as_deref()
+                .map(|reason| format!(", {reason}"))
+                .unwrap_or_default();
+            if orch.turn_end_checks_in_flight(job_id) {
+                format!(
+                    "A turn-end wave is in flight (attempt `{}`, {} {age} ago{reason}); its lanes \
+                     appear once it has planned.",
+                    attempt.id, attempt.state
+                )
+            } else {
+                format!(
+                    "Last turn-end attempt: {} {age} ago{reason}.",
+                    attempt.state
+                )
+            }
+        }
+        Ok(None) => "No turn-end wave has run for this node yet.".to_string(),
+        Err(error) => format!("No check results: the turn-end attempt is unreadable ({error})."),
+    }
 }
 
 /// Pure renderer for the `### Systematic checks` section. Returns `None` when the
 /// project has no configured checks. Split out so every status renders without a
 /// DB or worktree. `cadence` is the waves in flight, which is what separates a
 /// lane still to come (`pending`) from one nothing will produce (`absent`).
+#[cfg(test)]
 fn format_checks_section(
+    statuses: &[crate::execution::checks_status::NodeCheckStatus],
+    cadence: crate::execution::checks_status::WaveCadence,
+) -> Option<String> {
+    format_checks_section_under(None, statuses, cadence)
+}
+
+/// [`format_checks_section`] with a running wave's header line above its lanes.
+fn format_checks_section_under(
+    header: Option<&str>,
     statuses: &[crate::execution::checks_status::NodeCheckStatus],
     cadence: crate::execution::checks_status::WaveCadence,
 ) -> Option<String> {
@@ -1978,6 +2183,10 @@ fn format_checks_section(
         return None;
     }
     let mut out = String::from("\n### Systematic checks\n\n");
+    if let Some(header) = header {
+        out.push_str(header);
+        out.push_str("\n\n");
+    }
     push_check_lines(&mut out, statuses, Some(cadence));
     Some(out)
 }
@@ -2099,7 +2308,14 @@ fn push_check_lines(
                 }
             }
             NodeCheckState::Running => {
-                out.push_str(&format!("- {}: _running\u{2026}_\n", status.name));
+                match &status.progress {
+                    Some(progress) => out.push_str(&format!(
+                        "- {}: {}\n",
+                        status.name,
+                        progress.describe(now_unix_ms())
+                    )),
+                    None => out.push_str(&format!("- {}: _running\u{2026}_\n", status.name)),
+                }
                 if let Some(tail) = status
                     .output_tail
                     .as_deref()
@@ -2116,7 +2332,14 @@ fn push_check_lines(
                     "- {}: absent \u{2014} no lane has run it on this head\n",
                     status.name
                 )),
-                (Some(_), _) => out.push_str(&format!("- {}: pending\n", status.name)),
+                (Some(_), _) => match &status.progress {
+                    Some(progress) => out.push_str(&format!(
+                        "- {}: {}\n",
+                        status.name,
+                        progress.describe(now_unix_ms())
+                    )),
+                    None => out.push_str(&format!("- {}: pending\n", status.name)),
+                },
             },
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
@@ -2326,19 +2549,10 @@ fn prepare_log_dir(dir: &Path) {
     let _ = std::fs::create_dir_all(dir);
 }
 
-/// Whether a single check's per-check log file exists yet. The runner creates the
-/// file the instant a check starts — before any output — so existence marks the
-/// check as actively RUNNING even while it is still silent (e.g. `tsc --noEmit`
-/// before its first line). A queued check has no file after `prepare_log_dir`
-/// cleared the directory, so it reads as pending instead.
-pub(crate) fn turn_end_check_started(orch: &Orchestrator, job_id: &str, check_name: &str) -> bool {
-    turn_end_log_path(orch, job_id, check_name).exists()
-}
-
-/// Last `max_chars` chars of a single check's live log file, or `None` when it is
-/// missing/empty (that check exists but has not produced output yet). Existence is
-/// a SEPARATE signal ([`turn_end_check_started`]): a running-but-silent check has
-/// a file with no tail, so callers must not infer "queued" from a `None` tail.
+/// Last `max_chars` chars of a single check's log file, or `None` when it is
+/// missing or empty. Whether a lane is running is not read from here: the
+/// wave's status board says that, and a running lane's file is written only
+/// when its batch returns.
 pub(crate) fn read_turn_end_log_tail(
     orch: &Orchestrator,
     job_id: &str,
@@ -2805,6 +3019,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         }
     }
 
@@ -3310,6 +3525,111 @@ mod tests {
         .unwrap();
         assert!(s.contains("_running\u{2026}_"));
         assert!(!s.contains("```"));
+    }
+
+    /// cairn/4690. A running wave renders what it is actually doing: a header
+    /// with its head, age, attempt and machine, then one line per member, so
+    /// the member that is executing carries its age and the outstanding ones
+    /// are named rather than all reading `running`.
+    #[test]
+    fn section_renders_a_running_wave_one_member_at_a_time() {
+        use crate::execution::checks_status::LaneProgress;
+        let now = now_unix_ms();
+        let review = |name: &str, state: NodeCheckState, progress: LaneProgress| {
+            let mut lane = status(name, state);
+            lane.when = "review".to_string();
+            lane.progress = Some(progress);
+            lane
+        };
+        let lanes = [
+            review(
+                "lint",
+                NodeCheckState::Pending,
+                LaneProgress::Queued {
+                    behind: Some("rust-tests".into()),
+                },
+            ),
+            review(
+                "rust-lint",
+                NodeCheckState::Running,
+                LaneProgress::Finished {
+                    since_unix_ms: Some(now),
+                    annotation: Some(
+                        "finished in 4m 12s (exit 0); recorded when the wave ends".into(),
+                    ),
+                },
+            ),
+            review(
+                "rust-tests",
+                NodeCheckState::Running,
+                LaneProgress::Running {
+                    since_unix_ms: Some(now - (15 * 3_600 + 41 * 60) * 1_000),
+                },
+            ),
+        ];
+        let header =
+            "Review wave for `3f2a9c1`: submitted 16h 2m ago (attempt `a-1`), on bglab-mac";
+        let s =
+            format_checks_section_under(Some(header), &lanes, WaveCadence::reviewing_for_test())
+                .unwrap();
+        assert!(s.contains(header), "{s}");
+        assert!(s.contains("- rust-tests: running for 15h 41m"), "{s}");
+        assert!(s.contains("- lint: queued behind rust-tests"), "{s}");
+        assert!(
+            s.contains("- rust-lint: finished in 4m 12s (exit 0); recorded when the wave ends"),
+            "{s}"
+        );
+        assert!(s.find(header) < s.find("- lint"), "the header leads: {s}");
+    }
+
+    /// The board's states read as the projection's progress: one running member,
+    /// finished members awaiting the engine, the rest queued behind the runner,
+    /// and a member another request's execution is answering.
+    #[test]
+    fn a_wave_board_maps_to_lane_progress() {
+        use crate::execution::checks_status::{wave_lane_progress, LaneProgress};
+        let entry = |name: &str, state: &str| crate::mcp::handlers::run::CheckStatusEntry {
+            index: 0,
+            name: name.into(),
+            state: state.into(),
+            annotation: (state == "finished")
+                .then(|| "finished in 2s (exit 1); recorded when the wave ends".into()),
+            cached: false,
+            since_unix_ms: Some(7),
+        };
+        let board = [
+            entry("a", "finished"),
+            entry("b", "running"),
+            entry("c", "pending"),
+            entry("d", "shared"),
+        ];
+        let request = "req-1".to_string();
+        assert_eq!(
+            wave_lane_progress(&board, "a", None),
+            Some(LaneProgress::Finished {
+                since_unix_ms: Some(7),
+                annotation: Some("finished in 2s (exit 1); recorded when the wave ends".into()),
+            })
+        );
+        assert_eq!(
+            wave_lane_progress(&board, "b", None),
+            Some(LaneProgress::Running {
+                since_unix_ms: Some(7)
+            })
+        );
+        assert_eq!(
+            wave_lane_progress(&board, "c", None),
+            Some(LaneProgress::Queued {
+                behind: Some("b".into())
+            })
+        );
+        assert_eq!(
+            wave_lane_progress(&board, "d", Some(&request)),
+            Some(LaneProgress::Shared {
+                request_id: Some(request.clone())
+            })
+        );
+        assert_eq!(wave_lane_progress(&board, "unplanned", None), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::review_push::{
-    bounded_rearm_candidates, finish_superseded_turn_end_checks, rearm_one_bounded_failed_review,
-    spawn_turn_end_checks, BOUNDED_REARM_CANDIDATES_SQL, DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+    bounded_rearm_candidates, rearm_one_bounded_failed_review, spawn_turn_end_checks,
+    BOUNDED_REARM_CANDIDATES_SQL, DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
 };
 use super::{
     create_review_push_for_pr_open, evaluate_review_readiness, record_bounded_rearm_lookup_failure,
@@ -63,7 +63,7 @@ async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
     let orch = test_orchestrator(db);
 
     let stale = orch
-        .try_begin_turn_end_checks("j-prod")
+        .try_begin_turn_end_checks("j-prod", "a-stale")
         .expect("claim the stale wave's single-flight slot");
     crate::execution::checks::cancel_stale_review_on_branch_advance(
         &orch,
@@ -78,8 +78,9 @@ async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
         "a base advance that altered the patch cancels the stale wave"
     );
 
-    orch.end_turn_end_checks("j-prod");
-    finish_superseded_turn_end_checks(&orch, "j-prod", stale.is_cancelled());
+    // The stale wave returning early releases its slot, and the release arms
+    // the successor.
+    drop(stale);
 
     assert!(
         wave_scheduled(&orch, "j-prod"),
@@ -119,6 +120,7 @@ fn waited_on_lanes(
                 verified_on: None,
                 notice: None,
                 declared_unverified: None,
+                progress: None,
             },
         )
         .collect();
@@ -1405,7 +1407,7 @@ async fn a_dormant_infrastructure_red_rearms_once_per_changed_placement_fact() {
         "the machine attaching is the fact that earns the lane a wave"
     );
     assert!(wave_scheduled(&orch, "j-prod"));
-    orch.end_turn_end_checks("j-prod");
+    orch.release_turn_end_slot_for_test("j-prod");
 
     // That wave failed the same way on the machine it met, and says so.
     insert_infrastructure_observation(
@@ -2399,7 +2401,9 @@ async fn in_flight_turn_end_checks_do_not_defer_the_review() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+    let slot = orch
+        .try_begin_turn_end_checks("j-prod", "a-running")
+        .expect("the slot is free");
     run_review_push(&orch).await;
     let watcher = pending(&orch, "j-watch").await;
     assert_eq!(
@@ -2410,7 +2414,7 @@ async fn in_flight_turn_end_checks_do_not_defer_the_review() {
     assert_eq!(watcher[0].wake, Wake::Wake);
     assert!(pending(&orch, "j-prod").await.is_empty());
 
-    orch.end_turn_end_checks("j-prod");
+    drop(slot);
     run_review_push(&orch).await;
     assert_eq!(
         pending(&orch, "j-watch").await.len(),
@@ -2527,25 +2531,26 @@ async fn cancel_turn_end_checks_signals_the_in_flight_token() {
     let db = test_db().await;
     let orch = test_orchestrator(db);
 
-    let cancel = orch
-        .try_begin_turn_end_checks("j-prod")
+    let slot = orch
+        .try_begin_turn_end_checks("j-prod", "a-first")
         .expect("first claim wins the single-flight slot");
     assert!(
-        orch.try_begin_turn_end_checks("j-prod").is_none(),
+        orch.try_begin_turn_end_checks("j-prod", "a-second")
+            .is_err(),
         "a second claim while one is in flight is refused"
     );
-    assert!(!cancel.is_cancelled());
+    assert!(!slot.is_cancelled());
 
     orch.cancel_turn_end_checks(
         "j-prod",
         crate::orchestrator::TurnEndCancelReason::IssueResolved,
     );
     assert!(
-        cancel.is_cancelled(),
+        slot.is_cancelled(),
         "the cancel lever signals the in-flight suite's token"
     );
     assert_eq!(
-        cancel.cancelled().await,
+        slot.cancel().cancelled().await,
         crate::orchestrator::TurnEndCancelReason::IssueResolved,
         "the cause travels with the cancellation signal"
     );
@@ -2554,18 +2559,18 @@ async fn cancel_turn_end_checks_signals_the_in_flight_token() {
         crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
     );
     assert_eq!(
-        cancel.cancelled().await,
+        slot.cancel().cancelled().await,
         crate::orchestrator::TurnEndCancelReason::IssueResolved,
         "a later producer cannot overwrite the cause that cancelled the wave"
     );
 
-    orch.end_turn_end_checks("j-prod");
+    drop(slot);
     // After release the slot is free again and a stale cancel is a no-op.
     orch.cancel_turn_end_checks(
         "j-prod",
         crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
     );
-    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+    assert!(orch.try_begin_turn_end_checks("j-prod", "a-third").is_ok());
 }
 
 #[tokio::test]
@@ -2576,10 +2581,10 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
     let db = test_db().await;
     let orch = test_orchestrator(db);
 
-    let cancel = orch
-        .try_begin_turn_end_checks("j-prod")
+    let slot = orch
+        .try_begin_turn_end_checks("j-prod", "a-advanced")
         .expect("claim the job's single-flight slot");
-    assert!(!cancel.is_cancelled());
+    assert!(!slot.is_cancelled());
 
     crate::execution::checks::cancel_stale_review_on_branch_advance(
         &orch,
@@ -2588,11 +2593,13 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
     )
     .await;
     assert!(
-        cancel.is_cancelled(),
+        slot.is_cancelled(),
         "a sealed commit cancels the in-flight review suite for the job"
     );
 
-    orch.end_turn_end_checks("j-prod");
+    // No job row backs `j-prod` here, so the successor the release arms
+    // withdraws itself without claiming the slot.
+    drop(slot);
     // No suite in flight ⇒ the branch-advance cancel is a harmless no-op, and the
     // single-flight slot remains claimable.
     crate::execution::checks::cancel_stale_review_on_branch_advance(
@@ -2601,7 +2608,7 @@ async fn branch_advance_cancels_the_in_flight_review_suite() {
         crate::execution::checks::BranchAdvance::Commit,
     )
     .await;
-    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+    assert!(orch.try_begin_turn_end_checks("j-prod", "a-after").is_ok());
 }
 
 /// A base advance that replays the branch without changing its own patch leaves
@@ -2621,7 +2628,7 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
     };
 
     let wave = orch
-        .try_begin_turn_end_checks("j-prod")
+        .try_begin_turn_end_checks("j-prod", "a-kept")
         .expect("claim the wave's single-flight slot");
     for _ in 0..4 {
         crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", kept)
@@ -2632,8 +2639,7 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
         "four patch-preserving base advances withdraw nothing"
     );
     assert!(orch.turn_end_checks_in_flight("j-prod"));
-    orch.end_turn_end_checks("j-prod");
-    finish_superseded_turn_end_checks(&orch, "j-prod", wave.is_cancelled());
+    drop(wave);
     assert!(
         !wave_scheduled(&orch, "j-prod"),
         "a wave that finished on its own head arms no successor"
@@ -2645,16 +2651,26 @@ async fn a_base_replay_that_keeps_the_patch_keeps_the_wave_and_a_commit_withdraw
             patch_unchanged: false,
         },
     ] {
+        // A fresh node per advance: the successor each withdrawal arms holds
+        // the slot for the rest of its test.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+        let orch = test_orchestrator(db);
         let wave = orch
-            .try_begin_turn_end_checks("j-prod")
-            .expect("the slot is free again");
+            .try_begin_turn_end_checks("j-prod", "a-withdrawn")
+            .expect("the slot is free");
         crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod", advance)
             .await;
         assert!(
             wave.is_cancelled(),
             "{advance:?} changes the patch and withdraws the wave"
         );
-        orch.end_turn_end_checks("j-prod");
+        drop(wave);
+        assert!(
+            wave_scheduled(&orch, "j-prod"),
+            "{advance:?} arms one successor for the tree that replaced the stale one"
+        );
     }
 }
 
@@ -2699,8 +2715,10 @@ async fn a_commit_supersedes_every_review_suite_on_the_same_branch() {
     seed_branch_sharers(&db).await;
     let orch = test_orchestrator(db);
 
-    let node = orch.try_begin_turn_end_checks("j-node").unwrap();
-    let other = orch.try_begin_turn_end_checks("j-other").unwrap();
+    let node = orch.try_begin_turn_end_checks("j-node", "a-node").unwrap();
+    let other = orch
+        .try_begin_turn_end_checks("j-other", "a-other")
+        .unwrap();
 
     crate::execution::checks::cancel_stale_review_on_branch_advance(
         &orch,
@@ -2729,8 +2747,8 @@ async fn a_commit_spares_a_same_named_branch_in_another_project() {
     seed_branch_sharers(&db).await;
     let orch = test_orchestrator(db);
 
-    let near = orch.try_begin_turn_end_checks("j-node").unwrap();
-    let far = orch.try_begin_turn_end_checks("j-far").unwrap();
+    let near = orch.try_begin_turn_end_checks("j-node", "a-near").unwrap();
+    let far = orch.try_begin_turn_end_checks("j-far", "a-far").unwrap();
 
     crate::execution::checks::cancel_stale_review_on_branch_advance(
         &orch,
@@ -2757,7 +2775,9 @@ async fn a_branchless_job_still_cancels_its_own_suite() {
     let db = test_db().await;
     let orch = test_orchestrator(db);
 
-    let own = orch.try_begin_turn_end_checks("j-unknown").unwrap();
+    let own = orch
+        .try_begin_turn_end_checks("j-unknown", "a-own")
+        .unwrap();
     crate::execution::checks::cancel_stale_review_on_branch_advance(
         &orch,
         "j-unknown",
@@ -2786,17 +2806,13 @@ async fn set_prod_head_turn(db: &LocalDb, state: &str, reason: Option<&str>) {
 
 /// Did the turn-end hook schedule a review wave for `job_id`? The hook claims
 /// the job's single-flight slot before detaching the suite, so the slot is the
-/// observable. The probe restores the slot either way, leaving each subsequent
-/// turn-end in a test independently observable.
+/// observable.
 ///
 /// Deterministic: the suite is spawned onto the orchestrator's runtime, which in
 /// a test is the test's own current-thread runtime, so the detached suite — the
-/// only other party that releases the slot — cannot poll until the test next
-/// awaits.
+/// only party that releases the slot — cannot poll until the test next awaits.
 fn wave_scheduled(orch: &Orchestrator, job_id: &str) -> bool {
-    let claimed_by_probe = orch.try_begin_turn_end_checks(job_id).is_some();
-    orch.end_turn_end_checks(job_id);
-    !claimed_by_probe
+    orch.turn_end_checks_in_flight(job_id)
 }
 
 /// The reported defect: the heavy `when:review` suites fired at the turn end of
@@ -3122,10 +3138,10 @@ async fn resolving_an_issue_cancels_its_jobs_turn_end_checks() {
     seed(&db, "initial").await;
     let orch = test_orchestrator(db);
 
-    let cancel = orch
-        .try_begin_turn_end_checks("j-prod")
+    let slot = orch
+        .try_begin_turn_end_checks("j-prod", "a-resolving")
         .expect("claim the builder job's slot");
-    assert!(!cancel.is_cancelled());
+    assert!(!slot.is_cancelled());
 
     crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(
         &orch,
@@ -3135,10 +3151,14 @@ async fn resolving_an_issue_cancels_its_jobs_turn_end_checks() {
     .await;
 
     assert!(
-        cancel.is_cancelled(),
+        slot.is_cancelled(),
         "resolving issue i-rev quits its builder job's in-flight suite"
     );
-    orch.end_turn_end_checks("j-prod");
+    drop(slot);
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "a wave cancelled because its issue resolved owes no successor"
+    );
 }
 
 #[tokio::test]
@@ -3225,4 +3245,691 @@ async fn startup_reconciliation_terminalizes_every_moving_attempt_with_named_rea
     assert!(rows
         .iter()
         .all(|(state, reason)| state == "failed" && reason.contains("host restarted")));
+}
+
+// --- cairn/4690: the turn-end slot cannot leak, and a refused turn end is owed ---
+
+/// Every attempt row for `job_id` as `(id, state, reason)`, oldest first.
+async fn attempts(db: &LocalDb, job_id: &str) -> Vec<(String, String, Option<String>)> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, state, reason FROM turn_end_check_attempts
+                      WHERE job_id = ?1 ORDER BY created_at, rowid",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push((row.text(0)?, row.text(1)?, row.opt_text(2)?));
+            }
+            Ok::<_, crate::storage::DbError>(found)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+/// A second builder on `e-rev` whose last turn completed, so a turn end arms
+/// its review wave. Fault-injection tests use one of these: the fault seam is
+/// keyed by job id, and no other test uses these ids.
+async fn insert_shipping_builder(db: &LocalDb, job_id: &str) {
+    db.execute_script(&format!(
+        "INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
+           VALUES('{job_id}','e-rev','p-rev','i-rev','complete','{job_id}','builder','b',1,1);
+         INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+           VALUES('t-{job_id}','s-{job_id}','{job_id}',1,'complete','initial',1,1);"
+    ))
+    .await
+    .unwrap();
+    attach_planbuild_topology(db, job_id, NodeRole::Builder).await;
+}
+
+/// A claimed attempt and the slot it holds, as the turn-end hook leaves them.
+fn claimed_slot(orch: &Orchestrator, job_id: &str) -> (String, crate::orchestrator::TurnEndSlot) {
+    let id = crate::execution::checks_turn_end::request_turn_end_attempt(orch, job_id).unwrap();
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        orch, job_id, &id, "claimed", None,
+    )
+    .unwrap();
+    let slot = orch
+        .try_begin_turn_end_checks(job_id, &id)
+        .expect("the slot is free");
+    (id, slot)
+}
+
+/// The immutable facts a wave that sealed `head` publishes.
+fn plan_at(head: &str) -> Arc<crate::execution::checks_turn_end::WavePlan> {
+    Arc::new(crate::execution::checks_turn_end::WavePlan {
+        head: head.to_string(),
+        base: String::new(),
+        tree_hash: String::new(),
+        checks: Default::default(),
+        applicable_names: Default::default(),
+        input_hashes: Default::default(),
+        expected_toolchain: String::new(),
+        unsupported: Default::default(),
+    })
+}
+
+/// A failed `claimed` write used to return while holding the slot, so every
+/// later turn end for the job was `superseded` until the host restarted.
+#[tokio::test]
+async fn a_claim_write_failure_leaves_the_slot_free_and_the_attempt_failed() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_shipping_builder(&db, "j-claim-fault").await;
+    let orch = test_orchestrator(db);
+
+    crate::execution::checks_turn_end::transition_faults::fail("j-claim-fault", "claimed", 1);
+    spawn_turn_end_checks(&orch, "j-claim-fault");
+
+    assert!(
+        !orch.turn_end_checks_in_flight("j-claim-fault"),
+        "a claim that could not be recorded frees the slot"
+    );
+    let rows = attempts(&orch.db.local, "j-claim-fault").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, "failed", "{rows:?}");
+    assert_eq!(
+        rows[0].2.as_deref(),
+        Some(crate::orchestrator::TURN_END_ABANDONED_REASON)
+    );
+
+    spawn_turn_end_checks(&orch, "j-claim-fault");
+    assert!(
+        wave_scheduled(&orch, "j-claim-fault"),
+        "the next turn end claims the slot"
+    );
+}
+
+/// A panic in the detached wave never reached the release, which left the slot
+/// held by nothing.
+#[tokio::test]
+async fn a_panicking_wave_leaves_the_slot_free_and_the_attempt_failed() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let (id, slot) = claimed_slot(&orch, "j-prod");
+
+    let wave = tokio::spawn(async move {
+        let _slot = slot;
+        panic!("the wave panicked mid-flight");
+    })
+    .await;
+
+    assert!(wave.is_err(), "the wave panicked");
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let row = rows.iter().find(|row| row.0 == id).unwrap();
+    assert_eq!(row.1, "failed");
+    assert_eq!(
+        row.2.as_deref(),
+        Some(crate::orchestrator::TURN_END_ABANDONED_REASON)
+    );
+}
+
+/// A guard dropped after someone else terminalized its attempt keeps their
+/// reason: the spawn-failure path records why the wave never ran, and the
+/// guard inside the dropped future must not overwrite it.
+#[tokio::test]
+async fn an_abandoned_guard_never_overwrites_a_terminal_state() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let (id, slot) = claimed_slot(&orch, "j-prod");
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &orch,
+        "j-prod",
+        &id,
+        "failed",
+        Some("detached runtime construction failed"),
+    )
+    .unwrap();
+
+    drop(slot);
+
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(
+        rows[0].2.as_deref(),
+        Some("detached runtime construction failed")
+    );
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
+}
+
+/// A terminal write that keeps failing used to retain the slot. Releasing it
+/// behind a non-terminal row is safe; holding it made the job permanently
+/// superseded.
+#[tokio::test]
+async fn a_terminal_write_failure_still_releases_the_slot() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_shipping_builder(&db, "j-terminal-fault").await;
+    let orch = test_orchestrator(db);
+    let (id, slot) = claimed_slot(&orch, "j-terminal-fault");
+
+    crate::execution::checks_turn_end::transition_faults::fail("j-terminal-fault", "completed", 3);
+    slot.finish("completed", "check wave completed").await;
+
+    assert!(!orch.turn_end_checks_in_flight("j-terminal-fault"));
+    let rows = attempts(&orch.db.local, "j-terminal-fault").await;
+    let row = rows.iter().find(|row| row.0 == id).unwrap();
+    assert_eq!(row.1, "claimed", "the write never landed: {rows:?}");
+
+    spawn_turn_end_checks(&orch, "j-terminal-fault");
+    assert!(
+        wave_scheduled(&orch, "j-terminal-fault"),
+        "the next turn end claims the slot and becomes the current attempt"
+    );
+}
+
+/// A release is the holder's own: a late one from an older wave never frees the
+/// slot a newer wave holds.
+#[tokio::test]
+async fn a_late_release_never_frees_a_newer_waves_slot() {
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+
+    let old = orch.try_begin_turn_end_checks("j-prod", "a-old").unwrap();
+    let old_wave = old.cancel().clone();
+    drop(old);
+    let newer = orch.try_begin_turn_end_checks("j-prod", "a-new").unwrap();
+
+    assert!(!orch.end_turn_end_checks("j-prod", &old_wave));
+    assert!(
+        orch.turn_end_checks_in_flight("j-prod"),
+        "the newer wave still holds its slot"
+    );
+    drop(newer);
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
+}
+
+/// `j-prod` on a real agent branch in a managed store, so its logical head
+/// resolves. Returns that head and the directories backing it, or `None` when
+/// no jj binary is available.
+async fn resolvable_head(orch: &Orchestrator) -> Option<(String, Vec<tempfile::TempDir>)> {
+    let bin = crate::jj::tests::jj_bin()?;
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-4690-builder-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    std::fs::write(workspace.join("owed.rs"), "owed\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "agent branch", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+    let head = crate::execution::cache::resolve_job_logical_head(orch, "j-prod")
+        .await
+        .expect("the agent branch resolves");
+    Some((head, vec![repository, workspaces]))
+}
+
+/// Two turn ends arriving while a wave runs on an earlier head give exactly one
+/// successor, for the head the agent actually ended on.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn turn_ends_during_a_wave_on_an_earlier_head_owe_exactly_one_successor() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let Some((head, _dirs)) = resolvable_head(&orch).await else {
+        return;
+    };
+    let (wave, slot) = claimed_slot(&orch, "j-prod");
+    let earlier = "0".repeat(head.len());
+    slot.cancel().set_runtime_status(&wave, plan_at(&earlier));
+
+    spawn_turn_end_checks(&orch, "j-prod");
+    spawn_turn_end_checks(&orch, "j-prod");
+    let refused = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(refused.len(), 3, "{refused:?}");
+    assert!(
+        refused[1..].iter().all(|row| row.1 == "superseded"
+            && row.2.as_deref() == Some(super::review_push::OWED_SUCCESSOR_REASON)),
+        "each refused turn end names the debt: {refused:?}"
+    );
+
+    slot.finish("completed", "check wave completed").await;
+
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(
+        rows.len(),
+        4,
+        "one successor, not one per turn end: {rows:?}"
+    );
+    assert_ne!(rows[3].1, "superseded", "{rows:?}");
+}
+
+/// A turn end that left the head where the running wave sealed it was answered
+/// by that wave, and owes nothing.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_turn_end_on_the_head_the_wave_checked_owes_no_successor() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let Some((head, _dirs)) = resolvable_head(&orch).await else {
+        return;
+    };
+    let (wave, slot) = claimed_slot(&orch, "j-prod");
+    slot.cancel().set_runtime_status(&wave, plan_at(&head));
+
+    spawn_turn_end_checks(&orch, "j-prod");
+    slot.finish("completed", "check wave completed").await;
+
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    assert_eq!(rows.len(), 2, "no successor: {rows:?}");
+    assert!(!orch.turn_end_checks_in_flight("j-prod"));
+}
+
+/// The owed successor goes through every ordinary gate: a live turn arms its
+/// own wave when it ends, and a resolved issue arms nothing.
+#[tokio::test]
+async fn an_owed_successor_is_suppressed_by_a_live_turn_or_a_resolved_issue() {
+    for (gate, expected) in [("live turn", "skipped"), ("resolved issue", "withdrawn")] {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+        let orch = test_orchestrator(db);
+        let (wave, slot) = claimed_slot(&orch, "j-prod");
+        slot.cancel().set_runtime_status(&wave, plan_at("earlier"));
+        spawn_turn_end_checks(&orch, "j-prod");
+
+        match gate {
+            "live turn" => set_prod_head_turn(&orch.db.local, "running", None).await,
+            _ => orch
+                .db
+                .local
+                .execute("UPDATE issues SET status='merged' WHERE id='i-rev'", ())
+                .await
+                .map(|_| ())
+                .unwrap(),
+        }
+        slot.finish("completed", "check wave completed").await;
+
+        let rows = attempts(&orch.db.local, "j-prod").await;
+        assert_eq!(rows.len(), 3, "{gate}: {rows:?}");
+        assert_eq!(rows[2].1, expected, "{gate}: {rows:?}");
+        assert!(!orch.turn_end_checks_in_flight("j-prod"), "{gate}");
+    }
+}
+
+/// The edges that are not turn ends never mark a running wave owed: its own
+/// release arms whatever its job is owed.
+#[tokio::test]
+async fn a_recovery_edge_leaves_a_running_wave_alone() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let (_wave, slot) = claimed_slot(&orch, "j-prod");
+
+    assert!(!super::review_push::spawn_review_wave_unless_in_flight(
+        &orch, "j-prod"
+    ));
+
+    assert_eq!(
+        attempts(&orch.db.local, "j-prod").await.len(),
+        1,
+        "a recovery edge records nothing against a held slot"
+    );
+    slot.finish("completed", "check wave completed").await;
+    assert!(
+        !wave_scheduled(&orch, "j-prod"),
+        "nothing was owed, so nothing is armed"
+    );
+}
+
+#[derive(Clone, Default)]
+struct ChangeSink {
+    events: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl crate::services::EventEmitter for ChangeSink {
+    fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+        self.events
+            .lock()
+            .unwrap()
+            .push((event.to_string(), payload));
+        Ok(())
+    }
+
+    fn emit_empty(&self, event: &str) -> Result<(), String> {
+        self.emit(event, serde_json::Value::Null)
+    }
+}
+
+/// A live checks view refetches on a `check_result_cache` change and does not
+/// poll while no lane reads as running, so every move of a review wave's board
+/// must announce one. Without it, a panel open at submission kept every member
+/// `queued` for the whole wave.
+#[tokio::test]
+async fn every_move_of_a_review_waves_board_announces_a_check_change() {
+    let db = test_db().await;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.keep();
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+    std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+    let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+    let sink = ChangeSink::default();
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_emitter(sink.clone())
+            .build(),
+    );
+    let orch = OrchestratorBuilder::new(
+        Arc::new(DbState::new(Arc::new(db), search_index)),
+        services,
+        config_dir,
+    )
+    .build();
+    let plan = crate::execution::selection::CheckPlan {
+        name: "rust-tests".into(),
+        applies: true,
+        command: "true".into(),
+        scope: crate::execution::selection::CheckScope::Full,
+        resource_class: crate::config::project_settings::CheckResourceClass::Shared,
+        verdict_environment_names: Vec::new(),
+        verdict_platforms: Vec::new(),
+        verdict_runtime: Vec::new(),
+        verdict_executor_ids: None,
+        config_error: None,
+    };
+    let board = crate::execution::checks_turn_end::review_wave_board(
+        &orch,
+        "j-prod",
+        &[(plan, "input".to_string())],
+    );
+    let check_changes = || {
+        sink.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, payload)| {
+                event == "db-change" && payload["table"] == "check_result_cache"
+            })
+            .count()
+    };
+
+    board.transition(0, "running", None);
+    assert_eq!(check_changes(), 1, "a member starting is announced");
+    board.transition(0, "finished", Some("finished in 2s (exit 0)".into()));
+    assert_eq!(check_changes(), 2, "a member finishing is announced");
+}
+
+/// cairn/4690. The regression fixture the issue names, composed end to end on
+/// the runner: a real review wave (`run_turn_end_checks`, from the sealed head
+/// of a real agent branch) whose middle member never returns. The machine is a
+/// fake executor on the fleet link. It runs the members in order, reports each
+/// start and finish, and stops the silent one as `CommandStop::Silent`.
+///
+/// While the batch is open, the wave's board shows the member the executor is
+/// on and keeps the stopped one `finished`, not red. When the batch returns,
+/// the silent member is recorded as the named stall non-verdict, both siblings
+/// are recorded passed, the attempt reaches `completed`, and the slot is free.
+/// The real-process half (the silent tree actually stopped and reaped) is the
+/// executor's own and is pinned in `cairn-exec`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+async fn a_silent_member_ends_its_wave_as_a_named_stall_beside_recorded_siblings() {
+    use cairn_common::executor_protocol::{CommandStop, ExecutorMessage, RunnerCallback};
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-4690-silent-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        "checks:\n  fast-a:\n    command: \"true\"\n    when: review\n  silent:\n    command: \"true\"\n    when: review\n  fast-b:\n    command: \"true\"\n    when: review\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.join("change.rs"), "the change\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "three review lanes", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let (attempt, slot) = claimed_slot(&orch, "j-prod");
+    let wave = tokio::spawn(crate::execution::checks_turn_end::run_turn_end_checks(
+        orch.clone(),
+        "j-prod".to_string(),
+        slot,
+    ));
+
+    // The machine: claim what is offered, then take the granted batch.
+    let (request, batch) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        loop {
+            match executor.recv().await.expect("the link stays open") {
+                ExecutorMessage::Offer { entry_id, .. } => {
+                    orch.fleet.handle_executor_message(
+                        crate::fleet::COLOCATED_EXECUTOR_ID,
+                        generation,
+                        ExecutorMessage::Claim { entry_id },
+                    );
+                }
+                ExecutorMessage::Granted {
+                    request,
+                    batch: Some(batch),
+                    ..
+                } => return (request, batch),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the wave reaches the machine");
+    assert!(batch.sequential, "the wave's members run in order");
+    assert_eq!(batch.items.len(), 3);
+    let context = batch
+        .runner_context_id
+        .clone()
+        .expect("the wave names a context for its members' reports");
+    let board = orch
+        .turn_end_check_runtime_status("j-prod")
+        .and_then(|status| status.board)
+        .expect("a submitted wave publishes its board");
+    let index_of = |stream_id: &str| -> usize {
+        stream_id
+            .rsplit_once(":check-")
+            .and_then(|(_, index)| index.parse().ok())
+            .unwrap()
+    };
+    let name_of = |stream_id: &str| board.snapshot()[index_of(stream_id)].name.clone();
+    let state_of = |name: &str| {
+        board
+            .snapshot()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.state)
+            .unwrap()
+    };
+
+    let mut outcomes = Vec::new();
+    for item in &batch.items {
+        let name = name_of(&item.stream_id);
+        orch.fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::ProcessItemStarted {
+                    runner_context_id: context.clone(),
+                    stream_id: item.stream_id.clone(),
+                },
+            )
+            .await;
+        assert_eq!(state_of(&name), "running", "{name} starts");
+        let silent = name == "silent";
+        let exit = if silent { 143 } else { 0 };
+        orch.fleet
+            .handle_runner_callback(
+                &orch,
+                RunnerCallback::ProcessItemCompleted {
+                    runner_context_id: context.clone(),
+                    stream_id: item.stream_id.clone(),
+                    succeeded: !silent,
+                    exit_code: Some(exit),
+                    timed_out: false,
+                    duration_ms: 1_000,
+                },
+            )
+            .await;
+        assert_eq!(
+            state_of(&name),
+            "finished",
+            "{name}'s exit is not its verdict"
+        );
+        let mut outcome = serde_json::json!({
+            "header": name, "body": format!("{name} output"), "succeeded": !silent,
+            "suspended": false, "exitCode": exit, "startedAtUnixMs": 1,
+            "finishedAtUnixMs": 2, "durationMs": 1,
+        });
+        if silent {
+            outcome["stop"] = serde_json::to_value(CommandStop::Silent {
+                quiet_ms: 1_800_000,
+                last_output_unix_ms: None,
+                cpu_ms_in_window: Some(0),
+                storage_io_bytes_in_window: Some(0),
+                tree: Vec::new(),
+            })
+            .unwrap();
+        }
+        outcomes.push(outcome);
+    }
+
+    let metadata: cairn_common::executor_protocol::CellExecutionMeta =
+        serde_json::from_value(serde_json::json!({
+            "executorId": crate::fleet::COLOCATED_EXECUTOR_ID,
+            "executorDeviceId": "local-device",
+            "executorConnectionGeneration": generation,
+            "slotId": "cell", "cellEpoch": 1,
+            "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+        }))
+        .unwrap();
+    orch.fleet.handle_executor_message(
+        crate::fleet::COLOCATED_EXECUTOR_ID,
+        generation,
+        ExecutorMessage::Result {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            outcome: cairn_common::executor_protocol::CellOutcome::Completed {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                exit_code: Some(1),
+                output: serde_json::to_string(&outcomes).unwrap(),
+                timed_out: false,
+                metadata,
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+                node_scratch: None,
+            },
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(120), wave)
+        .await
+        .expect("the wave settles once its batch returns")
+        .expect("the wave does not panic");
+
+    assert!(
+        !orch.turn_end_checks_in_flight("j-prod"),
+        "the slot is released"
+    );
+    let rows = attempts(&orch.db.local, "j-prod").await;
+    let row = rows.iter().find(|row| row.0 == attempt).unwrap();
+    assert_eq!(row.1, "completed", "{rows:?}");
+
+    let recorded = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT check_name, passed, failure_kind, output_tail
+                           FROM check_result_cache WHERE job_id='j-prod'",
+                        (),
+                    )
+                    .await?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    found.push((
+                        row.text(0)?,
+                        row.i64(1)? != 0,
+                        row.opt_text(2)?,
+                        row.text(3)?,
+                    ));
+                }
+                Ok::<_, crate::storage::DbError>(found)
+            })
+        })
+        .await
+        .unwrap();
+    let lane = |name: &str| {
+        recorded
+            .iter()
+            .find(|row| row.0 == name)
+            .unwrap_or_else(|| panic!("{name} is recorded: {recorded:?}"))
+    };
+    for sibling in ["fast-a", "fast-b"] {
+        let row = lane(sibling);
+        assert!(row.1, "{sibling} is recorded passed: {row:?}");
+        assert_eq!(row.2, None, "{row:?}");
+    }
+    let stalled = lane("silent");
+    assert!(!stalled.1, "{stalled:?}");
+    // A stall is a substrate death, stored under the kind every non-capacity
+    // substrate shape shares; the tail is what names it a stall.
+    assert_eq!(
+        stalled.2.as_deref(),
+        Some("infrastructure"),
+        "a stall is a classified non-verdict, never a bare red: {stalled:?}"
+    );
+    assert!(
+        stalled.3.contains("stopped making progress") || stalled.3.contains("1800s"),
+        "the stall is named: {stalled:?}"
+    );
 }

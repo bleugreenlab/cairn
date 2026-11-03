@@ -67,11 +67,13 @@ fn page_origin_refusal(payload: &ChangePayload) -> Option<(usize, String)> {
     payload.changes.iter().enumerate().find_map(|(index, item)| {
         let resource = cairn_common::uri::parse_uri(&item.target)
             .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
+        // A collection patch or delete is admitted only scoped by where=,
+        // which the dispatch arm enforces as it does for every writer.
         let allowed = matches!(
             (resource, item.mode),
             (
                 Some(cairn_common::uri::CairnResource::ThreadDbTable { .. }),
-                ChangeMode::Append
+                ChangeMode::Append | ChangeMode::Patch | ChangeMode::Delete
             ) | (
                 Some(cairn_common::uri::CairnResource::ThreadDbRow { .. }),
                 ChangeMode::Patch | ChangeMode::Delete
@@ -81,7 +83,7 @@ fn page_origin_refusal(payload: &ChangePayload) -> Option<(usize, String)> {
             (
                 index,
                 format!(
-                    "{}: a page writes only rows of its owning thread's tables (append to .../db/<table>, patch or delete .../db/<table>/<pk>)",
+                    "{}: a page writes only rows of its owning thread's tables (append to .../db/<table>, patch or delete .../db/<table>/<pk> or .../db/<table>?where=...)",
                     item.target
                 ),
             )

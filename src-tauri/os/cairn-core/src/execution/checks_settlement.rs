@@ -461,8 +461,7 @@ pub(crate) fn arm_wave_for_waiter(
          in flight; arming one",
         &job_id[..job_id.len().min(8)]
     );
-    crate::orchestrator::lifecycle::spawn_turn_end_checks(orch, job_id);
-    true
+    crate::orchestrator::lifecycle::spawn_review_wave_unless_in_flight(orch, job_id)
 }
 
 /// The node a checks wait or wake is aimed at.
@@ -613,6 +612,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         }
     }
 

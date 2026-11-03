@@ -1072,6 +1072,12 @@ struct TurnEndCancelInner {
     reason: AtomicU8,
     notify: tokio::sync::Notify,
     status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
+    /// A turn end arrived while this wave held the slot. The wave owes the job
+    /// one successor when it releases, if the head has moved past the commit
+    /// it sealed. Set only under the in-flight map's lock, so a release (which
+    /// removes the entry under the same lock before reading this) never misses
+    /// a turn end that was refused the slot.
+    owed: std::sync::atomic::AtomicBool,
 }
 
 /// What a running review wave publishes once its planning finishes: the plan,
@@ -1086,6 +1092,22 @@ struct TurnEndCancelInner {
 pub(crate) struct TurnEndCheckRuntimeStatus {
     pub plan: Arc<crate::execution::checks_turn_end::WavePlan>,
     pub request_ids: HashMap<String, String>,
+    /// The attempt row this wave answers for.
+    pub attempt_id: String,
+    /// When the wave published its plan.
+    pub planned_at_unix_ms: u64,
+    /// The wave's own status board, once it has decided which lanes to submit:
+    /// which member the executor is running, which have finished, and which
+    /// wait behind them. Members run in order in one cell, so at most one is
+    /// running at a time.
+    pub board: Option<crate::execution::checks::CheckStatusBoard>,
+    /// When the wave was submitted to the fleet; `None` while it still plans
+    /// or defers to the node's own work.
+    pub submitted_at_unix_ms: Option<u64>,
+}
+
+fn now_unix_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
 }
 
 impl Default for TurnEndCancel {
@@ -1095,6 +1117,7 @@ impl Default for TurnEndCancel {
                 reason: AtomicU8::new(NOT_CANCELLED),
                 notify: tokio::sync::Notify::new(),
                 status: Mutex::new(None),
+                owed: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -1125,6 +1148,25 @@ impl TurnEndCancel {
         self.inner.reason.load(Ordering::SeqCst) != NOT_CANCELLED
     }
 
+    /// Why the wave was cancelled, if it was.
+    fn cancel_reason(&self) -> Option<TurnEndCancelReason> {
+        TurnEndCancelReason::from_discriminant(self.inner.reason.load(Ordering::SeqCst))
+    }
+
+    fn owe_successor(&self) {
+        self.inner.owed.store(true, Ordering::SeqCst);
+    }
+
+    fn owes_successor(&self) -> bool {
+        self.inner.owed.load(Ordering::SeqCst)
+    }
+
+    /// Whether two handles belong to the same wave. A slot entry is released
+    /// only by the guard of the wave that holds it.
+    fn same_wave(&self, other: &TurnEndCancel) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Resolve as soon as cancellation is signalled — immediately when already
     /// cancelled, otherwise when [`Self::cancel`] next fires.
     pub(crate) async fn cancelled(&self) -> TurnEndCancelReason {
@@ -1140,13 +1182,37 @@ impl TurnEndCancel {
 
     pub(crate) fn set_runtime_status(
         &self,
+        attempt_id: &str,
         plan: Arc<crate::execution::checks_turn_end::WavePlan>,
     ) {
         if let Ok(mut status) = self.inner.status.lock() {
             *status = Some(TurnEndCheckRuntimeStatus {
                 plan,
                 request_ids: HashMap::new(),
+                attempt_id: attempt_id.to_string(),
+                planned_at_unix_ms: now_unix_ms(),
+                board: None,
+                submitted_at_unix_ms: None,
             });
+        }
+    }
+
+    /// Publish the board the wave narrates its members on. A no-op before the
+    /// plan is published.
+    pub(crate) fn set_wave_board(&self, board: crate::execution::checks::CheckStatusBoard) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            if let Some(status) = status.as_mut() {
+                status.board = Some(board);
+            }
+        }
+    }
+
+    /// Record that the wave was submitted to the fleet, now.
+    pub(crate) fn mark_wave_submitted(&self) {
+        if let Ok(mut status) = self.inner.status.lock() {
+            if let Some(status) = status.as_mut() {
+                status.submitted_at_unix_ms = Some(now_unix_ms());
+            }
         }
     }
 
@@ -1160,6 +1226,177 @@ impl TurnEndCancel {
                 status.request_ids.insert(check_name, request_id);
             }
         }
+    }
+}
+
+/// The single-flight slot was already held when a wave asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnEndSlotHeld;
+
+/// What a released wave owes its job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TurnEndSuccessor {
+    /// Nothing: the wave answered the head the job ended on, or it was
+    /// cancelled for a reason no successor should undo.
+    None,
+    /// Arm one now: the wave was cancelled because its tree went stale, or a
+    /// turn end arrived before it had sealed a commit to compare against.
+    Arm,
+    /// A turn end arrived while the wave ran on `sealed`. Arm one only if the
+    /// job's head has since moved past it.
+    IfHeadMoved { sealed: String },
+}
+
+/// Ownership of one job's turn-end (`when:review`) single-flight slot.
+///
+/// The slot is an in-memory map entry, so it is held for exactly as long as
+/// this guard lives. [`Self::finish`] records the attempt's terminal state and
+/// releases. Dropping the guard without finishing (an early return, a panic
+/// unwinding the wave, a future that never ran because no runtime could be
+/// built) records the attempt `failed`, unless something else already
+/// terminalized it, and releases. A terminal write that keeps failing is logged
+/// and the slot is released anyway: a slot held with nothing behind it makes
+/// every later turn end for the job `superseded` until the host restarts, while
+/// a released slot behind a non-terminal row is safe, because the next claim
+/// moves the job's attempt pointer unconditionally.
+///
+/// The invariant this gives the rest of the system: within one runner
+/// incarnation, a non-terminal `turn_end_check_attempts` row always has a live
+/// guard, and so a live wave, behind it. Rows left non-terminal by a previous
+/// incarnation are the only exception, and startup reconciliation owns them.
+///
+/// Releasing also settles what the wave owes: one successor when it was
+/// cancelled for staleness, or when a turn end it refused arrived on a head
+/// the wave did not check (see [`TurnEndSuccessor`]).
+pub struct TurnEndSlot {
+    orch: Orchestrator,
+    job_id: String,
+    attempt_id: String,
+    cancel: TurnEndCancel,
+    settled: bool,
+}
+
+/// The reason a guard records when its wave ended without recording one.
+pub(crate) const TURN_END_ABANDONED_REASON: &str =
+    "turn-end wave ended without recording an outcome";
+
+/// How many times [`TurnEndSlot::finish`] tries the terminal write before it
+/// releases the slot regardless.
+const TURN_END_TERMINAL_WRITE_ATTEMPTS: u32 = 3;
+
+impl TurnEndSlot {
+    pub(crate) fn cancel(&self) -> &TurnEndCancel {
+        &self.cancel
+    }
+
+    pub(crate) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// Whether the wave this slot belongs to has been told to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Record the wave's terminal state, release the slot, arm whatever
+    /// successor the wave owes, and announce the settlement to review readiness
+    /// and to anyone waiting on the node's checks.
+    pub(crate) async fn finish(mut self, state: &str, reason: &str) {
+        self.settled = true;
+        let short = &self.job_id[..self.job_id.len().min(8)];
+        let mut attempt = 1;
+        loop {
+            match crate::execution::checks_turn_end::transition_turn_end_attempt(
+                &self.orch,
+                &self.job_id,
+                &self.attempt_id,
+                state,
+                Some(reason),
+            ) {
+                Ok(()) => break,
+                Err(error) if attempt < TURN_END_TERMINAL_WRITE_ATTEMPTS => {
+                    log::warn!(
+                        "turn-end checks for job {short}: terminal {state} write failed \
+                         (attempt {attempt}): {error}; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50 << attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    log::error!(
+                        "turn-end checks for job {short}: terminal {state} was not persisted \
+                         after {attempt} attempts ({error}); releasing the slot anyway so the \
+                         next turn end can claim it"
+                    );
+                    break;
+                }
+            }
+        }
+        let successor = self.release();
+        crate::execution::checks_turn_end::settle_released_turn_end_slot(
+            &self.orch,
+            &self.job_id,
+            successor,
+        )
+        .await;
+    }
+
+    /// Remove this wave's own slot entry and decide what it owes.
+    fn release(&self) -> TurnEndSuccessor {
+        if !self.orch.end_turn_end_checks(&self.job_id, &self.cancel) {
+            return TurnEndSuccessor::None;
+        }
+        match self.cancel.cancel_reason() {
+            Some(TurnEndCancelReason::BranchAdvanced) => return TurnEndSuccessor::Arm,
+            Some(_) => return TurnEndSuccessor::None,
+            None => {}
+        }
+        if !self.cancel.owes_successor() {
+            return TurnEndSuccessor::None;
+        }
+        match self.cancel.runtime_status() {
+            Some(status) => TurnEndSuccessor::IfHeadMoved {
+                sealed: status.plan.head.clone(),
+            },
+            None => TurnEndSuccessor::Arm,
+        }
+    }
+}
+
+impl Drop for TurnEndSlot {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        if let Err(error) = crate::execution::checks_turn_end::abandon_turn_end_attempt(
+            &self.orch,
+            &self.job_id,
+            &self.attempt_id,
+            TURN_END_ABANDONED_REASON,
+        ) {
+            log::error!(
+                "turn-end checks for job {}: could not record the abandoned attempt ({error}); \
+                 releasing the slot anyway",
+                &self.job_id[..self.job_id.len().min(8)]
+            );
+        }
+        let mut successor = self.release();
+        // An immediate successor is armed here, synchronously, so it holds the
+        // slot before anything else can observe it free. Not while unwinding:
+        // arming does database work, and a second panic there would abort.
+        if successor == TurnEndSuccessor::Arm && !std::thread::panicking() {
+            crate::orchestrator::lifecycle::arm_turn_end_successor_now(&self.orch, &self.job_id);
+            successor = TurnEndSuccessor::None;
+        }
+        let orch = self.orch.clone();
+        let job_id = self.job_id.clone();
+        self.orch.spawn_detached(async move {
+            crate::execution::checks_turn_end::settle_released_turn_end_slot(
+                &orch, &job_id, successor,
+            )
+            .await;
+        });
     }
 }
 
@@ -2398,15 +2635,21 @@ impl Orchestrator {
         ))
     }
 
-    /// Claim the turn-end-check single-flight slot for a job. Returns the job's
-    /// [`TurnEndCancel`] handle when this call newly claimed the slot (no run was
-    /// already in flight), or `None` when a run is already active for the job — in
-    /// which case the caller must NOT spawn another suite. The claim is released
-    /// with [`Self::end_turn_end_checks`].
-    pub fn try_begin_turn_end_checks(&self, job_id: &str) -> Option<TurnEndCancel> {
-        let mut map = self.turn_end_checks_in_flight.lock().ok()?;
+    /// Claim the turn-end-check single-flight slot for a job on behalf of the
+    /// attempt `attempt_id`. The returned [`TurnEndSlot`] holds the slot until it
+    /// is finished or dropped; `Err` means a wave already holds it, and the
+    /// caller must NOT spawn another suite.
+    pub fn try_begin_turn_end_checks(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<TurnEndSlot, TurnEndSlotHeld> {
+        let mut map = self
+            .turn_end_checks_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.contains_key(job_id) {
-            return None;
+            return Err(TurnEndSlotHeld);
         }
         let cancel = TurnEndCancel::default();
         map.insert(job_id.to_string(), cancel.clone());
@@ -2416,19 +2659,69 @@ impl Orchestrator {
         }
         self.invalidate_node_check_status(job_id, "check-submission");
         self.announce_checks_running(job_id);
-        Some(cancel)
+        Ok(TurnEndSlot {
+            orch: self.clone(),
+            job_id: job_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            cancel,
+            settled: false,
+        })
     }
 
-    /// Release the turn-end-check single-flight slot for a job. Idempotent.
-    pub fn end_turn_end_checks(&self, job_id: &str) {
-        let released = self
+    /// Record that a turn end was refused `job_id`'s slot, so the wave holding
+    /// it owes one successor. `false` when no wave holds the slot any more, in
+    /// which case the caller should claim it itself.
+    pub(crate) fn owe_turn_end_successor(&self, job_id: &str) -> bool {
+        let map = self
             .turn_end_checks_in_flight
             .lock()
-            .is_ok_and(|mut map| map.remove(job_id).is_some());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get(job_id) {
+            Some(holder) => {
+                holder.owe_successor();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Free `job_id`'s slot whichever wave holds it, as if that wave had settled.
+    /// Test-only: production releases go through the holder's own guard, and a
+    /// guard dropped after this finds its entry gone and releases nothing.
+    #[cfg(test)]
+    pub(crate) fn release_turn_end_slot_for_test(&self, job_id: &str) {
+        let holder = self
+            .turn_end_checks_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned();
+        if let Some(holder) = holder {
+            self.end_turn_end_checks(job_id, &holder);
+        }
+    }
+
+    /// Release `job_id`'s slot if, and only if, `owner` is the wave holding it,
+    /// so a late release can never free a successor's slot. Called only by
+    /// [`TurnEndSlot`]. Reports whether this call released it.
+    fn end_turn_end_checks(&self, job_id: &str, owner: &TurnEndCancel) -> bool {
+        let released = {
+            let mut map = self
+                .turn_end_checks_in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map.get(job_id).is_some_and(|held| held.same_wave(owner)) {
+                map.remove(job_id);
+                true
+            } else {
+                false
+            }
+        };
         self.invalidate_node_check_status(job_id, "check-settlement");
         if released {
             self.announce_checks_running(job_id);
         }
+        released
     }
 
     /// The issue row's checks-running glyph is decorated onto every read from
@@ -4578,13 +4871,15 @@ mod tests {
         )
         .build();
 
-        assert!(orch.try_begin_turn_end_checks("job-1").is_some());
+        let slot = orch
+            .try_begin_turn_end_checks("job-1", "attempt-1")
+            .expect("the slot is free");
         orch.set_turn_end_check_request_id(
             "job-1",
             "rust-tests".to_string(),
             "request-1".to_string(),
         );
-        orch.end_turn_end_checks("job-1");
+        drop(slot);
         assert_eq!(
             orch.recent_turn_end_check_request_ids("job-1")
                 .get("rust-tests")
@@ -4592,7 +4887,9 @@ mod tests {
             Some("request-1")
         );
 
-        assert!(orch.try_begin_turn_end_checks("job-1").is_some());
+        let _slot = orch
+            .try_begin_turn_end_checks("job-1", "attempt-2")
+            .expect("the slot is free again");
         assert!(orch.recent_turn_end_check_request_ids("job-1").is_empty());
     }
 

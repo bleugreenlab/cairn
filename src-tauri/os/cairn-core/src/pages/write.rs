@@ -10,8 +10,9 @@
 //!    else before this module is reached.
 //! 2. **Manifest.** Every target is a row write to a table the stored page
 //!    version's `manifest.writes` declares: `append` to `cairn:~/db/<table>`,
-//!    `patch` or `delete` on `cairn:~/db/<table>/<pk>`. The manifest is read
-//!    from the stored row, never from the frame.
+//!    `patch` or `delete` on `cairn:~/db/<table>/<pk>`, or `patch` or `delete`
+//!    on `cairn:~/db/<table>?where=...`. The manifest is read from the stored
+//!    row, never from the frame.
 //! 3. **Owner.** The page is a thread's (a draft cannot write) and the target
 //!    is that thread's own database. The write path's single ownership rule
 //!    (`owned_thread_scope`) takes the owner from the request's typed origin.
@@ -147,10 +148,26 @@ fn gate_write_targets(
             refusals.push(manifest_refusal(&target));
             continue;
         };
-        if resolved.contains(['?', '#']) {
-            refusals.push(format!("{target}: a write target carries no query"));
+        if resolved.contains('#') {
+            refusals.push(format!("{target}: a write target carries no fragment"));
             continue;
         }
+        // A query is the `where=` that scopes a collection patch or delete,
+        // and nothing else; the write path parses and enforces it.
+        let scoped = match resolved.split_once('?') {
+            None => false,
+            Some((_, query)) => {
+                let only_where = cairn_common::query::parse_query_params(query)
+                    .is_ok_and(|params| params.iter().all(|param| param.key == "where"));
+                if !only_where {
+                    refusals.push(format!(
+                        "{target}: a write target's only query is where=, scoping a patch or delete of a table's rows"
+                    ));
+                    continue;
+                }
+                true
+            }
+        };
         let resource = parse_uri(&resolved)
             .and_then(|parsed| crate::resources::delegate_thread_descendant(parsed).ok());
         let (project, name, table, is_row) = match &resource {
@@ -174,13 +191,13 @@ fn gate_write_targets(
             refusals.push(manifest_refusal(&target));
             continue;
         }
-        let mutation = match (is_row, mode.as_str()) {
-            (false, "append") => AuthorityMutation::Create,
-            (true, "patch") => AuthorityMutation::Update,
-            (true, "delete") => AuthorityMutation::Delete,
+        let mutation = match (is_row, scoped, mode.as_str()) {
+            (false, false, "append") => AuthorityMutation::Create,
+            (true, false, "patch") | (false, true, "patch") => AuthorityMutation::Update,
+            (true, false, "delete") | (false, true, "delete") => AuthorityMutation::Delete,
             _ => {
                 refusals.push(format!(
-                    "{target}: mode `{mode}` is refused; a page appends to cairn:~/db/<table> and patches or deletes cairn:~/db/<table>/<pk>"
+                    "{target}: mode `{mode}` is refused; a page appends to cairn:~/db/<table>, and patches or deletes cairn:~/db/<table>/<pk> or cairn:~/db/<table>?where=..."
                 ));
                 continue;
             }
@@ -245,8 +262,8 @@ fn split_input(input: &Value) -> Result<(Vec<Value>, Option<bool>), PageCallErro
     Ok((changes, atomic))
 }
 
-/// The URIs a change report names as written: each applied change's row URI,
-/// or its target when it has none.
+/// The URIs a change report names as written: each applied change's row URI
+/// (every row's, for a bulk append), or its target when it names none.
 fn written_uris(report: &Value) -> Vec<String> {
     report
         .get("applied")
@@ -254,12 +271,27 @@ fn written_uris(report: &Value) -> Vec<String> {
         .map(|applied| {
             applied
                 .iter()
-                .filter_map(|change| {
-                    change
-                        .pointer("/data/uri")
-                        .or_else(|| change.get("target"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
+                .flat_map(|change| {
+                    let mut uris: Vec<String> = change
+                        .pointer("/data/uris")
+                        .and_then(Value::as_array)
+                        .map(|uris| {
+                            uris.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if uris.is_empty() {
+                        uris.extend(
+                            change
+                                .pointer("/data/uri")
+                                .or_else(|| change.get("target"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        );
+                    }
+                    uris
                 })
                 .collect()
         })

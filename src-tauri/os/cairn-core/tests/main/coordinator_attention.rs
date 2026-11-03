@@ -481,7 +481,9 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
     let db = Arc::new(db);
     let (orch, recorder) = orchestrator(&temp, db.clone());
 
-    assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
+    let slot = orch
+        .try_begin_turn_end_checks("child-builder", "attempt-running")
+        .expect("the slot is free");
     evaluate_review_readiness(&orch, "child").await;
     await_spawn_count(&recorder, 1).await;
 
@@ -509,7 +511,7 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
     assert!(body.contains("Work product ready for review"), "{body}");
     assert!(body.contains(CHILD_URI), "{body}");
 
-    orch.end_turn_end_checks("child-builder");
+    drop(slot);
     evaluate_review_readiness(&orch, "child").await;
     assert_eq!(
         push_rows(&db, &format!("review:{CHILD_URI}")).await.len(),
@@ -603,7 +605,9 @@ async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
     let db = Arc::new(db);
     let (orch, recorder) = orchestrator_with_credential(&temp, db.clone(), None);
 
-    assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
+    let _slot = orch
+        .try_begin_turn_end_checks("child-builder", "attempt-running")
+        .expect("the slot is free");
     evaluate_review_readiness(&orch, "child").await;
 
     // Positive witness first: the coordinator's successor launch was attempted

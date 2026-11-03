@@ -295,6 +295,30 @@ fn row_payload(item: &ChangeItem) -> Result<serde_json::Map<String, serde_json::
     }
 }
 
+/// The query a structured write's target carries. The resource parser drops
+/// it, so it is read off the raw target, the way the browser's
+/// `return_content` is.
+fn target_query(item: &ChangeItem) -> Result<Vec<cairn_common::query::QueryParam>, String> {
+    item.target
+        .split_once('?')
+        .map(|(_, query)| cairn_common::query::parse_query_params(query))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+/// A row write that takes no query refuses one rather than ignoring it: a
+/// `where=` on an append or a row URI would otherwise read as a filter that
+/// did nothing.
+fn refuse_target_query(item: &ChangeItem, form: &str) -> Result<(), String> {
+    if target_query(item)?.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{form} takes no query; where= scopes only a patch or delete of a table's collection URI"
+        ))
+    }
+}
+
 /// The live shape of the table a structured write names, from the owning
 /// thread's store.
 async fn write_target_shape(scope: &WriteScope, table: &str) -> Result<TableShape, String> {
@@ -633,6 +657,8 @@ pub(super) async fn dispatch(
             },
             ChangeMode::Append,
         ) => {
+            refuse_target_query(item, "An append")
+                .map_err(|error| build_failure(index, item, error))?;
             let payload = row_payload(item).map_err(|error| build_failure(index, item, error))?;
             let scope = owned_thread_scope(orch, request, project, name)
                 .await
@@ -640,41 +666,151 @@ pub(super) async fn dispatch(
             let shape = write_target_shape(&scope, table)
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-            let columns = db_rows::payload_columns(&shape, &payload, PayloadUse::Insert)
+            let append = db_rows::parse_append(&shape, payload)
                 .map_err(|error| build_failure(index, item, error))?;
-            let (sql, params) = db_rows::insert_sql(&shape, &columns);
+            let key = if shape.primary_key().is_some() {
+                RowKey::Returned
+            } else {
+                RowKey::Unaddressed
+            };
+            // A bulk append is one `apply_write`, so its rows commit or roll
+            // back together.
+            let statements: Vec<WriteStatement> = db_rows::append_sql(&shape, &append)
+                .map_err(|error| build_failure(index, item, error))?
+                .into_iter()
+                .enumerate()
+                .map(|(position, (sql, params))| WriteStatement {
+                    sql,
+                    params,
+                    row: Some(RowTarget {
+                        table: shape.table.clone(),
+                        action: RowAction::Insert,
+                        key: key.clone(),
+                        position: append.bulk.then_some(position),
+                    }),
+                })
+                .collect();
+            police(&statements).map_err(|error| build_failure(index, item, error))?;
+            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            let (verb, would) = if append.upsert {
+                ("Upserted", "upsert")
+            } else {
+                ("Inserted", "insert")
+            };
+            let count = statements.len();
+            if dry_run {
+                format!("Would {would} {count} row(s) into {collection}")
+            } else {
+                let outcome = apply_write(&scope, statements, orch.services.emitter.as_ref())
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                let unaddressed = format!(
+                    "`{table}` has a composite (or no) primary key, so its rows have no URI"
+                );
+                if append.bulk {
+                    *applied_data = Some(serde_json::json!({
+                        "uris": outcome.rows,
+                        "count": count,
+                    }));
+                    match key {
+                        RowKey::Unaddressed => {
+                            format!("{verb} {count} rows into {collection}; {unaddressed}")
+                        }
+                        _ => format!(
+                            "{verb} {count} rows into {collection}; the change's data.uris names each row, in order"
+                        ),
+                    }
+                } else {
+                    match outcome.rows.into_iter().flatten().next() {
+                        Some(row) => {
+                            let summary = format!("{verb} {row}");
+                            *applied_data = Some(serde_json::json!({ "uri": row }));
+                            summary
+                        }
+                        None => format!("{verb} one row into {collection}; {unaddressed}"),
+                    }
+                }
+            }
+        }
+        (
+            CairnResource::ThreadDbTable {
+                project,
+                name,
+                table,
+            },
+            mode @ (ChangeMode::Patch | ChangeMode::Delete),
+        ) => {
+            let mode_name = if mode == ChangeMode::Patch {
+                "patch"
+            } else {
+                "delete"
+            };
+            let params = target_query(item).map_err(|error| build_failure(index, item, error))?;
+            let payload = row_payload(item).map_err(|error| build_failure(index, item, error))?;
+            let scope = owned_thread_scope(orch, request, project, name)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            if !params.iter().any(|param| param.key == "where") {
+                return Err(build_failure(
+                    index,
+                    item,
+                    db_rows::collection_write_needs_where(&collection, mode_name),
+                ));
+            }
+            if mode == ChangeMode::Patch && payload.is_empty() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "patch needs the columns to change: payload:{column: value, ...}",
+                ));
+            }
+            if mode == ChangeMode::Delete && !payload.is_empty() {
+                return Err(build_failure(index, item, "delete takes no payload"));
+            }
+            let shape = write_target_shape(&scope, table)
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+            let filters = db_rows::parse_write_filters(&params, &shape, &collection, mode_name)
+                .map_err(|error| build_failure(index, item, error))?;
+            let (sql, params, action) = if mode == ChangeMode::Patch {
+                let columns = db_rows::payload_columns(&shape, &payload, PayloadUse::Update)
+                    .map_err(|error| build_failure(index, item, error))?;
+                let (sql, params) = db_rows::update_where_sql(&shape, &filters, &columns);
+                (sql, params, RowAction::Update)
+            } else {
+                let (sql, params) = db_rows::delete_where_sql(&shape, &filters);
+                (sql, params, RowAction::Delete)
+            };
             let statement = WriteStatement {
                 sql,
                 params,
                 row: Some(RowTarget {
                     table: shape.table.clone(),
-                    action: RowAction::Insert,
-                    key: if shape.primary_key().is_some() {
-                        RowKey::Returned
-                    } else {
-                        RowKey::Unaddressed
-                    },
+                    action,
+                    key: RowKey::Matched,
+                    position: None,
                 }),
             };
             police(std::slice::from_ref(&statement))
                 .map_err(|error| build_failure(index, item, error))?;
-            let collection = cairn_common::uri::build_db_table_uri(&scope.db_root(), table);
+            let scoped = format!("{collection}{}", db_rows::describe_filters(&filters));
+            let verb = if action == RowAction::Update {
+                "Updated"
+            } else {
+                "Deleted"
+            };
             if dry_run {
-                format!("Would insert one row into {collection}")
+                format!(
+                    "Would have {} the rows of {scoped}",
+                    verb.to_ascii_lowercase()
+                )
             } else {
                 let outcome = apply_write(&scope, vec![statement], orch.services.emitter.as_ref())
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                match outcome.changes.into_iter().find_map(|change| change.uri) {
-                    Some(row) => {
-                        let summary = format!("Inserted {row}");
-                        *applied_data = Some(serde_json::json!({ "uri": row }));
-                        summary
-                    }
-                    None => format!(
-                        "Inserted one row into {collection}; `{table}` has a composite (or no) primary key, so the row has no URI"
-                    ),
-                }
+                *applied_data = Some(serde_json::json!({ "count": outcome.changed }));
+                format!("{verb} {} row(s) of {scoped}", outcome.changed)
             }
         }
         (
@@ -686,6 +822,8 @@ pub(super) async fn dispatch(
             },
             mode @ (ChangeMode::Patch | ChangeMode::Delete),
         ) => {
+            refuse_target_query(item, "A row URI")
+                .map_err(|error| build_failure(index, item, error))?;
             let payload = row_payload(item).map_err(|error| build_failure(index, item, error))?;
             if mode == ChangeMode::Patch && payload.is_empty() {
                 return Err(build_failure(
@@ -724,6 +862,7 @@ pub(super) async fn dispatch(
                     table: shape.table.clone(),
                     action,
                     key: RowKey::Known(pk.clone()),
+                    position: None,
                 }),
             };
             police(std::slice::from_ref(&statement))

@@ -255,12 +255,166 @@ fn parse_format(params: &[QueryParam]) -> Result<RowFormat, String> {
     }
 }
 
+/// The word a `where=` value spells to mean SQL NULL: `COL=null` is `IS NULL`
+/// and `COL!=null` is `IS NOT NULL`. A text column holding the four letters
+/// `null` is matched through `?sql=`.
+pub(crate) const NULL_WORD: &str = "null";
+
+/// The `where=` forms, for refusals and the affordance.
+pub(crate) const WHERE_FORMS: &str =
+    "COL=VALUE, COL!=VALUE, COL=null or COL!=null (repeatable, ANDed; LIKE and ranges stay in ?sql=)";
+
+fn no_column(shape: &TableShape, name: &str) -> String {
+    format!(
+        "`{}` has no column `{name}`; its columns are: {}",
+        shape.table,
+        shape.column_names()
+    )
+}
+
+/// One `where=` term, its column in declared spelling. The same terms scope a
+/// collection read and a collection patch or delete, so a write reaches
+/// exactly the rows the same filter reads.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Filter {
+    /// `COL=VALUE`: the column holds one of the candidates; see
+    /// [`match_values`] for why there may be two.
+    Eq(String, Vec<Value>),
+    /// `COL!=VALUE`: the column holds none of the candidates. A null is no
+    /// value, so a row whose column is null matches, where SQL's bare `!=`
+    /// would silently drop it.
+    Ne(String, Vec<Value>),
+    /// `COL=null`.
+    IsNull(String),
+    /// `COL!=null`.
+    NotNull(String),
+}
+
+impl Filter {
+    /// Parse one `where` value, split on its first `=`; a `!` ending the
+    /// column name negates it.
+    fn parse(text: &str, shape: &TableShape) -> Result<Self, String> {
+        let (left, value) = text
+            .split_once('=')
+            .ok_or_else(|| format!("where takes {WHERE_FORMS}; got '{text}'"))?;
+        let (name, negated) = match left.strip_suffix('!') {
+            Some(name) => (name, true),
+            None => (left, false),
+        };
+        let column = shape.column(name).ok_or_else(|| no_column(shape, name))?;
+        let name = column.name.clone();
+        Ok(match (negated, value == NULL_WORD) {
+            (false, true) => Self::IsNull(name),
+            (true, true) => Self::NotNull(name),
+            (false, false) => Self::Eq(name, match_values(&column.decl_type, value)),
+            (true, false) => Self::Ne(name, match_values(&column.decl_type, value)),
+        })
+    }
+
+    fn sql(&self) -> String {
+        match self {
+            Self::Eq(column, candidates) => equality_sql(column, candidates),
+            Self::Ne(column, candidates) => format!(
+                "({} IS NULL OR NOT ({}))",
+                quote_identifier(column),
+                equality_sql(column, candidates)
+            ),
+            Self::IsNull(column) => format!("{} IS NULL", quote_identifier(column)),
+            Self::NotNull(column) => format!("{} IS NOT NULL", quote_identifier(column)),
+        }
+    }
+
+    fn values(&self) -> &[Value] {
+        match self {
+            Self::Eq(_, candidates) | Self::Ne(_, candidates) => candidates,
+            Self::IsNull(_) | Self::NotNull(_) => &[],
+        }
+    }
+
+    /// `problem = two-sum`, `release is null`, for headers and summaries.
+    fn describe(&self) -> String {
+        // The last candidate is always the text as given.
+        let shown = |candidates: &[Value]| {
+            render_sql_value(candidates.last().cloned().unwrap_or(Value::Null))
+        };
+        match self {
+            Self::Eq(column, candidates) => format!("{column} = {}", shown(candidates)),
+            Self::Ne(column, candidates) => format!("{column} != {}", shown(candidates)),
+            Self::IsNull(column) => format!("{column} is null"),
+            Self::NotNull(column) => format!("{column} is not null"),
+        }
+    }
+}
+
+/// Every `where` occurrence of `params`, parsed against the shape.
+fn parse_filters(params: &[QueryParam], shape: &TableShape) -> Result<Vec<Filter>, String> {
+    params
+        .iter()
+        .filter(|param| param.key == "where")
+        .map(|param| Filter::parse(&param.value, shape))
+        .collect()
+}
+
+/// ` WHERE a = ? AND b IS NULL` and its bindings; empty for no filters.
+pub(crate) fn where_sql(filters: &[Filter]) -> (String, Vec<Value>) {
+    if filters.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let terms: Vec<String> = filters.iter().map(Filter::sql).collect();
+    (
+        format!(" WHERE {}", terms.join(" AND ")),
+        filters
+            .iter()
+            .flat_map(|filter| filter.values().iter().cloned())
+            .collect(),
+    )
+}
+
+/// ` where problem = two-sum and release is null`, or empty.
+pub(crate) fn describe_filters(filters: &[Filter]) -> String {
+    if filters.is_empty() {
+        return String::new();
+    }
+    let terms: Vec<String> = filters.iter().map(Filter::describe).collect();
+    format!(" where {}", terms.join(" and "))
+}
+
+/// The refusal for a collection patch or delete that names no rows. A write
+/// to every row is never implied by a missing filter.
+pub(crate) fn collection_write_needs_where(collection: &str, mode: &str) -> String {
+    format!(
+        "A {mode} of the collection {collection} names the rows it changes with where= in the target: \
+         {collection}?where=COLUMN=VALUE ({WHERE_FORMS}). Nothing was written: one row is \
+         {collection}/<pk>, and a whole-table write is SQL, a patch of the database root with payload.sql."
+    )
+}
+
+/// The filters scoping a collection patch or delete, from its target's query:
+/// only `where`, and at least one of it.
+pub(crate) fn parse_write_filters(
+    params: &[QueryParam],
+    shape: &TableShape,
+    collection: &str,
+    mode: &str,
+) -> Result<Vec<Filter>, String> {
+    if let Some(unsupported) = params.iter().find(|param| param.key != "where") {
+        return Err(format!(
+            "Unsupported query parameter '{}' for a {mode} of {collection} (accepted: where)",
+            unsupported.key
+        ));
+    }
+    let filters = parse_filters(params, shape)?;
+    if filters.is_empty() {
+        return Err(collection_write_needs_where(collection, mode));
+    }
+    Ok(filters)
+}
+
 /// A collection read's filters, order and window, resolved against the shape.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RowQuery {
-    /// `(column, candidates)` equality filters, ANDed, columns in declared
-    /// spelling; see [`match_values`] for why a filter may have two candidates.
-    pub filters: Vec<(String, Vec<Value>)>,
+    /// The `where=` terms, ANDed.
+    pub filters: Vec<Filter>,
     /// `(column, descending)`.
     pub order: Option<(String, bool)>,
     pub offset: usize,
@@ -288,24 +442,7 @@ impl RowQuery {
                 unsupported.key
             ));
         }
-        let unknown_column = |name: &str| {
-            format!(
-                "`{}` has no column `{name}`; its columns are: {}",
-                shape.table,
-                shape.column_names()
-            )
-        };
-        let mut filters = Vec::new();
-        for param in params.iter().filter(|param| param.key == "where") {
-            let (name, value) = param.value.split_once('=').ok_or_else(|| {
-                format!(
-                    "where takes COLUMN=VALUE (equality only; LIKE and ranges stay in ?sql=); got '{}'",
-                    param.value
-                )
-            })?;
-            let column = shape.column(name).ok_or_else(|| unknown_column(name))?;
-            filters.push((column.name.clone(), match_values(&column.decl_type, value)));
-        }
+        let filters = parse_filters(params, shape)?;
         let order = match find_query_value(params, "order") {
             None => None,
             Some(value) => {
@@ -313,7 +450,7 @@ impl RowQuery {
                     Some(name) => (name, true),
                     None => (value, false),
                 };
-                let column = shape.column(name).ok_or_else(|| unknown_column(name))?;
+                let column = shape.column(name).ok_or_else(|| no_column(shape, name))?;
                 Some((column.name.clone(), descending))
             }
         };
@@ -334,21 +471,7 @@ impl RowQuery {
     }
 
     fn where_clause(&self) -> (String, Vec<Value>) {
-        if self.filters.is_empty() {
-            return (String::new(), Vec::new());
-        }
-        let terms: Vec<String> = self
-            .filters
-            .iter()
-            .map(|(column, candidates)| equality_sql(column, candidates))
-            .collect();
-        (
-            format!(" WHERE {}", terms.join(" AND ")),
-            self.filters
-                .iter()
-                .flat_map(|(_, candidates)| candidates.iter().cloned())
-                .collect(),
-        )
+        where_sql(&self.filters)
     }
 
     /// The requested order, then the primary key ascending as the tie-breaker
@@ -406,19 +529,7 @@ impl RowQuery {
 
     /// ` where problem = two-sum and lang = rust`, for the page header.
     fn describe_filters(&self) -> String {
-        if self.filters.is_empty() {
-            return String::new();
-        }
-        let terms: Vec<String> = self
-            .filters
-            .iter()
-            .map(|(column, candidates)| {
-                // The last candidate is always the text as given.
-                let shown = candidates.last().cloned().unwrap_or(Value::Null);
-                format!("{column} = {}", render_sql_value(shown))
-            })
-            .collect();
-        format!(" where {}", terms.join(" and "))
+        describe_filters(&self.filters)
     }
 }
 
@@ -491,13 +602,7 @@ pub(crate) fn payload_columns(
 ) -> Result<Vec<(String, Value)>, String> {
     let mut columns = Vec::with_capacity(payload.len());
     for (key, value) in payload {
-        let column = shape.column(key).ok_or_else(|| {
-            format!(
-                "`{}` has no column `{key}`; its columns are: {}",
-                shape.table,
-                shape.column_names()
-            )
-        })?;
+        let column = shape.column(key).ok_or_else(|| no_column(shape, key))?;
         if use_ == PayloadUse::Update
             && shape.primary_key().is_some_and(|pk| pk.name == column.name)
         {
@@ -570,6 +675,238 @@ pub(crate) fn delete_sql(shape: &TableShape, pk: &Column, pk_text: &str) -> (Str
         format!("DELETE FROM {}{where_sql}", quote_identifier(&shape.table)),
         values,
     )
+}
+
+/// `UPDATE t SET c = ?, … WHERE <filters>`: a collection patch.
+pub(crate) fn update_where_sql(
+    shape: &TableShape,
+    filters: &[Filter],
+    columns: &[(String, Value)],
+) -> (String, Vec<Value>) {
+    let assignments: Vec<String> = columns
+        .iter()
+        .map(|(name, _)| format!("{} = ?", quote_identifier(name)))
+        .collect();
+    let (where_sql, filter_values) = where_sql(filters);
+    let mut values: Vec<Value> = columns.iter().map(|(_, value)| value.clone()).collect();
+    values.extend(filter_values);
+    (
+        format!(
+            "UPDATE {} SET {}{where_sql}",
+            quote_identifier(&shape.table),
+            assignments.join(", ")
+        ),
+        values,
+    )
+}
+
+/// `DELETE FROM t WHERE <filters>`: a collection delete.
+pub(crate) fn delete_where_sql(shape: &TableShape, filters: &[Filter]) -> (String, Vec<Value>) {
+    let (where_sql, values) = where_sql(filters);
+    (
+        format!("DELETE FROM {}{where_sql}", quote_identifier(&shape.table)),
+        values,
+    )
+}
+
+/// The columns forming the table's primary key, in key order; empty when it
+/// declared none.
+fn key_columns(shape: &TableShape) -> Vec<&Column> {
+    let mut keys: Vec<&Column> = shape
+        .columns
+        .iter()
+        .filter(|column| column.pk > 0)
+        .collect();
+    keys.sort_by_key(|column| column.pk);
+    keys
+}
+
+/// `INSERT … ON CONFLICT(pk) DO UPDATE SET c = excluded.c, … [RETURNING pk]`.
+///
+/// On a key conflict only the row's given columns change; every column the
+/// row leaves out keeps its stored value. That is the difference from
+/// `INSERT OR REPLACE`, which deletes the old row (firing delete triggers) and
+/// inserts one holding only the given columns. A row naming nothing but its
+/// key still assigns the key to itself, so the statement returns the row on a
+/// conflict and the reply can name it.
+///
+/// The row is still an insert first: SQLite checks NOT NULL before it looks
+/// for the conflict, so an upsert row names every column an insert must,
+/// even when its key exists. That is refused here by name rather than left to
+/// the engine's constraint error.
+
+pub(crate) fn upsert_sql(
+    shape: &TableShape,
+    columns: &[(String, Value)],
+) -> Result<(String, Vec<Value>), String> {
+    let keys = key_columns(shape);
+    if keys.is_empty() {
+        return Err(format!(
+            "`{}` has no primary key, so upsert has no conflict to resolve; append without upsert, or write ON CONFLICT on a unique index through ?sql=",
+            shape.table
+        ));
+    }
+    if let Some(missing) = keys
+        .iter()
+        .find(|key| !columns.iter().any(|(name, _)| *name == key.name))
+    {
+        return Err(format!(
+            "upsert matches a row by its primary key, so the row names `{}`",
+            missing.name
+        ));
+    }
+    if let Some(missing) = shape.columns.iter().find(|column| {
+        shape.required_for_insert(column) && !columns.iter().any(|(name, _)| *name == column.name)
+    }) {
+        return Err(format!(
+            "an upsert row is inserted first, so it names `{}` (NOT NULL without a default) even when its key exists: SQLite checks NOT NULL before the key conflict",
+            missing.name
+        ));
+    }
+    let mut assignments: Vec<String> = columns
+        .iter()
+        .filter(|(name, _)| !keys.iter().any(|key| key.name == *name))
+        .map(|(name, _)| {
+            let column = quote_identifier(name);
+            format!("{column} = excluded.{column}")
+        })
+        .collect();
+    if assignments.is_empty() {
+        let key = quote_identifier(&keys[0].name);
+        assignments.push(format!("{key} = excluded.{key}"));
+    }
+    let (insert, values) = insert_sql(
+        &TableShape {
+            table: shape.table.clone(),
+            // No key here, so `insert_sql` adds no RETURNING of its own; it
+            // belongs after the conflict clause.
+            columns: Vec::new(),
+        },
+        columns,
+    );
+    let mut sql = format!(
+        "{insert} ON CONFLICT({}) DO UPDATE SET {}",
+        quoted_list(keys.iter().map(|key| key.name.as_str())),
+        assignments.join(", ")
+    );
+    if let Some(pk) = shape.primary_key() {
+        sql.push_str(&format!(" RETURNING {}", quote_identifier(&pk.name)));
+    }
+    Ok((sql, values))
+}
+
+/// The most rows one `append` inserts: the same cap a collection read's
+/// `limit` has.
+pub(crate) const APPEND_ROWS_MAX: usize = DB_SQL_MAX_LIMIT;
+
+/// The append payload key holding several rows.
+pub(crate) const ROWS_KEY: &str = "rows";
+/// The append payload key that turns a key conflict into an update.
+pub(crate) const UPSERT_KEY: &str = "upsert";
+
+/// An append's rows, closed against the live shape.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AppendRows {
+    /// Each row's `(column, value)` pairs, in payload order.
+    pub rows: Vec<Vec<(String, Value)>>,
+    /// The payload was `{rows:[...]}`: the reply names every row, and a
+    /// refusal names the row's index.
+    pub bulk: bool,
+    pub upsert: bool,
+}
+
+/// Parse an append payload: one column map (`{col: value, …}`), or
+/// `{rows:[{…}, …]}`, either beside an optional `upsert: true`.
+///
+/// `rows` is the bulk form only when its value is an array, which no column
+/// can hold, so a table with a column called `rows` still appends it. `upsert`
+/// is always the flag; a table with a column of that name writes it through
+/// `?sql=`, and the append says so rather than reading the flag as data.
+pub(crate) fn parse_append(
+    shape: &TableShape,
+    mut payload: serde_json::Map<String, serde_json::Value>,
+) -> Result<AppendRows, String> {
+    let upsert = match payload.remove(UPSERT_KEY) {
+        None => false,
+        Some(_) if shape.column(UPSERT_KEY).is_some() => {
+            return Err(format!(
+                "`{}` has a column named `{UPSERT_KEY}`, which the append flag of that name would shadow; write that column through ?sql=",
+                shape.table
+            ));
+        }
+        Some(serde_json::Value::Bool(flag)) => flag,
+        Some(_) => return Err(format!("payload.{UPSERT_KEY} is true or false")),
+    };
+    let bulk = matches!(payload.get(ROWS_KEY), Some(serde_json::Value::Array(_)));
+    let maps: Vec<serde_json::Map<String, serde_json::Value>> = if bulk {
+        let Some(serde_json::Value::Array(rows)) = payload.remove(ROWS_KEY) else {
+            unreachable!("bulk means payload.rows is an array");
+        };
+        if let Some(stray) = payload.keys().next() {
+            return Err(format!(
+                "a bulk append's payload is {{rows:[...], upsert?}}; `{stray}` belongs inside each row"
+            ));
+        }
+        if rows.is_empty() {
+            return Err("payload.rows is empty: a bulk append names at least one row".to_string());
+        }
+        if rows.len() > APPEND_ROWS_MAX {
+            return Err(format!(
+                "payload.rows holds {} rows; one append inserts at most {APPEND_ROWS_MAX}, so split it into several appends",
+                rows.len()
+            ));
+        }
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, row)| match row {
+                serde_json::Value::Object(map) => Ok(map),
+                _ => Err(format!(
+                    "rows[{index}] is not a column map {{column: value, ...}}"
+                )),
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        vec![payload]
+    };
+    let rows = maps
+        .iter()
+        .enumerate()
+        .map(|(index, map)| {
+            payload_columns(shape, map, PayloadUse::Insert).map_err(|error| {
+                if bulk {
+                    format!("rows[{index}]: {error}")
+                } else {
+                    error
+                }
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(AppendRows { rows, bulk, upsert })
+}
+
+/// One insert (or upsert) statement per row of an append, in row order.
+pub(crate) fn append_sql(
+    shape: &TableShape,
+    append: &AppendRows,
+) -> Result<Vec<(String, Vec<Value>)>, String> {
+    append
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(index, columns)| {
+            if append.upsert {
+                upsert_sql(shape, columns).map_err(|error| {
+                    if append.bulk {
+                        format!("rows[{index}]: {error}")
+                    } else {
+                        error
+                    }
+                })
+            } else {
+                Ok(insert_sql(shape, columns))
+            }
+        })
+        .collect()
 }
 
 /// The text a primary-key value takes as a URI segment. Null and blob keys
@@ -1023,7 +1360,7 @@ pub(crate) fn table_affordance(
         .unwrap_or_default();
 
     let mut actions = vec![ActionSpec {
-        label: "read rows (columns below; filter with where=COLUMN=VALUE)".to_string(),
+        label: format!("read rows (columns below; filter with where= {WHERE_FORMS})"),
         mode: "read".to_string(),
         uri_template: collection.clone(),
         uri: Some(collection.clone()),
@@ -1055,8 +1392,17 @@ pub(crate) fn table_affordance(
         } else {
             required.clone()
         };
+        let upsert_guidance = if key_columns(shape).is_empty() {
+            format!("; this table has no primary key, so {UPSERT_KEY}:true is refused")
+        } else {
+            format!(
+                "; add {UPSERT_KEY}:true to update the given columns of a row whose primary key exists, leaving its other columns as stored (the row still names every required column, which SQLite checks before the key conflict)"
+            )
+        };
         actions.push(ActionSpec {
-            label: "insert one row; the reply carries its URI".to_string(),
+            label: format!(
+                "insert one row, or {{{ROWS_KEY}:[...]}} for up to {APPEND_ROWS_MAX} in one transaction; the reply carries each row's URI"
+            ),
             mode: ChangeMode::Append.as_str().to_string(),
             uri_template: collection.clone(),
             uri: Some(collection.clone()),
@@ -1072,7 +1418,7 @@ pub(crate) fn table_affordance(
                 "write({{changes:[{{target:\"{collection}\",mode:\"append\",payload:{}}}]}})",
                 example_payload(example_columns.into_iter())
             ),
-            guidance: None,
+            guidance: Some(upsert_guidance),
         });
         if let Some(pk) = pk {
             let patchable: Vec<&Column> = shape
@@ -1116,6 +1462,42 @@ pub(crate) fn table_affordance(
                 guidance: None,
             });
         }
+        let scoped = format!("{collection}?where={first_filter}=...");
+        let filterable: Vec<&Column> = shape
+            .columns
+            .iter()
+            .filter(|column| pk.is_none_or(|pk| pk.name != column.name))
+            .collect();
+        let where_guidance = format!(
+            "; where= in the target is required ({WHERE_FORMS}); a collection write without it is refused"
+        );
+        actions.push(ActionSpec {
+            label: "update columns of every row where= matches; the reply carries the count"
+                .to_string(),
+            mode: ChangeMode::Patch.as_str().to_string(),
+            uri_template: format!("{collection}?where=COLUMN=VALUE"),
+            uri: None,
+            required: Vec::new(),
+            optional: filterable
+                .iter()
+                .map(|column| column_key(shape, column))
+                .collect(),
+            example: format!(
+                "write({{changes:[{{target:\"{scoped}\",mode:\"patch\",payload:{}}}]}})",
+                example_payload(filterable.iter().copied().take(1))
+            ),
+            guidance: Some(where_guidance.clone()),
+        });
+        actions.push(ActionSpec {
+            label: "delete every row where= matches; the reply carries the count".to_string(),
+            mode: ChangeMode::Delete.as_str().to_string(),
+            uri_template: format!("{collection}?where=COLUMN=VALUE"),
+            uri: None,
+            required: Vec::new(),
+            optional: Vec::new(),
+            example: format!("write({{changes:[{{target:\"{scoped}\",mode:\"delete\"}}]}})"),
+            guidance: Some(where_guidance),
+        });
     }
     actions.extend(related);
     spec.actions = actions;
@@ -1171,11 +1553,11 @@ mod tests {
         assert_eq!(
             query.filters,
             vec![
-                (
+                Filter::Eq(
                     "problem".to_string(),
                     vec![Value::Text("two-sum".to_string())]
                 ),
-                ("created_at".to_string(), vec![Value::Integer(7)]),
+                Filter::Eq("created_at".to_string(), vec![Value::Integer(7)]),
             ]
         );
         let (sql, values) = query.select_page_sql(&attempts());
@@ -1189,7 +1571,230 @@ mod tests {
     #[test]
     fn a_where_value_may_itself_contain_equals() {
         let query = RowQuery::parse(&params("where=problem=a=b"), &attempts(), URI).unwrap();
-        assert_eq!(query.filters[0].1, vec![Value::Text("a=b".to_string())]);
+        assert_eq!(
+            query.filters[0],
+            Filter::Eq("problem".to_string(), vec![Value::Text("a=b".to_string())])
+        );
+        // A `!=` inside the value is data, not negation.
+        let query = RowQuery::parse(&params("where=problem=a!=b"), &attempts(), URI).unwrap();
+        assert_eq!(
+            query.filters[0],
+            Filter::Eq("problem".to_string(), vec![Value::Text("a!=b".to_string())])
+        );
+    }
+
+    #[test]
+    fn where_reads_null_and_negation_and_a_null_passes_a_negated_value() {
+        let query = RowQuery::parse(
+            &params("where=lang=null&where=problem!=two-sum&where=created_at!=null"),
+            &attempts(),
+            URI,
+        )
+        .unwrap();
+        assert_eq!(
+            query.filters,
+            vec![
+                Filter::IsNull("lang".to_string()),
+                Filter::Ne(
+                    "problem".to_string(),
+                    vec![Value::Text("two-sum".to_string())]
+                ),
+                Filter::NotNull("created_at".to_string()),
+            ]
+        );
+        let (sql, values) = query.count_sql(&attempts());
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM \"attempts\" WHERE \"lang\" IS NULL AND (\"problem\" IS NULL OR NOT (\"problem\" = ?)) AND \"created_at\" IS NOT NULL"
+        );
+        assert_eq!(values, vec![Value::Text("two-sum".to_string())]);
+        assert_eq!(
+            query.describe_filters(),
+            " where lang is null and problem != two-sum and created_at is not null"
+        );
+        let error = RowQuery::parse(&params("where=nope!=1"), &attempts(), URI).unwrap_err();
+        assert!(error.contains("no column `nope`"), "{error}");
+    }
+
+    #[test]
+    fn a_negated_untyped_value_excludes_both_of_its_readings() {
+        let shape = TableShape {
+            table: "kv".to_string(),
+            columns: vec![
+                column("k", "", false, None, 1),
+                column("score", "", false, None, 0),
+            ],
+        };
+        let query = RowQuery::parse(&params("where=score!=5"), &shape, URI).unwrap();
+        let (sql, values) = query.count_sql(&shape);
+        assert!(
+            sql.ends_with("WHERE (\"score\" IS NULL OR NOT (\"score\" IN (?, ?)))"),
+            "{sql}"
+        );
+        assert_eq!(values, vec![Value::Integer(5), Value::Text("5".into())]);
+    }
+
+    #[test]
+    fn filtered_writes_take_only_where_and_need_one() {
+        let shape = attempts();
+        let filters =
+            parse_write_filters(&params("where=lang=null"), &shape, URI, "delete").unwrap();
+        assert_eq!(
+            delete_where_sql(&shape, &filters).0,
+            "DELETE FROM \"attempts\" WHERE \"lang\" IS NULL"
+        );
+        let columns = vec![("lang".to_string(), Value::Text("go".into()))];
+        assert_eq!(
+            update_where_sql(&shape, &filters, &columns),
+            (
+                "UPDATE \"attempts\" SET \"lang\" = ? WHERE \"lang\" IS NULL".to_string(),
+                vec![Value::Text("go".into())]
+            )
+        );
+        let error = parse_write_filters(&[], &shape, URI, "delete").unwrap_err();
+        assert!(
+            error.contains(&format!("{URI}?where=COLUMN=VALUE")),
+            "{error}"
+        );
+        assert!(error.contains("Nothing was written"), "{error}");
+        let error =
+            parse_write_filters(&params("where=lang=x&limit=1"), &shape, URI, "patch").unwrap_err();
+        assert!(
+            error.contains("Unsupported query parameter 'limit'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn upsert_updates_only_the_given_columns_on_a_key_conflict() {
+        let shape = attempts();
+        let columns = vec![
+            ("id".to_string(), Value::Integer(7)),
+            ("problem".to_string(), Value::Text("two-sum".into())),
+        ];
+        assert_eq!(
+            upsert_sql(&shape, &columns).unwrap(),
+            (
+                "INSERT INTO \"attempts\"(\"id\", \"problem\") VALUES(?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"problem\" = excluded.\"problem\" RETURNING \"id\"".to_string(),
+                vec![Value::Integer(7), Value::Text("two-sum".into())]
+            )
+        );
+        let error = upsert_sql(&shape, &columns[1..]).unwrap_err();
+        assert!(error.contains("names `id`"), "{error}");
+        // `problem` is NOT NULL without a default, so even a conflicting
+        // upsert row has to name it.
+        let error = upsert_sql(&shape, &columns[..1]).unwrap_err();
+        assert!(error.contains("names `problem`"), "{error}");
+        // Naming only the key still returns the row on a conflict.
+        let nullable = TableShape {
+            table: "seen".to_string(),
+            columns: vec![
+                column("id", "INTEGER", false, None, 1),
+                column("at", "INTEGER", false, None, 0),
+            ],
+        };
+        assert!(upsert_sql(&nullable, &columns[..1])
+            .unwrap()
+            .0
+            .contains("DO UPDATE SET \"id\" = excluded.\"id\" RETURNING"));
+
+        let keyless = TableShape {
+            table: "log".to_string(),
+            columns: vec![column("line", "TEXT", false, None, 0)],
+        };
+        let error = upsert_sql(&keyless, &[]).unwrap_err();
+        assert!(error.contains("has no primary key"), "{error}");
+
+        let pairs = TableShape {
+            table: "pairs".to_string(),
+            columns: vec![
+                column("b", "TEXT", false, None, 2),
+                column("a", "TEXT", false, None, 1),
+                column("n", "INTEGER", false, None, 0),
+            ],
+        };
+        let (sql, _) = upsert_sql(
+            &pairs,
+            &[
+                ("a".to_string(), Value::Text("x".into())),
+                ("b".to_string(), Value::Text("y".into())),
+                ("n".to_string(), Value::Integer(1)),
+            ],
+        )
+        .unwrap();
+        assert!(
+            sql.ends_with("ON CONFLICT(\"a\", \"b\") DO UPDATE SET \"n\" = excluded.\"n\""),
+            "a composite key conflicts on its columns in key order and returns nothing: {sql}"
+        );
+    }
+
+    #[test]
+    fn an_append_is_one_row_or_a_capped_array_of_rows_and_names_the_bad_one() {
+        let shape = attempts();
+        let object = |value: serde_json::Value| value.as_object().unwrap().clone();
+        let single = parse_append(&shape, object(serde_json::json!({"problem": "x"}))).unwrap();
+        assert_eq!(
+            (single.rows.len(), single.bulk, single.upsert),
+            (1, false, false)
+        );
+
+        let bulk = parse_append(
+            &shape,
+            object(
+                serde_json::json!({"rows": [{"problem": "a"}, {"problem": "b"}], "upsert": true}),
+            ),
+        )
+        .unwrap();
+        assert_eq!((bulk.rows.len(), bulk.bulk, bulk.upsert), (2, true, true));
+        let error = append_sql(&shape, &bulk).unwrap_err();
+        assert!(error.starts_with("rows[0]: upsert matches"), "{error}");
+
+        let error = parse_append(
+            &shape,
+            object(serde_json::json!({"rows": [{"problem": "a"}, {"nope": 1}]})),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("rows[1]: ") && error.contains("no column `nope`"),
+            "{error}"
+        );
+        let error = parse_append(&shape, object(serde_json::json!({"rows": [{}, 3]}))).unwrap_err();
+        assert!(error.starts_with("rows[1] is not a column map"), "{error}");
+        let error = parse_append(
+            &shape,
+            object(serde_json::json!({"rows": [{"problem": "a"}], "problem": "b"})),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("`problem` belongs inside each row"),
+            "{error}"
+        );
+        let error = parse_append(&shape, object(serde_json::json!({"rows": []}))).unwrap_err();
+        assert!(error.contains("empty"), "{error}");
+        let many = vec![serde_json::json!({"problem": "a"}); APPEND_ROWS_MAX + 1];
+        let error = parse_append(&shape, object(serde_json::json!({ "rows": many }))).unwrap_err();
+        assert!(
+            error.contains(&format!("at most {APPEND_ROWS_MAX}")),
+            "{error}"
+        );
+        let error = parse_append(
+            &shape,
+            object(serde_json::json!({"problem": "a", "upsert": 1})),
+        )
+        .unwrap_err();
+        assert!(error.contains("true or false"), "{error}");
+
+        // A column called `upsert` is shadowed by the flag, and says so.
+        let flagged = TableShape {
+            table: "flags".to_string(),
+            columns: vec![
+                column("id", "INTEGER", false, None, 1),
+                column("upsert", "INTEGER", false, None, 0),
+            ],
+        };
+        let error =
+            parse_append(&flagged, object(serde_json::json!({"upsert": true}))).unwrap_err();
+        assert!(error.contains("would shadow"), "{error}");
     }
 
     #[test]
@@ -1255,7 +1860,7 @@ mod tests {
             "{error}"
         );
         let error = RowQuery::parse(&params("where=problem"), &attempts(), URI).unwrap_err();
-        assert!(error.contains("COLUMN=VALUE"), "{error}");
+        assert!(error.contains("COL=VALUE, COL!=VALUE"), "{error}");
         let error = RowQuery::parse(&params("format=csv"), &attempts(), URI).unwrap_err();
         assert!(error.contains("format"), "{error}");
     }

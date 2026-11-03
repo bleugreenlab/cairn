@@ -715,6 +715,9 @@ pub(crate) struct CheckStatusBoard {
     entries: Arc<std::sync::Mutex<Vec<CheckStatusEntry>>>,
     phase: Arc<std::sync::Mutex<CheckPhaseStatus>>,
     notify: CheckStatusNotify,
+    /// Whether the check engine, not the executor's per-item report, owns
+    /// this board's verdicts. See [`Self::for_review_wave`].
+    engine_owned: bool,
 }
 
 impl CheckStatusBoard {
@@ -730,12 +733,46 @@ impl CheckStatusBoard {
                         state: "pending".into(),
                         annotation: None,
                         cached: false,
+                        since_unix_ms: None,
                     })
                     .collect(),
             )),
             phase: Arc::new(std::sync::Mutex::new(CheckPhaseStatus::default())),
             notify,
+            engine_owned: false,
         }
+    }
+
+    /// The board a turn-end review wave publishes while it runs, indexed by
+    /// plan position like the wave's stream ids.
+    ///
+    /// Its verdicts belong to the check engine, which records them only when
+    /// the whole batch returns: an item the executor stopped (a silent tree, a
+    /// cancel) is a non-verdict whatever its exit code says. So an executor's
+    /// per-item completion marks a lane `finished`, an interim state annotated
+    /// with its exit and duration, never `passed` or `failed`. `on_change` runs
+    /// after every transition.
+    pub(crate) fn for_review_wave(
+        plans: &[(CheckPlan, String)],
+        on_change: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let mut board = Self::new(plans, Arc::new(move |_, _| on_change()));
+        board.engine_owned = true;
+        board
+    }
+
+    pub(crate) fn engine_owns_verdicts(&self) -> bool {
+        self.engine_owned
+    }
+
+    /// Every lane's current entry, in plan order.
+    pub(crate) fn snapshot(&self) -> Vec<CheckStatusEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    /// The machine that claimed the batch, once one has.
+    pub(crate) fn executor(&self) -> Option<String> {
+        self.phase.lock().unwrap().executor.clone()
     }
 
     fn emit(&self) {
@@ -766,6 +803,11 @@ impl CheckStatusBoard {
         {
             let mut entries = self.entries.lock().unwrap();
             if let Some(entry) = entries.get_mut(index) {
+                // Stamped on a change of state only: every output chunk re-marks
+                // a lane `running`, and that must not restart its clock.
+                if entry.state != state || entry.since_unix_ms.is_none() {
+                    entry.since_unix_ms = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+                }
                 entry.state = state.to_string();
                 entry.annotation = annotation;
                 entry.cached = cached;
@@ -4235,6 +4277,13 @@ async fn submit_single_planned_check_batch(
                 request.clone(),
                 items,
                 batch.run_context,
+                // Only a board whose verdicts the engine owns takes the
+                // executor's per-item reports; any other pure-verdict board
+                // would read an exit code as a verdict.
+                batch
+                    .status_board
+                    .clone()
+                    .filter(CheckStatusBoard::engine_owns_verdicts),
                 batch.purpose,
             )
         });
@@ -9229,7 +9278,7 @@ pub(crate) async fn head_verdicts_conn(
 // identity, plan set, spawn closure, live-status notifier); grouping them into a
 // struct would only add indirection here.
 #[allow(clippy::too_many_arguments)]
-async fn run_planned_checks_with_board<F, Fut, N, E>(
+pub(crate) async fn run_planned_checks_with_board<F, Fut, N, E>(
     db: Arc<LocalDb>,
     project_id: &str,
     commit: CheckRunCommit<'_>,
@@ -12286,6 +12335,7 @@ mod tests {
             state: state.into(),
             annotation: None,
             cached: false,
+            since_unix_ms: None,
         }
     }
 

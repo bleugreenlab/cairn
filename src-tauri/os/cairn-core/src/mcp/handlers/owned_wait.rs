@@ -1151,6 +1151,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         let statuses = vec![
             lane("rust-lint", NodeCheckState::Pending),

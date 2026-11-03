@@ -676,6 +676,7 @@ fn lane(
         }),
         notice: None,
         declared_unverified: None,
+        progress: None,
     }
 }
 

@@ -15,13 +15,14 @@ use crate::execution::checks::{
     CheckFailureKind,
 };
 use crate::execution::checks_turn_end::{
-    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started, JobCoords, WavePlan,
+    read_turn_end_log_tail, resolve_job_coords, JobCoords, WavePlan,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
 };
 use crate::execution::selection::plan_checks;
 use crate::jj::{logical_changed_files, logical_tree_hash, own_patch_against, OwnPatch};
+use crate::mcp::handlers::run::CheckStatusEntry;
 use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -657,6 +658,7 @@ pub(crate) fn test_status(
         verified_on: None,
         notice: None,
         declared_unverified: None,
+        progress: None,
     }
 }
 
@@ -774,6 +776,110 @@ pub struct NodeCheckStatus {
     /// ([`ParsedCheckResult::unverified`]), worded as every surface shows it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) declared_unverified: Option<String>,
+    /// What this lane of an in-flight review wave is doing, read from the
+    /// wave's own status board. `None` outside a running wave, and once the
+    /// lane holds a verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) progress: Option<LaneProgress>,
+}
+
+/// Where one member of a running review wave stands. The members run in order
+/// in one cell, so at most one is `running`; the rest have `finished` (and
+/// wait for the wave to record them) or are `queued` behind it. A member whose
+/// question another request was already answering is `shared`: that
+/// execution's reports go to its own leader, not this wave.
+///
+/// Times rather than ages, so a cached projection stays true; surfaces render
+/// the age when they show it ([`LaneProgress::describe`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "phase")]
+pub(crate) enum LaneProgress {
+    #[serde(rename_all = "camelCase")]
+    Running { since_unix_ms: Option<u64> },
+    #[serde(rename_all = "camelCase")]
+    Finished {
+        since_unix_ms: Option<u64>,
+        annotation: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Queued { behind: Option<String> },
+    #[serde(rename_all = "camelCase")]
+    Shared { request_id: Option<String> },
+}
+
+impl LaneProgress {
+    /// Whether the lane has left the queue.
+    fn is_started(&self) -> bool {
+        !matches!(self, Self::Queued { .. })
+    }
+
+    /// The lane's line, at `now_unix_ms`.
+    pub(crate) fn describe(&self, now_unix_ms: u64) -> String {
+        match self {
+            Self::Running {
+                since_unix_ms: Some(since),
+            } => format!(
+                "running for {}",
+                human_duration(now_unix_ms.saturating_sub(*since))
+            ),
+            Self::Running {
+                since_unix_ms: None,
+            } => "running".to_string(),
+            Self::Finished {
+                annotation: Some(annotation),
+                ..
+            } => annotation.clone(),
+            Self::Finished { .. } => "finished; recorded when the wave ends".to_string(),
+            Self::Queued { behind: Some(name) } => format!("queued behind {name}"),
+            Self::Queued { behind: None } => "queued".to_string(),
+            Self::Shared {
+                request_id: Some(id),
+            } => format!("answered by a shared execution (request {id})"),
+            Self::Shared { request_id: None } => "answered by a shared execution".to_string(),
+        }
+    }
+}
+
+/// A review lane's progress from its wave's board, or `None` when the board
+/// has no entry for it.
+pub(crate) fn wave_lane_progress(
+    board: &[CheckStatusEntry],
+    name: &str,
+    request_id: Option<&String>,
+) -> Option<LaneProgress> {
+    let entry = board.iter().find(|entry| entry.name == name)?;
+    Some(match entry.state.as_str() {
+        "running" => LaneProgress::Running {
+            since_unix_ms: entry.since_unix_ms,
+        },
+        // A terminal board state means the engine has recorded the lane and
+        // its row is about to be read; until then it reads as finished.
+        "finished" | "passed" | "failed" | "unverified" => LaneProgress::Finished {
+            since_unix_ms: entry.since_unix_ms,
+            annotation: (entry.state == "finished")
+                .then(|| entry.annotation.clone())
+                .flatten(),
+        },
+        "shared" => LaneProgress::Shared {
+            request_id: request_id.cloned(),
+        },
+        _ => LaneProgress::Queued {
+            behind: board
+                .iter()
+                .find(|other| other.state == "running")
+                .map(|other| other.name.clone()),
+        },
+    })
+}
+
+/// A duration as a reader wants it: `42s`, `4m 12s`, `15h 41m`.
+pub(crate) fn human_duration(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60),
+    }
 }
 
 /// The head, and the fork point it was on, that a lane's verdict was recorded
@@ -843,6 +949,7 @@ fn unsupported_lanes<'a>(
             verified_on: None,
             notice: Some(check.notice.clone()),
             declared_unverified: None,
+            progress: None,
         }
     })
 }
@@ -967,6 +1074,7 @@ async fn live_statuses(
             None,
             &orch.recent_turn_end_check_request_ids(job_id),
             cadence,
+            None,
         );
         return Some(with_unsupported_lanes(
             statuses,
@@ -1013,6 +1121,11 @@ async fn live_statuses(
         Some(&plan.applicable_names),
         &status.request_ids,
         cadence,
+        status
+            .board
+            .as_ref()
+            .map(crate::execution::checks::CheckStatusBoard::snapshot)
+            .as_deref(),
     );
     Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
 }
@@ -1142,6 +1255,7 @@ async fn retired_statuses(
         Some(&plan.applicable_names),
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
+        None,
     );
     Some(with_unsupported_lanes(statuses, job_id, &plan.unsupported))
 }
@@ -1338,6 +1452,7 @@ async fn settled_statuses(
         applicable_names.as_ref(),
         &orch.recent_turn_end_check_request_ids(job_id),
         cadence,
+        None,
     );
     Some(with_unsupported_lanes(
         statuses,
@@ -1362,8 +1477,10 @@ struct LaneVerdicts {
 
 /// One status row per configured check, in name order, from what the branch
 /// resolved: the verdicts that answered its lanes, which checks apply (`None`
-/// when that could not be decided), and the fabric request each lane was
-/// submitted as.
+/// when that could not be decided), the fabric request each lane was
+/// submitted as, and the running review wave's board, once it has published
+/// one.
+#[allow(clippy::too_many_arguments)]
 fn assemble_statuses(
     orch: &Orchestrator,
     job_id: &str,
@@ -1372,6 +1489,7 @@ fn assemble_statuses(
     applicable_names: Option<&HashSet<String>>,
     request_ids: &HashMap<String, String>,
     cadence: WaveCadence,
+    wave_board: Option<&[CheckStatusEntry]>,
 ) -> Vec<NodeCheckStatus> {
     let LaneVerdicts {
         rows: rows_by_name,
@@ -1419,19 +1537,22 @@ fn assemble_statuses(
                 return status;
             }
 
-            // Turn-end review checks run CONCURRENTLY in isolated COW clones
-            // (or sequentially in the shared worktree on the clone-unavailable
-            // fallback), each into its OWN log file created the instant it
-            // starts. Existence of that file — not a non-empty tail — is the
-            // RUNNING signal, so a silent-but-active check is not mistaken for a
-            // queued one; under isolation several checks read as running at
-            // once, while a not-yet-started (or fallback-queued) check has no
-            // file yet and stays pending. The tail is read separately and is
-            // None while a running check has yet to emit.
-            let started = (cadence.review && check.when == CheckWhen::Review
-                || cadence.write && check.when == CheckWhen::Write)
-                && !not_applicable
-                && (cadence.write || turn_end_check_started(orch, job_id, &name));
+            // A review wave's members run IN ORDER in one cell, and the wave's
+            // own board says which one the executor is running, which have
+            // finished, and which wait behind it. So at most one review lane
+            // reads as running, and a silent-but-active member still does,
+            // because the executor reported its start. Before the wave has
+            // published a board (still planning or deferring), every review
+            // lane is pending. A running write wave carries no per-lane
+            // board here, so its lanes read as running together.
+            let progress = (cadence.review && check.when == CheckWhen::Review && !not_applicable)
+                .then(|| {
+                    wave_board
+                        .and_then(|board| wave_lane_progress(board, &name, request_ids.get(&name)))
+                })
+                .flatten();
+            let started = (cadence.write && check.when == CheckWhen::Write && !not_applicable)
+                || progress.as_ref().is_some_and(LaneProgress::is_started);
 
             let state = match lane_evidence(false, not_applicable, started) {
                 LaneEvidence::NotApplicable => NodeCheckState::NotApplicable,
@@ -1475,6 +1596,7 @@ fn assemble_statuses(
                 verified_on: None,
                 notice: None,
                 declared_unverified: None,
+                progress,
             }
         })
         .collect()
@@ -1668,6 +1790,7 @@ fn status_from_row(
         verified_on: None,
         notice: None,
         declared_unverified: parsed.and_then(|p| p.unverified),
+        progress: None,
     }
 }
 
@@ -3311,6 +3434,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3377,6 +3501,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3471,6 +3596,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3514,6 +3640,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3566,6 +3693,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3649,6 +3777,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),
@@ -3750,6 +3879,7 @@ mod tests {
             verified_on: None,
             notice: None,
             declared_unverified: None,
+            progress: None,
         };
         assert_eq!(
             format_status_annotation(&status).as_deref(),

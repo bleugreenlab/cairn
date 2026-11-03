@@ -198,7 +198,7 @@ pub(crate) const THREAD_DB_CONTRACT: ResourceContract = ResourceContract {
 pub(crate) const DB_TABLE_PROJECTIONS: &[ProjectionSpec] = &[
     ProjectionSpec {
         key: "where",
-        values: "COL=VALUE — equality filter, repeatable (AND); LIKE and ranges stay in ?sql=",
+        values: "COL=VALUE, COL!=VALUE, COL=null (IS NULL) or COL!=null (IS NOT NULL) — repeatable (AND); COL!=VALUE also matches a null; LIKE and ranges stay in ?sql=",
     },
     ProjectionSpec {
         key: "order",
@@ -227,7 +227,7 @@ pub(crate) const THREAD_DB_TABLE_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ThreadDbTable,
     uri_template: "cairn://p/{project}/{name}/db/{table}",
     name: "Thread database table",
-    description: "The rows of one table in this thread's database, each addressed by its own row URI when the table has a single-column primary key. Read with equality filters, ordering, and paging; append a column map to insert a row, and the reply carries the new row's URI (a generated key included). The affordance block lists the live columns, types, nullability, and primary key. The segment `schema` is reserved: read a table named `schema` with ?sql= or the database's ?table=schema.",
+    description: "The rows of one table in this thread's database, each addressed by its own row URI when the table has a single-column primary key. Read with where= filters, ordering, and paging. Append a column map to insert a row, and the reply carries the new row's URI (a generated key included); append {rows:[...]} to insert up to 1000 in one transaction, the reply naming each row in order; add upsert:true to update a row's given columns, leaving the rest, when its primary key already exists. Patch or delete the collection with where= in the target to change every matching row; the reply carries the count, and without where= the write is refused. The affordance block lists the live columns, types, nullability, and primary key. The segment `schema` is reserved: read a table named `schema` with ?sql= or the database's ?table=schema.",
     read_projections: DB_TABLE_PROJECTIONS,
     related: &[RelatedSpec {
         label: "database overview and queries",
@@ -235,13 +235,29 @@ pub(crate) const THREAD_DB_TABLE_CONTRACT: ResourceContract = ResourceContract {
         actions: true,
     }],
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: &[MutationSpec {
-        mode: ChangeMode::Append,
-        required: &[],
-        optional: &[],
-        label: "insert one row (payload is a column map)",
-        example: r#"write({changes:[{target:"cairn:~/db/TABLE",mode:"append",payload:{COLUMN:"value"}}]})"#,
-    }],
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[],
+            optional: &[],
+            label: "insert one row (payload is a column map), or many with {rows:[...]}; upsert:true updates the given columns on a primary-key conflict",
+            example: r#"write({changes:[{target:"cairn:~/db/TABLE",mode:"append",payload:{rows:[{COLUMN:"a"},{COLUMN:"b"}]}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[],
+            optional: &[],
+            label: "update columns of every row the target's where= matches (payload is a column map); the reply carries the count",
+            example: r#"write({changes:[{target:"cairn:~/db/TABLE?where=COLUMN=value",mode:"patch",payload:{COLUMN:"new"}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Delete,
+            required: &[],
+            optional: &[],
+            label: "delete every row the target's where= matches; the reply carries the count",
+            example: r#"write({changes:[{target:"cairn:~/db/TABLE?where=COLUMN=null",mode:"delete"}]})"#,
+        },
+    ],
 };
 
 pub(crate) const THREAD_DB_ROW_CONTRACT: ResourceContract = ResourceContract {

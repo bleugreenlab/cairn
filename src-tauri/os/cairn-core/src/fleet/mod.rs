@@ -11234,6 +11234,7 @@ impl Fleet {
         request: CellRequest,
         items: Vec<PureVerdictBatchItem>,
         run_context: Option<crate::mcp::handlers::RunContext>,
+        check_status_board: Option<crate::execution::checks::CheckStatusBoard>,
         purpose: Option<purpose::PurposeKey>,
     ) -> Vec<CoalescedDelivery> {
         if request.mutation_policy != MutationPolicy::PureVerdict {
@@ -11356,6 +11357,13 @@ impl Fleet {
                 if opened {
                     keys.push(key);
                     newly_claimed.push(item);
+                } else if let Some(board) = &check_status_board {
+                    // Answered by an execution another leader opened, whose
+                    // per-item reports go to that leader. Say so, rather than
+                    // leave the lane reading as queued until the batch returns.
+                    if let Some(index) = check_index_from_stream_id(&item.process.stream_id) {
+                        board.transition(index, "shared", None);
+                    }
                 }
                 receivers.push((public_identity, rx));
             }
@@ -11395,25 +11403,30 @@ impl Fleet {
             );
             let coalesced_output = output_guard::RelayedOutput::shared();
             let flushed_context = run_context.clone();
-            let runner_context_id = run_context.map(|run_context| {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.runner_contexts.lock().unwrap().insert(
-                    id.clone(),
-                    RunnerContextEntry::new(
-                        &id,
-                        &request.request_id,
-                        RunnerCallbackContext {
-                            request: None,
-                            run_context: Some(run_context),
-                            check_status_board: None,
-                            live_checkout: false,
-                            executor_binding: None,
-                            output: coalesced_output.clone(),
-                        },
-                    ),
-                );
-                id
-            });
+            // A context exists only for someone to call back to: a run that
+            // relays the batch's output, or a board that narrates its members.
+            // The executor sends its per-item start and completion reports only
+            // to a batch that names one.
+            let runner_context_id =
+                (run_context.is_some() || check_status_board.is_some()).then(|| {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    self.runner_contexts.lock().unwrap().insert(
+                        id.clone(),
+                        RunnerContextEntry::new(
+                            &id,
+                            &request.request_id,
+                            RunnerCallbackContext {
+                                request: None,
+                                run_context,
+                                check_status_board,
+                                live_checkout: false,
+                                executor_binding: None,
+                                output: coalesced_output.clone(),
+                            },
+                        ),
+                    );
+                    id
+                });
             let batch = Self::check_process_batch(
                 newly_claimed.into_iter().map(|item| item.process).collect(),
                 runner_context_id.clone(),
@@ -11847,7 +11860,27 @@ impl Fleet {
                 duration_ms,
                 ..
             } => {
-                if let Some(board) = context.check_status_board {
+                if let Some(board) = context
+                    .check_status_board
+                    .as_ref()
+                    .filter(|board| board.engine_owns_verdicts())
+                {
+                    if let Some(index) = check_index_from_stream_id(&stream_id) {
+                        let exit = match exit_code {
+                            Some(code) => format!("exit {code}"),
+                            None if timed_out => "timed out".into(),
+                            None => "no exit code".into(),
+                        };
+                        board.transition(
+                            index,
+                            "finished",
+                            Some(format!(
+                                "finished in {} ({exit}); recorded when the wave ends",
+                                crate::execution::checks_status::human_duration(duration_ms)
+                            )),
+                        );
+                    }
+                } else if let Some(board) = context.check_status_board {
                     if let Some(index) = check_index_from_stream_id(&stream_id) {
                         let annotation = if succeeded {
                             Some(format_duration_annotation(duration_ms))
@@ -37047,7 +37080,7 @@ mod tests {
                 tokio::select! {
                     _ = wave_orch
                         .fleet
-                        .submit_pure_verdict_batch(&wave_orch, request, items, None, None) => {
+                        .submit_pure_verdict_batch(&wave_orch, request, items, None, None, None) => {
                         panic!("the wave is cancelled before its check settles")
                     }
                     _ = wave_cancelled => {}
@@ -37065,7 +37098,7 @@ mod tests {
         let follower = tokio::spawn(async move {
             follower_orch
                 .fleet
-                .submit_pure_verdict_batch(&follower_orch, request, items, None, None)
+                .submit_pure_verdict_batch(&follower_orch, request, items, None, None, None)
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -37161,6 +37194,218 @@ mod tests {
                 .iter()
                 .map(|delivery| delivery.as_ref().map(|delivered| &delivered.outcome))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// cairn/4690. A review wave's members run in order in one cell. The
+    /// executor reports each one's start and finish to the wave's engine-owned
+    /// board, so while the batch is open a reader sees the member that is
+    /// running, for how long, and the ones queued behind it. A finish is never a
+    /// verdict: the member the executor stopped as silent exits non-zero, and
+    /// its lane reads `finished` with that exit until the engine records it as
+    /// the non-verdict it is. The stop itself reaches the engine with the
+    /// member's outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_review_waves_board_follows_its_members_one_at_a_time() {
+        use cairn_common::executor_protocol::{
+            CommandStop, ProcessBatchItemOutcome, RunnerCallback,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        let names = ["fast-a", "silent", "fast-b"];
+        let plans: Vec<_> = names
+            .iter()
+            .map(|name| {
+                (
+                    crate::execution::selection::CheckPlan {
+                        name: name.to_string(),
+                        applies: true,
+                        command: "true".into(),
+                        scope: crate::execution::selection::CheckScope::Full,
+                        resource_class: crate::config::project_settings::CheckResourceClass::Shared,
+                        verdict_environment_names: Vec::new(),
+                        verdict_platforms: Vec::new(),
+                        verdict_runtime: Vec::new(),
+                        verdict_executor_ids: None,
+                        config_error: None,
+                    },
+                    "input".to_string(),
+                )
+            })
+            .collect();
+        let board = crate::execution::checks::CheckStatusBoard::for_review_wave(&plans, || {});
+        let mut request = provenance_request();
+        request.request_id = "wave".into();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        request.wait_horizon_unix_ms = unix_time_ms() + 60_000;
+        let items: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| PureVerdictBatchItem {
+                result_identity: CheckResultIdentity::new("project", name, "input"),
+                process: ProcessBatchItem {
+                    header: name.to_string(),
+                    stream_id: format!("turn-checks:j-prod:check-{index}"),
+                    ..cache_batch_item(Vec::new())
+                },
+            })
+            .collect();
+        let wave_orch = orch.clone();
+        let wave_board = board.clone();
+        let wave = tokio::spawn(async move {
+            wave_orch
+                .fleet
+                .submit_pure_verdict_batch(&wave_orch, request, items, None, Some(wave_board), None)
+                .await
+        });
+        let Some(ExecutorMessage::Offer { entry_id, .. }) = next_work_frame(&mut executor).await
+        else {
+            panic!("the wave is offered");
+        };
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Claim { entry_id },
+        );
+        let Some(ExecutorMessage::Granted {
+            request,
+            batch: Some(batch),
+            ..
+        }) = next_work_frame(&mut executor).await
+        else {
+            panic!("the wave is granted with its batch");
+        };
+        assert!(batch.sequential, "a wave's members run in order");
+        let context = batch
+            .runner_context_id
+            .clone()
+            .expect("a batch with a board names a context for its reports");
+        let states = || {
+            board
+                .snapshot()
+                .into_iter()
+                .map(|entry| entry.state)
+                .collect::<Vec<_>>()
+        };
+        let started = |index: usize| RunnerCallback::ProcessItemStarted {
+            runner_context_id: context.clone(),
+            stream_id: batch.items[index].stream_id.clone(),
+        };
+        let completed = |index: usize, exit: i32| RunnerCallback::ProcessItemCompleted {
+            runner_context_id: context.clone(),
+            stream_id: batch.items[index].stream_id.clone(),
+            succeeded: exit == 0,
+            exit_code: Some(exit),
+            timed_out: false,
+            duration_ms: 252_000,
+        };
+
+        orch.fleet.handle_runner_callback(&orch, started(0)).await;
+        assert_eq!(states(), ["running", "pending", "pending"]);
+        orch.fleet
+            .handle_runner_callback(&orch, completed(0, 0))
+            .await;
+        orch.fleet.handle_runner_callback(&orch, started(1)).await;
+        assert_eq!(states(), ["finished", "running", "pending"]);
+        let snapshot = board.snapshot();
+        assert_eq!(
+            snapshot[0].annotation.as_deref(),
+            Some("finished in 4m 12s (exit 0); recorded when the wave ends")
+        );
+        assert!(
+            snapshot[1].since_unix_ms.is_some(),
+            "the running member carries when it started"
+        );
+        // The executor stops the silent member; its leader exits non-zero.
+        orch.fleet
+            .handle_runner_callback(&orch, completed(1, 143))
+            .await;
+        orch.fleet.handle_runner_callback(&orch, started(2)).await;
+        assert_eq!(
+            states(),
+            ["finished", "finished", "running"],
+            "a stopped member's exit is not a verdict"
+        );
+        orch.fleet
+            .handle_runner_callback(&orch, completed(2, 0))
+            .await;
+
+        let outcome = |name: &str, exit: i32, stop: Option<CommandStop>| ProcessBatchItemOutcome {
+            header: name.into(),
+            body: "output".into(),
+            succeeded: exit == 0,
+            suspended: false,
+            images: Vec::new(),
+            exit_code: Some(exit),
+            timed_out: false,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            duration_ms: 1,
+            peak_rss_bytes: None,
+            cpu: None,
+            granted_units: None,
+            disk_delta_bytes: None,
+            sandbox_denials: Vec::new(),
+            tracked_modifications: None,
+            environment_fingerprint: String::new(),
+            verdict_platform: None,
+            verdict_arch: None,
+            toolchain_fingerprint: None,
+            verdict_environment_hash: None,
+            stop,
+            build_jobs: None,
+        };
+        let silent = CommandStop::Silent {
+            quiet_ms: 30 * 60 * 1_000,
+            last_output_unix_ms: None,
+            cpu_ms_in_window: Some(0),
+            storage_io_bytes_in_window: Some(0),
+            tree: Vec::new(),
+        };
+        let mut result = completed_for(&request, COLOCATED_EXECUTOR_ID, generation);
+        if let CellOutcome::Completed { output, .. } = &mut result {
+            *output = serde_json::to_string(&[
+                outcome("fast-a", 0, None),
+                outcome("silent", 143, Some(silent.clone())),
+                outcome("fast-b", 0, None),
+            ])
+            .unwrap();
+        }
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome: result,
+            },
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(10), wave)
+            .await
+            .expect("the wave is answered")
+            .unwrap();
+        assert_eq!(delivered.len(), 3);
+        assert!(
+            delivered.iter().all(Result::is_ok),
+            "every member is answered by the one execution"
+        );
+        assert_eq!(
+            states(),
+            ["finished", "finished", "finished"],
+            "only the engine moves a lane past finished"
+        );
+        assert!(
+            !orch
+                .fleet
+                .runner_contexts
+                .lock()
+                .unwrap()
+                .contains_key(&context),
+            "the wave's callback context settles with its batch"
         );
     }
 

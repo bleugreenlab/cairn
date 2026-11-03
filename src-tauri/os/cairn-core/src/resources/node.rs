@@ -725,7 +725,11 @@ pub(super) async fn read_node_checks(
             out.push('\n');
             out.push_str(section.trim_start_matches('\n'));
         }
-        None => out.push_str("\nNo turn-end check results yet for the current tree.\n"),
+        None => {
+            let why =
+                crate::execution::checks_turn_end::turn_end_checks_absence(orch, &job.id).await;
+            out.push_str(&format!("\n{why}\n"));
+        }
     }
     out
 }
@@ -761,7 +765,12 @@ pub(super) async fn read_task_checks(
             out.push('\n');
             out.push_str(section.trim_start_matches('\n'));
         }
-        None => out.push_str("\nNo turn-end check results yet for the current tree.\n"),
+        None => {
+            let why =
+                crate::execution::checks_turn_end::turn_end_checks_absence(orch, &task_job.id)
+                    .await;
+            out.push_str(&format!("\n{why}\n"));
+        }
     }
     out
 }

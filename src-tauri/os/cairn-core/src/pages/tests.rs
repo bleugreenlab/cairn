@@ -1414,6 +1414,94 @@ async fn a_page_write_outside_its_manifest_is_refused_whole_and_logged() {
 }
 
 #[tokio::test]
+async fn a_page_appends_many_rows_and_deletes_the_rows_a_where_names() {
+    let (orch, emitter) = seeded_for_writes().await;
+    let response = page_write(
+        &orch,
+        &write_request(json!({"changes": [insert("attempts", json!({"rows": [
+            {"problem": "a", "result": "ok"},
+            {"problem": "b"},
+            {"problem": "c"},
+        ]}))]})),
+        &operator(),
+    )
+    .await
+    .unwrap();
+    let report: Value = serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        report["applied"][0]["data"]["uris"],
+        json!([
+            format!("{ATTEMPTS}/1"),
+            format!("{ATTEMPTS}/2"),
+            format!("{ATTEMPTS}/3")
+        ]),
+        "{report}"
+    );
+    assert_eq!(attempt_count(&orch).await, 3);
+    // The call log names every row the bulk append wrote.
+    let (_, targets, _) = write_log(&orch).await.pop().unwrap();
+    assert_eq!(
+        targets,
+        json!([
+            format!("{ATTEMPTS}/1"),
+            format!("{ATTEMPTS}/2"),
+            format!("{ATTEMPTS}/3")
+        ])
+        .to_string()
+    );
+
+    let before = emitter.events_named("db-change").len();
+    let response = page_write(
+        &orch,
+        &write_request(json!({"changes": [
+            {"target": "cairn:~/db/attempts?where=result=null", "mode": "delete"}
+        ]})),
+        &operator(),
+    )
+    .await
+    .unwrap();
+    let report: Value = serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        report["applied"][0]["data"],
+        json!({"count": 2}),
+        "{report}"
+    );
+    assert_eq!(attempt_count(&orch).await, 1);
+    let announced: Vec<Value> = emitter.events_named("db-change").split_off(before);
+    assert!(
+        announced
+            .iter()
+            .any(|event| event["dbTable"] == "attempts" && event["action"] == "delete"),
+        "{announced:?}"
+    );
+
+    for (change, why) in [
+        (
+            json!({"target": "cairn:~/db/attempts?limit=1", "mode": "delete"}),
+            "only query is where=",
+        ),
+        (
+            json!({"target": "cairn:~/db/attempts?where=problem=a", "mode": "append", "payload": {"problem": "x"}}),
+            "mode `append`",
+        ),
+        (
+            json!({"target": "cairn:~/db/other?where=x=1", "mode": "delete"}),
+            "manifest.writes",
+        ),
+    ] {
+        let refused = page_write(
+            &orch,
+            &write_request(json!({"changes": [change.clone()]})),
+            &operator(),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains(why), "{change}: {refused}");
+    }
+    assert_eq!(attempt_count(&orch).await, 1);
+}
+
+#[tokio::test]
 async fn a_superseded_version_and_a_draft_cannot_write() {
     let (orch, _) = seeded_for_writes().await;
     write(
