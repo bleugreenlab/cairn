@@ -231,6 +231,7 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
     evict("codemap_cache", Eviction::InvalidatedCodemaps),
     evict("artifacts", Eviction::SupersededArcVersions).budget(768),
     evict("agent_waits", Eviction::SettledWaits).budget(64),
+    evict("codex_watchdog_lifecycle", Eviction::WatchdogLifecycle).budget(256),
     // Pruned by their own owners.
     owned_by(
         "runner_events",
@@ -370,12 +371,6 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
         "team_ordinary_admission_authority",
         "prepared_ordinary_launches",
     ),
-    undecided(
-        "codex_watchdog_lifecycle",
-        "cairn://p/cairn/harness",
-        "window: 30 days on created_at",
-    )
-    .budget(256),
     undecided(
         "execution_queue",
         "cairn/5543",
@@ -681,6 +676,12 @@ const ARC_CHAIN_BATCH: i64 = 64;
 /// it: a parked turn resumes within the batch ceiling (6 h) or at the next
 /// boot. A week is far past both.
 const SETTLED_WAIT_AGE_S: i64 = 7 * DAY_S;
+/// Routine watchdog evidence lasts a week; every other kind lasts a month.
+/// Both windows must exceed RECOVERY_SUCCESSOR_WINDOW_SECS (30 minutes):
+/// reserve_watchdog_successor counts recent successor_reserved rows to enforce
+/// the live recovery budget. Older evidence is forensic, not recovery state.
+const WATCHDOG_ROUTINE_AGE_S: i64 = 7 * DAY_S;
+const WATCHDOG_RECOVERY_AGE_S: i64 = 30 * DAY_S;
 /// Wait rows carry the settled batch's output: about 3 KB on average and up to
 /// 3.3 MB on the 11-02 database, so a typical write stays near 400 KB.
 const WAIT_PAGE_ROWS: usize = 128;
@@ -726,6 +727,14 @@ pub(crate) const HELD_TRANSFERRED_WAITS: &str = "SELECT w.rowid FROM permission_
      JOIN agent_waits w ON w.run_id = p.run_id AND w.tool_use_id = p.tool_use_id \
      WHERE p.status = 'pending' AND w.state = 'resolved' AND w.resolution_json = ?1";
 
+/// The covering age index bounds the read before the shortest window and
+/// evaluates kind without fetching payloads. No insertion-order assumption:
+/// watchdog timestamps can move backwards between adjacent rowids.
+pub(crate) const WATCHDOG_WALK: &str = "SELECT rowid FROM codex_watchdog_lifecycle \
+     WHERE created_at < ?1 AND (created_at < ?2 \
+     OR kind IN ('phase_transition', 'armed', 'disarmed')) \
+     ORDER BY created_at LIMIT ?3";
+
 /// One deleting rule of the evictor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Eviction {
@@ -747,11 +756,16 @@ pub enum Eviction {
     /// a deleted wait go with it by `prompts.mcp_wait_id`'s cascade: they
     /// belong to their wait, and a wait this old has none still open.
     SettledWaits,
+    /// Routine watchdog events older than seven days; all other kinds older
+    /// than thirty days, including any kinds added in the future.
+    WatchdogLifecycle,
 }
 
 impl Eviction {
-    /// Every rule, in the order a pass applies them: most reclaimed first.
-    pub const ALL: [Eviction; 6] = [
+    /// The initial order before budget-driven rotation. Watchdog evidence gets
+    /// the first runtime turn rather than waiting behind payload-heavy journals.
+    pub const ALL: [Eviction; 7] = [
+        Eviction::WatchdogLifecycle,
         Eviction::DoneOutbox,
         Eviction::TerminalStreams,
         Eviction::InvalidatedCodemaps,
@@ -768,6 +782,7 @@ impl Eviction {
             Eviction::InvalidatedCodemaps => "invalidated_codemaps",
             Eviction::SupersededArcVersions => "superseded_arc_versions",
             Eviction::SettledWaits => "settled_waits",
+            Eviction::WatchdogLifecycle => "watchdog_lifecycle",
         }
     }
 
@@ -780,6 +795,7 @@ impl Eviction {
             Eviction::InvalidatedCodemaps => &["codemap_cache"],
             Eviction::SupersededArcVersions => &["artifacts"],
             Eviction::SettledWaits => &["agent_waits"],
+            Eviction::WatchdogLifecycle => &["codex_watchdog_lifecycle"],
         }
     }
 
@@ -792,6 +808,7 @@ impl Eviction {
             Eviction::InvalidatedCodemaps => select_invalidated_codemaps(db, now, cursor).await?,
             Eviction::SupersededArcVersions => select_superseded_arcs(db, cursor).await?,
             Eviction::SettledWaits => select_settled_waits(db, now, cursor).await?,
+            Eviction::WatchdogLifecycle => select_watchdog_lifecycle(db, now).await?,
         };
         let select = started.elapsed();
         let rows = selection.rows();
@@ -1018,6 +1035,25 @@ async fn select_applied_search_outbox(
         })
         .await?;
     Ok(journal_page("search_outbox", rows, cutoff, cursor))
+}
+
+async fn select_watchdog_lifecycle(db: &LocalDb, now: i64) -> DbResult<Selection> {
+    let rowids = db
+        .query_all(
+            WATCHDOG_WALK,
+            (
+                now - WATCHDOG_ROUTINE_AGE_S,
+                now - WATCHDOG_RECOVERY_AGE_S,
+                PAGE_ROWS as i64,
+            ),
+            |row| row.i64(0),
+        )
+        .await?;
+    Ok(Selection {
+        done: rowids.len() < PAGE_ROWS,
+        deletes: vec![("codex_watchdog_lifecycle", rowids)],
+        ..Selection::default()
+    })
 }
 
 /// Terminal streams and their chunks, at most [`PAGE_ROWS`] rows in all. A

@@ -195,7 +195,20 @@ async fn every_selection_and_delete_seeks() {
         "idx_permission_requests_status",
     )
     .await;
+    assert_seeks(
+        &db,
+        WATCHDOG_WALK,
+        3,
+        "USING COVERING INDEX idx_codex_watchdog_lifecycle_retention",
+    )
+    .await;
+    let plan = query_plan(&db, WATCHDOG_WALK, 3).await;
+    assert!(
+        !plan.iter().any(|line| line.contains("SORTER")),
+        "{plan:#?}"
+    );
     for table in [
+        "codex_watchdog_lifecycle",
         "effect_outbox",
         "search_outbox",
         "message_streams",
@@ -335,7 +348,8 @@ async fn a_pass_folds_a_grown_log_and_ends_at_its_fold_budget() {
 #[tokio::test]
 async fn a_capped_pass_rotates_so_every_rule_gets_a_page() {
     let (_temp, db) = private_db().await;
-    seed_owners(&db).await;
+    seed_wait_owners(&db).await;
+    insert_watchdog(&db, "watchdog-old", "phase_transition", NOW - 8 * DAY_S).await;
     let old = NOW - 3 * 24 * HOUR;
     insert_outbox(&db, "done-old", "done", old, NOW - 2 * 24 * HOUR).await;
     insert_stream(&db, "finalized-old", "finalized", old, Some(old), 2).await;
@@ -356,16 +370,22 @@ async fn a_capped_pass_rotates_so_every_rule_gets_a_page() {
     };
     let first = run_pass(&db, NOW, budget, &mut state).await;
     assert_eq!(first.end, PassEnd::FoldBudget, "{first}");
-    assert_eq!(served(&first), vec!["done_outbox"], "{first}");
+    assert_eq!(served(&first), vec!["watchdog_lifecycle"], "{first}");
+    assert_eq!(first.rules[0].eviction, Eviction::WatchdogLifecycle);
 
     let second = run_pass(&db, NOW, budget, &mut state).await;
     assert_eq!(second.end, PassEnd::FoldBudget, "{second}");
+    assert_eq!(second.rules[0].eviction, Eviction::DoneOutbox, "{second}");
+    assert_eq!(served(&second), vec!["done_outbox"], "{second}");
+
+    let third = run_pass(&db, NOW, budget, &mut state).await;
+    assert_eq!(third.end, PassEnd::FoldBudget, "{third}");
     assert_eq!(
-        second.rules[0].eviction,
+        third.rules[0].eviction,
         Eviction::TerminalStreams,
-        "{second}"
+        "{third}"
     );
-    assert_eq!(served(&second), vec!["terminal_streams"], "{second}");
+    assert_eq!(served(&third), vec!["terminal_streams"], "{third}");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM message_streams").await, 0);
 }
 
@@ -965,10 +985,13 @@ async fn a_production_pass_over_an_empty_database_completes() {
     )
     .await;
     assert_eq!(report.end, PassEnd::Complete, "{report}");
-    assert!(report
-        .rules
-        .iter()
-        .all(|rule| rule.finished && rule.error.is_none()));
+    assert!(
+        report
+            .rules
+            .iter()
+            .all(|rule| rule.finished && rule.error.is_none()),
+        "{report}"
+    );
 }
 
 /// A rule's first page is folded alone; after that, a fold covers as many
@@ -1008,4 +1031,173 @@ fn quantiles_take_the_nearest_rank() {
     assert_eq!(quantile(&[], 0.5), 0);
     assert_eq!(quantile(&[5, 1, 3], 0.5), 3);
     assert_eq!(quantile(&[5, 1, 3], 0.99), 5);
+}
+
+fn watchdog_eviction() -> Eviction {
+    match retention_for("codex_watchdog_lifecycle").unwrap().rule {
+        Retention::Evict(rule) => rule,
+        other => panic!("watchdog lifecycle must be evicted, got {other:?}"),
+    }
+}
+
+async fn insert_watchdog(db: &LocalDb, id: &str, kind: &str, created_at: i64) {
+    db.execute(
+        "INSERT INTO codex_watchdog_lifecycle
+            (id, run_id, session_id, provider_turn_id, generation, kind, created_at)
+         VALUES (?1, 'r', 's', 'provider-turn', 'generation', ?2, ?3)",
+        (id.to_string(), kind.to_string(), created_at),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_uses_seven_days_for_noise_and_thirty_for_recovery() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let recovery = [
+        "expired",
+        "heartbeat",
+        "worker_panicked",
+        "worker_exited_unexpectedly",
+        "recovery_claimed",
+        "successor_reserved",
+        "successor_started",
+        "successor_failed",
+        "terminalization_succeeded",
+        "terminalization_failed",
+    ];
+    // Append in age order, as the production ledger does.
+    for (days, suffix) in [(31, "old"), (30, "boundary"), (8, "kept")] {
+        for kind in recovery {
+            insert_watchdog(&db, &format!("{kind}-{suffix}"), kind, NOW - days * DAY_S).await;
+        }
+    }
+    for kind in ["phase_transition", "armed", "disarmed"] {
+        for (days, suffix) in [(8, "old"), (7, "boundary"), (6, "kept")] {
+            insert_watchdog(&db, &format!("{kind}-{suffix}"), kind, NOW - days * DAY_S).await;
+        }
+    }
+    insert_watchdog(&db, "budget-window", "successor_reserved", NOW - 29 * 60).await;
+
+    let report = run(&db, UNBOUNDED, &[watchdog_eviction()]).await;
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert!(report.rules[0].finished, "{report}");
+    assert_eq!(report.rows(), recovery.len() + 3, "{report}");
+    let remaining = ids(&db, "SELECT id FROM codex_watchdog_lifecycle ORDER BY id").await;
+    assert_eq!(remaining.len(), 2 * recovery.len() + 7);
+    assert!(remaining.iter().all(|id| !id.ends_with("-old")));
+    assert!(remaining.contains(&"budget-window".to_string()));
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_handles_timestamp_reordering_within_a_page() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let cutoff = NOW - 7 * DAY_S;
+    insert_watchdog(&db, "new-first", "armed", cutoff + 1).await;
+    insert_watchdog(&db, "old-later", "phase_transition", cutoff - 36).await;
+    insert_watchdog(&db, "recovery-kept", "expired", cutoff - 36).await;
+
+    let report = run(&db, UNBOUNDED, &[watchdog_eviction()]).await;
+
+    assert_eq!(report.rows(), 1, "{report}");
+    assert_eq!(
+        ids(&db, "SELECT id FROM codex_watchdog_lifecycle ORDER BY id").await,
+        vec!["new-first", "recovery-kept"],
+    );
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_backlog_is_deleted_in_bounded_pages_and_passes() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    let kept = PAGE_ROWS + 3;
+    let expired = 3 * PAGE_ROWS + 17;
+    db.write(move |conn| {
+        Box::pin(async move {
+            for index in 0..kept + expired {
+                conn.execute(
+                    "INSERT INTO codex_watchdog_lifecycle
+                        (id, run_id, session_id, provider_turn_id, generation, kind, created_at)
+                     VALUES (?1, 'r', 's', 'provider-turn', 'generation', ?2, ?3)",
+                    (
+                        format!("watchdog-{index}"),
+                        if index < kept {
+                            "expired"
+                        } else {
+                            "phase_transition"
+                        },
+                        NOW - 8 * DAY_S,
+                    ),
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let rule = watchdog_eviction();
+    let budget = EvictorBudget {
+        pass_rows: PAGE_ROWS,
+        ..UNBOUNDED
+    };
+    let mut state = EvictorState::default();
+    let mut deleted = 0;
+    for pass in 0..4 {
+        let report = run_rules(&db, NOW, budget, &mut state, &[rule]).await;
+        assert_eq!(
+            report.end,
+            if pass < 3 {
+                PassEnd::RowBudget
+            } else {
+                PassEnd::Complete
+            },
+            "{report}"
+        );
+        assert!(report.rules[0].error.is_none(), "{report}");
+        assert!(report.rules[0].max_page_rows <= PAGE_ROWS, "{report}");
+        deleted += report.rows();
+    }
+    assert_eq!(deleted, expired);
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM codex_watchdog_lifecycle").await,
+        kept as i64
+    );
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_finds_old_rows_behind_a_full_page_of_recent_insertions() {
+    let (_temp, db) = private_db().await;
+    seed_wait_owners(&db).await;
+    db.write(|conn| {
+        Box::pin(async move {
+            for index in 0..PAGE_ROWS + 1 {
+                conn.execute(
+                    "INSERT INTO codex_watchdog_lifecycle
+                        (id, run_id, session_id, provider_turn_id, generation, kind, created_at)
+                     VALUES (?1, 'r', 's', 'provider-turn', 'generation', 'armed', ?2)",
+                    (format!("recent-{index}"), NOW),
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    insert_watchdog(&db, "late-routine", "phase_transition", NOW - 8 * DAY_S).await;
+    insert_watchdog(&db, "late-recovery", "expired", NOW - 31 * DAY_S).await;
+
+    let report = run(&db, UNBOUNDED, &[watchdog_eviction()]).await;
+
+    assert_eq!(report.end, PassEnd::Complete, "{report}");
+    assert_eq!(report.rows(), 2, "{report}");
+    assert_eq!(
+        count(&db, "SELECT count(*) FROM codex_watchdog_lifecycle").await,
+        (PAGE_ROWS + 1) as i64,
+    );
 }
