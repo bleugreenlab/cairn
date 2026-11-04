@@ -6865,6 +6865,16 @@ pub struct LearnedResourceEstimate {
 /// was, and it is the runner's own log and cadence message, never a frame. No
 /// frame, variant or field changes, and a runner talking to an older executor
 /// gets nothing wrong.
+///
+/// cairn/5922 does not move the number. Windows resolves managed tool wrappers
+/// through PATHEXT and installs the already-published npm tree with .cmd
+/// launchers. No frame, variant or field changes: the existing tool probe reports
+/// the copy that runs, and its existing provenance text names the manifest.
+/// A runner talking to an older executor gets nothing wrong: that executor
+/// still reports npm unavailable or host-provided as before, and placement uses
+/// that measured capability. An older runner already serves the same npm tree
+/// selection; the executor's local installation and spawn behavior need no new
+/// interpretation by either peer.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above

@@ -35,17 +35,21 @@ const PATH_SEP: char = ';';
 #[cfg(not(windows))]
 const PATH_SEP: char = ':';
 
-/// The suffix a bare program name takes before it names a file on this
-/// platform.
-///
-/// Windows resolves a bare `cargo` to `cargo.exe` and never to a file literally
-/// named `cargo`; Unix resolves it literally. A PATH lookup is therefore not one
-/// algorithm with a different separator, and treating it as one is how a
-/// diagnostic reports "not found" for a toolchain that is sitting right there.
-#[cfg(windows)]
-const EXECUTABLE_SUFFIX: &str = ".exe";
+/// cmd's default when the environment does not supply PATHEXT.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 #[cfg(not(windows))]
 const EXECUTABLE_SUFFIX: &str = "";
+
+fn executable_extensions() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        EXECUTABLE_SUFFIX.to_string()
+    }
+}
 
 /// The OS account this process runs as — the identity whose home directory and
 /// per-user tool installs [`user_path`] composes around.
@@ -80,26 +84,18 @@ pub fn locate_program(program: &str) -> Option<PathBuf> {
     resolve_on_path(
         &std::env::var("PATH").unwrap_or_default(),
         PATH_SEP,
-        EXECUTABLE_SUFFIX,
+        &executable_extensions(),
         program,
     )
 }
 
-/// PATH resolution as a pure function, taking the platform's separator and
-/// executable suffix as arguments rather than reading them from `cfg`.
-///
-/// The parameters let the Windows algorithm be exercised on every host, so a
-/// regression in it surfaces in the ordinary inner loop and on every platform's
-/// lane rather than only where Windows is. That matters because the native
-/// Windows lane in `publish-executor-protocol.yml` is gated on `main`: a
-/// `#[cfg(windows)]`-only test would give its first verdict after a merge had
-/// already landed. That lane does run these tests, which is what separately
-/// confirms the platform's own answer for a bare program name is the one
-/// modelled here.
+/// PATH resolution with explicit platform inputs, so Windows PATHEXT ordering
+/// is tested on every host. Unix supplies an empty extension string and searches
+/// for the literal name; Windows supplies its semicolon-separated PATHEXT.
 fn resolve_on_path(
     path: &str,
     separator: char,
-    executable_suffix: &str,
+    executable_extensions: &str,
     program: &str,
 ) -> Option<PathBuf> {
     // A name carrying a path component is never searched for: the spawner uses
@@ -112,17 +108,49 @@ fn resolve_on_path(
     {
         return given.is_file().then(|| given.to_path_buf());
     }
-    // Mirrors `CreateProcessW`: the suffix is appended only when the name
-    // carries no extension of its own.
-    let file_name = if executable_suffix.is_empty() || program.contains('.') {
-        program.to_string()
+    let file_names = if separator != ';' {
+        vec![program.to_string()]
     } else {
-        format!("{program}{executable_suffix}")
+        let extensions = if executable_extensions.is_empty() {
+            DEFAULT_PATHEXT
+        } else {
+            executable_extensions
+        };
+        // CMD tries a dotted name exactly before appending extensions. A dot
+        // alone does not make "some.tool.cmd" invisible to "some.tool".
+        let mut names = if given.extension().is_some() {
+            vec![program.to_string()]
+        } else {
+            Vec::new()
+        };
+        names.extend(
+            extensions
+                .split(';')
+                .map(str::trim)
+                .filter(|ext| ext.starts_with('.') && !ext.contains(['/', '\\', ':']))
+                // Windows compares names case-insensitively. Normalize here so
+                // the same fixtures exercise this algorithm on Unix hosts.
+                .map(|ext| format!("{program}{}", ext.to_ascii_lowercase())),
+        );
+        names
     };
+    // PATH directories take precedence over extensions: a managed npm.cmd in
+    // the first directory must beat a host npm.exe in a later one.
     path.split(separator)
+        .map(|entry| {
+            if separator == ';' {
+                entry.trim_matches('"')
+            } else {
+                entry
+            }
+        })
         .filter(|entry| !entry.is_empty())
-        .map(|entry| Path::new(entry).join(&file_name))
-        .find(|candidate| candidate.is_file())
+        .find_map(|entry| {
+            file_names
+                .iter()
+                .map(|name| Path::new(entry).join(name))
+                .find(|candidate| candidate.is_file())
+        })
 }
 
 /// Whether `execve` would run `candidate` for this process: a regular file the
@@ -193,6 +221,10 @@ pub fn resolve_spawn_program(program: &str, search_path: &str) -> Option<PathBuf
 
 /// A command that runs `program` with `search_path` as its PATH.
 ///
+/// Windows first tries PATH/PATHEXT, then retains std's native search on a
+/// miss. Call `command_on_path_strict` on Windows when a miss must be an error
+/// rather than allowing std's application/system-directory and .exe fallback.
+///
 /// On Unix a bare name is resolved up front, so the spawn names an absolute
 /// program and stays on `posix_spawn`; `argv[0]` keeps the name the caller
 /// gave. Rust's std can only use `posix_spawn` when it knows what to execute
@@ -220,9 +252,57 @@ pub fn command_on_path(program: &str, search_path: &str) -> std::process::Comman
         _ => std::process::Command::new(program),
     };
     #[cfg(windows)]
-    let mut command = std::process::Command::new(program);
+    let mut command = command_on_path_strict(program, search_path)
+        .unwrap_or_else(|_| std::process::Command::new(program));
     command.env("PATH", search_path);
     command
+}
+
+/// Windows argv spawning using this process's PATHEXT, with no native .exe
+/// fallback on a bare-name miss. Use for measured probes and executor argv so
+/// what runs agrees with the advertised PATH lookup.
+#[cfg(windows)]
+pub fn command_on_path_strict(
+    program: &str,
+    search_path: &str,
+) -> std::io::Result<std::process::Command> {
+    command_on_path_with_pathext(program, search_path, &executable_extensions())
+}
+
+/// Windows argv spawning under the same PATHEXT used by the child. Resolve
+/// before spawning: Rust's bare-name lookup only appends .exe, while an explicit
+/// .cmd or .bat is dispatched by std through the system cmd with batch argument
+/// escaping. Do not turn direct argv into a shell command string.
+///
+/// Lookup is PATH-only, directory first, then PATHEXT order. Relative entries
+/// are interpreted by this process, before the caller sets the child's cwd,
+/// matching std's Windows lookup. Supply the effective child PATHEXT here;
+/// changing it later on the returned command cannot redo this resolution.
+#[cfg(windows)]
+pub fn command_on_path_with_pathext(
+    program: &str,
+    search_path: &str,
+    path_ext: &str,
+) -> std::io::Result<std::process::Command> {
+    let given = Path::new(program);
+    // Explicit paths retain std's own handling, including extensionless .exe
+    // paths. Only bare names are subject to the PATH/PATHEXT search policy.
+    let resolved = if given
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        given.to_path_buf()
+    } else {
+        resolve_on_path(search_path, PATH_SEP, path_ext, program).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("program {program:?} was not found on PATH under PATHEXT {path_ext:?}"),
+            )
+        })?
+    };
+    let mut command = std::process::Command::new(resolved);
+    command.env("PATH", search_path).env("PATHEXT", path_ext);
+    Ok(command)
 }
 
 /// The user's home directory, as the platform names it.
@@ -595,10 +675,7 @@ mod tests {
         }
     }
 
-    /// The Windows lookup a bare `cargo` actually gets: the spawner appends
-    /// `.exe`, so a PATH entry holding `cargo.exe` is a hit even though nothing
-    /// on that PATH is named `cargo`. Getting this wrong reports a toolchain as
-    /// absent on the one platform Cairn cannot compile a test for.
+    /// An executable suffix on PATHEXT makes a bare cargo find cargo.exe.
     #[test]
     fn windows_resolution_appends_the_executable_suffix_to_a_bare_name() {
         let temp = tempfile::tempdir().unwrap();
@@ -611,6 +688,60 @@ mod tests {
             resolve_on_path(&path, ';', ".exe", "cargo"),
             Some(cargo_bin.join("cargo.exe"))
         );
+    }
+
+    #[test]
+    fn windows_resolution_honours_pathext_order_within_each_path_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("managed bin");
+        let second = temp.path().join("host");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("npm.cmd"), b"@echo 11.19.1\r\n").unwrap();
+        std::fs::write(first.join("npm.exe"), b"").unwrap();
+        std::fs::write(second.join("npm.com"), b"").unwrap();
+        let path = format!("{};{}", first.display(), second.display());
+        assert_eq!(
+            resolve_on_path(&path, ';', ".CMD;.EXE;.COM", "npm"),
+            Some(first.join("npm.cmd"))
+        );
+        assert_eq!(
+            resolve_on_path(&path, ';', ".EXE;.CMD", "npm"),
+            Some(first.join("npm.exe"))
+        );
+        assert_eq!(
+            resolve_on_path(&path, ';', ".BAT;.CMD", "npm"),
+            Some(first.join("npm.cmd"))
+        );
+        assert_eq!(resolve_on_path(&path, ';', ".BAT", "npm"), None);
+    }
+
+    #[test]
+    fn windows_resolution_defaults_empty_pathext_and_tries_dotted_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path();
+        std::fs::write(bin.join("npm.cmd"), b"").unwrap();
+        std::fs::write(bin.join("some.tool.cmd"), b"").unwrap();
+        let path = format!("\"{}\"", bin.display());
+        assert_eq!(
+            resolve_on_path(&path, ';', "", "npm"),
+            Some(bin.join("npm.cmd"))
+        );
+        assert_eq!(
+            resolve_on_path(&path, ';', ".CMD", "some.tool"),
+            Some(bin.join("some.tool.cmd"))
+        );
+        std::fs::write(bin.join("some.tool"), b"").unwrap();
+        assert_eq!(
+            resolve_on_path(&path, ';', ".CMD", "some.tool"),
+            Some(bin.join("some.tool"))
+        );
+        assert_eq!(
+            resolve_on_path(&path, ';', ".EXE", "npm.cmd"),
+            Some(bin.join("npm.cmd"))
+        );
+        assert_eq!(resolve_on_path(&path, ';', ".EXE", "npm"), None);
+        assert_eq!(resolve_on_path(&path, ';', "CMD;../exe;.BAT", "npm"), None);
     }
 
     /// The Unix lookup is literal: a `cargo.exe` sitting on a Unix PATH is not
