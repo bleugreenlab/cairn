@@ -1793,8 +1793,9 @@ impl LocalDb {
         })
     }
 
-    /// Run one statement on a pooled connection and drain its rows: PRAGMAs and
-    /// `VACUUM INTO`, which is why it is admitted as a write and never bounded.
+    /// Run one statement on a pooled connection and drain its rows: PRAGMAs,
+    /// some of which write, which is why it is admitted as a write and never
+    /// bounded.
     #[track_caller]
     pub fn consume_query<'s>(&'s self, sql: &'s str) -> DbCall<'s, ()> {
         let caller = Location::caller();
@@ -2030,38 +2031,6 @@ impl LocalDb {
             );
         }
         Ok(report)
-    }
-
-    /// Reclaim freelist space by writing a self-contained, compacted image of
-    /// this database to `dest` via `VACUUM INTO`.
-    ///
-    /// Unlike an in-place `VACUUM`, this writes a separate image that can be
-    /// validated before any offline swap. Older Turso revisions also had an MVCC
-    /// TRUNCATE-checkpoint corruption path on migrated schemas with deleted rows;
-    /// keep checkpoint-heavy changes covered by the regression tests described in
-    /// docs/database.md. `dest` is therefore itself
-    /// an MVCC three-file set (`{dest, dest-wal, dest-log}`) with committed data
-    /// living in the sidecars; move and validate it as a whole set, never the
-    /// `.db` file alone.
-    ///
-    /// Refuses a `dest` that does not end in `.db`, for the reason
-    /// [`LocalDb::open`] does, and refuses to run if any member of `dest`'s file
-    /// set already exists. `VACUUM` cannot run inside a `BEGIN..COMMIT`
-    /// transaction, so this issues the statement on a raw connection (via
-    /// `consume_query`) rather than the transaction-wrapped `execute`/`write`
-    /// path.
-    pub async fn vacuum_into(&self, dest: &Path) -> DbResult<()> {
-        require_db_path(dest)?;
-        for member in db_set_paths(dest) {
-            if member.exists() {
-                return Err(DbError::internal(format!(
-                    "vacuum_into destination already exists: {}",
-                    member.display()
-                )));
-            }
-        }
-        let target = dest.to_string_lossy().replace('\'', "''");
-        self.consume_query(&format!("VACUUM INTO '{target}'")).await
     }
 
     async fn configure(&self) -> DbResult<()> {
@@ -2910,7 +2879,7 @@ fn logical_log_path(base: &Path) -> PathBuf {
 /// `db.db`. Moving, sizing, or deleting either set then acts on the other's
 /// committed data. A `.db` path's log is `{path}-log`, which no other path
 /// produces.
-fn require_db_path(path: &Path) -> DbResult<()> {
+pub(super) fn require_db_path(path: &Path) -> DbResult<()> {
     if path.as_os_str() == ":memory:" || path.extension().is_some_and(|ext| ext == "db") {
         return Ok(());
     }
@@ -2922,8 +2891,8 @@ fn require_db_path(path: &Path) -> DbResult<()> {
 }
 
 /// Total size in bytes of every member of `base`'s three-file set that exists on
-/// disk. Absent sidecars contribute zero, so the figure is meaningful both
-/// before and after a `VACUUM INTO` regardless of how many sidecars are present.
+/// disk. Absent sidecars contribute zero, so the figure is meaningful whether or
+/// not the set's log has been folded away.
 pub fn db_set_size(base: &Path) -> u64 {
     db_set_paths(base)
         .iter()
@@ -4313,80 +4282,6 @@ mod tests {
             (per_handle * 2) as i64,
             "updates lost across handles"
         );
-    }
-
-    #[tokio::test]
-    async fn vacuum_into_produces_valid_compacted_image_with_all_rows() {
-        let db = crate::storage::migrated_test_db("vacuum-src.turso.db").await;
-        // Seed rows but never checkpoint, so these committed bytes live only in
-        // the source -wal/-log sidecars — exercising three-file handling end to
-        // end through VACUUM INTO.
-        for i in 0..50 {
-            db.execute(
-                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
-                (format!("w{i}"), format!("name-{i}")),
-            )
-            .await
-            .unwrap();
-        }
-
-        let dir = tempdir().unwrap();
-        let staged = dir.path().join("vacuum-staged.turso.db");
-        db.vacuum_into(&staged).await.unwrap();
-
-        // The staged image is a valid, self-contained database with every row.
-        let staged_db = LocalDb::open(&staged).await.unwrap();
-        assert_eq!(
-            query_text(&staged_db, "PRAGMA integrity_check")
-                .await
-                .unwrap(),
-            "ok"
-        );
-        assert_eq!(
-            query_i64(
-                &staged_db,
-                "SELECT COUNT(*) FROM workspaces WHERE id LIKE 'w%'"
-            )
-            .await
-            .unwrap(),
-            50
-        );
-        assert_eq!(
-            query_text(&staged_db, "SELECT name FROM workspaces WHERE id = 'w7'")
-                .await
-                .unwrap(),
-            "name-7"
-        );
-    }
-
-    #[tokio::test]
-    async fn vacuum_into_refuses_existing_destination() {
-        let db = crate::storage::migrated_test_db("vacuum-refuse.turso.db").await;
-        let dir = tempdir().unwrap();
-
-        // An existing main .db blocks it...
-        let dest = dir.path().join("occupied.turso.db");
-        std::fs::write(&dest, b"occupied").unwrap();
-        assert!(matches!(
-            db.vacuum_into(&dest).await.unwrap_err(),
-            DbError::Internal(_)
-        ));
-
-        // ...and so does an existing sidecar with no main .db file.
-        let sidecar_only = dir.path().join("sidecar-only.turso.db");
-        std::fs::write(dir.path().join("sidecar-only.turso.db-wal"), b"x").unwrap();
-        assert!(matches!(
-            db.vacuum_into(&sidecar_only).await.unwrap_err(),
-            DbError::Internal(_)
-        ));
-
-        // A destination outside `.db` is refused before anything is written.
-        let error = db
-            .vacuum_into(&dir.path().join("image.turso.db.vacuum-staged"))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("must end in .db"), "{error}");
-        assert!(!dir.path().join("image.turso.db.vacuum-staged").exists());
     }
 
     #[tokio::test]

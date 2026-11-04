@@ -43,7 +43,7 @@
 //! columns sit after a large payload, and building `effect_outbox(state,
 //! updated_at)` took 39 s on the 10-30 production clone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::storage::{DbResult, DrainBudget, LocalDb, RowExt, TrackedConnection};
@@ -592,6 +592,56 @@ pub const TABLE_RETENTION: &[TableRetention] = &[
 /// The rule for `table`, if it has one.
 pub fn retention_for(table: &str) -> Option<&'static TableRetention> {
     TABLE_RETENTION.iter().find(|entry| entry.table == table)
+}
+
+/// Every table `db` holds, as `sqlite_master` lists it, less the engine's own.
+pub async fn table_names(db: &LocalDb) -> DbResult<Vec<String>> {
+    db.query_all(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%'",
+        (),
+        |row| row.text(0),
+    )
+    .await
+}
+
+/// How [`TABLE_RETENTION`] covers a set of tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RetentionAudit {
+    /// Tables in the set that have no rule.
+    pub unruled: Vec<String>,
+    /// Rules for tables not in the set.
+    pub stale: Vec<&'static str>,
+    /// Tables with more than one rule.
+    pub duplicated: Vec<&'static str>,
+}
+
+/// Audit the registry against `tables`. Over the tables both lineages create,
+/// a clean audit is the registry's invariant (`every_table_has_a_retention_rule`).
+pub fn audit(tables: &BTreeSet<String>) -> RetentionAudit {
+    let mut seen = BTreeSet::new();
+    let mut audit = RetentionAudit::default();
+    for entry in TABLE_RETENTION {
+        if !seen.insert(entry.table) {
+            audit.duplicated.push(entry.table);
+        }
+        if !tables.contains(entry.table) {
+            audit.stale.push(entry.table);
+        }
+    }
+    audit.unruled = tables
+        .iter()
+        .filter(|table| !seen.contains(table.as_str()))
+        .cloned()
+        .collect();
+    audit
+}
+
+/// [`audit`] of the tables one database holds. Only `unruled` speaks for a
+/// single database: a rule for a table only the other lineage creates shows
+/// here as `stale`.
+pub async fn audit_tables(db: &LocalDb) -> DbResult<RetentionAudit> {
+    Ok(audit(&table_names(db).await?.into_iter().collect()))
 }
 
 /// The most rows one evictor write deletes.

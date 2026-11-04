@@ -28,32 +28,20 @@
 //! The sweep only visits the private database. Team replicas are archived by
 //! teardown alone.
 //!
-//! ## File-size reclamation: the offline `vacuum_reclaim` utility
+//! ## File-size reclamation is offline
 //!
 //! Compressing events only moves pages onto the freelist; the database file does
-//! not shrink until it is rewritten. In-place reclamation is **not safely
-//! available in this embedded Turso build** (measured during CAIRN-1555):
-//!
-//! - In-place `VACUUM` requires a TRUNCATE WAL checkpoint under MVCC, and that
-//!   checkpoint (and the VACUUM) corrupt on the real multi-table schema with
-//!   deleted rows (`MVCC delete: rowid N not found`).
-//! - `auto_vacuum=INCREMENTAL` is unreachable: the SDK builder exposes no
-//!   `enable_autovacuum`, and `auto_vacuum` is silently ignored on a non-empty
-//!   database anyway.
-//! - The one working primitive, `VACUUM INTO`, writes a fresh self-contained
-//!   compacted image to a *separate* path. Reclaiming therefore means swapping a
-//!   three-file MVCC set (`.db` + `-wal` + `-log`, where committed data lives in
-//!   the sidecars) while the database is closed — its blast radius is
-//!   whole-database loss, so the swap runs offline behind a retained backup.
+//! not shrink until it is rewritten. In-place reclamation is not available in
+//! this embedded Turso build: in-place `VACUUM` is not safe under MVCC, and
+//! `auto_vacuum=INCREMENTAL` is unreachable through the SDK builder.
 //!
 //! Because freed pages are reused, the file plateaus at its high-water mark
-//! rather than growing unbounded, so reclamation is a one-time, offline cleanup
-//! rather than in-app machinery. With the app quit the database is quiescent, so
-//! the `vacuum_reclaim` cargo example (`examples/vacuum_reclaim.rs`) does the
-//! whole job: `VACUUM INTO` a staged image, gate on `integrity_check`, then swap
-//! the three-file set in place behind a `.vacuum-backup` set. See
-//! docs/database.md. The `archival_backfill_state` table (migration 0055) is no
-//! longer read: the sweep needs no completion marker.
+//! rather than growing unbounded, so reclamation is an occasional offline swap
+//! rather than in-app machinery: a compacted copy written table by table in
+//! bounded memory (`cairn-db` `storage::reclaim`), verified against the
+//! original, then swapped in for the whole three-file set behind a retained
+//! backup. See docs/database.md. The `archival_backfill_state` table (migration
+//! 0055) is no longer read: the sweep needs no completion marker.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};

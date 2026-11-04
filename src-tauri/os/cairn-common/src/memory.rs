@@ -22,6 +22,39 @@ pub fn system_memory() -> Option<SystemMemory> {
     system_memory_scoped().map(|(memory, _)| memory)
 }
 
+/// This process's own resident memory, in bytes: the physical footprint on
+/// macOS (`proc_pid_rusage`'s `ri_phys_footprint`, which is what `footprint`
+/// reports and what memory-pressure kills count, compressed pages included)
+/// and `VmRSS` on Linux. `None` where it cannot be read; a caller enforcing a
+/// memory cap should treat that as a reason to stop, not to carry on.
+pub fn own_resident_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `proc_pid_rusage` fills a zeroed `rusage_info_v4` for our own
+        // pid; the cast matches the C `(rusage_info_t *)&buf` convention.
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                &mut info as *mut _ as *mut libc::rusage_info_t,
+            )
+        };
+        return (rc == 0).then_some(info.ri_phys_footprint);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))?;
+        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+        return Some(kib.saturating_mul(1024));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// [`system_memory`] together with what it measured. The one implementation
 /// of the host-or-cgroup choice, so a reader asking whether this reading is
 /// the host's cannot come to answer it differently from the reading itself.
@@ -130,4 +163,14 @@ pub fn system_memory_scoped() -> Option<(SystemMemory, MemoryScope)> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn reads_this_process_resident_memory() {
+        let resident = super::own_resident_bytes().expect("readable on this platform");
+        assert!(resident > 1024 * 1024, "{resident} bytes is not a process");
+    }
 }

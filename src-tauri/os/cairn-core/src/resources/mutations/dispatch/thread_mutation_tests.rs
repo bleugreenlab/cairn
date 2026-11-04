@@ -8,6 +8,7 @@ use crate::models::CreateThread;
 use crate::orchestrator::OrchestratorBuilder;
 use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
 use crate::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_models::types::catalog::{claude_models, ProviderModelCatalog};
 use std::sync::Arc;
 
 async fn seeded_orch() -> Orchestrator {
@@ -150,6 +151,24 @@ async fn seeded_orch_with_emitter() -> (Orchestrator, Arc<CapturingEmitter>) {
         tempfile::tempdir().unwrap().keep(),
     )
     .build();
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["claude".into(), "codex".into()]),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut codex = claude_models().remove(0);
+    codex.id = "gpt-5.6-sol".into();
+    codex.model = "gpt-5.6-sol".into();
+    codex.display_name = "gpt-5.6-sol".into();
+    for (backend, models) in [("claude", claude_models()), ("codex", vec![codex])] {
+        orch.seed_model_catalog_for_test(ProviderModelCatalog {
+            backend: backend.into(),
+            models,
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        });
+    }
     (orch, emitter)
 }
 
@@ -258,6 +277,14 @@ async fn cross_provider_thread_model_patch_rotates_at_edit_time() {
         .execute(
             "UPDATE sessions SET backend = 'codex' WHERE id = ?1",
             (source_id.clone(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE jobs SET model = 'gpt-5.6-sol' WHERE id = ?1",
+            (job_id.clone(),),
         )
         .await
         .unwrap();

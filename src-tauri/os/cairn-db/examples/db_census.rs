@@ -23,16 +23,20 @@
 //!   sample-days <db> <as_of> <days>      that many daily censuses replayed on the clone,
 //!                                        to score the pooled estimates
 //!   sql <db> <statement>                 one ad-hoc statement, rows as JSON
-//!   vacuum <db> <dest> --unbounded-memory   time VACUUM INTO, then fold the image
+//!   reclaim <db> <dest> [--cap-gb N] [--fold-mib N] [--stop-after-mib N]
+//!                                        the bounded reclaim copy (`storage::reclaim`)
+//!                                        into <dest>, then its verification; with
+//!                                        --stop-after-mib, a partial copy and no
+//!                                        verification (the fold-size probe)
 //!   delete-probe <db> <pages> [rows]     delete the oldest events a page per write,
 //!                                        on a sibling clone of <db>
 //!
 //! These are clone-only measurements, not a live instrument. Tables are walked
 //! in rowid ranges of 50k rows (one span of `events` reads about 100 MB), a
 //! table with sparse rowids is read in one statement, and `history` loads the
-//! skeleton tables whole. `vacuum` needs the explicit flag because on the
-//! pinned Turso `VACUUM INTO` holds the whole image in memory: 80 GB against
-//! the 30 GB production database.
+//! skeleton tables whole. `reclaim` enforces its own memory cap (default 8 GB)
+//! inside the process, beside the cap `scripts/db-census.ts` polls from
+//! outside.
 //!
 //! Usage:
 //!   cargo run --release -p cairn-db --example db_census -- tables <clone>/cairn.db 1793332400
@@ -42,10 +46,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cairn_db::storage::census::{payload_expr, quote_identifier as quote, Column};
+use cairn_db::storage::reclaim::{copy_compacted, verify, CopyProgress, ReclaimLimits};
 use cairn_db::storage::retention::retention_for;
-use cairn_db::storage::{
-    census, db_set_paths, db_set_size, DrainBudget, LocalDb, TrackedConnection,
-};
+use cairn_db::storage::{census, db_set_paths, DrainBudget, LocalDb, TrackedConnection};
 use cairn_db::turso::Value;
 use serde_json::{json, Value as Json};
 
@@ -105,8 +108,8 @@ const UPDATED_COLUMNS: &[&str] = &["updated_at", "updated_at_unix_ms"];
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // The database, and for `vacuum` the destination.
-    let paths = if args.first().map(String::as_str) == Some("vacuum") {
+    // The database, and for `reclaim` the destination.
+    let paths = if args.first().map(String::as_str) == Some("reclaim") {
         2
     } else {
         1
@@ -128,17 +131,12 @@ async fn main() {
         ["history", db, as_of] => history(db, parse(as_of)).await,
         ["sample", db, as_of] => sample(db, parse(as_of)).await,
         ["sample-days", db, as_of, days] => sample_days(db, parse(as_of), parse(days)).await,
-        ["vacuum", db, dest, "--unbounded-memory"] => vacuum(db, dest).await,
-        ["vacuum", ..] => Err(
-            "vacuum holds the whole image in memory on the pinned Turso \
-             (80 GB for a 30 GB database); pass --unbounded-memory to accept that"
-                .to_string(),
-        ),
+        ["reclaim", db, dest, options @ ..] => reclaim(db, dest, options).await,
         ["delete-probe", db, pages] => delete_probe(db, parse(pages), 500).await,
         ["delete-probe", db, pages, rows] => delete_probe(db, parse(pages), parse(rows)).await,
         ["sql", db, sql] => adhoc(db, sql).await,
         _ => Err(
-            "usage: db_census fold|tables|history|vacuum|delete-probe <db> ... \
+            "usage: db_census fold|tables|history|sample|sample-days|sql|reclaim|delete-probe <db> ... \
              (see the module docs)"
                 .to_string(),
         ),
@@ -984,25 +982,78 @@ async fn adhoc(path: &str, sql: &str) -> Res<Json> {
     Ok(json!({"ms": started.elapsed().as_secs_f64() * 1000.0, "rows": out}))
 }
 
-async fn vacuum(path: &str, dest: &str) -> Res<Json> {
-    let (db, open_s) = open(path).await?;
+/// The bounded reclaim copy of the clone into `dest`, then its verification.
+/// The copy's own memory guard enforces `--cap-gb`; a failed copy removes
+/// `dest` itself. A passing verification still leaves `dest` for the caller
+/// to measure and delete.
+async fn reclaim(path: &str, dest: &str, options: &[&str]) -> Res<Json> {
+    let mut limits = ReclaimLimits::with_cap(8_000_000_000);
+    let mut options = options.iter();
+    while let Some(flag) = options.next() {
+        let value = options
+            .next()
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        let number: f64 = value
+            .parse()
+            .map_err(|_| format!("{flag} takes a number, got {value:?}"))?;
+        match *flag {
+            "--cap-gb" => limits.cap_bytes = (number * 1e9) as u64,
+            "--fold-mib" => limits.fold_bytes = (number * 1_048_576.0) as u64,
+            "--stop-after-mib" => limits.stop_after_bytes = Some((number * 1_048_576.0) as u64),
+            other => return Err(format!("unknown reclaim option {other}")),
+        }
+    }
     let started = Instant::now();
-    db.vacuum_into(Path::new(dest))
-        .await
-        .map_err(|e| format!("VACUUM INTO: {e}"))?;
-    let vacuum_s = started.elapsed().as_secs_f64();
-    drop(db);
-    let image_set_bytes = db_set_size(Path::new(dest));
-    let image_log_bytes = log_bytes(dest);
-    let fold = fold(dest).await?;
+    let source_db_bytes = file_bytes(path);
+    let copy = copy_compacted(
+        Path::new(path),
+        Path::new(dest),
+        limits,
+        |progress| match progress {
+            CopyProgress::Table(table) => eprintln!(
+                "{}: {} rows, {} B, {} pages, {:.1}s",
+                table.table,
+                table.rows,
+                table.bytes,
+                table.pages,
+                table.ms as f64 / 1000.0
+            ),
+            CopyProgress::Fold(fold) => eprintln!(
+                "fold after {} B copied: {} B log in {} ms",
+                fold.after_bytes, fold.log_bytes_before, fold.ms
+            ),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let copy_s = started.elapsed().as_secs_f64();
+    let dest_db_bytes = file_bytes(dest);
+    eprintln!(
+        "copy: {copy_s:.0}s, peak {} B resident, {} B -> {} B",
+        copy.peak_resident_bytes, copy.source_set_bytes, copy.dest_set_bytes
+    );
+    let verification = if copy.partial {
+        None
+    } else {
+        Some(
+            verify(Path::new(path), Path::new(dest))
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    };
+    let failures = verification.as_ref().map(|v| v.failures());
     Ok(json!({
-        "open_s": open_s,
-        "vacuum_s": vacuum_s,
-        "source_db_bytes": file_bytes(path),
-        "image_set_bytes": image_set_bytes,
-        "image_log_bytes": image_log_bytes,
-        "image_fold": fold,
-        "image_db_bytes_after_fold": file_bytes(dest),
+        "copy_s": copy_s,
+        "wall_s": started.elapsed().as_secs_f64(),
+        "source_db_bytes": source_db_bytes,
+        "dest_db_bytes": dest_db_bytes,
+        "source_set_bytes": copy.source_set_bytes,
+        "dest_set_bytes": copy.dest_set_bytes,
+        "reclaimed_bytes": copy.source_set_bytes as i64 - copy.dest_set_bytes as i64,
+        "passed": failures.as_ref().map(Vec::is_empty),
+        "failures": failures,
+        "copy": copy,
+        "verification": verification,
     }))
 }
 

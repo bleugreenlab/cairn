@@ -199,10 +199,6 @@ name = "concurrent_db_probe"
 required-features = ["internal-api"]
 
 [[example]]
-name = "vacuum_reclaim"
-required-features = ["internal-api"]
-
-[[example]]
 name = "export_project"
 required-features = ["internal-api"]
 

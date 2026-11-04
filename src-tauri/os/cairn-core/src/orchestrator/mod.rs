@@ -2974,9 +2974,8 @@ impl Orchestrator {
     /// execution whose issue was resolved more than the grace period ago.
     ///
     /// This frees pages to the freelist but does NOT shrink the database file:
-    /// file-size reclamation is a separate offline step run via the
-    /// `vacuum_reclaim` cargo example (see the `archival::sweep` module docs and
-    /// docs/database.md).
+    /// file-size reclamation is a separate offline swap (see the
+    /// `archival::sweep` module docs and docs/database.md).
     pub async fn run_archival_maintenance(&self) {
         match crate::archival::run_archival_sweep(&self.db.local).await {
             Ok(summary) => log::info!(

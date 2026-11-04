@@ -49,52 +49,11 @@ async fn team_db() -> (TempDir, LocalDb) {
     (temp, db)
 }
 
-/// Every table `db` holds, as `sqlite_master` lists it, less the engine's own.
-async fn table_names(db: &LocalDb) -> Vec<String> {
-    db.query_all(
-        "SELECT name FROM sqlite_master WHERE type = 'table' \
-         AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%'",
-        (),
-        |row| row.text(0),
-    )
-    .await
-    .unwrap()
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Audit {
-    /// Tables a lineage creates that have no rule.
-    unruled: Vec<String>,
-    /// Rules for tables no lineage creates.
-    stale: Vec<&'static str>,
-    /// Tables with more than one rule.
-    duplicated: Vec<&'static str>,
-}
-
-fn audit(tables: &BTreeSet<String>) -> Audit {
-    let mut seen = BTreeSet::new();
-    let mut audit = Audit::default();
-    for entry in TABLE_RETENTION {
-        if !seen.insert(entry.table) {
-            audit.duplicated.push(entry.table);
-        }
-        if !tables.contains(entry.table) {
-            audit.stale.push(entry.table);
-        }
-    }
-    audit.unruled = tables
-        .iter()
-        .filter(|table| !seen.contains(table.as_str()))
-        .cloned()
-        .collect();
-    audit
-}
-
 async fn both_lineages() -> BTreeSet<String> {
     let (_private_temp, private) = private_db().await;
     let (_team_temp, team) = team_db().await;
-    let mut tables: BTreeSet<String> = table_names(&private).await.into_iter().collect();
-    tables.extend(table_names(&team).await);
+    let mut tables: BTreeSet<String> = table_names(&private).await.unwrap().into_iter().collect();
+    tables.extend(table_names(&team).await.unwrap());
     tables
 }
 
@@ -105,7 +64,7 @@ async fn every_table_has_a_retention_rule() {
     let tables = both_lineages().await;
     assert_eq!(
         audit(&tables),
-        Audit::default(),
+        RetentionAudit::default(),
         "every table either lineage creates needs exactly one rule in TABLE_RETENTION \
          (storage/retention.rs), and every rule must name a real table"
     );
@@ -117,8 +76,10 @@ async fn a_table_without_a_rule_fails_the_audit() {
     db.execute_script("CREATE TABLE injected_without_a_rule (id INTEGER PRIMARY KEY)")
         .await
         .unwrap();
-    let tables: BTreeSet<String> = table_names(&db).await.into_iter().collect();
-    assert_eq!(audit(&tables).unruled, vec!["injected_without_a_rule"]);
+    assert_eq!(
+        audit_tables(&db).await.unwrap().unruled,
+        vec!["injected_without_a_rule"]
+    );
 }
 
 #[test]

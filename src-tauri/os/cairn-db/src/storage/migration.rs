@@ -471,6 +471,23 @@ impl MigrationRunner {
         self.run_observed(db, |_| {}).await
     }
 
+    /// The migrations [`run`](Self::run) would apply to `db`, labelled as `run`
+    /// reports them, without applying anything. `db` must already carry the
+    /// migration ledger.
+    pub async fn pending(&self, db: &LocalDb) -> DbResult<Vec<String>> {
+        let (recorded, provisional) = self.applied_versions(db).await?;
+        Ok(self
+            .plan(recorded, provisional)
+            .into_iter()
+            .filter_map(|step| match step {
+                Planned::Apply(migration) => {
+                    Some(format!("{}_{}", migration.version, migration.name))
+                }
+                Planned::Adopt { .. } => None,
+            })
+            .collect())
+    }
+
     /// [`run`](Self::run), telling `observe` about each migration just before it
     /// applies.
     ///
