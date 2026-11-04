@@ -280,16 +280,19 @@ fn render_entity(view: &TenetView) -> String {
             "- Superseded by: [#{successor}]({tenets}/{successor})\n"
         ));
     }
-    if let Some(legacy) = &row.legacy {
+    // A migrated ruling's rationale renders under `## Rationale` like every
+    // tenet's. Rulings imported before it had that column also left a copy in
+    // `legacy`, which is deliberately not rendered a second time.
+    let provenance = row
+        .legacy
+        .as_ref()
+        .and_then(|legacy| legacy.get("provenance"))
+        .filter(|provenance| !provenance.is_null());
+    if let Some(provenance) = provenance {
         out.push_str("\n## Migrated ruling\n\n");
-        for field in ["rationale", "provenance"] {
-            match legacy.get(field) {
-                Some(serde_json::Value::String(text)) => {
-                    out.push_str(&format!("- {field}: {text}\n"))
-                }
-                Some(serde_json::Value::Null) | None => {}
-                Some(other) => out.push_str(&format!("- {field}: {other}\n")),
-            }
+        match provenance {
+            serde_json::Value::String(text) => out.push_str(&format!("- provenance: {text}\n")),
+            other => out.push_str(&format!("- provenance: {other}\n")),
         }
     }
 

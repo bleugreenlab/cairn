@@ -507,6 +507,9 @@ async fn a_migrated_rulings_multi_paragraph_rationale_renders_byte_exact() {
     migrated.origin = TenetOrigin::MigratedRuling;
     migrated.answer_source = Some(AnswerSource::Migrated);
     migrated.answered_by = None;
+    // The shape migration 0363 leaves: the rationale in its column, with the
+    // copy an earlier import left in `legacy` still there.
+    migrated.rationale = Some(rationale.to_string());
     migrated.legacy = Some(json!({
         "rationale": rationale,
         "provenance": ["cairn://p/thr/library"],
@@ -525,10 +528,17 @@ async fn a_migrated_rulings_multi_paragraph_rationale_renders_byte_exact() {
         "the old slug addresses the migrated tenet: {rendered}"
     );
     assert!(
-        rendered.contains(&format!("- rationale: {rationale}\n")),
-        "a multi-paragraph rationale must render byte-exact, blank lines and \
-         all: {rendered}"
+        rendered.contains(&format!("## Rationale\n\n{rationale}\n\n")),
+        "a migrated ruling's multi-paragraph rationale renders under Rationale \
+         byte-exact, blank lines and all: {rendered}"
     );
+    assert_eq!(
+        rendered.matches("COROLLARY").count(),
+        1,
+        "the rationale renders once, not again under Migrated ruling: {rendered}"
+    );
+    assert!(!rendered.contains("- rationale:"), "{rendered}");
+    assert!(rendered.contains("## Migrated ruling"), "{rendered}");
     assert!(
         rendered.contains("cairn://p/thr/library"),
         "provenance renders in the canonical form it was stored in: {rendered}"

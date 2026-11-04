@@ -4757,7 +4757,8 @@ line2', X'0001020AFF', 2.5),
         assert_eq!(tenet["statement"], ruling["text"]);
         assert_eq!(tenet["status"], "approved");
         assert_eq!(tenet["verdict"], "yes");
-        assert_eq!(tenet["legacy"]["rationale"], ruling["rationale"]);
+        assert_eq!(tenet["rationale"], ruling["rationale"]);
+        assert!(tenet["legacy"].get("rationale").is_none(), "{tenet}");
         assert_eq!(tenet["legacy"]["provenance"], ruling["provenance"]);
 
         // A branch-shaped segment is refused with its reason rather than read as

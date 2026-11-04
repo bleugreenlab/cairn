@@ -427,6 +427,24 @@ fn grep_continue_target(uri: &str, shown_lines: usize) -> String {
     target_with_query_param(uri, "head_limit", next_head_limit)
 }
 
+/// A rendered footer and the URI its `continue:` names, built from one
+/// computed target so [`SegmentMeta::continuation`] and the text a reader sees
+/// can never disagree.
+struct Footer {
+    text: String,
+    continuation: Option<String>,
+}
+
+impl Footer {
+    /// A footer whose text ends `continue: {target}]`.
+    fn continuing(prose: String, target: String) -> Self {
+        Self {
+            text: format!("{prose}continue: {target}]"),
+            continuation: Some(target),
+        }
+    }
+}
+
 fn line_footer(
     uri: &str,
     offset: usize,
@@ -435,7 +453,7 @@ fn line_footer(
     original_limit: Option<usize>,
     budget_truncated: bool,
     char_offset: Option<usize>,
-) -> String {
+) -> Footer {
     let start_line = offset + 1;
     let end_line = offset + shown_lines;
     let reason = if budget_truncated {
@@ -443,12 +461,8 @@ fn line_footer(
     } else {
         ""
     };
-    format!(
-        "[lines {}\u{2013}{} of {} — {}continue: {}]",
-        start_line,
-        end_line,
-        total_lines,
-        reason,
+    Footer::continuing(
+        format!("[lines {start_line}\u{2013}{end_line} of {total_lines} — {reason}"),
         line_continue_target(uri, offset, shown_lines, original_limit, char_offset),
     )
 }
@@ -462,16 +476,16 @@ fn record_footer(
     shown: usize,
     total: Option<usize>,
     noun: &str,
-) -> String {
+) -> Footer {
     let of_total = total
         .map(|total| format!(" of {total}"))
         .unwrap_or_default();
-    format!(
-        "[{} {}\u{2013}{}{} — continue: {}]",
-        noun,
-        offset + 1,
-        offset + shown,
-        of_total,
+    Footer::continuing(
+        format!(
+            "[{noun} {}\u{2013}{}{of_total} — ",
+            offset + 1,
+            offset + shown
+        ),
         target_with_query_param(uri, "offset", offset + shown),
     )
 }
@@ -480,20 +494,16 @@ fn record_footer(
 /// like the line-window footer because it answers the same question — what did
 /// I see, out of what, and how do I get the rest — and its continue widens the
 /// window to the true total, so one read completes the enumeration.
-fn grep_window_footer(uri: &str, shown: usize, total: usize, noun: &str) -> String {
-    format!(
-        "[{} 1\u{2013}{} of {} — continue: {}]",
-        noun,
-        shown,
-        total,
+fn grep_window_footer(uri: &str, shown: usize, total: usize, noun: &str) -> Footer {
+    Footer::continuing(
+        format!("[{noun} 1\u{2013}{shown} of {total} — "),
         target_with_query_param(uri, "head_limit", total),
     )
 }
 
-fn grep_footer(uri: &str, shown_lines: usize) -> String {
-    format!(
-        "[first {} matching lines shown — output truncated to fit budget; continue: {}]",
-        shown_lines,
+fn grep_footer(uri: &str, shown_lines: usize) -> Footer {
+    Footer::continuing(
+        format!("[first {shown_lines} matching lines shown — output truncated to fit budget; "),
         grep_continue_target(uri, shown_lines),
     )
 }
@@ -857,7 +867,7 @@ fn render_with<'t>(
         };
         if let Some(footer) = &footer {
             candidate.push('\n');
-            candidate.push_str(footer);
+            candidate.push_str(&footer.text);
         }
         candidate.push_str(&image_trailer);
         candidate.push_str(&history_suffix);
@@ -867,6 +877,7 @@ fn render_with<'t>(
             meta.shown_units = cut.shown_lines;
             meta.truncated = truncated;
             meta.char_continuation = cut.char_offset.is_some();
+            meta.continuation = footer.and_then(|footer| footer.continuation);
             return RenderedSegment {
                 text: candidate,
                 meta,
@@ -955,15 +966,20 @@ fn smaller_record_limit(
 /// Footer for a budget-cut page whose records could not be counted. Its
 /// continuation keeps the page's start and lowers `limit`, so following it can
 /// repeat records but never skip one.
-fn uncounted_record_footer(uri: &str, noun: &str, smaller_limit: Option<usize>) -> String {
+fn uncounted_record_footer(uri: &str, noun: &str, smaller_limit: Option<usize>) -> Footer {
     match smaller_limit {
-        Some(limit) => format!(
-            "[output truncated to fit budget partway through this page of {noun}, which cannot be counted; continue re-reads from the same start with a smaller limit — continue: {}]",
+        Some(limit) => Footer::continuing(
+            format!(
+                "[output truncated to fit budget partway through this page of {noun}, which cannot be counted; continue re-reads from the same start with a smaller limit — "
+            ),
             target_with_query_param(uri, "limit", limit),
         ),
-        None => format!(
-            "[output truncated to fit budget; this page holds a single one of its {noun}, so no smaller page exists]"
-        ),
+        None => Footer {
+            text: format!(
+                "[output truncated to fit budget; this page holds a single one of its {noun}, so no smaller page exists]"
+            ),
+            continuation: None,
+        },
     }
 }
 
@@ -1016,8 +1032,10 @@ fn render_record_segment<'t>(
             text.push('\n');
             text.push_str(cut.body);
         }
+        let footer = uncounted_record_footer(&meta.uri, &noun, smaller_limit);
         text.push('\n');
-        text.push_str(&uncounted_record_footer(&meta.uri, &noun, smaller_limit));
+        text.push_str(&footer.text);
+        meta.continuation = footer.continuation;
         text.push_str(&image_trailer);
         text.push_str(&history_suffix);
         return RenderedSegment { text, meta, images };
@@ -1055,16 +1073,13 @@ fn render_record_segment<'t>(
         format!("{head}\n{rendered_body}")
     };
 
+    meta.continuation = None;
     if more {
         if let Some(noun) = meta.unit_noun.as_deref() {
+            let footer = record_footer(&meta.uri, meta.offset, shown, meta.total_units, noun);
             text.push('\n');
-            text.push_str(&record_footer(
-                &meta.uri,
-                meta.offset,
-                shown,
-                meta.total_units,
-                noun,
-            ));
+            text.push_str(&footer.text);
+            meta.continuation = footer.continuation;
         }
     }
     text.push_str(&image_trailer);
@@ -1097,6 +1112,7 @@ pub fn render_segment_bounded(seg: ReadSegment, meter: &dyn TokenMeter) -> Rende
     );
     overflow.images.clear();
     overflow.meta.truncated = true;
+    overflow.meta.continuation = None;
     overflow
 }
 
@@ -1347,6 +1363,7 @@ fn assemble_inner(
     overflow.images.clear();
     for meta in &mut overflow.segments {
         meta.truncated = true;
+        meta.continuation = None;
     }
     if let Some(bodies) = &mut overflow.bodies {
         bodies.fill(String::new());
@@ -1747,6 +1764,95 @@ mod tests {
         assert!(!r.meta.truncated);
     }
 
+    /// `meta.continuation` is the URI the rendered footer names, for every
+    /// footer shape, and absent whenever no footer names one. The record case
+    /// carries a verbatim multi-line `sql=` value, whose footer spans two
+    /// physical lines and so cannot be recovered line by line.
+    #[test]
+    fn continuation_metadata_is_the_uri_the_footer_names() {
+        let sql_uri = "cairn://db?limit=1&format=json&sql=SELECT id -- first\nFROM posts";
+        let record = render_segment(
+            record_seg(
+                sql_uri,
+                r#"{"type":"row","values":[1]}"#,
+                Some(2),
+                1,
+                Some("rows"),
+                0,
+            ),
+            10_000,
+        );
+        let target = record.meta.continuation.clone().unwrap();
+        assert!(target.contains("-- first\nFROM posts"), "{target}");
+        assert!(target.ends_with("offset=1"), "{target}");
+        assert!(record.text.ends_with(&format!("continue: {target}]")));
+
+        let line = render_segment(file_seg("file:x.rs", "     1\ta\n     2\tb", 9, 0), 10_000);
+        assert_eq!(
+            line.meta.continuation.as_deref(),
+            Some("file:x.rs?offset=2")
+        );
+        assert_eq!(line.meta.continuation, continuation(&line.text));
+
+        let grep_meta = |uri: &str| {
+            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            meta.match_count = Some(200);
+            meta.file_count = Some(1);
+            meta.total_units = Some(200);
+            meta.unit_noun = Some("matches".to_string());
+            meta
+        };
+        let mut window = grep_meta("file:src?grep=needle&head_limit=8");
+        window.grep_shown = Some(8);
+        let windowed = render_segment(ReadSegment::text("src/a.rs:1:needle", window), 10_000);
+        assert_eq!(
+            windowed.meta.continuation.as_deref(),
+            Some("file:src?grep=needle&head_limit=200")
+        );
+        assert_eq!(windowed.meta.continuation, continuation(&windowed.text));
+
+        let matches: Vec<String> = (1..=200)
+            .map(|n| format!("src/a.rs:{n}:needle {}", "x".repeat(40)))
+            .collect();
+        let cut = render_segment(
+            ReadSegment::text(matches.join("\n"), grep_meta("file:src?grep=needle")),
+            400,
+        );
+        assert!(
+            cut.text.contains("output truncated to fit budget"),
+            "{}",
+            cut.text
+        );
+        assert!(cut
+            .meta
+            .continuation
+            .as_deref()
+            .unwrap()
+            .contains("head_limit="));
+        assert_eq!(cut.meta.continuation, continuation(&cut.text));
+
+        let whole = render_segment(file_seg("file:x.rs", "     1\ta", 1, 0), 10_000);
+        assert!(!whole.text.contains("continue:"));
+        assert_eq!(whole.meta.continuation, None);
+        let last_page = render_segment(
+            record_seg(
+                "cairn://p/CAIRN/issues?offset=140&limit=10",
+                "- tail",
+                Some(142),
+                2,
+                Some("issues"),
+                140,
+            ),
+            10_000,
+        );
+        assert_eq!(last_page.meta.continuation, None);
+        let complete = render_segment(
+            ReadSegment::text("src/a.rs:1:needle", grep_meta("file:src?grep=needle")),
+            10_000,
+        );
+        assert_eq!(complete.meta.continuation, None);
+    }
+
     #[test]
     fn window_before_eof_emits_footer() {
         let body = "     1\ta\n     2\tb";
@@ -2133,6 +2239,7 @@ mod tests {
         assert_eq!(out.meta.shown_units, 0);
         assert!(!out.text.contains("continue:"), "{}", out.text);
         assert!(out.text.contains("no smaller page exists"), "{}", out.text);
+        assert_eq!(out.meta.continuation, None);
     }
 
     /// A zero-line prelude whose first record alone exceeds the budget keeps
@@ -2363,7 +2470,8 @@ mod tests {
                     );
                     seen.push(number);
                 }
-                match continuation(&out.text) {
+                assert_eq!(out.meta.continuation, continuation(&out.text));
+                match out.meta.continuation {
                     Some(next) => uri = next,
                     None => break,
                 }

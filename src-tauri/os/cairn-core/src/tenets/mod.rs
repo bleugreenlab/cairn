@@ -316,8 +316,10 @@ pub struct TenetRow {
     pub slug: Option<String>,
     /// What the tenet says: how the project does things, in one sentence.
     pub statement: String,
-    /// Why, the alternatives ruled out, and where it was argued. `None` on a
-    /// tenet proposed without one, and on every tenet that predates the field.
+    /// Why, the alternatives ruled out, and where it was argued, for every
+    /// origin: a migrated ruling's rationale lives here too. `None` on a tenet
+    /// proposed without one, on a proposal that predates the field, and on a
+    /// ruling that recorded none.
     pub rationale: Option<String>,
     pub status: TenetStatus,
     pub verdict: Option<Verdict>,
@@ -327,6 +329,9 @@ pub struct TenetRow {
     pub answered_at: Option<i64>,
     pub supersedes: Option<i64>,
     pub origin: TenetOrigin,
+    /// A migrated ruling's import record: its provenance and the `legacy_key`
+    /// the import is idempotent by. Rulings imported before their rationale
+    /// had a column also carry a copy of it here, which nothing reads.
     pub legacy: Option<serde_json::Value>,
     pub contradiction_alerted_at: Option<i64>,
     pub proposer: PrincipalRef,

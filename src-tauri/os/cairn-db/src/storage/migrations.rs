@@ -5704,6 +5704,99 @@ mod tests {
         );
     }
 
+    /// cairn/6036: a migrated ruling's rationale moves from `legacy_json` into
+    /// the column. A row that already has one, a blank or placeholder legacy
+    /// rationale, a malformed `legacy_json`, and a non-migrated row are left
+    /// alone, and `legacy_json` itself is never rewritten.
+    #[tokio::test]
+    async fn migrated_rulings_rationale_moves_into_its_column() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("tenet-rationale-home.turso.db"))
+            .await
+            .unwrap();
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.name() != "tenet_rationale_one_home")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            head.len() < TURSO_MIGRATIONS.len(),
+            "the migration must be in the lineage"
+        );
+        MigrationRunner::new(head).run(&db).await.unwrap();
+
+        db.execute_batch(
+            r#"INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws1', 'w', 0, 0);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('p1', 'ws1', 'p', 'p', '/tmp/p', 0, 0);
+             INSERT INTO threads (id, project_id, name, created_at, updated_at)
+                 VALUES ('t1', 'p1', 'design', 0, 0);
+             INSERT INTO tenets (id, project_id, number, proposing_thread_id, statement, status,
+                 verdict, answer_source, answered_at, origin, legacy_json, proposer_principal_json,
+                 created_at, updated_at, rationale) VALUES
+               ('copied', 'p1', 1, 't1', 'S1', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                '{"rationale":"Because leases expire.\n\nTokens do not.","provenance":["cairn://p/p/1"],"legacy_key":"t1:one"}',
+                '{}', 1, 1, NULL),
+               ('kept', 'p1', 2, 't1', 'S2', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                '{"rationale":"legacy copy","legacy_key":"t1:two"}', '{}', 1, 1, 'already here'),
+               ('blank', 'p1', 3, 't1', 'S3', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                '{"rationale":"   ","legacy_key":"t1:three"}', '{}', 1, 1, NULL),
+               ('placeholder', 'p1', 4, 't1', 'S4', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                '{"rationale":"No rationale recorded","legacy_key":"t1:four"}', '{}', 1, 1, NULL),
+               ('keyless', 'p1', 5, 't1', 'S5', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                '{"legacy_key":"t1:five"}', '{}', 1, 1, NULL),
+               ('malformed', 'p1', 6, 't1', 'S6', 'approved', 'yes', 'migrated', 1, 'migrated-ruling',
+                'not json', '{}', 1, 1, NULL),
+               ('standing', 'p1', 7, 't1', 'S7', 'proposed', NULL, NULL, NULL, 'standing',
+                '{"rationale":"not a ruling"}', '{}', 1, 1, NULL);"#,
+        )
+        .await
+        .unwrap();
+        let legacy_before = query_text(
+            &db,
+            "SELECT group_concat(id || '=' || COALESCE(legacy_json, ''), ';')
+             FROM (SELECT * FROM tenets ORDER BY number)",
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT rationale FROM tenets WHERE id = 'copied'")
+                .await
+                .unwrap(),
+            "Because leases expire.\n\nTokens do not.",
+            "the legacy rationale is copied verbatim, blank lines and all"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || '=' || COALESCE(rationale, '<null>'), ';')
+                 FROM (SELECT * FROM tenets WHERE id <> 'copied' ORDER BY number)"
+            )
+            .await
+            .unwrap(),
+            "kept=already here;blank=<null>;placeholder=<null>;keyless=<null>;\
+             malformed=<null>;standing=<null>",
+            "an existing rationale is untouched; nothing else gains one"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT group_concat(id || '=' || COALESCE(legacy_json, ''), ';')
+                 FROM (SELECT * FROM tenets ORDER BY number)"
+            )
+            .await
+            .unwrap(),
+            legacy_before,
+            "legacy_json, which the import's idempotency reads, is never rewritten"
+        );
+    }
+
     /// cairn/5728: the pool records retire. Each machine's address becomes a
     /// machine record, a pool's default its warm model by real name under the
     /// pool's sorted machine key, the controller's operator-set idle window the

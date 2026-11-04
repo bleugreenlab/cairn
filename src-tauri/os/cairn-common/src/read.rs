@@ -205,6 +205,13 @@ pub struct SegmentMeta {
     /// stays a pure function of this metadata, identical live and archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// The URI this segment's `continue:` footer names, present exactly when
+    /// the renderer emits a footer that names one. The footer is prose for a
+    /// reader; this is the same target for a program, which must take it from
+    /// here rather than recover it from the text: a verbatim `sql=` value can
+    /// carry a newline, which splits the footer across physical lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
     pub truncated: bool,
     /// True when a sub-line character fallback was used (single-huge-line case).
     pub char_continuation: bool,
@@ -228,6 +235,7 @@ impl SegmentMeta {
             record_prelude_lines: None,
             more_records: false,
             revision: None,
+            continuation: None,
             truncated: false,
             char_continuation: false,
         }

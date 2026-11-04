@@ -836,7 +836,7 @@ async fn a_migrated_slug_resolves_to_its_canonical_number() {
         proposing_thread_id: DESIGN.into(),
         slug: Some("rulings-become-tenets".into()),
         statement: "Rulings become tenets".into(),
-        rationale: None,
+        rationale: Some("why".into()),
         status: TenetStatus::Approved,
         verdict: Some(Verdict::Yes),
         comment: None,
@@ -845,7 +845,7 @@ async fn a_migrated_slug_resolves_to_its_canonical_number() {
         answered_at: Some(5),
         supersedes: None,
         origin: TenetOrigin::MigratedRuling,
-        legacy: Some(serde_json::json!({"rationale": "why", "provenance": "cairn://p/prj/1"})),
+        legacy: Some(serde_json::json!({"provenance": "cairn://p/prj/1"})),
         proposer: design().principal,
         now: 5,
     };
@@ -870,7 +870,8 @@ async fn a_migrated_slug_resolves_to_its_canonical_number() {
     );
     let view = view(&db, 2).await;
     assert_eq!(view.answerer_label.as_deref(), Some("migrated ruling"));
-    assert_eq!(view.row.legacy.unwrap()["rationale"], "why");
+    assert_eq!(view.row.rationale.as_deref(), Some("why"));
+    assert_eq!(serde_json::to_value(&view).unwrap()["rationale"], "why");
 
     let by_slug = list(
         &db,

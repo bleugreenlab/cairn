@@ -181,13 +181,14 @@ struct Imported {
     proposer: PrincipalRef,
     created_at: i64,
     updated_at: i64,
+    rationale: Option<String>,
 }
 
 async fn imported(db: &LocalDb) -> Vec<Imported> {
     db.query_all(
         "SELECT number, proposing_thread_id, slug, statement, status, verdict,
                 answer_source, answered_at, answered_by_json, origin,
-                legacy_json, proposer_principal_json, created_at, updated_at
+                legacy_json, proposer_principal_json, created_at, updated_at, rationale
          FROM tenets WHERE project_id = 'p-imp' ORDER BY number",
         (),
         |row| {
@@ -206,6 +207,7 @@ async fn imported(db: &LocalDb) -> Vec<Imported> {
                 proposer: serde_json::from_str(&row.text(11)?).unwrap(),
                 created_at: row.i64(12)?,
                 updated_at: row.i64(13)?,
+                rationale: row.opt_text(14)?,
             })
         },
     )
@@ -266,10 +268,10 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
     assert_eq!(accepted.answered_at, Some(11));
     assert_eq!(accepted.origin, TenetOrigin::MigratedRuling.as_str());
     assert_eq!((accepted.created_at, accepted.updated_at), (10, 11));
+    assert_eq!(accepted.rationale.as_deref(), Some("Because shared-slug"));
     assert_eq!(
         accepted.legacy,
         json!({
-            "rationale": "Because shared-slug",
             "provenance": ["cairn://p/imp/10"],
             "legacy_key": "imp-a:shared-slug",
             "original_slug": "shared-slug",
@@ -299,7 +301,11 @@ async fn rulings_from_both_sources_become_numbered_migrated_tenets_exactly_once(
     assert_eq!(rows[1].legacy["legacy_key"], "imp-b:shared-slug");
     assert_eq!(rows[1].legacy["original_slug"], "shared-slug");
     assert_eq!(rows[3].legacy["provenance"], json!(["cairn://p/imp/9"]));
-    assert_eq!(rows[4].legacy["rationale"], "No rationale recorded");
+    assert_eq!(rows[3].rationale.as_deref(), Some("why c"));
+    assert_eq!(
+        rows[4].rationale, None,
+        "an arc ruling with no rationale has none, not a placeholder"
+    );
     assert_eq!((rows[4].created_at, rows[4].updated_at), (25, 25));
 
     // The import clock moves the project forward; it never moves it back.

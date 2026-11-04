@@ -83,6 +83,7 @@ struct Candidate {
     slug: String,
     text: String,
     status: String,
+    /// Verbatim; blank when the ruling recorded none.
     rationale: String,
     provenance: Value,
     created_at: i64,
@@ -419,9 +420,8 @@ fn new_tenet(
         proposing_thread_id: candidate.thread_id.clone(),
         slug: Some(slug),
         statement: candidate.text.clone(),
-        // A ruling's rationale is kept verbatim in `legacy` with its
-        // provenance, as every earlier import kept it.
-        rationale: None,
+        rationale: Some(candidate.rationale.clone())
+            .filter(|rationale| !rationale.trim().is_empty()),
         status,
         verdict: Some(verdict),
         comment: None,
@@ -431,7 +431,6 @@ fn new_tenet(
         supersedes: None,
         origin: TenetOrigin::MigratedRuling,
         legacy: Some(json!({
-            "rationale": candidate.rationale,
             "provenance": candidate.provenance,
             "legacy_key": candidate.legacy_key(),
             "original_slug": candidate.slug,
@@ -573,8 +572,7 @@ fn arc_candidate(
     let rationale = ruling
         .get("rationale")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("No rationale recorded")
+        .unwrap_or_default()
         .to_string();
     Some(Candidate {
         thread_id: thread.id.clone(),
@@ -694,5 +692,34 @@ mod tests {
             assert_eq!(tenet.statement, "Text");
             assert_eq!(tenet.answered_at, Some(1));
         }
+    }
+
+    /// A ruling's rationale is the tenet's rationale, written to its column
+    /// verbatim; `legacy` keeps only the import's own record.
+    #[test]
+    fn the_rationale_is_written_to_its_column_and_not_to_legacy() {
+        let mut row = candidate("s", "Text");
+        row.rationale = "Because leases expire.\n\nTokens do not.".into();
+        row.provenance = json!(["cairn://p/proj/3"]);
+        let tenet = new_tenet("p", "proj", &row, "s".into(), 9);
+        assert_eq!(
+            tenet.rationale.as_deref(),
+            Some("Because leases expire.\n\nTokens do not.")
+        );
+        let legacy = tenet
+            .legacy
+            .expect("a migrated ruling keeps its import record");
+        assert_eq!(
+            legacy,
+            json!({
+                "provenance": ["cairn://p/proj/3"],
+                "legacy_key": "t:s",
+                "original_slug": "s",
+            })
+        );
+        assert!(legacy.get("rationale").is_none(), "{legacy}");
+
+        row.rationale = "  ".into();
+        assert_eq!(new_tenet("p", "proj", &row, "s".into(), 9).rationale, None);
     }
 }
