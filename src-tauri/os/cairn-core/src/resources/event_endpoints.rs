@@ -74,6 +74,11 @@ async fn endpoint_block(orch: &Orchestrator, key: &str, endpoint: &EndpointRecor
         .unwrap_or_default();
     let state = if endpoint.is_active() {
         grant_line(endpoint)
+    } else if let Some(at) = endpoint.orphaned_at {
+        format!(
+            "orphaned {}: the operator re-registered the install's relay channel, so this URL reaches nothing; mint a new endpoint and reconfigure its sender",
+            ms(at)
+        )
     } else {
         format!(
             "revoked{}",
@@ -510,6 +515,7 @@ mod tests {
                 revoked_at: None,
                 url: None,
                 rejected_count: 0,
+                orphaned_at: None,
             },
         )
         .await

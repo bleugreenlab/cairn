@@ -70,7 +70,7 @@ pub struct EndpointRecord {
     pub name: String,
     pub provider: String,
     pub topic: Option<String>,
-    /// `active` or `revoked`.
+    /// `active` or `revoked`. An orphaned endpoint is revoked.
     pub status: String,
     /// The operator grant as the api last reported it (RFC 3339).
     pub granted_at: Option<String>,
@@ -80,6 +80,10 @@ pub struct EndpointRecord {
     pub url: Option<String>,
     /// Deliveries the api refused, as it last reported.
     pub rejected_count: i64,
+    /// When the operator re-registered the relay channel out from under it
+    /// (epoch milliseconds): its sender still posts to a URL on a channel
+    /// this install no longer holds. Set once, never cleared.
+    pub orphaned_at: Option<i64>,
 }
 
 impl EndpointRecord {
@@ -96,7 +100,7 @@ impl EndpointRecord {
     }
 }
 
-const ENDPOINT_COLUMNS: &str = "id,channel_id,project_id,name,provider,topic,status,granted_at,created_at,revoked_at,url,rejected_count";
+const ENDPOINT_COLUMNS: &str = "id,channel_id,project_id,name,provider,topic,status,granted_at,created_at,revoked_at,url,rejected_count,orphaned_at";
 
 fn endpoint_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<EndpointRecord> {
     Ok(EndpointRecord {
@@ -112,6 +116,7 @@ fn endpoint_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<End
         revoked_at: row.opt_i64(9)?,
         url: row.opt_text(10)?,
         rejected_count: row.opt_i64(11)?.unwrap_or(0),
+        orphaned_at: row.opt_i64(12)?,
     })
 }
 
@@ -205,14 +210,15 @@ pub async fn project_endpoints(
 pub async fn upsert_endpoint(db: &LocalDb, endpoint: &EndpointRecord) -> Result<(), String> {
     let endpoint = endpoint.clone();
     db.execute(
-        "INSERT INTO ingress_endpoints (id, channel_id, project_id, name, provider, topic, status, granted_at, created_at, revoked_at, url, rejected_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO ingress_endpoints (id, channel_id, project_id, name, provider, topic, status, granted_at, created_at, revoked_at, url, rejected_count, orphaned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
             granted_at = excluded.granted_at,
             revoked_at = excluded.revoked_at,
             url = COALESCE(excluded.url, ingress_endpoints.url),
-            rejected_count = excluded.rejected_count",
+            rejected_count = excluded.rejected_count,
+            orphaned_at = COALESCE(excluded.orphaned_at, ingress_endpoints.orphaned_at)",
         params![
             endpoint.id,
             endpoint.channel_id,
@@ -225,12 +231,84 @@ pub async fn upsert_endpoint(db: &LocalDb, endpoint: &EndpointRecord) -> Result<
             endpoint.created_at,
             endpoint.revoked_at,
             endpoint.url,
-            endpoint.rejected_count
+            endpoint.rejected_count,
+            endpoint.orphaned_at
         ],
     )
     .await
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Retire every live endpoint minted on a channel other than `channel_id`,
+/// the install's channel now, and return the ones whose senders have to be
+/// reconfigured.
+///
+/// None of them can receive anything: their events land on a channel this
+/// install no longer reads. The GitHub App's is only revoked, since its
+/// maintainer mints it again on the new channel. Every other one is also
+/// marked orphaned. Their secrets are forgotten, as a revocation's are.
+pub async fn retire_endpoints_off_channel(
+    db: &LocalDb,
+    channel_id: &str,
+) -> Result<Vec<EndpointRecord>, String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut orphaned = Vec::new();
+    for endpoint in active_endpoints(db).await? {
+        if endpoint.channel_id == channel_id {
+            continue;
+        }
+        let derived = endpoint.is_github_app();
+        let retired = EndpointRecord {
+            status: "revoked".into(),
+            revoked_at: Some(now),
+            orphaned_at: (!derived).then_some(now),
+            ..endpoint
+        };
+        upsert_endpoint(db, &retired).await?;
+        if retired.provider != "first-party" {
+            if let Err(error) = custody::forget(&retired.id) {
+                log::warn!(
+                    "retired endpoint {} but could not delete its keychain entry: {error}",
+                    retired.id
+                );
+            }
+        }
+        if !derived {
+            orphaned.push(retired);
+        }
+    }
+    Ok(orphaned)
+}
+
+/// Delete an orphaned endpoint's mirror row, and any secret this machine
+/// still keeps for it. Only an orphan: a live or revoked row mirrors the
+/// api's own. `None` when `id` names no orphan.
+pub async fn delete_orphaned_endpoint(
+    db: &LocalDb,
+    id: &str,
+) -> Result<Option<EndpointRecord>, String> {
+    let Some(endpoint) = get_endpoint(db, id)
+        .await?
+        .filter(|endpoint| endpoint.orphaned_at.is_some())
+    else {
+        return Ok(None);
+    };
+    db.execute(
+        "DELETE FROM ingress_endpoints WHERE id = ?1 AND orphaned_at IS NOT NULL",
+        (id.to_string(),),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if endpoint.provider != "first-party" {
+        if let Err(error) = custody::forget(&endpoint.id) {
+            log::warn!(
+                "deleted orphaned endpoint {} but could not delete its keychain entry: {error}",
+                endpoint.id
+            );
+        }
+    }
+    Ok(Some(endpoint))
 }
 
 /// How an endpoint's events have fared on this install.

@@ -116,6 +116,7 @@ fn record(channel_id: &str, wire: WireEndpoint, created_at: i64) -> EndpointReco
         revoked_at: revoked.then_some(created_at),
         url: wire.url,
         rejected_count: wire.rejected_count,
+        orphaned_at: None,
     }
 }
 

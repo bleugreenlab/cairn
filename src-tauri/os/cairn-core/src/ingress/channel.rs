@@ -19,6 +19,7 @@ use cairn_db::turso::params;
 use serde::Deserialize;
 use tokio::sync::{Mutex, Notify};
 
+use super::EndpointRecord;
 use crate::github::crypto;
 use crate::storage::{LocalDb, RowExt};
 
@@ -275,7 +276,7 @@ where
 /// Record that the api refused the channel's secret (401) or no longer knows
 /// the channel (404). Repair cannot fix either, and registering a new channel
 /// would orphan every endpoint on this one, so the state stays until the api
-/// accepts the channel again.
+/// accepts the channel again or the operator re-registers it ([`reregister`]).
 ///
 /// One statement, so the doorbell can record it while the sync loop rewrites
 /// the row without either losing the other's cursor.
@@ -378,22 +379,77 @@ pub async fn ensure(
         repair_locked(db, signals, relay_url).await?;
         return get_relay_channel(db).await;
     }
-    let registered = register(relay_url).await?;
-    let fresh = RelayChannel {
-        channel_id: Some(registered.channel_id),
-        secret: Some(registered.secret),
-        public_key: Some(registered.public_key),
-        private_key_encrypted: Some(registered.private_key_encrypted),
-        key_rotated_at: Some(chrono::Utc::now().to_rfc3339()),
-        ..RelayChannel::default()
-    };
-    update_relay_channel(db, {
-        let fresh = fresh.clone();
-        move |channel| *channel = fresh
-    })
-    .await?;
+    let fresh = register(relay_url).await?.into_channel();
+    update_relay_channel(db, move |channel| *channel = fresh).await?;
     signals.notify_channel_changed();
     get_relay_channel(db).await
+}
+
+/// Why [`reregister`] registered nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReregisterError {
+    /// The api does not reject the install's channel (or there is none), so
+    /// a new one would orphan every endpoint on it for nothing.
+    NotRejected(String),
+    Failed(String),
+}
+
+impl From<String> for ReregisterError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// What [`reregister`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reregistered {
+    pub channel_id: String,
+    /// The endpoints left on the old channel, whose senders must be
+    /// reconfigured.
+    pub orphaned: Vec<EndpointRecord>,
+}
+
+/// Give the install a new channel in place of one the api rejects.
+///
+/// The operator's recovery, never the runner's: every endpoint on the old
+/// channel keeps a URL nothing reads any more, which only the operator may
+/// decide to accept. The new channel is registered before the row is
+/// touched, so a failed registration leaves the install as it was, and the
+/// row is replaced under the operation lock, so the sync loop never finds the
+/// install without a channel. The GitHub App's endpoint is revoked, and its
+/// maintainer, told of the change, mints it on the new channel and repoints
+/// the App; every other endpoint is marked orphaned.
+pub async fn reregister(
+    db: &LocalDb,
+    signals: &RelaySignals,
+    relay_url: &str,
+) -> Result<Reregistered, ReregisterError> {
+    let relay_operation = signals.operation_lock().lock().await;
+    let channel = get_relay_channel(db).await?;
+    if channel.channel_id.is_none() {
+        return Err(ReregisterError::NotRejected(
+            "This install has no relay channel to re-register; one is registered when the first endpoint is minted".to_string(),
+        ));
+    }
+    if channel.health_state.as_deref() != Some("unauthorized") {
+        return Err(ReregisterError::NotRejected(
+            "The relay still accepts this install's channel. Re-registering it would orphan every endpoint on it, so only a channel the relay rejects is re-registered".to_string(),
+        ));
+    }
+    let registered = register(relay_url).await?;
+    let channel_id = registered.channel_id.clone();
+    let fresh = registered.into_channel();
+    update_relay_channel(db, move |channel| *channel = fresh).await?;
+    let orphaned = super::retire_endpoints_off_channel(db, &channel_id).await?;
+    drop(relay_operation);
+    signals.notify_channel_changed();
+    // The sync loop backs off at its maximum after a rejection; the new
+    // channel should not wait that out.
+    signals.notify_repaired();
+    Ok(Reregistered {
+        channel_id,
+        orphaned,
+    })
 }
 
 struct Registration {
@@ -401,6 +457,21 @@ struct Registration {
     secret: String,
     public_key: String,
     private_key_encrypted: String,
+}
+
+impl Registration {
+    /// The row a newly registered channel starts with: no cursor and no
+    /// health evidence.
+    fn into_channel(self) -> RelayChannel {
+        RelayChannel {
+            channel_id: Some(self.channel_id),
+            secret: Some(self.secret),
+            public_key: Some(self.public_key),
+            private_key_encrypted: Some(self.private_key_encrypted),
+            key_rotated_at: Some(chrono::Utc::now().to_rfc3339()),
+            ..RelayChannel::default()
+        }
+    }
 }
 
 async fn register(relay_url: &str) -> Result<Registration, String> {
@@ -669,5 +740,57 @@ mod tests {
             *seen.lock().unwrap(),
             vec!["PUT /relay/channels/ch-old/public-key".to_string()]
         );
+    }
+
+    /// Re-registering is for a channel the relay rejects only: a healthy one
+    /// is refused with the reason, and the api is never called.
+    #[tokio::test]
+    async fn reregister_refuses_a_channel_the_relay_still_accepts() {
+        let db = migrated_test_db("relay-channel-reregister-healthy.db").await;
+        let (url, seen) = relay().await;
+        let signals = RelaySignals::default();
+        let refused = reregister(&db, &signals, &url).await.unwrap_err();
+        assert!(
+            matches!(&refused, ReregisterError::NotRejected(reason) if reason.contains("no relay channel")),
+            "{refused:?}"
+        );
+
+        update_relay_channel(&db, |channel| {
+            channel.channel_id = Some("ch-old".into());
+            channel.secret = Some("old-secret".into());
+        })
+        .await
+        .unwrap();
+        let refused = reregister(&db, &signals, &url).await.unwrap_err();
+        assert!(
+            matches!(&refused, ReregisterError::NotRejected(reason) if reason.contains("still accepts")),
+            "{refused:?}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            get_relay_channel(&db).await.unwrap().channel_id.as_deref(),
+            Some("ch-old")
+        );
+    }
+
+    /// A registration that fails leaves the rejected channel as it was, so
+    /// the action can be retried and nothing is orphaned yet.
+    #[tokio::test]
+    async fn a_failed_reregistration_keeps_the_rejected_channel() {
+        let db = migrated_test_db("relay-channel-reregister-failed.db").await;
+        update_relay_channel(&db, |channel| {
+            channel.channel_id = Some("ch-old".into());
+            channel.secret = Some("old-secret".into());
+        })
+        .await
+        .unwrap();
+        mark_rejected(&db).await.unwrap();
+        let failed = reregister(&db, &RelaySignals::default(), "http://127.0.0.1:9/relay")
+            .await
+            .unwrap_err();
+        assert!(matches!(failed, ReregisterError::Failed(_)), "{failed:?}");
+        let channel = get_relay_channel(&db).await.unwrap();
+        assert_eq!(channel.channel_id.as_deref(), Some("ch-old"));
+        assert_eq!(channel.health_state.as_deref(), Some("unauthorized"));
     }
 }

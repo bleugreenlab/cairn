@@ -364,6 +364,10 @@ mod tests {
                 let not_found =
                     || (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
                 match (method.as_str(), parts.as_slice()) {
+                    ("POST", ["channels"]) => {
+                        Json(json!({"channel_id": "ch-2", "secret": "channel-secret-2"}))
+                            .into_response()
+                    }
                     ("GET", ["channels", channel, "endpoints"]) => {
                         if relay.failing_lists > 0 {
                             relay.failing_lists -= 1;
@@ -1020,6 +1024,92 @@ mod tests {
             .expect("the legacy mention minted a github_comment fact");
         println!("legacy github_comment origin: {legacy_origin}");
         assert!(!legacy_origin.contains("583231"), "{legacy_origin}");
+    }
+
+    /// The operator's re-registration of a rejected channel: one
+    /// registration, the App's endpoint minted again on the new channel by
+    /// its maintainer with no further step, and the other endpoint orphaned
+    /// for its sender to be reconfigured.
+    #[tokio::test]
+    async fn reregistering_a_rejected_channel_remints_the_app_and_orphans_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let world = World::new(temp.path()).await;
+        let (old_app, _) = pointed(&world.ensure(&github("https://old.test")).await.unwrap());
+        crate::ingress::upsert_endpoint(
+            &world.db,
+            &EndpointRecord {
+                id: "src_hook".into(),
+                channel_id: "ch-1".into(),
+                project_id: Some("p".into()),
+                name: "ci".into(),
+                provider: "cairn-hmac".into(),
+                status: "active".into(),
+                created_at: 1,
+                url: Some("https://api.cairn.test/e/src_hook".into()),
+                ..EndpointRecord::default()
+            },
+        )
+        .await
+        .unwrap();
+        channel::mark_rejected(&world.db).await.unwrap();
+        // Started while the channel is rejected, the maintainer mints nothing
+        // and settles on its hour-long recheck: only the change signal can
+        // bring it back within the wait below.
+        let maintainer = tokio::spawn(maintain(world.orch.clone(), world.relay_url.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(world
+            .bodies("POST", "/relay/channels/ch-2/endpoints")
+            .is_empty());
+
+        let outcome = channel::reregister(&world.db, &world.orch.relay, &world.relay_url)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.channel_id, "ch-2");
+        let orphaned: Vec<&str> = outcome.orphaned.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(orphaned, vec!["src_hook"]);
+        let reminted = async {
+            loop {
+                if let Some(endpoint) = current_endpoint(&world.orch, Some("ch-2"), "github-app-1")
+                    .await
+                    .unwrap()
+                {
+                    return endpoint;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let app = tokio::time::timeout(Duration::from_secs(10), reminted)
+            .await
+            .expect("the maintainer minted the App's endpoint on the new channel");
+        maintainer.abort();
+
+        let registrations = world
+            .calls()
+            .into_iter()
+            .filter(|(method, path)| method == "POST" && path == "/relay/channels")
+            .count();
+        assert_eq!(registrations, 1);
+        assert_ne!(app.id, old_app);
+        assert_eq!(
+            world.bodies("POST", "/relay/channels/ch-2/endpoints").len(),
+            1
+        );
+        let old_app = world.endpoint(&old_app).await;
+        assert_eq!(
+            (old_app.status.as_str(), old_app.orphaned_at),
+            ("revoked", None),
+            "the App's old endpoint is superseded, not left for the operator"
+        );
+        let hook = world.endpoint("src_hook").await;
+        assert_eq!(hook.status, "revoked");
+        assert!(hook.orphaned_at.is_some(), "{hook:?}");
+        let channel = channel::get_relay_channel(&world.db).await.unwrap();
+        assert_eq!(channel.channel_id.as_deref(), Some("ch-2"));
+        assert_eq!(
+            channel::relay_channel_status(&channel).health_state,
+            "healthy"
+        );
     }
 
     /// The maintainer runs at startup, and again when it is told the App

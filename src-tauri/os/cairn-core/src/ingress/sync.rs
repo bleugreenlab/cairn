@@ -756,6 +756,7 @@ mod tests {
                     revoked_at: None,
                     url: None,
                     rejected_count: 0,
+                    orphaned_at: None,
                 },
             )
             .await
