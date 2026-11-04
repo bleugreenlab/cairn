@@ -199,11 +199,12 @@ mod tests {
         assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(pack_lock::read_lock(&repo, "linear").is_none());
-        let catalog = crate::resources::packs::read_packs(&repo, None);
+        let library = crate::library::LibraryContext::configured();
+        let catalog = crate::resources::packs::read_packs(&repo, &library, None);
         assert!(catalog.contains("`matlab`"), "{catalog}");
         assert!(catalog.contains("`linear`"), "{catalog}");
         assert_eq!(
-            crate::resources::packs::read_packs(&repo, Some("installed"))
+            crate::resources::packs::read_packs(&repo, &library, Some("installed"))
                 .matches("State: installed")
                 .count(),
             1,
@@ -239,7 +240,7 @@ mod tests {
         assert!(entries["linear"].not_ready.is_some());
         assert!(entries["matlab"].not_ready.is_some());
 
-        let pack_page = crate::resources::packs::read_pack(&repo, "linear");
+        let pack_page = crate::resources::packs::read_pack(&repo, &library, "linear");
         assert!(pack_page.contains("State: installed"), "{pack_page}");
         assert!(pack_page.contains("needs_auth"), "{pack_page}");
 

@@ -1,0 +1,139 @@
+{
+  "entries": [
+    {
+      "author": {
+        "name": "Acme"
+      },
+      "contentHash": "79dfeaa08d3e64a86d855b2679a896ca6315bf7eb78dcfe6fc0a92376c3f1fc6",
+      "description": "",
+      "format": "claude-code",
+      "id": "acme-tools",
+      "items": [
+        {
+          "definition": {
+            "args": [
+              "--stdio"
+            ],
+            "command": "acme-mcp",
+            "env": {
+              "A": "1",
+              "B": "2"
+            },
+            "type": "stdio"
+          },
+          "hash": "f5c8ecf38cf2270e85ac78d59fac7076c94b2f0ef2cd9a6ab537408725f5b3b9",
+          "id": "acme",
+          "kind": "mcp",
+          "runs": "here"
+        },
+        {
+          "hash": "5a5806243795cbb544dbb487f55705a6d188f1564dbeed345fe568ab692cbd87",
+          "id": "acme",
+          "kind": "skill",
+          "path": "skills/acme",
+          "runs": "content"
+        }
+      ],
+      "name": "Acme Tools",
+      "notes": [
+        "ignored claude-code component: commands (no Cairn equivalent)"
+      ],
+      "origin": {
+        "kind": "source",
+        "path": "plugins/acme-tools"
+      },
+      "version": "2.0.0"
+    },
+    {
+      "contentHash": "32faf84aab3bc46a1f8a1aaeee4b30b943610d0b640aca3bf7b02288fd1d255c",
+      "description": "Document skills",
+      "format": "cairn",
+      "id": "document-skills",
+      "items": [
+        {
+          "from": "skills/docx",
+          "hash": "e013c2f5f1fd56824c7c2d064b7b4aff0eca7d6b312d760413a64b66be6d21fb",
+          "id": "docx",
+          "kind": "skill",
+          "path": "skills/docx",
+          "runs": "content"
+        },
+        {
+          "from": "skills/pdf",
+          "hash": "3affc2e1eadad8709ef3a1bb9b8044e06e8fbfda46e4f5f306271ec4fbc7a57c",
+          "id": "pdf",
+          "kind": "skill",
+          "path": "skills/pdf",
+          "runs": "content"
+        }
+      ],
+      "license": "Proprietary (source-available)",
+      "name": "document-skills",
+      "origin": {
+        "commit": "ca45fc4000000000000000000000000000000000",
+        "kind": "upstream",
+        "url": "https://github.com/anthropics/skills"
+      },
+      "version": "0.0.0"
+    },
+    {
+      "contentHash": "c72ad0233a6ebfa2cde8cdf3379decb0f659bffd9e20d23b3c2a349309d01e6b",
+      "description": "Linear issues.",
+      "format": "cairn",
+      "id": "linear",
+      "items": [
+        {
+          "definition": {
+            "oauth": {},
+            "type": "http",
+            "url": "https://mcp.linear.app/mcp"
+          },
+          "hash": "a676ac5826abbfac44f767b44251ad01e2eed978d1ebfe07fe9f5fee9f98105a",
+          "id": "linear",
+          "kind": "mcp",
+          "runs": "endpoint"
+        }
+      ],
+      "name": "Linear",
+      "origin": {
+        "kind": "source",
+        "path": "plugins/linear"
+      },
+      "version": "1.0.0"
+    },
+    {
+      "contentHash": "3c9bb5cc91d421920e6562ef972c231a60fd88fe510bc9de8f77d6dd23f3b544",
+      "description": "Skills selected from the repository root",
+      "format": "cairn",
+      "id": "local-skills",
+      "items": [
+        {
+          "from": "shared/skills/notes",
+          "hash": "1d8a165fb369ae39351ea40036b61a0a9b20c0ac8a0399a0b5c50b570fbf72bd",
+          "id": "notes",
+          "kind": "skill",
+          "path": "skills/notes",
+          "runs": "content"
+        }
+      ],
+      "name": "local-skills",
+      "origin": {
+        "kind": "source",
+        "path": ""
+      },
+      "version": "1.0.0"
+    }
+  ],
+  "format": "cairn-library-index/1",
+  "generatedAt": "2026-11-02T00:00:00Z",
+  "notes": [
+    "plugin `floating` skipped: its repository `https://github.com/example/floating` is not pinned to a full commit `sha`; the commit is the trust anchor",
+    "plugin `from-npm` skipped: `npm` sources are not supported; only relative directories and pinned git repositories are"
+  ],
+  "serial": 42,
+  "source": {
+    "commit": "1111111111111111111111111111111111111111",
+    "ref": "main",
+    "url": "https://github.com/bleugreenlab/cairn-library"
+  }
+}

@@ -17,3 +17,17 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 log = "0.4"
 jsonschema = { version = "0.26", default-features = false }
+minisign-verify = "0.2.4"
+# A minisign-format signer for fixture indexes, so dependent crates' tests can
+# publish a signed index without the production key.
+ring = { version = "0.17", optional = true }
+blake2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+
+[features]
+test-support = ["dep:ring", "dep:blake2", "dep:base64"]
+
+[dev-dependencies]
+ring = "0.17"
+blake2 = "0.10"
+base64 = "0.22"

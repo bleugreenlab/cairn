@@ -109,6 +109,62 @@ impl PackItemKind {
     ];
 }
 
+/// What installing an item lets happen on this machine.
+///
+/// Derived from the item, never declared by it, so a library index cannot
+/// describe a stdio server as inert. The Library shows it, and an update that
+/// changes an [`ItemRuns::Endpoint`] or [`ItemRuns::Here`] item waits for the
+/// operator's click instead of being applied in the background.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ItemRuns {
+    /// Text an agent reads: skills, agents, recipes, responses, routes. A
+    /// skill's `scripts/` stay content, because running them is an agent act.
+    #[default]
+    Content,
+    /// A remote MCP server (`http`/`sse`) the workspace connects to.
+    Endpoint,
+    /// Something that executes on this machine: a stdio MCP server, or a
+    /// workflow, whose `main.ts` runs.
+    Here,
+}
+
+impl ItemRuns {
+    pub fn classify(
+        kind: PackItemKind,
+        mcp: Option<&crate::server_config::McpServerConfig>,
+    ) -> Self {
+        match kind {
+            PackItemKind::Workflow => ItemRuns::Here,
+            PackItemKind::Mcp => match mcp.map(|config| config.transport.as_str()) {
+                Some("http" | "sse") => ItemRuns::Endpoint,
+                // An MCP item with no readable definition is assumed to spawn.
+                _ => ItemRuns::Here,
+            },
+            PackItemKind::Agent
+            | PackItemKind::Recipe
+            | PackItemKind::Response
+            | PackItemKind::Route
+            | PackItemKind::Skill => ItemRuns::Content,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemRuns::Content => "content",
+            ItemRuns::Endpoint => "endpoint",
+            ItemRuns::Here => "here",
+        }
+    }
+
+    /// Whether a change to an item of this class changes what runs.
+    pub fn is_runnable(self) -> bool {
+        self != ItemRuns::Content
+    }
+}
+
 /// One installable unit inside a pack.
 ///
 /// `path` is the workspace-relative destination (`skills/matlab`,
@@ -685,6 +741,44 @@ mod tests {
                 "recipes/mine.yaml"
             )]
         );
+    }
+
+    #[test]
+    fn what_an_item_runs_is_derived_from_its_kind_and_transport() {
+        let remote: crate::server_config::McpServerConfig =
+            serde_yaml::from_str("type: http\nurl: https://mcp.example/mcp\n").unwrap();
+        let sse: crate::server_config::McpServerConfig =
+            serde_yaml::from_str("type: sse\nurl: https://mcp.example/sse\n").unwrap();
+        let stdio: crate::server_config::McpServerConfig =
+            serde_yaml::from_str("command: npx\n").unwrap();
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Mcp, Some(&remote)),
+            ItemRuns::Endpoint
+        );
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Mcp, Some(&sse)),
+            ItemRuns::Endpoint
+        );
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Mcp, Some(&stdio)),
+            ItemRuns::Here,
+            "`type` defaults to stdio, which spawns a process"
+        );
+        assert_eq!(ItemRuns::classify(PackItemKind::Mcp, None), ItemRuns::Here);
+        assert_eq!(
+            ItemRuns::classify(PackItemKind::Workflow, None),
+            ItemRuns::Here
+        );
+        for kind in [
+            PackItemKind::Agent,
+            PackItemKind::Recipe,
+            PackItemKind::Response,
+            PackItemKind::Route,
+            PackItemKind::Skill,
+        ] {
+            assert_eq!(ItemRuns::classify(kind, None), ItemRuns::Content);
+        }
+        assert!(ItemRuns::Here > ItemRuns::Endpoint && ItemRuns::Endpoint > ItemRuns::Content);
     }
 
     #[test]

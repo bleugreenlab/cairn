@@ -169,6 +169,10 @@ pub mod resources {
     pub use crate::resources::*;
 }
 
+pub mod library {
+    pub use crate::library::*;
+}
+
 pub mod runs {
     pub use crate::runs::*;
 }

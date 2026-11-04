@@ -9,6 +9,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::mcp::McpVarSetup;
 use crate::server_config::McpServerConfig;
 use crate::{
     self as pack, lock as pack_lock, ContentHash, PackItemKind, PackLock, PackLockItem,
@@ -65,6 +66,155 @@ pub fn sync_resolved_pack(
             source,
         }],
     )
+}
+
+/// Refuse a non-bundled install whose pack id, destination path, or MCP server
+/// name already belongs to something else, naming both sides.
+///
+/// Packs do not namespace what they install, so two sources offering
+/// `skills/pdf` are a real conflict. The outcome is defined and never silent:
+/// no overwrite, no rename. Runs before anything is written. An update of the
+/// same pack from the same origin skips what that pack already holds.
+/// Bundled sync does not call this; it keeps its adopt-as-fork migration rule.
+pub fn check_install_collisions(
+    config_dir: &Path,
+    manifest: &PackManifest,
+    incoming: &PackSource,
+    shipped_ids: &[String],
+) -> Result<(), String> {
+    let id = &manifest.id;
+    let incoming_label = describe_source(incoming);
+    let refuse = |reason: String| {
+        Err(format!(
+            "{reason}; refusing to install pack `{id}` from {incoming_label}"
+        ))
+    };
+    let own = pack_lock::read_lock(config_dir, id);
+    match &own {
+        Some(lock) if !same_origin(&lock.source, incoming) => {
+            return refuse(format!(
+                "pack id `{id}` is already installed from {}",
+                describe_source(&lock.source)
+            ));
+        }
+        None if shipped_ids.iter().any(|shipped| shipped == id) => {
+            return refuse(format!("pack id `{id}` ships with the app"));
+        }
+        _ => {}
+    }
+    let own_items: BTreeSet<(PackItemKind, String)> = own
+        .iter()
+        .flat_map(|lock| {
+            lock.items
+                .iter()
+                .map(PackLockItem::manifest_item)
+                .chain(lock.removed.iter().cloned())
+        })
+        .map(|item| (item.kind, item.id))
+        .collect();
+    let others: Vec<PackLock> = pack_lock::installed_packs(config_dir)
+        .into_iter()
+        .filter(|lock| lock.id != *id)
+        .collect();
+    let pack_servers = pack::mcp::load_pack_mcp_servers(config_dir);
+    let settings_servers = settings_mcp_server_names(config_dir);
+
+    for item in manifest.items() {
+        if own_items.contains(&(item.kind, item.id.clone())) {
+            continue;
+        }
+        if item.kind == PackItemKind::Mcp {
+            if let Some(owner) = pack_servers
+                .get(&item.id)
+                .filter(|server| server.pack_id != *id)
+            {
+                let source = others
+                    .iter()
+                    .find(|lock| lock.id == owner.pack_id)
+                    .map(|lock| describe_source(&lock.source))
+                    .unwrap_or_else(|| "an installed pack".to_string());
+                return refuse(format!(
+                    "MCP server `{}` is already defined by pack `{}` (from {source})",
+                    item.id, owner.pack_id
+                ));
+            }
+            if settings_servers.contains(&item.id) {
+                return refuse(format!(
+                    "MCP server `{}` is already defined in your settings.yaml",
+                    item.id
+                ));
+            }
+            continue;
+        }
+        let Some(path) = &item.path else { continue };
+        if let Some(owner) = others.iter().find(|lock| {
+            lock.items
+                .iter()
+                .filter_map(|claimed| claimed.path.as_deref())
+                .chain(lock.removed.iter().filter_map(|gone| gone.path.as_deref()))
+                .any(|claimed| claimed == path)
+        }) {
+            return refuse(format!(
+                "`{path}` is installed from pack `{}` (from {})",
+                owner.id,
+                describe_source(&owner.source)
+            ));
+        }
+        if config_dir.join(path).exists() {
+            return refuse(format!(
+                "you already have your own {} `{}` at `{path}`, which no pack installed",
+                item.kind.as_str(),
+                item.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where a pack came from, in the words a refusal uses.
+pub fn describe_source(source: &PackSource) -> String {
+    match source.kind {
+        pack::PackSourceKind::Bundled => "the app bundle".to_string(),
+        pack::PackSourceKind::Local => format!(
+            "a local import of {}",
+            source.path.as_deref().unwrap_or("an unknown directory")
+        ),
+        pack::PackSourceKind::Url => {
+            let url = source.url.as_deref().unwrap_or("an unknown URL");
+            match &source.upstream {
+                Some(upstream) => format!("{url} (upstream {})", upstream.url),
+                None => url.to_string(),
+            }
+        }
+    }
+}
+
+fn same_origin(left: &PackSource, right: &PackSource) -> bool {
+    left.kind == right.kind
+        && match left.kind {
+            pack::PackSourceKind::Bundled => true,
+            pack::PackSourceKind::Local => left.path == right.path,
+            pack::PackSourceKind::Url => match (&left.url, &right.url) {
+                (Some(a), Some(b)) => pack::library::source::same_repository(a, b),
+                _ => false,
+            },
+        }
+}
+
+/// Server names the user's own `settings.yaml` defines.
+fn settings_mcp_server_names(config_dir: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(config_dir.join("settings.yaml"))
+        .ok()
+        .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok())
+        .and_then(|value| value.get("mcpServers").cloned())
+        .and_then(|servers| servers.as_mapping().cloned())
+        .map(|servers| {
+            servers
+                .keys()
+                .filter_map(|key| key.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Refuse a whole pack when any skill its source ships fails the skill-package
@@ -558,6 +708,8 @@ fn sync_pack(
         }
     }
 
+    refresh_mcp_setup(fs, config_dir, &pack_id, manifest)?;
+
     lock.cairn_version = 2;
     lock.name = manifest.name.clone();
     lock.version = manifest.version.clone();
@@ -697,7 +849,13 @@ fn materialize_item(
             .get(&item.id)
             .ok_or_else(|| format!("Missing shipped MCP definition `{}`", item.id))?;
         installed.insert(item.id.clone(), config.clone());
-        return write_mcp_layer(fs, config_dir, pack_id, &installed);
+        return write_mcp_layer(
+            fs,
+            config_dir,
+            pack_id,
+            &installed,
+            source_mcp_setup(manifest)?,
+        );
     }
     let path = item
         .path
@@ -724,7 +882,8 @@ fn remove_item_content(
     if item.kind == PackItemKind::Mcp {
         let mut installed = installed_mcp_servers(config_dir, pack_id)?;
         installed.remove(&item.id);
-        return write_mcp_layer(fs, config_dir, pack_id, &installed);
+        let setup = installed_mcp_setup(config_dir, pack_id)?;
+        return write_mcp_layer(fs, config_dir, pack_id, &installed, setup);
     }
     let path = item
         .path
@@ -741,16 +900,63 @@ fn remove_item_content(
     }
 }
 
+/// The `setup` copy a pack ships for its servers' `${VAR}`s.
+fn source_mcp_setup(manifest: &PackManifest) -> Result<BTreeMap<String, McpVarSetup>, String> {
+    match manifest.mcp_source() {
+        Some(path) => Ok(pack::mcp::parse_pack_mcp_file(&path)?.setup),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+fn installed_mcp_setup(
+    config_dir: &Path,
+    pack_id: &str,
+) -> Result<BTreeMap<String, McpVarSetup>, String> {
+    let path = pack_lock::mcp_path(config_dir, pack_id);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(pack::mcp::parse_pack_mcp_file(&path)?.setup)
+}
+
+/// Carry the shipped `setup` copy into an installed layer that lacks it.
+///
+/// The copy is what turns "needs setup" into a labelled field a user can act
+/// on. Layers written before it was carried hold the servers alone, and the
+/// item sync rewrites a layer only when a server changes, so this is what
+/// brings an existing install up to date. Server definitions are rewritten
+/// exactly as installed.
+fn refresh_mcp_setup(
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    pack_id: &str,
+    manifest: &PackManifest,
+) -> Result<(), String> {
+    let path = pack_lock::mcp_path(config_dir, pack_id);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let shipped = source_mcp_setup(manifest)?;
+    if installed_mcp_setup(config_dir, pack_id)? == shipped {
+        return Ok(());
+    }
+    let servers = installed_mcp_servers(config_dir, pack_id)?;
+    write_mcp_layer(fs, config_dir, pack_id, &servers, shipped)
+}
+
 fn write_mcp_layer(
     fs: &dyn FileSystem,
     config_dir: &Path,
     pack_id: &str,
     servers: &BTreeMap<String, McpServerConfig>,
+    setup: BTreeMap<String, McpVarSetup>,
 ) -> Result<(), String> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct McpLayer<'a> {
         mcp_servers: &'a BTreeMap<String, McpServerConfig>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        setup: BTreeMap<String, McpVarSetup>,
     }
     let path = pack_lock::mcp_path(config_dir, pack_id);
     if servers.is_empty() {
@@ -764,6 +970,7 @@ fn write_mcp_layer(
     }
     let yaml = serde_yaml::to_string(&McpLayer {
         mcp_servers: servers,
+        setup,
     })
     .map_err(|error| format!("Failed to serialize pack MCP layer: {error}"))?;
     fs.write_str(&path, &yaml)
@@ -820,6 +1027,195 @@ pub fn provision_workflow_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest;
+    use cairn_platform::services::RealFileSystem;
+
+    fn write(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A pack source with one skill and one MCP server.
+    fn incoming(root: &Path, id: &str, skill: &str, server: &str) -> PackManifest {
+        let dir = root.join(id);
+        write(&dir.join("cairn-pack.yaml"), &format!("id: {id}\n"));
+        write(
+            &dir.join(format!("skills/{skill}/SKILL.md")),
+            "---\nname: x\n---\n",
+        );
+        write(
+            &dir.join("mcp.yaml"),
+            &format!("mcpServers:\n  {server}:\n    type: http\n    url: https://x.test/mcp\n"),
+        );
+        manifest::load(&dir).unwrap()
+    }
+
+    fn library_source() -> PackSource {
+        PackSource::library(
+            "https://github.com/bleugreenlab/cairn-library".into(),
+            "main".into(),
+            "1111111111111111111111111111111111111111".into(),
+            "k".into(),
+            None,
+            pack::PackFormat::Cairn,
+        )
+    }
+
+    fn install(config: &Path, manifest: &PackManifest, source: PackSource) {
+        let lock = PackLock::new(manifest, "h".into(), source, manifest.items());
+        pack_lock::write_lock(&RealFileSystem, config, &lock).unwrap();
+    }
+
+    #[test]
+    fn your_own_content_at_a_destination_is_refused_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        write(&config.join("skills/pdf/SKILL.md"), "mine\n");
+        let manifest = incoming(temp.path(), "document-skills", "pdf", "docs");
+        let error =
+            check_install_collisions(&config, &manifest, &library_source(), &[]).unwrap_err();
+        assert_eq!(
+            error,
+            "you already have your own skill `pdf` at `skills/pdf`, which no pack installed; \
+             refusing to install pack `document-skills` from \
+             https://github.com/bleugreenlab/cairn-library"
+        );
+    }
+
+    #[test]
+    fn a_path_or_server_another_pack_holds_is_refused_naming_that_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        let first = incoming(&temp.path().join("a"), "first", "pdf", "shared");
+        install(&config, &first, PackSource::local("/plugins/first".into()));
+        write(
+            &pack_lock::mcp_path(&config, "first"),
+            "mcpServers:\n  shared:\n    type: http\n    url: https://x.test/mcp\n",
+        );
+
+        let same_path = incoming(&temp.path().join("b"), "second", "pdf", "other");
+        let error =
+            check_install_collisions(&config, &same_path, &library_source(), &[]).unwrap_err();
+        assert!(
+            error.starts_with(
+                "`skills/pdf` is installed from pack `first` (from a local import of /plugins/first)"
+            ),
+            "{error}"
+        );
+
+        let same_server = incoming(&temp.path().join("c"), "third", "other", "shared");
+        let error =
+            check_install_collisions(&config, &same_server, &library_source(), &[]).unwrap_err();
+        assert!(
+            error.starts_with("MCP server `shared` is already defined by pack `first`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_server_your_settings_define_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        write(
+            &config.join("settings.yaml"),
+            "mcpServers:\n  linear:\n    type: http\n    url: https://mine.test/mcp\n",
+        );
+        let manifest = incoming(temp.path(), "linear", "linear", "linear");
+        let error =
+            check_install_collisions(&config, &manifest, &library_source(), &[]).unwrap_err();
+        assert!(
+            error.starts_with("MCP server `linear` is already defined in your settings.yaml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_taken_or_shipped_id_is_refused_and_a_same_origin_update_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        let manifest = incoming(temp.path(), "linear", "linear", "linear");
+
+        let error = check_install_collisions(
+            &config,
+            &manifest,
+            &library_source(),
+            &["linear".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("pack id `linear` ships with the app"),
+            "{error}"
+        );
+
+        install(
+            &config,
+            &manifest,
+            PackSource::local("/plugins/linear".into()),
+        );
+        let error =
+            check_install_collisions(&config, &manifest, &library_source(), &[]).unwrap_err();
+        assert!(
+            error.starts_with(
+                "pack id `linear` is already installed from a local import of /plugins/linear"
+            ),
+            "{error}"
+        );
+
+        install(&config, &manifest, library_source());
+        write(&config.join("skills/linear/SKILL.md"), "materialized\n");
+        assert!(
+            check_install_collisions(&config, &manifest, &library_source(), &[]).is_ok(),
+            "an update of the same pack from the same source holds its own paths"
+        );
+    }
+
+    /// The installed layer keeps the pack's `setup` copy, so a gated server
+    /// explains what it needs after install rather than only in the source.
+    #[test]
+    fn an_installed_mcp_layer_keeps_the_setup_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("home");
+        let source = temp.path().join("src/tool");
+        write(&source.join("cairn-pack.yaml"), "id: tool\n");
+        write(
+            &source.join("mcp.yaml"),
+            "mcpServers:\n  tool:\n    command: ${TOOL_BIN}\nsetup:\n  TOOL_BIN:\n    kind: path\n    label: Tool executable\n",
+        );
+        let manifest = manifest::load(&source).unwrap();
+        sync_resolved_pack(
+            &cairn_platform::services::RealGitClient,
+            &RealFileSystem,
+            &config,
+            manifest,
+            PackSource::local("/src/tool".into()),
+        )
+        .unwrap();
+        let installed =
+            pack::mcp::parse_pack_mcp_file(&pack_lock::mcp_path(&config, "tool")).unwrap();
+        assert_eq!(
+            installed.setup["TOOL_BIN"].label.as_deref(),
+            Some("Tool executable")
+        );
+
+        // A layer written before the copy was carried is brought up to date.
+        write(
+            &pack_lock::mcp_path(&config, "tool"),
+            "mcpServers:\n  tool:\n    command: ${TOOL_BIN}\n",
+        );
+        sync_resolved_pack(
+            &cairn_platform::services::RealGitClient,
+            &RealFileSystem,
+            &config,
+            manifest::load(&source).unwrap(),
+            PackSource::local("/src/tool".into()),
+        )
+        .unwrap();
+        let refreshed =
+            pack::mcp::parse_pack_mcp_file(&pack_lock::mcp_path(&config, "tool")).unwrap();
+        assert!(refreshed.setup.contains_key("TOOL_BIN"));
+        assert_eq!(refreshed.servers, installed.servers);
+    }
+
     #[test]
     fn legacy_and_pack_commit_subjects_are_both_sync_authored() {
         // Retaining the pre-pack subjects verbatim is what keeps an existing
@@ -838,11 +1234,6 @@ mod tests {
         assert!(!is_pack_authored_subject("Snapshot workspace config"));
         assert!(!is_pack_authored_subject("Merge branch 'bundle'"));
         assert!(!is_pack_authored_subject("User edits explore"));
-    }
-
-    fn write(path: &Path, content: &str) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, content).unwrap();
     }
 
     #[test]

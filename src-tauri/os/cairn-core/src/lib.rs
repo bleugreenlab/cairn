@@ -107,6 +107,7 @@ mod env;
 mod execution;
 mod git;
 mod jj;
+mod library;
 mod markdown_frontmatter;
 mod mcp;
 mod node_scratch;

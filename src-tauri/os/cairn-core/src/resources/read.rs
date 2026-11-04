@@ -3158,14 +3158,14 @@ async fn render_resource_body(
                 Some(value) if value != "installed" && value != "available" => {
                     format!("Unsupported ?state={value} (installed | available)")
                 }
-                _ => super::packs::read_packs(&orch.config_dir, state.as_deref()),
+                _ => super::packs::read_packs(&orch.config_dir, &orch.library, state.as_deref()),
             }
         }
         CairnResource::Pack { pack_id } => {
             if let Some(error) = reject_query_params("pack", &params) {
                 error
             } else {
-                super::packs::read_pack(&orch.config_dir, &pack_id)
+                super::packs::read_pack(&orch.config_dir, &orch.library, &pack_id)
             }
         }
         CairnResource::Labels => {

@@ -214,6 +214,18 @@ fn gate_resource_change(
             return Err(build_failure(index, item, refusal));
         }
     }
+    if matches!(kind, ResourceKind::Packs | ResourceKind::Pack) {
+        if let Some(key) = item.payload.as_ref().and_then(crate::library::source_key) {
+            return Err(build_failure(
+                index,
+                item,
+                format!(
+                    "payload.{key} is not accepted. {}",
+                    crate::library::ADD_SOURCE_REFUSAL
+                ),
+            ));
+        }
+    }
     let candidates = candidate_specs(kind, item.mode);
     if candidates.is_empty() {
         return Err(build_failure(

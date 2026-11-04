@@ -158,6 +158,7 @@ pub struct OrchestratorBuilder {
     artifact_revision_quiet: std::time::Duration,
     boot_at: i64,
     startup_readiness: startup_readiness::StartupReadiness,
+    library: crate::library::LibraryContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +486,7 @@ impl OrchestratorBuilder {
             artifact_revision_quiet: crate::execution::artifact_revisions::DEFAULT_QUIET_PERIOD,
             boot_at: chrono::Utc::now().timestamp(),
             startup_readiness: startup_readiness::StartupReadiness::ready(),
+            library: crate::library::LibraryContext::configured(),
         }
     }
 
@@ -514,6 +516,15 @@ impl OrchestratorBuilder {
     /// place seeded runs on either side of boot.
     pub fn boot_at(mut self, boot_at: i64) -> Self {
         self.boot_at = boot_at;
+        self
+    }
+
+    /// Point the Library at fixture sources. Production builds always read
+    /// [`crate::library::LibraryContext::configured`]; there is no setter
+    /// outside test builds.
+    #[cfg(feature = "test-utils")]
+    pub fn library_context(mut self, library: crate::library::LibraryContext) -> Self {
+        self.library = library;
         self
     }
 
@@ -817,6 +828,7 @@ impl OrchestratorBuilder {
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
             boot_at: self.boot_at,
+            library: self.library,
             runtime: tokio::runtime::Handle::try_current().ok(),
             attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
@@ -1692,6 +1704,8 @@ pub struct Orchestrator {
     /// transcript reader died with the process that spawned it. Runtime-only;
     /// never persisted.
     pub boot_at: i64,
+    /// The Library's remote sources and the git policy used to reach them.
+    pub library: crate::library::LibraryContext,
     /// The Tokio runtime this orchestrator was built on, if any.
     ///
     /// Work is often triggered from plain OS threads (process reader and exit

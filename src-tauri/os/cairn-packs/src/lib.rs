@@ -17,6 +17,7 @@
 pub mod agent_plugin;
 pub mod install;
 pub mod instructions;
+pub mod library;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;
@@ -28,8 +29,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 pub use install::*;
-pub use lock::{installed_packs, PackLock, PackLockItem, PackSource, PackSourceKind};
-pub use manifest::{PackFormat, PackItem, PackItemKind, PackManifest};
+pub use lock::{installed_packs, PackLock, PackLockItem, PackSource, PackSourceKind, UpstreamRef};
+pub use manifest::{ItemRuns, PackFormat, PackItem, PackItemKind, PackManifest};
 pub use restore::{bundled_resource_ids, mirror_bundle_resources, RestoreResult};
 
 use crate::server_config::McpServerConfig;
@@ -124,7 +125,9 @@ pub fn hash_mcp_definition(config: &McpServerConfig) -> Result<String, String> {
     Ok(sha256_bytes(&bytes))
 }
 
-fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+/// Recursively sort every object key, so a value holding `HashMap`s serializes
+/// to the same bytes on every run.
+pub(crate) fn canonical_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.into_iter().map(canonical_json).collect())

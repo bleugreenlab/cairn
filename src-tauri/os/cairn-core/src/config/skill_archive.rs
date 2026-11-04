@@ -7,7 +7,7 @@ use std::path::{Component, Path};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use super::skill_fetch::{build_fetched_skill, FetchedFile, FetchedSkill, FetchedSkillSource};
+use super::skill_package::{build_fetched_skill, FetchedFile, FetchedSkill};
 
 pub(crate) const MAX_COMPRESSED_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES: u64 = 25 * 1024 * 1024;
@@ -168,7 +168,7 @@ pub(crate) fn parse_skill_archive(bytes: &[u8], filename: &str) -> Result<Fetche
     if skill_md_count != 1 {
         return Err("Skill archive must contain exactly one case-insensitive SKILL.md".into());
     }
-    let fetched = build_fetched_skill(files, FetchedSkillSource::LocalFile(filename.to_string()))?;
+    let fetched = build_fetched_skill(files, filename.to_string())?;
     if fetched.skill_id != root {
         return Err(format!(
             "SKILL.md name '{}' must match top-level directory '{root}'",

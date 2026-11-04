@@ -213,8 +213,10 @@ impl PackMcpServer {
 
 /// The MCP layer contributed by every installed pack, keyed by server name.
 ///
-/// Two packs declaring the same server name is a collision the install path
-/// refuses, so a later pack winning here is a safety net rather than a policy.
+/// Every non-bundled install refuses a server name another pack or the user's
+/// `settings.yaml` already defines ([`crate::install::check_install_collisions`]),
+/// and the bundled packs are curated together, so a later pack winning here is
+/// a safety net rather than a policy.
 pub fn load_pack_mcp_servers(config_dir: &Path) -> BTreeMap<String, PackMcpServer> {
     let mut layer = BTreeMap::new();
     for lock in super::lock::installed_packs(config_dir) {

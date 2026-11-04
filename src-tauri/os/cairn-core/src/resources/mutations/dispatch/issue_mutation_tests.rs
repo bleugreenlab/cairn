@@ -554,6 +554,47 @@ async fn issue_uri_append_still_creates_a_comment() {
     assert_eq!(listed[0].content, "a fresh comment");
 }
 
+/// No add-source affordance exists in this slice: a create that names a source
+/// is refused before it can read as a malformed import, and naming a source on
+/// a pack action is refused rather than ignored.
+#[tokio::test]
+async fn the_packs_resource_refuses_to_add_a_library_source() {
+    let orch = seeded_orch().await;
+    for (target, mode, payload) in [
+        (
+            "cairn://packs",
+            ChangeMode::Create,
+            serde_json::json!({"source": "https://github.com/someone/library"}),
+        ),
+        (
+            "cairn://packs",
+            ChangeMode::Create,
+            serde_json::json!({"url": "https://github.com/someone/library", "path": "/tmp/x"}),
+        ),
+        (
+            "cairn://packs/linear",
+            ChangeMode::Patch,
+            serde_json::json!({"action": "install", "url": "https://github.com/someone/library"}),
+        ),
+    ] {
+        let error = apply(&orch, &change_item(target, mode, Some(payload)))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .error
+                .contains("is not accepted. Adding library sources is not available"),
+            "{}",
+            error.error
+        );
+        assert!(
+            error.error.contains("tenet 1370") && error.error.contains("later slice"),
+            "{}",
+            error.error
+        );
+    }
+}
+
 pub(super) fn change_item(
     target: &str,
     mode: ChangeMode,

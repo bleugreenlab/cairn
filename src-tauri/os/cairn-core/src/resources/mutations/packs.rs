@@ -49,6 +49,15 @@ fn commit_plugin_snapshot(
     stage: tempfile::TempDir,
     destination: &Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
+    commit_snapshot(&stage.keep(), destination)
+}
+
+/// Move a staged pack root into place as `destination`, keeping any previous
+/// snapshot aside as `source.previous` until the sync that follows succeeds.
+fn commit_snapshot(
+    staged: &Path,
+    destination: &Path,
+) -> Result<Option<std::path::PathBuf>, String> {
     let parent = destination
         .parent()
         .ok_or("Managed snapshot has no parent")?;
@@ -65,7 +74,7 @@ fn commit_plugin_snapshot(
         std::fs::rename(destination, &backup)
             .map_err(|e| format!("Failed to preserve managed plugin snapshot: {e}"))?;
     }
-    if let Err(error) = std::fs::rename(stage.keep(), destination) {
+    if let Err(error) = std::fs::rename(staged, destination) {
         if had_snapshot {
             let _ = std::fs::rename(&backup, destination);
         }
@@ -202,14 +211,19 @@ pub fn import_agent_plugin(orch: &Orchestrator, path: &Path) -> Result<PackMutat
         .map_err(|e| format!("Failed to resolve plugin path {path:?}: {e}"))?;
     let (stage, plugin) = stage_plugin_snapshot(&orch.config_dir, &canonical)?;
     let id = plugin.manifest.id.clone();
-    if pack::lock::read_lock(&orch.config_dir, &id).is_some()
-        || source_dir(orch)
-            .ok()
-            .and_then(|root| pack::available_pack(&root, &id))
-            .is_some()
-    {
-        return Err(format!("Pack id `{id}` collides with an existing pack"));
+    let source = pack::PackSource::local(canonical.to_string_lossy().into_owned());
+    // A re-import of the same directory is an update, which has its own path.
+    if pack::lock::read_lock(&orch.config_dir, &id).is_some() {
+        return Err(format!(
+            "Pack `{id}` is already installed; update it with patch {{action:\"update\"}}"
+        ));
     }
+    pack::check_install_collisions(
+        &orch.config_dir,
+        &plugin.manifest,
+        &source,
+        &shipped_pack_ids(orch),
+    )?;
     let destination = pack::lock::pack_dir(&orch.config_dir, &id).join("source");
     let transaction = PackMutationSnapshot::capture(&orch.config_dir, &id, None, &plugin.manifest)?;
     let backup = commit_plugin_snapshot(stage, &destination)?;
@@ -220,7 +234,7 @@ pub fn import_agent_plugin(orch: &Orchestrator, path: &Path) -> Result<PackMutat
         &RealFileSystem,
         &orch.config_dir,
         manifest,
-        pack::PackSource::local(canonical.to_string_lossy().into_owned()),
+        source,
     )
     .map_err(|error| {
         rollback_plugin_snapshot(&destination, backup.as_deref());
@@ -346,9 +360,9 @@ pub fn reset_pack_item(
     kind: PackItemKind,
     item_id: &str,
 ) -> Result<PackMutationResult, String> {
-    let resource_dir = source_dir(orch)?;
-    let manifest = pack::available_pack(&resource_dir, pack_id)
-        .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
+    let mut lock = pack::lock::read_lock(&orch.config_dir, pack_id)
+        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    let manifest = shipped_manifest(orch, &lock)?;
     if !manifest
         .items()
         .iter()
@@ -359,9 +373,6 @@ pub fn reset_pack_item(
             kind.as_str()
         ));
     }
-
-    let mut lock = pack::lock::read_lock(&orch.config_dir, pack_id)
-        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
     let item = lock.item(kind, item_id).cloned().ok_or_else(|| {
         format!(
             "Pack `{pack_id}` does not carry {} `{item_id}`",
@@ -432,14 +443,7 @@ pub fn reset_pack_item(
         }
     }
 
-    let result = sync_one_pack(
-        &RealGitClient,
-        &RealFileSystem,
-        &resource_dir,
-        &orch.config_dir,
-        pack_id,
-    )
-    .inspect_err(|_| {
+    let result = resync_from_shipped(orch, &lock, manifest).inspect_err(|_| {
         let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
     })?;
 
@@ -452,6 +456,250 @@ pub fn reset_pack_item(
             "Reset {} `{item_id}` to pack '{pack_id}'s version",
             kind.as_str()
         ),
+        ..Default::default()
+    })
+}
+
+/// Ids of every pack the app bundle ships, for collision refusals.
+fn shipped_pack_ids(orch: &Orchestrator) -> Vec<String> {
+    crate::library::shipped_ids(&orch.config_dir).unwrap_or_default()
+}
+
+/// What an installed pack shipped: the app bundle's copy for a bundled pack,
+/// the verified snapshot for a local or library one.
+fn shipped_manifest(
+    orch: &Orchestrator,
+    lock: &pack::PackLock,
+) -> Result<pack::PackManifest, String> {
+    match lock.source.kind {
+        pack::PackSourceKind::Bundled => {
+            let resource_dir = source_dir(orch)?;
+            pack::available_pack(&resource_dir, &lock.id)
+                .ok_or_else(|| format!("No pack `{}` is shipped in {resource_dir:?}", lock.id))
+        }
+        _ => crate::library::snapshot_manifest(&orch.config_dir, lock),
+    }
+}
+
+/// Sync an installed pack again from what it shipped, without fetching.
+fn resync_from_shipped(
+    orch: &Orchestrator,
+    lock: &pack::PackLock,
+    manifest: pack::PackManifest,
+) -> Result<pack::PackSyncResult, String> {
+    match lock.source.kind {
+        pack::PackSourceKind::Bundled => sync_one_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &source_dir(orch)?,
+            &orch.config_dir,
+            &lock.id,
+        ),
+        _ => sync_resolved_pack(
+            &RealGitClient,
+            &RealFileSystem,
+            &orch.config_dir,
+            manifest,
+            lock.source.clone(),
+        ),
+    }
+}
+
+/// Install or update one entry of a verified library index.
+///
+/// Fetches the entry's origin at the commit the index pins, stages it under
+/// `packs/.library-stage-*`, and refuses unless every byte matches the index
+/// and nothing it installs collides with what is already here. Only then does
+/// the staged root become the pack's snapshot and run through the same sync as
+/// every other pack; a failed sync puts the snapshot, lock, and items back.
+pub(crate) fn install_library_entry(
+    orch: &Orchestrator,
+    source: &pack::library::LibrarySource,
+    verified: &pack::library::VerifiedIndex,
+    entry_id: &str,
+    existing: Option<&pack::PackLock>,
+) -> Result<PackMutationResult, String> {
+    let config_dir = &orch.config_dir;
+    let packs = config_dir.join(pack::lock::PACKS_DIR);
+    std::fs::create_dir_all(&packs).map_err(|e| e.to_string())?;
+    let stage = tempfile::Builder::new()
+        .prefix(".library-stage-")
+        .tempdir_in(&packs)
+        .map_err(|e| e.to_string())?;
+    let staged = pack::library::stage::stage_verified_entry(
+        source,
+        verified,
+        entry_id,
+        stage.path(),
+        &pack::library::derive::PolicyFetch(orch.library.policy),
+    )?;
+    pack::check_install_collisions(
+        config_dir,
+        &staged.manifest,
+        &staged.source,
+        &shipped_pack_ids(orch),
+    )?;
+
+    let id = staged.manifest.id.clone();
+    let destination = crate::library::snapshot_root(config_dir, &id);
+    let transaction = PackMutationSnapshot::capture(config_dir, &id, existing, &staged.manifest)?;
+    let backup = commit_snapshot(&staged.manifest.root, &destination)?;
+    let mut manifest = staged.manifest.clone();
+    manifest.root = destination.clone();
+    let result = sync_resolved_pack(
+        &RealGitClient,
+        &RealFileSystem,
+        config_dir,
+        manifest,
+        staged.source.clone(),
+    )
+    .map_err(|error| {
+        rollback_plugin_snapshot(&destination, backup.as_deref());
+        match transaction.restore() {
+            Ok(()) => error,
+            Err(rollback) => format!("{error}; rollback failed: {rollback}"),
+        }
+    })?;
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_dir_all(backup);
+    }
+    drop(stage);
+    orch.emit_pack_registry_change();
+    let (action, verb) = match existing {
+        Some(_) => ("update", "Updated"),
+        None => ("install", "Installed"),
+    };
+    Ok(PackMutationResult {
+        action: action.into(),
+        pack_id: id.clone(),
+        changed_paths: result.changed_paths,
+        diagnostics: staged.manifest.notes.clone(),
+        summary: format!("{verb} pack '{id}' from the {}", source.label),
+        ..Default::default()
+    })
+}
+
+/// The configured source whose verified cache offers `pack_id`, if any.
+fn library_offer(
+    orch: &Orchestrator,
+    pack_id: &str,
+) -> Result<Option<(pack::library::LibrarySource, pack::library::VerifiedIndex)>, String> {
+    for source in &orch.library.sources {
+        let cached = pack::library::cache::read_cached_index(&orch.config_dir, source);
+        let Some(verified) = cached.verified() else {
+            continue;
+        };
+        if let Some(refusal) = verified.refused.iter().find(|r| r.id == pack_id) {
+            return Err(format!(
+                "The {} offers `{pack_id}`, but it cannot be installed: {}",
+                source.label, refusal.reason
+            ));
+        }
+        if verified.entry(pack_id).is_some() {
+            return Ok(Some((source.clone(), verified.clone())));
+        }
+    }
+    Ok(None)
+}
+
+/// Update a pack installed from a library source.
+///
+/// An update that changes what runs on this machine (an endpoint or a stdio
+/// server, a workflow) is the operator's to apply; for anyone else it is
+/// refused, naming the Library page. With nothing new in the index, the pack
+/// re-syncs from its snapshot without fetching.
+fn update_library_pack(
+    orch: &Orchestrator,
+    lock: &pack::PackLock,
+    authority: crate::library::UpdateAuthority,
+) -> Result<PackMutationResult, String> {
+    let url = lock.source.url.as_deref().unwrap_or_default();
+    let source = orch.library.source_for_url(url).cloned().ok_or_else(|| {
+        format!(
+            "Pack `{}` came from {url}, which this build does not read; it keeps working, but \
+             its updates are frozen",
+            lock.id
+        )
+    })?;
+    let verified = match pack::library::cache::read_cached_index(&orch.config_dir, &source) {
+        pack::library::cache::CachedIndex::Verified(verified) => *verified,
+        pack::library::cache::CachedIndex::Refused(reason) => {
+            return Err(format!(
+                "Pack `{}` was not updated: the {} index cannot be used ({reason})",
+                lock.id, source.label
+            ))
+        }
+        pack::library::cache::CachedIndex::Absent => {
+            return Err(format!(
+                "Pack `{}` was not updated: the {} has not been fetched on this machine yet; \
+                 open the Library to refresh it",
+                lock.id, source.label
+            ))
+        }
+    };
+    let entry = verified.entry(&lock.id).ok_or_else(|| {
+        format!(
+            "The {} no longer offers `{}`; the installed copy keeps working",
+            source.label, lock.id
+        )
+    })?;
+    match crate::library::pending_update(&orch.config_dir, lock, entry) {
+        crate::library::PendingUpdate::NeedsReview(changes)
+            if authority != crate::library::UpdateAuthority::Operator =>
+        {
+            let what = changes
+                .iter()
+                .map(|change| format!("{} `{}` {}", change.kind, change.id, change.change))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Pack `{}`'s update {} ({what}), so only the operator may apply it, from the \
+                 Library page in Settings. Updates that change only content apply on their own.",
+                lock.id,
+                crate::library::OPERATOR_ONLY_UPDATE
+            ));
+        }
+        crate::library::PendingUpdate::UpToDate => {
+            if let Ok(manifest) = crate::library::snapshot_manifest(&orch.config_dir, lock) {
+                let result = resync_from_shipped(orch, lock, manifest)?;
+                orch.emit_pack_registry_change();
+                return Ok(PackMutationResult {
+                    action: "update".into(),
+                    pack_id: lock.id.clone(),
+                    changed_paths: result.changed_paths,
+                    summary: format!("Pack '{}' is up to date with the {}", lock.id, source.label),
+                    ..Default::default()
+                });
+            }
+        }
+        _ => {}
+    }
+    install_library_entry(orch, &source, &verified, &lock.id, Some(lock))
+}
+
+/// Restore removed items of a local or library pack from its snapshot.
+fn restore_snapshot_pack(
+    orch: &Orchestrator,
+    lock: &pack::PackLock,
+) -> Result<PackMutationResult, String> {
+    // Resolve the snapshot before the removal records are discarded, so a
+    // pack that could never be restored keeps them.
+    let manifest = crate::library::snapshot_manifest(&orch.config_dir, lock)?;
+    let restored = pack::lock::restore_removed_items(&RealFileSystem, &orch.config_dir, &lock.id)?;
+    let result = resync_from_shipped(orch, lock, manifest).inspect_err(|_| {
+        let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, lock);
+    })?;
+    orch.emit_pack_registry_change();
+    Ok(PackMutationResult {
+        action: "restore".into(),
+        pack_id: lock.id.clone(),
+        changed_paths: result.changed_paths,
+        summary: format!(
+            "Restored {} removed item(s) to pack '{}'",
+            restored.len(),
+            lock.id
+        ),
+        restored_items: restored,
         ..Default::default()
     })
 }
@@ -476,12 +724,44 @@ pub fn apply_pack_action(
     action: &str,
     pack_id: &str,
 ) -> Result<PackMutationResult, String> {
-    if action == "update" {
-        if let Some(lock) = pack::lock::read_lock(&orch.config_dir, pack_id) {
-            if lock.source.kind == pack::PackSourceKind::Local {
-                return update_local_plugin(orch, &lock);
+    apply_pack_action_as(
+        orch,
+        action,
+        pack_id,
+        crate::library::UpdateAuthority::Agent,
+    )
+}
+
+/// [`apply_pack_action`] for a caller whose authority the transport has
+/// established. Only an update can need it.
+pub fn apply_pack_action_as(
+    orch: &Orchestrator,
+    action: &str,
+    pack_id: &str,
+    authority: crate::library::UpdateAuthority,
+) -> Result<PackMutationResult, String> {
+    let lock = pack::lock::read_lock(&orch.config_dir, pack_id);
+    match (action, &lock) {
+        ("update", Some(lock)) if lock.source.kind == pack::PackSourceKind::Local => {
+            return update_local_plugin(orch, lock);
+        }
+        ("update", Some(lock)) if lock.source.kind == pack::PackSourceKind::Url => {
+            return update_library_pack(orch, lock, authority);
+        }
+        ("restore", Some(lock)) if lock.source.kind != pack::PackSourceKind::Bundled => {
+            return restore_snapshot_pack(orch, lock);
+        }
+        ("install", None) => {
+            let shipped = pack::source_dir(&orch.config_dir)
+                .and_then(|root| pack::available_pack(&root, pack_id))
+                .is_some();
+            if !shipped {
+                if let Some((source, verified)) = library_offer(orch, pack_id)? {
+                    return install_library_entry(orch, &source, &verified, pack_id, None);
+                }
             }
         }
+        _ => {}
     }
     // Resolve what this action will sync FROM before touching any lock. A
     // restore records its intent by rewriting the pack lock, so a source that
@@ -844,6 +1124,10 @@ mod tests {
     }
 
     async fn workspace() -> Workspace {
+        workspace_with(None).await
+    }
+
+    async fn workspace_with(library: Option<crate::library::LibraryContext>) -> Workspace {
         crate::config::secrets::mock_keychain::install();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -860,7 +1144,11 @@ mod tests {
                 .with_emitter(emitter.clone())
                 .build(),
         );
-        let orch = Orchestrator::builder(db_state, services, home.clone()).build();
+        let mut builder = Orchestrator::builder(db_state, services, home.clone());
+        if let Some(library) = library {
+            builder = builder.library_context(library);
+        }
+        let orch = builder.build();
         Workspace {
             orch,
             emitter,
@@ -997,7 +1285,7 @@ mod tests {
     }
 
     fn item_state(ws: &Workspace, pack_id: &str, kind: &str, id: &str) -> Option<PackItemState> {
-        pack_catalog(&ws.home)
+        pack_catalog(&ws.home, &ws.orch.library)
             .find(pack_id)?
             .items
             .iter()
@@ -1096,7 +1384,10 @@ mod tests {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "my agent\n");
 
-        let entry = pack_catalog(&ws.home).find("core").unwrap().clone();
+        let entry = pack_catalog(&ws.home, &ws.orch.library)
+            .find("core")
+            .unwrap()
+            .clone();
         let item = entry
             .items
             .iter()
@@ -1256,7 +1547,7 @@ mod tests {
         assert!(ws.home.join("agents/explore.md").exists());
         assert!(!ws.home.join("recipes/default.yaml").exists());
 
-        let catalog = pack_catalog(&ws.home);
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
         let core = catalog.find("core").unwrap();
         assert_eq!(core.state, PackState::Available);
         assert!(core.uninstalled_by_user);
@@ -1476,7 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn the_catalog_reports_installed_available_default_source_and_readiness() {
         let ws = workspace().await;
-        let catalog = pack_catalog(&ws.home);
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
         assert!(catalog.source_recorded);
 
         let core = catalog.find("core").unwrap();
@@ -1500,7 +1791,7 @@ mod tests {
         // Installing the connector surfaces the reason it is inert: its command
         // references a `${VAR}` with no value anywhere.
         apply_pack_action(&ws.orch, "install", "matlab").unwrap();
-        let installed = pack_catalog(&ws.home);
+        let installed = pack_catalog(&ws.home, &ws.orch.library);
         let connector = installed
             .find("matlab")
             .unwrap()
@@ -1524,10 +1815,443 @@ mod tests {
             "shipped v2\n",
         );
         assert!(
-            pack_catalog(&ws.home)
+            pack_catalog(&ws.home, &ws.orch.library)
                 .find("core")
                 .unwrap()
                 .update_available
+        );
+    }
+
+    // ── Library sources ──
+    //
+    // A real git repository in marketplace layout, its signed index published
+    // on `cairn-index`, fetched over `file://` under the test git policy, and
+    // verified by the production verifier against a fixture key.
+
+    use crate::config::mcp_servers::NotReady;
+    use crate::library::testing::LibraryFixture;
+    use crate::library::{refresh_library_sources, UpdateAuthority, OPERATOR_ONLY_UPDATE};
+
+    fn stdio_connector(fixture: &LibraryFixture, id: &str, command: &str) {
+        fixture.write(
+            id,
+            "cairn-pack.yaml",
+            &format!("id: {id}\nname: {id}\nversion: 1.0.0\n"),
+        );
+        fixture.write(
+            id,
+            "mcp.yaml",
+            &format!(
+                "mcpServers:\n  {id}:\n    command: {command}\n    args: [\"${{FIXTURE_TOKEN_FILE}}\"]\n\
+                 setup:\n  FIXTURE_TOKEN_FILE:\n    kind: path\n    label: Token file\n"
+            ),
+        );
+    }
+
+    fn guides_pack(fixture: &LibraryFixture, notes: &str, tips: &str) {
+        fixture.write(
+            "guides",
+            "cairn-pack.yaml",
+            "id: guides\nname: Guides\nversion: 1.0.0\n",
+        );
+        fixture.write(
+            "guides",
+            "skills/notes/SKILL.md",
+            &format!("---\nname: notes\ndescription: Notes\n---\n{notes}\n"),
+        );
+        fixture.write(
+            "guides",
+            "skills/tips/SKILL.md",
+            &format!("---\nname: tips\ndescription: Tips\n---\n{tips}\n"),
+        );
+    }
+
+    async fn library_workspace(fixture: &LibraryFixture) -> Workspace {
+        workspace_with(Some(fixture.context())).await
+    }
+
+    fn mcp_layer(ws: &Workspace, id: &str) -> String {
+        std::fs::read_to_string(pack::lock::mcp_path(&ws.home, id)).unwrap()
+    }
+
+    fn stage_dirs(ws: &Workspace) -> Vec<String> {
+        std::fs::read_dir(ws.home.join("packs"))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .filter(|name| name.starts_with(".library-stage-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_library_connector_installs_with_its_provenance_and_waits_for_setup() {
+        let mut fixture = LibraryFixture::new();
+        stdio_connector(&fixture, "acme", "acme-mcp");
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+
+        let before = pack_catalog(&ws.home, &ws.orch.library);
+        assert_eq!(before.sources[0].state, "not-fetched");
+        assert!(
+            before.find("acme").is_none(),
+            "catalog reads never fetch, so nothing is offered yet"
+        );
+
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(report.sources[0].outcome, "updated", "{report:?}");
+        let offered = pack_catalog(&ws.home, &ws.orch.library)
+            .find("acme")
+            .cloned()
+            .expect("the library's entry is offered");
+        assert_eq!(offered.state, PackState::Available);
+        assert_eq!(offered.source.label, "Cairn library");
+        assert_eq!(offered.source.signer.as_deref(), Some("cairn-library-test"));
+        assert_eq!(
+            offered.runs,
+            pack::ItemRuns::Here,
+            "a stdio server runs here"
+        );
+
+        let result = apply_pack_action(&ws.orch, "install", "acme").unwrap();
+        assert_eq!(
+            result.summary,
+            "Installed pack 'acme' from the Cairn library"
+        );
+        let lock = pack::lock::read_lock(&ws.home, "acme").unwrap();
+        assert_eq!(lock.source.kind, pack::PackSourceKind::Url);
+        assert_eq!(
+            lock.source.url.as_deref(),
+            Some(fixture.source().url.as_str())
+        );
+        assert!(lock
+            .source
+            .sha
+            .as_deref()
+            .is_some_and(pack::library::is_full_commit));
+        assert_eq!(lock.source.signer.as_deref(), Some("cairn-library-test"));
+        assert!(stage_dirs(&ws).is_empty(), "the stage is dropped");
+
+        // The same readiness gate as a bundled pack server.
+        let entry = pack_catalog(&ws.home, &ws.orch.library)
+            .find("acme")
+            .cloned()
+            .unwrap();
+        let server = entry.items.iter().find(|item| item.kind == "mcp").unwrap();
+        assert!(
+            matches!(&server.not_ready, Some(NotReady::MissingVars { vars }) if vars == &["FIXTURE_TOKEN_FILE".to_string()]),
+            "{:?}",
+            server.not_ready
+        );
+        assert_eq!(server.setup[0].setup.label.as_deref(), Some("Token file"));
+        assert!(
+            !crate::config::mcp_servers::resolve_mcp_servers(&ws.home, None).contains_key("acme"),
+            "an ingested server with an unset variable is withheld from agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_that_changes_what_runs_waits_for_the_operator() {
+        let mut fixture = LibraryFixture::new();
+        stdio_connector(&fixture, "acme", "acme-mcp");
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+        apply_pack_action(&ws.orch, "install", "acme").unwrap();
+        let layer = mcp_layer(&ws, "acme");
+
+        stdio_connector(&fixture, "acme", "acme-mcp-v2");
+        fixture.publish();
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(report.sources[0].awaiting_review, vec!["acme".to_string()]);
+        assert!(report.sources[0].applied.is_empty());
+        assert_eq!(
+            mcp_layer(&ws, "acme"),
+            layer,
+            "a refresh never applies a change to what runs"
+        );
+
+        let entry = pack_catalog(&ws.home, &ws.orch.library)
+            .find("acme")
+            .cloned()
+            .unwrap();
+        assert!(entry.update_available && entry.update_needs_review);
+        let change = &entry.runtime_changes[0];
+        assert_eq!(
+            (change.kind.as_str(), change.change.as_str()),
+            ("mcp", "changed")
+        );
+        assert_eq!(
+            change.before.as_ref().and_then(|d| d.command.as_deref()),
+            Some("acme-mcp")
+        );
+        assert_eq!(
+            change.after.as_ref().and_then(|d| d.command.as_deref()),
+            Some("acme-mcp-v2")
+        );
+
+        let error = apply_pack_action(&ws.orch, "update", "acme").unwrap_err();
+        assert!(error.contains(OPERATOR_ONLY_UPDATE), "{error}");
+        assert!(
+            error.contains("from the Library page in Settings"),
+            "{error}"
+        );
+        assert_eq!(
+            mcp_layer(&ws, "acme"),
+            layer,
+            "a refused update writes nothing"
+        );
+
+        apply_pack_action_as(&ws.orch, "update", "acme", UpdateAuthority::Operator).unwrap();
+        assert!(mcp_layer(&ws, "acme").contains("acme-mcp-v2"));
+        let after = pack_catalog(&ws.home, &ws.orch.library);
+        let entry = after.find("acme").unwrap();
+        assert!(!entry.update_available && !entry.update_needs_review);
+    }
+
+    #[tokio::test]
+    async fn a_content_update_applies_on_refresh_and_leaves_your_copy_alone() {
+        let mut fixture = LibraryFixture::new();
+        guides_pack(&fixture, "v1", "v1");
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+        apply_pack_action(&ws.orch, "install", "guides").unwrap();
+        write(&ws.home.join("skills/tips/SKILL.md"), "mine\n");
+
+        guides_pack(&fixture, "v2", "v2");
+        fixture.publish();
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(
+            report.sources[0].applied,
+            vec!["guides".to_string()],
+            "{report:?}"
+        );
+        assert!(
+            std::fs::read_to_string(ws.home.join("skills/notes/SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.home.join("skills/tips/SKILL.md")).unwrap(),
+            "mine\n",
+            "latest is always latest, except for your copy"
+        );
+        assert_eq!(
+            item_state(&ws, "guides", "skill", "tips"),
+            Some(PackItemState::EditedByUser)
+        );
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        let tips = catalog
+            .find("guides")
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| item.id == "tips")
+            .unwrap();
+        assert!(tips.behind_shipped, "your copy, behind shipped");
+
+        // Remove and restore come back from the snapshot, without a fetch.
+        apply_pack_item_removal(&ws.orch, "guides", PackItemKind::Skill, "notes").unwrap();
+        assert!(!ws.home.join("skills/notes").exists());
+        let restored = apply_pack_action(&ws.orch, "restore", "guides").unwrap();
+        assert_eq!(restored.restored_items.len(), 1);
+        assert!(
+            std::fs::read_to_string(ws.home.join("skills/notes/SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_signature_keeps_the_last_verified_index_and_a_tampered_cache_is_dropped() {
+        let mut fixture = LibraryFixture::new();
+        stdio_connector(&fixture, "acme", "acme-mcp");
+        let bytes = fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+
+        fixture.publish_tampered(&bytes.replace("acme-mcp", "evil-mcp"));
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(report.sources[0].outcome, "failed");
+        assert_eq!(
+            report.sources[0].error.as_deref(),
+            Some("index signature does not verify against the Cairn library's trusted keys")
+        );
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        assert_eq!(
+            catalog.sources[0].state, "verified",
+            "the previous index stays"
+        );
+        assert!(catalog.sources[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("does not verify")));
+        assert!(catalog.find("acme").is_some());
+        assert!(
+            !ws.home.join("packs/acme").exists(),
+            "nothing was installed"
+        );
+
+        // The cache lives where agents can write; a cache that no longer
+        // verifies is not believed.
+        let cached = fixture.cache_dir(&ws.home).join("index.json");
+        let text = std::fs::read_to_string(&cached).unwrap();
+        std::fs::write(&cached, text.replace("acme-mcp", "evil-mcp")).unwrap();
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        assert_eq!(catalog.sources[0].state, "unverified");
+        assert!(catalog.sources[0]
+            .refusal
+            .as_deref()
+            .is_some_and(|r| r.contains("does not verify")));
+        assert!(catalog.find("acme").is_none(), "its entries are dropped");
+        let page = crate::resources::packs::read_packs(&ws.home, &ws.orch.library, None);
+        assert!(page.contains("the cached index is not trusted"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn content_the_signed_index_does_not_vouch_for_is_refused_and_nothing_is_written() {
+        let mut fixture = LibraryFixture::new();
+        guides_pack(&fixture, "v1", "v1");
+        let bytes = fixture.publish();
+        let mut index: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+        let forged = pack::sha256_bytes(b"forged");
+        for item in index["entries"][0]["items"].as_array_mut().unwrap() {
+            if item["id"] == "notes" {
+                item["hash"] = serde_json::json!(forged);
+            }
+        }
+        fixture.publish_signed(&serde_json::to_string_pretty(&index).unwrap());
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+
+        let error = apply_pack_action(&ws.orch, "install", "guides").unwrap_err();
+        assert!(error.starts_with("skill `notes` from "), "{error}");
+        assert!(
+            error.contains(&format!("but the signed index says {forged}")),
+            "{error}"
+        );
+        assert!(pack::lock::read_lock(&ws.home, "guides").is_none());
+        assert!(!ws.home.join("skills/notes").exists());
+        assert!(!ws.home.join("packs/guides").exists());
+        assert!(
+            stage_dirs(&ws).is_empty(),
+            "the stage is dropped on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_over_your_own_skill_is_refused_naming_both_sides() {
+        let mut fixture = LibraryFixture::new();
+        guides_pack(&fixture, "v1", "v1");
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        refresh_library_sources(&ws.orch, true);
+        write(
+            &ws.home.join("skills/notes/SKILL.md"),
+            "---\nname: notes\n---\nmine\n",
+        );
+        let error = apply_pack_action(&ws.orch, "install", "guides").unwrap_err();
+        assert!(
+            error.starts_with(
+                "you already have your own skill `notes` at `skills/notes`, which no pack installed"
+            ),
+            "{error}"
+        );
+        assert!(error.contains(&fixture.source().url), "{error}");
+        assert!(pack::lock::read_lock(&ws.home, "guides").is_none());
+        assert!(stage_dirs(&ws).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bundled_connector_that_moved_to_the_library_keeps_working_under_its_new_provenance()
+    {
+        let mut fixture = LibraryFixture::new();
+        // Byte-identical to the bundled pack this workspace installs.
+        fixture.write(
+            "matlab",
+            "cairn-pack.yaml",
+            "id: matlab\nname: MATLAB\nversion: 1.0.0\ndefault: false\n",
+        );
+        fixture.write(
+            "matlab",
+            "mcp.yaml",
+            "mcpServers:\n  matlab:\n    type: stdio\n    command: ${MATLAB_BIN}\n",
+        );
+        fixture.publish();
+        let ws = library_workspace(&fixture).await;
+        apply_pack_action(&ws.orch, "install", "matlab").unwrap();
+        let layer = mcp_layer(&ws, "matlab");
+        let before = pack::lock::read_lock(&ws.home, "matlab").unwrap();
+        assert_eq!(before.source.kind, pack::PackSourceKind::Bundled);
+
+        // While this build still ships it, the bundled pack wins.
+        refresh_library_sources(&ws.orch, true);
+        assert_eq!(
+            pack::lock::read_lock(&ws.home, "matlab")
+                .unwrap()
+                .source
+                .kind,
+            pack::PackSourceKind::Bundled
+        );
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        assert!(catalog.sources[0].refused_entries.iter().any(
+            |refusal| refusal.id == "matlab" && refusal.reason.contains("ships with this app")
+        ));
+
+        // The next build no longer ships it.
+        std::fs::remove_dir_all(source_pack(&ws.resources, "matlab")).unwrap();
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(report.sources[0].migrated, vec!["matlab".to_string()]);
+        let after = pack::lock::read_lock(&ws.home, "matlab").unwrap();
+        assert_eq!(after.source.kind, pack::PackSourceKind::Url);
+        assert!(after.source.signer.is_some() && after.source.sha.is_some());
+        assert_eq!(
+            after.items, before.items,
+            "items and baselines are untouched"
+        );
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(mcp_layer(&ws, "matlab"), layer, "so readiness is unchanged");
+        let entry = pack_catalog(&ws.home, &ws.orch.library)
+            .find("matlab")
+            .cloned()
+            .unwrap();
+        assert_eq!(entry.source.label, "Cairn library");
+        assert!(
+            !entry.update_available,
+            "a byte-identical move is not an update"
+        );
+        assert!(entry
+            .items
+            .iter()
+            .any(|item| matches!(item.not_ready, Some(NotReady::MissingVars { .. }))));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_library_leaves_the_bundled_core_and_says_why() {
+        let fixture = LibraryFixture::new();
+        let ws = library_workspace(&fixture).await;
+        let report = refresh_library_sources(&ws.orch, true);
+        assert_eq!(report.sources[0].outcome, "failed");
+        assert!(report.sources[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("has no `cairn-index` branch")));
+        let catalog = pack_catalog(&ws.home, &ws.orch.library);
+        assert_eq!(catalog.sources[0].state, "unreachable");
+        let ids: Vec<&str> = catalog
+            .packs
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["core", "matlab"], "only what the app ships");
+        // Within the TTL a refresh is not attempted again unless forced; a
+        // failure is never cached as fresh.
+        assert_eq!(
+            refresh_library_sources(&ws.orch, false).sources[0].outcome,
+            "failed"
         );
     }
 }

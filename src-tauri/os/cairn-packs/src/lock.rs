@@ -47,6 +47,23 @@ pub struct PackSource {
     /// Canonical original directory for a local import. Runtime reads use the managed snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The id of the trusted key whose signature over the library index vouched
+    /// for this install. Absent for anything not installed from a signed index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// For content a library index references from another repository: where
+    /// the bytes were actually fetched from. `url`/`sha` above stay the
+    /// library's, because that is the index that vouched for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamRef>,
+}
+
+/// A repository and pinned commit a library entry's content was fetched from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamRef {
+    pub url: String,
+    pub sha: String,
 }
 
 impl PackSource {
@@ -58,6 +75,8 @@ impl PackSource {
             sha: None,
             format: Some(format),
             path: None,
+            signer: None,
+            upstream: None,
         }
     }
 
@@ -69,6 +88,29 @@ impl PackSource {
             sha: None,
             format: Some(PackFormat::AgentPlugin),
             path: Some(path),
+            signer: None,
+            upstream: None,
+        }
+    }
+
+    /// A pack installed from a library source's signed index.
+    pub fn library(
+        url: String,
+        git_ref: String,
+        sha: String,
+        signer: String,
+        upstream: Option<UpstreamRef>,
+        format: PackFormat,
+    ) -> Self {
+        PackSource {
+            kind: PackSourceKind::Url,
+            url: Some(url),
+            git_ref: Some(git_ref),
+            sha: Some(sha),
+            format: Some(format),
+            path: None,
+            signer: Some(signer),
+            upstream,
         }
     }
 }
@@ -535,6 +577,11 @@ mod tests {
                 sha: Some("9f2c".into()),
                 format: Some(PackFormat::ClaudeCode),
                 path: None,
+                signer: Some("cairn-library-2026".into()),
+                upstream: Some(UpstreamRef {
+                    url: "https://github.com/acme/upstream".into(),
+                    sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                }),
             },
             vec![],
         );
@@ -550,6 +597,8 @@ mod tests {
         let read = read_lock(temp.path(), "acme").unwrap();
         assert_eq!(read.source.sha.as_deref(), Some("9f2c"));
         assert_eq!(read.source.kind, PackSourceKind::Url);
+        assert_eq!(read.source.signer.as_deref(), Some("cairn-library-2026"));
+        assert_eq!(read.source, lock.source, "provenance round-trips whole");
         assert_eq!(read.notes.len(), 1);
     }
 

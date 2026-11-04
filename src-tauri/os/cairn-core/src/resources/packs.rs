@@ -14,18 +14,60 @@ use serde::{Deserialize, Serialize};
 use cairn_common::uri::build_pack_uri;
 
 use crate::config::mcp_servers::{workspace_mcp_entries, NotReady, WorkspaceMcpEntry};
+use crate::config::pack::library::cache::{self as library_cache, CachedIndex};
+use crate::config::pack::library::{EntryOrigin, EntryRefusal, IndexEntry, LibrarySource};
 use crate::config::pack::mcp::McpVarRequirement;
-use crate::config::pack::{self, ContentHash, PackItem, PackItemKind, PackLock, PackManifest};
+use crate::config::pack::server_config::McpServerConfig;
+use crate::config::pack::{
+    self, ContentHash, ItemRuns, PackItem, PackItemKind, PackLock, PackManifest, PackSourceKind,
+    UpstreamRef,
+};
+use crate::library::{LibraryContext, PendingUpdate, RuntimeChange};
 
-/// One pack as the catalog sees it: what the app ships, what the workspace
-/// installed, or both.
+/// One entry a verified library index offers.
+struct LibraryOffer {
+    source: LibrarySource,
+    signer: String,
+    commit: String,
+    entry: IndexEntry,
+}
+
+/// One pack as the catalog sees it: what the app ships, what a library source
+/// offers, what the workspace installed, or some of each.
 struct PackView {
     id: String,
     available: Option<PackManifest>,
+    offered: Option<LibraryOffer>,
     installed: Option<PackLock>,
 }
 
 impl PackView {
+    /// What a library source says about this installed library pack.
+    fn pending(&self, config_dir: &Path) -> PendingUpdate {
+        match (&self.offered, &self.installed) {
+            (Some(offer), Some(lock)) if lock.source.kind == PackSourceKind::Url => {
+                crate::library::pending_update(config_dir, lock, &offer.entry)
+            }
+            _ => PendingUpdate::UpToDate,
+        }
+    }
+
+    /// The root holding what this pack shipped, to compare a user's copy with.
+    fn shipped_root(&self, config_dir: &Path) -> Option<std::path::PathBuf> {
+        if let Some(manifest) = &self.available {
+            return Some(manifest.root.clone());
+        }
+        let lock = self.installed.as_ref()?;
+        let root = crate::library::snapshot_root(config_dir, &lock.id);
+        (lock.source.kind != PackSourceKind::Bundled && root.is_dir()).then_some(root)
+    }
+
+    fn version(&self) -> Option<String> {
+        self.available
+            .as_ref()
+            .map(|m| m.version.clone())
+            .or_else(|| self.offered.as_ref().map(|o| o.entry.version.clone()))
+    }
     fn state(&self) -> PackState {
         if self.installed.is_some() {
             PackState::Installed
@@ -37,6 +79,10 @@ impl PackView {
     /// True when the shipped pack's contents differ from what the install
     /// recorded — a version bump or any edited file in the source tree.
     fn update_available(&self, resource_dir: Option<&Path>) -> bool {
+        if let (Some(offer), Some(lock)) = (&self.offered, &self.installed) {
+            return lock.source.kind == PackSourceKind::Url
+                && lock.content_hash != offer.entry.content_hash;
+        }
         let (Some(manifest), Some(lock)) = (&self.available, &self.installed) else {
             return false;
         };
@@ -62,7 +108,16 @@ impl PackView {
                 })
                 .collect(),
             (None, Some(manifest)) => manifest.items(),
-            (None, None) => Vec::new(),
+            (None, None) => self
+                .offered
+                .iter()
+                .flat_map(|offer| offer.entry.items.iter())
+                .map(|item| PackItem {
+                    kind: item.kind,
+                    id: item.id.clone(),
+                    path: item.path.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -70,6 +125,7 @@ impl PackView {
         self.available
             .as_ref()
             .map(|m| m.name.as_str())
+            .or_else(|| self.offered.as_ref().map(|o| o.entry.name.as_str()))
             .or_else(|| self.installed.as_ref().map(|l| l.name.as_str()))
             .unwrap_or(&self.id)
     }
@@ -78,6 +134,7 @@ impl PackView {
         self.available
             .as_ref()
             .map(|m| m.description.as_str())
+            .or_else(|| self.offered.as_ref().map(|o| o.entry.description.as_str()))
             .or_else(|| self.installed.as_ref().map(|l| l.description.as_str()))
             .unwrap_or("")
     }
@@ -86,8 +143,34 @@ impl PackView {
         self.available
             .as_ref()
             .map(|m| m.notes.clone())
+            .or_else(|| self.offered.as_ref().map(|o| o.entry.notes.clone()))
             .or_else(|| self.installed.as_ref().map(|l| l.notes.clone()))
             .unwrap_or_default()
+    }
+
+    /// The definition of one MCP item: the live registry's, else the offered
+    /// index's, else the bundled pack's.
+    fn mcp_definition(
+        &self,
+        id: &str,
+        mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
+    ) -> Option<McpServerConfig> {
+        mcp_entries
+            .get(id)
+            .map(|entry| entry.config.clone())
+            .or_else(|| {
+                self.offered
+                    .as_ref()
+                    .and_then(|offer| offer.entry.item(PackItemKind::Mcp, id))
+                    .and_then(|item| item.definition.clone())
+            })
+            .or_else(|| {
+                let path = self.available.as_ref()?.mcp_source()?;
+                pack::mcp::parse_pack_mcp_file(&path)
+                    .ok()?
+                    .servers
+                    .remove(id)
+            })
     }
 }
 
@@ -156,6 +239,12 @@ pub struct PackCatalogItem {
     /// with a file picker instead of a variable name and no way to act on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub setup: Vec<McpVarRequirement>,
+    /// Whether this item is content, a remote endpoint, or runs here.
+    #[serde(default)]
+    pub runs: ItemRuns,
+    /// For an endpoint: the host it connects to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connects_to: Option<String>,
 }
 
 /// How many live items of one kind a pack carries, for the compact
@@ -168,13 +257,63 @@ pub struct PackContentCount {
 }
 
 /// Where an entry's pack came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackSourceInfo {
-    /// `bundled` (shipped in the app) or `url`.
+    /// `bundled` (shipped in the app), `url` (a library source), or `local`.
     pub kind: String,
+    /// What the Library calls the source: `Bundled`, `Cairn library`,
+    /// `Local import`, or `Unconfigured source`.
+    #[serde(default)]
+    pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The trusted key that signed the index this came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// The source commit installed (or offered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Another repository the content is fetched from, at a pinned commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamRef>,
+    /// A local import's original directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A URL pack whose source this build no longer reads: it keeps working,
+    /// and cannot update.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub updates_frozen: bool,
+}
+
+/// One configured library source, as its verified cache stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySourceStatus {
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    /// `verified`, `unverified` (a cached index that does not verify),
+    /// `unreachable` (never fetched, and the last contact failed), or
+    /// `not-fetched`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    /// Why the last contact failed. The last verified index stays in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Why a cached index is not believed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// Entries the verified index carries that are not offered here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_entries: Vec<EntryRefusal>,
 }
 
 /// One pack, projected for both renderings.
@@ -199,6 +338,19 @@ pub struct PackCatalogEntry {
     /// pack can sit in the catalog as available.
     pub uninstalled_by_user: bool,
     pub source: PackSourceInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    /// The most consequential thing any of its items does here.
+    #[serde(default)]
+    pub runs: ItemRuns,
+    /// The pending update changes an endpoint or something that runs here, so
+    /// it waits for the operator instead of applying on its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub update_needs_review: bool,
+    /// What that update would change, from the signed index and the installed
+    /// layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_changes: Vec<RuntimeChange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -273,6 +425,9 @@ pub struct PackCatalog {
     /// is recorded on the next startup sync.
     pub source_recorded: bool,
     pub packs: Vec<PackCatalogEntry>,
+    /// Every configured library source and whether its index is believed.
+    #[serde(default)]
+    pub sources: Vec<LibrarySourceStatus>,
 }
 
 impl PackCatalog {
@@ -281,54 +436,153 @@ impl PackCatalog {
     }
 }
 
-/// Every pack this workspace knows about: shipped by the app, installed, or
-/// both. Sorted by id.
-fn pack_views(resource_dir: Option<&Path>, config_dir: &Path) -> Vec<PackView> {
+/// Every pack this workspace knows about: shipped by the app, offered by a
+/// library source, installed, or several of these. Sorted by id.
+///
+/// A library entry whose id the app bundle also ships is not offered: the
+/// bundled pack wins, and the duplicate is listed on its source as refused.
+fn pack_views(
+    resource_dir: Option<&Path>,
+    config_dir: &Path,
+    library: &LibraryContext,
+) -> (Vec<PackView>, Vec<LibrarySourceStatus>) {
     let mut by_id: BTreeMap<String, PackView> = BTreeMap::new();
+    let view = |id: &str| PackView {
+        id: id.to_string(),
+        available: None,
+        offered: None,
+        installed: None,
+    };
 
     if let Some(resource_dir) = resource_dir {
         for manifest in pack::discover_available_packs(resource_dir) {
-            by_id.insert(
-                manifest.id.clone(),
-                PackView {
-                    id: manifest.id.clone(),
-                    available: Some(manifest),
-                    installed: None,
-                },
-            );
+            let id = manifest.id.clone();
+            by_id
+                .entry(id.clone())
+                .or_insert_with(|| view(&id))
+                .available = Some(manifest);
         }
+    }
+
+    let mut statuses = Vec::new();
+    for source in &library.sources {
+        let state = library_cache::read_state(config_dir, source);
+        let mut status = LibrarySourceStatus {
+            id: source.id.clone(),
+            label: source.label.clone(),
+            url: source.url.clone(),
+            state: String::new(),
+            signer: None,
+            commit: None,
+            serial: None,
+            checked_at: state.checked_at.clone(),
+            last_error: state.last_error.clone(),
+            refusal: None,
+            refused_entries: Vec::new(),
+        };
+        match library_cache::read_cached_index(config_dir, source) {
+            CachedIndex::Absent => {
+                status.state = if state.last_error.is_some() {
+                    "unreachable"
+                } else {
+                    "not-fetched"
+                }
+                .to_string();
+            }
+            CachedIndex::Refused(reason) => {
+                status.state = "unverified".to_string();
+                status.refusal = Some(reason);
+            }
+            CachedIndex::Verified(verified) => {
+                status.state = "verified".to_string();
+                status.signer = Some(verified.signer.clone());
+                status.commit = Some(verified.index.source.commit.clone());
+                status.serial = Some(verified.index.serial);
+                status.refused_entries = verified.refused.clone();
+                for entry in &verified.index.entries {
+                    let slot = by_id
+                        .entry(entry.id.clone())
+                        .or_insert_with(|| view(&entry.id));
+                    if slot.available.is_some() {
+                        status.refused_entries.push(EntryRefusal {
+                            id: entry.id.clone(),
+                            reason: format!(
+                                "`{}` ships with this app, so the {}'s `{}` is not offered here",
+                                entry.id, source.label, entry.id
+                            ),
+                        });
+                        continue;
+                    }
+                    if slot.offered.is_none() {
+                        slot.offered = Some(LibraryOffer {
+                            source: source.clone(),
+                            signer: verified.signer.clone(),
+                            commit: verified.index.source.commit.clone(),
+                            entry: entry.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        statuses.push(status);
     }
 
     for lock in pack::installed_packs(config_dir) {
-        match by_id.get_mut(&lock.id) {
-            Some(view) => view.installed = Some(lock),
-            None => {
-                by_id.insert(
-                    lock.id.clone(),
-                    PackView {
-                        id: lock.id.clone(),
-                        available: None,
-                        installed: Some(lock),
-                    },
-                );
-            }
+        let id = lock.id.clone();
+        by_id
+            .entry(id.clone())
+            .or_insert_with(|| view(&id))
+            .installed = Some(lock);
+    }
+    // An offer only matters to the pack it came from: a library entry sharing
+    // an id with a local import is not that import's update.
+    for view in by_id.values_mut() {
+        let foreign = match (&view.installed, &view.offered) {
+            (Some(lock), Some(offer)) => !lock
+                .source
+                .url
+                .as_deref()
+                .is_some_and(|url| offer.source.is_url(url)),
+            _ => false,
+        };
+        if foreign {
+            view.offered = None;
         }
     }
 
-    by_id.into_values().collect()
+    (
+        by_id
+            .into_values()
+            .filter(|view| {
+                view.available.is_some() || view.offered.is_some() || view.installed.is_some()
+            })
+            .collect(),
+        statuses,
+    )
 }
 
-/// The typed catalog for `config_dir`.
-pub fn pack_catalog(config_dir: &Path) -> PackCatalog {
+/// The typed catalog for `config_dir`, reading `library`'s verified caches.
+/// Never touches the network.
+pub fn pack_catalog(config_dir: &Path, library: &LibraryContext) -> PackCatalog {
     let resource_dir = pack::source_dir(config_dir);
     let mcp_entries = workspace_mcp_entries(config_dir);
-    let packs = pack_views(resource_dir.as_deref(), config_dir)
+    let (views, sources) = pack_views(resource_dir.as_deref(), config_dir, library);
+    let packs = views
         .iter()
-        .map(|view| project(config_dir, resource_dir.as_deref(), view, &mcp_entries))
+        .map(|view| {
+            project(
+                config_dir,
+                resource_dir.as_deref(),
+                view,
+                &mcp_entries,
+                library,
+            )
+        })
         .collect();
     PackCatalog {
         source_recorded: resource_dir.is_some(),
         packs,
+        sources,
     }
 }
 
@@ -337,26 +591,44 @@ fn project(
     resource_dir: Option<&Path>,
     view: &PackView,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
+    library: &LibraryContext,
 ) -> PackCatalogEntry {
+    let classify = |entry: &mut PackCatalogItem, kind: PackItemKind| {
+        let definition = (kind == PackItemKind::Mcp)
+            .then(|| view.mcp_definition(&entry.id, mcp_entries))
+            .flatten();
+        entry.runs = ItemRuns::classify(kind, definition.as_ref());
+        entry.connects_to = (entry.runs == ItemRuns::Endpoint)
+            .then(|| {
+                definition
+                    .as_ref()
+                    .and_then(|d| d.url.as_deref())
+                    .and_then(host_of)
+            })
+            .flatten();
+    };
     let mut items: Vec<PackCatalogItem> = view
         .items()
         .into_iter()
         .map(|item| {
+            let kind = item.kind;
             let verdict = file_item_verdict(config_dir, view, &item);
             let state = item_state(&view.id, &item, verdict.edited, mcp_entries);
             let mut entry = catalog_item(item, state, mcp_entries);
             entry.behind_shipped = verdict.behind;
+            classify(&mut entry, kind);
             entry
         })
         .collect();
     if let Some(lock) = &view.installed {
-        items.extend(
-            lock.removed
-                .iter()
-                .cloned()
-                .map(|item| catalog_item(item, PackItemState::RemovedByUser, mcp_entries)),
-        );
+        items.extend(lock.removed.iter().cloned().map(|item| {
+            let kind = item.kind;
+            let mut entry = catalog_item(item, PackItemState::RemovedByUser, mcp_entries);
+            classify(&mut entry, kind);
+            entry
+        }));
     }
+    let pending = view.pending(config_dir);
     items.sort_by(|a, b| (a.kind.as_str(), a.id.as_str()).cmp(&(b.kind.as_str(), b.id.as_str())));
     items.dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
 
@@ -374,27 +646,46 @@ fn project(
         description: view.description().trim().to_string(),
         state: view.state(),
         installed_version: view.installed.as_ref().map(|l| l.version.clone()),
-        shipped_version: view.available.as_ref().map(|m| m.version.clone()),
+        shipped_version: view.version(),
         update_available: view.update_available(resource_dir),
         installs_by_default: view.available.as_ref().is_some_and(|m| m.default),
         uninstalled_by_user: view.installed.is_none()
             && pack::lock::is_uninstalled(config_dir, &view.id),
-        source: source_info(view),
+        source: source_info(view, library),
+        license: view
+            .available
+            .as_ref()
+            .and_then(|m| m.license.clone())
+            .or_else(|| view.offered.as_ref().and_then(|o| o.entry.license.clone())),
+        runs: items
+            .iter()
+            .filter(|item| item.state != PackItemState::RemovedByUser)
+            .map(|item| item.runs)
+            .max()
+            .unwrap_or_default(),
+        update_needs_review: matches!(pending, PendingUpdate::NeedsReview(_)),
+        runtime_changes: match pending {
+            PendingUpdate::NeedsReview(changes) => changes,
+            _ => Vec::new(),
+        },
         author: view
             .available
             .as_ref()
             .and_then(|m| m.author.as_ref())
+            .or_else(|| view.offered.as_ref().and_then(|o| o.entry.author.as_ref()))
             .or_else(|| view.installed.as_ref().and_then(|l| l.author.as_ref()))
             .and_then(|a| a.name.clone()),
         homepage: view
             .available
             .as_ref()
             .and_then(|m| m.homepage.clone())
+            .or_else(|| view.offered.as_ref().and_then(|o| o.entry.homepage.clone()))
             .or_else(|| view.installed.as_ref().and_then(|l| l.homepage.clone())),
         keywords: view
             .available
             .as_ref()
             .map(|m| m.keywords.clone())
+            .or_else(|| view.offered.as_ref().map(|o| o.entry.keywords.clone()))
             .or_else(|| view.installed.as_ref().map(|l| l.keywords.clone()))
             .unwrap_or_default(),
         installed_at: view.installed.as_ref().map(|l| l.installed_at.clone()),
@@ -453,33 +744,75 @@ fn file_item_verdict(config_dir: &Path, view: &PackView, item: &PackItem) -> Ite
     let edited =
         locked.forked || !pack::matches_baseline(config_dir, locked, &current).unwrap_or(false);
     let behind = edited
-        && view.available.as_ref().is_some_and(|manifest| {
+        && view.shipped_root(config_dir).is_some_and(|root| {
             matches!(
-                pack::hash_item_path(item.kind, &manifest.root, &manifest.root.join(path)),
+                pack::hash_item_path(item.kind, &root, &root.join(path)),
                 Ok(shipped @ ContentHash::Present(_)) if shipped != current
             )
         });
     ItemVerdict { edited, behind }
 }
 
-fn source_info(view: &PackView) -> PackSourceInfo {
-    match &view.installed {
-        Some(lock) => PackSourceInfo {
-            kind: match lock.source.kind {
-                pack::PackSourceKind::Bundled => "bundled",
-                pack::PackSourceKind::Url => "url",
-                pack::PackSourceKind::Local => "local",
+fn source_info(view: &PackView, library: &LibraryContext) -> PackSourceInfo {
+    let bundled = || PackSourceInfo {
+        kind: "bundled".to_string(),
+        label: "Bundled".to_string(),
+        ..Default::default()
+    };
+    match (&view.installed, &view.offered) {
+        (Some(lock), _) => match lock.source.kind {
+            PackSourceKind::Bundled => bundled(),
+            PackSourceKind::Local => PackSourceInfo {
+                kind: "local".to_string(),
+                label: "Local import".to_string(),
+                path: lock.source.path.clone(),
+                ..Default::default()
+            },
+            PackSourceKind::Url => {
+                let configured = lock
+                    .source
+                    .url
+                    .as_deref()
+                    .and_then(|url| library.source_for_url(url));
+                PackSourceInfo {
+                    kind: "url".to_string(),
+                    label: configured
+                        .map(|source| source.label.clone())
+                        .unwrap_or_else(|| "Unconfigured source".to_string()),
+                    url: lock.source.url.clone(),
+                    signer: lock.source.signer.clone(),
+                    commit: lock.source.sha.clone(),
+                    upstream: lock.source.upstream.clone(),
+                    path: None,
+                    updates_frozen: configured.is_none(),
+                }
             }
-            .to_string(),
-            url: lock.source.url.clone(),
         },
-        // Everything the app itself offers is bundled; a URL pack only exists
-        // once it has been installed (CAIRN-3773 adds the other direction).
-        None => PackSourceInfo {
-            kind: "bundled".to_string(),
-            url: None,
+        (None, Some(offer)) if view.available.is_none() => PackSourceInfo {
+            kind: "url".to_string(),
+            label: offer.source.label.clone(),
+            url: Some(offer.source.url.clone()),
+            signer: Some(offer.signer.clone()),
+            commit: Some(offer.commit.clone()),
+            upstream: match &offer.entry.origin {
+                EntryOrigin::Upstream { url, commit, .. } => Some(UpstreamRef {
+                    url: url.clone(),
+                    sha: commit.clone(),
+                }),
+                EntryOrigin::Source { .. } => None,
+            },
+            ..Default::default()
         },
+        _ => bundled(),
     }
+}
+
+/// The host part of a URL, for "Connects to <host>".
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Whether the user has taken ownership of one live item.
@@ -530,6 +863,8 @@ fn catalog_item(
         behind_shipped: false,
         not_ready: entry.and_then(|e| e.not_ready.clone()),
         setup: entry.map(|e| e.setup.clone()).unwrap_or_default(),
+        runs: ItemRuns::Content,
+        connects_to: None,
     }
 }
 
@@ -562,17 +897,25 @@ pub struct PackItemFileDiff {
     pub binary: bool,
 }
 
-/// Compare one file-backed item of a shipped pack with the workspace copy.
+/// Compare one file-backed item of a pack with the workspace copy: the app's
+/// copy for a bundled pack, the verified snapshot for a local or library one.
 pub fn pack_item_diff(
     config_dir: &Path,
     pack_id: &str,
     kind: PackItemKind,
     item_id: &str,
 ) -> Result<PackItemDiff, String> {
-    let resource_dir = pack::source_dir(config_dir)
-        .ok_or("This workspace has no recorded app resource directory yet")?;
-    let manifest = pack::available_pack(&resource_dir, pack_id)
-        .ok_or_else(|| format!("No pack `{pack_id}` is shipped"))?;
+    let manifest = match pack::lock::read_lock(config_dir, pack_id) {
+        Some(lock) if lock.source.kind != PackSourceKind::Bundled => {
+            crate::library::snapshot_manifest(config_dir, &lock)?
+        }
+        _ => {
+            let resource_dir = pack::source_dir(config_dir)
+                .ok_or("This workspace has no recorded app resource directory yet")?;
+            pack::available_pack(&resource_dir, pack_id)
+                .ok_or_else(|| format!("No pack `{pack_id}` is shipped"))?
+        }
+    };
     let item = manifest
         .items()
         .into_iter()
@@ -699,8 +1042,115 @@ fn render_items(out: &mut String, entry: &PackCatalogEntry) {
     out.push('\n');
 }
 
-pub(crate) fn read_packs(config_dir: &Path, state_filter: Option<&str>) -> String {
-    render_packs(&pack_catalog(config_dir), state_filter)
+pub(crate) fn read_packs(
+    config_dir: &Path,
+    library: &LibraryContext,
+    state_filter: Option<&str>,
+) -> String {
+    render_packs(&pack_catalog(config_dir, library), state_filter)
+}
+
+/// One line per configured source: whether its index is believed, and why not.
+fn source_status_line(source: &LibrarySourceStatus) -> String {
+    let label = &source.label;
+    let mut line = match source.state.as_str() {
+        "verified" => format!(
+            "> **{label}**: verified index at `{}` (serial {}), signed by `{}`.",
+            source.commit.as_deref().map(short_commit).unwrap_or("?"),
+            source.serial.unwrap_or_default(),
+            source.signer.as_deref().unwrap_or("?")
+        ),
+        "unverified" => format!(
+            "> **{label}**: the cached index is not trusted ({}), so none of its entries are \
+             offered.",
+            source.refusal.as_deref().unwrap_or("no reason recorded")
+        ),
+        "unreachable" => format!(
+            "> **{label}**: unreachable ({}), so only bundled packs are listed.",
+            source.last_error.as_deref().unwrap_or("no reason recorded")
+        ),
+        _ => format!("> **{label}**: not fetched yet; it refreshes when the Library opens."),
+    };
+    if source.state == "verified" {
+        if let Some(error) = &source.last_error {
+            line.push_str(&format!(
+                " The last refresh failed ({error}); this is the last verified index."
+            ));
+        }
+    }
+    if !source.refused_entries.is_empty() {
+        let refused: Vec<String> = source
+            .refused_entries
+            .iter()
+            .map(|refusal| format!("`{}` ({})", refusal.id, refusal.reason))
+            .collect();
+        line.push_str(&format!(" Not offered: {}.", refused.join("; ")));
+    }
+    line.push_str("\n\n");
+    line
+}
+
+fn short_commit(commit: &str) -> &str {
+    &commit[..commit.len().min(12)]
+}
+
+/// "Cairn library · signed", "Bundled", "Local import".
+fn source_label(source: &PackSourceInfo) -> String {
+    let mut label = source.label.clone();
+    if source.signer.is_some() {
+        label.push_str(" · signed");
+    }
+    if let Some(upstream) = &source.upstream {
+        label.push_str(&format!(" · from {}", upstream.url));
+    }
+    if source.updates_frozen {
+        label.push_str(" · source not configured, updates frozen");
+    }
+    label
+}
+
+/// What installing this entry lets happen here, or nothing for pure content.
+fn runs_label(entry: &PackCatalogEntry) -> Option<String> {
+    match entry.runs {
+        ItemRuns::Content => None,
+        ItemRuns::Endpoint => {
+            let hosts: Vec<&str> = entry
+                .items
+                .iter()
+                .filter_map(|item| item.connects_to.as_deref())
+                .collect();
+            Some(if hosts.is_empty() {
+                "Connects to a remote server".to_string()
+            } else {
+                format!("Connects to {}", hosts.join(", "))
+            })
+        }
+        ItemRuns::Here => Some("Runs on this machine".to_string()),
+    }
+}
+
+/// A definition in one line: the command a stdio server spawns, or the URL
+/// a remote one reaches.
+fn describe_definition(definition: &McpServerConfig) -> String {
+    match definition.transport.as_str() {
+        "http" | "sse" => format!(
+            "{} {}",
+            definition.transport,
+            definition.url.as_deref().unwrap_or("?")
+        ),
+        _ => {
+            let mut argv = vec![definition.command.clone().unwrap_or_default()];
+            argv.extend(definition.args.iter().cloned());
+            let mut text = format!("`{}`", argv.join(" "));
+            if !definition.env.is_empty() {
+                let mut keys: Vec<&String> = definition.env.keys().collect();
+                keys.sort();
+                let keys: Vec<&str> = keys.into_iter().map(String::as_str).collect();
+                text.push_str(&format!(" with env {}", keys.join(", ")));
+            }
+            text
+        }
+    }
 }
 
 /// The library's sections, in the order they read, each paired with its heading
@@ -775,6 +1225,9 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
              already-installed entries are listed. It is recorded on the next startup sync.\n\n",
         );
     }
+    for source in &catalog.sources {
+        out.push_str(&source_status_line(source));
+    }
 
     let filtered: Vec<&PackCatalogEntry> = catalog
         .packs
@@ -794,11 +1247,16 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
             members.len()
         ));
         for entry in members {
-            let update = if entry.update_available {
+            let update = if entry.update_needs_review {
+                " — update needs review"
+            } else if entry.update_available {
                 " — update available"
             } else {
                 ""
             };
+            let runs = runs_label(entry)
+                .map(|label| format!(" · {label}"))
+                .unwrap_or_default();
             out.push_str(&format!(
                 "### [{}]({}) `{}`\n\n",
                 entry.name,
@@ -806,10 +1264,11 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
                 entry.id
             ));
             out.push_str(&format!(
-                "State: {}{} · Version: {}\n\n",
+                "State: {}{} · Version: {} · Source: {}{runs}\n\n",
                 entry.state.as_str(),
                 update,
-                display_version(entry)
+                display_version(entry),
+                source_label(&entry.source)
             ));
             if !entry.description.is_empty() {
                 out.push_str(&format!("{}\n\n", entry.description));
@@ -851,8 +1310,8 @@ fn display_version(entry: &PackCatalogEntry) -> &str {
         .unwrap_or("0.0.0")
 }
 
-pub(crate) fn read_pack(config_dir: &Path, pack_id: &str) -> String {
-    let catalog = pack_catalog(config_dir);
+pub(crate) fn read_pack(config_dir: &Path, library: &LibraryContext, pack_id: &str) -> String {
+    let catalog = pack_catalog(config_dir, library);
     match catalog.find(pack_id) {
         Some(entry) => render_pack(entry),
         None => format!("Pack not found: {pack_id}"),
@@ -876,9 +1335,39 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
     out.push_str(&format!("Version: {}\n", display_version(entry)));
     if entry.update_available {
         let shipped = entry.shipped_version.as_deref().unwrap_or("?");
+        let offerer = if entry.source.kind == "bundled" {
+            "the app ships".to_string()
+        } else {
+            format!("the {} offers", entry.source.label)
+        };
         out.push_str(&format!(
-            "Update available: the app ships {shipped}, which differs from what is installed\n"
+            "Update available: {offerer} {shipped}, which differs from what is installed\n"
         ));
+    }
+    out.push_str(&format!("Source: {}\n", source_label(&entry.source)));
+    if let Some(url) = &entry.source.url {
+        out.push_str(&format!("Source URL: {url}\n"));
+    }
+    if let Some(commit) = &entry.source.commit {
+        out.push_str(&format!("Source commit: {commit}\n"));
+    }
+    if let Some(signer) = &entry.source.signer {
+        out.push_str(&format!("Signed by: {signer}\n"));
+    }
+    if let Some(upstream) = &entry.source.upstream {
+        out.push_str(&format!(
+            "Fetched from: {} at {}\n",
+            upstream.url, upstream.sha
+        ));
+    }
+    if let Some(path) = &entry.source.path {
+        out.push_str(&format!("Imported from: {path}\n"));
+    }
+    if let Some(license) = &entry.license {
+        out.push_str(&format!("License: {license}\n"));
+    }
+    if let Some(runs) = runs_label(entry) {
+        out.push_str(&format!("{runs}\n"));
     }
 
     if let Some(author) = &entry.author {
@@ -899,13 +1388,35 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
 
     if let Some(installed_at) = &entry.installed_at {
         out.push_str(&format!("Installed at: {installed_at}\n"));
-        out.push_str(&format!("Source: {}", entry.source.kind));
-        if let Some(url) = &entry.source.url {
-            out.push_str(&format!(" — {url}"));
+    }
+    out.push('\n');
+
+    if entry.update_needs_review {
+        out.push_str("## Update needs review\n\n");
+        out.push_str(
+            "This update changes what runs on this machine, so it is not applied on its own. The \
+             operator applies it from the Library page in Settings; an agent's update of this \
+             pack is refused.\n\n",
+        );
+        for change in &entry.runtime_changes {
+            let before = change.before.as_ref().map(describe_definition);
+            let after = change.after.as_ref().map(describe_definition);
+            let detail = match (before, after) {
+                (Some(before), Some(after)) => format!(": {before} → {after}"),
+                (None, Some(after)) => format!(": {after}"),
+                (Some(before), None) => format!(": was {before}"),
+                (None, None) => String::new(),
+            };
+            out.push_str(&format!(
+                "- {} `{}` ({}) {}{detail}\n",
+                change.kind,
+                change.id,
+                change.runs.as_str(),
+                change.change
+            ));
         }
         out.push('\n');
     }
-    out.push('\n');
 
     if !entry.description.is_empty() {
         out.push_str(&format!("{}\n\n", entry.description));
@@ -973,6 +1484,8 @@ mod tests {
             behind_shipped: false,
             not_ready: None,
             setup: Vec::new(),
+            runs: ItemRuns::Content,
+            connects_to: None,
         }
     }
 
@@ -989,8 +1502,13 @@ mod tests {
             uninstalled_by_user: false,
             source: PackSourceInfo {
                 kind: "bundled".into(),
-                url: None,
+                label: "Bundled".into(),
+                ..Default::default()
             },
+            license: None,
+            runs: ItemRuns::Content,
+            update_needs_review: false,
+            runtime_changes: vec![],
             author: Some("Cairn".into()),
             homepage: None,
             keywords: vec![],
@@ -1063,6 +1581,88 @@ mod tests {
         assert!(page.contains("- skill `skills/matlab`"), "{page}");
         assert!(page.contains("## Removed by you"), "{page}");
         assert!(page.contains("- mcp `matlab`"), "{page}");
+        assert!(page.contains("Source: Bundled\n"), "{page}");
+    }
+
+    /// Every entry says where it came from and what it runs, and a pending
+    /// update that changes what runs says so with the definitions on both
+    /// sides.
+    #[test]
+    fn provenance_runs_and_a_review_are_on_the_page() {
+        let before: McpServerConfig = serde_yaml::from_str("command: old-mcp\n").unwrap();
+        let after: McpServerConfig =
+            serde_yaml::from_str("command: new-mcp\nargs: [--stdio]\n").unwrap();
+        let mut library = single("acme", "mcp");
+        library.state = PackState::Installed;
+        library.source = PackSourceInfo {
+            kind: "url".into(),
+            label: "Cairn library".into(),
+            url: Some("https://github.com/bleugreenlab/cairn-library".into()),
+            signer: Some("cairn-library-2026".into()),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..Default::default()
+        };
+        library.runs = ItemRuns::Here;
+        library.update_available = true;
+        library.update_needs_review = true;
+        library.runtime_changes = vec![RuntimeChange {
+            kind: "mcp".into(),
+            id: "acme".into(),
+            runs: ItemRuns::Here,
+            change: "changed".into(),
+            before: Some(before),
+            after: Some(after),
+        }];
+        let page = render_pack(&library);
+        assert!(page.contains("Source: Cairn library · signed\n"), "{page}");
+        assert!(page.contains("Signed by: cairn-library-2026"), "{page}");
+        assert!(page.contains("Runs on this machine"), "{page}");
+        assert!(
+            page.contains("Update available: the Cairn library offers"),
+            "{page}"
+        );
+        assert!(page.contains("## Update needs review"), "{page}");
+        assert!(
+            page.contains("- mcp `acme` (here) changed: `old-mcp` → `new-mcp --stdio`"),
+            "{page}"
+        );
+
+        let catalog = PackCatalog {
+            source_recorded: true,
+            packs: vec![library],
+            sources: vec![LibrarySourceStatus {
+                id: "cairn-library".into(),
+                label: "Cairn library".into(),
+                url: "https://github.com/bleugreenlab/cairn-library".into(),
+                state: "unreachable".into(),
+                signer: None,
+                commit: None,
+                serial: None,
+                checked_at: None,
+                last_error: Some("no network".into()),
+                refusal: None,
+                refused_entries: vec![],
+            }],
+        };
+        let page = render_packs(&catalog, None);
+        assert!(
+            page.contains("**Cairn library**: unreachable (no network)"),
+            "{page}"
+        );
+        assert!(page.contains("update needs review"), "{page}");
+    }
+
+    #[test]
+    fn hosts_are_read_from_urls() {
+        assert_eq!(
+            host_of("https://mcp.linear.app/mcp").as_deref(),
+            Some("mcp.linear.app")
+        );
+        assert_eq!(
+            host_of("https://u:p@h.test:8443/x?y").as_deref(),
+            Some("h.test:8443")
+        );
+        assert_eq!(host_of("not a url"), None);
     }
 
     #[test]
@@ -1081,6 +1681,7 @@ mod tests {
         let catalog = PackCatalog {
             source_recorded: true,
             packs: vec![entry(), available],
+            sources: vec![],
         };
         assert_eq!(
             render_packs(&catalog, Some("installed"))
@@ -1096,6 +1697,7 @@ mod tests {
         let catalog = PackCatalog {
             source_recorded: false,
             packs: vec![],
+            sources: vec![],
         };
         let page = render_packs(&catalog, None);
         assert!(
@@ -1132,6 +1734,7 @@ mod tests {
                 single("deepwiki", "mcp"),
                 single("triage", "channel"),
             ],
+            sources: vec![],
         };
         let page = render_packs(&catalog, None);
 

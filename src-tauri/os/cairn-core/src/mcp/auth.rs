@@ -606,6 +606,10 @@ mod tests {
             // only the runner's payload; the runner gates the input against
             // the page's manifest.
             "src-tauri/src/commands/pages.rs",
+            // Library pack updates that change what runs on this machine:
+            // routed through `operator_target` like page writes, forwarding
+            // only the pack id and returning only the runner's payload.
+            "src-tauri/src/commands/packs.rs",
             // Database browser row writes: routed through `operator_target`
             // like page writes, so only the main webview reaches the local
             // runner or a configured peer; inline browser webviews and page

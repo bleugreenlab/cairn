@@ -326,7 +326,9 @@ pub(crate) const SKILL_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
 pub(crate) const PACK_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "install | update | restore | export (requires path)",
+    "install | update | restore | export (requires path). install takes a bundled pack or an \
+     entry the Cairn library offers; an update that changes what runs on this machine is \
+     refused here and applied by the operator from the Library page",
 );
 pub(crate) const PACK_PATH: KeySpec =
     KeySpec::new("path", KeyType::Str, "local Agent Plugin directory");

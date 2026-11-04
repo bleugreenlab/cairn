@@ -305,20 +305,11 @@ impl Orchestrator {
         config_resource::delete_config::<SkillResource>(self, id, project_id, workspace_id)
     }
 
-    /// Fetch a skill from a URL and return a preview for the UI.
-    pub fn fetch_skill_preview(
-        &self,
-        url: &str,
-    ) -> Result<crate::config::skill_fetch::FetchedSkill, String> {
-        let source = crate::config::skill_fetch::parse_skill_url(url)?;
-        crate::config::skill_fetch::fetch_skill(&source, url)
-    }
-
     /// Preview a local portable `.skill` archive.
     pub fn preview_skill_archive(
         &self,
         path: &Path,
-    ) -> Result<crate::config::skill_fetch::FetchedSkill, String> {
+    ) -> Result<crate::config::skill_package::FetchedSkill, String> {
         validate_skill_archive_file(path)?;
         let bytes =
             std::fs::read(path).map_err(|e| format!("Failed to read selected .skill file: {e}"))?;
@@ -367,20 +358,9 @@ impl Orchestrator {
             .map_err(|e| format!("Failed to write .skill archive: {e}"))
     }
 
-    /// Install a previously fetched skill to the target scope.
-    pub fn install_skill_from_url(
-        &self,
-        url: &str,
-        project_id: Option<&str>,
-    ) -> Result<SkillConfig, String> {
-        let source = crate::config::skill_fetch::parse_skill_url(url)?;
-        let fetched = crate::config::skill_fetch::fetch_skill(&source, url)?;
-        self.install_fetched_skill_package(fetched, project_id)
-    }
-
     fn install_fetched_skill_package(
         &self,
-        fetched: crate::config::skill_fetch::FetchedSkill,
+        fetched: crate::config::skill_package::FetchedSkill,
         project_id: Option<&str>,
     ) -> Result<SkillConfig, String> {
         let project_path: Option<std::path::PathBuf> = if let Some(pid) = project_id {
@@ -389,7 +369,7 @@ impl Orchestrator {
             None
         };
 
-        let installed_dir = crate::config::skill_fetch::install_fetched_skill(
+        let installed_dir = crate::config::skill_package::install_fetched_skill(
             &fetched,
             &self.config_dir,
             project_path.as_deref(),
