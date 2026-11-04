@@ -93,6 +93,9 @@ pub enum TurnYieldReason {
     Permission,
     DependencyWait,
     Wait,
+    /// Historical: written only by the Codex repeat circuit breaker, which #4293
+    /// removed. Nothing writes it now; it stays so persisted turns still parse,
+    /// and it is not a self-suspend reason, so such a turn holds no message.
     SafetyPause,
     ProviderLimit,
 }

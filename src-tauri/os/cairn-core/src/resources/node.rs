@@ -325,16 +325,27 @@ fn append_optional_timestamp(output: &mut String, label: &str, timestamp: Option
     }
 }
 
+/// The summary's title and timestamps. A job held on its own pending work
+/// carries that hold beside its status icon and in a sentence beneath, because
+/// `running` alone reads exactly like a node mid-turn.
 fn render_job_summary_header(
     name: &str,
     status: &str,
     started_at: Option<i64>,
     completed_at: Option<i64>,
+    hold: Option<&crate::messages::delivery::Hold>,
 ) -> String {
-    let mut output = format!("# {} [{}]\n\n", name, job_status_icon(status));
+    let icon = job_status_icon(status);
+    let mut output = match hold {
+        Some(hold) => format!("# {name} [{icon} {}]\n\n", hold.qualifier()),
+        None => format!("# {name} [{icon}]\n\n"),
+    };
     append_optional_timestamp(&mut output, "Started", started_at);
     append_optional_timestamp(&mut output, "Completed", completed_at);
     output.push('\n');
+    if let Some(hold) = hold {
+        output.push_str(&format!("Not taking a turn: {}.\n\n", hold.render()));
+    }
     output
 }
 
@@ -1785,11 +1796,13 @@ pub(super) async fn read_node(
         Err(error) => return error,
     };
 
+    let hold = crate::messages::delivery::describe_hold(db, &job.id).await;
     let mut output = render_job_summary_header(
         node_name,
         &job.status,
         job.started_at.map(i64::from),
         job.completed_at.map(i64::from),
+        hold.as_ref(),
     );
     push_placement_default(&mut output, db, &job.id).await;
     if job.status == "pending" && job.started_at.is_none() {
@@ -2960,11 +2973,13 @@ pub(super) async fn read_task(
         Err(error) => return error,
     };
 
+    let hold = crate::messages::delivery::describe_hold(db, &task_job.id).await;
     let mut output = render_job_summary_header(
         task_name,
         &task_job.status,
         task_job.started_at.map(i64::from),
         task_job.completed_at.map(i64::from),
+        hold.as_ref(),
     );
     push_placement_default(&mut output, db, &task_job.id).await;
     if let Some(parent_segment) = parent_segment {
@@ -4258,5 +4273,48 @@ mod stuck_resolution_tests {
             "{text}"
         );
         assert!(!text.contains("failed"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod hold_header_tests {
+    use super::render_job_summary_header;
+    use crate::messages::delivery::Hold;
+
+    /// `running` alone reads exactly like a node mid-turn, so a held node's
+    /// title carries the hold and the summary says what releases it.
+    #[test]
+    fn a_held_node_names_its_hold_beside_the_status_and_beneath_it() {
+        let limit = Hold::ProviderLimit {
+            retry_not_before: Some(1_790_000_000),
+        };
+        let header = render_job_summary_header("builder", "running", None, None, Some(&limit));
+        assert!(
+            header.starts_with(&format!("# builder [◐ {}]", limit.qualifier())),
+            "{header}"
+        );
+        assert!(
+            header.contains("[◐ held: provider limit until "),
+            "{header}"
+        );
+        assert!(
+            header.contains("Not taking a turn: it is held for a provider usage limit until "),
+            "{header}"
+        );
+
+        let wait = Hold::Wait {
+            labels: vec!["waitFor: duration".into()],
+            supersedable: true,
+        };
+        let header = render_job_summary_header("builder", "running", None, None, Some(&wait));
+        assert!(
+            header.starts_with("# builder [◐ waiting: waitFor: duration]"),
+            "{header}"
+        );
+        assert!(header.contains("escalate:true"), "{header}");
+
+        let idle = render_job_summary_header("builder", "running", None, None, None);
+        assert!(idle.starts_with("# builder [◐]\n"), "{idle}");
+        assert!(!idle.contains("Not taking a turn"), "{idle}");
     }
 }

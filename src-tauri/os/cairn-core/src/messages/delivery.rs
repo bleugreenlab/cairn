@@ -173,7 +173,7 @@ fn session_refuses_turns_sync(db: &LocalDb, job_id: &str) -> bool {
 /// [`Self::SessionRefusesTurns`], whose session carries the reason, rather
 /// than the bare [`Self::Cancelled`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeliveryRefusal {
+pub enum DeliveryRefusal {
     /// The job is a closed thread's session.
     DormantThread,
     /// The job's execution was superseded by another attempt on its issue.
@@ -189,7 +189,7 @@ pub(crate) enum DeliveryRefusal {
 }
 
 impl DeliveryRefusal {
-    fn describe(self) -> &'static str {
+    pub fn describe(self) -> &'static str {
         match self {
             Self::DormantThread => "its thread is closed",
             Self::Superseded => "its execution was superseded",
@@ -240,23 +240,25 @@ pub(crate) fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
     run_db_blocking(move || async move { head_turn_active(db, &job_id).await }).unwrap_or(false)
 }
 
-/// These yielded turns have an owner for their resumption: pending agent work,
-/// a safety pause, or a provider-capacity hold. External pushes cannot resolve
-/// that wait; explicit operator continuation remains authoritative. The set is exhaustive over `TurnYieldReason`
-/// (`models::turn`): a sub-agent task/batch wait or a dependency wait yields
-/// `dependency_wait`, the agent's own open question/prompt yields `user_input`,
-/// and its own pending permission yields `permission`. Verify against the writers
-/// (`mcp/handlers/planning.rs`, `mcp/handlers/permission.rs`,
+/// These yielded turns have an owner for their resumption: the agent's own
+/// pending work, or a provider-capacity hold whose reset time owns it. An
+/// external push does not resolve that wait, with one exception: an escalated
+/// direct message ends a pure `waitFor` park through the park's own resolution
+/// path (see [`nudge_for_direct_message`]). Explicit operator continuation
+/// remains authoritative.
+///
+/// A sub-agent task/batch wait or a dependency wait yields `dependency_wait`,
+/// the agent's own open question/prompt yields `user_input`, its own pending
+/// permission yields `permission`, and a durable `waitFor` or `run` park yields
+/// `wait`. Verify against the writers (`mcp/handlers/planning.rs`,
+/// `mcp/handlers/permission.rs`, `mcp/handlers/durable_suspend.rs`,
 /// `execution/delegation/runtime/resume.rs`) before extending.
+/// `safety_pause` is deliberately absent: it has no live writer, and a
+/// historical turn carrying it must not hold messages forever.
 fn is_self_suspend_reason(reason: &str) -> bool {
     matches!(
         reason,
-        "user_input"
-            | "permission"
-            | "dependency_wait"
-            | "wait"
-            | "safety_pause"
-            | "provider_limit"
+        "user_input" | "permission" | "dependency_wait" | "wait" | "provider_limit"
     )
 }
 
@@ -307,7 +309,11 @@ pub(crate) enum HeadTurn {
     /// is decided, the wait fires), draining anything queued for it then. Two
     /// consequences follow. It must NOT be woken by an external attention push,
     /// even a `wake`/`interrupt` one (`docs/attention-redesign.md` — "Wakeable vs
-    /// self-suspended"; CAIRN-1876). And background work must NOT be scheduled
+    /// self-suspended"; CAIRN-1876). The one exception is an escalated direct
+    /// message to a pure `waitFor` park, which ends the wait through its owner's
+    /// resolution path rather than resuming around it
+    /// ([`crate::mcp::handlers::durable_suspend::supersede_timed_waits`]). And
+    /// background work must NOT be scheduled
     /// against it as though its turn had ended — notably the turn-end project
     /// check cadence, whose heavy lanes would otherwise compete with the very
     /// tests the agent is suspended waiting on (CAIRN-3154).
@@ -342,13 +348,48 @@ impl HeadTurn {
 /// `interrupted`/`cancelled`; only the durable-wait yields land a `yielded` head
 /// turn. The reason check guards against any future non-self-suspend yield.
 async fn head_turn(db: &LocalDb, job_id: &str) -> Result<HeadTurn, String> {
+    Ok(head_turn_row(db, job_id)
+        .await?
+        .map_or(HeadTurn::Idle, |row| row.classify()))
+}
+
+/// The job's head turn as stored: the one row every head-turn question reads.
+struct HeadTurnRow {
+    id: String,
+    state: String,
+    yield_reason: Option<String>,
+}
+
+impl HeadTurnRow {
+    fn classify(&self) -> HeadTurn {
+        match self.state.as_str() {
+            "yielded" if self.self_suspend_reason().is_some() => HeadTurn::SelfSuspended,
+            "yielded" | "running" | "pending" => HeadTurn::Live,
+            _ => HeadTurn::Idle,
+        }
+    }
+
+    /// Why the head turn is self-suspended, or `None` when it is not.
+    fn self_suspend_reason(&self) -> Option<crate::models::TurnYieldReason> {
+        if self.state != "yielded" {
+            return None;
+        }
+        self.yield_reason
+            .as_deref()
+            .filter(|reason| is_self_suspend_reason(reason))?
+            .parse()
+            .ok()
+    }
+}
+
+async fn head_turn_row(db: &LocalDb, job_id: &str) -> Result<Option<HeadTurnRow>, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT t.state, t.yield_reason
+                    "SELECT t.id, t.state, t.yield_reason
                      FROM jobs j
                      LEFT JOIN turns current ON current.id = j.current_turn_id
                      JOIN turns t ON t.id = COALESCE(
@@ -365,29 +406,187 @@ async fn head_turn(db: &LocalDb, job_id: &str) -> Result<HeadTurn, String> {
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
-                return Ok(HeadTurn::Idle);
+                return Ok(None);
             };
-            let state = row.text(0)?;
-            Ok(match state.as_str() {
-                "yielded" => {
-                    if row
-                        .opt_text(1)?
-                        .as_deref()
-                        .map(is_self_suspend_reason)
-                        .unwrap_or(false)
-                    {
-                        HeadTurn::SelfSuspended
-                    } else {
-                        HeadTurn::Live
-                    }
-                }
-                "running" | "pending" => HeadTurn::Live,
-                _ => HeadTurn::Idle,
-            })
+            Ok(Some(HeadTurnRow {
+                id: row.text(0)?,
+                state: row.text(1)?,
+                yield_reason: row.opt_text(2)?,
+            }))
         })
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// What holds a self-suspended job, and what releases it: the one description
+/// both a sender's reply and the node summary give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// Parked on its own durable calls (`waitFor`, `run`, MCP).
+    Wait {
+        /// Each parked call's label, such as `waitFor: duration` or `run: cargo test`.
+        labels: Vec<String>,
+        /// Whether an escalated message would end these waits now.
+        supersedable: bool,
+    },
+    /// Waiting on its own sub-agent tasks, or on a dependency when none is open.
+    Tasks { pending: i64 },
+    /// Waiting for the operator to answer its question.
+    Question,
+    /// Waiting for the operator to decide its permission request.
+    Permission,
+    /// Held for a provider usage limit until `retry_not_before` (unix seconds).
+    ProviderLimit { retry_not_before: Option<i64> },
+}
+
+impl Hold {
+    /// One clause naming what holds the job and what releases it, written to
+    /// follow "It has not started a turn: ".
+    pub fn render(&self) -> String {
+        match self {
+            Hold::Wait {
+                labels,
+                supersedable: true,
+            } => format!(
+                "it is parked on its own {}; it reads this when that wait resolves or the operator resumes it, and a message sent with escalate:true ends the wait and wakes it now",
+                Self::calls(labels)
+            ),
+            Hold::Wait { labels, .. } => format!(
+                "it is parked on its own {}, which is work in flight; it reads this when that call resolves or the operator resumes it",
+                Self::calls(labels)
+            ),
+            Hold::Tasks { pending } if *pending > 0 => format!(
+                "it is waiting on {pending} sub-agent task{} of its own; it reads this when they return or the operator resumes it",
+                if *pending == 1 { "" } else { "s" }
+            ),
+            Hold::Tasks { .. } => {
+                "it is waiting on its own dependencies; it reads this when they resolve or the operator resumes it".into()
+            }
+            Hold::Question => {
+                "it is waiting for the operator to answer its question; it reads this once the question is answered".into()
+            }
+            Hold::Permission => {
+                "it is waiting for the operator to decide its permission request; it reads this once the request is decided".into()
+            }
+            Hold::ProviderLimit {
+                retry_not_before: Some(at),
+            } => format!(
+                "it is held for a provider usage limit until {}; it reads this when the limit resets or the operator resumes it sooner",
+                Self::time(*at)
+            ),
+            Hold::ProviderLimit {
+                retry_not_before: None,
+            } => {
+                "it is held for a provider usage limit with no known reset time; it reads this when the limit clears or the operator resumes it".into()
+            }
+        }
+    }
+
+    /// The short form a node summary's title carries beside its status icon.
+    pub fn qualifier(&self) -> String {
+        match self {
+            Hold::Wait { labels, .. } => match labels.as_slice() {
+                [one] => format!("waiting: {one}"),
+                [] => "waiting: its own call".into(),
+                many => format!("waiting: {} calls", many.len()),
+            },
+            Hold::Tasks { pending } if *pending > 0 => format!(
+                "waiting: {pending} task{}",
+                if *pending == 1 { "" } else { "s" }
+            ),
+            Hold::Tasks { .. } => "waiting: dependencies".into(),
+            Hold::Question => "waiting: operator answer".into(),
+            Hold::Permission => "waiting: permission decision".into(),
+            Hold::ProviderLimit {
+                retry_not_before: Some(at),
+            } => format!("held: provider limit until {}", Self::time(*at)),
+            Hold::ProviderLimit { .. } => "held: provider limit".into(),
+        }
+    }
+
+    fn calls(labels: &[String]) -> String {
+        if labels.is_empty() {
+            return "durable call".into();
+        }
+        labels
+            .iter()
+            .map(|label| format!("`{label}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn time(unix_seconds: i64) -> String {
+        crate::clock::stamp(unix_seconds).unwrap_or_else(|| unix_seconds.to_string())
+    }
+}
+
+/// What holds this job from taking a turn, or `None` when nothing of its own
+/// does (it is idle, mid-turn, or its read failed).
+pub(crate) async fn describe_hold(db: &LocalDb, job_id: &str) -> Option<Hold> {
+    use crate::models::TurnYieldReason;
+    let row = head_turn_row(db, job_id).await.ok()??;
+    Some(match row.self_suspend_reason()? {
+        TurnYieldReason::Wait => {
+            let waits =
+                crate::mcp::handlers::durable_suspend::parked_waits_of_turn(db, job_id, &row.id)
+                    .await
+                    .unwrap_or_default();
+            Hold::Wait {
+                labels: waits.labels,
+                supersedable: waits.supersedable,
+            }
+        }
+        TurnYieldReason::DependencyWait => Hold::Tasks {
+            pending: db
+                .query_one(
+                    "SELECT COUNT(*) FROM delegated_packets
+                     WHERE parent_job_id = ?1
+                       AND status NOT IN ('completed', 'failed', 'cancelled')",
+                    params![job_id],
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap_or(0),
+        },
+        TurnYieldReason::UserInput => Hold::Question,
+        TurnYieldReason::Permission => Hold::Permission,
+        TurnYieldReason::ProviderLimit => Hold::ProviderLimit {
+            retry_not_before: db
+                .query_opt(
+                    "SELECT retry_not_before FROM provider_limit_holds
+                     WHERE job_id = ?1 AND state = 'active'
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![job_id],
+                    |row| row.opt_i64(0),
+                )
+                .await
+                .ok()
+                .flatten()
+                .flatten(),
+        },
+        TurnYieldReason::SafetyPause => return None,
+    })
+}
+
+/// Why a job is self-suspended and on which turn, for the one caller that acts
+/// on the reason rather than only on the fact.
+struct SelfSuspension {
+    reason: crate::models::TurnYieldReason,
+    turn_id: String,
+}
+
+fn self_suspension_sync(db: &LocalDb, job_id: &str) -> Option<SelfSuspension> {
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move { head_turn_row(db, &job_id).await })
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            Some(SelfSuspension {
+                reason: row.self_suspend_reason()?,
+                turn_id: row.id,
+            })
+        })
 }
 
 /// [`head_turn`] for the non-async flush-on-idle resume gate. Fails open to
@@ -726,13 +925,14 @@ struct PendingFlush {
 /// `continue_job_impl` resume claims and injects pending notices for the job,
 /// so the flush only needs their presence to decide whether to resume. Building
 /// them in here as well would deliver each notice twice.
-fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush> {
+fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Result<PendingFlush, FlushDecline> {
     let run_id_owned = run_id.to_string();
     let job_id = run_db_blocking(move || async move {
         Ok(crate::messages::side_channel::job_id_for_run(db, &run_id_owned).await)
     })
     .ok()
-    .flatten()?;
+    .flatten()
+    .ok_or(FlushDecline::NoJob)?;
 
     // A recipient no turn can reach is not resumed by anything queued for it —
     // pushes, queued user messages, or notices. Taken here, at the one gate the
@@ -752,14 +952,14 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
                 &job_id[..job_id.len().min(8)],
                 refusal.describe()
             );
-            return None;
+            return Err(FlushDecline::Refused(refusal));
         }
         Err(error) => {
             log::debug!(
                 "flush-on-idle: job {} declined resume (deliverability unknown): {error}",
                 &job_id[..job_id.len().min(8)]
             );
-            return None;
+            return Err(FlushDecline::Unknown(error));
         }
     }
 
@@ -769,16 +969,17 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
     let queued_count =
         crate::messages::queued::peek_waking_pending_count_for_job(db, &job_id).unwrap_or(0);
     // CAIRN-1876: an agent self-suspended on its OWN pending work (a sub-agent
-    // task/batch, its own open question/prompt, its own pending permission, or a
-    // dependency wait) is NOT idle and must NOT be woken by an external attention
-    // push — even a `wake`/`interrupt` one. The push stays queued (undelivered)
-    // and rides along on the agent's own-work-resolution resume (the task returns
-    // / the question is answered / the permission is decided / the dependency
-    // unblocks), which drains the queue then. This guards both external
-    // attention-push resume reasons below; directs and queued user messages are a
-    // separate delivery mechanism (migrated in a later slice) and keep their
-    // existing wake-on-idle behavior. (docs/attention-redesign.md — "Wakeable vs
-    // self-suspended".)
+    // task/batch, its own open question/prompt, its own pending permission, a
+    // dependency wait, or a durable `waitFor`/`run` park) is NOT idle and must NOT
+    // be resumed here by an external attention push — even a `wake`/`interrupt`
+    // one. The push stays queued (undelivered) and rides along on the agent's
+    // own-work-resolution resume, which drains the queue then. Direct messages
+    // are `direct:` pushes and are held the same way. The one exception is taken
+    // before this gate, in `nudge_for_direct_message`: an escalated direct to a
+    // pure `waitFor` park ends the wait through the park's own resolution path,
+    // never by resuming around it. A queued operator message is counted above
+    // without this check, because the operator stays authoritative.
+    // (docs/attention-redesign.md — "Wakeable vs self-suspended".)
     let self_suspended = head_turn_sync(db, &job_id).is_self_suspended();
 
     // CAIRN-1881/1900: a pending rousing (`wake`/`interrupt`) push for this job is
@@ -827,14 +1028,39 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
                 keys.join(", "),
             );
         }
-        return None;
+        return Err(if self_suspended {
+            FlushDecline::SelfSuspended
+        } else {
+            FlushDecline::NothingPending
+        });
     }
 
-    Some(PendingFlush {
+    Ok(PendingFlush {
         job_id,
         notice_count,
         queued_count,
     })
+}
+
+/// Why the idle flush did not resume a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlushDecline {
+    /// The run resolves to no job.
+    NoJob,
+    /// No turn can reach the job (see [`DeliveryRefusal`]).
+    Refused(DeliveryRefusal),
+    /// Whether the job can take a turn could not be read, so the flush failed closed.
+    Unknown(String),
+    /// The job is suspended on its own pending work, which holds what is queued.
+    SelfSuspended,
+    /// Nothing queued for the job is a reason to resume it.
+    NothingPending,
+}
+
+/// What the idle flush did.
+enum FlushOutcome {
+    Resumed,
+    Declined(FlushDecline),
 }
 
 /// Resume a run that has just gone idle to deliver anything still queued for it:
@@ -850,6 +1076,12 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
 /// stamps every pending item (notices, queued messages, pushes); this function
 /// only decides whether to resume and carries no prompt of its own.
 pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
+    flush_on_idle(orch, run_id).map(|_| ())
+}
+
+/// [`flush_pending_directs_on_idle`], reporting whether it resumed the run and,
+/// when it did not, why.
+fn flush_on_idle(orch: &Orchestrator, run_id: &str) -> Result<FlushOutcome, String> {
     let timing_started = std::time::Instant::now();
     let db = match run_db_blocking({
         let dbs = orch.db.clone();
@@ -868,13 +1100,16 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Resul
             ));
         }
     };
-    let Some(pending) = collect_pending_for_flush(&db, run_id) else {
-        let mut event = crate::resume_timing::ResumeTimingEvent::new("idle_flush_decision")
-            .elapsed(timing_started);
-        event.run_id = Some(run_id);
-        event.mode = Some("skip");
-        event.emit();
-        return Ok(());
+    let pending = match collect_pending_for_flush(&db, run_id) {
+        Ok(pending) => pending,
+        Err(decline) => {
+            let mut event = crate::resume_timing::ResumeTimingEvent::new("idle_flush_decision")
+                .elapsed(timing_started);
+            event.run_id = Some(run_id);
+            event.mode = Some("skip");
+            event.emit();
+            return Ok(FlushOutcome::Declined(decline));
+        }
     };
 
     let mut event =
@@ -905,7 +1140,37 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Resul
     event.run_id = Some(run_id);
     event.job_id = Some(&pending.job_id);
     event.emit();
-    Ok(())
+    Ok(FlushOutcome::Resumed)
+}
+
+/// Which direct message is waking a job, so a wait it ends can say so.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectMessageRef {
+    /// The sender's node URI, or its name when it has none.
+    pub(crate) from: String,
+    pub(crate) message_id: String,
+}
+
+/// What a nudge did with the content already queued for a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NudgeOutcome {
+    /// The urgency does not wake anyone (passive); the content rides along.
+    NotWaking,
+    /// No turn can reach the job.
+    Refused(DeliveryRefusal),
+    /// The job is mid-turn and reads the content at its next tool or turn boundary.
+    DeliveredToLiveTurn,
+    /// The job's active turn was stopped, and it resumes with the content.
+    Interrupted,
+    /// A continuation was dispatched; it takes the content as it starts.
+    Resumed,
+    /// An escalated direct message ended the job's `waitFor` park, and it is
+    /// resuming through that wait's resolution.
+    SupersededWait { labels: Vec<String> },
+    /// The job is suspended on its own work, which holds the content.
+    Held(Hold),
+    /// The job was not resumed for some other reason, named in the sentence.
+    Declined(String),
 }
 
 /// Nudge a job after a pending row has been durably persisted according to the
@@ -913,18 +1178,42 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Resul
 /// Interrupt on an active recipient uses the same semantics as manually queueing
 /// a message and pressing Stop: stop the active turn and let the normal idle
 /// flush claim the already-persisted row and resume exactly once. Idle interrupt
-/// recipients still resume immediately.
+/// recipients still resume immediately. A self-suspended recipient is held, and
+/// the outcome says what holds it.
 pub fn nudge_job_for_urgency(
     orch: &Orchestrator,
     job_id: &str,
     urgency: DeliveryUrgency,
-) -> Result<(), String> {
+) -> Result<NudgeOutcome, String> {
+    nudge(orch, job_id, urgency, None)
+}
+
+/// [`nudge_job_for_urgency`] for an agent's direct message, which adds one
+/// rung: an escalated (`interrupt`) message to a job parked only on its own
+/// `waitFor` calls ends those waits and resumes it with the message. A
+/// `waitFor` only observes something, so ending it loses nothing. Every other
+/// self-suspension still holds, and operator input never comes through here.
+pub(crate) fn nudge_for_direct_message(
+    orch: &Orchestrator,
+    job_id: &str,
+    urgency: DeliveryUrgency,
+    message: &DirectMessageRef,
+) -> Result<NudgeOutcome, String> {
+    nudge(orch, job_id, urgency, Some(message))
+}
+
+fn nudge(
+    orch: &Orchestrator,
+    job_id: &str,
+    urgency: DeliveryUrgency,
+    message: Option<&DirectMessageRef>,
+) -> Result<NudgeOutcome, String> {
     let mut timing_event = crate::resume_timing::ResumeTimingEvent::new("queue_nudge");
     timing_event.job_id = Some(job_id);
     timing_event.mode = Some(urgency.as_str());
     timing_event.emit();
     if !urgency.wakes_idle() {
-        return Ok(());
+        return Ok(NudgeOutcome::NotWaking);
     }
 
     let db = run_db_blocking({
@@ -947,13 +1236,13 @@ pub fn nudge_job_for_urgency(
             "queue_nudge: not nudging job {} (its session is closed); the push stays queued",
             &job_id[..job_id.len().min(8)]
         );
-        return Ok(());
+        return Ok(NudgeOutcome::Refused(DeliveryRefusal::SessionRefusesTurns));
     }
 
     let live_run_id = crate::orchestrator::lifecycle::live_run_id_for_job(orch, job_id);
     let head_active = head_turn_active_sync(&db, job_id);
     if head_active && urgency != DeliveryUrgency::Interrupt {
-        return Ok(());
+        return Ok(NudgeOutcome::DeliveredToLiveTurn);
     }
 
     if urgency == DeliveryUrgency::Interrupt && head_active {
@@ -971,17 +1260,56 @@ pub fn nudge_job_for_urgency(
         // observes no pending rows; continue_job_impl also joins an in-flight
         // launch, so neither ordering can create a duplicate successor.
         flush_pending_directs_on_idle(orch, &run_id)?;
-        return Ok(());
+        return Ok(NudgeOutcome::Interrupted);
     }
 
-    if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
-        flush_pending_directs_on_idle(orch, &run_id)?;
+    if let (Some(message), DeliveryUrgency::Interrupt) = (message, urgency) {
+        if let Some(SelfSuspension {
+            reason: crate::models::TurnYieldReason::Wait,
+            turn_id,
+        }) = self_suspension_sync(&db, job_id)
+        {
+            if let Some(labels) = crate::mcp::handlers::durable_suspend::supersede_timed_waits(
+                orch, &db, job_id, &turn_id, message,
+            )? {
+                log::info!(
+                    "queue_nudge: escalated direct {} ended job {}'s parked {}",
+                    message.message_id,
+                    &job_id[..job_id.len().min(8)],
+                    labels.join(", ")
+                );
+                return Ok(NudgeOutcome::SupersededWait { labels });
+            }
+        }
+    }
+
+    let flushed = if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
+        flush_on_idle(orch, &run_id)?
     } else {
         crate::execution::jobs::continue_job_impl(orch, job_id, None, None, None)
-            .map(|_| ())
             .map_err(|error| format!("could not resume queued delivery: {error}"))?;
-    }
-    Ok(())
+        FlushOutcome::Resumed
+    };
+    Ok(match flushed {
+        FlushOutcome::Resumed => NudgeOutcome::Resumed,
+        FlushOutcome::Declined(FlushDecline::Refused(refusal)) => NudgeOutcome::Refused(refusal),
+        FlushOutcome::Declined(FlushDecline::SelfSuspended) => {
+            let job_id = job_id.to_string();
+            match run_db_blocking(move || async move { Ok(describe_hold(&db, &job_id).await) }) {
+                Ok(Some(hold)) => NudgeOutcome::Held(hold),
+                _ => NudgeOutcome::Declined("it is suspended on its own pending work".into()),
+            }
+        }
+        FlushOutcome::Declined(FlushDecline::Unknown(error)) => NudgeOutcome::Declined(format!(
+            "whether it can take a turn could not be read ({error})"
+        )),
+        FlushOutcome::Declined(FlushDecline::NothingPending) => {
+            NudgeOutcome::Declined("nothing queued for it is deliverable now".into())
+        }
+        FlushOutcome::Declined(FlushDecline::NoJob) => {
+            NudgeOutcome::Declined("its run does not resolve to a job".into())
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1099,13 +1427,13 @@ mod tests {
         set_head_turn(&db, "job-thread", "complete", None).await;
 
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_some(),
+            collect_pending_for_flush(&db, "run-1").is_ok(),
             "an active thread resumes for a pending rousing push"
         );
 
         set_thread_status(&db, "closed").await;
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_none(),
+            collect_pending_for_flush(&db, "run-1").is_err(),
             "a closed thread is not resumed by anything queued for it"
         );
         assert_eq!(
@@ -1120,7 +1448,7 @@ mod tests {
 
         set_thread_status(&db, "active").await;
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_some(),
+            collect_pending_for_flush(&db, "run-1").is_ok(),
             "reopening makes the same push deliverable again"
         );
     }
@@ -1270,10 +1598,14 @@ mod tests {
         }
 
         // A yield for some future non-self-suspend reason is not self-suspended,
-        // but the host holds the turn — so it is live, not idle.
-        set_head_turn(&db, "job-1", "yielded", Some("host_takeover")).await;
-        assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Live);
-        assert!(!head_turn(&db, "job-1").await.unwrap().is_self_suspended());
+        // but the host holds the turn — so it is live, not idle. A historical
+        // `safety_pause` turn reads the same way: nothing writes it now, and it
+        // must not hold messages.
+        for reason in ["host_takeover", "safety_pause"] {
+            set_head_turn(&db, "job-1", "yielded", Some(reason)).await;
+            assert_eq!(head_turn(&db, "job-1").await.unwrap(), HeadTurn::Live);
+            assert!(!head_turn(&db, "job-1").await.unwrap().is_self_suspended());
+        }
 
         // A completed head turn is the normal idle case.
         set_head_turn(&db, "job-1", "complete", None).await;
@@ -1303,7 +1635,7 @@ mod tests {
         set_head_turn(&db, "job-1", "yielded", Some("dependency_wait")).await;
 
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_none(),
+            collect_pending_for_flush(&db, "run-1").is_err(),
             "a self-suspended agent must not be resumed by a pending wake push"
         );
 
@@ -1319,13 +1651,176 @@ mod tests {
         );
     }
 
+    /// The Codex repeat brake that wrote `safety_pause` is gone, and 1,135
+    /// directs once sat behind turns it parked. A head still carrying it is
+    /// resumed for a pending push like any agent that is not self-suspended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_historical_safety_pause_head_no_longer_holds_a_waking_push() {
+        let db = migrated_db().await;
+        seed_run(&db, "run-1", "job-1").await;
+        seed_waking_push(&db, "job-1").await;
+        set_head_turn(&db, "job-1", "yielded", Some("safety_pause")).await;
+
+        let pending = collect_pending_for_flush(&db, "run-1")
+            .expect("a safety-paused head must not hold the push");
+        assert_eq!(pending.job_id, "job-1");
+        assert_eq!(describe_hold(&db, "job-1").await, None);
+    }
+
+    async fn seed_provider_limit_hold(db: &LocalDb, job_id: &str, retry_not_before: i64) {
+        db.execute(
+            "INSERT INTO provider_limit_holds
+               (id, job_id, run_id, turn_id, backend, retry_not_before, boundary_source, created_at, updated_at)
+             VALUES ('hold-1', ?1, 'run-1', 't-head', 'claude', ?2, 'rate_limit_event', 1, 1)",
+            params![job_id, retry_not_before],
+        )
+        .await
+        .unwrap();
+    }
+
+    fn escalation() -> DirectMessageRef {
+        DirectMessageRef {
+            from: "cairn://p/proj/42/1/coordinator".into(),
+            message_id: "msg-1".into(),
+        }
+    }
+
+    /// Only a pure `waitFor` park yields to an escalated message. Every other
+    /// self-suspension holds it, and says what holds it and what releases it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_escalated_direct_holds_for_every_other_self_suspension_and_names_its_release() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        db.execute(
+            "INSERT INTO delegated_packets (execution_id, id, seq, parent_job_id, status, spec, created_at)
+             VALUES ('exec-1', 'packet-1', 1, 'job-1', 'running', '{}', 1),
+                    ('exec-1', 'packet-2', 2, 'job-1', 'completed', '{}', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let reset = chrono::Utc::now().timestamp() + 3_600;
+
+        for (reason, expected, release) in [
+            (
+                "dependency_wait",
+                Hold::Tasks { pending: 1 },
+                "when they return",
+            ),
+            (
+                "user_input",
+                Hold::Question,
+                "once the question is answered",
+            ),
+            (
+                "permission",
+                Hold::Permission,
+                "once the request is decided",
+            ),
+            (
+                "provider_limit",
+                Hold::ProviderLimit {
+                    retry_not_before: Some(reset),
+                },
+                "when the limit resets",
+            ),
+        ] {
+            set_head_turn(&db, "job-1", "yielded", Some(reason)).await;
+            if reason == "provider_limit" {
+                seed_provider_limit_hold(&db, "job-1", reset).await;
+            }
+            let outcome =
+                nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
+                    .unwrap();
+            assert_eq!(outcome, NudgeOutcome::Held(expected.clone()), "{reason}");
+            let said = expected.render();
+            assert!(said.contains(release), "{reason}: {said}");
+        }
+
+        let at = crate::clock::stamp(reset).unwrap_or_else(|| reset.to_string());
+        let limit = Hold::ProviderLimit {
+            retry_not_before: Some(reset),
+        };
+        assert!(limit.render().contains(&at), "{}", limit.render());
+        assert_eq!(
+            limit.qualifier(),
+            format!("held: provider limit until {at}")
+        );
+        assert_eq!(Hold::Tasks { pending: 1 }.qualifier(), "waiting: 1 task");
+    }
+
+    /// An escalate that cannot stop the recipient's turn is an error the sender
+    /// sees, not a warn line in the host log under a bare "Sent".
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_escalate_to_a_turn_with_no_stoppable_run_reports_the_failure() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+        // The turn reads running, but no run is starting or live to stop.
+        db.execute("UPDATE runs SET status = 'complete' WHERE id = 'run-1'", ())
+            .await
+            .unwrap();
+
+        let error =
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &escalation())
+                .expect_err("a running turn with no stoppable run cannot be interrupted");
+        assert!(error.contains("stoppable run"), "{error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_plain_direct_to_a_live_turn_is_read_at_its_next_tool_call() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "running", None).await;
+
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Steer, &escalation())
+                .unwrap(),
+            NudgeOutcome::DeliveredToLiveTurn
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_nudge_to_an_idle_recipient_reports_the_turn_it_started() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_thread_session_run(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('sess-1','job-thread','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-1' WHERE id='job-thread';
+             UPDATE runs SET session_id='sess-1' WHERE id='run-1';
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at)
+               VALUES('turn-1','sess-1','run-1','job-thread',1,'complete','initial',1,1,1);
+             UPDATE jobs SET current_turn_id='turn-1' WHERE id='job-thread';",
+        )
+        .await
+        .unwrap();
+        crate::messages::queued::enqueue_async(
+            &db,
+            "job-thread",
+            "are you there?",
+            DeliveryUrgency::Queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            nudge_job_for_urgency(&orch, "job-thread", DeliveryUrgency::Queue).unwrap(),
+            NudgeOutcome::Resumed
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn provider_limit_hold_defers_external_waking_push() {
         let db = migrated_db().await;
         seed_run(&db, "run-1", "job-1").await;
         seed_waking_push(&db, "job-1").await;
         set_head_turn(&db, "job-1", "yielded", Some("provider_limit")).await;
-        assert!(collect_pending_for_flush(&db, "run-1").is_none());
+        assert!(collect_pending_for_flush(&db, "run-1").is_err());
         assert_eq!(
             crate::orchestrator::attention_push::list_pending(&db, "job-1")
                 .await
@@ -1403,7 +1898,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_some(),
+            collect_pending_for_flush(&db, "run-1").is_ok(),
             "the fixture resumes before the cancel"
         );
 
@@ -1411,21 +1906,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(collect_pending_for_flush(&db, "run-1").is_none());
+        assert!(collect_pending_for_flush(&db, "run-1").is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn collect_pending_returns_none_when_nothing_queued() {
         let db = migrated_db().await;
         seed_run(&db, "run-1", "job-1").await;
-        assert!(collect_pending_for_flush(&db, "run-1").is_none());
+        assert!(collect_pending_for_flush(&db, "run-1").is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn collect_pending_returns_none_for_unknown_run() {
         let db = migrated_db().await;
         // No run row -> job can't be resolved -> nothing to flush, no panic.
-        assert!(collect_pending_for_flush(&db, "ghost").is_none());
+        assert!(collect_pending_for_flush(&db, "ghost").is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1451,7 +1946,7 @@ mod tests {
             "the fixture must be deliverable before testing that the flush leaves it alone"
         );
         assert!(
-            collect_pending_for_flush(&db, "run-1").is_none(),
+            collect_pending_for_flush(&db, "run-1").is_err(),
             "passive side-channel notices must not trigger flush-on-idle resumes"
         );
 

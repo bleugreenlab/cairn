@@ -444,6 +444,7 @@ pub(super) async fn trigger(
                 job_id: r.job_id.clone(),
             });
             loop {
+                stand_down_if_settled(&db, &r.id).await?;
                 if let Some(v) =
                     terminal(&orch, &db, &owner, uri, slug, on, phrase.as_deref()).await?
                 {
@@ -453,13 +454,29 @@ pub(super) async fn trigger(
             }
         }
         Condition::Checks { uri, job_id, suite } => {
-            checks(&orch, uri, job_id, suite.as_deref(), r.created).await
+            checks(&orch, &db, &r.id, uri, job_id, suite.as_deref(), r.created).await
         }
         // A run batch has no pollable condition: its trigger is the awaited
         // executor result, which only the suspending host holds.
         Condition::RunBatch { .. } | Condition::McpContinuation { .. } => {
             Err("this durable suspension has no waitFor condition to await".into())
         }
+    }
+}
+
+/// What a polling trigger returns once its row was settled by someone else.
+/// Nothing reads it: the resolver it hands this to finds the row already
+/// claimed and does nothing.
+const SETTLED_ELSEWHERE: &str = "this wait was settled by another resolver";
+
+/// End a polling trigger whose row is no longer pending (see
+/// [`durable_suspend::still_pending`]), instead of polling a resolved row until
+/// its condition happens to hit.
+async fn stand_down_if_settled(db: &LocalDb, wait_id: &str) -> Result<(), String> {
+    if durable_suspend::still_pending(db, wait_id).await {
+        Ok(())
+    } else {
+        Err(SETTLED_ELSEWHERE.into())
     }
 }
 
@@ -474,6 +491,8 @@ pub(super) async fn trigger(
 /// wrong trade.
 async fn checks(
     orch: &Orchestrator,
+    db: &LocalDb,
+    wait_id: &str,
     uri: &str,
     job_id: &str,
     suite: Option<&str>,
@@ -495,6 +514,7 @@ async fn checks(
     let mut verdictless_since: Option<i64> = None;
     let mut unavailable_since: Option<i64> = None;
     loop {
+        stand_down_if_settled(db, wait_id).await?;
         let snapshot = match node_checks_settlement(orch, job_id, suite).await {
             Ok(snapshot) => {
                 unavailable_since = None;

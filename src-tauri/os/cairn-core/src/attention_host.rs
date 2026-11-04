@@ -79,7 +79,7 @@ impl AttentionHost for CoreAttentionHost {
         self.0.db.for_project(project_key).await
     }
     fn nudge(&self, job_id: &str, urgency: DeliveryUrgency) -> Result<(), String> {
-        crate::messages::delivery::nudge_job_for_urgency(&self.0, job_id, urgency)
+        crate::messages::delivery::nudge_job_for_urgency(&self.0, job_id, urgency).map(|_| ())
     }
     async fn message(&self, db: &LocalDb, message_id: &str) -> Option<crate::models::Message> {
         crate::messages::db::get_message_by_id_async(db, message_id)

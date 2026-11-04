@@ -158,6 +158,25 @@ pub(crate) async fn relinquish_to_inner_wait(
 /// work only it can end looks here. An unreadable row reads as not cancelled:
 /// the work then runs to its own bound, which is the safe side.
 pub(crate) async fn was_cancelled(db: &LocalDb, id: &str) -> bool {
+    wait_row_state(db, id).await.as_deref() == Some("cancelled")
+}
+
+/// Whether a trigger polling for this suspension's condition should keep going.
+///
+/// A trigger loses its row in two ways: a Stop cancels it, or something else
+/// resolves it first (an escalated message superseding a `waitFor`, see
+/// [`supersede_timed_waits`]). Either way nothing it finds can be delivered, so
+/// a polling loop stands down rather than watching a resolved row until its
+/// condition happens to hit. No row at all is the inline phase, before the
+/// durable row exists, and an unreadable row reads as pending: the trigger then
+/// runs to its own bound, which is the safe side.
+pub(crate) async fn still_pending(db: &LocalDb, id: &str) -> bool {
+    wait_row_state(db, id)
+        .await
+        .is_none_or(|state| state == "pending")
+}
+
+async fn wait_row_state(db: &LocalDb, id: &str) -> Option<String> {
     db.query_text(
         "SELECT state FROM agent_waits WHERE id=?1",
         (id.to_string(),),
@@ -165,8 +184,186 @@ pub(crate) async fn was_cancelled(db: &LocalDb, id: &str) -> bool {
     .await
     .ok()
     .flatten()
-    .as_deref()
-        == Some("cancelled")
+}
+
+/// What a turn parked on its own durable calls is waiting for, as the hold
+/// description and the supersede decision both read it.
+#[derive(Debug, Default)]
+pub(crate) struct ParkedWaits {
+    /// Each active call's [`Condition::label`], in creation order.
+    pub(crate) labels: Vec<String>,
+    /// Whether an escalated message may end these waits: every active call is a
+    /// parked `waitFor`, and at least one of them is still pending.
+    pub(crate) supersedable: bool,
+}
+
+/// The active (pending or resolving) suspensions a parked turn holds.
+async fn active_waits_of_turn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    turn_id: &str,
+) -> DbResult<Vec<(Record, String, bool)>> {
+    let mut rows = conn
+        .query(
+            "SELECT id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,created_at,state,hold FROM agent_waits WHERE job_id=?1 AND predecessor_turn_id=?2 AND state IN ('pending','resolving') ORDER BY created_at, id",
+            params![job_id, turn_id],
+        )
+        .await?;
+    let mut found = Vec::new();
+    while let Some(row) = rows.next().await? {
+        found.push((
+            record_from_row(&row)?,
+            row.text(9)?,
+            row.opt_text(10)?.is_some(),
+        ));
+    }
+    Ok(found)
+}
+
+/// Whether these active calls are a pure `waitFor` park an escalated message
+/// may end. A `run` batch or an MCP continuation is work in flight whose result
+/// would be lost, and a held row is a call still answering on its own socket,
+/// so any of them alongside keeps the whole turn held.
+fn timed_waits_only(waits: &[(Record, String, bool)]) -> bool {
+    waits
+        .iter()
+        .all(|(record, _, held)| record.condition.is_wait_for() && !held)
+        && waits.iter().any(|(_, state, _)| state == "pending")
+}
+
+/// What the parked turn `turn_id` of `job_id` is waiting for.
+pub(crate) async fn parked_waits_of_turn(
+    db: &LocalDb,
+    job_id: &str,
+    turn_id: &str,
+) -> Result<ParkedWaits, String> {
+    let (job_id, turn_id) = (job_id.to_string(), turn_id.to_string());
+    let waits = db
+        .read(|c| {
+            let (job_id, turn_id) = (job_id.clone(), turn_id.clone());
+            Box::pin(async move { active_waits_of_turn(c, &job_id, &turn_id).await })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ParkedWaits {
+        labels: waits
+            .iter()
+            .map(|(record, _, _)| record.condition.label())
+            .collect(),
+        supersedable: timed_waits_only(&waits),
+    })
+}
+
+/// The result a superseded `waitFor` call returns, so the agent reads why its
+/// wait ended early. The message itself arrives in the resume briefing.
+pub(crate) fn superseded_by_message_result(
+    message: &crate::messages::delivery::DirectMessageRef,
+) -> String {
+    serde_json::json!({
+        "outcome": "superseded_by_message",
+        "from": message.from,
+        "messageId": message.message_id,
+    })
+    .to_string()
+}
+
+/// End a pure `waitFor` park early for an escalated direct message.
+///
+/// A `waitFor` only observes something, so ending it loses nothing: the agent
+/// resumes with the message and can wait again. Anything else parked in the
+/// same turn is work in flight, and then nothing is superseded.
+///
+/// The decision and the claim are one write. Every eligible row moves
+/// `pending -> resolving` carrying [`superseded_by_message_result`], exactly the
+/// first-writer-wins transition any resolver takes, so a trigger that fires
+/// later loses the race harmlessly and a resolver that got there first leaves
+/// nothing eligible. The resume itself is the ordinary owner's path
+/// ([`drive_resolution`] replaying the claimed rows): it answers each call,
+/// elects one resumer, settles any native goal pause, and starts the successor
+/// turn that drains the pending `direct:` pushes.
+///
+/// Returns the superseded calls' labels, or `None` when the park is not a pure
+/// `waitFor` park. The resume runs on the ambient runtime; with none, the
+/// claimed rows are re-driven by the periodic sweep of stale `resolving` rows.
+pub(crate) fn supersede_timed_waits(
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    job_id: &str,
+    turn_id: &str,
+    message: &crate::messages::delivery::DirectMessageRef,
+) -> Result<Option<Vec<String>>, String> {
+    let result = superseded_by_message_result(message);
+    let claimed = crate::storage::run_db_blocking({
+        let (db, job_id, turn_id, result) = (
+            db.clone(),
+            job_id.to_string(),
+            turn_id.to_string(),
+            result.clone(),
+        );
+        move || async move { claim_timed_waits(&db, &job_id, &turn_id, &result).await }
+    })?;
+    let Some(records) = claimed else {
+        return Ok(None);
+    };
+    let labels = records
+        .iter()
+        .map(|record| record.condition.label())
+        .collect();
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            let (orch, db) = (orch.clone(), db.clone());
+            runtime.spawn(async move {
+                // In order, so every sibling but the last stands down and the
+                // last one out drives the turn's single resume.
+                for record in records {
+                    drive_resolution(&orch, &db, &record, &result, true).await;
+                }
+            });
+        }
+        Err(_) => log::warn!(
+            "superseded the waits of turn {turn_id} for job {job_id} with no runtime to resume it on; the stale-resolution sweep resumes it"
+        ),
+    }
+    Ok(Some(labels))
+}
+
+/// The claim half of [`supersede_timed_waits`]: decide and transition in one
+/// write, so no resolver can land between the eligibility read and the claim.
+async fn claim_timed_waits(
+    db: &LocalDb,
+    job_id: &str,
+    turn_id: &str,
+    result: &str,
+) -> Result<Option<Vec<Record>>, String> {
+    let (job_id, turn_id, result) = (job_id.to_string(), turn_id.to_string(), result.to_string());
+    db.write(|c| {
+        let (job_id, turn_id, result) = (job_id.clone(), turn_id.clone(), result.clone());
+        Box::pin(async move {
+            let waits = active_waits_of_turn(c, &job_id, &turn_id).await?;
+            if waits.is_empty() || !timed_waits_only(&waits) {
+                return Ok(None);
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            let mut claimed = Vec::new();
+            for (record, state, _) in waits {
+                if state != "pending" {
+                    continue;
+                }
+                let changed = c
+                    .execute(
+                        "UPDATE agent_waits SET state='resolving',resolution_json=?2,resolving_at=?3 WHERE id=?1 AND state='pending'",
+                        params![record.id.as_str(), result.as_str(), now],
+                    )
+                    .await?;
+                if changed > 0 {
+                    claimed.push(record);
+                }
+            }
+            Ok((!claimed.is_empty()).then_some(claimed))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The inverse of [`relinquish_to_inner_wait`], for an inner wait that was
@@ -234,6 +431,15 @@ pub(crate) async fn await_inner_wait_release(db: &LocalDb, record: &Record) {
 }
 
 impl Condition {
+    /// Whether this is a `waitFor` condition, which only observes something,
+    /// rather than a call whose result is work in flight.
+    pub(crate) fn is_wait_for(&self) -> bool {
+        matches!(
+            self,
+            Condition::Duration | Condition::Terminal { .. } | Condition::Checks { .. }
+        )
+    }
+
     /// The serde tag this condition is stored under, which is also the row's
     /// `kind` column.
     pub(crate) fn kind(&self) -> &'static str {
@@ -252,7 +458,7 @@ impl Condition {
     /// with several, so it names what the agent asked for rather than what the
     /// resolver polls: the question it answers is "which of the calls I issued
     /// is this?".
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Condition::Duration => "waitFor: duration".to_string(),
             Condition::Terminal { slug, on, .. } => {
@@ -1931,8 +2137,9 @@ pub(crate) fn live_resolvers(orch: &Orchestrator) -> HashSet<String> {
 /// calling [`resolve`] directly.
 ///
 /// A resolution that fails while the host stays up is retried here, not left
-/// for the next boot: a parked agent cannot be reached by message, so a row
-/// stranded in `resolving` strands the agent with it (cairn/5778).
+/// for the next boot: a parked agent is reached only through its own resolution
+/// (an escalated message ends a `waitFor` park by driving this same path), so a
+/// row stranded in `resolving` strands the agent with it (cairn/5778).
 pub(crate) async fn drive_resolution(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -6918,5 +7125,249 @@ mod tests {
                 .as_deref(),
             Some("user_stop")
         );
+    }
+
+    // ---- Escalated direct messages and waitFor parks -----------------------
+
+    use crate::messages::delivery::{
+        nudge_for_direct_message, DirectMessageRef, Hold, NudgeOutcome,
+    };
+    use crate::messages::queued::DeliveryUrgency;
+
+    /// A direct message to the parked builder from its coordinator, persisted
+    /// and pushed the way the message handler does before it nudges.
+    async fn seed_direct(orch: &Orchestrator, urgency: &str) -> DirectMessageRef {
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at, urgency)
+                 VALUES ('msg-1', 'direct', 'coordinator', 'run-1', 'stop waiting, the plan changed', 1, ?1)",
+                (urgency.to_string(),),
+            )
+            .await
+            .unwrap();
+        crate::orchestrator::attention_push::push(
+            &orch.db.local,
+            "job-1",
+            "cairn://p/prj/1/1/builder",
+            if urgency == "interrupt" {
+                crate::orchestrator::attention_push::Wake::Interrupt
+            } else {
+                crate::orchestrator::attention_push::Wake::Wake
+            },
+            crate::orchestrator::attention_push::Boundary::Event,
+            "direct:msg-1",
+        )
+        .await
+        .unwrap();
+        DirectMessageRef {
+            from: "cairn://p/prj/1/1/coordinator".into(),
+            message_id: "msg-1".into(),
+        }
+    }
+
+    async fn direct_push_delivered(orch: &Orchestrator) -> bool {
+        orch.db
+            .local
+            .query_opt_text(
+                "SELECT delivered_event_id FROM attention_pushes WHERE key = 'direct:msg-1'",
+                (),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// A duration wait still ten minutes from firing, so only the message can
+    /// end it inside the test.
+    fn ten_minute_wait(base: Record) -> Record {
+        Record {
+            deadline: Some(chrono::Utc::now().timestamp_millis() + 600_000),
+            ..base
+        }
+    }
+
+    #[tokio::test]
+    async fn an_escalated_direct_ends_a_waitfor_duration_park_and_resumes_once() {
+        let (orch, base, _) = durable_env().await;
+        let record = ten_minute_wait(base);
+        insert(&orch.db.local, &record).await.unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "interrupt").await;
+
+        let outcome =
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap();
+        assert_eq!(
+            outcome,
+            NudgeOutcome::SupersededWait {
+                labels: vec!["waitFor: duration".into()]
+            }
+        );
+
+        await_wait_state(&orch, "wait-1", "resolved").await;
+        let successors = wait_resolved_turns(&orch).await;
+        assert_eq!(successors.len(), 1, "exactly one successor turn");
+        assert_eq!(successors[0].1, "running");
+        let results = tool_results(&orch).await;
+        assert_eq!(results.len(), 1, "the waitFor call is answered once");
+        assert!(
+            results[0].1.contains("superseded_by_message") && results[0].1.contains("msg-1"),
+            "the call's result says a message ended it: {}",
+            results[0].1
+        );
+        assert!(
+            direct_push_delivered(&orch).await,
+            "the resume delivers the message itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalated_direct_ends_terminal_and_checks_parks_and_their_triggers_stand_down() {
+        let parks = [
+            (
+                Condition::Terminal {
+                    uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
+                    slug: "tests".into(),
+                    owner: None,
+                    on: TerminalWaitEvent::Exit,
+                    phrase: None,
+                },
+                "waitFor: terminal tests exit",
+            ),
+            (
+                Condition::Checks {
+                    uri: "cairn://p/prj/1/1/reviewer/checks".into(),
+                    job_id: "job-other".into(),
+                    suite: Some("rust-tests".into()),
+                },
+                "waitFor: checks verdict rust-tests",
+            ),
+        ];
+        for (condition, label) in parks {
+            let (orch, base, _) = durable_env().await;
+            let record = Record {
+                condition,
+                deadline: None,
+                ..base
+            };
+            insert(&orch.db.local, &record).await.unwrap();
+            register_warm(&orch);
+            let message = seed_direct(&orch, "interrupt").await;
+
+            assert_eq!(
+                nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message)
+                    .unwrap(),
+                NudgeOutcome::SupersededWait {
+                    labels: vec![label.into()]
+                }
+            );
+            await_wait_state(&orch, "wait-1", "resolved").await;
+
+            // The trigger armed for this park is still polling. Its next pass
+            // finds the row settled and stands down rather than watching the
+            // terminal or the lanes until they happen to finish.
+            let stood_down = tokio::time::timeout(
+                Duration::from_secs(5),
+                super::super::owned_wait::trigger(
+                    orch.clone(),
+                    orch.db.local.clone(),
+                    record.clone(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label}: the trigger kept polling a resolved row"));
+            assert_eq!(
+                stood_down.unwrap_err(),
+                "this wait was settled by another resolver",
+                "{label}"
+            );
+
+            // Whatever it hands on loses the race: no second answer or resume.
+            drive_resolution(&orch, &orch.db.local, &record, EXITED, false).await;
+            assert_eq!(wait_resolved_turns(&orch).await.len(), 1, "{label}");
+            assert_eq!(tool_result_count(&orch).await, 1, "{label}");
+            assert_eq!(wait_state(&orch).await, "resolved", "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_direct_to_a_waitfor_park_is_held_and_names_the_escalation() {
+        let (orch, base, _) = durable_env().await;
+        insert(&orch.db.local, &ten_minute_wait(base))
+            .await
+            .unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "steer").await;
+
+        let outcome =
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Steer, &message).unwrap();
+        let NudgeOutcome::Held(hold) = outcome else {
+            panic!("a plain message must not end a wait: {outcome:?}");
+        };
+        assert_eq!(
+            hold,
+            Hold::Wait {
+                labels: vec!["waitFor: duration".into()],
+                supersedable: true
+            }
+        );
+        let said = hold.render();
+        assert!(
+            said.contains("`waitFor: duration`") && said.contains("escalate:true"),
+            "{said}"
+        );
+        assert_eq!(wait_state(&orch).await, "pending");
+        assert!(wait_resolved_turns(&orch).await.is_empty());
+        assert!(!direct_push_delivered(&orch).await);
+    }
+
+    #[tokio::test]
+    async fn an_escalated_direct_holds_for_a_run_park_alone_or_beside_a_waitfor() {
+        let batch_of = |base: &Record| Record {
+            condition: run_batch_condition(false, Some("cargo test")),
+            deadline: None,
+            ..base.clone()
+        };
+
+        // A run batch alone is work in flight.
+        let (orch, base, _) = durable_env().await;
+        insert(&orch.db.local, &batch_of(&base)).await.unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "interrupt").await;
+        assert_eq!(
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap(),
+            NudgeOutcome::Held(Hold::Wait {
+                labels: vec!["run: cargo test".into()],
+                supersedable: false
+            })
+        );
+        assert_eq!(wait_state(&orch).await, "pending");
+
+        // A waitFor parked beside one is not ended either: ending it would
+        // resume the turn while the batch's result is still owed.
+        let (orch, base, _) = durable_env().await;
+        insert(&orch.db.local, &ten_minute_wait(base.clone()))
+            .await
+            .unwrap();
+        insert(&orch.db.local, &batch_of(&sibling_record(&base)))
+            .await
+            .unwrap();
+        register_warm(&orch);
+        let message = seed_direct(&orch, "interrupt").await;
+        let outcome =
+            nudge_for_direct_message(&orch, "job-1", DeliveryUrgency::Interrupt, &message).unwrap();
+        let NudgeOutcome::Held(hold) = outcome else {
+            panic!("a turn with a run in flight must hold: {outcome:?}");
+        };
+        assert_eq!(
+            hold,
+            Hold::Wait {
+                labels: vec!["waitFor: duration".into(), "run: cargo test".into()],
+                supersedable: false
+            }
+        );
+        assert!(hold.render().contains("`run: cargo test`"));
+        assert_eq!(active_wait_count(&orch).await, 2);
+        assert!(wait_resolved_turns(&orch).await.is_empty());
     }
 }

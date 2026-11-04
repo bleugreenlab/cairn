@@ -669,14 +669,19 @@ pub async fn append_direct_message_with_urgency(
     // not told about its own message. Sender resolution routes to the database
     // that owns the sender's run (a team agent's run lives in its replica, not
     // the private DB), matching how the rest of this handler routes by owner.
-    let sender_job_id = match sender_run_id.as_deref() {
+    let (sender_job_id, sender_uri) = match sender_run_id.as_deref() {
         Some(run_id) => {
             let sender_db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
                 .await
                 .unwrap_or_else(|_| orch.db.local.clone());
-            crate::messages::side_channel::job_id_for_run(&sender_db, run_id).await
+            let job_id = crate::messages::side_channel::job_id_for_run(&sender_db, run_id).await;
+            let uri = match job_id.as_deref() {
+                Some(job_id) => delivery::node_uri_for_job(&sender_db, job_id).await,
+                None => None,
+            };
+            (job_id, uri)
         }
-        None => None,
+        None => (None, None),
     };
     match crate::orchestrator::attention_delivery::create_catchup_pushes_for_watchers(
         &owning_db,
@@ -692,19 +697,67 @@ pub async fn append_direct_message_with_urgency(
 
     // Nudge only when the effective wake still wakes an idle recipient. A muted
     // source was downgraded to `Passive` and rides along on the recipient's next
-    // run. `nudge_job_for_urgency` is the shared resume ladder: an idle recipient
-    // resumes and drains the push; an `interrupt` on an active recipient stops the
-    // turn so the turn-end flush delivers it; a non-interrupt active recipient is
-    // left for the event-boundary push drain; a self-suspended recipient is not
-    // resumed (the resume gate is `!self_suspended`-gated) and the direct rides
-    // along when its own work resolves.
-    if effective_wake.wakes_idle() {
-        if let Err(e) = delivery::nudge_job_for_urgency(orch, &job_id, urgency) {
+    // run. `nudge_for_direct_message` is the shared resume ladder: an idle
+    // recipient resumes and drains the push; an `interrupt` on an active
+    // recipient stops the turn so the turn-end flush delivers it; a non-interrupt
+    // active recipient is left for the event-boundary push drain; an `interrupt`
+    // to a recipient parked only on `waitFor` ends that wait; any other
+    // self-suspended recipient is held and the direct rides along when its own
+    // work resolves. The message row and push are durable either way, so the
+    // send succeeds and the reply says which of these happened.
+    let wake = effective_wake.wakes_idle().then(|| {
+        let message = delivery::DirectMessageRef {
+            from: sender_uri.unwrap_or_else(|| sender_name.clone()),
+            message_id: msg.id.clone(),
+        };
+        let outcome = delivery::nudge_for_direct_message(orch, &job_id, urgency, &message);
+        if let Err(e) = &outcome {
             log::warn!("direct message wake for {} failed: {}", recipient_label, e);
         }
-    }
+        outcome
+    });
 
-    Ok(format!("Sent direct message to {}", recipient_label))
+    Ok(direct_message_reply(&recipient_label, wake))
+}
+
+/// What the sender of a direct message is told: that it was sent, and what the
+/// recipient does with it now. `wake` is `None` when the recipient muted the
+/// sender, so nothing was woken.
+fn direct_message_reply(
+    recipient_label: &str,
+    wake: Option<Result<delivery::NudgeOutcome, String>>,
+) -> String {
+    use delivery::NudgeOutcome;
+    let what = match wake {
+        None => "The recipient muted you; it will read this on its next turn.".to_string(),
+        Some(Err(error)) => format!("The wake failed: {error}; the message stays queued."),
+        Some(Ok(NudgeOutcome::NotWaking)) => {
+            "It was sent passively and wakes nothing; the recipient will read it on its next turn."
+                .to_string()
+        }
+        Some(Ok(NudgeOutcome::Refused(refusal))) => format!(
+            "It cannot take a turn: {}; the message stays queued.",
+            refusal.describe()
+        ),
+        Some(Ok(NudgeOutcome::DeliveredToLiveTurn)) => {
+            "It is mid-turn and will read it at its next tool call.".to_string()
+        }
+        Some(Ok(NudgeOutcome::Interrupted)) => {
+            "Its turn was interrupted and it is resuming with your message.".to_string()
+        }
+        Some(Ok(NudgeOutcome::Resumed)) => "It started a turn.".to_string(),
+        Some(Ok(NudgeOutcome::SupersededWait { labels })) => format!(
+            "Its wait ({}) was ended early and it is resuming with your message.",
+            labels.join(", ")
+        ),
+        Some(Ok(NudgeOutcome::Held(hold))) => {
+            format!("It has not started a turn: {}.", hold.render())
+        }
+        Some(Ok(NudgeOutcome::Declined(reason))) => {
+            format!("It was not woken: {reason}; the message stays queued.")
+        }
+    };
+    format!("Sent direct message to {recipient_label}. {what}")
 }
 
 // ============================================================================
@@ -731,3 +784,56 @@ pub struct MessagePayload {
 // ============================================================================
 // Handler
 // ============================================================================
+
+#[cfg(test)]
+mod reply_tests {
+    use super::direct_message_reply;
+    use crate::messages::delivery::{DeliveryRefusal, Hold, NudgeOutcome};
+
+    fn reply(wake: Option<Result<NudgeOutcome, String>>) -> String {
+        direct_message_reply("builder", wake)
+    }
+
+    /// The sender always learns what the recipient does with the message, and
+    /// the established prefix stays first so existing readers keep matching.
+    #[test]
+    fn every_outcome_tells_the_sender_what_happened() {
+        let cases = [
+            (Some(Ok(NudgeOutcome::Resumed)), "It started a turn."),
+            (
+                Some(Ok(NudgeOutcome::DeliveredToLiveTurn)),
+                "will read it at its next tool call",
+            ),
+            (
+                Some(Ok(NudgeOutcome::SupersededWait {
+                    labels: vec!["waitFor: checks verdict rust-tests".into()],
+                })),
+                "Its wait (waitFor: checks verdict rust-tests) was ended early and it is resuming with your message.",
+            ),
+            (
+                Some(Ok(NudgeOutcome::Held(Hold::Wait {
+                    labels: vec!["waitFor: duration".into()],
+                    supersedable: true,
+                }))),
+                "It has not started a turn: it is parked on its own `waitFor: duration`",
+            ),
+            (
+                Some(Ok(NudgeOutcome::Refused(DeliveryRefusal::Cancelled))),
+                "It cannot take a turn: it is cancelled",
+            ),
+            (
+                Some(Err("the active turn has not attached to a stoppable run yet".into())),
+                "The wake failed: the active turn has not attached to a stoppable run yet; the message stays queued.",
+            ),
+            (None, "The recipient muted you"),
+        ];
+        for (wake, expected) in cases {
+            let said = reply(wake);
+            assert!(
+                said.starts_with("Sent direct message to builder. "),
+                "{said}"
+            );
+            assert!(said.contains(expected), "{said}");
+        }
+    }
+}
