@@ -1741,9 +1741,8 @@ async fn model_role_economics_costs_match_the_shared_rule() {
     for row in &rows {
         let expected = crate::cost::exact_or_priced(
             row.model.as_deref(),
-            &row.usage,
+            &row.unmetered_usage,
             row.exact_cost,
-            row.exact_cost_count,
         );
         let key = row.model.clone().unwrap_or_else(|| "unknown".to_string());
         let actual = econ(&out.by_model, &key).cost_usd;
@@ -1806,6 +1805,291 @@ async fn effective_cost_buckets_by_calendar_month_and_flags_provisional() {
     assert!(!point(&points, FEB_2025, "claude").provisional);
     assert!(point(&points, now_month, "claude").provisional);
     assert_ne!(JAN_2025, FEB_2025);
+}
+
+#[tokio::test]
+async fn row_grain_cost_keeps_unmetered_rows_in_a_metered_group() {
+    let db = cost_db().await;
+    seed_run(&db, "exact", "openrouter", "sonnet").await;
+    seed_run(&db, "list", "openrouter", "sonnet").await;
+    add_event(
+        &db,
+        "exact",
+        "exact",
+        "assistant",
+        JAN_2025 + 10,
+        1000,
+        100,
+        Some(0.42),
+    )
+    .await;
+    add_event(
+        &db,
+        "list",
+        "list",
+        "assistant",
+        JAN_2025 + 20,
+        2000,
+        200,
+        None,
+    )
+    .await;
+
+    let usage = pricing::TieredUsage {
+        all: pricing::Components {
+            input: 2000,
+            output: 200,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let expected = 0.42 + pricing::cost_usd(Some("sonnet"), &usage);
+    for bucket in [Bucket::Hour, Bucket::Day, Bucket::Week, Bucket::Month] {
+        let points = cost_timeseries(&db, &Scope::default(), &TimeRange::default(), bucket)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert!(
+            (points[0].cost_usd - expected).abs() < 1e-12,
+            "{bucket:?}: got {}, expected {expected}",
+            points[0].cost_usd
+        );
+        assert_eq!(points[0].billable_tokens, 3300);
+    }
+    assert_row_grain_cost_views(&db, expected, 3300).await;
+}
+
+/// Both token events precede their settlement in the same hourly row; a count
+/// of one metered event does not mean only one token event has been paid for.
+/// Another hour on the same job remains independently list-priced.
+#[tokio::test]
+async fn row_grain_cost_partial_and_zero_metering_stays_exact_only() {
+    for exact in [0.0, 0.42] {
+        let db = cost_db().await;
+        seed_run(&db, "partial", "openrouter", "haiku").await;
+        add_event(
+            &db,
+            "p1",
+            "partial",
+            "assistant",
+            JAN_2025 + 10,
+            1000,
+            100,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "p2",
+            "partial",
+            "assistant",
+            JAN_2025 + 20,
+            2000,
+            200,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "settle",
+            "partial",
+            "result:success",
+            JAN_2025 + 30,
+            0,
+            0,
+            Some(exact),
+        )
+        .await;
+        // One long-prompt request with disjoint cached input and cache writes.
+        ins_ev(
+            &db,
+            "next",
+            "run-partial",
+            "sess-partial",
+            3,
+            "assistant",
+            JAN_2025 + 3610,
+            80_000,
+            40_000,
+            10_000,
+            1_000,
+            0,
+            None,
+        )
+        .await;
+        queries::fold_token_rollup(&db).await.unwrap();
+
+        let counts = db.query_all(
+            "SELECT token_event_count, exact_cost_count FROM token_rollup ORDER BY bucket_start",
+            (), |row| Ok((row.i64(0)?, row.i64(1)?))
+        ).await.unwrap();
+        assert_eq!(counts, vec![(2, 1), (1, 0)]);
+        let usage = pricing::Components {
+            input: 80_000,
+            cache_read: 40_000,
+            cache_create: 10_000,
+            output: 1_000,
+        };
+        let list = pricing::cost_usd(
+            Some("haiku"),
+            &pricing::TieredUsage {
+                all: usage,
+                long_prompt: usage,
+            },
+        );
+        let points = cost_timeseries(&db, &Scope::default(), &TimeRange::default(), Bucket::Hour)
+            .await
+            .unwrap();
+        assert_eq!(points.len(), 2);
+        assert!((points[0].cost_usd - exact).abs() < 1e-12);
+        assert!((points[1].cost_usd - list).abs() < 1e-12);
+        assert_row_grain_cost_views(&db, exact + list, 134_300).await;
+    }
+}
+
+#[tokio::test]
+async fn row_grain_cost_oracle_matches_nullable_dimensions() {
+    let db = cost_db().await;
+    seed_run(&db, "metered", "claude", "sonnet").await;
+    seed_run(&db, "unmetered", "claude", "sonnet").await;
+    db.execute_script(format!(
+        "UPDATE jobs SET model = NULL, agent_config_id = NULL;
+         INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type,
+             data, created_at, input_tokens, cost_usd)
+         VALUES ('m', 'run-metered', NULL, 0, {JAN_2025}, 'assistant', '{{}}', {JAN_2025}, 1000, 0.0),
+                ('u', 'run-unmetered', NULL, 0, {JAN_2025}, 'assistant', '{{}}', {JAN_2025}, 2000, NULL)"
+    )).await.unwrap();
+    queries::fold_token_rollup(&db).await.unwrap();
+    let scope = Scope::default();
+    let range = TimeRange::default();
+    for bucket in [Bucket::Hour, Bucket::Day, Bucket::Month] {
+        let rows = queries::cost_components(&db, &scope, &range, bucket)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, None);
+        assert_eq!(rows[0].usage.all.input, 3000);
+        assert_eq!(rows[0].unmetered_usage.all.input, 2000);
+        assert_eq!(rows[0].exact_cost_count, 1);
+        assert_cost_components_eq(
+            rows,
+            queries::cost_components_live(&db, &scope, &range, bucket)
+                .await
+                .unwrap(),
+            "nullable row dimensions",
+        );
+    }
+}
+
+/// These fixtures make every job ship a PR, so delivery views should reconcile
+/// too. Production delivery filters and denominators remain their own.
+async fn assert_row_grain_cost_views(db: &LocalDb, expected: f64, tokens: i64) {
+    db.execute_script(format!(
+        "INSERT INTO merge_requests(id, job_id, project_id, title, source_branch,
+             target_branch, status, opened_at, updated_at, merged_at, additions, deletions)
+         SELECT 'mr-' || id, id, project_id, 'PR', id, 'main', 'merged',
+             {JAN_2025}, {JAN_2025}, {JAN_2025}, 10, 2 FROM jobs"
+    ))
+    .await
+    .unwrap();
+    let close = |actual: f64, label: &str| {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "{label}: got {actual}, expected {expected}"
+        );
+    };
+    for scope in [Scope::default(), Scope::new(Some("proj".into()))] {
+        let range = TimeRange::default();
+        for bucket in [Bucket::Hour, Bucket::Day, Bucket::Week, Bucket::Month] {
+            let card = cost_timeseries(db, &scope, &range, bucket).await.unwrap();
+            close(card.iter().map(|r| r.cost_usd).sum(), "card");
+            assert_eq!(card.iter().map(|r| r.billable_tokens).sum::<i64>(), tokens);
+            let backends = cost_by_backend_timeseries(db, &scope, &range, bucket)
+                .await
+                .unwrap();
+            close(backends.iter().map(|r| r.cost_usd).sum(), "backend");
+            let models = tokens_by_model_timeseries(db, &scope, &range, bucket)
+                .await
+                .unwrap();
+            close(models.iter().map(|r| r.cost_usd).sum(), "model chart");
+            let spend = spend_by_thread(db, &scope, &range, bucket).await.unwrap();
+            close(spend.total_cost_usd, "spend");
+            assert_eq!(spend.billable_tokens, tokens);
+            let effective = effective_cost(db, &scope, &range, bucket).await.unwrap();
+            close(
+                effective.iter().map(|r| r.effective_cost).sum(),
+                "effective",
+            );
+            let trend = merged_pr_cost_trend(db, &scope, &range, bucket)
+                .await
+                .unwrap();
+            close(trend.iter().map(|r| r.cost_usd).sum(), "delivery trend");
+            assert_cost_components_eq(
+                queries::cost_components(db, &scope, &range, bucket)
+                    .await
+                    .unwrap(),
+                queries::cost_components_live(db, &scope, &range, bucket)
+                    .await
+                    .unwrap(),
+                "row-grain",
+            );
+        }
+        let projects = cost_by_project(db, &scope, &range).await.unwrap();
+        close(projects.iter().map(|r| r.cost_usd).sum(), "project");
+        let provider = provider_model_costs(db, "openrouter", &scope, &range)
+            .await
+            .unwrap();
+        close(provider.iter().map(|r| r.cost_usd).sum(), "provider");
+        assert_eq!(
+            provider.iter().map(|r| r.billable_tokens).sum::<i64>(),
+            tokens
+        );
+        let econ = model_role_economics(db, &scope, &range).await.unwrap();
+        close(
+            econ.by_model.iter().map(|r| r.cost_usd).sum(),
+            "economics model",
+        );
+        close(
+            econ.by_role.iter().map(|r| r.cost_usd).sum(),
+            "economics role",
+        );
+        let loc = tokens_per_loc(db, &scope, &range).await.unwrap();
+        close(loc.iter().map(|r| r.cost_usd).sum(), "LOC");
+        let delivery = merged_pr_economics(db, &scope, &range).await.unwrap();
+        close(
+            delivery.by_model.iter().map(|r| r.cost_usd).sum(),
+            "delivery model",
+        );
+        close(
+            delivery.by_role.iter().map(|r| r.cost_usd).sum(),
+            "delivery role",
+        );
+        assert_provider_eq(
+            queries::provider_model_components(db, "openrouter", &scope, &range)
+                .await
+                .unwrap(),
+            queries::provider_model_components_live(db, "openrouter", &scope, &range)
+                .await
+                .unwrap(),
+            "row-grain",
+        );
+        assert_granular_eq(
+            queries::economics_granular(db, &scope, &range)
+                .await
+                .unwrap(),
+            queries::economics_granular_live(db, &scope, &range)
+                .await
+                .unwrap(),
+            "row-grain",
+        );
+        assert_loc_eq(
+            queries::tokens_per_loc(db, &scope, &range).await.unwrap(),
+            queries::tokens_per_loc_live(db, &scope, &range)
+                .await
+                .unwrap(),
+            "row-grain",
+        );
+    }
 }
 
 #[tokio::test]
@@ -2279,6 +2563,7 @@ fn assert_cost_components_eq(
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.backend, b.backend, "{ctx}");
         assert_eq!(a.usage, b.usage, "{ctx}");
+        assert_eq!(a.unmetered_usage, b.unmetered_usage, "{ctx} unmetered");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
         assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
@@ -2328,6 +2613,7 @@ fn assert_provider_eq(
     for (a, b) in r.iter().zip(l.iter()) {
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.usage, b.usage, "{ctx}");
+        assert_eq!(a.unmetered_usage, b.unmetered_usage, "{ctx} unmetered");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert_eq!(a.runs, b.runs, "{ctx}");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
@@ -2362,6 +2648,7 @@ fn assert_granular_eq(
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.agent_config_id, b.agent_config_id, "{ctx}");
         assert_eq!(a.usage, b.usage, "{ctx}");
+        assert_eq!(a.unmetered_usage, b.unmetered_usage, "{ctx} unmetered");
         assert_eq!(a.thinking, b.thinking, "{ctx}");
         assert_eq!(a.billable, b.billable, "{ctx}");
         assert_eq!(a.runs, b.runs, "{ctx}");
@@ -2401,6 +2688,7 @@ fn assert_loc_eq(rollup: Vec<queries::LocRow>, live: Vec<queries::LocRow>, ctx: 
         assert_eq!(a.model, b.model, "{ctx}");
         assert_eq!(a.node_name, b.node_name, "{ctx}");
         assert_eq!(a.usage, b.usage, "{ctx}");
+        assert_eq!(a.unmetered_usage, b.unmetered_usage, "{ctx} unmetered");
         assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
         assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
     }
@@ -3835,11 +4123,19 @@ async fn spend_by_thread_nests_issues_under_their_threads() {
     let child = spend_child(models, "cairn://p/PRJ/1");
     assert_eq!(child.label, "#1 Child");
     assert_eq!(child.number, Some(1));
-    // #1's only spend sits in the metered hour, so the group's exact cost
-    // leaves it at $0 with its tokens still counted.
+    // #1 is unmetered, so its own list price survives the neighboring
+    // one-shot's exact cost in the same hour.
     let child_own = spend_child(child, "cairn://p/PRJ/1#own");
     assert_eq!(child_own.label, "this issue's runs");
-    assert_eq!(child_own.cost_usd, 0.0);
+    let usage = pricing::TieredUsage {
+        all: pricing::Components {
+            input: 40_000,
+            output: 2_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!((child_own.cost_usd - pricing::cost_usd(Some("sonnet"), &usage)).abs() < 1e-12);
     assert_eq!(child_own.billable_tokens, 42_000);
     // The grandchild carries its builder plus the stale task that walked
     // parent_job_id up to it.

@@ -147,6 +147,21 @@ fn usage_select(item: impl Fn(&str, &str) -> String) -> String {
         .join(",\n                   ")
 }
 
+/// List-price eligibility is decided before grouping: a metered hourly rollup
+/// row contributes no usage to this subset, even when only partly metered.
+fn unmetered_usage_select(source: &str) -> String {
+    usage_select(|column, alias| {
+        format!(
+            "SUM(CASE WHEN {source}.exact_cost_count = 0 \
+             THEN {source}.{column} ELSE 0 END) AS unmetered_{alias}"
+        )
+    })
+}
+
+fn unmetered_usage_columns(source: &str) -> String {
+    usage_select(|_, alias| format!("{source}.unmetered_{alias}"))
+}
+
 /// Read the [`USAGE_MEASURES`] columns, in order, starting at index `at`.
 fn usage_at(row: &impl RowExt, at: usize) -> DbResult<TieredUsage> {
     let col = |i: usize| row.i64(at + i);
@@ -605,6 +620,21 @@ pub(crate) const TOOL_RESULT_UPDATE_SQL: &str =
 fn token_events_cte() -> String {
     format!(
         "\
+metered_rows AS (
+    SELECT e.run_id, e.session_id,
+           (e.created_at / 3600) * 3600 AS hour_start,
+           {model_key} AS model,
+           LOWER(COALESCE(s.backend, 'claude')) AS backend,
+           j.agent_config_id,
+           COUNT(e.cost_usd) AS exact_cost_count
+    FROM events e
+    LEFT JOIN runs r ON r.id = e.run_id
+    LEFT JOIN sessions s ON s.id = e.session_id
+    LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+    WHERE e.cost_usd IS NOT NULL
+    GROUP BY e.run_id, e.session_id, (e.created_at / 3600) * 3600,
+             {model_key}, LOWER(COALESCE(s.backend, 'claude')), j.agent_config_id
+),
 token_events AS (
     SELECT
         e.run_id AS run_id,
@@ -629,11 +659,19 @@ token_events AS (
             AS long_cache_read_tokens,
         CASE WHEN {long} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END
             AS long_cache_create_tokens,
-        CASE WHEN {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END AS long_output_tokens
+        CASE WHEN {long} THEN COALESCE(e.output_tokens, 0) ELSE 0 END AS long_output_tokens,
+        COALESCE(metered.exact_cost_count, 0) AS exact_cost_count
     FROM events e
     LEFT JOIN runs r ON r.id = e.run_id
     LEFT JOIN sessions s ON s.id = e.session_id
     LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+    LEFT JOIN metered_rows metered
+      ON metered.run_id = e.run_id
+     AND metered.session_id IS e.session_id
+     AND metered.hour_start = (e.created_at / 3600) * 3600
+     AND metered.model IS ({model_key})
+     AND metered.backend = LOWER(COALESCE(s.backend, 'claude'))
+     AND metered.agent_config_id IS j.agent_config_id
     WHERE e.parent_tool_use_id IS NULL
       AND (
             (LOWER(COALESCE(s.backend, 'claude')) = 'codex'
@@ -755,10 +793,13 @@ pub(crate) struct LocRow {
     pub lines: i64,
     pub model: Option<String>,
     pub node_name: Option<String>,
+    #[cfg(test)]
     pub usage: TieredUsage,
+    pub unmetered_usage: TieredUsage,
     /// Sum of real `events.cost_usd` for this job (0 when none reported).
     pub exact_cost: f64,
     /// Count of this job's events that carried a real `cost_usd`.
+    #[cfg(test)]
     pub exact_cost_count: i64,
 }
 
@@ -770,9 +811,12 @@ fn loc_row(row: &impl RowExt) -> DbResult<LocRow> {
         lines: row.i64(3)?,
         model: row.opt_text(4)?,
         node_name: row.opt_text(5)?,
+        #[cfg(test)]
         usage: usage_at(row, 6)?,
         exact_cost: row.opt_f64(14)?.unwrap_or(0.0),
+        #[cfg(test)]
         exact_cost_count: row.i64(15)?,
+        unmetered_usage: usage_at(row, 16)?,
     })
 }
 
@@ -794,6 +838,7 @@ pub(crate) async fn tokens_per_loc(
             SELECT tr.job_id AS job_id,
                    SUM(tr.billable_tokens) AS billable,
                    {usage},
+                   {unmetered_usage},
                    MAX(tr.model) AS model,
                    MAX(tr.node_name) AS node_name
             FROM token_rollup tr
@@ -827,7 +872,8 @@ pub(crate) async fn tokens_per_loc(
                jt.node_name,
                {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
-               COALESCE(jc.exact_cost_count, 0)
+               COALESCE(jc.exact_cost_count, 0),
+               {unmetered_usage_cols}
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
@@ -841,7 +887,9 @@ pub(crate) async fn tokens_per_loc(
           AND (?3 IS NULL OR mr.opened_at < ?3)
         ORDER BY mr.opened_at",
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("jt.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("jt"),
     );
     db.query_all(sql, scope_range_params(scope, range), loc_row)
         .await
@@ -870,6 +918,7 @@ pub(crate) async fn tokens_per_loc_live(
             SELECT te.job_id AS job_id,
                    SUM(te.billable_tokens) AS billable,
                    {usage},
+                   {unmetered_usage},
                    MAX(te.model) AS model,
                    MAX(te.node_name) AS node_name
             FROM token_events te
@@ -895,7 +944,8 @@ pub(crate) async fn tokens_per_loc_live(
                jt.node_name,
                {usage_cols},
                COALESCE(jc.exact_cost, 0.0),
-               COALESCE(jc.exact_cost_count, 0)
+               COALESCE(jc.exact_cost_count, 0),
+               {unmetered_usage_cols}
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
@@ -910,7 +960,9 @@ pub(crate) async fn tokens_per_loc_live(
         ORDER BY mr.opened_at",
         cte = token_events_cte(),
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("te"),
         usage_cols = usage_select(|_, alias| format!("jt.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("jt"),
     );
     db.query_all(sql, scope_range_params(scope, range), loc_row)
         .await
@@ -929,9 +981,11 @@ pub(crate) struct CostComponentRow {
     pub backend: String,
     pub usage: TieredUsage,
     pub billable: i64,
+    pub unmetered_usage: TieredUsage,
     /// Sum of real `events.cost_usd` for this group (0 when none reported).
     pub exact_cost: f64,
-    /// Count of events in this group that carried a real `cost_usd`.
+    /// Count retained for the event-scan parity oracle.
+    #[cfg(test)]
     pub exact_cost_count: i64,
 }
 
@@ -943,7 +997,9 @@ fn cost_component_row(row: &impl RowExt) -> DbResult<CostComponentRow> {
         usage: usage_at(row, 3)?,
         billable: row.i64(11)?,
         exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
+        #[cfg(test)]
         exact_cost_count: row.i64(13)?,
+        unmetered_usage: usage_at(row, 14)?,
     })
 }
 
@@ -960,6 +1016,7 @@ pub(crate) async fn cost_components(
                    tr.model AS model,
                    tr.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND {filter}
@@ -981,7 +1038,8 @@ pub(crate) async fn cost_components(
                {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               COALESCE(cost.exact_count, 0),
+               {unmetered_cols}
         FROM tok
         LEFT JOIN cost
             ON cost.bucket_start = tok.bucket_start
@@ -992,6 +1050,8 @@ pub(crate) async fn cost_components(
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
+        unmetered_cols = unmetered_usage_columns("tok"),
     );
     db.query_all(
         sql,
@@ -1014,13 +1074,12 @@ pub(crate) struct JobCostComponentRow {
     pub model: Option<String>,
     pub backend: String,
     pub job_id: Option<String>,
-    pub usage: TieredUsage,
+    pub unmetered_usage: TieredUsage,
     pub billable: i64,
     /// Rollup rows of this job in the group that carried billable tokens; a
     /// group with none across all its jobs is dropped, as the card drops it.
     pub token_rows: i64,
     pub exact_cost: f64,
-    pub exact_cost_count: i64,
 }
 
 pub(crate) async fn cost_components_by_job(
@@ -1038,16 +1097,13 @@ pub(crate) async fn cost_components_by_job(
                 {usage},
                 SUM(CASE WHEN tr.token_event_count > 0 THEN tr.billable_tokens ELSE 0 END),
                 SUM(CASE WHEN tr.token_event_count > 0 THEN 1 ELSE 0 END),
-                SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost ELSE 0.0 END),
-                SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost_count ELSE 0 END)
+                SUM(CASE WHEN tr.exact_cost_count > 0 THEN tr.exact_cost ELSE 0.0 END)
          FROM token_rollup tr
          WHERE (tr.token_event_count > 0 OR tr.exact_cost_count > 0) AND {filter}
          GROUP BY {bucket_expr}, tr.model, tr.backend, tr.job_id
          ORDER BY 1",
         filter = ROLLUP_SCOPE_RANGE,
-        usage = usage_select(|column, alias| format!(
-            "SUM(CASE WHEN tr.token_event_count > 0 THEN tr.{column} ELSE 0 END) AS {alias}"
-        )),
+        usage = unmetered_usage_select("tr"),
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(JobCostComponentRow {
@@ -1055,11 +1111,10 @@ pub(crate) async fn cost_components_by_job(
             model: row.opt_text(1)?,
             backend: row.text(2)?,
             job_id: row.opt_text(3)?,
-            usage: usage_at(row, 4)?,
+            unmetered_usage: usage_at(row, 4)?,
             billable: row.i64(12)?,
             token_rows: row.i64(13)?,
             exact_cost: row.opt_f64(14)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(15)?,
         })
     })
     .await
@@ -1096,6 +1151,7 @@ pub(crate) async fn cost_components_live(
                    te.model AS model,
                    te.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(te.billable_tokens) AS billable
             FROM token_events te
             WHERE {filter}
@@ -1117,7 +1173,8 @@ pub(crate) async fn cost_components_live(
                {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               COALESCE(cost.exact_count, 0),
+               {unmetered_cols}
         FROM tok
         LEFT JOIN cost
             ON cost.bucket_start = tok.bucket_start
@@ -1130,6 +1187,8 @@ pub(crate) async fn cost_components_live(
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage = unmetered_usage_select("te"),
+        unmetered_cols = unmetered_usage_columns("tok"),
     );
     db.query_all(
         sql,
@@ -1146,23 +1205,29 @@ pub(crate) async fn cost_components_live(
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderModelComponentRow {
     pub model: Option<String>,
+    #[cfg(test)]
     pub usage: TieredUsage,
+    pub unmetered_usage: TieredUsage,
     pub billable: i64,
     pub runs: i64,
     /// Sum of real `events.cost_usd` for this model (0 when none reported).
     pub exact_cost: f64,
     /// Count of events for this model that carried a real `cost_usd`.
+    #[cfg(test)]
     pub exact_cost_count: i64,
 }
 
 fn provider_model_row(row: &impl RowExt) -> DbResult<ProviderModelComponentRow> {
     Ok(ProviderModelComponentRow {
         model: row.opt_text(0)?,
+        #[cfg(test)]
         usage: usage_at(row, 1)?,
         billable: row.i64(9)?,
         runs: row.i64(10)?,
         exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
+        #[cfg(test)]
         exact_cost_count: row.i64(12)?,
+        unmetered_usage: usage_at(row, 13)?,
     })
 }
 
@@ -1182,6 +1247,7 @@ pub(crate) async fn provider_model_components(
             SELECT tr.model AS model,
                    tr.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(tr.billable_tokens) AS billable,
                    COUNT(DISTINCT tr.run_id) AS runs
             FROM token_rollup tr
@@ -1202,7 +1268,8 @@ pub(crate) async fn provider_model_components(
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               COALESCE(cost.exact_count, 0),
+               {unmetered_usage_cols}
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -1210,7 +1277,9 @@ pub(crate) async fn provider_model_components(
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
     let mut params = scope_range_params_doubled(scope, range);
     params.push(Value::Text(backend.to_string()));
@@ -1243,6 +1312,7 @@ pub(crate) async fn provider_model_components_live(
             SELECT te.model AS model,
                    te.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(te.billable_tokens) AS billable,
                    COUNT(DISTINCT te.run_id) AS runs
             FROM token_events te
@@ -1263,7 +1333,8 @@ pub(crate) async fn provider_model_components_live(
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               COALESCE(cost.exact_count, 0),
+               {unmetered_usage_cols}
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -1273,7 +1344,9 @@ pub(crate) async fn provider_model_components_live(
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("te"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
     let mut params = scope_range_params_doubled(scope, range);
     params.push(Value::Text(backend.to_string()));
@@ -1288,6 +1361,7 @@ pub(crate) struct GranularRow {
     pub model: Option<String>,
     pub agent_config_id: Option<String>,
     pub usage: TieredUsage,
+    pub unmetered_usage: TieredUsage,
     pub thinking: i64,
     pub billable: i64,
     pub runs: i64,
@@ -1296,6 +1370,7 @@ pub(crate) struct GranularRow {
     /// tokens, independent of per-row time co-location. 0 when none reported.
     pub exact_cost: f64,
     /// Count of events contributing to `exact_cost`.
+    #[cfg(test)]
     pub exact_cost_count: i64,
 }
 
@@ -1308,7 +1383,9 @@ fn granular_row(row: &impl RowExt) -> DbResult<GranularRow> {
         billable: row.i64(11)?,
         runs: row.i64(12)?,
         exact_cost: row.opt_f64(13)?.unwrap_or(0.0),
+        #[cfg(test)]
         exact_cost_count: row.i64(14)?,
+        unmetered_usage: usage_at(row, 15)?,
     })
 }
 
@@ -1317,21 +1394,17 @@ pub(crate) async fn economics_granular(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<GranularRow>> {
-    // Cost attribution is grain-invariant by construction: the `tok` CTE keeps
-    // only groups that HAVE billable tokens; the `cost` CTE sums each group's
-    // metered `exact_cost` INDEPENDENTLY of time co-location (no
-    // `token_event_count` gate); the LEFT JOIN gives each billable group ALL its
-    // metered cost. So a settlement event that lands in a different hour than
-    // its turn's billable tokens still attributes its cost -- and SUM(exact_cost)
-    // over hour rows equals the same sum over day rows, so the re-grain can never
-    // move economics cost. This mirrors `cost_by_project`, unifying cost
-    // attribution into one pattern across the module.
+    // Exact costs are accumulated independently of token co-location, so a
+    // settlement in another hour still contributes to its token-bearing group.
+    // List pricing applies only to token rows whose original hourly rollup row
+    // has no exact cost, before aggregation across model, role, and backend.
     let sql = format!(
         "WITH tok AS (
             SELECT tr.model AS model,
                    tr.agent_config_id AS agent_config_id,
                    tr.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(tr.thinking_tokens) AS thinking,
                    SUM(tr.billable_tokens) AS billable,
                    COUNT(DISTINCT tr.run_id) AS runs
@@ -1356,7 +1429,8 @@ pub(crate) async fn economics_granular(
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               COALESCE(cost.exact_count, 0),
+               {unmetered_usage_cols}
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -1365,7 +1439,9 @@ pub(crate) async fn economics_granular(
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
     db.query_all(sql, scope_range_params_doubled(scope, range), granular_row)
         .await
@@ -1373,13 +1449,10 @@ pub(crate) async fn economics_granular(
 
 /// Event-scan oracle for [`economics_granular`].
 ///
-/// Both sides attribute cost by the SAME independent rule: sum every metered
-/// event's `cost_usd` per `(model, agent_config_id, backend)` group, then keep
-/// only groups that also carry billable tokens (the `FROM tok LEFT JOIN cost`
-/// shape). There is no time co-location gate, so the attribution is invariant to
-/// the rollup's hour-vs-day grain -- which is exactly why the rollup-vs-oracle
-/// equality test cannot itself guard the co-location behavior (a dedicated
-/// cross-hour economics test does).
+/// Both sides sum exact costs independently per token-bearing
+/// `(model, agent_config_id, backend)` group. The token-event CTE also preserves
+/// each original hourly row's exact-cost coverage, so list-price eligibility
+/// matches the rollup before aggregation.
 #[cfg(test)]
 pub(crate) async fn economics_granular_live(
     db: &LocalDb,
@@ -1416,6 +1489,7 @@ pub(crate) async fn economics_granular_live(
                    te.agent_config_id AS agent_config_id,
                    te.backend AS backend,
                    {usage},
+                   {unmetered_usage},
                    SUM(te.thinking_tokens) AS thinking,
                    SUM(te.billable_tokens) AS billable,
                    COUNT(DISTINCT te.run_id) AS runs
@@ -1430,7 +1504,8 @@ pub(crate) async fn economics_granular_live(
                tok.billable,
                tok.runs,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_cost_count, 0)
+               COALESCE(cost.exact_cost_count, 0),
+               {unmetered_usage_cols}
         FROM tok
         LEFT JOIN cost
             ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
@@ -1441,7 +1516,9 @@ pub(crate) async fn economics_granular_live(
         filter = SCOPE_RANGE,
         cost_filter = COST_SCOPE_RANGE,
         usage = usage_select(|column, alias| format!("SUM(te.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("te"),
         usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
     db.query_all(sql, scope_range_params_doubled(scope, range), granular_row)
         .await
@@ -2211,7 +2288,7 @@ pub(crate) async fn token_components_live(
 
 /// Per (project, model, backend) token components and real metered cost, with
 /// the project's display name joined. Folded to per-project totals in the parent
-/// module via the canonical exact-cost-preferred rule. The settlement cost lands
+/// module by adding exact costs to list-priced unmetered usage. Settlement cost lands
 /// on a non-billable event in the same (project, model, backend) group, so it is
 /// joined here exactly as [`cost_components`] does for its time buckets.
 #[derive(Debug, Clone)]
@@ -2219,10 +2296,9 @@ pub(crate) struct ProjectCostComponentRow {
     pub project_id: String,
     pub project_name: String,
     pub model: Option<String>,
-    pub usage: TieredUsage,
+    pub unmetered_usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
-    pub exact_cost_count: i64,
 }
 
 pub(crate) async fn cost_by_project(
@@ -2235,7 +2311,7 @@ pub(crate) async fn cost_by_project(
             SELECT tr.project_id AS project_id,
                    tr.model AS model,
                    tr.backend AS backend,
-                   {usage},
+                   {unmetered_usage},
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND tr.project_id IS NOT NULL AND {filter}
@@ -2245,8 +2321,7 @@ pub(crate) async fn cost_by_project(
             SELECT tr.project_id AS project_id,
                    tr.model AS model,
                    tr.backend AS backend,
-                   SUM(tr.exact_cost) AS exact_cost,
-                   SUM(tr.exact_cost_count) AS exact_count
+                   SUM(tr.exact_cost) AS exact_cost
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND tr.project_id IS NOT NULL AND {cost_filter}
             GROUP BY tr.project_id, tr.model, tr.backend
@@ -2254,10 +2329,9 @@ pub(crate) async fn cost_by_project(
         SELECT tok.project_id,
                COALESCE(p.name, tok.project_id) AS project_name,
                tok.model,
-               {usage_cols},
                tok.billable,
                COALESCE(cost.exact_cost, 0.0),
-               COALESCE(cost.exact_count, 0)
+               {unmetered_usage_cols}
         FROM tok
         LEFT JOIN cost
             ON cost.project_id = tok.project_id
@@ -2267,18 +2341,17 @@ pub(crate) async fn cost_by_project(
         ORDER BY tok.project_id",
         filter = ROLLUP_SCOPE_RANGE,
         cost_filter = ROLLUP_COST_SCOPE_RANGE,
-        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
-        usage_cols = usage_select(|_, alias| format!("tok.{alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
+        unmetered_usage_cols = unmetered_usage_columns("tok"),
     );
     db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
         Ok(ProjectCostComponentRow {
             project_id: row.text(0)?,
             project_name: row.text(1)?,
             model: row.opt_text(2)?,
-            usage: usage_at(row, 3)?,
-            billable: row.i64(11)?,
-            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(13)?,
+            billable: row.i64(3)?,
+            exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
+            unmetered_usage: usage_at(row, 5)?,
         })
     })
     .await
@@ -2404,10 +2477,9 @@ fn merged_pr_ctes() -> String {
                MAX(tr.model) AS model,
                MAX(tr.agent_config_id) AS agent_config_id,
                MAX(tr.backend) AS backend,
-               {usage},
+               {unmetered_usage},
                SUM(tr.billable_tokens) AS billable,
-               SUM(tr.exact_cost) AS exact_cost,
-               SUM(tr.exact_cost_count) AS exact_cost_count
+               SUM(tr.exact_cost) AS exact_cost
         FROM token_rollup tr
         WHERE tr.job_id IS NOT NULL AND tr.token_event_count > 0
           AND (?1 IS NULL OR tr.project_id = ?1)
@@ -2417,13 +2489,13 @@ fn merged_pr_ctes() -> String {
         SELECT job_id, SUM(COALESCE(additions, 0) + COALESCE(deletions, 0)) AS lines
         FROM file_changes GROUP BY job_id
     )",
-        usage = usage_select(|column, alias| format!("SUM(tr.{column}) AS {alias}")),
+        unmetered_usage = unmetered_usage_select("tr"),
     )
 }
 
-/// The merged-PR queries' sum of each job's [`USAGE_MEASURES`] over a group.
-fn merged_pr_usage_sums() -> String {
-    usage_select(|_, alias| format!("SUM(jt.{alias})"))
+/// Sum each job's unmetered usage components over a merged-PR group.
+fn merged_pr_unmetered_usage_sums() -> String {
+    usage_select(|_, alias| format!("SUM(jt.unmetered_{alias})"))
 }
 
 /// Lines shipped for a merged PR: GitHub-synced `additions + deletions` when
@@ -2441,11 +2513,10 @@ pub(crate) struct MergedPrEconRow {
     pub model: Option<String>,
     pub agent_config_id: Option<String>,
     pub pr_count: i64,
-    pub usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
-    pub exact_cost_count: i64,
     pub lines: i64,
+    pub unmetered_usage: TieredUsage,
 }
 
 /// Merged-PR delivery economics grouped by (model, agent, backend). The parent
@@ -2461,10 +2532,10 @@ pub(crate) async fn merged_pr_economics_rows(
         "WITH {ctes}
         SELECT jt.model, jt.agent_config_id,
                COUNT(*) AS pr_count,
-               {usage},
                SUM(jt.billable),
-               SUM(jt.exact_cost), SUM(jt.exact_cost_count),
-               SUM({lines})
+               SUM(jt.exact_cost),
+               SUM({lines}),
+               {unmetered_usage}
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
             AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
@@ -2473,7 +2544,7 @@ pub(crate) async fn merged_pr_economics_rows(
           AND (?3 IS NULL OR mr.merged_at < ?3)
         GROUP BY jt.model, jt.agent_config_id, jt.backend",
         ctes = merged_pr_ctes(),
-        usage = merged_pr_usage_sums(),
+        unmetered_usage = merged_pr_unmetered_usage_sums(),
         lines = MERGED_PR_LINES_EXPR,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
@@ -2481,11 +2552,10 @@ pub(crate) async fn merged_pr_economics_rows(
             model: row.opt_text(0)?,
             agent_config_id: row.opt_text(1)?,
             pr_count: row.i64(2)?,
-            usage: usage_at(row, 3)?,
-            billable: row.i64(11)?,
-            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(13)?,
-            lines: row.opt_i64(14)?.unwrap_or(0),
+            billable: row.i64(3)?,
+            exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
+            lines: row.opt_i64(5)?.unwrap_or(0),
+            unmetered_usage: usage_at(row, 6)?,
         })
     })
     .await
@@ -2498,11 +2568,10 @@ pub(crate) struct PrCostTrendRow {
     pub bucket_start: i64,
     pub model: Option<String>,
     pub pr_count: i64,
-    pub usage: TieredUsage,
     pub billable: i64,
     pub exact_cost: f64,
-    pub exact_cost_count: i64,
     pub lines: i64,
+    pub unmetered_usage: TieredUsage,
 }
 
 /// Merged-PR delivery aggregates bucketed on `mr.merged_at`, split per (model,
@@ -2518,10 +2587,10 @@ pub(crate) async fn merged_pr_cost_trend_rows(
         "WITH {ctes}
         SELECT {bucket_expr} AS bucket_start, jt.model,
                COUNT(*) AS pr_count,
-               {usage},
                SUM(jt.billable),
-               SUM(jt.exact_cost), SUM(jt.exact_cost_count),
-               SUM({lines})
+               SUM(jt.exact_cost),
+               SUM({lines}),
+               {unmetered_usage}
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
             AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
@@ -2531,7 +2600,7 @@ pub(crate) async fn merged_pr_cost_trend_rows(
         GROUP BY bucket_start, jt.model, jt.backend
         ORDER BY bucket_start",
         ctes = merged_pr_ctes(),
-        usage = merged_pr_usage_sums(),
+        unmetered_usage = merged_pr_unmetered_usage_sums(),
         lines = MERGED_PR_LINES_EXPR,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
@@ -2539,11 +2608,10 @@ pub(crate) async fn merged_pr_cost_trend_rows(
             bucket_start: row.i64(0)?,
             model: row.opt_text(1)?,
             pr_count: row.i64(2)?,
-            usage: usage_at(row, 3)?,
-            billable: row.i64(11)?,
-            exact_cost: row.opt_f64(12)?.unwrap_or(0.0),
-            exact_cost_count: row.i64(13)?,
-            lines: row.opt_i64(14)?.unwrap_or(0),
+            billable: row.i64(3)?,
+            exact_cost: row.opt_f64(4)?.unwrap_or(0.0),
+            lines: row.opt_i64(5)?.unwrap_or(0),
+            unmetered_usage: usage_at(row, 6)?,
         })
     })
     .await

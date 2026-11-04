@@ -46,12 +46,7 @@ pub async fn tokens_per_loc(
             } else {
                 0.0
             };
-            let cost_usd = exact_or_priced(
-                r.model.as_deref(),
-                &r.usage,
-                r.exact_cost,
-                r.exact_cost_count,
-            );
+            let cost_usd = exact_or_priced(r.model.as_deref(), &r.unmetered_usage, r.exact_cost);
             TokensPerLocPoint {
                 job_id: r.job_id,
                 ts: r.ts,
@@ -104,12 +99,8 @@ pub async fn tokens_by_model_timeseries(
         entry.billable_tokens += row.billable;
         entry.input_tokens += row.usage.all.prompt();
         entry.output_tokens += row.usage.all.output;
-        entry.cost_usd += exact_or_priced(
-            row.model.as_deref(),
-            &row.usage,
-            row.exact_cost,
-            row.exact_cost_count,
-        );
+        entry.cost_usd +=
+            exact_or_priced(row.model.as_deref(), &row.unmetered_usage, row.exact_cost);
     }
     let mut points: Vec<ModelTokenPoint> = agg
         .into_values()

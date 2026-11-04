@@ -3,8 +3,8 @@
 //! issues, and the issues' children.
 //!
 //! The roots reconcile with the Cost card ([`crate::cost_timeseries`]) because
-//! both price the same `token_rollup` groups by the same rule; this module only
-//! splits each group's cost across the jobs inside it.
+//! both price the same `token_rollup` rows by the same rule before summing
+//! them at different grains.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +15,6 @@ use cairn_db::turso::{Row, Value};
 use super::attribution::{
     attribute, Attribution, IssueEdge, JobPlacement, OtherKind, ParentGraph, Root, ThreadInfo,
 };
-use super::pricing;
 use super::queries::{self, JobCostComponentRow};
 use super::types::{Bucket, ModelSpend, Scope, SpendByThread, SpendNode, SpendNodeKind, TimeRange};
 
@@ -23,43 +22,32 @@ use super::types::{Bucket, ModelSpend, Scope, SpendByThread, SpendNode, SpendNod
 /// matching the attribution walk's own cap.
 const MAX_LOAD_DEPTH: usize = 64;
 
-/// Price each job's row so the rows of a (bucket, model, backend) group sum to
-/// the group's card cost. The card's exact-or-priced switch is per group: when
-/// any job in the group metered a real cost, the group costs the exact sum, so
-/// each job costs its own exact sum (zero when it metered nothing); otherwise
-/// each job is list-priced, which sums to the group's list price because
-/// pricing is linear in the summed components. Groups with no billable-token
-/// row are dropped, as the card's `tok LEFT JOIN cost` drops them.
+/// Price each job's share using the same row-level rule as the card. The query
+/// has already separated unmetered usage before summing by job. Groups without
+/// any billable-token row are still dropped, as the card's token-side join does.
 pub(crate) fn price_job_rows(rows: Vec<JobCostComponentRow>) -> Vec<(JobCostComponentRow, f64)> {
-    type GroupKey = (i64, Option<String>, String);
-    let key = |row: &JobCostComponentRow| -> GroupKey {
-        (row.bucket_start, row.model.clone(), row.backend.clone())
-    };
-    let mut groups: HashMap<GroupKey, (bool, i64)> = HashMap::new();
-    for row in &rows {
-        let group = groups.entry(key(row)).or_default();
-        group.0 |= row.token_rows > 0;
-        group.1 += row.exact_cost_count;
-    }
+    let key =
+        |row: &JobCostComponentRow| (row.bucket_start, row.model.clone(), row.backend.clone());
+    let token_groups: HashSet<_> = rows
+        .iter()
+        .filter(|row| row.token_rows > 0)
+        .map(&key)
+        .collect();
     rows.into_iter()
-        .filter_map(|row| {
-            let (has_tokens, exact_count) = groups[&key(&row)];
-            if !has_tokens {
-                return None;
-            }
-            let cost = if exact_count > 0 {
-                row.exact_cost
-            } else {
-                pricing::cost_usd(row.model.as_deref(), &row.usage)
-            };
-            Some((row, cost))
+        .filter(|row| token_groups.contains(&key(row)))
+        .map(|row| {
+            let cost = super::cost::exact_or_priced(
+                row.model.as_deref(),
+                &row.unmetered_usage,
+                row.exact_cost,
+            );
+            (row, cost)
         })
         .collect()
 }
 
-/// Spend for `scope` and `range`, attributed to threads. `bucket` is the grain
-/// the exact-or-priced switch applies at, so pass the page's bucket to
-/// reconcile with its Cost card.
+/// Spend for `scope` and `range`, attributed to threads. Pass the page's
+/// `bucket` to preserve the card's inclusion of cost-only settlements.
 pub async fn spend_by_thread(
     db: &LocalDb,
     scope: &Scope,
