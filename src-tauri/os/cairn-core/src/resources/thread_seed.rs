@@ -32,7 +32,7 @@ use cairn_tokenize::{count, Family};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::storage::{LocalDb, RowExt};
+use crate::storage::{DbResult, LocalDb, RowExt};
 use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
 use crate::threads::arc_store::ArcProjection;
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
@@ -175,39 +175,36 @@ pub(crate) async fn compose_thread_seed_with_policy(
         );
     }
 
+    // The node's own point lookups share one read. The census statements each
+    // take their own (`load_children`, `load_branches`), so no single read
+    // spans the whole census, however many children a thread has.
     let job = job_id.to_owned();
-    let (coordinates, source_session_id, children, branches, store) =
-        read_resource(db, move |conn| {
-            Box::pin(async move {
-                let job_id = job.as_str();
-                let coordinates = node_coordinates(conn, job_id).await.ok_or_else(|| {
-                    "Cannot compose a thread seed: the node has no addressable coordinates."
-                        .to_string()
-                })?;
-                let source_session_id =
-                    current_session_id(conn, job_id).await.ok_or_else(|| {
-                        "Cannot compose a thread seed: the job has no current session.".to_string()
-                    })?;
-                let children = load_children(conn, job_id).await.map_err(|error| {
-                    format!("Failed to resolve this thread's children: {error}")
-                })?;
-                let branches = load_branches(conn, job_id).await.map_err(|error| {
-                    format!("Failed to resolve this thread's branches: {error}")
-                })?;
-                let thread_id = job_thread_id(conn, job_id).await;
-                Ok((
-                    coordinates,
-                    source_session_id,
-                    children,
-                    branches,
-                    thread_id,
-                ))
-            })
+    let (coordinates, source_session_id, thread_id) = read_resource(db, move |conn| {
+        Box::pin(async move {
+            let job_id = job.as_str();
+            let coordinates = node_coordinates(conn, job_id).await.ok_or_else(|| {
+                "Cannot compose a thread seed: the node has no addressable coordinates.".to_string()
+            })?;
+            let source_session_id = current_session_id(conn, job_id).await.ok_or_else(|| {
+                "Cannot compose a thread seed: the job has no current session.".to_string()
+            })?;
+            Ok((
+                coordinates,
+                source_session_id,
+                job_thread_id(conn, job_id).await,
+            ))
         })
-        .await?;
+    })
+    .await?;
+    let children = load_children(db, thread_id.as_deref())
+        .await
+        .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
+    let branches = load_branches(db, thread_id.as_deref())
+        .await
+        .map_err(|error| format!("Failed to resolve this thread's branches: {error}"))?;
     // The thread's own store is a second database, opened and counted after
-    // the main read has released.
-    let store = thread_store_census(store, now).await;
+    // every main read has released.
+    let store = thread_store_census(thread_id, now).await;
     let chat_uri = format!("{}/chat", coordinates.base_uri);
 
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
@@ -1016,7 +1013,7 @@ fn collapsed_eras(count: usize) -> String {
 /// has.
 fn collapsed_census(children: &[ChildStatus], thread_uri: &str, budget: usize) -> String {
     let (open, mut terminal): (Vec<_>, Vec<_>) = children.iter().partition(|child| child.is_open());
-    terminal.sort_by_key(|child| std::cmp::Reverse(child.last_activity_at.unwrap_or(0)));
+    terminal.sort_by_key(|child| std::cmp::Reverse(child.resolved_at.unwrap_or(0)));
     let lines: Vec<String> = open
         .into_iter()
         .chain(terminal)
@@ -2041,33 +2038,150 @@ fn render_branches(branches: &[BranchStatus], now: i64) -> String {
     out
 }
 
-async fn load_branches(
-    conn: &cairn_db::storage::TrackedConnection,
-    job_id: &str,
-) -> Result<Vec<BranchStatus>, String> {
-    let mut rows = conn
-        .query(
-            "SELECT b.number, b.title, b.stage, b.moved_at, mr.github_pr_number, mr.status
-         FROM thread_branches b
-         LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
-         WHERE b.thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-         ORDER BY b.number",
-            params![job_id],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut branches = Vec::new();
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let pr_status = row.opt_text(5).map_err(|error| error.to_string())?;
-        branches.push(BranchStatus {
-            number: row.i64(0).map_err(|error| error.to_string())?,
-            title: row.opt_text(1).map_err(|error| error.to_string())?,
-            stage: row.text(2).map_err(|error| error.to_string())?,
-            moved_at: row.i64(3).map_err(|error| error.to_string())?,
+async fn load_branches(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<BranchStatus>, String> {
+    let Some(thread_id) = thread_id else {
+        return Ok(Vec::new());
+    };
+    thread_rows(db, BRANCHES_SQL, thread_id, |row| {
+        let pr_status = row.opt_text(5)?;
+        Ok(Some(BranchStatus {
+            number: row.i64(0)?,
+            title: row.opt_text(1)?,
+            stage: row.text(2)?,
+            moved_at: row.i64(3)?,
             pr: pr_status.map(|status| (row.opt_i64(4).ok().flatten(), status)),
-        });
-    }
-    Ok(branches)
+        }))
+    })
+    .await
+}
+
+// ── Census statements ──────────────────────────────────────────────────────────
+//
+// Every statement the census runs, each bound to the thread id alone and each
+// run on its own pooled read by `thread_rows`. They start from the thread's
+// children through `idx_issues_parent_thread_id` and reach every facet table by
+// an index seek per child; `census_statements_seek_from_the_threads_children`
+// pins those plans. Turso keeps no statistics, so left to choose it enumerates
+// by walking `idx_issues_number` and drives a facet from the facet table: it
+// scanned `jobs`, `merge_requests`, `prompts` and every check observation, and
+// walked every event of every child's runs (cairn/6004). An index on
+// `parent_thread_id` does not settle that, so these name the indexes that hold
+// them to this drive.
+//
+// The facet statements skip merged and closed children. A resolved child renders
+// as its address line alone, so its facets would be read for nothing, and
+// resolved children are nearly all of a long-lived thread's (297 of 298 under
+// the `main` thread on 11-04). What orders them is on their own row.
+
+const BRANCHES_SQL: &str =
+    "SELECT b.number, b.title, b.stage, b.moved_at, mr.github_pr_number, mr.status
+       FROM thread_branches b
+       LEFT JOIN merge_requests mr ON mr.job_id = b.job_id
+      WHERE b.thread_id = ?1
+      ORDER BY b.number";
+
+const CHILDREN_SQL: &str = "SELECT child.id, p.key, child.number, child.title, child.status,
+            parent_project.key, parent.number,
+            COALESCE(child.merged_at, child.closed_at, child.completed_at)
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN projects p ON p.id = child.project_id
+       LEFT JOIN issues parent ON parent.id = child.parent_issue_id
+       LEFT JOIN projects parent_project ON parent_project.id = parent.project_id
+      WHERE child.parent_thread_id = ?1
+      ORDER BY child.number ASC";
+
+/// The newest execution's top-level nodes. An older execution's nodes describe
+/// an attempt that has been superseded, which would read as live work.
+const CHILD_NODES_SQL: &str = "SELECT child.id, COALESCE(j.node_name, j.uri_segment), j.status
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN jobs j ON j.issue_id = child.id
+       JOIN executions e ON e.id = j.execution_id
+      WHERE child.parent_thread_id = ?1
+        AND child.status NOT IN ('merged', 'closed')
+        AND j.parent_job_id IS NULL
+        AND e.seq = (SELECT MAX(latest.seq) FROM executions latest
+                      WHERE latest.issue_id = child.id)
+      ORDER BY j.created_at ASC";
+
+/// Oldest first, so the last write per child is its newest pull request. A
+/// non-positive number is a phantom binding, not a pull request.
+const CHILD_PRS_SQL: &str = "SELECT child.id, m.github_pr_number, m.status
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN merge_requests m ON m.issue_id = child.id
+      WHERE child.parent_thread_id = ?1
+        AND child.status NOT IN ('merged', 'closed')
+        AND m.github_pr_number > 0
+      ORDER BY m.opened_at ASC";
+
+const CHILD_QUESTIONS_SQL: &str = "SELECT child.id, COUNT(*)
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN runs r INDEXED BY idx_runs_issue_id ON r.issue_id = child.id
+       JOIN prompts p INDEXED BY idx_prompts_run_id ON p.run_id = r.id
+      WHERE child.parent_thread_id = ?1
+        AND child.status NOT IN ('merged', 'closed')
+        AND p.answered_at IS NULL
+        AND p.withdrawn_at IS NULL
+      GROUP BY child.id";
+
+/// Oldest first again: the newest observation of a check name replaces the
+/// one before it, so each child ends with one current verdict per check. Read
+/// from `idx_check_result_observations_job` alone; an observation's row
+/// carries its output tail.
+const CHILD_CHECKS_SQL: &str = "SELECT child.id, o.check_name, o.verdict
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN jobs j ON j.issue_id = child.id
+       JOIN check_result_observations o ON o.job_id = j.id
+      WHERE child.parent_thread_id = ?1
+        AND child.status NOT IN ('merged', 'closed')
+      ORDER BY o.ran_at ASC";
+
+/// Each unresolved child run's last-written event, one row per run: one reverse
+/// seek of `idx_events_run_sequence`, which has to be named, because left to choose the
+/// planner takes `idx_events_run_id` and sorts the run's whole history. Events
+/// are numbered as they are written, and a stamp can lag its neighbour, so this
+/// can read a second behind the run's largest timestamp (2 of 40 sampled runs on
+/// 11-03). The census renders this as an age, where that does not show.
+/// `MAX(e.timestamp)` read every event of every run instead: 13.9 s cold for the
+/// 1,223 runs under a 298-child thread on the 11-03 clone.
+const CHILD_ACTIVITY_SQL: &str = "SELECT child.id,
+            (SELECT e.timestamp FROM events e INDEXED BY idx_events_run_sequence
+              WHERE e.run_id = r.id
+              ORDER BY e.sequence DESC LIMIT 1)
+       FROM issues child INDEXED BY idx_issues_parent_thread_id
+       JOIN runs r ON r.issue_id = child.id
+      WHERE child.parent_thread_id = ?1
+        AND child.status NOT IN ('merged', 'closed')";
+
+/// One census statement, bound to `thread_id`, on its own pooled read. `row`
+/// maps each row, `Ok(None)` skipping one the census has no use for. The
+/// connection is released before the caller assembles anything from the rows.
+#[track_caller]
+fn thread_rows<'s, T, F>(
+    db: &'s LocalDb,
+    sql: &'static str,
+    thread_id: &str,
+    row: F,
+) -> impl std::future::Future<Output = Result<Vec<T>, String>> + 's
+where
+    T: Send + 'static,
+    F: Fn(&cairn_db::turso::Row) -> DbResult<Option<T>> + Send + 'static,
+{
+    let thread_id = thread_id.to_owned();
+    read_resource(db, move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(sql, params![thread_id])
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut out = Vec::new();
+            while let Some(next) = rows.next().await.map_err(|error| error.to_string())? {
+                if let Some(value) = row(&next).map_err(|error| error.to_string())? {
+                    out.push(value);
+                }
+            }
+            Ok(out)
+        })
+    })
 }
 
 /// Where one child issue stands at composition time.
@@ -2087,6 +2201,9 @@ struct ChildStatus {
     checks: Vec<(String, String)>,
     unanswered_questions: i64,
     last_activity_at: Option<i64>,
+    /// When the child reached its resolution, which is what orders resolved
+    /// children. Its facets above are read only while it is not merged or closed.
+    resolved_at: Option<i64>,
     /// One gate-census line per held execution (`exec N — held, waiting on
     /// ...`). A child whose only execution is held derives Backlog and has no
     /// nodes, so without these it would read exactly like a child nobody
@@ -2269,7 +2386,7 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
     }
 
     let (open, mut terminal): (Vec<_>, Vec<_>) = children.iter().partition(|child| child.is_open());
-    terminal.sort_by_key(|child| std::cmp::Reverse(child.last_activity_at.unwrap_or(0)));
+    terminal.sort_by_key(|child| std::cmp::Reverse(child.resolved_at.unwrap_or(0)));
 
     for child in open
         .into_iter()
@@ -2303,81 +2420,87 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
 
 /// Assemble every child issue's live status.
 ///
-/// Six queries, each keyed on the parent issue rather than run per child, so
-/// composition costs the same whether a thread has three children or forty.
+/// Each statement takes its own pooled read, so a thread's whole census is never
+/// one snapshot: a child's line can be a moment newer than the list it sits in,
+/// which a census read live at composition already allows. Its cost follows one
+/// row per child and the unresolved children's work, not the size of the tables
+/// it reads.
 ///
 /// Enumerating the children is strict: a census that silently omits one is the
 /// staleness this block exists to remove. Enriching them is best-effort — a
 /// facet that cannot be read is left off the line, which is what the renderer
 /// does for a facet that simply does not exist.
-async fn load_children(
-    conn: &cairn_db::storage::TrackedConnection,
-    job_id: &str,
-) -> Result<Vec<ChildStatus>, String> {
+async fn load_children(db: &LocalDb, thread_id: Option<&str>) -> Result<Vec<ChildStatus>, String> {
+    let Some(thread_id) = thread_id else {
+        return Ok(Vec::new());
+    };
     let mut children: Vec<ChildStatus> = Vec::new();
-    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
     // A child that also has a parent issue is approved by that issue's
     // coordinator, not by the reading thread.
     let mut approvers: HashMap<String, String> = HashMap::new();
 
-    let mut rows = conn
-        .query(
-            "SELECT child.id, p.key, child.number, child.title, child.status,
-                    parent_project.key, parent.number
-             FROM issues child
-             JOIN projects p ON p.id = child.project_id
-             LEFT JOIN issues parent ON parent.id = child.parent_issue_id
-             LEFT JOIN projects parent_project ON parent_project.id = parent.project_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-             ORDER BY child.number ASC",
-            params![job_id],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(row) = rows.next().await.map_err(|error| error.to_string())? {
-        let id = row.text(0).map_err(|error| error.to_string())?;
-        let key = row.text(1).map_err(|error| error.to_string())?;
-        let number = row.i64(2).map_err(|error| error.to_string())? as i32;
-        let parent_key = row.opt_text(5).map_err(|error| error.to_string())?;
-        let parent_number = row.opt_i64(6).map_err(|error| error.to_string())?;
-        if let (Some(key), Some(number)) = (parent_key, parent_number) {
-            approvers.insert(id.clone(), format!("{key}/{number}"));
+    let enumerated = thread_rows(db, CHILDREN_SQL, thread_id, |row| {
+        let approver = match (row.opt_text(5)?, row.opt_i64(6)?) {
+            (Some(key), Some(number)) => Some(format!("{key}/{number}")),
+            _ => None,
+        };
+        Ok(Some((
+            row.text(0)?,
+            cairn_common::uri::build_issue_uri(&row.text(1)?, row.i64(2)? as i32),
+            row.text(3)?,
+            row.text(4)?,
+            approver,
+            row.opt_i64(7)?,
+        )))
+    })
+    .await?;
+    for (id, uri, title, status, approver, resolved_at) in enumerated {
+        if let Some(approver) = approver {
+            approvers.insert(id.clone(), approver);
         }
         at.insert(id, children.len());
         children.push(ChildStatus {
-            uri: cairn_common::uri::build_issue_uri(&key, number),
-            title: row.text(3).map_err(|error| error.to_string())?,
-            status: row.text(4).map_err(|error| error.to_string())?,
+            uri,
+            title,
+            status,
             nodes: Vec::new(),
             pr: None,
             checks: Vec::new(),
             unanswered_questions: 0,
             last_activity_at: None,
+            resolved_at,
             held: Vec::new(),
             wont_start: Vec::new(),
             approvals: Vec::new(),
         });
     }
-    if children.is_empty() {
+    // A merged or closed child's resolution already ended its work; a gated
+    // execution or artifact left on it is not something to wait on, and its
+    // history line already says the child is done.
+    let unresolved: Vec<String> = at
+        .iter()
+        .filter(|(_, index)| !matches!(children[**index].status.as_str(), "merged" | "closed"))
+        .map(|(id, _)| id.clone())
+        .collect();
+    if unresolved.is_empty() {
         return Ok(children);
     }
 
     // Held executions are read strictly, like the enumeration itself: a held
     // child produces no attention on its own, so the census line is the only
     // place a thread learns it is waiting.
-    let child_ids: Vec<String> = at.keys().cloned().collect();
-    let gated = crate::execution::gates::census::gated_executions_for_issues_conn(conn, &child_ids)
-        .await
-        .map_err(|error| error.to_string())?;
+    let ids = unresolved.clone();
+    let gated = read_resource(db, move |conn| {
+        Box::pin(async move {
+            crate::execution::gates::census::gated_executions_for_issues_conn(conn, &ids)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await?;
     for (issue_id, executions) in gated {
-        if let Some(child) = at
-            .get(&issue_id)
-            .map(|index| &mut children[*index])
-            // A merged or closed child's resolution already ended its work;
-            // a gated execution left on it is not something to wait on, and
-            // its history line already says the child is done.
-            .filter(|child| !matches!(child.status.as_str(), "merged" | "closed"))
-        {
+        if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
             child.held = executions.held.into_iter().map(|held| held.line).collect();
             child.wont_start = executions
                 .wont_start
@@ -2389,10 +2512,14 @@ async fn load_children(
 
     // Gated artifacts waiting on their approver: one keyed read, index-only on
     // artifacts. Best-effort like the facets below.
-    if let Ok(approvals) = crate::execution::approvals::pending_approvals_conn(
-        conn,
-        &crate::execution::approvals::ApprovalScope::Issues(child_ids.clone()),
-    )
+    let scope = crate::execution::approvals::ApprovalScope::Issues(unresolved);
+    if let Ok(approvals) = read_resource(db, move |conn| {
+        Box::pin(async move {
+            crate::execution::approvals::pending_approvals_conn(conn, &scope)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
     .await
     {
         for approval in approvals {
@@ -2412,134 +2539,82 @@ async fn load_children(
         }
     }
 
-    // The newest execution's top-level nodes. An older execution's nodes describe
-    // an attempt that has been superseded, which would read as live work.
-    if let Ok(mut rows) = conn
-        .query(
-            "SELECT j.issue_id, COALESCE(j.node_name, j.uri_segment), j.status
-             FROM jobs j
-             JOIN executions e ON e.id = j.execution_id
-             JOIN issues child ON child.id = j.issue_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-               AND j.parent_job_id IS NULL
-               AND e.seq = (SELECT MAX(latest.seq) FROM executions latest WHERE latest.issue_id = j.issue_id)
-             ORDER BY j.created_at ASC",
-            params![job_id],
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(issue_id), Ok(Some(name)), Ok(status)) =
-                (row.text(0), row.opt_text(1), row.text(2))
-            else {
-                continue;
-            };
-            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
-                child.nodes.push((name, status));
-            }
+    // The facets are best-effort: a facet that cannot be read leaves its
+    // field empty rather than failing the census, and a row missing a field
+    // the line needs is skipped.
+    let nodes = thread_rows(db, CHILD_NODES_SQL, thread_id, |row| {
+        Ok(match (row.text(0), row.opt_text(1), row.text(2)) {
+            (Ok(issue_id), Ok(Some(name)), Ok(status)) => Some((issue_id, name, status)),
+            _ => None,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for (issue_id, name, status) in nodes {
+        if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+            child.nodes.push((name, status));
         }
     }
 
-    // Oldest first, so the last write per child is its newest pull request. A
-    // non-positive number is a phantom binding, not a pull request.
-    if let Ok(mut rows) = conn
-        .query(
-            "SELECT m.issue_id, m.github_pr_number, m.status
-             FROM merge_requests m
-             JOIN issues child ON child.id = m.issue_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-               AND m.github_pr_number > 0
-             ORDER BY m.opened_at ASC",
-            params![job_id],
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(issue_id), Ok(Some(number)), Ok(status)) =
-                (row.text(0), row.opt_i64(1), row.text(2))
-            else {
-                continue;
-            };
-            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
-                child.pr = Some((number, status));
-            }
+    let prs = thread_rows(db, CHILD_PRS_SQL, thread_id, |row| {
+        Ok(match (row.text(0), row.opt_i64(1), row.text(2)) {
+            (Ok(issue_id), Ok(Some(number)), Ok(status)) => Some((issue_id, number, status)),
+            _ => None,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for (issue_id, number, status) in prs {
+        if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+            child.pr = Some((number, status));
         }
     }
 
-    if let Ok(mut rows) = conn
-        .query(
-            "SELECT r.issue_id, COUNT(*)
-             FROM prompts p
-             JOIN runs r ON r.id = p.run_id
-             JOIN issues child ON child.id = r.issue_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-               AND p.answered_at IS NULL
-               AND p.withdrawn_at IS NULL
-             GROUP BY r.issue_id",
-            params![job_id],
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(issue_id), Ok(count)) = (row.text(0), row.i64(1)) else {
-                continue;
-            };
-            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
-                child.unanswered_questions = count;
-            }
+    let questions = thread_rows(db, CHILD_QUESTIONS_SQL, thread_id, |row| {
+        Ok(match (row.text(0), row.i64(1)) {
+            (Ok(issue_id), Ok(count)) => Some((issue_id, count)),
+            _ => None,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for (issue_id, count) in questions {
+        if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+            child.unanswered_questions = count;
         }
     }
 
-    // Oldest first again: the newest observation of a check name replaces the
-    // one before it, so each child ends with one current verdict per check.
-    if let Ok(mut rows) = conn
-        .query(
-            "SELECT j.issue_id, o.check_name, o.verdict
-             FROM check_result_observations o
-             JOIN jobs j ON j.id = o.job_id
-             JOIN issues child ON child.id = j.issue_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-             ORDER BY o.ran_at ASC",
-            params![job_id],
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(issue_id), Ok(name), Ok(verdict)) = (row.text(0), row.text(1), row.text(2))
-            else {
-                continue;
-            };
-            let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) else {
-                continue;
-            };
-            match child.checks.iter_mut().find(|(known, _)| *known == name) {
-                Some(entry) => entry.1 = verdict,
-                None => child.checks.push((name, verdict)),
-            }
+    let checks = thread_rows(db, CHILD_CHECKS_SQL, thread_id, |row| {
+        Ok(match (row.text(0), row.text(1), row.text(2)) {
+            (Ok(issue_id), Ok(name), Ok(verdict)) => Some((issue_id, name, verdict)),
+            _ => None,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for (issue_id, name, verdict) in checks {
+        let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) else {
+            continue;
+        };
+        match child.checks.iter_mut().find(|(known, _)| *known == name) {
+            Some(entry) => entry.1 = verdict,
+            None => child.checks.push((name, verdict)),
         }
     }
 
     // Last activity is the newest event under the child, not `issues.updated_at`:
     // patching an issue's labels is not the work moving.
-    if let Ok(mut rows) = conn
-        .query(
-            "SELECT r.issue_id, MAX(e.timestamp)
-             FROM events e
-             JOIN runs r ON r.id = e.run_id
-             JOIN issues child ON child.id = r.issue_id
-             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
-             GROUP BY r.issue_id",
-            params![job_id],
-        )
-        .await
-    {
-        while let Ok(Some(row)) = rows.next().await {
-            let (Ok(issue_id), Ok(Some(timestamp))) = (row.text(0), row.opt_i64(1)) else {
-                continue;
-            };
-            if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
-                child.last_activity_at = Some(timestamp);
-            }
+    let activity = thread_rows(db, CHILD_ACTIVITY_SQL, thread_id, |row| {
+        Ok(match (row.text(0), row.opt_i64(1)) {
+            (Ok(issue_id), Ok(Some(timestamp))) => Some((issue_id, timestamp)),
+            _ => None,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    for (issue_id, timestamp) in activity {
+        if let Some(child) = at.get(&issue_id).map(|index| &mut children[*index]) {
+            child.last_activity_at = child.last_activity_at.max(Some(timestamp));
         }
     }
 
@@ -4869,6 +4944,300 @@ mod tests {
                 event_bytes / 1_000_000,
                 group_turn_blocks(&events).len(),
             );
+        }
+    }
+
+    /// Every statement the children census runs, by the name the probe and
+    /// the plan pin report it under.
+    const CENSUS_STATEMENTS: [(&str, &str); 7] = [
+        ("branches", BRANCHES_SQL),
+        ("children", CHILDREN_SQL),
+        ("nodes", CHILD_NODES_SQL),
+        ("prs", CHILD_PRS_SQL),
+        ("questions", CHILD_QUESTIONS_SQL),
+        ("checks", CHILD_CHECKS_SQL),
+        ("activity", CHILD_ACTIVITY_SQL),
+    ];
+
+    async fn census_plan(db: &LocalDb, sql: &str) -> Vec<String> {
+        crate::storage::query_plan(db, sql, vec![cairn_db::turso::Value::Text("x".into())])
+            .await
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Each census statement starts from the thread's children through
+    /// `idx_issues_parent_thread_id` and reaches its facet table by a seek per
+    /// child. Left to choose, Turso, which keeps no statistics, walked
+    /// `idx_issues_number` for the enumeration and drove the facets from the
+    /// facet side: full scans of `jobs`, `merge_requests`, `prompts` and
+    /// `check_result_observations`, and a walk of every event of every child
+    /// run, 18 s cold for a 298-child thread on the 11-04 clone (cairn/6004).
+    /// The rows are the same either way, so only the plan witnesses a
+    /// regression.
+    #[tokio::test]
+    async fn census_statements_seek_from_the_threads_children() {
+        let db = migrated_test_db("thread-census-plan.db").await;
+        for (label, sql) in CENSUS_STATEMENTS {
+            let plan = census_plan(&db, sql).await;
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{label}: no table or index is scanned: {plan:#?}"
+            );
+            if label == "branches" {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.starts_with("SEARCH b USING")
+                            && step.contains("(thread_id=?")),
+                    "{label}: branches are sought by thread: {plan:#?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                plan.first().map(String::as_str),
+                Some("SEARCH child USING INDEX idx_issues_parent_thread_id (parent_thread_id=?)"),
+                "{label}: the drive starts from the thread's children: {plan:#?}"
+            );
+        }
+
+        let checks = census_plan(&db, CHILD_CHECKS_SQL).await;
+        assert!(
+            checks.iter().any(|step| step
+                .starts_with("SEARCH o USING COVERING INDEX idx_check_result_observations_job")),
+            "checks: verdicts come from the covering job index, never an observation row: {checks:#?}"
+        );
+        let activity = census_plan(&db, CHILD_ACTIVITY_SQL).await;
+        assert!(
+            activity
+                .iter()
+                .any(|step| step.contains("idx_events_run_sequence (run_id=?)")),
+            "activity: each run's newest event is one seek of its sequence: {activity:#?}"
+        );
+        assert!(
+            !activity.iter().any(|step| step.contains("SORTER")),
+            "activity: ordering down to the newest event needs no sort: {activity:#?}"
+        );
+        let nodes = census_plan(&db, CHILD_NODES_SQL).await;
+        assert!(
+            !nodes
+                .iter()
+                .any(|step| step.contains("sqlite_autoindex_executions_1")),
+            "nodes: an execution's seq is read from an index, never its snapshot-carrying row: {nodes:#?}"
+        );
+    }
+
+    /// Last activity is the newest event across all of a child's runs, and an
+    /// older run can hold it: two nodes of one execution run side by side.
+    #[tokio::test]
+    async fn last_activity_is_the_newest_event_of_any_of_a_childs_runs() {
+        let db = thread_fixture("thread-seed-last-activity.db").await;
+        make_open_child_live(&db).await;
+        db.execute_script(
+            "INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-early','job-open-build','i-open','exited',1,1);
+             INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('ev-early-1','run-early',1,9000,'assistant','{}',9000);
+             INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('ev-early-2','run-early',2,9500,'assistant','{}',9500);
+             INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+               VALUES ('run-late','job-open-review','i-open','running',2,2);
+             INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('ev-late-1','run-late',1,9200,'assistant','{}',9200);",
+        )
+        .await
+        .unwrap();
+
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let child = children
+            .iter()
+            .find(|child| child.uri == OPEN_CHILD)
+            .unwrap();
+        assert_eq!(child.last_activity_at, Some(9500));
+    }
+
+    /// A resolved child renders as its address line, so no facet statement reads
+    /// it: nearly all of a long-lived thread's children are resolved, and their
+    /// jobs, runs and events are where a census pays. The same rows come back the
+    /// moment the child is live again, which is what makes the empty answer mean
+    /// "skipped" rather than "the fixture has nothing to find".
+    #[tokio::test]
+    async fn no_facet_statement_reads_a_resolved_child() {
+        let db = thread_fixture("thread-seed-resolved-facets.db").await;
+        make_open_child_live(&db).await;
+        const FACETS: [(&str, &str); 5] = [
+            ("nodes", CHILD_NODES_SQL),
+            ("prs", CHILD_PRS_SQL),
+            ("questions", CHILD_QUESTIONS_SQL),
+            ("checks", CHILD_CHECKS_SQL),
+            ("activity", CHILD_ACTIVITY_SQL),
+        ];
+        for (label, sql) in FACETS {
+            let live = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+                .await
+                .unwrap();
+            assert!(!live.is_empty(), "{label}: reads a live child");
+        }
+        for status in ["merged", "closed"] {
+            db.execute(
+                "UPDATE issues SET status = ?1 WHERE id = 'i-open'",
+                params![status],
+            )
+            .await
+            .unwrap();
+            for (label, sql) in FACETS {
+                let resolved = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+                    .await
+                    .unwrap();
+                assert!(resolved.is_empty(), "{label}: skips a {status} child");
+            }
+        }
+        db.execute(
+            "UPDATE issues SET status = 'failed' WHERE id = 'i-open'",
+            (),
+        )
+        .await
+        .unwrap();
+        for (label, sql) in FACETS {
+            let failed = thread_rows(&db, sql, "t-thread", |_| Ok(Some(())))
+                .await
+                .unwrap();
+            assert!(
+                !failed.is_empty(),
+                "{label}: a failed child can be live again through a held rerun"
+            );
+        }
+    }
+
+    /// The most recently resolved children lead the capped history, by the stamp
+    /// on their own row: a merged child carries `merged_at`, a closed one
+    /// `closed_at`, and a failed one only `completed_at`, which older merged and
+    /// closed rows also lack.
+    #[tokio::test]
+    async fn resolved_children_are_listed_by_when_they_resolved() {
+        let db = thread_fixture("thread-seed-resolved-order.db").await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, merged_at)
+               VALUES ('i-merged','p',30,'Merged','merged','none',1,1,'t-thread',500);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, closed_at, completed_at)
+               VALUES ('i-closed','p',31,'Closed','closed','none',1,1,'t-thread',900,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id, completed_at)
+               VALUES ('i-failed','p',32,'Failed','failed','none',1,1,'t-thread',700);",
+        )
+        .await
+        .unwrap();
+
+        let children = load_children(&db, Some("t-thread")).await.unwrap();
+        let rendered = render_children(&children, NOW);
+        let at = |uri: &str| {
+            rendered
+                .find(uri)
+                .unwrap_or_else(|| panic!("{uri} is listed: {rendered}"))
+        };
+        assert!(
+            at("cairn://p/prj/31`") < at("cairn://p/prj/32`"),
+            "{rendered}"
+        );
+        assert!(
+            at("cairn://p/prj/32`") < at("cairn://p/prj/30`"),
+            "{rendered}"
+        );
+        assert!(at("cairn://p/prj/30`") < at(DONE_CHILD), "{rendered}");
+    }
+
+    /// A job that belongs to no thread has no census to read, rather than one
+    /// that fails.
+    #[tokio::test]
+    async fn a_job_outside_any_thread_has_an_empty_census() {
+        let db = thread_fixture("thread-seed-no-thread.db").await;
+        assert!(load_children(&db, None).await.unwrap().is_empty());
+        assert!(load_branches(&db, None).await.unwrap().is_empty());
+    }
+
+    /// What the children census costs on a real history: the whole census as
+    /// the composer reads it, then each statement on its own, first against
+    /// cold reads and then warm, with every plan. Same clone discipline as the
+    /// probes above; a fresh clone per run is what makes the first pass cold.
+    /// `CAIRN_PROBE_JOB` names a thread's session job, `CAIRN_PROBE_MIGRATE`
+    /// brings an older copy's schema forward (building this census's index),
+    /// and `CAIRN_PROBE_STATEMENTS_FIRST` times the statements before the
+    /// whole census, so each statement's first sighting is the cold one.
+    ///
+    /// Building the index reads the table it covers, which warms it. For a
+    /// cold number, migrate one clone, clone that (`cp -c`, on APFS a fresh file
+    /// the buffer cache has not seen), and probe the second without
+    /// `CAIRN_PROBE_MIGRATE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a real database copy via CAIRN_CHECKPOINT_PROBE_DB"]
+    async fn census_probe_against_a_real_database_copy() {
+        use std::time::Instant;
+        let path = std::env::var("CAIRN_CHECKPOINT_PROBE_DB")
+            .expect("set CAIRN_CHECKPOINT_PROBE_DB to a copy of a real database set");
+        let job_id = std::env::var("CAIRN_PROBE_JOB").expect("set CAIRN_PROBE_JOB to a thread job");
+        let db = LocalDb::open(&path).await.unwrap();
+        if std::env::var_os("CAIRN_PROBE_MIGRATE").is_some() {
+            let started = Instant::now();
+            crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+                .run(&db)
+                .await
+                .unwrap();
+            println!("migrated in {:?}", started.elapsed());
+        }
+
+        async fn census(db: &LocalDb, job_id: &str) -> (usize, usize) {
+            let job = job_id.to_owned();
+            let started = Instant::now();
+            let thread_id = read_resource(db, move |conn| {
+                Box::pin(async move {
+                    node_coordinates(conn, &job).await.unwrap();
+                    current_session_id(conn, &job).await.unwrap();
+                    Ok(job_thread_id(conn, &job).await)
+                })
+            })
+            .await
+            .unwrap();
+            let node = started.elapsed();
+            let children = load_children(db, thread_id.as_deref()).await.unwrap();
+            let branches = load_branches(db, thread_id.as_deref()).await.unwrap();
+            println!(
+                "census: node read {node:?}; {} children, {} branches in {:?} total",
+                children.len(),
+                branches.len(),
+                started.elapsed()
+            );
+            (children.len(), branches.len())
+        }
+        async fn statements(db: &LocalDb, thread_id: &str, pass: &str) {
+            for (label, sql) in CENSUS_STATEMENTS {
+                let started = Instant::now();
+                let rows = thread_rows(db, sql, thread_id, |_| Ok(Some(())))
+                    .await
+                    .unwrap()
+                    .len();
+                println!("{pass} {label}: {rows} rows in {:?}", started.elapsed());
+            }
+        }
+
+        let thread_id = db
+            .query_opt_text(
+                "SELECT thread_id FROM jobs WHERE id = ?1",
+                (job_id.clone(),),
+            )
+            .await
+            .unwrap()
+            .expect("the probed job belongs to a thread");
+        if std::env::var_os("CAIRN_PROBE_STATEMENTS_FIRST").is_some() {
+            statements(&db, &thread_id, "cold").await;
+            census(&db, &job_id).await;
+        } else {
+            print!("cold ");
+            census(&db, &job_id).await;
+            statements(&db, &thread_id, "warm").await;
+        }
+        print!("warm ");
+        census(&db, &job_id).await;
+        for (label, sql) in CENSUS_STATEMENTS {
+            println!("plan {label}: {}", census_plan(&db, sql).await.join(" | "));
         }
     }
 

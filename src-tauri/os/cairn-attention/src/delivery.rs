@@ -1256,6 +1256,26 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
         }
     }
 
+    // A `child-unresumed:` push is the same kind of statement: which turn the
+    // restart took, what became of the resume, and that the work is the parent's
+    // to pick up. Re-derived at delivery, so a child that has since moved on says
+    // so rather than sending the parent to read a healthy node.
+    if push
+        .key
+        .starts_with(&format!("{}:", crate::push::CHILD_UNRESUMED_PUSH_PREFIX))
+    {
+        if let Some(body) = runtime
+            .host
+            .render_content(ContentRequest::ChildUnresumed {
+                recipient: &push.recipient,
+                reference: &push.content_ref,
+            })
+            .await
+        {
+            return format!("{header}\n\n{body}");
+        }
+    }
+
     // A `direct:` push carries frozen message content, not an idempotent
     // resolvable referent. Resolve it from the durable `messages` row rather
     // than from `content_ref` (which is the conversation surface the wake card

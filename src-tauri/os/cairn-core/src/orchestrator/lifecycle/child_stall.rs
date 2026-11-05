@@ -81,12 +81,10 @@
 //! that lands, the two arms below stop occurring in new data but must stay for
 //! old rows.)
 
-use crate::orchestrator::attention_push::{
-    latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
-};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
+use super::child_attention::{tell_child_watchers, wake_recipients, ChildFact};
 use super::watchdog_recovery::{
     has_pending_resume_trigger_async, ALREADY_TERMINAL_RECONCILED_REASON,
 };
@@ -491,60 +489,22 @@ async fn newest_terminal_reason(db: &LocalDb, job_id: &str) -> Result<Option<Str
     .map_err(|error| format!("stalled-child sweep failed to load the newest transition: {error}"))
 }
 
-/// Tell the child's watchers, and hand back the ones a wake should rouse.
-///
-/// The recipient set is [`watcher_jobs_for_issue`], which resolves the node
-/// currently driving the parent live on every call (CAIRN-3293) — so a parent
-/// issue that gained a new coordinator execution inherits its children's stalls
-/// with no hand-off step, and a superseded coordinator stops hearing them. Jobs
-/// on the child's own issue are excluded: a node cannot act on its own death.
-///
-/// [`watcher_jobs_for_issue`]: crate::orchestrator::wakes::watcher_jobs_for_issue
+/// Tell the stalled child's watchers, and hand back the ones a wake should rouse.
 pub(crate) async fn tell_watchers(
     db: &LocalDb,
     child: &StalledChild,
 ) -> Result<Vec<String>, String> {
-    let key = format!("{CHILD_STALL_PUSH_PREFIX}:{}", child.issue_uri);
-    let fingerprint = child.fingerprint();
-    let watchers = crate::orchestrator::wakes::watcher_jobs_for_issue(db, &child.issue_uri).await?;
-    let mut pushed = Vec::new();
-    for recipient in watchers {
-        if crate::orchestrator::attention_delivery::job_belongs_to_issue(
-            db,
-            &recipient,
-            &child.issue_id,
-        )
-        .await?
-        {
-            continue;
-        }
-        // The change trigger. A stall persists for as long as nobody fixes it,
-        // and the sweep re-observes it every tick; without this the parent would
-        // be woken on every one of them.
-        if let Some(Some(previous)) = latest_push_fingerprint(db, &recipient, &key)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            if previous == fingerprint {
-                continue;
-            }
-        }
-        let (_, effective) = push_with_fingerprint(
-            db,
-            &recipient,
-            &child.node_uri,
-            Wake::Wake,
-            Boundary::Event,
-            &key,
-            Some(&fingerprint),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        if effective.wakes_idle() {
-            pushed.push(recipient);
-        }
-    }
-    Ok(pushed)
+    tell_child_watchers(
+        db,
+        &ChildFact {
+            issue_id: &child.issue_id,
+            issue_uri: &child.issue_uri,
+            node_uri: &child.node_uri,
+            key: format!("{CHILD_STALL_PUSH_PREFIX}:{}", child.issue_uri),
+            fingerprint: child.fingerprint(),
+        },
+    )
+    .await
 }
 
 /// The periodic pass: find every stalled child and tell its watchers. Returns
@@ -576,25 +536,13 @@ pub(crate) async fn sweep_stalled_children(orch: &Orchestrator) -> usize {
                 continue;
             }
             told += 1;
-            orch.notifier.emit_change("attention_pushes");
             log::info!(
                 "stalled child {}: {} recovery death(s), telling {} watcher(s)",
                 child.node_uri,
                 child.deaths.len(),
                 recipients.len()
             );
-            for recipient in recipients {
-                if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
-                    orch,
-                    &recipient,
-                    crate::messages::queued::DeliveryUrgency::Steer,
-                ) {
-                    log::warn!(
-                        "stalled-child wake for {} failed: {error}",
-                        &recipient[..recipient.len().min(8)]
-                    );
-                }
-            }
+            wake_recipients(orch, &recipients, "stalled-child");
         }
     }
     told

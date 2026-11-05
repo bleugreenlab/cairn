@@ -83,4 +83,8 @@ pub enum ContentRequest<'a> {
         recipient: &'a str,
         reference: &'a str,
     },
+    ChildUnresumed {
+        recipient: &'a str,
+        reference: &'a str,
+    },
 }

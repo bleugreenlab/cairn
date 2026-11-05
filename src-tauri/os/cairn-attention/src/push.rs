@@ -22,6 +22,11 @@
 //!
 /// Push source for a child that has stopped making progress.
 pub const CHILD_STALL_PUSH_PREFIX: &str = "child-stalled";
+/// Push source for a child whose one automatic resume after a host restart did
+/// not take. The key suffix is the child NODE uri, not its issue uri: each node
+/// on an issue is its own episode, and two sharing a key would overwrite each
+/// other's fingerprint and re-wake the parent on every sweep.
+pub const CHILD_UNRESUMED_PUSH_PREFIX: &str = "child-unresumed";
 
 use std::collections::{HashMap, HashSet};
 
@@ -343,6 +348,7 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "tasks" => ("tasks", "Tasks need attention"),
         "turn-checks" => ("checks", "Turn-end check results"),
         "child-stalled" => ("child", "A child node has no viable session"),
+        "child-unresumed" => ("child", "A child's restart resume did not take"),
         "child-safety" => ("child", "A child node paused for safety"),
         "build-change" => ("system", "Cairn was rebuilt"),
         other => (other, "Attention update"),
@@ -491,6 +497,9 @@ async fn source_mute_downgrade(
         // ride-along it takes for every other fact from it (CAIRN-4609).
         crate::push::CHILD_STALL_PUSH_PREFIX => {
             (SOURCE_KIND_ISSUE, crate::wakes::FACT_KIND_CHILD_STALLED)
+        }
+        crate::push::CHILD_UNRESUMED_PUSH_PREFIX => {
+            (SOURCE_KIND_ISSUE, crate::wakes::FACT_KIND_CHILD_UNRESUMED)
         }
         _ => return Ok(requested),
     };

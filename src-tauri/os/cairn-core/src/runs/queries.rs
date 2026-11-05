@@ -154,11 +154,13 @@ pub struct RestartResumeSummary {
 /// already re-derived each such job to Pending (a node) or Idle (a thread
 /// session), so selection also requires that status and no active run.
 ///
-/// It resumes once because whatever the continuation does, it mints a follow-up
-/// turn that becomes the latest work turn, started or, when refused, cancelled
-/// `launch_refused`. Either way the key stops matching, and a later boot cannot
-/// match it either, since the turn ended before that boot. A refused resume
-/// leaves the job Pending (wants-to-run) for the DAG or a message to pick up.
+/// It resumes once. A continuation that takes, or is refused after minting, leaves
+/// a follow-up turn at the head, started or cancelled `launch_refused`, so the key
+/// stops matching. One refused before minting writes nothing, and the old turn
+/// stays at the head. No later boot retries any of these, since the turn ended
+/// before that boot. A refused resume leaves the job Pending (wants-to-run) for
+/// the DAG or a message to pick up, and a child's parent hears about it through
+/// `lifecycle::child_unresumed`.
 ///
 /// Each job is launched through the recovery entry of the ordinary launch
 /// funnel, under the job's launch lock and after a compare-and-set that the head
@@ -174,7 +176,20 @@ pub struct RestartResumeSummary {
 /// calls until then (cairn/4758). Before readiness it selects nothing; admission
 /// would hold any launch anyway, but a pass that cannot do its work should not
 /// pretend to.
+///
+/// Every way out marks the pass over, including the two that resumed nothing,
+/// because nothing retries a pass. The unresumed-child sweep acts only once that
+/// mark is set, since until then it could not honestly say a resume did not take.
 pub fn resume_jobs_interrupted_by_restart(
+    orch: &crate::orchestrator::Orchestrator,
+    boot_at: i64,
+) -> RestartResumeSummary {
+    let summary = restart_resume_pass(orch, boot_at);
+    orch.mark_restart_resume_pass_over();
+    summary
+}
+
+fn restart_resume_pass(
     orch: &crate::orchestrator::Orchestrator,
     boot_at: i64,
 ) -> RestartResumeSummary {

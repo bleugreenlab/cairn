@@ -801,6 +801,7 @@ impl OrchestratorBuilder {
             provider_admission_cache,
             agent_memory: Arc::default(),
             startup_readiness: self.startup_readiness,
+            restart_resume_pass_over: Arc::default(),
             fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
             permission_responses: self.permission_responses,
@@ -1531,6 +1532,10 @@ pub struct Orchestrator {
     /// callback gateway's 503 hold and the admission promoters read. See
     /// [`startup_readiness`].
     pub startup_readiness: startup_readiness::StartupReadiness,
+    /// Whether this process's boot resume pass has finished, however it
+    /// finished. It never reopens. A host that runs no pass never sets it, so it
+    /// never reports a resume as having not taken.
+    restart_resume_pass_over: Arc<std::sync::atomic::AtomicBool>,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
@@ -3321,6 +3326,16 @@ impl Orchestrator {
         crate::runs::queries::resume_jobs_interrupted_by_restart(self, self.boot_at)
     }
 
+    pub(crate) fn restart_resume_pass_over(&self) -> bool {
+        self.restart_resume_pass_over
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_restart_resume_pass_over(&self) {
+        self.restart_resume_pass_over
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub async fn redispatch_crashed_workflows(&self) {
         crate::execution::jobs::redispatch_crashed_workflows(self).await;
     }
@@ -4026,6 +4041,9 @@ impl Orchestrator {
                 // stranded-job recovery that reads the same lifecycle evidence
                 // (CAIRN-4609).
                 crate::orchestrator::lifecycle::sweep_stalled_children(&orch).await;
+                // Likewise a child whose one restart resume did not take: some of
+                // those refusals leave no row to fire from.
+                crate::orchestrator::lifecycle::sweep_unresumed_children(&orch).await;
                 let orch = orch.clone();
                 // Off the async worker: the eviction lookup and kills block on
                 // DB round-trips, so keep the runtime responsive.

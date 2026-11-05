@@ -32,6 +32,11 @@ pub const FACT_KIND_CHECKS_SETTLED: &str = "checks_settled";
 /// it (CAIRN-4609). Issue-sourced, like every other child fact, so it reaches
 /// the node currently driving the parent through the same derived watch.
 pub const FACT_KIND_CHILD_STALLED: &str = "child_stalled";
+/// A child node's turn was cancelled by a host restart and the one automatic
+/// resume that follows did not take. Issue-sourced for the same reason as
+/// [`FACT_KIND_CHILD_STALLED`], and independent of it: this one never looks at
+/// sessions.
+pub const FACT_KIND_CHILD_UNRESUMED: &str = "child_unresumed";
 
 /// Whether a job status is one the projection will never move again on its own.
 ///
@@ -56,6 +61,7 @@ pub const DEFAULT_CHILD_FACT_KINDS: &[&str] = &[
     "resolved",
     FACT_KIND_MESSAGE,
     FACT_KIND_CHILD_STALLED,
+    FACT_KIND_CHILD_UNRESUMED,
 ];
 pub const REVIEW_LEGACY_FACT_KINDS: &[&str] = &["agent_idle_with_work", "pr_state_change"];
 

@@ -20,7 +20,9 @@
 //! - [`finalize`] — warm transition, run finalization, memory-review completion
 
 mod backend_turn;
+mod child_attention;
 mod child_stall;
+mod child_unresumed;
 mod common;
 mod finalize;
 mod process_lifetime;
@@ -37,6 +39,7 @@ pub(crate) use backend_turn::{
 };
 
 pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
+pub(crate) use child_unresumed::{render_unresumed_push_body, sweep_unresumed_children};
 pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::{
     current_session_closed, finalize_run_for_operator_compact, finalize_run_for_recovery,
@@ -90,6 +93,11 @@ pub(crate) use stop::{stop_session_internal, StopReason};
 /// notice rather than accumulating wakes.
 #[cfg(test)]
 mod child_stall_tests;
+/// cairn/4835: the parent-facing fact for a child whose one restart resume did
+/// not take — which row shapes produce it, which must not, and that one episode
+/// is one wake however many ticks and boots observe it.
+#[cfg(test)]
+mod child_unresumed_tests;
 #[cfg(test)]
 mod memory_review_tests;
 #[cfg(test)]

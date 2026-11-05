@@ -1558,6 +1558,292 @@ async fn a_failing_resume_settles_wants_to_run_and_is_not_retried() {
     }
 }
 
+/// A coordinator node on its own parent issue, with an open session and no turns,
+/// so the boot resume has nothing to say about it.
+async fn seed_parent_coordinator(db: &LocalDb, number: i64) {
+    db.execute(
+        "INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
+         VALUES('parent','p',?1,'Parent','active',1,1)",
+        params![number],
+    )
+    .await
+    .unwrap();
+    db.execute_script(
+        "INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq)
+           VALUES('parent-exec','recipe','parent','p','running',1,1);
+         INSERT INTO jobs(id,project_id,issue_id,execution_id,status,uri_segment,
+                          current_session_id,created_at,updated_at,started_at)
+           VALUES('parent-job','p','parent','parent-exec','running','coordinator',
+                  'parent-session',3,3,3);
+         INSERT INTO sessions(id,job_id,status,sequence,created_at,updated_at)
+           VALUES('parent-session','parent-job','open',1,3,3);",
+    )
+    .await
+    .unwrap();
+}
+
+/// `(recipient, key, content_ref, fingerprint)` of every `child-unresumed:` push,
+/// delivered or not.
+async fn unresumed_pushes(db: &LocalDb) -> Vec<(String, String, String, String)> {
+    use crate::storage::RowExt as _;
+    db.query_all(
+        "SELECT recipient, key, content_ref, fingerprint FROM attention_pushes
+          WHERE key LIKE 'child-unresumed:%'",
+        (),
+        |row| {
+            Ok((
+                row.text(0)?,
+                row.text(1)?,
+                row.text(2)?,
+                row.opt_text(3)?.unwrap_or_default(),
+            ))
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Every row the child node owns that the sweep could have written to, so a test
+/// can assert it wrote to none of them.
+async fn child_footprint(db: &LocalDb, job: &str) -> String {
+    use crate::storage::RowExt as _;
+    let mut footprint = status(db, job).await;
+    for sql in [
+        "SELECT id || '/' || state || '/' || COALESCE(end_reason, '-') || '/' || updated_at
+           FROM turns WHERE job_id = ?1 ORDER BY id",
+        "SELECT id || '/' || COALESCE(status, '-') || '/' || updated_at
+           FROM runs WHERE job_id = ?1 ORDER BY id",
+        "SELECT id || '/' || status || '/' || updated_at
+           FROM sessions WHERE job_id = ?1 ORDER BY id",
+    ] {
+        let rows = db
+            .query_all(sql, (job.to_string(),), |row| row.text(0))
+            .await
+            .unwrap();
+        footprint.push('\n');
+        footprint.push_str(&rows.join(","));
+    }
+    footprint
+}
+
+/// Child node `jc` on issue 2 with a parent coordinator on issue 1, plus the
+/// `review` task the standard recipe creates up front: `pending`, no turns, and
+/// waiting on the node.
+async fn seed_child_with_parent(db: &LocalDb) {
+    seed_parent_coordinator(db, 1).await;
+    seed_node_job(db, "jc", 2, "active").await;
+    db.execute_script(
+        "UPDATE issues SET parent_issue_id = 'parent' WHERE id = 'i-jc';
+         INSERT INTO jobs(id,execution_id,recipe_node_id,parent_job_id,issue_id,project_id,status,
+                          node_name,uri_segment,current_session_id,model,created_at,updated_at)
+           VALUES('review-jc','exec-jc','review-node','jc','i-jc','p','pending','Review','review',
+                  's-review-jc','opus',1,1);
+         INSERT INTO sessions(id,job_id,status,sequence,created_at,updated_at)
+           VALUES('s-review-jc','review-jc','open',1,1,1);",
+    )
+    .await
+    .unwrap();
+}
+
+/// A turn an earlier boot settled and no resume ever took, on a run long over: the
+/// shape a pass that never ran, or a refusal before minting, leaves behind.
+async fn seed_settled_episode(db: &LocalDb) {
+    seed_turn(
+        db,
+        "turn-jc",
+        "jc",
+        None,
+        2,
+        "cancelled",
+        "follow_up",
+        Some("orphaned_pending"),
+    )
+    .await;
+    db.execute_script(
+        "UPDATE turns SET started_at = NULL WHERE id = 'turn-jc';
+         UPDATE runs SET status = 'crashed', exit_reason = 'crash' WHERE id = 'r-jc';
+         UPDATE jobs SET status = 'pending' WHERE id = 'jc';",
+    )
+    .await
+    .unwrap();
+}
+
+/// Until this process's pass has finished the sweep can say nothing honestly, so
+/// it neither tells nor withdraws, and a host that never runs a pass stays here.
+/// After it, an episode an earlier boot left behind is told like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_does_nothing_until_this_processs_resume_pass_has_finished() {
+    use crate::orchestrator::lifecycle::{render_unresumed_push_body, sweep_unresumed_children};
+    const CHILD_NODE: &str = "cairn://p/p/2/1/builder";
+
+    let (orch, db, _prompts, _backend) = host("restart-unresumed-pass").await;
+    seed_child_with_parent(&db).await;
+    seed_settled_episode(&db).await;
+    db.execute(
+        "INSERT INTO attention_pushes (id, recipient, content_ref, wake, boundary, key, created_at)
+         VALUES ('stale', 'parent-job', 'cairn://p/p/9/1/builder', 'wake', 'event',
+                 'child-unresumed:cairn://p/p/9/1/builder', 1)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let before = sweep_unresumed_children(&orch).await;
+    assert!(before.told.is_empty(), "{before:?}");
+    assert_eq!(before.withdrawn, 0, "it withdraws nothing either");
+    assert_eq!(
+        render_unresumed_push_body(&orch, "parent-job", CHILD_NODE).await,
+        None,
+        "and delivery falls back to the pointer"
+    );
+
+    assert_eq!(resume(&orch).await.selected, 0, "the turn predates this boot");
+
+    let after = sweep_unresumed_children(&orch).await;
+    assert_eq!(
+        after.told,
+        vec![(CHILD_NODE.to_string(), vec!["parent-job".to_string()])]
+    );
+    assert_eq!(after.withdrawn, 1, "the node that is not standing goes");
+}
+
+/// A parent that drains the fact after the child moved on, in the tick before the
+/// sweep withdraws it, reads that nothing is owed. The sweep then clears the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_that_moved_on_reads_that_nothing_is_owed() {
+    use crate::orchestrator::lifecycle::{render_unresumed_push_body, sweep_unresumed_children};
+    const CHILD_NODE: &str = "cairn://p/p/2/1/builder";
+
+    let (orch, db, _prompts, _backend) = host("restart-unresumed-moved-on").await;
+    seed_child_with_parent(&db).await;
+    seed_settled_episode(&db).await;
+    resume(&orch).await;
+    assert_eq!(sweep_unresumed_children(&orch).await.told.len(), 1);
+
+    seed_turn(&db, "turn-jc2", "jc", None, 3, "running", "follow_up", None).await;
+
+    let body = render_unresumed_push_body(&orch, "parent-job", CHILD_NODE)
+        .await
+        .expect("the body renders");
+    assert!(body.contains(CHILD_NODE), "{body}");
+    assert!(body.contains("no longer in that state"), "{body}");
+    assert!(body.contains("Nothing is owed"), "{body}");
+
+    sweep_unresumed_children(&orch).await;
+    let undelivered = db
+        .query_opt_i64(
+            "SELECT COUNT(*) FROM attention_pushes
+              WHERE key LIKE 'child-unresumed:%' AND delivered_event_id IS NULL",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(undelivered, Some(0));
+}
+
+/// cairn/4835. A child with a pending runless turn, an open provider session and
+/// a parent coordinator goes through the real boot path: the sweep settles the
+/// turn `orphaned_pending`, the one resume is refused, and the parent is told once.
+/// Neither another tick nor another boot tells it again, and nothing on this path
+/// touches the child, because the parent decides what happens to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_whose_orphaned_turn_was_never_resumed_wakes_its_parent_once() {
+    use crate::orchestrator::lifecycle::{render_unresumed_push_body, sweep_unresumed_children};
+    const CHILD_NODE: &str = "cairn://p/p/2/1/builder";
+
+    let (orch, db, _prompts, _backend) = host("restart-unresumed-child").await;
+    seed_child_with_parent(&db).await;
+    seed_turn(
+        &db,
+        "turn-jc0",
+        "jc",
+        Some("r-jc"),
+        1,
+        "complete",
+        "initial",
+        None,
+    )
+    .await;
+    seed_turn(&db, "turn-jc", "jc", None, 2, "pending", "follow_up", None).await;
+    db.execute(
+        "UPDATE jobs SET agent_config_id = 'no-such-agent' WHERE id = 'jc'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    reconcile(&orch).await;
+    assert_eq!(
+        status(&db, "review-jc").await,
+        "pending",
+        "the review task is still waiting on the node, as in production"
+    );
+    assert_eq!(
+        settlement(&db, "turn-jc").await,
+        "cancelled/orphaned_pending"
+    );
+
+    let before_the_pass = sweep_unresumed_children(&orch).await;
+    assert!(
+        before_the_pass.told.is_empty() && unresumed_pushes(&db).await.is_empty(),
+        "the resume has not had its chance yet, so saying it failed would be false"
+    );
+
+    let summary = resume(&orch).await;
+    assert_eq!(summary.refused, 1, "{summary:?}");
+    let footprint = child_footprint(&db, "jc").await;
+
+    let told = sweep_unresumed_children(&orch).await;
+    assert_eq!(
+        told.told,
+        vec![(CHILD_NODE.to_string(), vec!["parent-job".to_string()])],
+        "one wake, to the parent coordinator"
+    );
+    let expected = vec![(
+        "parent-job".to_string(),
+        format!("child-unresumed:{CHILD_NODE}"),
+        CHILD_NODE.to_string(),
+        "turn-jc".to_string(),
+    )];
+    assert_eq!(unresumed_pushes(&db).await, expected);
+
+    let body = render_unresumed_push_body(&orch, "parent-job", CHILD_NODE)
+        .await
+        .expect("the body renders");
+    assert!(body.contains(CHILD_NODE), "{body}");
+    assert!(body.contains("turn-jc"), "{body}");
+    assert!(body.contains("orphaned_pending"), "{body}");
+    assert!(body.contains("1 refused launch since"), "{body}");
+    assert!(body.contains("resumable"), "{body}");
+
+    let again = sweep_unresumed_children(&orch).await;
+    assert!(again.told.is_empty(), "{again:?}");
+    assert_eq!(unresumed_pushes(&db).await, expected);
+
+    let later_boot = chrono::Utc::now().timestamp() + 10;
+    let boot = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        super::reconcile_stale_runs(&boot, boot.services.emitter.as_ref(), later_boot);
+        super::resume_jobs_interrupted_by_restart(&boot, later_boot)
+    })
+    .await
+    .map(|summary| assert_eq!(summary.selected, 0, "{summary:?}"))
+    .unwrap();
+    let next_boot = sweep_unresumed_children(&orch).await;
+    assert!(next_boot.told.is_empty(), "{next_boot:?}");
+    assert_eq!(
+        unresumed_pushes(&db).await,
+        expected,
+        "another boot over unchanged state repeats nothing"
+    );
+
+    assert_eq!(
+        child_footprint(&db, "jc").await,
+        footprint,
+        "the sweep observes and never writes to the child"
+    );
+}
+
 /// A pending turn bound to a stale run never began. It used to settle `failed`,
 /// which reprojection would read as a failed job; it now settles resumable, and
 /// its resume is told nothing ran. Its stamped delivery returns to the queue
