@@ -1,3 +1,4 @@
+use super::installer::EngineCapabilities;
 use super::{
     current_target, model_catalog, ComponentInstaller, ComponentState, DictationMode, EngineState,
     InstallEvent, ManagedComponent, ModelPurpose, ProtocolCommand, ProtocolEvent, Transcript,
@@ -421,13 +422,22 @@ impl VoiceServiceHandle {
 
     pub async fn status(&self) -> VoiceResult<VoiceStatus> {
         let manifest = self.0.installer.manifest().await?;
-        let engine = if let Some(path) = &self.0.engine_override {
+        let (engine, capabilities) = if let Some(path) = &self.0.engine_override {
             match super::installer::probe_engine(path, &self.0.app_version).await {
-                Ok(()) => ComponentState::Installed,
-                Err(_) => ComponentState::Incompatible,
+                Ok(capabilities) => (ComponentState::Installed, Some(capabilities)),
+                Err(_) => (ComponentState::Incompatible, None),
             }
         } else {
-            engine_component_state(&self.0.installer, self.0.target, &manifest.components).await
+            let state =
+                engine_component_state(&self.0.installer, self.0.target, &manifest.components)
+                    .await;
+            let capabilities = match find_component(&manifest.components, "engine") {
+                Ok(component) if state == ComponentState::Installed => {
+                    self.0.installer.engine_capabilities(component).await.ok()
+                }
+                _ => None,
+            };
+            (state, capabilities)
         };
         // Only while the engine is not usable: a refused handoff leaves the
         // current engine in place, and nothing would ever clear its failure.
@@ -440,8 +450,14 @@ impl VoiceServiceHandle {
             component_state(&self.0.installer, &manifest.components, "model:fast").await;
         let accurate_model =
             component_state(&self.0.installer, &manifest.components, "model:accurate").await;
-        let realtime_model =
-            component_state(&self.0.installer, &manifest.components, "model:realtime").await;
+        // A current engine without Parakeet makes Realtime unusable whether or
+        // not the model is on disk. A stale engine says nothing about the one
+        // that will replace it, so it leaves the model's own state standing.
+        let realtime_model = if capabilities.is_some_and(|capabilities| !capabilities.realtime) {
+            ComponentState::Incompatible
+        } else {
+            component_state(&self.0.installer, &manifest.components, "model:realtime").await
+        };
         Ok(VoiceStatus {
             supported: self.0.target.is_some(),
             enabled: self.0.enabled.load(Ordering::Acquire),
@@ -511,6 +527,7 @@ impl VoiceServiceHandle {
             .installer
             .verify(find_component(&manifest.components, model_kind(model))?)
             .await?;
+        self.admit_on_current_engine(model).await?;
         let mut preferences = self
             .preferences(self.0.enabled.load(Ordering::Acquire))
             .await;
@@ -530,6 +547,40 @@ impl VoiceServiceHandle {
             }
         }
         self.status().await
+    }
+
+    /// What the engine that would serve the next request can run, or `None`
+    /// where there is no current engine to ask: a missing or stale one says
+    /// nothing about the engine that will replace it.
+    async fn current_engine_capabilities(&self) -> VoiceResult<Option<EngineCapabilities>> {
+        if let Some(path) = &self.0.engine_override {
+            return super::installer::probe_engine(path, &self.0.app_version)
+                .await
+                .map(Some);
+        }
+        let Some(target) = self.0.target else {
+            return Ok(None);
+        };
+        let manifest = self.0.installer.manifest().await?;
+        let Ok(engine) = find_component(&manifest.components, "engine") else {
+            return Ok(None);
+        };
+        if !self.0.installer.engine_is_current(engine, target) {
+            return Ok(None);
+        }
+        self.0.installer.engine_capabilities(engine).await.map(Some)
+    }
+
+    /// Refuse `model` when the current engine is known not to run it. Only
+    /// Realtime depends on how the engine was built, so the others never ask.
+    async fn admit_on_current_engine(&self, model: VoiceModel) -> VoiceResult<()> {
+        if model != VoiceModel::Realtime {
+            return Ok(());
+        }
+        match self.current_engine_capabilities().await? {
+            Some(capabilities) => capabilities.admit(model),
+            None => Ok(()),
+        }
     }
 
     pub async fn download_model(&self, model: VoiceModel) -> VoiceResult<VoiceStatus> {
@@ -890,7 +941,9 @@ impl VoiceServiceHandle {
         if guard.is_none() {
             let manifest = self.0.installer.manifest().await?;
             let engine_path = if let Some(path) = &self.0.engine_override {
-                super::installer::probe_engine(path, &self.0.app_version).await?;
+                super::installer::probe_engine(path, &self.0.app_version)
+                    .await?
+                    .admit(model)?;
                 path.clone()
             } else {
                 let target = self.0.target.ok_or(VoiceError::UnsupportedTarget)?;
@@ -902,6 +955,15 @@ impl VoiceServiceHandle {
                     self.install_engine(target).await?
                 };
                 self.0.installer.verify(&engine).await?;
+                // Asked of the engine resolved here, after any handoff it
+                // adopted, since that is the engine about to be handed the model.
+                if model == VoiceModel::Realtime {
+                    self.0
+                        .installer
+                        .engine_capabilities(&engine)
+                        .await?
+                        .admit(model)?;
+                }
                 engine.path
             };
             let model_component = find_component(&manifest.components, model_kind(model))?;
@@ -946,6 +1008,7 @@ impl VoiceServiceHandle {
             self.0.restart_attempts.store(0, Ordering::Release);
             *self.0.loaded_model.lock().await = Some(model);
         } else if *self.0.loaded_model.lock().await != Some(model) {
+            self.admit_on_current_engine(model).await?;
             let manifest = self.0.installer.manifest().await?;
             let component = find_component(&manifest.components, model_kind(model))?;
             self.0.installer.verify(component).await?;
@@ -1201,7 +1264,8 @@ mod tests {
         assert_eq!(
             status.realtime_model,
             ComponentState::Installed,
-            "a Parakeet model is as version-independent as a whisper one"
+            "a Parakeet model is as version-independent as a whisper one, and a stale engine \
+             says nothing about whether the engine replacing it can run Realtime"
         );
         assert_eq!(
             status.engine_failure, None,
@@ -1328,7 +1392,7 @@ mod tests {
     const PREAMBLE: &str = r#"#!/bin/sh
 LOG='@LOG@'
 if [ "$1" = '--distribution-info' ]; then
-  printf '{"name":"cairn-voice","version":"@VERSION@","protocolVersion":@PROTOCOL@}\n'
+  printf '{"name":"cairn-voice","version":"@VERSION@","protocolVersion":@PROTOCOL@@PARAKEET@}\n'
   exit 0
 fi
 printf '{"type":"hello","protocolVersion":@PROTOCOL@,"engineVersion":"@VERSION@"}\n'
@@ -1352,20 +1416,32 @@ done
     *'"type":"transcribeFile"'*)
       printf '{"type":"done","requestId":"%s","text":"a file","segments":[],"audioDurationMs":1}\n' "$id" ;;"#;
 
+    /// What `--distribution-info` adds for an engine built with the Parakeet
+    /// backend. Without it the preamble prints the whisper-only shape every
+    /// engine printed before Realtime, as the published 0.12.34 engine does.
+    const PARAKEET_PROVENANCE: &str =
+        r#","parakeet":{"commit":"test","ggmlCommit":"test","patches":[],"device":"cpu"}"#;
+
     /// An engine script that logs every command it receives to `log`.
     fn engine_script(log: &Path, script: &str) -> String {
+        engine_script_reporting(log, script, "")
+    }
+
+    /// [`engine_script`], with `provenance` appended to its distribution info.
+    fn engine_script_reporting(log: &Path, script: &str, provenance: &str) -> String {
         PREAMBLE
             .replace("@LOG@", &log.display().to_string())
             .replace("@VERSION@", APP_VERSION)
             .replace("@PROTOCOL@", &crate::voice::PROTOCOL_VERSION.to_string())
+            .replace("@PARAKEET@", provenance)
             .replace("@SCRIPT@", script)
     }
 
-    fn scripted_engine(root: &Path, script: &str) -> PathBuf {
+    fn scripted_engine(root: &Path, script: &str, provenance: &str) -> PathBuf {
         let executable = root.join("fake-voice-engine");
         std::fs::write(
             &executable,
-            engine_script(&root.join("commands.log"), script),
+            engine_script_reporting(&root.join("commands.log"), script, provenance),
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1413,9 +1489,29 @@ done
         }
 
         fn with_preferences(script: &str, preferences: super::super::VoicePreferences) -> Harness {
+            Harness::reporting(script, preferences, "")
+        }
+
+        /// [`Harness::new`] with an engine built with the Parakeet backend.
+        fn parakeet(script: &str) -> Harness {
+            Harness::reporting(
+                script,
+                super::super::VoicePreferences {
+                    enabled: true,
+                    ..Default::default()
+                },
+                PARAKEET_PROVENANCE,
+            )
+        }
+
+        fn reporting(
+            script: &str,
+            preferences: super::super::VoicePreferences,
+            provenance: &str,
+        ) -> Harness {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().to_path_buf();
-            let engine = scripted_engine(&root, script);
+            let engine = scripted_engine(&root, script, provenance);
             std::fs::write(
                 root.join("voice-components.json"),
                 serde_json::to_vec(&manifest(&root)).unwrap(),
@@ -1522,6 +1618,29 @@ done
             self.service.handle()
         }
 
+        /// Add a verified Realtime model to the managed install.
+        fn install_realtime(&self) {
+            let root = self.directory.path();
+            let manifest_path = root.join("voice-components.json");
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+            let bytes = b"model:realtime";
+            let path = root.join("models/model-realtime");
+            std::fs::write(&path, bytes).unwrap();
+            manifest["components"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "kind": "model:realtime",
+                    "id": "model-realtime",
+                    "target": Value::Null,
+                    "sizeBytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(bytes)),
+                    "path": path,
+                }));
+            std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        }
+
         /// Every command line the engine has received, in order.
         fn commands(&self) -> Vec<String> {
             std::fs::read_to_string(self.directory.path().join("commands.log"))
@@ -1546,7 +1665,7 @@ done
                 .into_iter()
                 .filter(|line| line.contains("\"type\":\"loadModel\""))
                 .map(|line| {
-                    ["model-fast", "model-accurate"]
+                    ["model-fast", "model-accurate", "model-realtime"]
                         .into_iter()
                         .find(|model| line.contains(model))
                         .unwrap_or("unknown")
@@ -1613,6 +1732,105 @@ done
             voice.preferred_file_model().await,
             VoiceModel::Fast,
             "choosing a dictation model must not move the file setting"
+        );
+    }
+
+    /// The 2026-10-10 defect: an engine that identifies as this version but was
+    /// built before Parakeet. Realtime is reported unusable and refused by
+    /// name, and Fast is untouched.
+    #[tokio::test]
+    async fn an_engine_without_parakeet_reports_realtime_incompatible_and_refuses_it() {
+        let harness = Harness::new(COOPERATIVE);
+        harness.install_realtime();
+        let voice = harness.voice();
+
+        let status = voice.status().await.unwrap();
+        assert_eq!(status.engine, ComponentState::Installed);
+        assert_eq!(status.realtime_model, ComponentState::Incompatible);
+        assert_eq!(status.fast_model, ComponentState::Installed);
+
+        let error = voice
+            .set_preferred_model(ModelPurpose::Dictation, VoiceModel::Realtime)
+            .await
+            .expect_err("Realtime cannot be chosen on this engine");
+        assert_eq!(error.code(), "realtime_unsupported");
+        assert!(
+            error.to_string().contains("predates the Realtime model"),
+            "{error}"
+        );
+        assert_eq!(
+            voice.preferred_dictation_model().await,
+            VoiceModel::Fast,
+            "a refused choice is not remembered"
+        );
+    }
+
+    /// A Realtime preference saved before the engine changed under it fails
+    /// with the cause, and the engine is never handed the GGUF to try as a
+    /// whisper model.
+    #[tokio::test]
+    async fn a_saved_realtime_preference_on_an_engine_without_parakeet_never_loads() {
+        let harness = Harness::with_preferences(
+            COOPERATIVE,
+            super::super::VoicePreferences {
+                enabled: true,
+                preferred_dictation_model: VoiceModel::Realtime,
+                ..Default::default()
+            },
+        );
+        harness.install_realtime();
+        let voice = harness.voice();
+
+        let error = voice
+            .stream_start()
+            .await
+            .expect_err("dictation cannot open on Realtime here");
+        assert_eq!(error.code(), "realtime_unsupported");
+        assert_eq!(harness.count_command("loadModel"), 0);
+    }
+
+    /// The same refusal for a managed engine, probed through the installer,
+    /// and for a running engine asked to swap to Realtime.
+    #[tokio::test]
+    async fn a_managed_engine_without_parakeet_refuses_a_swap_to_realtime() {
+        let harness = Harness::managed(COOPERATIVE);
+        harness.install_realtime();
+        let voice = harness.voice();
+        assert_eq!(
+            voice.status().await.unwrap().realtime_model,
+            ComponentState::Incompatible
+        );
+
+        let stream = voice.stream_start().await.expect("Fast still dictates");
+        voice.stream_finish(stream).await.expect("session closes");
+        let error = voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Realtime, None)
+            .await
+            .expect_err("the running engine cannot swap to Realtime");
+        assert_eq!(error.code(), "realtime_unsupported");
+        assert_eq!(harness.loads(), ["model-fast"]);
+    }
+
+    /// An engine built with Parakeet runs Realtime like any other model.
+    #[tokio::test]
+    async fn an_engine_with_parakeet_offers_and_loads_realtime() {
+        let harness = Harness::parakeet(COOPERATIVE);
+        harness.install_realtime();
+        let voice = harness.voice();
+        assert_eq!(
+            voice.status().await.unwrap().realtime_model,
+            ComponentState::Installed
+        );
+
+        voice
+            .set_preferred_model(ModelPurpose::Dictation, VoiceModel::Realtime)
+            .await
+            .expect("Realtime can be chosen");
+        let stream = voice.stream_start().await.expect("session opens");
+        voice.stream_finish(stream).await.expect("session closes");
+        assert_eq!(
+            harness.loads().last().map(String::as_str),
+            Some("model-realtime")
         );
     }
 

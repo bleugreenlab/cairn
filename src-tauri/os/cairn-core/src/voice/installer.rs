@@ -1,9 +1,11 @@
 use super::{
-    engine_asset_name, ManagedComponent, ModelArtifact, VoiceError, VoiceResult, PROTOCOL_VERSION,
+    engine_asset_name, ManagedComponent, ModelArtifact, VoiceError, VoiceModel, VoiceResult,
+    PROTOCOL_VERSION,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -17,6 +19,10 @@ const MAX_ENGINE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 1024;
 /// Shortest gap between two progress events for one download.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a download may go without a byte before it fails. A download has no
+/// overall deadline, since a model is up to a gigabyte on whatever link the
+/// operator has, so this is what ends one whose connection silently stopped.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One download's observable life. `operation_id` is minted per download and
 /// repeated on every event of that download: the UI latches the id it sees start
@@ -147,10 +153,14 @@ pub struct ComponentInstaller {
     /// engine to the app it was built with.
     build_identity: String,
     client: reqwest::Client,
+    stall_timeout: Duration,
     events: EventSink,
     /// Shared so an engine commit can carry the lock into a task of its own and
     /// keep it until the commit settles, whoever stops waiting for it.
     install_lock: Arc<Mutex<()>>,
+    /// What each engine build can run, by its sha256. See
+    /// [`ComponentInstaller::engine_capabilities`].
+    capabilities: std::sync::Mutex<HashMap<String, EngineCapabilities>>,
     #[cfg(test)]
     commit_gate: Option<Arc<CommitGate>>,
 }
@@ -191,8 +201,10 @@ impl ComponentInstaller {
             app_version: app_version.into(),
             build_identity: build_identity.into(),
             client: cairn_tls::client().clone(),
+            stall_timeout: DOWNLOAD_STALL_TIMEOUT,
             events: Arc::new(events),
             install_lock: Arc::new(Mutex::new(())),
+            capabilities: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             commit_gate: None,
         }
@@ -370,10 +382,14 @@ impl ComponentInstaller {
             probe_engine(staged, &self.app_version).await
         }
         .await;
-        if let Err(error) = probed {
-            let _ = tokio::fs::remove_file(staged).await;
-            return Err(error);
-        }
+        let capabilities = match probed {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(staged).await;
+                return Err(error);
+            }
+        };
+        self.remember_capabilities(&component.sha256, capabilities);
         let destination = self.engine_dir().join(&asset);
         component.id = asset.clone();
         component.target = Some(target.to_owned());
@@ -399,6 +415,36 @@ impl ComponentInstaller {
             VoiceError::Install(format!("engine publication task failed: {error}"))
         })??;
         Ok(component)
+    }
+
+    /// What the engine `component` records can run, probed once per engine
+    /// build. Keyed by digest, so an engine installed before anything asked
+    /// (by a release, a handoff, or by hand) is probed on first use, and a
+    /// replaced engine never answers for its successor. The caller has
+    /// verified the bytes against that digest.
+    pub(crate) async fn engine_capabilities(
+        &self,
+        component: &ManagedComponent,
+    ) -> VoiceResult<EngineCapabilities> {
+        let known = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&component.sha256)
+            .copied();
+        if let Some(known) = known {
+            return Ok(known);
+        }
+        let probed = probe_engine(&component.path, &self.app_version).await?;
+        self.remember_capabilities(&component.sha256, probed);
+        Ok(probed)
+    }
+
+    fn remember_capabilities(&self, sha256: &str, capabilities: EngineCapabilities) {
+        self.capabilities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(sha256.to_owned(), capabilities);
     }
 
     pub fn engine_is_current(&self, component: &ManagedComponent, target: &str) -> bool {
@@ -514,6 +560,13 @@ impl ComponentInstaller {
         Ok(bytes.to_vec())
     }
 
+    fn stalled(&self) -> VoiceError {
+        VoiceError::Install(format!(
+            "download stalled: no data for {:?}",
+            self.stall_timeout
+        ))
+    }
+
     async fn download_verified(
         &self,
         kind: &str,
@@ -538,11 +591,9 @@ impl ComponentInstaller {
                 .unwrap_or_default()
         ));
         let _ = tokio::fs::remove_file(&partial).await;
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let response = tokio::time::timeout(self.stall_timeout, self.client.get(url).send())
             .await
+            .map_err(|_| self.stalled())?
             .map_err(|error| VoiceError::Install(format!("download failed: {error}")))?
             .error_for_status()
             .map_err(|error| VoiceError::Install(format!("download failed: {error}")))?;
@@ -561,7 +612,10 @@ impl ComponentInstaller {
         let mut stream = response.bytes_stream();
         let mut downloaded = 0_u64;
         let mut hasher = Sha256::new();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(self.stall_timeout, stream.next())
+            .await
+            .map_err(|_| self.stalled())?
+        {
             let chunk = chunk
                 .map_err(|error| VoiceError::Install(format!("download interrupted: {error}")))?;
             downloaded = downloaded.saturating_add(chunk.len() as u64);
@@ -1026,9 +1080,37 @@ struct DistributionInfo {
     name: String,
     version: String,
     protocol_version: u32,
+    /// Read for its presence alone; see [`EngineCapabilities`].
+    #[serde(default)]
+    parakeet: Option<serde::de::IgnoredAny>,
 }
 
-pub(crate) async fn probe_engine(path: &Path, version: &str) -> VoiceResult<()> {
+/// What an engine can run beyond what its distribution identity promises.
+///
+/// The version string names a release, not a build. A self-rebuild of main and
+/// the published engine of the same version share it, yet only one of them may
+/// carry the Parakeet backend (see the versioning section of PROTOCOL.md). An
+/// engine built with that backend reports its provenance under `parakeet` in
+/// `--distribution-info`, so the key's presence is the capability. Reading it
+/// leaves the exact-version identity check exactly as strict as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineCapabilities {
+    pub realtime: bool,
+}
+
+impl EngineCapabilities {
+    /// Refuse a model this engine cannot load, before it is handed one. An
+    /// engine without Parakeet would try the GGUF as a whisper model and fail
+    /// with an error that names neither the cause nor the remedy.
+    pub fn admit(self, model: VoiceModel) -> VoiceResult<()> {
+        if model == VoiceModel::Realtime && !self.realtime {
+            return Err(VoiceError::RealtimeUnsupported);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn probe_engine(path: &Path, version: &str) -> VoiceResult<EngineCapabilities> {
     let probe_failed = |error: std::io::Error| {
         VoiceError::Install(format!("engine identity probe failed: {error}"))
     };
@@ -1060,7 +1142,9 @@ pub(crate) async fn probe_engine(path: &Path, version: &str) -> VoiceResult<()> 
             "engine distribution identity does not match this app".into(),
         ));
     }
-    Ok(())
+    Ok(EngineCapabilities {
+        realtime: info.parakeet.is_some(),
+    })
 }
 
 #[cfg(test)]
@@ -1176,13 +1260,45 @@ mod tests {
     #[test]
     fn the_identity_probe_tolerates_fields_it_does_not_read() {
         let info: DistributionInfo = serde_json::from_str(
-            r#"{"name":"cairn-voice","version":"1.2.3","protocolVersion":1,
+            r#"{"name":"cairn-voice","version":"1.2.3","protocolVersion":1,"future":true,
                 "parakeet":{"commit":"abc","ggmlCommit":"def","patches":[],"device":"metal"}}"#,
         )
         .expect("unknown fields are ignored");
         assert_eq!(info.name, "cairn-voice");
         assert_eq!(info.version, "1.2.3");
         assert_eq!(info.protocol_version, 1);
+        assert!(
+            info.parakeet.is_some(),
+            "Parakeet provenance means the engine runs Realtime"
+        );
+    }
+
+    /// The shape every engine printed before the Parakeet backend, which the
+    /// published 0.12.34 engine still prints: identity only.
+    #[test]
+    fn an_engine_without_parakeet_provenance_cannot_run_realtime() {
+        let info: DistributionInfo = serde_json::from_str(
+            r#"{"name":"cairn-voice","protocolVersion":1,"version":"0.12.34"}"#,
+        )
+        .expect("the pre-Parakeet shape still identifies the engine");
+        assert!(info.parakeet.is_none());
+        let capabilities = EngineCapabilities { realtime: false };
+        let refused = capabilities
+            .admit(VoiceModel::Realtime)
+            .expect_err("Realtime is refused");
+        assert_eq!(refused.code(), "realtime_unsupported");
+        assert!(
+            refused.to_string().contains("predates the Realtime model"),
+            "{refused}"
+        );
+        for model in [VoiceModel::Fast, VoiceModel::Accurate] {
+            capabilities
+                .admit(model)
+                .expect("whisper models need nothing more than the identity");
+        }
+        EngineCapabilities { realtime: true }
+            .admit(VoiceModel::Realtime)
+            .expect("an engine with Parakeet runs Realtime");
     }
 
     #[test]
@@ -1373,6 +1489,59 @@ mod tests {
         );
     }
 
+    /// A connection that sends part of a model and then goes quiet fails the
+    /// download, rather than holding the install open for as long as the
+    /// socket lives.
+    #[tokio::test]
+    async fn a_download_that_stops_receiving_data_fails_as_stalled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 16\r\n\r\nfour")
+                .await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(socket);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let artifact = ModelArtifact {
+            model: super::super::VoiceModel::Fast,
+            file_name: "model-fast.bin",
+            url: Box::leak(format!("http://{address}/model-fast.bin").into_boxed_str()),
+            size_bytes: 16,
+            sha256: Box::leak(
+                format!("{:x}", Sha256::digest(b"sixteen bytes!!!")).into_boxed_str(),
+            ),
+        };
+        let mut installer = ComponentInstaller::new(
+            directory.path().to_path_buf(),
+            "http://127.0.0.1:1",
+            "1.2.3",
+            "test-build",
+            |_| {},
+        );
+        installer.stall_timeout = Duration::from_millis(200);
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(10), installer.install_model(&artifact))
+                .await
+                .expect("the stall bound ends the download")
+                .expect_err("a stalled download does not install");
+        assert!(
+            matches!(&error, VoiceError::Install(message) if message.starts_with("download stalled")),
+            "{error}"
+        );
+        assert!(!directory
+            .path()
+            .join("models")
+            .join(artifact.file_name)
+            .exists());
+    }
+
     /// The cross-language contract: exactly what `handOffVoiceEngine` in
     /// `scripts/self-rebuild-lib.ts` writes, and nothing else.
     #[test]
@@ -1412,6 +1581,28 @@ mod tests {
                 "#!/bin/sh\n# {marker}\nif [ \"$1\" = '--distribution-info' ]; then\n  printf '{{\"name\":\"{name}\",\"version\":\"{version}\",\"protocolVersion\":{PROTOCOL_VERSION}}}\\n'\n  exit {status}\nfi\nexit 0\n"
             )
             .into_bytes()
+        }
+
+        /// An engine that appends a line to `log` for every identity probe,
+        /// reporting Parakeet provenance when `parakeet` is set.
+        fn counting_engine(log: &Path, parakeet: bool) -> Vec<u8> {
+            let provenance = if parakeet {
+                r#","parakeet":{"commit":"c","ggmlCommit":"g","patches":[],"device":"cpu"}"#
+            } else {
+                ""
+            };
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = '--distribution-info' ]; then\n  echo probed >> '{log}'\n  printf '{{\"name\":\"cairn-voice\",\"version\":\"{VERSION}\",\"protocolVersion\":{PROTOCOL_VERSION}{provenance}}}\\n'\n  exit 0\nfi\nexit 0\n",
+                log = log.display()
+            )
+            .into_bytes()
+        }
+
+        fn probes(log: &Path) -> usize {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .count()
         }
 
         fn component(
@@ -1552,6 +1743,58 @@ mod tests {
                 );
                 assert!(!self.installer.local_engine_pending().await);
             }
+        }
+
+        /// The engine the operator's machine runs was installed before
+        /// capabilities were read at all. It is asked once, and the answer
+        /// stands for those bytes from then on.
+        #[tokio::test]
+        async fn an_engine_installed_before_capabilities_were_read_is_probed_once() {
+            let fixture = Fixture::new().await;
+            let root = fixture.directory.path();
+            let log = root.join("probes.log");
+            let path = root.join("voice/engine/hand-installed");
+            let bytes = counting_engine(&log, false);
+            std::fs::write(&path, &bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let engine = component("engine", path, &bytes, Some(fixture.target));
+
+            for _ in 0..3 {
+                let capabilities = fixture
+                    .installer
+                    .engine_capabilities(&engine)
+                    .await
+                    .unwrap();
+                assert!(
+                    !capabilities.realtime,
+                    "no Parakeet provenance, no Realtime"
+                );
+            }
+            assert_eq!(probes(&log), 1, "one probe per engine build");
+        }
+
+        /// Publication already probes the engine it installs; what that probe
+        /// learned is what the engine is asked for afterwards.
+        #[tokio::test]
+        async fn a_published_engine_answers_from_its_install_probe() {
+            let fixture = Fixture::new().await;
+            let log = fixture.directory.path().join("probes.log");
+            let engine = counting_engine(&log, true);
+            fixture.hand_off(THIS_RUNNER, &engine, &engine);
+
+            let installed = fixture
+                .installer
+                .install_engine(fixture.target)
+                .await
+                .expect("the handed-off engine is adopted");
+            let capabilities = fixture
+                .installer
+                .engine_capabilities(&installed)
+                .await
+                .unwrap();
+
+            assert!(capabilities.realtime);
+            assert_eq!(probes(&log), 1, "the install probe is the only probe");
         }
 
         #[tokio::test]

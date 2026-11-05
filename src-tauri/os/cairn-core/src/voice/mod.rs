@@ -202,6 +202,10 @@ pub enum VoiceError {
     /// handshake is exact-version, so no other release's engine can stand in.
     #[error("exact-version voice engine release asset is unavailable: {0}")]
     ReleaseAssetMissing(String),
+    /// The engine identifies as this version's but was built without the
+    /// Parakeet backend, so it cannot load the Realtime model.
+    #[error("this voice engine predates the Realtime model, so Cairn will not load Realtime on it; update Cairn to get an engine that includes it. Fast and Accurate still work.")]
+    RealtimeUnsupported,
 }
 
 impl VoiceError {
@@ -220,6 +224,7 @@ impl VoiceError {
             VoiceError::Transport(_) => "transport_failed",
             VoiceError::Install(_) => "install_failed",
             VoiceError::ReleaseAssetMissing(_) => "release_asset_missing",
+            VoiceError::RealtimeUnsupported => "realtime_unsupported",
         }
     }
 }
