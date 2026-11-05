@@ -341,6 +341,7 @@ async fn rebuild_provider_admission_snapshot(
         .collect();
     let mut unresolved: HashMap<RouteScope, HashMap<String, Vec<usize>>> = HashMap::new();
     for (index, record) in snapshot.records.iter_mut().enumerate() {
+        let mut owner_resolved = false;
         if let Some(old) = previous.get(record.request_id.as_str()).filter(|old| {
             old.authority_key == record.authority_key
                 && old.workspace_id == record.workspace_id
@@ -349,6 +350,9 @@ async fn rebuild_provider_admission_snapshot(
                 && old.owner.run_id == record.owner.run_id
                 && old.owner.execution_id == record.owner.execution_id
         }) {
+            owner_resolved = old.owner.project_id.is_some();
+            record.owner.thread_name = old.owner.thread_name.clone();
+            record.owner.project_key = old.owner.project_key.clone();
             if record.owner.project_id.is_none() {
                 record.owner.project_id = old.owner.project_id.clone();
                 record.owner.issue_id = old.owner.issue_id.clone();
@@ -361,9 +365,12 @@ async fn rebuild_provider_admission_snapshot(
                 record.enqueued_at_unix_ms = old.enqueued_at_unix_ms;
             }
         }
-        if record.owner.project_id.is_none() {
+        if !owner_resolved {
             if let Some(job_id) = &record.owner.job_id {
                 if let Ok(scope) = parse_route_scope(job_id) {
+                    // Local projections already know this ID. Only a successful
+                    // owner query may mark enrichment resolved for later refreshes.
+                    record.owner.project_id = None;
                     unresolved
                         .entry(scope)
                         .or_default()
@@ -386,7 +393,7 @@ async fn rebuild_provider_admission_snapshot(
             serde_json::to_string(&jobs.keys().collect::<Vec<_>>()).expect("job ids serialize");
         owner_query(&scope);
         let owners = db.query_all(
-            "SELECT j.id,j.project_id,j.issue_id,j.thread_id,i.number,j.node_name FROM jobs j LEFT JOIN issues i ON i.id=j.issue_id WHERE j.id IN (SELECT value FROM json_each(?1))",
+            "SELECT j.id,j.project_id,j.issue_id,j.thread_id,i.number,j.node_name,t.name,p.key FROM jobs j LEFT JOIN issues i ON i.id=j.issue_id LEFT JOIN threads t ON t.id=j.thread_id LEFT JOIN projects p ON p.id=t.project_id WHERE j.id IN (SELECT value FROM json_each(?1))",
             (ids,),
             |row| Ok((
                 row.text(0)?,
@@ -395,11 +402,23 @@ async fn rebuild_provider_admission_snapshot(
                 row.opt_text(3)?,
                 row.opt_i64(4)?.and_then(|number| i32::try_from(number).ok()),
                 row.opt_text(5)?.filter(|kind| !kind.is_empty()),
+                row.opt_text(6)?,
+                row.opt_text(7)?,
             )),
         ).await;
         match owners {
             Ok(owners) => {
-                for (job, project, issue, thread, issue_number, node_kind) in owners {
+                for (
+                    job,
+                    project,
+                    issue,
+                    thread,
+                    issue_number,
+                    node_kind,
+                    thread_name,
+                    project_key,
+                ) in owners
+                {
                     for &index in &jobs[&job] {
                         let owner = &mut snapshot.records[index].owner;
                         owner.project_id = project.clone();
@@ -407,6 +426,8 @@ async fn rebuild_provider_admission_snapshot(
                         owner.thread_id = thread.clone();
                         owner.issue_number = issue_number;
                         owner.node_kind = node_kind.clone();
+                        owner.thread_name = thread_name.clone();
+                        owner.project_key = project_key.clone();
                     }
                 }
             }
@@ -1660,6 +1681,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_owner_labels_are_enriched_once_and_renames_do_not_republish() {
+        use crate::db::DbState;
+        use crate::storage::SearchIndex;
+        let local = Arc::new(crate::storage::migrated_test_db("provider-thread-owners.db").await);
+        let index_dir = tempfile::tempdir().unwrap();
+        let dbs = DbState::new(
+            local.clone(),
+            Arc::new(SearchIndex::open_or_create(index_dir.path()).unwrap()),
+        );
+        let thread_job = "00000000-0000-4000-8000-000000000001";
+        let plain_job = "00000000-0000-4000-8000-000000000002";
+        local
+            .execute_script(format!(
+                "INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('project','default','Cairn','cairn','/tmp/cairn',1,1);
+             INSERT INTO threads(id,project_id,name,created_at,updated_at)
+             VALUES('thread','project','providers',1,1);
+             INSERT INTO jobs(id,project_id,thread_id,node_name,status,created_at,updated_at)
+             VALUES('{thread_job}','project','thread','thread','running',1,1),
+                   ('{plain_job}','project',NULL,'builder','running',1,1);"
+            ))
+            .await
+            .unwrap();
+        for (index, job) in [thread_job, plain_job].iter().enumerate() {
+            let prepared = serde_json::json!({"job_id": job, "execution_id": "execution"});
+            local.execute_script(format!(
+                "INSERT INTO runtime_admission_requests(request_id,workspace_key,resource_lane,launch_key,claim_json,enqueue_seq,state,created_at,updated_at)
+                 VALUES('request-{index}','private-runtime','codex','call:{index}','{{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}}',{index},'queued',1,1);
+                 INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at)
+                 VALUES('request-{index}','run-{index}','{prepared}',1);"
+            )).await.unwrap();
+        }
+        let seed = provider_admission_snapshot(&local, 500, &[], None)
+            .await
+            .unwrap();
+        assert_eq!(seed.records[0].owner.project_id.as_deref(), Some("project"));
+        local
+            .execute_script("ALTER TABLE threads RENAME TO unavailable_threads;")
+            .await
+            .unwrap();
+        let mut queries = 0;
+        let failed =
+            rebuild_provider_admission_snapshot(&dbs, 750, &[], None, None, &mut |_| queries += 1)
+                .await
+                .unwrap();
+        assert_eq!(queries, 1);
+        assert_eq!(failed.records[0].owner.thread_name, None);
+        assert_eq!(failed.records[0].owner.project_key, None);
+        local
+            .execute_script("ALTER TABLE unavailable_threads RENAME TO threads;")
+            .await
+            .unwrap();
+        queries = 0;
+        let first =
+            rebuild_provider_admission_snapshot(&dbs, 1_000, &[], None, Some(&failed), &mut |_| {
+                queries += 1
+            })
+            .await
+            .unwrap();
+        assert_eq!(queries, 1, "one bulk owner query for cold local records");
+        let owner = &first.records[0].owner;
+        assert_eq!(owner.thread_name.as_deref(), Some("providers"));
+        assert_eq!(owner.project_key.as_deref(), Some("cairn"));
+        assert_eq!(first.records[1].owner.thread_name, None);
+        assert_eq!(first.records[1].owner.project_key, None);
+        local
+            .execute_script(
+                "UPDATE threads SET name='renamed' WHERE id='thread';
+             UPDATE projects SET key='renamed-project' WHERE id='project';",
+            )
+            .await
+            .unwrap();
+        queries = 0;
+        let refreshed =
+            rebuild_provider_admission_snapshot(&dbs, 2_000, &[], None, Some(&first), &mut |_| {
+                queries += 1
+            })
+            .await
+            .unwrap();
+        assert_eq!(queries, 0, "unchanged records need no owner query");
+        let first = EncodedProviderAdmissionSnapshot::encode(first).unwrap();
+        let refreshed = EncodedProviderAdmissionSnapshot::encode(refreshed).unwrap();
+        assert!(
+            first == refreshed,
+            "owner label renames alone must not republish"
+        );
+        let cold = rebuild_provider_admission_snapshot(&dbs, 3_000, &[], None, None, &mut |_| {
+            queries += 1
+        })
+        .await
+        .unwrap();
+        assert_eq!(queries, 1);
+        assert_eq!(
+            cold.records[0].owner.thread_name.as_deref(),
+            Some("renamed")
+        );
+        assert_eq!(
+            cold.records[0].owner.project_key.as_deref(),
+            Some("renamed-project")
+        );
+        local.execute(
+            "UPDATE prepared_runtime_calls SET prepared_json=?1 WHERE request_id='request-0'",
+            (serde_json::json!({"job_id": "00000000-0000-4000-8000-000000000003", "execution_id": "execution"}).to_string(),),
+        ).await.unwrap();
+        let missing =
+            rebuild_provider_admission_snapshot(&dbs, 4_000, &[], None, Some(&cold), &mut |_| {})
+                .await
+                .unwrap();
+        assert_eq!(missing.records[0].owner.thread_name, None);
+        assert_eq!(missing.records[0].owner.project_key, None);
+    }
+
+    #[tokio::test]
     async fn five_hundred_record_cache_rebuild_bounds_owner_queries_by_replica() {
         use crate::db::DbState;
         use crate::orchestrator::generation_cache::rebuild_with;
@@ -1837,6 +1971,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(missing.records[0].owner.project_id, None);
+        assert_eq!(missing.records[0].owner.thread_name, None);
+        assert_eq!(missing.records[0].owner.project_key, None);
         assert_eq!(queries.swap(0, Ordering::SeqCst), 0);
         let reopened =
             Arc::new(crate::storage::migrated_test_db("provider-owners-reopened.db").await);
