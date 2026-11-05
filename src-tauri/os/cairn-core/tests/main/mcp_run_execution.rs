@@ -955,6 +955,7 @@ fn occupying_request(
         },
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     }
 }
 

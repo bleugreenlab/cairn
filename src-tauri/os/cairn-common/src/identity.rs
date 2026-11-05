@@ -508,8 +508,13 @@ impl CredentialRef {
         ];
         let oracle_markers = ["fingerprint", "sha1:", "sha256:", "sha512:", "hash:"];
         let long_hex = value
-            .split(|c: char| !c.is_ascii_hexdigit())
-            .any(|part| part.len() >= 32);
+            .split(['/', ':'])
+            .filter(|segment| !is_record_id_segment(segment))
+            .any(|segment| {
+                segment
+                    .split(|c: char| !c.is_ascii_hexdigit())
+                    .any(|run| run.len() >= 32)
+            });
         let jwt_shaped = value.split('.').count() == 3 && value.len() >= 32;
         if secret_markers.iter().any(|m| lower.contains(m))
             || oracle_markers.iter().any(|m| lower.contains(m))
@@ -523,6 +528,24 @@ impl CredentialRef {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Whether one `/`- or `:`-delimited segment of a credential reference is a
+/// Cairn record id: a type prefix of 2 to 8 lowercase ASCII letters, `_`, and
+/// exactly 32 lowercase hex digits (`cae_33c0dabe7ef94071a321966b3819b3e5`).
+///
+/// Its hex is a random record key, not key or digest material. The type prefix
+/// labels it as a reference to a row, and only a whole segment qualifies, so a
+/// hex run embedded in other text (`key-cae_…`, `cae_….pem`) or any longer or
+/// unlabeled run is still refused as possible secret or oracle material.
+fn is_record_id_segment(segment: &str) -> bool {
+    let Some((prefix, id)) = segment.split_once('_') else {
+        return false;
+    };
+    (2..=8).contains(&prefix.len())
+        && prefix.bytes().all(|b| b.is_ascii_lowercase())
+        && id.len() == 32
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl<'de> Deserialize<'de> for CredentialRef {
@@ -1250,6 +1273,41 @@ mod tests {
             assert!(CredentialRef::new(bad).is_err(), "{bad}");
         }
         assert!(serde_json::from_str::<CredentialRef>("\"token:abc\"").is_err());
+    }
+
+    #[test]
+    fn credential_refs_admit_a_whole_segment_record_id_and_nothing_wider() {
+        let hex = "33c0dabe7ef94071a321966b3819b3e5";
+        for good in [
+            format!("companion-enrollment/cae_{hex}"),
+            format!("served-api-client:cli_{hex}"),
+            format!("cae_{hex}"),
+            format!("ab_{hex}"),
+            format!("abcdefgh_{hex}"),
+        ] {
+            assert!(CredentialRef::new(&good).is_ok(), "{good}");
+        }
+        for bad in [
+            format!("served-api-client:{}", "ab".repeat(32)),
+            format!("cae_{hex}0"),
+            format!("cae_{}", hex.to_ascii_uppercase()),
+            format!("CAE_{hex}"),
+            format!("c_{hex}"),
+            format!("abcdefghi_{hex}"),
+            format!("ca2_{hex}"),
+            format!("cae-{hex}"),
+            format!("key-cae_{hex}"),
+            format!("cae_{hex}.pem"),
+            format!("cak-{}", "0123456789abcdef".repeat(3)),
+            format!("companion-enrollment/sha256:cae_{hex}"),
+            format!("companion-enrollment/cae_{hex}/{}", "ab".repeat(16)),
+        ] {
+            assert_eq!(
+                CredentialRef::new(&bad).unwrap_err(),
+                IdentityValidationError::UnsafeCredentialRef,
+                "{bad}"
+            );
+        }
     }
     #[test]
     fn verification_enforces_method_fields_and_deserialization() {

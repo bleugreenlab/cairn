@@ -70,6 +70,7 @@ use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, AdmissionHoldEvidence, ClaimedAttemptAccount,
     MachineModelResident, PriorDecline,
 };
+use cairn_common::executor_protocol::{HomeAffinity, ScratchSyncEstimate};
 use decline_condition::{AdmissionView, PostedHold};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -1561,11 +1562,20 @@ pub struct Fleet {
     /// `environment_evictions`: each one is a verdict about a machine session
     /// this runner is watching, and lapses with it.
     withdrawn_homes: Arc<Mutex<HashMap<String, Vec<WithdrawnHome>>>>,
+    /// The machine each job's home last answered from, keyed by holder, which
+    /// a thread's next fresh home is priced toward. In memory by choice: a
+    /// runner restart costs one placement on the runner's platform, and a live
+    /// home's route persists anyway.
+    previous_homes: Arc<Mutex<HashMap<String, PreviousHome>>>,
     /// When each absent executor was first observed to be absent, which is what
     /// separates a link that flapped from a machine that left. Stamped when a
     /// connection goes away and when an acquisition first finds a route with no
-    /// connection behind it; cleared when the executor attaches again.
+    /// connection behind it; cleared when the executor attaches again. Monotonic
+    /// stamps, so a link that died as the host went to sleep is not read as gone
+    /// for the length of the sleep.
     link_absence_since: Arc<Mutex<HashMap<String, u64>>>,
+    /// Whether the colocated executor has attached in this runner's life.
+    colocated_attached_once: Arc<std::sync::atomic::AtomicBool>,
     /// When the runner last bounced a link for publishing frozen facts.
     ///
     /// Facts freezing on several machines within one window is the specimen
@@ -1998,7 +2008,7 @@ struct RoutedCell {
 /// answering before reclaiming its cell: the two are the same judgement made
 /// from opposite sides of the link, and they should not disagree about how long
 /// silence takes to mean absence.
-const ENVIRONMENT_LEASE_GRACE_MS: u64 = 5 * 60 * 1000;
+pub(crate) const ENVIRONMENT_LEASE_GRACE_MS: u64 = 5 * 60 * 1000;
 
 /// An execution environment the runner rebuilt because the executor session
 /// holding the previous one ended.
@@ -2072,17 +2082,70 @@ impl WithdrawnHome {
     }
 }
 
+/// How long the machine a job's home last answered from is remembered. Long
+/// enough to span a stretch of a thread being idle, and bounded so that jobs which
+/// never acquire again do not keep their entries for the runner's life.
+const PREVIOUS_HOME_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The machine a job's home last answered from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviousHome {
+    executor_id: String,
+    recorded_at_unix_ms: u64,
+}
+
+/// What an acquisition prices its fresh home by, beyond the machine's forecast.
+/// Runner-side and never on the wire, which is why this rides beside
+/// [`ResidencyAcquireRequest`] rather than on it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HomePrices {
+    pub(crate) home_affinity: Option<HomeAffinity>,
+    pub(crate) scratch_sync: Option<ScratchSyncEstimate>,
+}
+
+/// A final acquisition result, with what the machines before it answered. A
+/// refusal keeps its kind and outcome, so it classifies as it would have alone.
+/// A success needs no account: the batch's first line names the machine it ran
+/// on, and the refusals before it stay in the log and the placement record.
+fn naming_earlier_refusals(result: ResidencyResult, refused: &[String]) -> ResidencyResult {
+    match result {
+        ResidencyResult::Failed {
+            kind,
+            diagnostic,
+            cell_outcome,
+        } if !refused.is_empty() => ResidencyResult::Failed {
+            kind,
+            diagnostic: format!("{}. {diagnostic}", refused.join(". ")),
+            cell_outcome,
+        },
+        other => other,
+    }
+}
+
 /// The refusal an owner reads when the machine granted its environment refused
 /// to provision it: the machine, its own words (which name the cell), and that
 /// the owner was withdrawn from it and goes elsewhere next.
 fn home_withdrawal_diagnostic(holder: &ResidencyHolder, machine: &str, refusal: &str) -> String {
     let minutes = HOME_WITHDRAWAL_MS / 60_000;
+    let refused = home_refusal_sentence(holder, machine, refusal);
     match holder {
         ResidencyHolder::Job { .. } => format!(
-            "{machine} refused to provision this job's execution environment: {refusal}. The job is withdrawn from {machine}, so its next batch acquires its environment on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes"
+            "{refused}. The job is withdrawn from {machine}, so its next batch acquires its environment on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes"
         ),
+        _ => format!(
+            "{refused}. It is withdrawn from {machine}, so its next acquisition is placed on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes"
+        ),
+    }
+}
+
+/// Which machine refused to provision an owner's environment, in its own words.
+fn home_refusal_sentence(holder: &ResidencyHolder, machine: &str, refusal: &str) -> String {
+    match holder {
+        ResidencyHolder::Job { .. } => {
+            format!("{machine} refused to provision this job's execution environment: {refusal}")
+        }
         other => format!(
-            "{machine} refused to provision the execution environment of {}: {refusal}. It is withdrawn from {machine}, so its next acquisition is placed on another machine; {machine} is considered for it again once it reconnects, or after {minutes} minutes",
+            "{machine} refused to provision the execution environment of {}: {refusal}",
             describe_holder(other)
         ),
     }
@@ -2146,6 +2209,18 @@ fn link_silence_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> Option<
         link_clock::LinkJudgement::PeerSilent { silence_ms } => Some(silence_ms),
         _ => None,
     }
+}
+
+/// When a closed link last delivered a frame, counting only time the runner was
+/// awake. Its reader has ended, so no listening rule applies, and the wall clock
+/// would charge the machine for every hour the runner's own host slept.
+fn last_heard_unix_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> u64 {
+    entry
+        .link_clock
+        .received_silence_ms(link_clock::monotonic_now_ns())
+        .map_or(entry.last_progress_unix_ms, |silence_ms| {
+            now_unix_ms.saturating_sub(silence_ms)
+        })
 }
 
 /// An owner in the words the executors page uses for it.
@@ -4059,6 +4134,28 @@ impl Fleet {
     }
 
     pub fn attach_executor(&self, sender: mpsc::UnboundedSender<ExecutorMessage>) -> u64 {
+        self.attach_colocated_advertising(sender, Vec::new())
+    }
+
+    /// [`Fleet::attach_executor`], advertising `toolchains` as a real executor
+    /// does from its first frame, for a test whose work requires one.
+    #[cfg(test)]
+    pub(crate) fn attach_executor_with_toolchains(
+        &self,
+        sender: mpsc::UnboundedSender<ExecutorMessage>,
+        toolchains: &[&str],
+    ) -> u64 {
+        self.attach_colocated_advertising(
+            sender,
+            toolchains.iter().map(|name| name.to_string()).collect(),
+        )
+    }
+
+    fn attach_colocated_advertising(
+        &self,
+        sender: mpsc::UnboundedSender<ExecutorMessage>,
+        toolchains: Vec<String>,
+    ) -> u64 {
         let advertisement = ExecutorAdvertisement {
             identity: ExecutorIdentity {
                 device_id: "local-device".into(),
@@ -4070,7 +4167,7 @@ impl Fleet {
                 arch: std::env::consts::ARCH.into(),
                 logical_cores: 1,
                 concurrency_capacity: None,
-                toolchains: Vec::new(),
+                toolchains,
                 projects_served: Vec::new(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
@@ -4167,6 +4264,10 @@ impl Fleet {
             generation
         };
         self.link_absence_since.lock().unwrap().remove(&executor_id);
+        if executor_id == COLOCATED_EXECUTOR_ID {
+            self.colocated_attached_once
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let advertised_scratches = advertisement.node_scratches.clone();
         let mut connection = ExecutorConnectionState {
             identity: advertisement.identity.clone(),
@@ -4356,6 +4457,21 @@ impl Fleet {
         }
     }
 
+    /// Wait, within `bound`, for the colocated executor's first attach of this
+    /// runner's life, and say whether it has happened.
+    ///
+    /// Placement ranks only attached machines, so at boot a remote that attaches
+    /// first would win a choice the runner's own machine was about to contest.
+    /// Only the first attach is waited for: later, an absent colocated executor
+    /// is an ordinary absence for placement to route around.
+    pub(crate) async fn wait_for_first_colocated_attach(&self, bound: std::time::Duration) -> bool {
+        self.colocated_attached_once
+            .load(std::sync::atomic::Ordering::Acquire)
+            || tokio::time::timeout(bound, self.wait_for_named_executor(LOCAL_EXECUTOR_NAME))
+                .await
+                .is_ok()
+    }
+
     pub(crate) fn named_executor_is_connected(&self, executor_name: &str) -> bool {
         self.lock_connections().values().any(|entry| {
             !entry.sender.is_closed()
@@ -4418,7 +4534,7 @@ impl Fleet {
                 .lock()
                 .unwrap()
                 .entry(executor_id.to_string())
-                .or_insert_with(unix_time_ms);
+                .or_insert_with(link_clock::monotonic_now_ns);
             if executor_id == COLOCATED_EXECUTOR_ID {
                 self.disconnect_origins
                     .lock()
@@ -9143,16 +9259,34 @@ impl Fleet {
         // stack, which deep callers such as terminal start overflowed.
         match operation {
             ResidencyOperation::Acquire { request } => {
-                Box::pin(self.acquire_residency(orch, request)).await
+                self.acquire_priced_home(orch, request, HomePrices::default())
+                    .await
             }
             operation => Box::pin(self.operate_residency_rpc(orch, operation)).await,
         }
     }
 
+    /// Acquire an environment whose fresh home is priced by `prices`. Boxed for
+    /// the same reason as [`Self::operate_residency`].
+    pub(crate) async fn acquire_priced_home(
+        &self,
+        orch: &Orchestrator,
+        request: ResidencyAcquireRequest,
+        prices: HomePrices,
+    ) -> ResidencyResult {
+        Box::pin(self.acquire_residency(orch, request, prices)).await
+    }
+
+    /// Acquire an environment, treating a machine that refuses to provision it
+    /// as one more claim rather than the end of the call: the machine is
+    /// withdrawn, and the same acquisition goes to the next machine inside the
+    /// same wait horizon. Only when none remains is the caller refused, and then
+    /// the refusal names every machine that answered.
     async fn acquire_residency(
         &self,
         orch: &Orchestrator,
         original: ResidencyAcquireRequest,
+        prices: HomePrices,
     ) -> ResidencyResult {
         // Route resolution below may evict the existing home on what the
         // project's setup needs, so the setup it judges by must be the current
@@ -9162,6 +9296,30 @@ impl Fleet {
         // already-deep acquisition future overflowed the stack of a terminal
         // acquisition.
         Box::pin(self.refresh_project_setup(orch, &original)).await;
+        let mut refused = Vec::new();
+        loop {
+            let mut retry = None;
+            // Boxed for the same reason: this future holds placement, preparation
+            // and route resolution across its awaits.
+            let result =
+                Box::pin(self.acquire_residency_attempt(orch, &original, &prices, &mut retry))
+                    .await;
+            match retry {
+                Some(diagnostic) => refused.push(diagnostic),
+                None => return naming_earlier_refusals(result, &refused),
+            }
+        }
+    }
+
+    /// One claim on one machine. `retry` is set, with the refusal's sentence,
+    /// when the machine granted this attempt refused and another may take it.
+    async fn acquire_residency_attempt(
+        &self,
+        orch: &Orchestrator,
+        original: &ResidencyAcquireRequest,
+        prices: &HomePrices,
+        retry: &mut Option<String>,
+    ) -> ResidencyResult {
         let identity = (
             residency_queue_entry_id(&original.holder),
             RESIDENCY_ACQUIRE_ATTEMPT_ID.into(),
@@ -9183,7 +9341,7 @@ impl Fleet {
                             "wait horizon elapsed while acquisition entry {entry_id} was {state:?}"
                         ),
                         Some(self.wait_horizon_outcome(
-                            &residency_placement_request(&original),
+                            &residency_placement_request(original),
                             &self.recorded_declines(&entry_id),
                         )),
                     );
@@ -9222,7 +9380,7 @@ impl Fleet {
                 return residency_core_failure(
                     ResidencyFailureKind::Admission,
                     "execution environment acquisition wait horizon elapsed",
-                    Some(self.wait_horizon_outcome(&residency_placement_request(&original), &[])),
+                    Some(self.wait_horizon_outcome(&residency_placement_request(original), &[])),
                 );
             }
             let mut placement = residency_placement_request(&acquisition);
@@ -9244,9 +9402,10 @@ impl Fleet {
             // A machine that just refused to provision this owner's environment
             // would refuse it again, and an idle one claims every fresh
             // acquisition first. Placement looks past it until it lapses.
-            placement
-                .avoided_executor_ids
-                .extend(self.withdrawn_home_executors(&original.holder));
+            let withdrawals = self.withdrawals_that_steer(&placement, &original.holder);
+            placement.avoided_executor_ids.extend(withdrawals);
+            placement.home_affinity = prices.home_affinity.clone();
+            placement.scratch_sync = prices.scratch_sync.clone();
             let Ok((entry_id, entry_rx)) = self.queue.enqueue(
                 queue::NewEntry {
                     request: placement.clone(),
@@ -9564,10 +9723,12 @@ impl Fleet {
                         )
                     }
                     ResidencyGrantAnswer::Answered(result) => {
-                        let result = self.withdraw_refusing_home(
+                        let another_remains = matches!(*result, ResidencyResult::Failed { .. })
+                            && self.home_candidate_remains(&placement, &selected.executor_id);
+                        let (result, withdrawn) = self.withdraw_refusing_home(
                             &granted_request.holder,
                             &selected,
-                            placement.pinned_executor_id.is_some(),
+                            PlacementScope::of(&placement).targeted() && !another_remains,
                             *result,
                         );
                         self.record_residency_result(
@@ -9583,10 +9744,74 @@ impl Fleet {
                             .take(&identity, queue::TerminalState::Completed, unix_time_ms());
                         entry_guard.disarm();
                         self.binding_changed.notify_waiters();
+                        // Only an answer that withdrew the machine continues:
+                        // the runner's own persistence failures share its kind
+                        // and must not loop. And only while a machine remains,
+                        // because an untargeted request with every machine
+                        // avoided would wait out a horizon of up to the batch
+                        // ceiling for one to attach.
+                        if withdrawn
+                            && another_remains
+                            && unix_time_ms() < placement.wait_horizon_unix_ms
+                        {
+                            if let ResidencyResult::Failed { diagnostic, .. } = &result {
+                                *retry = Some(diagnostic.clone());
+                            }
+                        }
                         return result;
                     }
                 }
             }
+        }
+    }
+
+    /// Whether a machine other than the one that just refused could be placed
+    /// on, by the same structural survey placement reads. Requirements the
+    /// attempt already stamped count, so this is asked of the attempt's request.
+    fn home_candidate_remains(&self, placement: &CellRequest, refused_by: &str) -> bool {
+        let mut request = placement.clone();
+        request.avoided_executor_ids.push(refused_by.to_owned());
+        self.any_home_candidate(&request)
+    }
+
+    fn any_home_candidate(&self, request: &CellRequest) -> bool {
+        let connections = self.lock_connections().clone();
+        let unattached = self.unattached_enrolled_remotes();
+        matches!(
+            survey_candidates(
+                &connections,
+                &unattached,
+                request,
+                unix_time_ms(),
+                &HashMap::new(),
+                &AdmissionView::of_request(request),
+            ),
+            Ok(survey) if !survey.usable.is_empty()
+        )
+    }
+
+    /// The owner's standing withdrawals this request looks past.
+    ///
+    /// A withdrawal steers placement among machines. It never decides the answer
+    /// for a caller who declared where to go: a targeted request with nothing
+    /// else to choose would be refused without its machine being asked, on the
+    /// strength of one answer, for as long as the withdrawal stands.
+    fn withdrawals_that_steer(
+        &self,
+        placement: &CellRequest,
+        holder: &ResidencyHolder,
+    ) -> Vec<String> {
+        let withdrawn = self.withdrawn_home_executors(holder);
+        if withdrawn.is_empty() || !PlacementScope::of(placement).targeted() {
+            return withdrawn;
+        }
+        let mut steered = placement.clone();
+        steered
+            .avoided_executor_ids
+            .extend(withdrawn.iter().cloned());
+        match self.any_home_candidate(&steered) {
+            true => withdrawn,
+            false => Vec::new(),
         }
     }
 
@@ -10015,6 +10240,7 @@ impl Fleet {
         match result {
             ResidencyResult::State { cell } => {
                 if let Some(residency) = cell.residency.as_ref() {
+                    self.remember_previous_home(&residency.holder, executor_id);
                     let key = (executor_id.to_owned(), residency.holder.storage_key());
                     if let Err(error) = self.update_residency_routes(|routes| {
                         routes.insert(
@@ -10058,6 +10284,38 @@ impl Fleet {
             ResidencyResult::ConflictMaterialized { .. }
             | ResidencyResult::AttachmentMaterialized { .. } => {}
             ResidencyResult::Failed { .. } => {}
+        }
+    }
+
+    fn remember_previous_home(&self, holder: &ResidencyHolder, executor_id: &str) {
+        if !matches!(holder, ResidencyHolder::Job { .. }) {
+            return;
+        }
+        let now = unix_time_ms();
+        let mut homes = self.previous_homes.lock().unwrap();
+        homes.retain(|_, home| {
+            now.saturating_sub(home.recorded_at_unix_ms) < PREVIOUS_HOME_RETENTION_MS
+        });
+        homes.insert(
+            holder.storage_key(),
+            PreviousHome {
+                executor_id: executor_id.to_owned(),
+                recorded_at_unix_ms: now,
+            },
+        );
+    }
+
+    /// What leaving this thread's natural machines costs its home: the runner's
+    /// own platform, and the machine that last held it.
+    pub(crate) fn thread_home_affinity(&self, holder: &ResidencyHolder) -> HomeAffinity {
+        HomeAffinity {
+            runner_os: std::env::consts::OS.to_owned(),
+            previous_executor_id: self
+                .previous_homes
+                .lock()
+                .unwrap()
+                .get(&holder.storage_key())
+                .map(|home| home.executor_id.clone()),
         }
     }
 
@@ -10258,10 +10516,11 @@ impl Fleet {
         })
     }
 
-    /// The executor a job home occupies, or will occupy before it has been routed.
-    ///
-    /// Job residencies are untargeted and immobile, so an unrouted home can only
-    /// land on the colocated executor. A route naming an executor that is no
+    /// The executor a job home occupies, or the colocated executor as a guess
+    /// before it has been routed. Placement chooses a fresh home among every
+    /// machine the batch's selector admits, so the guess only decides whether a
+    /// batch founds a home or leaves, and acquisition then says where the home
+    /// actually is. A route naming an executor that is no
     /// longer connected names nothing this job can occupy: the cell it recorded
     /// died with that executor session, and the next acquisition rebuilds the
     /// environment wherever placement lands
@@ -10283,8 +10542,9 @@ impl Fleet {
     /// A recorded route is the authority even while its machine is away: the link
     /// may have dropped with the cell and its processes intact, and acquisition
     /// waits out exactly that grace. Only with no route at all does this fall back
-    /// to the colocated machine an untargeted acquisition would most likely use,
-    /// and it says so, because no cell and therefore no live process exists yet.
+    /// to the colocated machine as a guess, and it says so, because no cell and
+    /// therefore no live process exists yet. The guess decides whether a batch
+    /// founds a home or leaves; it does not decide where a founded home lands.
     pub(crate) fn predicted_job_home(&self, holder: &ResidencyHolder) -> Option<PredictedJobHome> {
         if let Some(executor_id) = self.residency_route_executor(holder) {
             return Some(PredictedJobHome {
@@ -10457,14 +10717,40 @@ impl Fleet {
     /// Stamped on disconnect, and stamped here for an executor this process has
     /// never seen — a route loaded from the authority file after a runner
     /// restart names a machine whose absence starts being counted the first time
-    /// anyone asks for it, not at some instant nobody observed.
+    /// anyone asks for it, not at some instant nobody observed. Answered on the
+    /// wall clock its callers compare against, less any time the host slept.
     fn link_absent_since(&self, executor_id: &str, now_unix_ms: u64) -> u64 {
-        *self
+        let stamp = *self
             .link_absence_since
             .lock()
             .unwrap()
             .entry(executor_id.to_string())
-            .or_insert(now_unix_ms)
+            .or_insert_with(link_clock::monotonic_now_ns);
+        now_unix_ms.saturating_sub(link_clock::awake_ms_since(stamp))
+    }
+
+    /// Stage a machine absent for `ago_ms` of awake time.
+    #[cfg(test)]
+    pub(crate) fn stage_link_absent(&self, executor_id: &str, ago_ms: u64) {
+        self.link_absence_since.lock().unwrap().insert(
+            executor_id.to_string(),
+            link_clock::stamp_awake_ms_ago(ago_ms),
+        );
+    }
+
+    /// Whether a machine has gone unanswered for the whole lease grace, by the
+    /// rule eviction uses, so the owner of a resident there is never told
+    /// something different from what placement is about to act on.
+    pub(crate) fn machine_lost_past_grace(&self, executor_id: &str) -> bool {
+        if self.executor_link_restoration(executor_id) == placement::LinkRestoration::Restoring {
+            return false;
+        }
+        let now = unix_time_ms();
+        matches!(
+            self.route_answer(executor_id, now),
+            RouteAnswer::Unanswered(unanswered)
+                if now.saturating_sub(unanswered.since_unix_ms) >= ENVIRONMENT_LEASE_GRACE_MS
+        )
     }
 
     /// Whether the link a residency failure came from is one the runner is still
@@ -10509,8 +10795,8 @@ impl Fleet {
             (
                 entry.sender.is_closed(),
                 entry.generation,
-                entry.last_progress_unix_ms,
-                link_silence_ms(entry, now_unix_ms).is_some(),
+                last_heard_unix_ms(entry, now_unix_ms),
+                link_silence_ms(entry, now_unix_ms),
             )
         });
         match present {
@@ -10520,17 +10806,17 @@ impl Fleet {
                 since_unix_ms: self.link_absent_since(executor_id, now_unix_ms),
                 cause: UnansweredCause::Disconnected,
             }),
-            Some((true, _, last_progress_unix_ms, _)) => RouteAnswer::Unanswered(Unanswered {
-                since_unix_ms: last_progress_unix_ms,
+            Some((true, _, last_heard_unix_ms, _)) => RouteAnswer::Unanswered(Unanswered {
+                since_unix_ms: last_heard_unix_ms,
                 cause: UnansweredCause::Disconnected,
             }),
-            Some((false, generation, last_progress_unix_ms, true)) => {
-                RouteAnswer::Unanswered(Unanswered {
-                    since_unix_ms: last_progress_unix_ms,
-                    cause: UnansweredCause::Silent { generation },
-                })
-            }
-            Some((false, _, _, false)) => RouteAnswer::Live,
+            // Silence as the link clock counted it: only while the runner was
+            // listening, so a sleep does not spend the grace.
+            Some((false, generation, _, Some(silence_ms))) => RouteAnswer::Unanswered(Unanswered {
+                since_unix_ms: now_unix_ms.saturating_sub(silence_ms),
+                cause: UnansweredCause::Silent { generation },
+            }),
+            Some((false, _, _, None)) => RouteAnswer::Live,
         }
     }
 
@@ -10572,29 +10858,47 @@ impl Fleet {
     /// batch of that job was refused before it ran, whatever the batch's own
     /// selector named, because each one starts by acquiring the home.
     ///
-    /// Work pinned to one machine is not withdrawn from it: it has nowhere else
-    /// to go, and its refusal already says why.
+    /// Work the caller narrowed to this machine, by a pin, a name, or a selector
+    /// nothing else satisfies, is not withdrawn from it: it has nowhere else to
+    /// go, and one answer should not refuse the caller's own choice for the
+    /// length of a withdrawal. It gets the machine's refusal, and the next batch
+    /// asks again. The second value says whether this answer withdrew the
+    /// machine, which is what entitles the acquisition to continue.
     fn withdraw_refusing_home(
         &self,
         holder: &ResidencyHolder,
         selected: &SelectedExecutor,
-        pinned: bool,
+        narrowed_to_this_machine: bool,
         result: ResidencyResult,
-    ) -> ResidencyResult {
+    ) -> (ResidencyResult, bool) {
         let ResidencyResult::Failed {
             kind,
             diagnostic,
             cell_outcome,
         } = result
         else {
-            return result;
+            return (result, false);
         };
-        if pinned || !placement::residency_failure_withdraws_home(&kind) {
-            return ResidencyResult::Failed {
-                kind,
-                diagnostic,
-                cell_outcome,
-            };
+        if !placement::residency_failure_withdraws_home(&kind) {
+            return (
+                ResidencyResult::Failed {
+                    kind,
+                    diagnostic,
+                    cell_outcome,
+                },
+                false,
+            );
+        }
+        if narrowed_to_this_machine {
+            let machine = self.executor_name_for_text(&selected.executor_id);
+            return (
+                ResidencyResult::Failed {
+                    kind,
+                    diagnostic: home_refusal_sentence(holder, &machine, &diagnostic),
+                    cell_outcome,
+                },
+                false,
+            );
         }
         let now = unix_time_ms();
         {
@@ -10624,11 +10928,14 @@ impl Fleet {
             %diagnostic,
             "machine refused to provision an execution environment; withdrawn from this owner's placement"
         );
-        ResidencyResult::Failed {
-            kind,
-            diagnostic: home_withdrawal_diagnostic(holder, &machine, &diagnostic),
-            cell_outcome,
-        }
+        (
+            ResidencyResult::Failed {
+                kind,
+                diagnostic: home_withdrawal_diagnostic(holder, &machine, &diagnostic),
+                cell_outcome,
+            },
+            true,
+        )
     }
 
     /// The machines an owner's next fresh acquisition must not be placed on,
@@ -14095,6 +14402,7 @@ impl Fleet {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         self.select_executor(
             &request,
@@ -14468,6 +14776,7 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         resource_reservation: acquisition.footprint.reservation(),
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     }
 }
 
@@ -15746,6 +16055,12 @@ fn rank_survey(
                 .scratch_sync
                 .as_ref()
                 .map_or(0, |estimate| estimate.ms_for(&entry.identity.executor_id));
+            candidate.home_affinity_ms = request.home_affinity.as_ref().map_or(0, |affinity| {
+                affinity.price_ms(
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities.os,
+                )
+            });
             candidate
         })
         .collect();
@@ -15994,6 +16309,11 @@ struct ScoredCandidate<'a> {
     /// take. Added to the predicted verdict, never a filter: a machine where
     /// the scratch is warm ranks ahead of an otherwise-equal cold one.
     scratch_sync_ms: u64,
+    /// What a thread's home leaves behind by landing here: the runner's
+    /// platform, the machine that last held it. Added to the predicted verdict
+    /// and never a filter, so it decides among machines that can all take the
+    /// home and loses to a machine that cannot.
+    home_affinity_ms: u64,
 }
 
 impl<'a> ScoredCandidate<'a> {
@@ -16140,6 +16460,7 @@ impl<'a> ScoredCandidate<'a> {
             prediction,
             cache_distance: None,
             scratch_sync_ms: 0,
+            home_affinity_ms: 0,
         }
     }
 
@@ -16277,10 +16598,12 @@ fn rank_candidates<'a, 'b>(
         a.prediction
             .predicted_verdict_ms
             .saturating_add(a.scratch_sync_ms)
+            .saturating_add(a.home_affinity_ms)
             .cmp(
                 &b.prediction
                     .predicted_verdict_ms
-                    .saturating_add(b.scratch_sync_ms),
+                    .saturating_add(b.scratch_sync_ms)
+                    .saturating_add(b.home_affinity_ms),
             )
             .then_with(|| {
                 a.cpu_headroom_risk
@@ -16376,7 +16699,11 @@ fn rank_candidates<'a, 'b>(
     // full I/O stall beside fifteen cargo lanes, chosen over a 1.6 s forecast,
     // each run dying at vitest's 60 s start bound). It still competes on its
     // forecast, where its stall is priced.
-    let exploration_due = exploration.decisions_since_exploration >= EXPLORATION_INTERVAL - 1;
+    // A service resident never completes, so it never teaches a duration, and
+    // exploring with it would land it on whatever idle machine was due rather
+    // than on the service box or home its stance and role affinity prefer.
+    let exploration_due = exploration.decisions_since_exploration >= EXPLORATION_INTERVAL - 1
+        && request.placement_work_class != PlacementWorkClass::Services;
     let last_explored = |candidate: &&ScoredCandidate<'a>| {
         exploration
             .explored_executors
@@ -16478,6 +16805,14 @@ fn rank_candidates<'a, 'b>(
         PlacementStance::RemoteFirst | PlacementStance::RemoteOnly => candidate.entry.colocated,
         PlacementStance::Any => false,
     };
+    // A service resident is what a services-only machine is for, so one ranks
+    // first for it. Like the stance it is a preference inside the hard group
+    // and the preference-delay deadline: priced, never a pin (tenet 314), so a
+    // service box that is away or clearly slower yields to the next machine.
+    let role_affinity = |candidate: &&ScoredCandidate<'a>| {
+        !(request.placement_work_class == PlacementWorkClass::Services
+            && candidate.entry.machine_role == MachineRole::ServicesOnly)
+    };
     let priority = |candidate: &&ScoredCandidate<'a>| {
         policy
             .profile
@@ -16492,8 +16827,9 @@ fn rank_candidates<'a, 'b>(
             .then_with(|| same_hard_group(b).cmp(&same_hard_group(a)))
             .then_with(|| {
                 if same_hard_group(a) && same_hard_group(b) {
-                    preference(a)
-                        .cmp(&preference(b))
+                    role_affinity(a)
+                        .cmp(&role_affinity(b))
+                        .then_with(|| preference(a).cmp(&preference(b)))
                         .then_with(|| priority(a).cmp(&priority(b)))
                 } else {
                     std::cmp::Ordering::Equal
@@ -16514,6 +16850,7 @@ fn rank_candidates<'a, 'b>(
                 hard_order(&winner, candidate).is_eq()
                     && forecast_order(&winner, candidate).is_eq()
                     && same_hard_group(candidate)
+                    && role_affinity(&winner) == role_affinity(candidate)
                     && preference(&winner) == preference(candidate)
                     && priority(&winner) == priority(candidate)
             })
@@ -16523,6 +16860,7 @@ fn rank_candidates<'a, 'b>(
             hard_order(&winner, &candidate).is_eq()
                 && forecast_order(&winner, &candidate).is_eq()
                 && same_hard_group(&candidate)
+                && role_affinity(&winner) == role_affinity(&candidate)
                 && preference(&winner) == preference(&candidate)
                 && priority(&winner) == priority(&candidate)
                 && recent_selection_order(&winner, &candidate).is_ne()
@@ -22646,6 +22984,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         }
     }
 
@@ -23835,6 +24174,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
 
         let outcome = pool.submit_execution(&orch, request, None).await;
@@ -23912,6 +24252,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         let config = ExecutorConfig {
             project_id: "p".into(),
@@ -24592,6 +24933,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         let started = Instant::now();
         let outcome = pool
@@ -30227,6 +30569,278 @@ mod tests {
         }
     }
 
+    /// A services-only machine takes a service resident and nothing else,
+    /// however idle it is: no run batch, check lane, REPL or terminal (all
+    /// `agentSessions`), or dev instance. The record names its role.
+    #[test]
+    fn a_services_only_machine_takes_services_and_is_passed_over_for_every_other_class() {
+        let connections = busy_home_and_idle_remote(MachineRole::ServicesOnly);
+        for class in PlacementWorkClass::ALL {
+            let mut request = spillable_request();
+            request.placement_work_class = class;
+            let draft = place_remote_first(&connections, &request).unwrap();
+            if class == PlacementWorkClass::Services {
+                assert_eq!(chosen(&draft).executor_id, "sp1");
+                continue;
+            }
+            assert_eq!(
+                chosen(&draft).executor_id,
+                COLOCATED_EXECUTOR_ID,
+                "{class:?}"
+            );
+            assert_eq!(
+                rejection_for(&draft, "sp1"),
+                &PlacementRejectionReason::RoleExcluded {
+                    role: MachineRole::ServicesOnly,
+                    work_class: class,
+                },
+                "{class:?}"
+            );
+        }
+    }
+
+    /// `run` with `executor:{name:"bgsrv-ub2"}` on a services box is refused
+    /// before anything runs, in the role's words.
+    #[test]
+    fn a_batch_pinned_to_a_services_only_machine_is_refused_naming_the_role() {
+        let connections = busy_home_and_idle_remote(MachineRole::ServicesOnly);
+        let mut request = targeted_request("linux");
+        request.placement_work_class = PlacementWorkClass::AgentSessions;
+        request.executor = Some(ExecutorSelector {
+            name: Some("sp1".into()),
+            ..ExecutorSelector::default()
+        });
+        assert_eq!(
+            place(&connections, &request).expect_err("a batch is refused"),
+            "sp1 runs services only; this request is agentSessions. Its role is set by an operator on cairn://executors/sp1."
+        );
+    }
+
+    /// Rank a service resident (or `class`) among `candidates`, each at the
+    /// verdict forecast it is given, under `profile`, with exploration due.
+    fn rank_at_forecasts(
+        candidates: &[(&ExecutorConnectionState, u64)],
+        class: PlacementWorkClass,
+        profile: PlacementProfile,
+        run: DurationEstimate,
+    ) -> (String, bool) {
+        let scored = candidates
+            .iter()
+            .map(|(entry, verdict_ms)| {
+                let mut prediction = placement_prediction(
+                    entry,
+                    CacheWarmthEvidence::Observed {
+                        warmth: ExecutionWarmth::Cold,
+                        observed_at_unix_ms: NOW,
+                    },
+                    QueueForecast::Forecast {
+                        predicted_ms: 0,
+                        requests_ahead: 0,
+                        running_ahead: 0,
+                        fully_measured: true,
+                        observed_at_unix_ms: NOW,
+                        stalled_head_ms: None,
+                    },
+                    run.clone(),
+                    SyncCost::Known(0),
+                );
+                prediction.predicted_verdict_ms = *verdict_ms;
+                ScoredCandidate::new(
+                    entry,
+                    SyncCost::Known(0),
+                    None,
+                    &ResourceReservation::default(),
+                    prediction,
+                    None,
+                    None,
+                    NOW,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut request = spillable_request();
+        request.placement_work_class = class;
+        let (winner, _, _, exploring, _) = rank_candidates(
+            &scored,
+            false,
+            true,
+            &request,
+            &ActivePlacementPolicy {
+                name: "test".into(),
+                profile,
+            },
+            &ExplorationState {
+                decisions_since_exploration: EXPLORATION_INTERVAL,
+                ..Default::default()
+            },
+        );
+        (
+            winner.unwrap().entry.identity.executor_id.clone(),
+            exploring,
+        )
+    }
+
+    fn learned_duration() -> DurationEstimate {
+        let mut learned = test_prior_duration();
+        learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        learned.sample_count = 20;
+        learned.fallback = None;
+        learned
+    }
+
+    /// The service tier's order under the built-in default profile: a
+    /// services-only machine, then home, then another machine only when home
+    /// is clearly slower. Each preference holds only inside the profile's
+    /// window, so a service box that is clearly slower loses: priced, never
+    /// pinned (tenet 314).
+    #[test]
+    fn a_service_prefers_a_services_only_machine_then_home_then_a_clearly_faster_machine() {
+        let entry = |id: &str, role: MachineRole| {
+            let (_, mut entry) = fleet_entry(id, "linux", 0, &[]);
+            measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
+            entry.machine_role = role;
+            entry
+        };
+        let local = entry(COLOCATED_EXECUTOR_ID, MachineRole::General);
+        let builder = entry("bgsrv", MachineRole::General);
+        let service_box = entry("pi1", MachineRole::ServicesOnly);
+        let default = || built_in_profile(DEFAULT_PLACEMENT_PROFILE).unwrap().clone();
+        let window_ms = default().max_preference_delay_seconds * 1_000;
+        assert!(window_ms > 0, "a preference needs a window to be priced in");
+        let services = PlacementWorkClass::Services;
+        let rank = |candidates: &[(&ExecutorConnectionState, u64)]| {
+            rank_at_forecasts(candidates, services, default(), learned_duration()).0
+        };
+
+        assert_eq!(
+            rank(&[(&local, 10_000), (&builder, 5_000), (&service_box, 12_000)]),
+            "pi1",
+            "inside the window the service box wins over a faster builder and home"
+        );
+        assert_eq!(
+            rank(&[
+                (&local, 10_000),
+                (&builder, 5_000),
+                (&service_box, 5_000 + window_ms + 1),
+            ]),
+            COLOCATED_EXECUTOR_ID,
+            "a service box clearly slower than the window yields, and home is next"
+        );
+        assert_eq!(
+            rank(&[(&local, 10_000), (&builder, 5_000)]),
+            COLOCATED_EXECUTOR_ID,
+            "with no service box a service stays home"
+        );
+        assert_eq!(
+            rank(&[(&local, 5_000 + window_ms + 1), (&builder, 5_000)]),
+            "bgsrv",
+            "another machine wins only when home is clearly slower"
+        );
+
+        let general_box = entry("pi1", MachineRole::General);
+        assert_eq!(
+            rank(&[(&local, 10_000), (&builder, 5_000), (&general_box, 12_000)]),
+            COLOCATED_EXECUTOR_ID,
+            "the role, not the name, is what ranks the box first"
+        );
+    }
+
+    /// Exploration lands work on whichever idle machine is due, which for a
+    /// service would skip the service box and home; a resident never
+    /// completes, so it would teach nothing anyway.
+    #[test]
+    fn a_service_never_spends_its_placement_on_exploration() {
+        let entry = |id: &str| {
+            let (_, mut entry) = fleet_entry(id, "linux", 0, &[]);
+            measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
+            entry
+        };
+        let local = entry(COLOCATED_EXECUTOR_ID);
+        let thin_remote = entry("bgsrv");
+        let mut thin = test_prior_duration();
+        thin.profile_key = Some("svc".into());
+        thin.fallback = Some(DurationFallback::NoProfileRecorded);
+        let candidates = [(&local, 5_000), (&thin_remote, 5_000)];
+        let any = || profile_with_routes(30, |_| PlacementStance::LocalFirst);
+        assert!(
+            rank_at_forecasts(
+                &candidates,
+                PlacementWorkClass::AgentSessions,
+                any(),
+                thin.clone()
+            )
+            .1,
+            "the fixture is one where a batch class explores"
+        );
+        assert_eq!(
+            rank_at_forecasts(&candidates, PlacementWorkClass::Services, any(), thin),
+            (COLOCATED_EXECUTOR_ID.to_string(), false)
+        );
+    }
+
+    /// A service's own residency request, end to end through placement: it
+    /// needs no checkout and no cell contents, it goes to the service box
+    /// while that is up and among machines with bun, and home when it is not.
+    #[test]
+    fn a_service_residency_takes_the_service_box_and_falls_back_home_without_it() {
+        let request = residency_placement_request(&service_placement::service_acquire_request(
+            "thread:t-1:bugs",
+            ExecutorSelector {
+                required_toolchains: vec!["bun".into()],
+                ..ExecutorSelector::default()
+            },
+            cairn_common::executor_protocol::ResidencyFootprint {
+                memory_bytes: 256 * 1024 * 1024,
+                disk_growth_bytes: 64 * 1024 * 1024,
+            },
+            cairn_common::executor_protocol::OwnerDeathPolicy {
+                heartbeat_timeout_ms: 90_000,
+                reclaim_grace_ms: 30_000,
+            },
+        ));
+        assert!(matches!(
+            request.repository,
+            RepositoryLocator::ScratchOnly { .. }
+        ));
+        assert!(request.base_commit.is_empty(), "no commit to materialize");
+        assert_eq!(request.placement_work_class, PlacementWorkClass::Services);
+        assert!(request.pinned_executor_id.is_none());
+
+        let entry = |id: &str, role: MachineRole, toolchains: &[&str]| {
+            let (key, mut entry) = fleet_entry(id, "linux", 0, &[]);
+            measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
+            entry.machine_role = role;
+            entry.advertisement.capabilities.toolchains =
+                toolchains.iter().map(|name| name.to_string()).collect();
+            // Enrolled without `--project`, as a service box is: a scratch-only
+            // residency's project is its service id, which no project list names.
+            entry.advertisement.capabilities.projects_served = Vec::new();
+            (key, entry)
+        };
+        let mut connections = HashMap::from([
+            entry(COLOCATED_EXECUTOR_ID, MachineRole::General, &["bun"]),
+            entry("bgsrv", MachineRole::General, &["bun", "rust"]),
+            entry("pi1", MachineRole::ServicesOnly, &["bun"]),
+        ]);
+        let draft = place(&connections, &request).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "pi1", "{:#?}", draft.rejected);
+
+        let without_bun = entry("pi1", MachineRole::ServicesOnly, &[]);
+        connections.insert(without_bun.0, without_bun.1);
+        let draft = place(&connections, &request).unwrap();
+        assert_eq!(chosen(&draft).executor_id, COLOCATED_EXECUTOR_ID);
+        assert!(matches!(
+            rejection_for(&draft, "pi1"),
+            PlacementRejectionReason::SelectorMismatch { .. }
+        ));
+
+        connections.remove("pi1");
+        assert_eq!(
+            chosen(&place(&connections, &request).unwrap()).executor_id,
+            COLOCATED_EXECUTOR_ID,
+            "with the service box away, the service falls back home"
+        );
+    }
+
     /// A pin by name is refused before anything runs, naming the machine, its
     /// role, the class, and who can change it (cairn/4479).
     #[test]
@@ -30241,7 +30855,7 @@ mod tests {
         let refusal = place(&connections, &request).expect_err("an excluded pin is refused");
         assert_eq!(
             refusal,
-            "sp1 is inference only; this request is agentSessions. Its role is set by an operator on cairn://executors/sp1."
+            "sp1 runs inference only; this request is agentSessions. Its role is set by an operator on cairn://executors/sp1."
         );
 
         // A permanent role outranks a drain an operator could clear.
@@ -30280,7 +30894,7 @@ mod tests {
         request.placement_mobility = PlacementMobility::PinnedOrColocated;
         let refusal = place(&connections, &request).expect_err("immobile work is refused");
         assert!(
-            refusal.contains("is inference only; this request is agentSessions"),
+            refusal.contains("runs inference only; this request is agentSessions"),
             "{refusal}"
         );
         assert!(refusal.contains("Nothing was run"), "{refusal}");
@@ -33927,10 +34541,118 @@ mod tests {
     }
 
     fn machine_left(pool: &Fleet, executor_id: &str) {
-        pool.link_absence_since.lock().unwrap().insert(
-            executor_id.into(),
-            unix_time_ms().saturating_sub(ENVIRONMENT_LEASE_GRACE_MS + 1),
+        pool.stage_link_absent(executor_id, ENVIRONMENT_LEASE_GRACE_MS + 1);
+    }
+
+    /// A machine is lost when it has gone unanswered for the grace in time the
+    /// runner was awake. The hour here is the runner's own host asleep: the link
+    /// closed under it, and the machine had answered ten awake seconds earlier,
+    /// so neither the owner's wake nor eviction may fire over a healthy box.
+    #[test]
+    fn a_runners_own_sleep_is_not_charged_to_a_machine_whose_link_closed() {
+        let (pool, mut request, inbox) = pool_with_a_silent_home(3_600_000);
+        drop(inbox);
+        pool.lock_connections()
+            .get("bbs")
+            .unwrap()
+            .link_clock
+            .stage(10_000, 10_000);
+
+        assert!(!pool.machine_lost_past_grace("bbs"));
+        assert!(pool.resolve_residency_acquire_route(&mut request).is_err());
+        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
+        assert!(pool.take_environment_eviction(&request.holder).is_none());
+
+        // The same closed link after the grace of awake time really has passed.
+        pool.lock_connections()
+            .get("bbs")
+            .unwrap()
+            .link_clock
+            .stage(ENVIRONMENT_LEASE_GRACE_MS + 1_000, 10_000);
+        assert!(pool.machine_lost_past_grace("bbs"));
+    }
+
+    /// Absence is counted the same way, and reconnecting ends it.
+    #[test]
+    fn an_absent_machine_is_lost_only_past_the_grace_and_until_it_returns() {
+        let pool = Fleet::default();
+        pool.stage_link_absent("pi1", 10_000);
+        assert!(!pool.machine_lost_past_grace("pi1"));
+        machine_left(&pool, "pi1");
+        assert!(pool.machine_lost_past_grace("pi1"));
+        pool.lock_connections()
+            .extend([answering_fleet_entry("pi1", "linux", 0, &[])]);
+        assert!(!pool.machine_lost_past_grace("pi1"));
+    }
+
+    /// An unnamed service waits for the runner's own machine at boot, so a
+    /// remote that attaches first does not take it. The wait is bounded, for a
+    /// runner whose executor never comes, and belongs to the first attach only.
+    #[tokio::test]
+    async fn an_unnamed_placement_waits_only_for_the_first_colocated_attach() {
+        let pool = Fleet::default();
+        assert!(
+            !pool
+                .wait_for_first_colocated_attach(std::time::Duration::from_millis(20))
+                .await
         );
+
+        let waiting = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.wait_for_first_colocated_attach(std::time::Duration::from_secs(60))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        let (sender, _inbox) = mpsc::unbounded_channel();
+        let link = pool.attach_executor_with_toolchains(sender, &["bun"]);
+        assert!(waiting.await.unwrap());
+
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, link));
+        assert!(
+            pool.wait_for_first_colocated_attach(std::time::Duration::ZERO)
+                .await,
+            "a later absence is placement's to route around"
+        );
+    }
+
+    /// A runner restart keeps a service on its machine while that machine
+    /// answers: the route is persisted, and an acquisition converges on it
+    /// rather than ranking the fleet again, even where the ranking would choose
+    /// somewhere else.
+    #[test]
+    fn a_restarted_runner_acquires_a_service_where_its_persisted_route_says() {
+        let temp = tempfile::tempdir().unwrap();
+        let route_path = temp.path().join("routes.json");
+        let request = fleet_residency_request(ResidencyHolder::Service {
+            service_id: "thread:p:t-1:bugs".into(),
+        });
+        Fleet::with_residency_route_path(route_path.clone())
+            .update_residency_routes(|routes| {
+                routes.insert(
+                    ("pi1".into(), request.holder.storage_key()),
+                    ResidencyRoute {
+                        holder: request.holder.clone(),
+                        repository: request.repository.clone(),
+                        executor_id: "pi1".into(),
+                        pending: false,
+                    },
+                );
+            })
+            .unwrap();
+
+        let restarted = Fleet::with_residency_route_path(route_path);
+        restarted.lock_connections().extend([
+            answering_fleet_entry("pi1", "linux", 3, &[]),
+            answering_fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]),
+        ]);
+        let mut request = request;
+        let selected = restarted
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .expect("a live route settles the placement");
+        assert_eq!(selected.executor_id, "pi1");
     }
 
     /// cairn/4931 specimen A: bbs holds a job's environment with terminal `dev`
@@ -34512,6 +35234,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         }
     }
 
@@ -36593,8 +37316,16 @@ mod tests {
         pool: &Fleet,
         id: &str,
     ) -> (u64, mpsc::UnboundedReceiver<ExecutorMessage>) {
+        residency_queue_attach_on(pool, id, "linux")
+    }
+
+    fn residency_queue_attach_on(
+        pool: &Fleet,
+        id: &str,
+        os: &str,
+    ) -> (u64, mpsc::UnboundedReceiver<ExecutorMessage>) {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let (_, advertised) = fleet_entry(id, "linux", 0, &[]);
+        let (_, advertised) = fleet_entry(id, os, 0, &[]);
         let generation = pool
             .attach_advertised_executor(
                 advertised.advertisement,
@@ -39363,6 +40094,906 @@ mod tests {
             !home.stands(None, 1_000),
             "an absent machine is placed nowhere anyway"
         );
+    }
+
+    /// The acquisition a machine is offered, claimed through to its grant.
+    async fn residency_queue_claimed(
+        pool: &Fleet,
+        executor: &str,
+        generation: u64,
+        receiver: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+    ) -> (String, ResidencyAcquireRequest) {
+        let entry = residency_queue_offer(receiver).await;
+        pool.handle_executor_message(
+            executor,
+            generation,
+            ExecutorMessage::Claim {
+                entry_id: entry.clone(),
+            },
+        );
+        residency_queue_grant(receiver, Some(&entry)).await
+    }
+
+    /// A machine takes the offer it is sent and provisions the home.
+    async fn residency_queue_accepts(
+        pool: &Fleet,
+        executor: &str,
+        generation: u64,
+        receiver: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+    ) {
+        let (correlation, granted) =
+            residency_queue_claimed(pool, executor, generation, receiver).await;
+        residency_queue_reply(pool, executor, generation, correlation, &granted);
+    }
+
+    /// A machine takes the offer it is sent and answers the grant with a failure.
+    async fn residency_queue_refuses(
+        pool: &Fleet,
+        executor: &str,
+        generation: u64,
+        receiver: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+        kind: ResidencyFailureKind,
+        refusal: &str,
+    ) {
+        let (correlation, _) = residency_queue_claimed(pool, executor, generation, receiver).await;
+        pool.handle_executor_message(
+            executor,
+            generation,
+            ExecutorMessage::ResidencyResponse {
+                correlation_id: correlation,
+                result: residency_core_failure(kind, refusal, None),
+            },
+        );
+    }
+
+    fn assert_never_offered(
+        receiver: &mut mpsc::UnboundedReceiver<ExecutorMessage>,
+        machine: &str,
+    ) {
+        while let Ok(frame) = receiver.try_recv() {
+            assert!(
+                !matches!(
+                    frame,
+                    ExecutorMessage::Offer { .. } | ExecutorMessage::ResidencyRequest { .. }
+                ),
+                "{machine} must not be offered this acquisition: {frame:?}"
+            );
+        }
+    }
+
+    fn residency_queue_untargeted(job: &str) -> ResidencyAcquireRequest {
+        let mut request = residency_queue_request(job);
+        request.executor = None;
+        request
+    }
+
+    fn on_platform(os: &str) -> ExecutorSelector {
+        ExecutorSelector {
+            os: Some(os.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A platform no test machine that means to lose is ever on by accident.
+    fn another_platform() -> &'static str {
+        match std::env::consts::OS {
+            "windows" => "linux",
+            _ => "windows",
+        }
+    }
+
+    /// cairn/5875's first specimen: the idle Windows and Linux machines both
+    /// sort ahead of the Mac, and neither is ever offered the home.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_platform_selector_never_acquires_a_home_on_another_platform() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut windows) = residency_queue_attach_on(&orch.fleet, "a-windows", "windows");
+            let (_, mut linux) = residency_queue_attach_on(&orch.fleet, "b-linux", "linux");
+            let (mac_generation, mut mac) =
+                residency_queue_attach_on(&orch.fleet, "z-macos", "macos");
+            let mut request = residency_queue_request("thread");
+            request.executor = Some(on_platform("macos"));
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_accepts(&orch.fleet, "z-macos", mac_generation, &mut mac)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the Mac takes the home: {placed:?}"
+            );
+            assert_never_offered(&mut windows, "the readier Windows machine");
+            assert_never_offered(&mut linux, "the readier Linux machine");
+            assert_eq!(
+                orch.fleet.residency_route_executor(&request.holder),
+                Some("z-macos".to_string())
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selector_no_machine_satisfies_is_refused_by_name_and_acquires_nothing() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut windows) = residency_queue_attach_on(&orch.fleet, "a-windows", "windows");
+            let mut request = residency_queue_request("thread");
+            request.executor = Some(on_platform("macos"));
+            let refused = orch
+                .fleet
+                .operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone(),
+                    },
+                )
+                .await;
+            let ResidencyResult::Failed {
+                kind, cell_outcome, ..
+            } = &refused
+            else {
+                panic!("nothing can satisfy the selector: {refused:?}");
+            };
+            let Some(CellOutcome::Unavailable { diagnostic, .. }) = cell_outcome.as_deref() else {
+                panic!("the refusal carries the placement sentence: {refused:?}");
+            };
+            assert!(
+                diagnostic.contains("macos"),
+                "the refusal names the selector: {diagnostic}"
+            );
+            assert_eq!(
+                placement::classify_residency_failure(
+                    kind,
+                    cell_outcome.as_deref(),
+                    placement::LinkRestoration::NotRestoring
+                ),
+                placement::PlacementVerdict::Structural,
+                "no amount of waiting changes this answer"
+            );
+            assert_never_offered(&mut windows, "a machine the selector refuses");
+            assert!(
+                orch.fleet.residency_routes.lock().unwrap().is_empty(),
+                "nothing was acquired"
+            );
+        })
+        .await;
+    }
+
+    /// A freshly attached machine on another platform has never been selected,
+    /// which sorts it first on every tie, and its id sorts first too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_home_prefers_the_runners_platform_over_a_fresh_machine() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut fresh) =
+                residency_queue_attach_on(&orch.fleet, "a-fresh", another_platform());
+            let (runner_generation, mut runner) =
+                residency_queue_attach_on(&orch.fleet, "b-runners", std::env::consts::OS);
+            let request = residency_queue_untargeted("thread");
+            let prices = HomePrices {
+                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
+                scratch_sync: None,
+            };
+            let (placed, ()) = tokio::join!(
+                orch.fleet
+                    .acquire_priced_home(&orch, request.clone(), prices),
+                residency_queue_accepts(&orch.fleet, "b-runners", runner_generation, &mut runner)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "{placed:?}"
+            );
+            assert_never_offered(&mut fresh, "the machine that just attached");
+            assert_eq!(
+                orch.fleet
+                    .thread_home_affinity(&request.holder)
+                    .previous_executor_id,
+                Some("b-runners".to_string()),
+                "the machine that answered is the thread's previous home from here on"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_home_lands_off_platform_when_nothing_else_can_take_it() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut only) =
+                residency_queue_attach_on(&orch.fleet, "only", another_platform());
+            let request = residency_queue_untargeted("thread");
+            let prices = HomePrices {
+                home_affinity: Some(orch.fleet.thread_home_affinity(&request.holder)),
+                scratch_sync: None,
+            };
+            let (placed, ()) = tokio::join!(
+                orch.fleet
+                    .acquire_priced_home(&orch, request.clone(), prices),
+                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "priced, not pinned: {placed:?}"
+            );
+            assert_eq!(
+                orch.fleet.residency_route_executor(&request.holder),
+                Some("only".to_string())
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_home_affinity_prices_and_never_excludes() {
+        const BASE_MS: u64 = 20 * 60_000;
+        let entries =
+            [("a-linux", "linux"), ("b-mac", "macos"), ("c-mac", "macos")].map(|(id, os)| {
+                let (_, mut entry) = fleet_entry(id, os, 0, &[]);
+                measured(&mut entry, 0.1, 8_000_000_000, 8_000_000_000);
+                entry
+            });
+        let [linux, b_mac, c_mac] = &entries;
+        fn candidate<'a>(
+            entry: &'a ExecutorConnectionState,
+            verdict_ms: u64,
+            affinity: Option<&HomeAffinity>,
+        ) -> ScoredCandidate<'a> {
+            let mut prediction = placement_prediction(
+                entry,
+                CacheWarmthEvidence::Observed {
+                    warmth: ExecutionWarmth::Cold,
+                    observed_at_unix_ms: NOW,
+                },
+                QueueForecast::Forecast {
+                    predicted_ms: 0,
+                    requests_ahead: 0,
+                    running_ahead: 0,
+                    fully_measured: true,
+                    observed_at_unix_ms: NOW,
+                    stalled_head_ms: None,
+                },
+                test_prior_duration(),
+                SyncCost::Known(0),
+            );
+            prediction.predicted_verdict_ms = verdict_ms;
+            let mut scored = ScoredCandidate::new(
+                entry,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                prediction,
+                None,
+                None,
+                NOW,
+            );
+            scored.home_affinity_ms = affinity.map_or(0, |affinity| {
+                affinity.price_ms(
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities.os,
+                )
+            });
+            scored
+        }
+        let request = spillable_request();
+        let policy = ActivePlacementPolicy::default_profile();
+        let history = ExplorationState {
+            decisions_since_exploration: 0,
+            ..Default::default()
+        };
+        let winner_of = |scored: Vec<ScoredCandidate<'_>>| {
+            let (winner, _, _, _, _) =
+                rank_candidates(&scored, false, true, &request, &policy, &history);
+            winner
+                .expect("a priced machine is never excluded")
+                .entry
+                .identity
+                .executor_id
+                .clone()
+        };
+        let on_a_mac = HomeAffinity {
+            runner_os: "macos".into(),
+            previous_executor_id: None,
+        };
+
+        assert_eq!(
+            winner_of(vec![
+                candidate(linux, BASE_MS - 60_000, Some(&on_a_mac)),
+                candidate(b_mac, BASE_MS, Some(&on_a_mac)),
+            ]),
+            "b-mac",
+            "a minute's head start does not take a thread off the runner's platform"
+        );
+        assert_eq!(
+            winner_of(vec![
+                candidate(linux, BASE_MS - 10 * 60_000, Some(&on_a_mac)),
+                candidate(b_mac, BASE_MS, Some(&on_a_mac)),
+            ]),
+            "a-linux",
+            "a genuinely backlogged Mac still spills"
+        );
+        assert_eq!(
+            winner_of(vec![candidate(linux, BASE_MS, Some(&on_a_mac))]),
+            "a-linux",
+            "the only candidate takes the home whatever it costs"
+        );
+
+        let returning = HomeAffinity {
+            runner_os: "macos".into(),
+            previous_executor_id: Some("c-mac".into()),
+        };
+        assert_eq!(
+            winner_of(vec![
+                candidate(b_mac, BASE_MS, Some(&returning)),
+                candidate(c_mac, BASE_MS, Some(&returning)),
+            ]),
+            "c-mac",
+            "the previous machine beats a peer on the same platform on a tie"
+        );
+
+        assert_eq!(
+            winner_of(vec![
+                candidate(linux, BASE_MS, None),
+                candidate(b_mac, BASE_MS, None),
+            ]),
+            "a-linux",
+            "an issue-owned home carries no affinity, so ordinary order decides"
+        );
+    }
+
+    /// cairn/5875's third requirement, through one `operate_residency`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_first_grant_continues_to_the_next_machine_in_the_same_call() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (broken_generation, mut broken) = residency_queue_attach(&orch.fleet, "a-broken");
+            let (healthy_generation, mut healthy) =
+                residency_queue_attach(&orch.fleet, "b-healthy");
+            let request = residency_queue_untargeted("thread");
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "a-broken",
+                        broken_generation,
+                        &mut broken,
+                        ResidencyFailureKind::Persistence,
+                        "provision residency checkout: Access is denied",
+                    )
+                    .await;
+                    residency_queue_accepts(
+                        &orch.fleet,
+                        "b-healthy",
+                        healthy_generation,
+                        &mut healthy,
+                    )
+                    .await;
+                }
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the same call lands on the next machine: {placed:?}"
+            );
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&request.holder),
+                vec!["a-broken".to_string()]
+            );
+            let routes = orch.fleet.residency_routes.lock().unwrap();
+            let holders: Vec<_> = routes
+                .values()
+                .map(|route| route.executor_id.as_str())
+                .collect();
+            assert_eq!(
+                holders,
+                vec!["b-healthy"],
+                "one home, on the machine that built it"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_machine_refusing_names_every_refusal_promptly() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (first_generation, mut first) = residency_queue_attach(&orch.fleet, "a-first");
+            let (second_generation, mut second) = residency_queue_attach(&orch.fleet, "b-second");
+            let mut request = residency_queue_untargeted("thread");
+            request.wait_horizon_unix_ms = unix_time_ms() + 3_600_000;
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "a-first",
+                        first_generation,
+                        &mut first,
+                        ResidencyFailureKind::Persistence,
+                        "first machine's storage",
+                    )
+                    .await;
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "b-second",
+                        second_generation,
+                        &mut second,
+                        ResidencyFailureKind::Cleanup,
+                        "second machine's storage",
+                    )
+                    .await;
+                }
+            );
+            let ResidencyResult::Failed {
+                kind, diagnostic, ..
+            } = &refused
+            else {
+                panic!("no machine remains: {refused:?}");
+            };
+            assert_eq!(
+                *kind,
+                ResidencyFailureKind::Cleanup,
+                "keeps the last answer's kind, so classification is unchanged"
+            );
+            for named in [
+                "a-first",
+                "first machine's storage",
+                "b-second",
+                "second machine's storage",
+            ] {
+                assert!(diagnostic.contains(named), "names {named}: {diagnostic}");
+            }
+            // The scenario's own 20 s bound is what holds this to "promptly": the
+            // horizon above is an hour, so nothing here waited it out.
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_that_does_not_withdraw_ends_the_acquisition() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut first) = residency_queue_attach(&orch.fleet, "a-first");
+            let (_, mut second) = residency_queue_attach(&orch.fleet, "b-second");
+            let request = residency_queue_untargeted("thread");
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "a-first",
+                    generation,
+                    &mut first,
+                    ResidencyFailureKind::InvalidDeclaration,
+                    "the declaration itself is wrong",
+                )
+            );
+            assert!(
+                matches!(
+                    &refused,
+                    ResidencyResult::Failed {
+                        kind: ResidencyFailureKind::InvalidDeclaration,
+                        ..
+                    }
+                ),
+                "{refused:?}"
+            );
+            assert_never_offered(&mut second, "the next machine");
+            assert!(orch
+                .fleet
+                .withdrawn_home_executors(&request.holder)
+                .is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_selector_is_refused_without_withdrawing_the_machine() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut remote) = residency_queue_attach(&orch.fleet, "remote");
+            let (_, mut other) = residency_queue_attach(&orch.fleet, "other");
+            // `residency_queue_request` names `remote`.
+            let request = residency_queue_request("thread");
+            let refusal = "provision residency checkout: Access is denied";
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "remote",
+                    generation,
+                    &mut remote,
+                    ResidencyFailureKind::Persistence,
+                    refusal,
+                )
+            );
+            let ResidencyResult::Failed { diagnostic, .. } = &refused else {
+                panic!("the machine it named refused: {refused:?}");
+            };
+            let machine = orch.fleet.executor_name_for_text("remote");
+            assert_eq!(
+                diagnostic,
+                &format!(
+                    "{machine} refused to provision this job's execution environment: {refusal}"
+                ),
+                "its own refusal, with nothing withdrawn"
+            );
+            assert_never_offered(&mut other, "a machine the selector did not name");
+            assert!(
+                orch.fleet
+                    .withdrawn_home_executors(&request.holder)
+                    .is_empty(),
+                "one answer must not refuse the caller's own choice for the withdrawal window"
+            );
+        })
+        .await;
+    }
+
+    /// A platform selector narrowed to one machine is the same case as a name:
+    /// a transient failure there must not refuse every matching batch for the
+    /// length of a withdrawal without the machine ever being asked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selector_with_one_matching_machine_asks_it_again_after_a_refusal() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (_, mut linux) = residency_queue_attach_on(&orch.fleet, "a-linux", "linux");
+            let (generation, mut mac) = residency_queue_attach_on(&orch.fleet, "z-mac", "macos");
+            let mut request = residency_queue_request("thread");
+            request.executor = Some(on_platform("macos"));
+            let refusal = "provision residency checkout: Access is denied";
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "z-mac",
+                    generation,
+                    &mut mac,
+                    ResidencyFailureKind::Persistence,
+                    refusal,
+                )
+            );
+            let ResidencyResult::Failed { diagnostic, .. } = &refused else {
+                panic!("the only matching machine refused: {refused:?}");
+            };
+            let machine = orch.fleet.executor_name_for_text("z-mac");
+            assert!(
+                diagnostic.contains(&machine) && diagnostic.contains(refusal),
+                "names the machine and its words: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains("withdrawn"),
+                "nothing was withdrawn, so it must not say so: {diagnostic}"
+            );
+            assert!(orch
+                .fleet
+                .withdrawn_home_executors(&request.holder)
+                .is_empty());
+
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_accepts(&orch.fleet, "z-mac", generation, &mut mac)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the next acquisition asks the machine again: {placed:?}"
+            );
+            assert_never_offered(&mut linux, "a machine the selector refuses");
+        })
+        .await;
+    }
+
+    /// A withdrawal standing from an untargeted acquisition steers later ones. It
+    /// must not stop a caller who then names that machine from reaching it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_standing_withdrawal_never_bars_a_machine_the_caller_names() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (generation, mut only) = residency_queue_attach(&orch.fleet, "only");
+            let untargeted = residency_queue_untargeted("thread");
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: untargeted.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "only",
+                    generation,
+                    &mut only,
+                    ResidencyFailureKind::Persistence,
+                    "provision residency checkout: Access is denied",
+                )
+            );
+            assert!(
+                matches!(refused, ResidencyResult::Failed { .. }),
+                "{refused:?}"
+            );
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&untargeted.holder),
+                vec!["only".to_string()],
+                "an untargeted request is free to go elsewhere, so it is withdrawn"
+            );
+
+            let mut named = untargeted.clone();
+            named.executor = Some(ExecutorSelector {
+                name: Some("only".into()),
+                ..Default::default()
+            });
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: named.clone()
+                    }
+                ),
+                residency_queue_accepts(&orch.fleet, "only", generation, &mut only)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "the machine the caller named is asked: {placed:?}"
+            );
+        })
+        .await;
+    }
+
+    /// Two machines match: the first refusal steers to the second, and running
+    /// out leaves the last one askable rather than locking the selector out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_selector_that_runs_out_of_machines_names_both_and_keeps_the_last_askable() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (first_generation, mut first) =
+                residency_queue_attach_on(&orch.fleet, "a-mac", "macos");
+            let (second_generation, mut second) =
+                residency_queue_attach_on(&orch.fleet, "b-mac", "macos");
+            let mut request = residency_queue_request("thread");
+            request.executor = Some(on_platform("macos"));
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                async {
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "a-mac",
+                        first_generation,
+                        &mut first,
+                        ResidencyFailureKind::Persistence,
+                        "first machine's storage",
+                    )
+                    .await;
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "b-mac",
+                        second_generation,
+                        &mut second,
+                        ResidencyFailureKind::Persistence,
+                        "second machine's storage",
+                    )
+                    .await;
+                }
+            );
+            let ResidencyResult::Failed { diagnostic, .. } = &refused else {
+                panic!("no matching machine remains: {refused:?}");
+            };
+            for named in [
+                orch.fleet.executor_name_for_text("a-mac"),
+                "first machine's storage".to_string(),
+                orch.fleet.executor_name_for_text("b-mac"),
+                "second machine's storage".to_string(),
+            ] {
+                assert!(diagnostic.contains(&named), "names {named}: {diagnostic}");
+            }
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&request.holder),
+                vec!["a-mac".to_string()],
+                "the machine that had a successor is withdrawn; the last one is not"
+            );
+
+            let (placed, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_accepts(&orch.fleet, "b-mac", second_generation, &mut second)
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "{placed:?}"
+            );
+            assert_never_offered(&mut first, "the machine still withdrawn");
+        })
+        .await;
+    }
+
+    /// A scratch affinity guess reaches the acquisition as a price and never as
+    /// a selector, so the machine it favours can refuse and be passed over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scratch_affinity_guess_never_pins_a_home() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (next_generation, mut next) = residency_queue_attach(&orch.fleet, "a-next");
+            let (guessed_generation, mut guessed) =
+                residency_queue_attach(&orch.fleet, "z-guessed");
+            let request = residency_queue_untargeted("thread");
+            let prices = HomePrices {
+                home_affinity: None,
+                scratch_sync: Some(ScratchSyncEstimate {
+                    per_executor_ms: std::collections::BTreeMap::from([(
+                        "z-guessed".to_string(),
+                        0,
+                    )]),
+                    uncovered_ms: 60_000,
+                }),
+            };
+            let (placed, ()) = tokio::join!(
+                orch.fleet
+                    .acquire_priced_home(&orch, request.clone(), prices),
+                async {
+                    residency_queue_refuses(
+                        &orch.fleet,
+                        "z-guessed",
+                        guessed_generation,
+                        &mut guessed,
+                        ResidencyFailureKind::Persistence,
+                        "provision residency checkout: Access is denied",
+                    )
+                    .await;
+                    residency_queue_accepts(&orch.fleet, "a-next", next_generation, &mut next)
+                        .await;
+                }
+            );
+            assert!(
+                matches!(placed, ResidencyResult::State { .. }),
+                "{placed:?}"
+            );
+            assert_eq!(
+                orch.fleet.withdrawn_home_executors(&request.holder),
+                vec!["z-guessed".to_string()]
+            );
+            assert_eq!(
+                orch.fleet.residency_route_executor(&request.holder),
+                Some("a-next".to_string())
+            );
+        })
+        .await;
+    }
+
+    /// The refusal and the predicate meet here: a job a guess sends back to the
+    /// machine that just refused its home would undo the withdrawal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guess_does_not_send_a_job_back_to_the_machine_that_refused_its_home() {
+        residency_queue_scenario(async {
+            let temp = tempfile::tempdir().unwrap();
+            let orch = test_orchestrator(temp.path()).await;
+            let (broken_generation, mut broken) = residency_queue_attach(&orch.fleet, "a-broken");
+            let request = residency_queue_untargeted("thread");
+            let (refused, ()) = tokio::join!(
+                orch.fleet.operate_residency(
+                    &orch,
+                    ResidencyOperation::Acquire {
+                        request: request.clone()
+                    }
+                ),
+                residency_queue_refuses(
+                    &orch.fleet,
+                    "a-broken",
+                    broken_generation,
+                    &mut broken,
+                    ResidencyFailureKind::Persistence,
+                    "provision residency checkout: Access is denied",
+                )
+            );
+            assert!(
+                matches!(refused, ResidencyResult::Failed { .. }),
+                "{refused:?}"
+            );
+            let (_holder_generation, _holder) = residency_queue_attach(&orch.fleet, "b-holder");
+
+            let holder_on = |executor_id: &str| crate::node_scratch::holders::ScratchHolder {
+                process: format!("terminal on {executor_id}"),
+                executor_id: executor_id.into(),
+                job_id: "thread".into(),
+            };
+            let machines = vec![
+                ("a-broken".to_string(), vec![holder_on("a-broken")]),
+                ("b-holder".to_string(), vec![holder_on("b-holder")]),
+            ];
+            let price = |executor_id: &str| match executor_id {
+                "a-broken" => 0,
+                _ => 900,
+            };
+            let name = |executor_id: &str| executor_id.to_string();
+            let can_take = |executor_id: &str| {
+                orch.fleet
+                    .scratch_holder_can_take(executor_id, &request.holder)
+            };
+            let chosen = crate::node_scratch::holders::affinity_among(
+                &machines, can_take, price, None, name,
+            )
+            .unwrap();
+            assert_eq!(
+                chosen.executor_id.as_deref(),
+                Some("b-holder"),
+                "the warmer machine refused this job's home, so the guess passes it over"
+            );
+            let chosen = crate::node_scratch::holders::affinity_among(
+                &machines[..1],
+                can_take,
+                price,
+                None,
+                name,
+            )
+            .unwrap();
+            assert_eq!(chosen.executor_id, None);
+            assert!(
+                chosen.note.contains("placed without that affinity"),
+                "a guess is filtered, never a refusal: {}",
+                chosen.note
+            );
+            assert!(
+                orch.fleet.scratch_holder_can_take(
+                    "a-broken",
+                    &ResidencyHolder::Job {
+                        job_id: "another-job".into()
+                    }
+                ),
+                "the withdrawal is about that job's home, not the machine"
+            );
+        })
+        .await;
     }
 
     async fn residency_queue_duplicate_scenario(winner_fails: bool) {

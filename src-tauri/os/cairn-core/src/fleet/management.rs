@@ -2104,10 +2104,14 @@ mod tests {
         }))
         .unwrap_err()
         .to_string();
-        assert!(
-            bad.contains("buildsOnly") && bad.contains("general") && bad.contains("inferenceOnly"),
-            "{bad}"
-        );
+        for role in crate::fleet::MachineRole::ALL {
+            assert!(bad.contains(role.as_str()), "{bad}");
+        }
+        let services = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
+            "host": "pi1.local", "sshUser": "pi", "role": "servicesOnly"
+        }))
+        .unwrap();
+        assert_eq!(services.role, Some(crate::fleet::MachineRole::ServicesOnly));
         let good = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
             "host": "sp1.local", "sshUser": "dev", "role": "inferenceOnly"
         }))

@@ -880,6 +880,17 @@ fn a_gang_must_lie_in_one_detected_pool_off_builds_only_machines() {
         catalog[&d("embed-fedora")].refused.as_deref(),
         Some("fedora is builds only, so it runs no inference deployment")
     );
+
+    let roles = BTreeMap::from([("fedora".to_string(), MachineRole::ServicesOnly)]);
+    let catalog = super::rules::catalog(&inventory(), &joined, &roles);
+    assert_eq!(
+        catalog[&d("embed-fedora")].refused.as_deref(),
+        Some("fedora is services only, so it runs no inference deployment")
+    );
+
+    let roles = BTreeMap::from([("fedora".to_string(), MachineRole::InferenceOnly)]);
+    let catalog = super::rules::catalog(&inventory(), &joined, &roles);
+    assert_eq!(catalog[&d("embed-fedora")].refused, None);
 }
 
 #[test]

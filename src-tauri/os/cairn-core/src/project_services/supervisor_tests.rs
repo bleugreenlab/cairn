@@ -33,9 +33,8 @@ pub(crate) struct FakeHost {
     refuse_placement: StdMutex<VecDeque<LaunchError>>,
     /// Every native resident started, in order.
     native_launches: StdMutex<Vec<NativeLaunchRecord>>,
-    /// Ends the latest native resident on a machine: (exit code, whether the
-    /// executor was lost).
-    native_exits: StdMutex<HashMap<String, mpsc::UnboundedSender<(Option<i32>, bool)>>>,
+    /// Ends the latest native resident on a machine.
+    native_exits: StdMutex<HashMap<String, NativeExit>>,
     /// Native residents that have exited, by machine.
     native_ended: StdMutex<Vec<String>>,
     /// What the next probes answer: JSON text, or a failure. `None` answers ready.
@@ -44,6 +43,9 @@ pub(crate) struct FakeHost {
     /// The machines the supervisor sees, in place of the fleet's.
     machines: StdMutex<Option<Vec<machine::MachineView>>>,
 }
+
+/// Ends a native resident: (exit code, whether the executor was lost).
+type NativeExit = mpsc::UnboundedSender<(Option<i32>, bool)>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeLaunchRecord {
@@ -215,6 +217,19 @@ impl ServiceHost for Arc<FakeHost> {
                                     return;
                                 }
                                 "hang" => {}
+                                // What a real lease delivers when the machine
+                                // is lost and the service is placed elsewhere.
+                                "lose" => {
+                                    let _ = events.send(HostEvent::MachineLost {
+                                        executor_id: "pi1".into(),
+                                    });
+                                    let _ = events.send(HostEvent::Exited {
+                                        code: None,
+                                        detail: "its event stream closed".into(),
+                                        executor_lost: false,
+                                    });
+                                    return;
+                                }
                                 other => out(&events, json!({"type": "result", "id": id, "ok": false, "error": {"message": format!("no {other}"), "code": "unknown_method"}})),
                             },
                             "drain" => {
@@ -1722,6 +1737,96 @@ async fn the_first_failure_of_a_streak_wakes_the_thread_and_the_next_does_not() 
         .last_error
         .as_deref()
         .is_some_and(|error| error.contains("unknown_method")));
+}
+
+/// What comes next depends on whether the service is free to move, and the
+/// notice says which.
+#[test]
+fn a_lost_machine_notice_says_what_the_service_does_next() {
+    let moves = machine_loss_notice("bugs", "pi1", "cairn://p/cairn/bug-monitor", false);
+    assert!(moves.contains("next machine placement prefers"), "{moves}");
+    let waits = machine_loss_notice("bugs", "pi1", "cairn://p/cairn/bug-monitor", true);
+    assert!(waits.contains("waits for it to come back"), "{waits}");
+    assert!(!waits.contains("placement prefers"), "{waits}");
+}
+
+/// A service whose services-only machine is lost under it wakes its thread
+/// once; the same loss on a general machine, which may simply be asleep, and
+/// a project's service, which has no thread, wake no one.
+#[tokio::test]
+async fn losing_a_services_only_machine_wakes_the_owning_thread_once() {
+    use cairn_common::executor_protocol::MachineRole;
+    let h = thread_harness().await;
+    h.orch
+        .db
+        .local
+        .execute(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+             VALUES ('spanish-run', 'p', 'spanish-session', 'completed', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let notices = "SELECT COUNT(*) FROM messages WHERE content LIKE '%lost its machine%'";
+    write_tutor(&h, "spanish-session", main_ts("serve({})"), false)
+        .await
+        .unwrap();
+    let owner = || thread_agent("cairn://p/cairn/spanish");
+
+    // A general machine going away is ordinary.
+    call(&h.orch, tutor_request("lose", owner()))
+        .await
+        .unwrap_err();
+    eventually("the restart", || {
+        h.host.launches.load(Ordering::Acquire) == 2
+    })
+    .await;
+    assert_eq!(count(&h, notices).await, 0);
+
+    h.orch
+        .fleet
+        .hydrate_machine_roles([("pi1".to_string(), MachineRole::ServicesOnly)]);
+    eventually("the service to serve again", || {
+        h.host.frames_of("hello").len() == 2
+    })
+    .await;
+    call(&h.orch, tutor_request("lose", owner()))
+        .await
+        .unwrap_err();
+    eventually("the second restart", || {
+        h.host.launches.load(Ordering::Acquire) == 3
+    })
+    .await;
+    assert_eq!(count(&h, notices).await, 1, "a lost service box is news");
+    let notice = h
+        .orch
+        .db
+        .local
+        .query_text(
+            "SELECT content FROM messages WHERE content LIKE '%lost its machine%'",
+            (),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        notice.contains("Service `tutor` lost its machine: fake runs services only"),
+        "{notice}"
+    );
+    assert!(notice.contains(&format!("{TUTOR}/status")), "{notice}");
+
+    // A project's service has no thread to wake.
+    call(&h.orch, request("echo", "echo", agent()))
+        .await
+        .unwrap();
+    call(&h.orch, request("echo", "lose", agent()))
+        .await
+        .unwrap_err();
+    eventually("the echo restart", || {
+        status(&h, "echo").state != ServiceState::Backoff
+    })
+    .await;
+    assert_eq!(count(&h, notices).await, 1);
 }
 
 /// An explicit stop pauses a schedule rather than failing it.

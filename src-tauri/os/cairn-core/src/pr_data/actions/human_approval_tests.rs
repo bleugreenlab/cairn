@@ -3,11 +3,22 @@ use crate::api::{ApiConfig, RunnerCredential};
 use crate::services::testing::MockHttpClient;
 use crate::services::{HttpClient, HttpResponse};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 const FIXTURE: &str = include_str!("../../../../../../fixtures/approvals/runner-routes-v1.json");
 const SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-const ENROLLMENT: &str = "cae_fixture00000000000000000001";
+/// The enrollment the fixture's assertion was approved on, and the one the
+/// attempt's policy selects.
+static ENROLLMENT: LazyLock<String> = LazyLock::new(|| {
+    fixture()["assertion"]["expected"]["enrollmentId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+});
+static POLICY: LazyLock<String> = LazyLock::new(|| {
+    serde_json::json!({"version": 1, "state": "enabled", "approval_enrollment_id": *ENROLLMENT})
+        .to_string()
+});
 const CHALLENGE: &str = "apr_1";
 
 fn fixture() -> serde_json::Value {
@@ -183,9 +194,15 @@ fn fixture_claims() -> serde_json::Value {
 
 /// The fixture's Human assertion, minted again for this challenge and intent.
 fn assertion_for(digest: &[u8; 32]) -> String {
+    assertion_with(digest, |_| {})
+}
+
+/// [`assertion_for`], with `edit` applied to the claims before signing.
+fn assertion_with(digest: &[u8; 32], edit: impl FnOnce(&mut serde_json::Value)) -> String {
     let mut claims = fixture_claims();
     claims["challenge_id"] = CHALLENGE.into();
     claims["intent_digest_sha256"] = digest_hex(digest).into();
+    edit(&mut claims);
     let mut der = hex_bytes("302e020100300506032b657004220420");
     der.extend(hex_bytes(SEED));
     jsonwebtoken::encode(
@@ -293,7 +310,7 @@ fn attempt() -> MergeAttemptJournal<'static> {
         job_id: "job",
         target_ref: "main",
         source_ref: "feature/zeta",
-        policy_json: r#"{"version":1,"state":"enabled","approval_enrollment_id":"cae_fixture00000000000000000001"}"#,
+        policy_json: &POLICY,
     }
 }
 
@@ -430,7 +447,7 @@ async fn twice(
         vec![Ok(observation()), Ok(observation())],
         execution,
         shape,
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await
 }
@@ -541,7 +558,7 @@ async fn every_bound_field_that_changes_after_approval_is_stale_and_unclaimed() 
             vec![Ok(observation()), Ok(moved)],
             landed(),
             Ok(squash_shape()),
-            ENROLLMENT,
+            &ENROLLMENT,
         )
         .await;
         let refusal = run.result.as_ref().expect_err(label);
@@ -589,7 +606,7 @@ async fn an_unobservable_revalidation_is_stale_not_a_guess() {
         vec![Ok(observation()), Err("the repository moved".into())],
         landed(),
         Ok(squash_shape()),
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await;
     assert!(run.result.is_err());
@@ -612,7 +629,7 @@ async fn failing_checks_mean_the_phone_is_never_asked() {
         vec![Ok(red)],
         landed(),
         Ok(squash_shape()),
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await;
     assert!(run
@@ -633,7 +650,7 @@ async fn checks_that_go_red_after_approval_refuse_without_a_claim() {
         vec![Ok(observation()), Ok(red)],
         landed(),
         Ok(squash_shape()),
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await;
     assert!(run.result.is_err());
@@ -830,7 +847,7 @@ async fn a_retired_phone_is_never_asked() {
             vec![Ok(observation())],
             landed(),
             Ok(squash_shape()),
-            ENROLLMENT,
+            &ENROLLMENT,
         )
         .await;
         let refusal = run.result.as_ref().unwrap_err();
@@ -852,7 +869,7 @@ async fn a_rebase_is_refused_before_the_phone_is_asked() {
         vec![Ok(rebase)],
         landed(),
         Ok(squash_shape()),
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await;
     assert!(run
@@ -874,7 +891,7 @@ async fn denied_superseded_revoked_and_stale_answers_refuse_without_a_claim() {
             vec![Ok(observation())],
             landed(),
             Ok(squash_shape()),
-            ENROLLMENT,
+            &ENROLLMENT,
         )
         .await;
         assert!(run.result.is_err(), "{state}");
@@ -933,7 +950,7 @@ async fn a_status_read_the_service_refuses_ends_the_wait_unclaimed() {
         vec![Ok(observation())],
         landed(),
         Ok(squash_shape()),
-        ENROLLMENT,
+        &ENROLLMENT,
     )
     .await;
     assert!(run
@@ -986,6 +1003,41 @@ async fn an_approval_from_another_phone_is_never_claimed() {
     .await;
     assert!(run.result.is_err());
     assert_eq!(states(&run.rows).last(), Some(&"invalid_signature"));
+    assert!(run.posted("/claims").is_empty());
+    assert!(!run.executed());
+}
+
+#[tokio::test]
+async fn a_verified_assertion_this_runner_cannot_decode_fails_without_a_claim() {
+    let undecodable = assertion_with(&approved_digest(), |claims| {
+        claims["surprise"] = true.into();
+    });
+    let run = twice(
+        Service {
+            statuses: vec![
+                respond(200, status_body("pending", None)),
+                respond(
+                    200,
+                    status_body("authorized_not_executed", Some(undecodable)),
+                ),
+            ],
+            ..Service::default()
+        },
+        landed(),
+        Ok(squash_shape()),
+    )
+    .await;
+    assert!(run.result.is_err());
+    let (state, human, detail) = run.rows.last().unwrap();
+    assert_eq!(state, "failed");
+    assert!(
+        human.is_none(),
+        "nothing verified is attributed to a person"
+    );
+    assert!(
+        detail.as_deref().unwrap().contains("contract"),
+        "{detail:?}"
+    );
     assert!(run.posted("/claims").is_empty());
     assert!(!run.executed());
 }

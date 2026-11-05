@@ -3834,10 +3834,18 @@ pub enum MachineRole {
     /// Inference deployments only: never surveyed, ranked, explored or chosen
     /// for any batch class.
     InferenceOnly,
+    /// Service residents only: never a batch class, a check lane, a dev
+    /// instance or an inference deployment.
+    ServicesOnly,
 }
 
 impl MachineRole {
-    pub const ALL: [Self; 3] = [Self::BuildsOnly, Self::General, Self::InferenceOnly];
+    pub const ALL: [Self; 4] = [
+        Self::BuildsOnly,
+        Self::General,
+        Self::InferenceOnly,
+        Self::ServicesOnly,
+    ];
 
     /// The wire spelling, which is also what the CLI and the settings file take.
     pub fn as_str(self) -> &'static str {
@@ -3845,6 +3853,7 @@ impl MachineRole {
             Self::BuildsOnly => "buildsOnly",
             Self::General => "general",
             Self::InferenceOnly => "inferenceOnly",
+            Self::ServicesOnly => "servicesOnly",
         }
     }
 
@@ -3854,11 +3863,12 @@ impl MachineRole {
             Self::BuildsOnly => "builds only",
             Self::General => "general",
             Self::InferenceOnly => "inference only",
+            Self::ServicesOnly => "services only",
         }
     }
 
-    /// Parse an operator-supplied spelling, naming the three accepted values
-    /// when it is none of them.
+    /// Parse an operator-supplied spelling, naming every accepted value when
+    /// it is none of them.
     pub fn parse(value: &str) -> Result<Self, String> {
         Self::ALL
             .into_iter()
@@ -3876,8 +3886,8 @@ impl MachineRole {
     /// The ONLY place a role is mapped to classes: placement, the executors
     /// page and every summary ask here. The non-general arms match `class`
     /// exhaustively with no wildcard, so adding a class fails to compile until
-    /// it is answered here. The `Inference` class (deployments) is intended to
-    /// read: builds only false, inference only true, general true.
+    /// it is answered here. Inference deployments are not a placement class;
+    /// [`MachineRole::runs_inference_deployments`] answers for them.
     pub fn accepts(self, class: PlacementWorkClass) -> bool {
         match self {
             Self::General => true,
@@ -3895,6 +3905,23 @@ impl MachineRole {
                 | PlacementWorkClass::DevInstances
                 | PlacementWorkClass::Services => false,
             },
+            Self::ServicesOnly => match class {
+                PlacementWorkClass::Services => true,
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances => false,
+            },
+        }
+    }
+
+    /// Whether model placement may put an inference deployment on a machine
+    /// with this role. Deployments are placed by the model rules, not by
+    /// [`MachineRole::accepts`], so this is their half of the derivation.
+    pub fn runs_inference_deployments(self) -> bool {
+        match self {
+            Self::General | Self::InferenceOnly => true,
+            Self::BuildsOnly | Self::ServicesOnly => false,
         }
     }
 
@@ -5360,6 +5387,10 @@ pub struct LearnedResourceEstimate {
 /// accepted: an operator who downgrades their own runner to a pre-5070 build at
 /// this version keeps a settings file whose `machineRoles` that build ignores,
 /// and would offer batch work to a machine enrolled as inference only.
+///
+/// cairn/5902 adds [`MachineRole::ServicesOnly`] at this version for the same
+/// reason: like the other roles it lives only in the runner, and no executor
+/// is told it, so nothing on the wire changes.
 ///
 /// Still 150 (cairn/5066): check lanes take a placement selector from their
 /// request. [`ExecutorSelector::placement_pin`],
@@ -6875,6 +6906,15 @@ pub struct LearnedResourceEstimate {
 /// that measured capability. An older runner already serves the same npm tree
 /// selection; the executor's local installation and spawn behavior need no new
 /// interpretation by either peer.
+///
+/// cairn/5875 does not move the number. `CellRequest::home_affinity` is
+/// `#[serde(skip)]`, like `scratch_sync`, so it never crosses, and
+/// `ResidencyAcquireRequest` does not change. A run batch's fresh home
+/// acquisition now fills that request's existing `executor` field, as a terminal
+/// or REPL create that names a machine already did, and placement reads it on the
+/// runner before anything is offered. A runner talking to an older executor gets
+/// nothing wrong: that executor is offered only what placement chose, and a
+/// refusal it answers continues on the runner.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 164;
 
 /// The version `build.rs` derived from the paragraphs above
@@ -9048,6 +9088,10 @@ pub struct CellRequest {
     /// no executor reads it and no peer version disagrees about it.
     #[serde(skip)]
     pub scratch_sync: Option<ScratchSyncEstimate>,
+    /// What leaving a thread's natural machines costs its home, priced into
+    /// placement. Runner-side only for the same reason as [`Self::scratch_sync`].
+    #[serde(skip)]
+    pub home_affinity: Option<HomeAffinity>,
 }
 
 /// The milliseconds a node scratch sync is predicted to take per machine:
@@ -9067,6 +9111,45 @@ impl ScratchSyncEstimate {
             .get(executor_id)
             .copied()
             .unwrap_or(self.uncovered_ms)
+    }
+}
+
+/// What a machine that is not the thread's previous home costs it, on top of its
+/// forecast. An initial judgment, not a measurement: big enough to beat a tie and
+/// a small forecast difference, small enough that a backlogged machine still
+/// spills.
+const LEFT_PREVIOUS_HOME_MS: u64 = 30_000;
+
+/// What a machine off the runner's platform costs a thread's home, on top of its
+/// forecast. An initial judgment, not a measurement, sized like
+/// [`LEFT_PREVIOUS_HOME_MS`] but larger: a thread's diagnostics and reads belong
+/// on the platform the runner is on unless that platform is genuinely backed up.
+const OFF_RUNNER_PLATFORM_MS: u64 = 120_000;
+
+/// What leaving a thread's natural machines costs its home: the runner's own
+/// platform and the machine that last held the home. An affinity, never a
+/// filter: every machine stays selectable, and one that is the only candidate
+/// takes the home whatever it costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeAffinity {
+    pub runner_os: String,
+    pub previous_executor_id: Option<String>,
+}
+
+impl HomeAffinity {
+    pub fn price_ms(&self, executor_id: &str, os: &str) -> u64 {
+        if self.previous_executor_id.as_deref() == Some(executor_id) {
+            return 0;
+        }
+        let left_previous = match self.previous_executor_id {
+            Some(_) => LEFT_PREVIOUS_HOME_MS,
+            None => 0,
+        };
+        let off_platform = match os.eq_ignore_ascii_case(&self.runner_os) {
+            true => 0,
+            false => OFF_RUNNER_PLATFORM_MS,
+        };
+        left_previous + off_platform
     }
 }
 
@@ -17131,7 +17214,7 @@ impl PlacementRejectionReason {
                 build_volume_absent_detail(path)
             ),
             Self::RoleExcluded { role, work_class } => format!(
-                "is {}; this request is {}",
+                "runs {}; this request is {}",
                 role.label(),
                 work_class.as_str()
             ),
@@ -20562,15 +20645,16 @@ mod tests {
         );
     }
 
-    /// The three spellings are the ones every surface takes, and an omitted
+    /// The four spellings are the ones every surface takes, and an omitted
     /// role is general so no existing machine changes behaviour.
     #[test]
-    fn machine_role_round_trips_its_three_spellings_and_defaults_to_general() {
+    fn machine_role_round_trips_its_four_spellings_and_defaults_to_general() {
         assert_eq!(MachineRole::default(), MachineRole::General);
         for (role, spelling) in [
             (MachineRole::BuildsOnly, "buildsOnly"),
             (MachineRole::General, "general"),
             (MachineRole::InferenceOnly, "inferenceOnly"),
+            (MachineRole::ServicesOnly, "servicesOnly"),
         ] {
             assert_eq!(
                 serde_json::to_value(role).unwrap(),
@@ -20585,20 +20669,39 @@ mod tests {
         }
         let error = MachineRole::parse("inference-only").unwrap_err();
         assert!(
-            error.contains("buildsOnly, general, inferenceOnly"),
-            "a bad role names the three it could have been: {error}"
+            error.contains("buildsOnly, general, inferenceOnly, servicesOnly"),
+            "a bad role names the four it could have been: {error}"
         );
     }
 
     /// The whole derivation, role by class. Inference-only refuses every class
-    /// that exists today; the other two accept all of them.
+    /// that exists today, services-only accepts service residents alone, and
+    /// the other two accept all of them.
     #[test]
     fn machine_role_accepts_is_the_role_by_class_table() {
         for class in PlacementWorkClass::ALL {
             assert!(MachineRole::General.accepts(class), "{class:?}");
             assert!(MachineRole::BuildsOnly.accepts(class), "{class:?}");
             assert!(!MachineRole::InferenceOnly.accepts(class), "{class:?}");
+            assert_eq!(
+                MachineRole::ServicesOnly.accepts(class),
+                class == PlacementWorkClass::Services,
+                "{class:?}"
+            );
         }
+        assert_eq!(
+            MachineRole::ServicesOnly.describe_accepted(),
+            "accepts services"
+        );
+        assert_eq!(
+            MachineRole::ServicesOnly.refused_classes(),
+            vec![
+                PlacementWorkClass::ReviewChecks,
+                PlacementWorkClass::WriteChecks,
+                PlacementWorkClass::AgentSessions,
+                PlacementWorkClass::DevInstances,
+            ]
+        );
         assert_eq!(
             MachineRole::InferenceOnly.describe_accepted(),
             "accepts none of today's batch classes"
@@ -20614,6 +20717,20 @@ mod tests {
         assert!(MachineRole::General.refused_classes().is_empty());
     }
 
+    /// Deployments are the one kind of work outside the class table, so their
+    /// half of the derivation is its own table.
+    #[test]
+    fn runs_inference_deployments_is_the_role_table_for_deployments() {
+        for (role, runs) in [
+            (MachineRole::BuildsOnly, false),
+            (MachineRole::General, true),
+            (MachineRole::InferenceOnly, true),
+            (MachineRole::ServicesOnly, false),
+        ] {
+            assert_eq!(role.runs_inference_deployments(), runs, "{role:?}");
+        }
+    }
+
     #[test]
     fn role_excluded_names_the_role_and_the_class() {
         assert_eq!(
@@ -20622,8 +20739,18 @@ mod tests {
                 work_class: PlacementWorkClass::AgentSessions,
             }
             .describe(),
-            "is inference only; this request is agentSessions"
+            "runs inference only; this request is agentSessions"
         );
+        for class in MachineRole::ServicesOnly.refused_classes() {
+            assert_eq!(
+                PlacementRejectionReason::RoleExcluded {
+                    role: MachineRole::ServicesOnly,
+                    work_class: class,
+                }
+                .describe(),
+                format!("runs services only; this request is {}", class.as_str())
+            );
+        }
         for class in PlacementWorkClass::ALL {
             assert_eq!(
                 serde_json::to_value(class).unwrap(),
@@ -20835,6 +20962,7 @@ mod tests {
             },
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         }
     }
 

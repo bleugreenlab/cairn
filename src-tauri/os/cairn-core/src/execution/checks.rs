@@ -12663,6 +12663,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         let emitted = crate::execution::wire::durable_check_request(|wait_horizon_unix_ms| {
             let mut request = request();

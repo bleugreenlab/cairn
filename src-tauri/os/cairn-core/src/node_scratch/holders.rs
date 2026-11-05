@@ -171,7 +171,7 @@ pub struct Affinity {
     pub note: String,
 }
 
-fn affinity_among(
+pub(crate) fn affinity_among(
     machines: &[(String, Vec<ScratchHolder>)],
     can_take: impl Fn(&str) -> bool,
     price_ms: impl Fn(&str) -> u64,
@@ -208,8 +208,9 @@ fn affinity_among(
 
 /// Where a batch of `job_id` that named no machine of its own should go for
 /// its node's scratch, when a live process holds the scratch anywhere. A
-/// holder's machine can take the batch when it is connected and not drained;
-/// beyond that, placement decides as it would for any batch.
+/// holder's machine can take the batch when
+/// [`Fleet::scratch_holder_can_take`](crate::fleet::Fleet::scratch_holder_can_take)
+/// says so; beyond that, placement decides as it would for any batch.
 pub async fn affinity(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -220,12 +221,9 @@ pub async fn affinity(
     if machines.is_empty() {
         return None;
     }
-    let connected: Vec<String> = orch
-        .fleet
-        .connected_executors()
-        .into_iter()
-        .map(|(executor_id, _)| executor_id)
-        .collect();
+    let job_holder = ResidencyHolder::Job {
+        job_id: job_id.to_owned(),
+    };
     // Only priced when two machines compete; one holder needs no estimate.
     let estimate = match machines.len() {
         1 => ScratchSyncEstimate::default(),
@@ -233,17 +231,11 @@ pub async fn affinity(
     };
     let own_home = orch
         .fleet
-        .predicted_job_home(&ResidencyHolder::Job {
-            job_id: job_id.to_owned(),
-        })
+        .predicted_job_home(&job_holder)
         .map(|home| home.executor_id);
     affinity_among(
         &machines,
-        |executor_id| {
-            connected.iter().any(|id| id == executor_id)
-                && !orch.fleet.is_drained(executor_id)
-                && orch.fleet.executor_display_name(executor_id).is_some()
-        },
+        |executor_id| orch.fleet.scratch_holder_can_take(executor_id, &job_holder),
         |executor_id| estimate.ms_for(executor_id),
         own_home.as_deref(),
         |executor_id| orch.fleet.executor_name_for_text(executor_id),

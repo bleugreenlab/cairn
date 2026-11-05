@@ -292,6 +292,150 @@ async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
     );
 }
 
+/// `subscribe`, `mute` and `unmute` resolve the `checks` alias to a stored
+/// `condition` row, and `unsubscribe` has no route to that row, so mute and unmute
+/// are its control. Until that changes, the wakes read must not promise otherwise,
+/// and the refusal must leave every row as it found it.
+#[tokio::test]
+async fn checks_unsubscribe_is_neither_advertised_nor_accepted() {
+    let orch = seeded_orch().await;
+    let (issue_id, number) = seed_issue(&orch).await;
+    orch.db
+        .local
+        .execute_script(format!(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               SELECT 'exec-checks','recipe',id,project_id,'running',1,1 FROM issues WHERE id='{issue_id}';
+             INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, created_at, updated_at)
+               SELECT 'job-checks','exec-checks',project_id,id,'running','builder','builder','agent/test',1,1
+               FROM issues WHERE id='{issue_id}';"
+        ))
+        .await
+        .unwrap();
+    let target = format!("cairn://p/cairn/{number}/1/builder/wakes");
+    let watched = "cairn://p/cairn/999";
+    apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Append,
+            Some(serde_json::json!({"mute": {"kind": "checks"}})),
+        ),
+    )
+    .await
+    .unwrap();
+    apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Append,
+            Some(serde_json::json!({"subscribe": {"kind": "issue", "ref": watched}})),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let read = read_as(&orch, None, &target).await;
+    assert!(
+        read.contains("`{mute:{kind:\"checks\",ref?}}`")
+            && read.contains("`{unmute:{kind,ref?}}` (including `kind:\"checks\"`)"),
+        "mute and unmute keep advertising checks: {read}"
+    );
+    let promises: Vec<&str> = read
+        .lines()
+        .filter(|line| line.contains("unsubscribe") && line.contains("checks"))
+        .collect();
+    assert!(
+        promises.is_empty(),
+        "no line may promise a checks unsubscribe: {promises:?}"
+    );
+
+    async fn wake_rows(orch: &Orchestrator) -> Vec<(String, Option<String>, String)> {
+        crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "job-checks")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|sub| {
+                (
+                    sub.source_kind,
+                    sub.source_ref,
+                    sub.state.as_str().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    let before = wake_rows(&orch).await;
+    let checks_ref = format!("cairn://p/cairn/{number}/1/builder/checks");
+    for filter in [
+        serde_json::json!({"kind": "checks"}),
+        serde_json::json!({"kind": "checks", "ref": checks_ref}),
+    ] {
+        let refusal = apply(
+            &orch,
+            &change_item(
+                &target,
+                ChangeMode::Delete,
+                Some(serde_json::json!({"unsubscribe": filter})),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refusal.error.contains("unknown wake source kind 'checks'"),
+            "{refusal:?}"
+        );
+        assert_eq!(wake_rows(&orch).await, before, "a refusal mutates nothing");
+    }
+
+    let unsubscribed = apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Delete,
+            Some(serde_json::json!({"unsubscribe": {"kind": "issue", "ref": watched}})),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unsubscribed, "Unsubscribed 1 wake subscription(s)");
+    let rows = wake_rows(&orch).await;
+    assert!(
+        rows.contains(&(
+            "issue".to_string(),
+            Some(watched.to_string()),
+            "unsubscribed".to_string()
+        )),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(
+            "condition".to_string(),
+            Some(checks_ref.clone()),
+            "muted".to_string()
+        )),
+        "unsubscribing an issue leaves the checks mute alone: {rows:?}"
+    );
+
+    apply(
+        &orch,
+        &change_item(
+            &target,
+            ChangeMode::Patch,
+            Some(serde_json::json!({"unmute": {"kind": "checks"}})),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        wake_rows(&orch).await.contains(&(
+            "condition".to_string(),
+            Some(checks_ref),
+            "active".to_string()
+        )),
+        "the checks alias still unmutes"
+    );
+}
+
 /// Create a `CAIRN` project plus one issue; returns the issue id and number.
 async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
     let clock = RealClock;

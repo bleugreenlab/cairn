@@ -79,12 +79,16 @@ impl EffectiveSelector {
 /// `placement` is what residence and the cell request read, so it is every
 /// effective selector. `shell_pin` is what the batch's shells receive as
 /// `CAIRN_BATCH_EXECUTOR`, which a nested `cairn check run` inherits as a
-/// narrowing, so it is never a node default (tenet 1233). Both call sites read
-/// this, so neither can take the other's by mistake.
+/// narrowing, so it is never a node default (tenet 1233). `declared` is what the
+/// job's home is acquired under: the caller's own statement of intent, so it is
+/// never an affinity guess, which reaches the acquisition only as a price and may
+/// be refused and passed over (tenet 1395). All call sites read this, so none can
+/// take another's by mistake.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct BatchSelectors {
     pub(super) placement: Option<ExecutorSelector>,
     pub(super) shell_pin: Option<ExecutorSelector>,
+    pub(super) declared: Option<ExecutorSelector>,
 }
 
 impl BatchSelectors {
@@ -101,6 +105,12 @@ impl BatchSelectors {
                 SelectorSource::Call | SelectorSource::ScratchAffinity => {
                     Some(effective.selector.clone())
                 }
+            },
+            declared: match effective.source {
+                SelectorSource::Call | SelectorSource::NodeDefault => {
+                    Some(effective.selector.clone())
+                }
+                SelectorSource::ScratchAffinity => None,
             },
         }
     }
@@ -190,6 +200,7 @@ mod tests {
             BatchSelectors {
                 placement: Some(named("bbs")),
                 shell_pin: None,
+                declared: Some(named("bbs")),
             }
         );
         let call = EffectiveSelector::declared(Some(&named("mac")), Some(default_on("bbs")));
@@ -198,6 +209,7 @@ mod tests {
             BatchSelectors {
                 placement: Some(named("mac")),
                 shell_pin: Some(named("mac")),
+                declared: Some(named("mac")),
             }
         );
         let affinity = EffectiveSelector::from_affinity(named("fedora"));
@@ -206,7 +218,9 @@ mod tests {
             BatchSelectors {
                 placement: Some(named("fedora")),
                 shell_pin: Some(named("fedora")),
-            }
+                declared: None,
+            },
+            "an affinity guess places the batch and never its home"
         );
         assert_eq!(BatchSelectors::of(None), BatchSelectors::default());
     }

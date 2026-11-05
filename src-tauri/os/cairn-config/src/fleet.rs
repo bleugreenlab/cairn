@@ -134,19 +134,29 @@ pub fn profile_with_routes(
 
 pub fn built_in_placement_profiles() -> BTreeMap<String, PlacementProfile> {
     [
+        // Services stay home unless a services-only machine is up or home is
+        // clearly slower, in every built-in. The window is what "clearly" means;
+        // with every other route `Any` and no machine priority it changes nothing
+        // for any other class here.
         (
             DEFAULT_PLACEMENT_PROFILE.to_string(),
-            profile_with_routes(0, |_| PlacementStance::Any),
+            profile_with_routes(30, |class| match class {
+                PlacementWorkClass::Services => PlacementStance::LocalFirst,
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances => PlacementStance::Any,
+            }),
         ),
         (INTERACTIVE_PLACEMENT_PROFILE.to_string(), {
             let mut profile = profile_with_routes(30, |class| match class {
                 PlacementWorkClass::ReviewChecks | PlacementWorkClass::WriteChecks => {
                     PlacementStance::RemoteFirst
                 }
-                PlacementWorkClass::AgentSessions => PlacementStance::LocalFirst,
-                PlacementWorkClass::DevInstances | PlacementWorkClass::Services => {
-                    PlacementStance::Any
+                PlacementWorkClass::AgentSessions | PlacementWorkClass::Services => {
+                    PlacementStance::LocalFirst
                 }
+                PlacementWorkClass::DevInstances => PlacementStance::Any,
             });
             profile.executor_policy_overrides.insert(
                 LOCAL_EXECUTOR_NAME.to_string(),
@@ -163,7 +173,13 @@ pub fn built_in_placement_profiles() -> BTreeMap<String, PlacementProfile> {
         }),
         (
             LOW_POWER_PLACEMENT_PROFILE.to_string(),
-            profile_with_routes(120, |_| PlacementStance::RemoteFirst),
+            profile_with_routes(120, |class| match class {
+                PlacementWorkClass::Services => PlacementStance::LocalFirst,
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances => PlacementStance::RemoteFirst,
+            }),
         ),
     ]
     .into_iter()
@@ -1162,6 +1178,20 @@ fn default_timeout_seconds() -> u64 {
 mod tests {
     use super::*;
 
+    /// A service prefers a services-only machine and then home under every
+    /// built-in. Low power would otherwise send each unnamed service to a remote
+    /// build box at its next re-place, the poor service host this order avoids.
+    #[test]
+    fn every_built_in_profile_keeps_services_home_first() {
+        for (name, profile) in built_in_placement_profiles() {
+            assert_eq!(
+                profile.routes.get(&PlacementWorkClass::Services),
+                Some(&PlacementStance::LocalFirst),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn an_absent_machine_roles_block_is_every_machine_general() {
         let config: FleetConfig = serde_json::from_value(serde_json::json!({})).unwrap();
@@ -1198,6 +1228,15 @@ mod tests {
             "general is stored as absence"
         );
         assert!(!config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::General));
+
+        // Every role persists and hydrates as itself.
+        for role in MachineRole::ALL {
+            let mut config = FleetConfig::default();
+            config.set_machine_role("pi1", role);
+            let reloaded: FleetConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(reloaded.machine_role("pi1"), role, "{role:?}");
+        }
     }
 
     #[test]

@@ -12,11 +12,14 @@ use cairn_common::approvals::{
     ApprovalEnrollmentBindingV1, ApprovalIntent, ApprovalRevocationBindingV1,
     ApprovalSignatureAlgorithm, ApprovalSignatureFormat, BaseMergeIntentV2, PhoneApprovalAssertion,
 };
+use cairn_common::identity::CredentialRef;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const CONTRACT_FIXTURE: &str =
     include_str!("../../../../fixtures/approvals/phone-contract-v1.json");
+const RUNNER_ROUTES_FIXTURE: &str =
+    include_str!("../../../../fixtures/approvals/runner-routes-v1.json");
 
 fn fixture() -> Value {
     serde_json::from_str(CONTRACT_FIXTURE).expect("contract fixture is valid JSON")
@@ -217,6 +220,25 @@ fn head_ref_vectors_decide_the_same_way_on_every_side() {
         let label = expect_str(&vector["label"]);
         assert_eq!(
             is_safe_head_ref(expect_str(&vector["value"])),
+            vector["accepted"].as_bool().unwrap(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn credential_ref_vectors_decide_the_same_way_on_every_side() {
+    let fixture: Value =
+        serde_json::from_str(RUNNER_ROUTES_FIXTURE).expect("runner fixture is valid JSON");
+    let vectors = fixture["credentialRefVectors"]["vectors"]
+        .as_array()
+        .unwrap();
+    assert!(vectors.iter().any(|vector| vector["accepted"] == true));
+    assert!(vectors.iter().any(|vector| vector["accepted"] == false));
+    for vector in vectors {
+        let label = expect_str(&vector["label"]);
+        assert_eq!(
+            CredentialRef::new(expect_str(&vector["value"])).is_ok(),
             vector["accepted"].as_bool().unwrap(),
             "{label}"
         );

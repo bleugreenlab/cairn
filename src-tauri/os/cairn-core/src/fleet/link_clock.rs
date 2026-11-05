@@ -57,6 +57,17 @@ pub fn monotonic_now_ns() -> u64 {
         .saturating_add(MONOTONIC_BASE_NS)
 }
 
+/// Milliseconds of awake time since `at_ns`, a stamp from [`monotonic_now_ns`].
+pub fn awake_ms_since(at_ns: u64) -> u64 {
+    monotonic_now_ns().saturating_sub(at_ns) / NANOS_PER_MS
+}
+
+/// The stamp [`monotonic_now_ns`] gave `ago_ms` of awake time ago, for tests.
+#[cfg(test)]
+pub(crate) fn stamp_awake_ms_ago(ago_ms: u64) -> u64 {
+    monotonic_now_ns() - ago_ms * NANOS_PER_MS
+}
+
 /// What the task applying a link's messages is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -35,7 +35,13 @@ pub(crate) enum ExecutorCommand {
         extra_ssh_args: Vec<String>,
         /// What the machine is for. Omitted means general for a new machine
         /// and the role it already holds for one enrolled again.
-        #[arg(long, value_parser = ["buildsOnly", "general", "inferenceOnly"])]
+        #[arg(
+            long,
+            value_parser = clap::builder::PossibleValuesParser::new(
+                cairn_common::executor_protocol::MachineRole::ALL
+                    .map(cairn_common::executor_protocol::MachineRole::as_str)
+            )
+        )]
         role: Option<String>,
     },
     /// Tear down an executor and revoke its enrollment, by public name.
@@ -685,9 +691,16 @@ mod tests {
             .err()
             .expect("an unknown role is refused")
             .to_string();
-        assert!(
-            refused.contains("buildsOnly") && refused.contains("inferenceOnly"),
-            "{refused}"
+        for role in cairn_common::executor_protocol::MachineRole::ALL {
+            assert!(refused.contains(role.as_str()), "{refused}");
+        }
+        let cli = Cli::try_parse_from(["cairn", "add", "pi@pi1.local", "--role", "servicesOnly"])
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(add_request(cli.command).unwrap())
+                .unwrap()
+                .get("role"),
+            Some(&json!("servicesOnly"))
         );
     }
 

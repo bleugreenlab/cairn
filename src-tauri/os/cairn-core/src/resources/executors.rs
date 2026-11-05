@@ -399,6 +399,7 @@ pub(crate) fn render_executors(
             plural(executors.len(), "executor", "executors")
         ));
     }
+    out.push_str(&role_census(executors, enrolled));
     out.push_str(&stranded_summary(enrolled));
     for executor in executors {
         out.push_str(&format!("## {}\n", executor.name));
@@ -650,6 +651,37 @@ fn drain_line(executor: &ExecutorInspection) -> String {
 /// admission, queues, the work resident on a machine — comes from the machine
 /// itself, and none of it was measured. Printing those sections as zeroes would
 /// describe an idle machine rather than an absent one.
+/// Every machine by role, in one line, once any machine is not general: the
+/// service tier, the build tier and the inference tier at a glance. Nothing
+/// when every machine is general, which is what a fleet without roles is.
+fn role_census(executors: &[ExecutorInspection], enrolled: &[EnrolledRemote]) -> String {
+    let mut by_name = std::collections::BTreeMap::<&str, MachineRole>::new();
+    for remote in enrolled {
+        by_name.insert(remote.name.as_str(), remote.role);
+    }
+    for executor in executors {
+        by_name.insert(executor.name.as_str(), executor.health.role);
+    }
+    if by_name.values().all(|role| *role == MachineRole::General) {
+        return String::new();
+    }
+    let order = MachineRole::ALL
+        .into_iter()
+        .filter(|role| *role != MachineRole::General)
+        .chain([MachineRole::General]);
+    let groups = order
+        .filter_map(|role| {
+            let names = by_name
+                .iter()
+                .filter(|(_, held)| **held == role)
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+            (!names.is_empty()).then(|| format!("{}: {}", role.label(), names.join(", ")))
+        })
+        .collect::<Vec<_>>();
+    format!("Roles: {}\n\n", groups.join(" · "))
+}
+
 /// What a machine is for, and what that means for today's classes of work,
 /// derived from the role's own [`MachineRole::accepts`].
 fn machine_role_line(role: MachineRole) -> String {
@@ -733,6 +765,24 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
                 Some(cairn_common::executor_protocol::UpdateRestart { outcome: None, .. }) => "The runner is restarting its daemon once over this machine's ssh bootstrap now.",
                 Some(cairn_common::executor_protocol::UpdateRestart { outcome: Some(_), .. }) => "The runner restarted its daemon once over this machine's ssh bootstrap, with the outcome above, and does not try again for this build: bringing it back is the operator's from here.",
             },
+        ));
+        out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
+        return out;
+    }
+    // A service box does not sleep, so its silence is never "ordinary".
+    if let (
+        MachineRole::ServicesOnly,
+        RemoteLinkState::Absent {
+            last_beat_unix_ms, ..
+        },
+    ) = (remote.role, &remote.link)
+    {
+        let since = last_beat_unix_ms
+            .and_then(|at| crate::clock::stamp_millis_with_seconds(at as i64))
+            .unwrap_or_else(|| "this runner started".to_string());
+        out.push_str(&format!(
+            "{} runs services only and is expected to be always on; its link has been silent since {since}. That is an incident, not sleep: residents not pinned to it fall back to other machines until it returns.\n",
+            remote.name
         ));
         out.push_str("\nNo load, admission, or occupancy is reported: those are measured on the machine, and this one is not reporting.\n");
         return out;
@@ -1317,7 +1367,11 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         executor.captured_at_unix_ms,
     ));
 
-    out.push_str(&render_storage(executor));
+    if health.role == MachineRole::ServicesOnly {
+        out.push_str(&render_services_only_storage(executor));
+    } else {
+        out.push_str(&render_storage(executor));
+    }
     // Two verdicts, never one. The physical half is how much room is left; the
     // custodial half is whether the executor still owns bytes it has admitted it
     // cannot reclaim. Flattening them is what let an `Ok` volume hide two
@@ -1602,28 +1656,35 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     ));
     out.push('\n');
 
+    // A services-only machine keeps no pool of build cells, so the pool's
+    // counts and slots would describe a machine it is not; its residents and
+    // anything left from before the role are on the storage block above.
+    let services_only = health.role == MachineRole::ServicesOnly;
     out.push_str("## Occupancy\n");
     let occupancy = &executor.occupancy;
-    // "Materialized" is every cell in the pool. It used to read "checked out",
-    // which an operator took for holds and went looking for bytes held cells
-    // did not have; holds are `held`, and only idle cells are reclaimable.
-    out.push_str(&format!(
-        "- Cells: {} materialized ({} held, {} running, {} idle reclaimable)\n",
-        health.inventory.checked_out_count,
-        health.inventory.held_count,
-        health.inventory.transient_occupancy,
-        health.inventory.idle_count
-    ));
-    out.push_str(&format!(
-        "- Idle retention guard: up to {} idle per project, {} machine-wide{}\n",
-        health.inventory.idle_retention_budget_per_project,
-        health.inventory.idle_retention_budget_total,
-        if health.inventory.idle_retention_pressured {
-            " (volume at its pressure line: reclamation is byte-driven, coldest first)"
-        } else {
-            ""
-        }
-    ));
+    if !services_only {
+        // "Materialized" is every cell in the pool. It used to read "checked
+        // out", which an operator took for holds and went looking for bytes
+        // held cells did not have; holds are `held`, and only idle cells are
+        // reclaimable.
+        out.push_str(&format!(
+            "- Cells: {} materialized ({} held, {} running, {} idle reclaimable)\n",
+            health.inventory.checked_out_count,
+            health.inventory.held_count,
+            health.inventory.transient_occupancy,
+            health.inventory.idle_count
+        ));
+        out.push_str(&format!(
+            "- Idle retention guard: up to {} idle per project, {} machine-wide{}\n",
+            health.inventory.idle_retention_budget_per_project,
+            health.inventory.idle_retention_budget_total,
+            if health.inventory.idle_retention_pressured {
+                " (volume at its pressure line: reclamation is byte-driven, coldest first)"
+            } else {
+                ""
+            }
+        ));
+    }
     out.push_str(&format!(
         "- Running: {}\n",
         occupancy.executing_requests.len()
@@ -1644,7 +1705,29 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     ));
     out.push('\n');
 
-    out.push_str("## Pool slots\n");
+    if !services_only {
+        out.push_str(&render_pool_slots(executor));
+    }
+
+    if services_only {
+        out.push_str(&format!(
+            "Placement history: cairn://executors/{}?view=placements\n\nThis machine runs services only, so a `run` that names it is refused; a service declaration may name it with `executor: {{name: \"{}\"}}`. Renaming it is an operator action: `cairn executor rename {} <new-name>`.\n",
+            executor.name, executor.name, executor.name
+        ));
+    } else {
+        out.push_str(&format!(
+            "Placement history: cairn://executors/{}?view=placements\n\nTarget this machine with `run({{executor:{{name:\"{}\"}}}})`. Renaming it is an operator action: `cairn executor rename {} <new-name>`.\n",
+            executor.name, executor.name, executor.name
+        ));
+    }
+    out
+}
+
+/// The `## Pool slots` section: every cell this machine keeps, with its head,
+/// lifecycle, footprint and last use.
+fn render_pool_slots(executor: &ExecutorInspection) -> String {
+    let occupancy = &executor.occupancy;
+    let mut out = String::from("## Pool slots\n");
     if occupancy.cells.is_empty() {
         out.push_str("No cached slot state.\n");
     }
@@ -1702,11 +1785,90 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         }
     }
     out.push('\n');
+    out
+}
 
+/// Whether a cell is a service resident's scratch: the one kind of cell a
+/// services-only machine is meant to hold.
+fn is_resident_scratch(cell: &cairn_common::executor_protocol::PersistentCellState) -> bool {
+    cell.residency.as_ref().is_some_and(|residency| {
+        matches!(
+            residency.holder,
+            cairn_common::executor_protocol::ResidencyHolder::Service { .. }
+        )
+    })
+}
+
+/// The `## Storage` head for a services-only machine: the volume, the one rung
+/// it is meant to hold, and whatever it still holds from before the role.
+///
+/// The executor is never told its role, so build cells, the dependency
+/// catalog, managed objects and caches made before the change stay until the
+/// executor's own idle retention reclaims them. They are named here, sized,
+/// rather than hidden, so the page can show that nothing new is being made.
+fn render_services_only_storage(executor: &ExecutorInspection) -> String {
+    let health = &executor.health;
+    let captured = executor.captured_at_unix_ms;
+    let mut out = String::from("## Storage\n");
     out.push_str(&format!(
-        "Placement history: cairn://executors/{}?view=placements\n\nTarget this machine with `run({{executor:{{name:\"{}\"}}}})`. Renaming it is an operator action: `cairn executor rename {} <new-name>`.\n",
-        executor.name, executor.name, executor.name
+        "- Volume: {} — {:?}\n",
+        reading(&health.machine.volume, captured, |volume| format!(
+            "{} free of {}",
+            bytes(volume.free_bytes),
+            bytes(volume.total_bytes)
+        )),
+        health.disk.status,
     ));
+    let (resident, leftover): (Vec<_>, Vec<_>) = executor
+        .occupancy
+        .cells
+        .iter()
+        .partition(|cell| is_resident_scratch(cell));
+    let sum = |cells: &[&cairn_common::executor_protocol::PersistentCellState]| {
+        cells
+            .iter()
+            .fold(0_u64, |total, cell| total.saturating_add(cell.size_bytes))
+    };
+    out.push_str(&format!(
+        "- Storage: resident scratch only (services only keeps no build cells, dependency catalog or managed objects): {} across {}\n",
+        bytes(sum(&resident)),
+        plural(resident.len(), "resident", "residents"),
+    ));
+    let mut left = Vec::new();
+    if !leftover.is_empty() {
+        left.push(format!(
+            "{}: {}",
+            plural(leftover.len(), "build cell", "build cells"),
+            bytes(sum(&leftover))
+        ));
+    }
+    if let Some(accounting) = health.machine.disk_accounting.value() {
+        let categories = &accounting.categories;
+        let catalog = categories
+            .external_caches
+            .catalog_staging_bytes
+            .saturating_add(categories.external_caches.catalog_generations_bytes);
+        let tool_caches = categories
+            .external_managed_caches_bytes
+            .saturating_sub(catalog);
+        for (name, size) in [
+            ("dependency catalog", catalog),
+            ("managed objects", categories.managed_objects_bytes),
+            ("tool caches", tool_caches),
+            ("warm caches", categories.warm_caches_bytes),
+            ("quarantines", categories.quarantines_bytes),
+        ] {
+            if size > 0 {
+                left.push(format!("{name}: {}", bytes(size)));
+            }
+        }
+    }
+    if !left.is_empty() {
+        out.push_str("- Left from before this machine was services only (the storage ladder's idle retention reclaims these; nothing new is made here):\n");
+        for line in left {
+            out.push_str(&format!("  - {line}\n"));
+        }
+    }
     out
 }
 
@@ -2376,7 +2538,40 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                 .fold(0_u64, |sum, entry| sum.saturating_add(entry.bytes));
             let retired = by_rung(StorageReclaimRung::RetiredCells);
             let retired_homes = by_rung(StorageReclaimRung::RetiredHomes);
-            out.push_str(&format!(
+            if executor.health.role == MachineRole::ServicesOnly {
+                // Only the rungs that gave anything: the build rungs of a
+                // services-only machine hold nothing but leftovers, and a row
+                // of zeroes would read as build storage it keeps.
+                let gave = [
+                    ("retired executor homes", StorageReclaimRung::RetiredHomes),
+                    ("retired trees", StorageReclaimRung::RetiredTrees),
+                    ("catalog staging", StorageReclaimRung::CatalogStaging),
+                    ("managed caches", StorageReclaimRung::ManagedCaches),
+                    ("quarantine targets", StorageReclaimRung::QuarantineTargets),
+                    ("resident scratch", StorageReclaimRung::IdleCellScratch),
+                    ("idle targets", StorageReclaimRung::IdleTargets),
+                    ("retired cells", StorageReclaimRung::RetiredCells),
+                ]
+                .into_iter()
+                .map(|(label, rung)| (label, by_rung(rung).bytes))
+                .filter(|(_, size)| *size > 0)
+                .map(|(label, size)| format!("{label} {}", bytes(size)))
+                .collect::<Vec<_>>();
+                out.push_str(&format!(
+                    "- Last pressure pass {}: band {:?}, asked {}, reclaimed {}{} — {:?}\n",
+                    age(captured.saturating_sub(pressure.at_unix_ms)),
+                    pressure.band,
+                    bytes(pressure.target_bytes),
+                    bytes(total),
+                    if gave.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", gave.join(" · "))
+                    },
+                    pressure.outcome,
+                ));
+            } else {
+                out.push_str(&format!(
                 "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · catalog staging {} · managed caches {} · quarantine targets {} · idle cell scratch {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
                 age(captured.saturating_sub(pressure.at_unix_ms)),
                 pressure.band,
@@ -2405,6 +2600,7 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                     ))
                     .unwrap_or_default()
             ));
+            }
             for withheld in &pressure.withheld {
                 out.push_str(&format!("- Not reclaimed: {}\n", withheld_line(withheld)));
             }
@@ -3707,6 +3903,11 @@ fn link_summary(executor: &ExecutorInspection) -> String {
                 None => "online".to_string(),
             }
         }
+        ExecutorHealthStatus::Stale if executor.health.role == MachineRole::ServicesOnly => format!(
+            "stale — no heartbeat for {}; {} runs services only and is expected to be always on, so that is an incident, not sleep: residents not pinned to it fall back to other machines until it returns",
+            held(executor.health.heartbeat_age_ms),
+            executor.name
+        ),
         ExecutorHealthStatus::Stale => format!(
             "stale — no heartbeat for {}",
             age(executor.health.heartbeat_age_ms)
@@ -5255,6 +5456,99 @@ mod storage_section_tests {
             },
         );
         executor
+    }
+
+    /// A services-only machine's storage is its one rung. What it still holds
+    /// from before the role (bgsrv-ub2's cells, catalog and objects) is named
+    /// and sized under its own heading rather than hidden, and the build
+    /// sections that would read as current are not rendered.
+    #[test]
+    fn a_services_only_page_shows_resident_scratch_and_what_is_left_from_before() {
+        use cairn_common::executor_protocol::{
+            CellResidency, MachineRole, OwnerDeathPolicy, PersistentCellState, RepositoryLocator,
+            ResidencyFootprint, ResidencyHolder, ResidencyPhase,
+        };
+        let cell = |id: &str, size_bytes: u64| -> PersistentCellState {
+            serde_json::from_value(serde_json::json!({
+                "projectId": "p", "slotId": id, "path": "/cells/x", "repository": "/r",
+                "lifecycle": "idle", "cellEpoch": 1, "lastSealedCommit": null,
+                "lastUsedUnixMs": 0, "sizeBytes": size_bytes, "occupancy": {}
+            }))
+            .unwrap()
+        };
+        let mut resident = cell("svc-1", 3 * 1024 * 1024);
+        resident.residency = Some(CellResidency {
+            holder: ResidencyHolder::Service {
+                service_id: "thread:t-1:bugs".into(),
+            },
+            repository: RepositoryLocator::ScratchOnly {
+                owner_id: "thread:t-1:bugs".into(),
+            },
+            owner_ref: None,
+            selector: None,
+            incarnation_id: String::new(),
+            current_base_commit: String::new(),
+            phase: ResidencyPhase::Active,
+            last_heartbeat_unix_ms: 0,
+            reclaim_deadline_unix_ms: 0,
+            death_policy: OwnerDeathPolicy {
+                heartbeat_timeout_ms: 90_000,
+                reclaim_grace_ms: 30_000,
+            },
+            footprint: ResidencyFootprint {
+                memory_bytes: 0,
+                disk_growth_bytes: 0,
+            },
+            state_revision: 0,
+            events: Vec::new(),
+        });
+        let mut executor = tight_local();
+        executor.health.role = MachineRole::ServicesOnly;
+        executor.occupancy.cells = vec![resident.clone(), cell("slot-7", 5 * GIB)];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- Storage: resident scratch only (services only keeps no build cells, dependency catalog or managed objects): 3.0 MiB across 1 resident\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Left from before this machine was services only (the storage ladder's idle retention reclaims these; nothing new is made here):\n  - 1 build cell: 5.0 GiB\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - tool caches: 93.0 GiB\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - quarantines: 104.0 GiB\n"),
+            "{rendered}"
+        );
+        for build_only in [
+            "## Pool slots",
+            "- Cells: ",
+            "Idle retention guard",
+            "Cairn holds",
+        ] {
+            assert!(!rendered.contains(build_only), "{build_only}: {rendered}");
+        }
+        assert!(rendered.contains("- Resident processes: "), "{rendered}");
+        assert!(
+            rendered
+                .contains("This machine runs services only, so a `run` that names it is refused"),
+            "{rendered}"
+        );
+
+        // Once the ladder has reclaimed the leftovers, nothing is left to name.
+        executor.occupancy.cells = vec![resident];
+        executor.health.machine.disk_accounting =
+            Measurement::measured(executor.captured_at_unix_ms, DiskAccounting::default());
+        let clean = render_executor(&executor);
+        assert!(!clean.contains("Left from before"), "{clean}");
+
+        // A general machine keeps its build sections.
+        executor.health.role = MachineRole::General;
+        let general = render_executor(&executor);
+        assert!(general.contains("## Pool slots"), "{general}");
+        assert!(!general.contains("resident scratch only"), "{general}");
     }
 
     /// bgsrv-mac on 10-31: the external caches were one figure, almost all of
@@ -8380,6 +8674,75 @@ mod tests {
         assert!(detached.contains("- Role: inference only"), "{detached}");
         let overview = render_executors(&[], &[remote], &[], None, REMOTE_CAPTURED_AT, false);
         assert!(overview.contains("- Role: inference only"), "{overview}");
+    }
+
+    /// The fleet listing names every machine by role once any is not general,
+    /// and says nothing about roles while all are.
+    #[test]
+    fn the_fleet_listing_carries_a_role_census_once_any_machine_has_a_role() {
+        let local = inspection("local", true);
+        let mut ub2 = inspection("bgsrv-ub2", false);
+        let general_only = render_executors(
+            &[local.clone(), ub2.clone()],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(!general_only.contains("Roles:"), "{general_only}");
+
+        ub2.health.role = MachineRole::ServicesOnly;
+        let mut sp1 = enrolled(
+            "sp1",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: None,
+                last_reason: String::new(),
+            },
+        );
+        sp1.role = MachineRole::InferenceOnly;
+        let listed = render_executors(&[local, ub2], &[sp1], &[], None, CAPTURED_AT, false);
+        assert!(
+            listed.contains(
+                "Roles: inference only: sp1 · services only: bgsrv-ub2 · general: local\n"
+            ),
+            "{listed}"
+        );
+    }
+
+    /// A service box does not sleep: its silence is an incident on the page,
+    /// where any other machine's is ordinary.
+    #[test]
+    fn a_silent_services_only_machine_reads_as_an_incident_not_sleep() {
+        let mut remote = enrolled(
+            "pi1",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: Some(REMOTE_CAPTURED_AT - 60_000),
+                last_reason: String::new(),
+            },
+        );
+        let ordinary = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(ordinary.contains("powered off, asleep"), "{ordinary}");
+        remote.role = MachineRole::ServicesOnly;
+        let incident = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(
+            incident.contains("pi1 runs services only and is expected to be always on; its link has been silent since "),
+            "{incident}"
+        );
+        assert!(
+            incident.contains("That is an incident, not sleep: residents not pinned to it fall back to other machines until it returns."),
+            "{incident}"
+        );
+        assert!(!incident.contains("asleep"), "{incident}");
+
+        let mut attached = inspection("pi1", false);
+        attached.health.status = ExecutorHealthStatus::Stale;
+        attached.health.heartbeat_age_ms = 180_000;
+        attached.health.role = MachineRole::ServicesOnly;
+        assert_eq!(
+            link_summary(&attached),
+            "stale — no heartbeat for 3m; pi1 runs services only and is expected to be always on, so that is an incident, not sleep: residents not pinned to it fall back to other machines until it returns"
+        );
     }
 
     #[test]

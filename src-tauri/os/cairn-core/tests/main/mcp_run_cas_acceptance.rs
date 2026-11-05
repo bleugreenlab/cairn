@@ -581,6 +581,7 @@ fn request_at(
         resource_reservation: Default::default(),
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     }
 }
 

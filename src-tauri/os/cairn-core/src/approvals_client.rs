@@ -560,6 +560,9 @@ impl<'a> ApprovalsClient<'a> {
         let base = self.api.base_url().to_string();
         if let Some(keys) = self.keys.get(&base) {
             match verify_service_assertion(token, &keys, expected, now) {
+                // Only a rejection that could mean a rotated key fetches again. A
+                // claims rejection already verified under a cached key, so new
+                // keys would not change it.
                 Err(AssertionRejection::InvalidSignature(_)) => {}
                 verdict => return verdict,
             }
@@ -590,12 +593,16 @@ pub struct AssertionExpectation<'a> {
 /// Why an assertion was not accepted, in the journal's vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssertionRejection {
-    /// The signature, header, issue time, claims, digest, or enrollment is wrong.
+    /// The signature, header, issue time, digest, or enrollment is wrong.
     InvalidSignature(String),
     /// It was minted for another issuer, audience, or organization.
     WrongAudience(String),
     /// The key set could not be read, so nothing could be verified.
     KeysUnavailable(String),
+    /// The signature verified under the service's key, but the claims do not
+    /// satisfy this runner's contract: version or validation drift between
+    /// service and runner, not a forgery.
+    ClaimsRejected(String),
 }
 
 impl AssertionRejection {
@@ -604,8 +611,10 @@ impl AssertionRejection {
         match self {
             Self::WrongAudience(_) => ApprovalOutcome::WrongAudience,
             Self::InvalidSignature(_) => ApprovalOutcome::InvalidSignature,
-            // Nothing was verified either way: the keys could not be read.
-            Self::KeysUnavailable(_) => ApprovalOutcome::Failed,
+            // Nothing was authorized either way, and neither is a forgery: the
+            // keys could not be read, or the service signed claims this runner
+            // cannot accept.
+            Self::KeysUnavailable(_) | Self::ClaimsRejected(_) => ApprovalOutcome::Failed,
         }
     }
 
@@ -613,9 +622,29 @@ impl AssertionRejection {
         match self {
             Self::InvalidSignature(detail)
             | Self::WrongAudience(detail)
-            | Self::KeysUnavailable(detail) => detail,
+            | Self::KeysUnavailable(detail)
+            | Self::ClaimsRejected(detail) => detail,
         }
     }
+}
+
+/// The longest claims-rejection detail kept. It reaches the journal and the
+/// operator's sentence, and a decoding error can be long.
+const CLAIMS_DETAIL_MAX_BYTES: usize = 300;
+
+fn claims_rejected(error: serde_json::Error) -> AssertionRejection {
+    let mut detail = format!(
+        "the assertion's signature verifies, but its claims do not match this runner's \
+         contract: {error}"
+    );
+    if detail.len() > CLAIMS_DETAIL_MAX_BYTES {
+        let mut end = CLAIMS_DETAIL_MAX_BYTES;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    AssertionRejection::ClaimsRejected(detail)
 }
 
 /// Verify a `cairn_human_approval` assertion completely: the EdDSA signature
@@ -646,14 +675,16 @@ pub fn verify_service_assertion(
     validation.validate_nbf = false;
     validation.validate_aud = false;
     validation.required_spec_claims.clear();
-    let claims = keys
+    // The signature first, over claims of any shape, so a strict decoding
+    // failure is never mistaken for a forgery.
+    let verified = keys
         .iter()
         .filter_map(|x| DecodingKey::from_ed_components(x).ok())
-        .find_map(|key| decode::<ServiceApprovalAssertion>(token, &key, &validation).ok())
+        .find_map(|key| decode::<serde_json::Value>(token, &key, &validation).ok())
         .map(|data| data.claims)
-        .ok_or_else(|| {
-            invalid("the assertion does not verify as a canonical Human approval under these keys")
-        })?;
+        .ok_or_else(|| invalid("the assertion's signature does not verify"))?;
+    let claims: ServiceApprovalAssertion =
+        serde_json::from_value(verified).map_err(claims_rejected)?;
     if claims.iat > now + 60 {
         return Err(invalid("the assertion claims to be issued in the future"));
     }
@@ -798,6 +829,17 @@ mod tests {
             cairn_common::identity::PrincipalRef::Human { .. }
         ));
         assert_eq!(claims.appearance.principal(), &claims.principal);
+        // A production-shaped enrollment id, which an earlier CredentialRef
+        // rule refused, so a real approval failed as a forgery.
+        assert_eq!(
+            serde_json::to_value(&claims.appearance).unwrap()["verification"]["credential_ref"],
+            format!(
+                "companion-enrollment/{}",
+                fixture["assertion"]["expected"]["enrollmentId"]
+                    .as_str()
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
@@ -854,18 +896,40 @@ mod tests {
         )
         .unwrap();
         check(&hs, ApprovalOutcome::InvalidSignature);
+        // The service's key signed claims this runner cannot accept: a
+        // contract mismatch, failed closed and never journaled as a forgery.
+        let claims_rejected = |token: String| {
+            let rejection = verify_service_assertion(&token, &keys(), &expect, now).unwrap_err();
+            assert_eq!(
+                rejection.journal_state(),
+                ApprovalOutcome::Failed,
+                "{rejection:?}"
+            );
+            let AssertionRejection::ClaimsRejected(detail) = &rejection else {
+                panic!("expected a claims rejection, got {rejection:?}");
+            };
+            assert!(detail.contains("contract"), "{detail}");
+            assert!(detail.len() <= CLAIMS_DETAIL_MAX_BYTES, "{detail}");
+        };
+        claims_rejected(resign(
+            |claims| {
+                claims["appearance"]["verification"]["credential_ref"] = "ab".repeat(32).into()
+            },
+            approval_header(),
+        ));
+        claims_rejected(resign(
+            |claims| claims["surprise"] = true.into(),
+            approval_header(),
+        ));
+        // A lifetime is not part of this contract, so a claim naming one is refused.
+        claims_rejected(resign(
+            |claims| claims["exp"] = (now + 300).into(),
+            approval_header(),
+        ));
         // Issued in the future.
         check(
             &resign(
                 |claims| claims["iat"] = (now + 61).into(),
-                approval_header(),
-            ),
-            ApprovalOutcome::InvalidSignature,
-        );
-        // A lifetime is not part of this contract, so a claim naming one is refused.
-        check(
-            &resign(
-                |claims| claims["exp"] = (now + 300).into(),
                 approval_header(),
             ),
             ApprovalOutcome::InvalidSignature,
@@ -916,9 +980,11 @@ mod tests {
     async fn every_recorded_route_response_decodes_into_the_canonical_types() {
         let fixture = fixture();
         let responses = &fixture["responses"];
+        let expected = &fixture["assertion"]["expected"];
+        let challenge_id = expected["challengeId"].as_str().unwrap();
         let mut http = MockHttpClient::new()
             .respond_to(
-                "/approvals/challenges/apr_fixture000000000000000000001/claims",
+                &format!("/approvals/challenges/{challenge_id}/claims"),
                 respond(201, &responses["claim"]["claimed"]),
             )
             .respond_to(
@@ -982,7 +1048,7 @@ mod tests {
         );
         assert_eq!(
             client
-                .enrollment("cae_fixture00000000000000000001")
+                .enrollment(expected["enrollmentId"].as_str().unwrap())
                 .await
                 .unwrap()
                 .unwrap()

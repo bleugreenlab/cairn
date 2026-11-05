@@ -660,7 +660,7 @@ pub(crate) const EXECUTOR_DRAINING: KeySpec = KeySpec::new(
 pub(crate) const EXECUTOR_ROLE: KeySpec = KeySpec::new(
     "role",
     KeyType::Str,
-    "buildsOnly | general | inferenceOnly: what this machine is for; omitted means general (or, re-enrolling, the role it holds). Durable runner-side state like draining: unfenced, works on an unreachable machine, and the machine is never told. inferenceOnly is never offered any batch class",
+    "buildsOnly | general | inferenceOnly | servicesOnly: what this machine is for; omitted means general (or, re-enrolling, the role it holds). Durable runner-side state like draining: unfenced, works on an unreachable machine, and the machine is never told. inferenceOnly is never offered any batch class. servicesOnly takes service residents only (no run batch, check lane, REPL, terminal, dev instance or inference deployment), is ranked first for services, and is read as always on",
 );
 pub(crate) const EXECUTOR_BUILD_ROOT: KeySpec = KeySpec::new(
     "buildRoot",

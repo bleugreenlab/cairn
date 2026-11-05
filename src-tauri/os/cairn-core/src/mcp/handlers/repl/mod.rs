@@ -875,6 +875,7 @@ pub async fn spawn_session(
                 wait_horizon_unix_ms,
                 crate::fleet::unix_time_ms(),
                 selector,
+                None,
             )
             .await
             .map_err(|refusal| {

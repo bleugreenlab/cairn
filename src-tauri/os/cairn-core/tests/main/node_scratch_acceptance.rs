@@ -257,6 +257,7 @@ fn request_on(machines: &TwoMachines, suffix: &str, machine: &str) -> CellReques
         resource_reservation: Default::default(),
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     }
 }
 
@@ -582,6 +583,28 @@ impl Node {
             "the terminal did not start: {reply}"
         );
         reply
+    }
+
+    /// Attach the runner's own machine, named `local`, beside the node's two.
+    /// It is what a job with no route is guessed to found its home on.
+    async fn attach_colocated(&self) {
+        let orch = self.orch().clone();
+        cairn_exec::blocking::offload(move || common::attach_test_executor(&orch))
+            .await
+            .unwrap();
+    }
+
+    /// The placement record of `job`'s fresh home acquisition: what the handler
+    /// actually asked for, read from the same record an operator reads.
+    fn home_acquisition_of(&self, job: &str) -> cairn_common::executor_protocol::PlacementDecision {
+        let request_id = format!("residency-acquire:job:{job}");
+        self.orch()
+            .fleet
+            .inspect_executors(common::unix_time_ms())
+            .into_iter()
+            .flat_map(|executor| executor.recent_placements)
+            .find(|decision| decision.request_id == request_id)
+            .unwrap_or_else(|| panic!("{job} acquired no fresh home"))
     }
 
     /// Attach a third machine, neither of the node's first two.
@@ -988,6 +1011,71 @@ async fn two_terminals_on_two_machines_both_start_and_their_writes_merge() {
         shared.iter().any(|line| line.ends_with("=from-a"))
             && shared.iter().any(|line| line.ends_with("=from-b")),
         "nothing dropped: {read}"
+    );
+}
+
+/// cairn/5875's first specimen, through the `run` tool: a fresh job's batch
+/// acquires its home under its own selector, whatever else is attached, and the
+/// job's later batches follow that home. Read from the placement record, so it
+/// holds whichever machine would have won without the selector.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_founds_its_home_under_the_selector_it_declared() {
+    if common::skip_if_fenced("a_batch_founds_its_home_under_the_selector_it_declared") {
+        return;
+    }
+    let node = node().await;
+    node.attach_colocated().await;
+    let local = ExecutorSelector {
+        name: Some("local".to_owned()),
+        ..ExecutorSelector::default()
+    };
+
+    let named = node
+        .shell("r-1", Some("local"), "echo \"tmp=$TMPDIR\"")
+        .await;
+    assert!(named.starts_with("Ran on **local**"), "{named}");
+    assert!(!named.contains("detached"), "it runs in its home: {named}");
+    assert_eq!(node.home_acquisition_of("job-1").selector, Some(local));
+
+    let later = node.shell("r-1", None, "echo \"tmp=$TMPDIR\"").await;
+    assert!(
+        later.starts_with("Ran on **local**"),
+        "a batch with no selector follows the home the first one founded: {later}"
+    );
+}
+
+/// The guess half (tenet 1395): a batch a holder's affinity sends to the
+/// runner's machine founds its home under nothing, because a guess is not a
+/// declaration, while the batch itself still goes where the guess said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home() {
+    if common::skip_if_fenced(
+        "a_scratch_affinity_guess_places_the_batch_and_never_selects_its_home",
+    ) {
+        return;
+    }
+    let node = node().await;
+    node.attach_colocated().await;
+    let task = node.add_task("side").await;
+    node.start_terminal_of(
+        &task,
+        &format!("{OWNER}/task/side"),
+        "held",
+        Some("local"),
+        "sleep 120",
+    )
+    .await;
+
+    let guessed = node.shell("r-1", None, "echo \"tmp=$TMPDIR\"").await;
+    assert!(guessed.starts_with("Ran on **local**"), "{guessed}");
+    assert!(
+        guessed.contains("placed on local beside terminal `held`"),
+        "the guess placed the batch: {guessed}"
+    );
+    assert_eq!(
+        node.home_acquisition_of("job-1").selector,
+        None,
+        "the home was acquired under no selector"
     );
 }
 

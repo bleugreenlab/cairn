@@ -1882,6 +1882,7 @@ mod slot_publication_tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         let target = RunnerPublicationTarget {
             project_id: "project".into(),
@@ -4643,6 +4644,7 @@ async fn prepare_and_run_batch(
                 resource_reservation: Default::default(),
                 learned_estimate: None,
                 scratch_sync: None,
+                home_affinity: None,
             };
             // Where the scratch is warm is placement affinity: each candidate
             // is priced by how long bringing it current there would take.
@@ -4682,6 +4684,7 @@ async fn prepare_and_run_batch(
                 ),
                 ceiling_horizon_unix_ms,
                 node_default: node_default.is_some(),
+                home_selector: selectors.declared.clone(),
                 template,
             };
             let batch = ResolvedRunBatch {
@@ -5535,6 +5538,11 @@ struct BatchPlacement {
     /// The template's selector is the node's placement default, so the
     /// result's first line says so.
     node_default: bool,
+    /// What the batch's caller declared, which the job's home is acquired
+    /// under. Not the template's selector, which also holds the scratch
+    /// affinity guess: a guess may send the batch somewhere, but it must never
+    /// settle where the job's home lives.
+    home_selector: Option<ExecutorSelector>,
 }
 
 impl BatchPlacement {
@@ -5958,6 +5966,11 @@ async fn place_and_run_attempts(
             // a job whose batches all declare short timeouts still gets a home:
             // an acquisition abandoned at a one-second bound is cancelled, and
             // the next batch would only start it over.
+            //
+            // A fresh home is acquired under what the batch's caller declared,
+            // so it is never placed on a machine the batch would refuse. The
+            // scratch affinity guess reaches it only as a price: the template's
+            // estimate of what each machine would cost to bring current.
             Some(environment) => match crate::fleet::residency::acquire_job_residency(
                 orch,
                 &environment.db,
@@ -5965,7 +5978,8 @@ async fn place_and_run_attempts(
                 &environment.base_commit,
                 placement.ceiling_horizon_unix_ms,
                 placement.template.waiting_since_unix_ms,
-                None,
+                placement.home_selector.as_ref(),
+                placement.template.scratch_sync.clone(),
             )
             .await
             {
@@ -8832,6 +8846,7 @@ mod tests {
             capacity_wait_budget: None,
             ceiling_horizon_unix_ms: u64::MAX,
             node_default: false,
+            home_selector: None,
         }
     }
 
@@ -9467,6 +9482,7 @@ mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         }
     }
 

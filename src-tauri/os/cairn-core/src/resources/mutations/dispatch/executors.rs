@@ -24,8 +24,10 @@ struct ConfigureRequest {
     #[serde(alias = "runtime_policy")]
     runtime_policy: Option<cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     draining: Option<bool>,
-    /// What the machine is for: buildsOnly, general, or inferenceOnly. Runner
-    /// state like draining, so it is durable and unfenced.
+    /// What the machine is for, one of [`MachineRole::ALL`]. Runner state like
+    /// draining, so it is durable and unfenced.
+    ///
+    /// [`MachineRole::ALL`]: cairn_common::executor_protocol::MachineRole::ALL
     role: Option<cairn_common::executor_protocol::MachineRole>,
     /// Pack-declared machine services to select (`{}`, or
     /// `{override:{command}}`) or unselect (`null`) on this machine, keyed
@@ -196,7 +198,12 @@ pub(super) async fn dispatch(
                     build_failure(
                         index,
                         item,
-                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, and expectedGeneration."),
+                        format!(
+                            "invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role ({}), machineServices ({{\"<pack>/<service>\": {{}} | {{override:{{command}}}} | null}}), repaired, buildRoot, and expectedGeneration.",
+                            cairn_common::executor_protocol::MachineRole::ALL
+                                .map(cairn_common::executor_protocol::MachineRole::as_str)
+                                .join(", ")
+                        ),
                     )
                 })?;
             if request.new_name.is_none()

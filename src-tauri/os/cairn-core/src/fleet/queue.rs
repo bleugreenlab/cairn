@@ -1908,6 +1908,7 @@ impl super::Fleet {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         };
         let (entry_id, receiver) = self
             .queue
@@ -2361,6 +2362,7 @@ pub(super) mod tests {
             resource_reservation: Default::default(),
             learned_estimate: None,
             scratch_sync: None,
+            home_affinity: None,
         }
     }
 

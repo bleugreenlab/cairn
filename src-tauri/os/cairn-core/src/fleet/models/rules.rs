@@ -77,8 +77,9 @@ impl Acquirable {
 
 /// What placement may acquire: every deployment of `inventory`, placed on
 /// the detected `pools`. A gang must lie wholly inside one pool, number the
-/// machines its profile states, and avoid machines whose role is builds only
-/// (tenet 1176); one machine is the degenerate gang.
+/// machines its profile states, and avoid machines whose role runs no
+/// deployment ([`MachineRole::runs_inference_deployments`], tenet 1176); one
+/// machine is the degenerate gang.
 pub fn catalog(
     inventory: &Inventory,
     pools: &[Pool],
@@ -111,9 +112,17 @@ pub fn catalog(
                 }
                 Some(_) => machines
                     .iter()
-                    .find(|machine| roles.get(*machine) == Some(&MachineRole::BuildsOnly))
-                    .map(|machine| {
-                        format!("{machine} is builds only, so it runs no inference deployment")
+                    .find_map(|machine| {
+                        roles
+                            .get(machine)
+                            .filter(|role| !role.runs_inference_deployments())
+                            .map(|role| (machine, role))
+                    })
+                    .map(|(machine, role)| {
+                        format!(
+                            "{machine} is {}, so it runs no inference deployment",
+                            role.label()
+                        )
                     })
                     .or_else(|| match pool {
                         Some(_) => None,

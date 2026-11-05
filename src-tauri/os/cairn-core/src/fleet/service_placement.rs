@@ -23,6 +23,13 @@ const ONE_SHOT_KEY: &str = "service-one-shot";
 pub(super) const ONE_SHOT_ROLE: &str = "command";
 const ACQUIRE_WAIT: Duration = Duration::from_secs(30);
 const RENEW_INTERVAL: Duration = Duration::from_secs(30);
+/// How often a lease waiting on its machine checks whether the machine has
+/// outlasted the lease grace. Only an outage's first report depends on it.
+const LOSS_CHECK_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(15)
+};
 
 #[derive(Debug, Error)]
 pub(crate) enum ServicePlacementError {
@@ -199,6 +206,11 @@ pub(crate) struct LeaseCore {
     release_notify: tokio::sync::Notify,
     health: Arc<StdMutex<ServicePlacementHealth>>,
     routes: ProcessRoutes,
+    /// The executor last reported lost under this lease.
+    machine_lost: tokio::sync::watch::Sender<Option<String>>,
+    /// Whether the current outage has been reported, so a machine that stays
+    /// away is one report however long recovery takes.
+    loss_reported: AtomicBool,
     /// Keeps [`subscribe_lease_events`] registered for exactly the lease's life.
     _events: super::ResidentProcessSubscription,
 }
@@ -286,6 +298,8 @@ pub(crate) async fn acquire_service_lease(
             release_notify: tokio::sync::Notify::new(),
             health: Arc::new(StdMutex::new(ServicePlacementHealth::Ready)),
             routes,
+            machine_lost: tokio::sync::watch::channel(None).0,
+            loss_reported: AtomicBool::new(false),
             _events: events,
         }),
     })
@@ -344,7 +358,7 @@ fn subscribe_lease_events(
     })
 }
 
-fn service_acquire_request(
+pub(super) fn service_acquire_request(
     service_id: &str,
     selector: ExecutorSelector,
     footprint: ResidencyFootprint,
@@ -395,7 +409,9 @@ impl ServiceLease {
                     return;
                 }
                 let fence = core.current_fence();
-                let Err(error) = super::residency::renew(&core.orch, &fence).await else {
+                let machine = core.executor_id();
+                let renewal = super::residency::renew(&core.orch, &fence);
+                let Err(error) = core.reporting_loss(machine.as_deref(), renewal).await else {
                     continue;
                 };
                 tracing::warn!(%error, holder = %fence.holder, "service residency renewal failed; waiting to reacquire");
@@ -445,6 +461,46 @@ impl LeaseCore {
         self.fence.read().unwrap().clone()
     }
 
+    /// Told the executor each time one is reported lost under this lease: the
+    /// runner's own judgement, past the lease grace, that a machine has stopped
+    /// answering. Nothing on the machine can say this, least of all when it is
+    /// powered off. A receiver hears only reports made after it subscribed.
+    pub(crate) fn machine_lost_signal(&self) -> tokio::sync::watch::Receiver<Option<String>> {
+        self.machine_lost.subscribe()
+    }
+
+    pub(crate) fn report_machine_lost(&self, executor_id: &str) {
+        if !self.loss_reported.swap(true, Ordering::AcqRel) {
+            self.machine_lost
+                .send_replace(Some(executor_id.to_string()));
+        }
+    }
+
+    /// Run `work`, reporting `machine` lost if it outlasts the grace meanwhile.
+    /// A lease parked for a named machine can wait out a whole outage here, and
+    /// nothing else would speak for it until the machine came back.
+    async fn reporting_loss<T>(
+        &self,
+        machine: Option<&str>,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
+        let Some(machine) = machine else {
+            return work.await;
+        };
+        tokio::pin!(work);
+        let mut check = tokio::time::interval(LOSS_CHECK_INTERVAL);
+        loop {
+            tokio::select! {
+                outcome = &mut work => return outcome,
+                _ = check.tick() => {
+                    if self.orch.fleet.machine_lost_past_grace(machine) {
+                        self.report_machine_lost(machine);
+                    }
+                }
+            }
+        }
+    }
+
     async fn recover(&self) -> Result<ResidencyFence, ServicePlacementError> {
         let _recovery = self.recovery.lock().await;
         if self.released.load(Ordering::Acquire) {
@@ -458,14 +514,14 @@ impl LeaseCore {
         // Only a pinned lease has one machine worth waiting for. An unpinned
         // one asks the fleet again at once, and the renewal loop's interval
         // paces the retries while no machine fits.
+        let machine = self.executor_id();
         if let Some(pinned) = self.pinned_executor.as_deref() {
-            if !wait_for_recovery_or_release(
+            let ready = wait_for_recovery_or_release(
                 self.orch.fleet.wait_for_named_executor(pinned),
                 &self.released,
                 &self.release_notify,
-            )
-            .await
-            {
+            );
+            if !self.reporting_loss(machine.as_deref(), ready).await {
                 return Err(ServicePlacementError::Operation(
                     "service residency has been released".into(),
                 ));
@@ -475,9 +531,20 @@ impl LeaseCore {
         let now = unix_time_ms();
         request.waiting_since_unix_ms = now;
         request.wait_horizon_unix_ms = now.saturating_add(ACQUIRE_WAIT.as_millis() as u64);
-        let fence = super::residency::acquire(&self.orch, request)
-            .await
-            .map_err(acquire_refusal)?;
+        let acquired = super::residency::acquire(&self.orch, request).await;
+        // An eviction is the fleet acting on the same grace, and may beat the
+        // periodic check to it. Reported whether or not a machine was then
+        // found, and before the routes drop below, so the owner hears about the
+        // loss ahead of the process's end.
+        if let (Some(machine), Some(_)) = (
+            machine.as_deref(),
+            self.orch
+                .fleet
+                .take_environment_eviction(&self.current_fence().holder),
+        ) {
+            self.report_machine_lost(machine);
+        }
+        let fence = acquired.map_err(acquire_refusal)?;
         if self.released.load(Ordering::Acquire) {
             let _ = super::residency::release(&self.orch, &fence).await;
             return Err(ServicePlacementError::Operation(
@@ -497,6 +564,7 @@ impl LeaseCore {
         // recovery returns, so it is not swept here.
         drop(std::mem::take(&mut *self.routes.lock().unwrap()));
         *self.health.lock().unwrap() = ServicePlacementHealth::Ready;
+        self.loss_reported.store(false, Ordering::Release);
         Ok(fence)
     }
 
@@ -925,7 +993,9 @@ pub(crate) mod tests {
             });
         let pool = ExecutorPool::new(runtime);
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let attached = fleet.attach_executor(sender);
+        // A service with no named machine requires bun, which every real
+        // executor advertises from its first frame.
+        let attached = fleet.attach_executor_with_toolchains(sender, &["bun"]);
         generation.store(attached, Ordering::Release);
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
@@ -1221,6 +1291,142 @@ pub(crate) mod tests {
             closes_promptly(&mut watch).await,
             "a watch started before readmission must be told its stream is over"
         );
+        lease.release().await.unwrap();
+    }
+
+    fn no_footprint() -> ResidencyFootprint {
+        ResidencyFootprint {
+            memory_bytes: 0,
+            disk_growth_bytes: 0,
+        }
+    }
+
+    fn death_policy() -> OwnerDeathPolicy {
+        OwnerDeathPolicy {
+            heartbeat_timeout_ms: 30_000,
+            reclaim_grace_ms: 10_000,
+        }
+    }
+
+    /// A service held to a machine waits through an outage with nothing ending,
+    /// so only the runner's own judgement can speak for it. It stays quiet inside
+    /// the grace, reports once past it however long the wait goes on, and reports
+    /// the next outage too.
+    #[tokio::test]
+    async fn a_lease_parked_on_its_named_machine_reports_the_loss_once_past_the_grace() {
+        const LOCAL: &str = super::super::COLOCATED_EXECUTOR_ID;
+        let (orch, _config, link) = attached_orchestrator_with_link().await;
+        let lease = acquire_service_lease(
+            &orch,
+            ServiceIdentity {
+                id: "thread:p:t-1:bugs",
+                label: "bugs",
+            },
+            named_executor(LOCAL_EXECUTOR_NAME),
+            no_footprint(),
+            death_policy(),
+        )
+        .await
+        .unwrap();
+        let mut lost = lease.machine_lost_signal();
+        let quiet = Duration::from_millis(200);
+
+        assert!(orch.fleet.disconnect_advertised_executor(LOCAL, link));
+        *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+        let core = Arc::clone(&lease.core);
+        let parked = tokio::spawn(async move { core.recover().await });
+
+        assert!(
+            tokio::time::timeout(quiet, lost.changed()).await.is_err(),
+            "a machine inside the grace is only away"
+        );
+        orch.fleet
+            .stage_link_absent(LOCAL, super::super::ENVIRONMENT_LEASE_GRACE_MS + 1);
+        tokio::time::timeout(Duration::from_secs(5), lost.changed())
+            .await
+            .expect("a machine past the grace is reported while recovery waits")
+            .unwrap();
+        assert_eq!(lost.borrow_and_update().as_deref(), Some(LOCAL));
+        assert!(
+            tokio::time::timeout(quiet, lost.changed()).await.is_err(),
+            "one report per outage, however long it lasts"
+        );
+
+        lease.loss_reported.store(false, Ordering::Release);
+        lease.report_machine_lost(LOCAL);
+        assert!(lost.has_changed().unwrap(), "the next outage reports again");
+
+        // Refused, since its machine is still gone. Releasing is what ends the wait.
+        let _ = lease.release().await;
+        assert!(parked.await.unwrap().is_err());
+    }
+
+    /// A service free to move, on a machine that stayed away past the grace: the
+    /// real eviction and re-placement, with the fleet choosing the runner's own
+    /// machine. The report must arrive before the process's stream closes,
+    /// because the supervisor stops reading at the exit that closure becomes.
+    #[tokio::test]
+    async fn an_unnamed_lease_on_a_lost_machine_reports_the_loss_and_recovers_home() {
+        const LOCAL: &str = super::super::COLOCATED_EXECUTOR_ID;
+        let (orch, _config) = attached_orchestrator().await;
+        let lease = acquire_service_lease(
+            &orch,
+            ServiceIdentity {
+                id: "thread:p:t-1:bugs",
+                label: "bugs",
+            },
+            ExecutorSelector {
+                required_toolchains: vec!["bun".into()],
+                ..ExecutorSelector::default()
+            },
+            no_footprint(),
+            death_policy(),
+        )
+        .await
+        .unwrap();
+        let mut watch = lease
+            .start_resident(
+                "svc-1",
+                "service",
+                &ResidentLaunch::command("/bin/sh", vec!["-c".into(), "exec sleep 600".into()]),
+            )
+            .await
+            .unwrap();
+        let mut lost = lease.machine_lost_signal();
+        assert_eq!(lease.executor_id().as_deref(), Some(LOCAL));
+
+        // The residency's route as it stood on the service box, which has gone.
+        let holder = lease.current_fence().holder;
+        orch.fleet
+            .update_residency_routes(|routes| {
+                let route = routes
+                    .remove(&(LOCAL.to_string(), holder.storage_key()))
+                    .expect("the placed route");
+                routes.insert(
+                    ("pi1".to_string(), holder.storage_key()),
+                    super::super::ResidencyRoute {
+                        executor_id: "pi1".into(),
+                        ..route
+                    },
+                );
+            })
+            .unwrap();
+        orch.fleet
+            .stage_link_absent("pi1", super::super::ENVIRONMENT_LEASE_GRACE_MS + 1);
+        *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+
+        lease
+            .recover()
+            .await
+            .expect("with the service box gone the fleet places the service at home");
+
+        assert!(
+            lost.has_changed().unwrap(),
+            "the loss is reported by the time recovery has closed the process's stream"
+        );
+        assert_eq!(lost.borrow_and_update().as_deref(), Some("pi1"));
+        assert_eq!(lease.executor_id().as_deref(), Some(LOCAL));
+        assert!(closes_promptly(&mut watch).await);
         lease.release().await.unwrap();
     }
 

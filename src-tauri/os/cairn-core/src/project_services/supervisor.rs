@@ -178,6 +178,12 @@ pub(crate) struct LaunchSpec {
 pub(crate) enum HostEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
+    /// The runner has judged this process's machine gone: unanswered past the
+    /// lease grace. Says nothing about the process, which may wait with its
+    /// machine or be ended and placed elsewhere next.
+    MachineLost {
+        executor_id: String,
+    },
     /// `executor_lost`: the machine went away, which says nothing about the
     /// service.
     Exited {
@@ -1256,6 +1262,9 @@ async fn read_events(
                     stderr_row(&orch, &cell, generation, line).await;
                 }
             }
+            HostEvent::MachineLost { executor_id } => {
+                notify_lost_always_on_machine(&orch, &cell, &incarnation, &executor_id).await;
+            }
             HostEvent::Exited {
                 code,
                 detail,
@@ -1379,6 +1388,62 @@ async fn on_exit(
         &format!("generation {generation} crashed ({code_text}, {detail})"),
     )
     .await;
+}
+
+/// What the owner of a service on a lost always-on machine is told.
+fn machine_loss_notice(service: &str, machine: &str, home: &str, named: bool) -> String {
+    let next = if named {
+        "Its declaration names that machine, so the service waits for it to come back."
+    } else {
+        "The runner places the service again on the next machine placement prefers: another \
+         services-only machine if one is up, otherwise this runner's own."
+    };
+    format!(
+        "Service `{service}` lost its machine: {machine} runs services only and is expected to \
+         be always on, and it has not answered for the whole executor grace. {next} \
+         {home}/status says where it is. This is the only notice for this loss."
+    )
+}
+
+/// Tell the owning thread, once, that its service lost an always-on machine.
+///
+/// Any other machine going away is ordinary (a laptop sleeps) and the restart
+/// in the log says enough. A services-only machine is expected never to, so
+/// its loss is an incident the owner should hear about. Keyed by the
+/// incarnation's run, which a runner restart does not reuse the way it does a
+/// generation, so one loss cannot swallow the notice for a later one. A service
+/// with no thread has the same words in its log.
+async fn notify_lost_always_on_machine(
+    orch: &Orchestrator,
+    cell: &Arc<Cell>,
+    incarnation: &Arc<Incarnation>,
+    executor_id: &str,
+) {
+    if orch.fleet.machine_role(executor_id)
+        != cairn_common::executor_protocol::MachineRole::ServicesOnly
+    {
+        return;
+    }
+    let home = cell.home();
+    let named = matches!(cell.owner, ServiceOwner::Pack { .. })
+        || incarnation
+            .declaration
+            .executor
+            .as_ref()
+            .is_some_and(|selector| selector.name.is_some());
+    let content = machine_loss_notice(&cell.service, &incarnation.executor, &home, named);
+    lifecycle(orch, cell, incarnation.generation, &content, "fleet").await;
+    let key = format!(
+        "service-executor-lost:{home}:{executor_id}:{}",
+        incarnation
+            .run_id
+            .clone()
+            .unwrap_or_else(|| incarnation.generation.to_string())
+    );
+    if let Err(error) = super::notify_owner(orch, &orch.db.local, &cell.owner, &key, &content).await
+    {
+        tracing::warn!(%error, service = %cell.service, "could not send a lost-machine notice");
+    }
 }
 
 /// Record a crash and decide what follows it: a restart after backoff, or
@@ -2147,7 +2212,7 @@ async fn fire_occurrence(
         let home = cell.home();
         let content = schedule::streak_notice(&home, service, row, began_at, error);
         let key = format!("service-schedule:{home}:{}", row.entry_key);
-        if let Err(error) = schedule::notify_owner(orch, &db, owner, &key, &content).await {
+        if let Err(error) = super::notify_owner(orch, &db, owner, &key, &content).await {
             tracing::warn!(%error, service = %cell.service, "could not send a schedule failure notice");
         }
     }
@@ -2293,8 +2358,10 @@ pub(crate) fn note_base_advance(orch: &Orchestrator, project_id: &str) {
 /// what a predecessor left live, resume every schedule whose rows exist, and
 /// start every thread's `launch` services. A thread's services come from its
 /// own store, which no repository catch-up touches, so nothing here waits on
-/// one. Placement is the only precondition, and the colocated executor's
-/// pending attach holds a lease request rather than refusing it.
+/// one. Placement is the only precondition: a service free to run anywhere waits,
+/// within a bound, for the colocated executor's first attach (`LeaseHost::lease`),
+/// so a remote that attaches first does not take it, and a service that names a
+/// machine is held until that machine is there.
 ///
 /// Schedules resume before any source is applied, and each owner's source is
 /// applied on its own task: one owner whose source is slow to read or whose

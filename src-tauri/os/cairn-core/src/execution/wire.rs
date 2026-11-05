@@ -185,6 +185,7 @@ pub(crate) fn build_check_batch_wire(
         resource_reservation: declared_batch_reservation(&batch.items),
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     });
     let items = batch
         .items
@@ -269,6 +270,7 @@ pub(crate) fn build_review_check_request(input: ReviewCheckWireInput) -> CellReq
         resource_reservation: declared_check_reservation(input.resource_class),
         learned_estimate: None,
         scratch_sync: None,
+        home_affinity: None,
     })
 }
 

@@ -3,10 +3,11 @@ use std::path::Path;
 use cairn_common::executor_protocol::{
     CellOutcome, CellOwnerRef, CellPriority, ExecutorSelector, OwnerDeathPolicy, RepositoryLocator,
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyFootprint,
-    ResidencyHolder, ResidencyOperation, ResidencyResult,
+    ResidencyHolder, ResidencyOperation, ResidencyResult, ScratchSyncEstimate,
 };
 
 use crate::fleet::placement::{classify_residency_failure, PlacementRefusal};
+use crate::fleet::HomePrices;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
@@ -220,10 +221,18 @@ pub(crate) async fn live_checkout_residency_request(
 /// cell. The renewal that follows is what lets an environment survive a long
 /// stretch of agent thinking between two batches.
 ///
-/// `selector` is set only by a terminal or REPL create that names a machine,
-/// after [`place_for_resident_process`] has settled that the environment may
-/// be placed there. A run batch passes `None`: its environment is placement,
-/// and its own selector is decided per batch (`BatchResidence`).
+/// `selector` is what the caller declared: a terminal or REPL create that names
+/// a machine, after [`place_for_resident_process`] has settled that the
+/// environment may be placed there, or a run batch's own or its node default's
+/// selector. It binds only a fresh acquisition, so a home is never placed on a
+/// machine the batch would refuse; a home that already exists keeps its route,
+/// and whether a batch runs in it is decided per batch (`BatchResidence`).
+///
+/// A thread-owned job's home is priced toward the runner's platform and the
+/// machine that last held it, and never pinned there. An issue-owned job gets no
+/// such price: its branch work should keep spreading (tenet 1257). `scratch_sync`
+/// prices warmth for any job's fresh home.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn acquire_job_residency(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -232,6 +241,7 @@ pub(crate) async fn acquire_job_residency(
     wait_horizon_unix_ms: u64,
     waiting_since_unix_ms: u64,
     selector: Option<&ExecutorSelector>,
+    scratch_sync: Option<ScratchSyncEstimate>,
 ) -> Result<ResidencyFence, PlacementRefusal> {
     let mut request = job_residency_request(
         db,
@@ -243,9 +253,28 @@ pub(crate) async fn acquire_job_residency(
     .await
     .map_err(PlacementRefusal::structural)?;
     request.executor = selector.cloned();
-    let fence = acquire(orch, request).await?;
+    let prices = job_home_prices(orch, db, &request.holder, job_id, scratch_sync).await;
+    let fence = acquire_with_logging(orch, request, true, prices).await?;
     let _ = renew(orch, &fence).await;
     Ok(fence)
+}
+
+/// What a job's fresh home is priced by. Ownership is read from the caller's
+/// `db`, because a job can live in a team database rather than the runner's own.
+async fn job_home_prices(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    holder: &ResidencyHolder,
+    job_id: &str,
+    scratch_sync: Option<ScratchSyncEstimate>,
+) -> HomePrices {
+    let home_affinity = (crate::threads::job_owner(db, job_id).await
+        == crate::threads::JobOwner::Thread)
+        .then(|| orch.fleet.thread_home_affinity(holder));
+    HomePrices {
+        home_affinity,
+        scratch_sync,
+    }
 }
 
 /// The acquisition any surface of one job presents, branch or no branch.
@@ -354,7 +383,7 @@ pub(crate) async fn acquire(
     orch: &Orchestrator,
     request: ResidencyAcquireRequest,
 ) -> Result<ResidencyFence, PlacementRefusal> {
-    acquire_with_logging(orch, request, true).await
+    acquire_with_logging(orch, request, true, HomePrices::default()).await
 }
 
 /// Acquire residency without emitting the generic failure warning.
@@ -365,19 +394,17 @@ pub(crate) async fn acquire_quietly(
     orch: &Orchestrator,
     request: ResidencyAcquireRequest,
 ) -> Result<ResidencyFence, PlacementRefusal> {
-    acquire_with_logging(orch, request, false).await
+    acquire_with_logging(orch, request, false, HomePrices::default()).await
 }
 
 async fn acquire_with_logging(
     orch: &Orchestrator,
     request: ResidencyAcquireRequest,
     log_failure: bool,
+    prices: HomePrices,
 ) -> Result<ResidencyFence, PlacementRefusal> {
     let holder = request.holder.clone();
-    let result = orch
-        .fleet
-        .operate_residency(orch, ResidencyOperation::Acquire { request })
-        .await;
+    let result = orch.fleet.acquire_priced_home(orch, request, prices).await;
     let cell = match result {
         ResidencyResult::State { cell } => cell,
         // Only `Acquire` reaches here, and it materializes nothing.
@@ -1235,6 +1262,61 @@ mod resident_callback_tests {
         assert!(refuse_runner_credentials(&orch, &with_url).is_err());
         let clean = vec![("CAIRN_RUN_ID".to_string(), "r-1".to_string())];
         assert!(refuse_runner_credentials(&orch, &clean).is_ok());
+    }
+
+    #[tokio::test]
+    async fn only_a_thread_owned_jobs_home_is_priced_toward_its_natural_machines() {
+        let orch = orchestrator().await;
+        let db = crate::storage::migrated_test_db("home-prices-by-owner.db").await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
+               VALUES ('i-issue','p',1,'An ordinary issue','active','none',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('t-thread','p','topic','active','none',1,1);
+             INSERT INTO executions(id, issue_id, project_id, recipe_id, status, started_at, seq)
+               VALUES ('e-issue','i-issue','p','build','running',1,1);
+             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('j-issue','e-issue','i-issue','p','running','builder','builder',1,1);
+             INSERT INTO jobs(id, thread_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES ('j-thread','t-thread','p','running','thread','thread',1,1);",
+        )
+        .await
+        .unwrap();
+        let job = |job_id: &str| ResidencyHolder::Job {
+            job_id: job_id.into(),
+        };
+        let warmth = ScratchSyncEstimate {
+            per_executor_ms: Default::default(),
+            uncovered_ms: 5,
+        };
+
+        let thread = job_home_prices(
+            &orch,
+            &db,
+            &job("j-thread"),
+            "j-thread",
+            Some(warmth.clone()),
+        )
+        .await;
+        assert_eq!(
+            thread.home_affinity.map(|affinity| affinity.runner_os),
+            Some(std::env::consts::OS.to_string())
+        );
+        assert_eq!(thread.scratch_sync.as_ref(), Some(&warmth));
+
+        let issue =
+            job_home_prices(&orch, &db, &job("j-issue"), "j-issue", Some(warmth.clone())).await;
+        assert_eq!(
+            issue.home_affinity, None,
+            "branch work keeps spreading (tenet 1257)"
+        );
+        assert_eq!(
+            issue.scratch_sync.as_ref(),
+            Some(&warmth),
+            "warmth is priced for every job's fresh home"
+        );
     }
 
     /// Where the start frame leaves: a machine other than the runner's own

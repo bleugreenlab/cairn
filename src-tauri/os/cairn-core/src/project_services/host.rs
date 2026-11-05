@@ -116,33 +116,40 @@ fn process_for(spec: &LaunchSpec) -> ResidentLaunch {
     }
 }
 
-/// Where a service runs: where its declaration's `executor` says, by machine
-/// name, platform, and toolchains, exactly as a `run` selector would place it.
-/// A declaration that names neither a machine nor a platform runs on the
-/// runner's own machine, refined by any toolchains it asks for.
+/// Where a service may run: its declaration's `executor`, by machine name,
+/// platform, and toolchains, exactly as a `run` selector would place it.
+///
+/// A declaration that names a machine is held to it. One that does not leaves
+/// the choice to the fleet, which ranks a services-only machine first, then
+/// the runner's own, then any other only when the forecast says home is
+/// clearly slower (the `services` route of the placement profile). Since the
+/// resident is a `bun` process, an unnamed selector also requires the `bun`
+/// toolchain, so the fleet never chooses a machine whose probe did not
+/// measure one.
 ///
 /// A service elsewhere reaches Cairn through its executor's resident relay,
 /// with bearers bound to that relay, so placement is a choice and not a pin.
 fn service_selector(spec: &LaunchSpec) -> cairn_common::executor_protocol::ExecutorSelector {
-    use cairn_common::executor_protocol::{ExecutorSelector, LOCAL_EXECUTOR_NAME};
+    use cairn_common::executor_protocol::ExecutorSelector;
     if let ServiceOwner::Pack { machine, .. } = &spec.owner {
         return crate::fleet::service_placement::named_executor(machine);
     }
     let declared = spec.declaration.executor.clone().unwrap_or_default();
-    if declared.name.is_none() && declared.os.is_none() {
-        return ExecutorSelector {
-            name: Some(LOCAL_EXECUTOR_NAME.to_string()),
-            required_toolchains: declared.required_toolchains,
-            ..ExecutorSelector::default()
-        };
+    let mut required_toolchains = declared.required_toolchains;
+    if declared.name.is_none() && !required_toolchains.iter().any(|name| name == "bun") {
+        required_toolchains.push("bun".to_string());
     }
     ExecutorSelector {
         name: declared.name,
         os: declared.os,
-        required_toolchains: declared.required_toolchains,
+        required_toolchains,
         ..ExecutorSelector::default()
     }
 }
+
+/// How long a service free to run anywhere waits, once in a runner's life, for
+/// the colocated executor to attach before placing without it.
+const FIRST_COLOCATED_ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What the supervisor is told about a refused placement or start. Only a
 /// refusal the substrate made without judging the service is `Unplaced`: a
@@ -163,12 +170,22 @@ impl LeaseHost {
         spec: &LaunchSpec,
     ) -> Result<Arc<ServiceLease>, LaunchError> {
         let id = holder_id(&spec.project_id, &spec.owner, &spec.service);
+        if let Some(lease) = self.leases.lock().await.get(&id) {
+            return Ok(lease.clone());
+        }
+        let selector = service_selector(spec);
+        // Held outside the map's lock: a runner whose executor never comes makes
+        // each service wait out the bound, not every service in turn.
+        if selector.name.is_none() {
+            orch.fleet
+                .wait_for_first_colocated_attach(FIRST_COLOCATED_ATTACH_WAIT)
+                .await;
+        }
         let mut leases = self.leases.lock().await;
         if let Some(lease) = leases.get(&id) {
             return Ok(lease.clone());
         }
         let label = holder_label(spec);
-        let selector = service_selector(spec);
         // A machine service claims nothing, as desktop automation did: it is
         // the machine's own program, not work admitted onto the machine.
         let footprint = if spec.native.is_some() {
@@ -269,8 +286,22 @@ impl ServiceHost for LeaseHost {
             .await
             .map_err(launch_error)?;
         let (sender, events) = mpsc::unbounded_channel();
+        let mut machine_lost = lease.machine_lost_signal();
         tokio::spawn(async move {
-            while let Some(event) = subscription.recv().await {
+            loop {
+                // Biased: a report and the stream's closure can arrive together,
+                // and the supervisor stops reading at the exit the closure becomes.
+                let event = tokio::select! {
+                    biased;
+                    Ok(()) = machine_lost.changed() => {
+                        if let Some(executor_id) = machine_lost.borrow_and_update().clone() {
+                            let _ = sender.send(HostEvent::MachineLost { executor_id });
+                        }
+                        continue;
+                    }
+                    event = subscription.recv() => event,
+                };
+                let Some(event) = event else { break };
                 match event.event {
                     ResidentProcessEventKind::Output { stream, data, .. } => {
                         let event = match stream {
@@ -432,11 +463,46 @@ mod tests {
                     }
                 }
                 HostEvent::Stderr(bytes) => stderr.push_str(&String::from_utf8_lossy(&bytes)),
+                HostEvent::MachineLost { .. } => {}
                 HostEvent::Exited { code, detail, .. } => {
                     panic!("exited ({code:?}, {detail}) before a frame; stderr: {stderr}")
                 }
             }
         }
+    }
+
+    /// The real path from outage to supervisor: a real resident under a real
+    /// lease, its link taken away and aged past the grace, and the real renewal
+    /// task finding out. The event reaches the process's event stream with no
+    /// executor ever saying anything, because a powered-off machine cannot.
+    #[tokio::test]
+    async fn a_real_outage_reaches_the_supervisor_as_machine_lost() {
+        const LOCAL: &str = crate::fleet::COLOCATED_EXECUTOR_ID;
+        let (orch, _config, link) =
+            crate::fleet::service_placement::tests::attached_orchestrator_with_link().await;
+        let host = LeaseHost::default();
+        let mut process = host
+            .launch(&orch, &echo_spec())
+            .await
+            .expect("the service launches");
+
+        assert!(orch.fleet.disconnect_advertised_executor(LOCAL, link));
+        orch.fleet
+            .stage_link_absent(LOCAL, crate::fleet::ENVIRONMENT_LEASE_GRACE_MS + 1);
+
+        let reported = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some(event) = process.events.recv().await {
+                if let HostEvent::MachineLost { executor_id } = event {
+                    return Some(executor_id);
+                }
+            }
+            None
+        })
+        .await
+        .expect("renewal finds the outage within a renewal interval");
+        assert_eq!(reported.as_deref(), Some(LOCAL));
+        host.release(&orch, "p", &ServiceOwner::Project, "echo")
+            .await;
     }
 
     /// The whole launch path with a real process: the lease, the confined
@@ -597,9 +663,12 @@ mod tests {
         };
         let selector = service_selector(&spec);
         assert_eq!(
-            selector.name.as_deref(),
-            Some(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME),
-            "a declaration that names no machine runs on the runner's"
+            selector,
+            cairn_common::executor_protocol::ExecutorSelector {
+                required_toolchains: vec!["bun".to_string()],
+                ..Default::default()
+            },
+            "a declaration that names no machine leaves the choice to the fleet, among machines with bun"
         );
         let mut remote = spec.clone();
         remote.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
@@ -610,12 +679,30 @@ mod tests {
         let selector = service_selector(&remote);
         assert_eq!(selector.name, None);
         assert_eq!(selector.os.as_deref(), Some("linux"));
-        assert_eq!(selector.required_toolchains, vec!["uv".to_string()]);
+        assert_eq!(
+            selector.required_toolchains,
+            vec!["uv".to_string(), "bun".to_string()],
+            "declared toolchains are kept, and bun is added once"
+        );
+        remote.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
+            required_toolchains: vec!["bun".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            service_selector(&remote).required_toolchains,
+            vec!["bun".to_string()]
+        );
         remote.declaration.executor = Some(cairn_common::executor_protocol::ExecutorSelector {
             name: Some("machine-b".into()),
             ..Default::default()
         });
-        assert_eq!(service_selector(&remote).name.as_deref(), Some("machine-b"));
+        let named = service_selector(&remote);
+        assert_eq!(
+            named.name.as_deref(),
+            Some("machine-b"),
+            "a named machine still wins"
+        );
+        assert!(named.required_toolchains.is_empty());
         let launch = process_for(&spec);
         assert_eq!(launch.program, "bun");
         assert_eq!(launch.sandbox_mode, ProcessSandboxMode::Confined);
@@ -656,10 +743,7 @@ mod tests {
         assert_eq!(launch.sandbox_mode, ProcessSandboxMode::Confined);
         assert_eq!(launch.spec().io, ResidentProcessIoMode::Pipe);
         assert!(launch.spec().sandbox_policy.is_none());
-        assert_eq!(
-            service_selector(&spec).name.as_deref(),
-            Some(cairn_common::executor_protocol::LOCAL_EXECUTOR_NAME)
-        );
+        assert_eq!(service_selector(&spec).name, None);
         let elsewhere = crate::project_services::thread_store::package(
             "echo",
             uri,

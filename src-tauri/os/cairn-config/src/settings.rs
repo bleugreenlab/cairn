@@ -3871,6 +3871,13 @@ extraSshArgs: []
                 .stance(PlacementWorkClass::ReviewChecks),
             PlacementStance::Any
         );
+        assert_eq!(
+            fleet
+                .active_placement_profile()
+                .stance(PlacementWorkClass::Services),
+            PlacementStance::LocalFirst,
+            "a service stays home unless a service box or a clearly faster machine is up"
+        );
         assert_eq!(fleet.resolved_placement_profiles().len(), 3);
     }
 

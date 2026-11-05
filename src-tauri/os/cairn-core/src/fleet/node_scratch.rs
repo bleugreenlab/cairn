@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use cairn_common::executor_protocol::{ExecutorMessage, NodeScratchReplica};
+use cairn_common::executor_protocol::{ExecutorMessage, NodeScratchReplica, ResidencyHolder};
 
 use super::Fleet;
 
@@ -120,5 +120,22 @@ impl Fleet {
         self.lock_connections()
             .get(executor_id)
             .map(super::executor_public_name)
+    }
+
+    /// Whether a machine holding a node's scratch can take a batch of `job`: it
+    /// is connected and not drained, and it has not refused that job's home. A
+    /// guess that sent the job back to the machine that just refused it would
+    /// undo the withdrawal, so the guess follows the withdrawal's own lapse rule
+    /// and never refuses a batch: with no holder left it goes without affinity.
+    pub(crate) fn scratch_holder_can_take(&self, executor_id: &str, job: &ResidencyHolder) -> bool {
+        self.connected_executors()
+            .iter()
+            .any(|(id, _)| id == executor_id)
+            && !self.is_drained(executor_id)
+            && self.executor_display_name(executor_id).is_some()
+            && !self
+                .withdrawn_home_executors(job)
+                .iter()
+                .any(|id| id == executor_id)
     }
 }

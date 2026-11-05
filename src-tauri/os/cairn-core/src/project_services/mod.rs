@@ -111,6 +111,73 @@ fn executor_uri(machine: &str) -> String {
 pub(crate) const MACHINE_SERVICE_REFUSAL: &str =
     "machine services are reached over MCP, not called as a service";
 
+/// Deliver a notice to a service's owning thread and wake it, once per
+/// `dedupe_key`: the one way a service reaches its thread's attention. Two
+/// things send one: the first failure of a schedule's streak, and a service
+/// whose services-only machine was lost under it. A project's service has no
+/// owning thread, so its notices are recorded in its log and status only.
+pub(crate) async fn notify_owner(
+    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
+    owner: &ServiceOwner,
+    dedupe_key: &str,
+    content: &str,
+) -> Result<(), String> {
+    use crate::storage::RowExt;
+    let Some(thread_id) = owner.thread_id() else {
+        return Ok(());
+    };
+    let (thread_id, dedupe_key, content) = (
+        thread_id.to_string(),
+        dedupe_key.to_string(),
+        content.to_string(),
+    );
+    let nudge = db
+        .write(move |conn| {
+            let (thread_id, dedupe_key, content) =
+                (thread_id.clone(), dedupe_key.clone(), content.clone());
+            Box::pin(async move {
+                let session_job =
+                    crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await?;
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
+                        cairn_db::turso::params![session_job.as_str()],
+                    )
+                    .await?;
+                let recipient_run = rows.next().await?.map(|row| row.text(0)).transpose()?;
+                drop(rows);
+                let Some(recipient_run) = recipient_run else {
+                    return Ok(None);
+                };
+                crate::messages::delivery::insert_system_direct_push_with_key_conn(
+                    conn,
+                    &session_job,
+                    &recipient_run,
+                    &content,
+                    crate::models::DeliveryUrgency::Steer,
+                    Some(&dedupe_key),
+                )
+                .await?;
+                Ok(Some(session_job))
+            })
+        })
+        .await
+        .map_err(|error| format!("Failed to record the notice: {error}"))?;
+    // The notice is durable by now and the thread's next idle drain delivers
+    // it; a wake that cannot be issued this instant is not a lost notice.
+    if let Some(job_id) = nudge {
+        if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
+            orch,
+            &job_id,
+            crate::models::DeliveryUrgency::Steer,
+        ) {
+            tracing::warn!(%error, job_id, "recorded a service notice but could not wake its thread");
+        }
+    }
+    Ok(())
+}
+
 /// The runner's project-services state, held on the orchestrator.
 #[derive(Default)]
 pub(crate) struct ProjectServices {

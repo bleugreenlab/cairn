@@ -4,7 +4,8 @@
 //! A thread runs code without a turn only through a service (tenet 1313).
 //! On-demand code is a method call; scheduled code is a `schedule` entry
 //! naming a method; wakes stay attention. So this module never starts a turn
-//! and never wakes the owner, except once per failure streak.
+//! and wakes the owner only once per failure streak ([`super::notify_owner`],
+//! whose one other caller is a service whose always-on machine was lost).
 //!
 //! Each declared entry is a `service_schedules` row holding its anchored
 //! recurrence and what its last occurrence did. [`sync`] keeps the rows in step
@@ -494,70 +495,6 @@ pub(crate) fn streak_notice(
         method = row.method,
         every = every_text(row.every_ms),
     )
-}
-
-/// Deliver the streak notice to the owning thread and wake it: the one way a
-/// schedule reaches a thread's attention. A project's service has no owning
-/// thread, so its streaks are recorded in its log and status only.
-pub(crate) async fn notify_owner(
-    orch: &crate::orchestrator::Orchestrator,
-    db: &LocalDb,
-    owner: &ServiceOwner,
-    dedupe_key: &str,
-    content: &str,
-) -> Result<(), String> {
-    let Some(thread_id) = owner.thread_id() else {
-        return Ok(());
-    };
-    let (thread_id, dedupe_key, content) = (
-        thread_id.to_string(),
-        dedupe_key.to_string(),
-        content.to_string(),
-    );
-    let nudge = db
-        .write(move |conn| {
-            let (thread_id, dedupe_key, content) =
-                (thread_id.clone(), dedupe_key.clone(), content.clone());
-            Box::pin(async move {
-                let session_job =
-                    crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await?;
-                let mut rows = conn
-                    .query(
-                        "SELECT id FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1",
-                        params![session_job.as_str()],
-                    )
-                    .await?;
-                let recipient_run = rows.next().await?.map(|row| row.text(0)).transpose()?;
-                drop(rows);
-                let Some(recipient_run) = recipient_run else {
-                    return Ok(None);
-                };
-                crate::messages::delivery::insert_system_direct_push_with_key_conn(
-                    conn,
-                    &session_job,
-                    &recipient_run,
-                    &content,
-                    crate::models::DeliveryUrgency::Steer,
-                    Some(&dedupe_key),
-                )
-                .await?;
-                Ok(Some(session_job))
-            })
-        })
-        .await
-        .map_err(|error| format!("Failed to record the failure notice: {error}"))?;
-    // The notice is durable by now and the thread's next idle drain delivers
-    // it; a wake that cannot be issued this instant is not a lost notice.
-    if let Some(job_id) = nudge {
-        if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
-            orch,
-            &job_id,
-            crate::models::DeliveryUrgency::Steer,
-        ) {
-            tracing::warn!(%error, job_id, "recorded a schedule failure notice but could not wake its thread");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
