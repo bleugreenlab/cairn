@@ -216,9 +216,9 @@ struct Patience<'a> {
     scope: PackedRefs<'a>,
     ctx: &'a str,
     started: Instant,
-    /// When the most recent attempt began.
-    attempt_started: Instant,
     attempts: u32,
+    contention_ended: Option<Instant>,
+    operation_deadline: Option<Instant>,
     healed: bool,
     /// Whether the early abandonment probe has run.
     probed: bool,
@@ -231,28 +231,27 @@ impl<'a> Patience<'a> {
             scope,
             ctx,
             started,
-            attempt_started: started,
             attempts: 0,
+            contention_ended: None,
+            operation_deadline: None,
             healed: false,
             probed: false,
         }
     }
 
     fn attempting(&mut self) {
+        if self.contention_ended.is_some() {
+            self.contention_ended = Some(Instant::now());
+        }
         self.attempts += 1;
-        self.attempt_started = Instant::now();
     }
 
-    /// Time lost to contention: everything before the attempt that succeeded,
-    /// or the whole call when patience gave up.
-    fn contended(&self, succeeded: bool) -> Duration {
-        if succeeded && self.attempts <= 1 {
-            Duration::ZERO
-        } else if succeeded {
-            self.attempt_started.duration_since(self.started)
-        } else {
-            self.started.elapsed()
-        }
+    /// Only confirmed lock failures and the waits following them are contention.
+    /// An unrelated failed attempt (including a killed command) is not lock time.
+    fn contended(&self) -> Duration {
+        self.contention_ended
+            .map(|ended| ended.duration_since(self.started))
+            .unwrap_or_default()
     }
 
     fn settled(&self) {
@@ -273,6 +272,20 @@ impl<'a> Patience<'a> {
     fn recover(&mut self, error: String) -> Result<Recovery, String> {
         if !packed_refs_lock_error(&error) {
             return Err(error);
+        }
+        self.contention_ended = Some(Instant::now());
+        if let Some(deadline) = self.operation_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "{} timed out: operation budget exhausted",
+                    self.ctx
+                ));
+            }
+            // The shared stale-lock proof invokes lsof without a timeout. A
+            // deadline-bound caller waits only; unbudgeted maintenance owns
+            // abandonment proof and removal, never a background lock holder.
+            return Ok(Recovery::Wait(RETRY_DELAY.min(remaining)));
         }
         // One early probe, held to the same proof as the final one: older than
         // the probe bound and held open by no live process. A lock it cannot
@@ -342,9 +355,28 @@ impl<'a> Patience<'a> {
 pub fn with_packed_refs_patience<T>(
     scope: PackedRefs<'_>,
     ctx: &str,
-    mut op: impl FnMut() -> Result<T, String>,
+    op: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    run_with_patience(Patience::new(scope, ctx), op)
+}
+
+/// Store work and its retry sleeps share the same deadline. Budgeted callers
+/// never start the unbounded external stale-lock proof.
+pub(crate) fn with_packed_refs_patience_for<T>(
+    jj: &super::JjEnv,
+    scope: PackedRefs<'_>,
+    ctx: &str,
+    op: impl FnMut() -> Result<T, String>,
 ) -> Result<T, String> {
     let mut patience = Patience::new(scope, ctx);
+    patience.operation_deadline = jj.operation_deadline;
+    run_with_patience(patience, op)
+}
+
+fn run_with_patience<T>(
+    mut patience: Patience<'_>,
+    mut op: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
     let result = loop {
         patience.attempting();
         match op() {
@@ -359,7 +391,7 @@ pub fn with_packed_refs_patience<T>(
             },
         }
     };
-    record_waited(patience.contended(result.is_ok()));
+    record_waited(patience.contended());
     result
 }
 
@@ -412,44 +444,63 @@ pub(crate) fn run_store_rewrite(
     ctx: &str,
 ) -> Result<String, String> {
     let pre_op = super::operation_id(jj, store)?;
-    with_packed_refs_patience(PackedRefs::JjStore(store), ctx, || {
+    with_packed_refs_patience_for(jj, PackedRefs::JjStore(store), ctx, || {
         let error = match jj.run(store, args, ctx) {
             Ok(output) => return Ok(output),
             Err(error) => error,
         };
-        if !packed_refs_lock_error(&error) {
+        let timed_out = super::is_jj_timeout_error(&error);
+        if !packed_refs_lock_error(&error) && !timed_out {
             return Err(error);
         }
-        let now = super::operation_id(jj, store).map_err(|read| {
-            unrepeatable_rewrite(
-                ctx,
-                &format!(
-                    "the operation head could not be re-read to prove the attempt committed \
-                     nothing ({})",
-                    defuse_lock_phrasing(&read)
-                ),
-            )
-        })?;
+        let failure = defuse_lock_phrasing(&error);
+        // A killed process may already have committed its transaction. Inspect
+        // and undo under the caller's store lock, never with the spent deadline.
+        let now = super::operation_id(jj, store)
+            .or_else(|read| {
+                if super::is_jj_timeout_error(&read) {
+                    super::operation_id(&jj.cleanup_env(), store)
+                } else {
+                    Err(read)
+                }
+            })
+            .map_err(|read| {
+                unrepeatable_rewrite(
+                    ctx,
+                    &format!(
+                        "{failure}; the operation head could not be re-read to prove the attempt \
+                     committed nothing ({})",
+                        defuse_lock_phrasing(&read)
+                    ),
+                )
+            })?;
         if now == pre_op {
             return Err(error);
         }
         log::warn!(
-            "{ctx}: an attempt that lost the packed-refs lock still committed operation {now}; \
-             restoring {pre_op} before repeating"
+            "{ctx}: a failed attempt still committed operation {now}; \
+             restoring {pre_op} before returning or retrying"
         );
-        super::restore_operation(jj, store, &pre_op).map_err(|restore| {
+        super::restore_operation(&jj.cleanup_env(), store, &pre_op).map_err(|restore| {
             log::error!(
                 "{ctx}: restoring {pre_op} after a committed lost-lock attempt failed: {restore}"
             );
             unrepeatable_rewrite(
                 ctx,
                 &format!(
-                    "it committed operation {now} before failing, and restoring {pre_op} also \
+                    "{failure}; it committed operation {now} before failing, and restoring {pre_op} also \
                      failed ({}). The store may hold that partial operation",
                     defuse_lock_phrasing(&restore)
                 ),
             )
         })?;
+        if jj.operation_deadline.is_some() {
+            // Cleanup consumed the operation's one undo allowance. Do not feed
+            // a committed-and-restored attempt back into the forward retry loop.
+            return Err(format!(
+                "{ctx} timed out: operation budget exhausted after rewrite rollback: {failure}"
+            ));
+        }
         Err(error)
     })
 }
@@ -459,7 +510,7 @@ pub(crate) fn run_store_rewrite(
 /// it refuses to repeat and the classifier would file it as routine.
 fn unrepeatable_rewrite(ctx: &str, why: &str) -> String {
     super::rollback_incomplete(&format!(
-        "{ctx}: lost the ref-store lock and was not repeated, because {why}."
+        "{ctx}: rewrite failed and was not repeated, because {why}."
     ))
 }
 
@@ -585,14 +636,20 @@ mod tests {
     #[test]
     fn a_non_contention_error_is_never_retried() {
         let temp = TempDir::new().unwrap();
+        let _ = take_packed_refs_waited();
         let attempts = AtomicU32::new(0);
         let error =
             with_packed_refs_patience::<()>(PackedRefs::Checkout(temp.path()), "unit test", || {
                 attempts.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
                 Err("Revision main does not exist".to_string())
             })
             .unwrap_err();
         assert_eq!(error, "Revision main does not exist");
+        assert!(
+            take_packed_refs_waited().is_zero(),
+            "an unrelated failure is not packed-refs contention"
+        );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -788,5 +845,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+}
+
+#[cfg(test)]
+mod operation_budget_tests {
+    use super::*;
+
+    #[test]
+    fn operation_budget_bounds_contention_retry_sleeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let jj = crate::jj::JjEnv::with_binary("unused-jj", temp.path())
+            .with_operation_budget(Duration::from_millis(100));
+        let started = Instant::now();
+        let error = with_packed_refs_patience_for::<()>(
+            &jj,
+            PackedRefs::Checkout(temp.path()),
+            "lock wait",
+            || Err("The lock for the packed-ref file could not be obtained".into()),
+        )
+        .unwrap_err();
+        assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn operation_budget_does_not_start_unbounded_lock_holder_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut patience = Patience::new(PackedRefs::Checkout(temp.path()), "proof");
+        patience.started -= Duration::from_secs(6);
+        patience.operation_deadline = Some(Instant::now() + Duration::from_secs(1));
+        let recovery = patience
+            .recover("The lock for the packed-ref file could not be obtained".into())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(recovery, Recovery::Wait(_)));
+        assert!(!patience.probed);
     }
 }

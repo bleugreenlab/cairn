@@ -594,6 +594,8 @@ pub(super) fn undo_branch_rewrite(
     rewrite: &str,
     reason: String,
 ) -> String {
+    let cleanup = jj.cleanup_env();
+    let jj = &cleanup;
     let undone = restore_operation(jj, store, pre_op).and_then(|()| {
         export_bookmark_advance(
             jj,

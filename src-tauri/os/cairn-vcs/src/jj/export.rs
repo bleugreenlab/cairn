@@ -35,9 +35,68 @@
 //! run on EVERY export: it only ever repairs a detach the export caused, works
 //! for non-default branches, and never touches a user-deliberate detached HEAD.
 use super::*;
-use crate::checkout::{reattach_checkout_head, CheckoutRepairPolicy};
-use cairn_platform::services::{GitClient, RealGitClient};
+use crate::checkout::{reattach_checkout_head, CheckoutGit, CheckoutRepairPolicy};
+use cairn_platform::services::GitOutput;
 use std::path::{Path, PathBuf};
+
+/// Export's Git operations share the same deadline as its jj commands. The
+/// checkout repair algorithm stays in checkout; this is only its process driver.
+struct ScopedGit<'a>(&'a JjEnv);
+
+impl ScopedGit<'_> {
+    fn run_raw(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String> {
+        let output = self.0.command_output(
+            cairn_platform::env::git().args(&args).current_dir(repo),
+            JJ_DEFAULT_TIMEOUT,
+            &format!("git {}", args.first().map(String::as_str).unwrap_or("")),
+        )?;
+        Ok(GitOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+
+    fn run(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String> {
+        let mut output = self.run_raw(repo, args)?;
+        output.stdout = output.stdout.trim().to_string();
+        Ok(output)
+    }
+
+    fn rev_parse(&self, repo: &Path, mut args: Vec<String>) -> Result<String, String> {
+        args.insert(0, "rev-parse".into());
+        let output = self.run(repo, args)?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(output.stderr)
+        }
+    }
+
+    fn current_branch(&self, repo: &Path) -> Result<String, String> {
+        let output = self.run(repo, vec!["branch".into(), "--show-current".into()])?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(output.stderr)
+        }
+    }
+}
+
+impl CheckoutGit for ScopedGit<'_> {
+    fn checkout_status(&self, repo: &Path) -> Result<String, String> {
+        let output = self.run_raw(repo, vec!["status".into(), "--porcelain".into()])?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(output.stderr)
+        }
+    }
+
+    fn checkout_run(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String> {
+        self.run(repo, args)
+    }
+}
 
 /// The project checkout's HEAD attachment, snapshotted before an export. Only
 /// captured when HEAD was ATTACHED (a pre-existing detached HEAD is the user's
@@ -168,7 +227,7 @@ pub(crate) fn export_git_guarded(
     expect: &[(&str, &str)],
 ) -> Result<(), ExportError> {
     let checkout = resolve_backing_checkout(export_cwd);
-    let git = RealGitClient;
+    let git = ScopedGit(jj);
     if !expect.is_empty() {
         let Some(repo) = checkout.as_deref() else {
             // A caller that named an expectation asked to be PROVEN right. Without a
@@ -229,16 +288,19 @@ pub fn is_conflict_scaffolding_export_refusal(error: &str) -> bool {
 /// The scaffolding always sits at the tree ROOT, so this is one non-recursive
 /// `git ls-tree`. An unreadable tree is an `Err`, never an empty list.
 pub(crate) fn root_conflict_scaffolding(
+    jj: Option<&JjEnv>,
     repository: &Path,
     commit: &str,
 ) -> Result<Vec<String>, String> {
-    let output = cairn_platform::env::git()
+    let mut command = cairn_platform::env::git();
+    command
         .args(["ls-tree", "--name-only", commit])
-        .current_dir(repository)
-        .output()
-        .map_err(|error| {
-            format!("inspect tree root of {commit} for conflict scaffolding: {error}")
-        })?;
+        .current_dir(repository);
+    let ctx = format!("inspect tree root of {commit} for conflict scaffolding");
+    let output = match jj {
+        Some(jj) => jj.command_output(&mut command, JJ_DEFAULT_TIMEOUT, &ctx),
+        None => bounded_command_output(&mut command, JJ_DEFAULT_TIMEOUT, &ctx),
+    }?;
     if !output.status.success() {
         return Err(format!(
             "inspect tree root of {commit} for conflict scaffolding: {}",
@@ -256,7 +318,7 @@ pub(crate) fn root_conflict_scaffolding(
 /// carries conflict scaffolding. Runs before the export; see
 /// [`export_git_guarded`] for why a ref already at its commit is skipped.
 fn refuse_scaffolded_ref_moves(
-    git: &dyn GitClient,
+    git: &ScopedGit<'_>,
     repo: &Path,
     ctx: &str,
     expect: &[(&str, &str)],
@@ -267,7 +329,7 @@ fn refuse_scaffolded_ref_moves(
         if current.as_deref() == Some(*commit) {
             continue;
         }
-        let entries = root_conflict_scaffolding(repo, commit).map_err(|error| {
+        let entries = root_conflict_scaffolding(Some(git.0), repo, commit).map_err(|error| {
             ExportError::Failed(format!(
                 "{ctx}: refusing to export `{branch}` to {commit}: its tree could not be checked \
                  for jj conflict scaffolding, and an unchecked tree is not a clean one: {error}"
@@ -313,26 +375,31 @@ fn run_export(
     // unless this leg succeeded — so an impatient export rolls back a patch that
     // already applied cleanly. Repeating is safe: `jj git export` is idempotent,
     // and `export_git_verified` re-reads the refs afterwards to prove it landed.
-    super::with_packed_refs_patience(super::PackedRefs::JjStore(export_cwd), ctx, || {
-        let stderr = jj
-            .run_capturing_stderr(export_cwd, args, ctx)
-            .map(|(_, stderr)| stderr)?;
-        // Contention does not arrive here as an error. `jj git export` reports a
-        // ref it could not write on stderr and still exits 0, so a lost race for
-        // `packed-refs.lock` reaches this point looking like success while
-        // `refs/heads/<branch>` never moved. Hand it back as the failure it is,
-        // or the patience above has nothing to retry — and the export sites that
-        // name no expectation would return `Ok` having exported nothing at all.
-        if super::packed_refs_lock_error(&stderr) {
-            return Err(stderr);
-        }
-        Ok(stderr)
-    })
+    super::packed_refs::with_packed_refs_patience_for(
+        jj,
+        super::PackedRefs::JjStore(export_cwd),
+        ctx,
+        || {
+            let stderr = jj
+                .run_capturing_stderr(export_cwd, args, ctx)
+                .map(|(_, stderr)| stderr)?;
+            // Contention does not arrive here as an error. `jj git export` reports a
+            // ref it could not write on stderr and still exits 0, so a lost race for
+            // `packed-refs.lock` reaches this point looking like success while
+            // `refs/heads/<branch>` never moved. Hand it back as the failure it is,
+            // or the patience above has nothing to retry — and the export sites that
+            // name no expectation would return `Ok` having exported nothing at all.
+            if super::packed_refs_lock_error(&stderr) {
+                return Err(stderr);
+            }
+            Ok(stderr)
+        },
+    )
 }
 
 /// The commit `refs/heads/<branch>` currently holds in `repo`, or `None` when the
 /// ref does not exist.
-fn git_ref_commit(git: &dyn GitClient, repo: &Path, branch: &str) -> Option<String> {
+fn git_ref_commit(git: &ScopedGit<'_>, repo: &Path, branch: &str) -> Option<String> {
     git.rev_parse(repo, vec![format!("refs/heads/{branch}")])
         .ok()
         .map(|commit| commit.trim().to_string())
@@ -344,7 +411,7 @@ fn git_ref_commit(git: &dyn GitClient, repo: &Path, branch: &str) -> Option<Stri
 #[allow(clippy::too_many_arguments)]
 fn verify_exported_refs(
     jj: &JjEnv,
-    git: &dyn GitClient,
+    git: &ScopedGit<'_>,
     export_cwd: &Path,
     repo: &Path,
     ignore_working_copy: bool,
@@ -466,7 +533,7 @@ fn judge_ref_mismatch(
     match targets.as_slice() {
         [current] if current == expected => RefMismatch::Frozen,
         [current]
-            if actual == Some(current.as_str()) && git_is_ancestor(repo, expected, current) =>
+            if actual == Some(current.as_str()) && git_is_ancestor(jj, repo, expected, current) =>
         {
             RefMismatch::Superseded {
                 current: current.clone(),
@@ -678,14 +745,19 @@ pub(crate) fn verified_publish_target(
 /// for a pull request that did not exist. Note the probe follows a push that just
 /// succeeded over the same network to the same remote, so being unable to reach
 /// origin here is genuinely anomalous rather than routine.
-pub(crate) fn confirm_origin_tip(cwd: &Path, branch: &str, expected: &str) -> Result<(), String> {
+pub(crate) fn confirm_origin_tip(
+    jj: &JjEnv,
+    cwd: &Path,
+    branch: &str,
+    expected: &str,
+) -> Result<(), String> {
     let Some(repo) = resolve_backing_checkout(cwd) else {
         return Err(format!(
             "cannot confirm the published tip of `{branch}`: no backing git checkout resolved for {}",
             cwd.display()
         ));
     };
-    let git = RealGitClient;
+    let git = ScopedGit(jj);
     let output = git
         .run(
             &repo,
@@ -765,7 +837,7 @@ pub(crate) fn resolve_backing_checkout(export_cwd: &Path) -> Option<PathBuf> {
 /// Snapshot the checkout's HEAD attachment before the export. Returns `None` when
 /// HEAD is already detached (the user's own choice, never repaired) or when the
 /// probe fails (best-effort: skip the repair).
-fn snapshot_checkout_head(git: &dyn GitClient, repo: &Path) -> Option<CheckoutHeadBefore> {
+fn snapshot_checkout_head(git: &ScopedGit<'_>, repo: &Path) -> Option<CheckoutHeadBefore> {
     // Read from disk first: every export runs this under the store lock, and on
     // a loaded host each `git` spawn costs about a second. The subprocess probe
     // stays as the fallback for a layout the reader does not understand.
@@ -852,7 +924,7 @@ fn read_branch_commit(repo: &Path, branch: &str) -> Option<String> {
 /// Any other post-state (still attached, or the branch did not move) is left
 /// untouched. Best-effort throughout — a probe failure logs and returns.
 fn repair_export_detach(
-    git: &dyn GitClient,
+    git: &ScopedGit<'_>,
     repo: &Path,
     before: &CheckoutHeadBefore,
     policy: CheckoutRepairPolicy,
@@ -991,5 +1063,32 @@ mod head_reader_tests {
         assert_eq!(read_branch_commit(repo, "main"), Some(head));
         git(&["checkout", "-q", "--detach"]);
         assert_eq!(read_checkout_head(repo), CheckoutHead::Detached);
+    }
+}
+
+#[cfg(test)]
+mod operation_budget_tests {
+    use super::*;
+
+    #[test]
+    fn operation_budget_covers_git_export_probes_and_checkout_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let jj = JjEnv::with_binary("unused-jj", temp.path())
+            .with_operation_budget(std::time::Duration::ZERO);
+        let git = ScopedGit(&jj);
+        for result in [
+            git.rev_parse(temp.path(), vec!["HEAD".into()]),
+            git.current_branch(temp.path()),
+            git.checkout_status(temp.path()),
+            git.checkout_run(temp.path(), vec!["status".into()])
+                .map(|_| String::new()),
+            root_conflict_scaffolding(Some(&jj), temp.path(), "HEAD").map(|_| String::new()),
+            reattach_checkout_head(&git, temp.path(), "main", Default::default())
+                .map(|_| String::new()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(is_jj_timeout_error(&error), "{error}");
+            assert!(error.contains("before spawning"), "{error}");
+        }
     }
 }

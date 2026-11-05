@@ -2,10 +2,11 @@
 //! store initialization and bounded command execution.
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use crate::PublicationIdentity;
 
@@ -15,6 +16,11 @@ use crate::PublicationIdentity;
 /// never fall back to different identities.
 const JJ_DEFAULT_USER_NAME: &str = crate::MANAGED_IDENTITY_NAME;
 const JJ_DEFAULT_USER_EMAIL: &str = crate::MANAGED_IDENTITY_EMAIL;
+/// Total subprocess budget for one automatic reconcile phase under the store lock.
+pub const BACKGROUND_RECONCILE_BUDGET: Duration = Duration::from_secs(10);
+/// Rollback has its own allowance: an expired forward budget cannot prevent undo.
+const RECONCILE_CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+
 pub(crate) const JJ_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) use cairn_platform::process::{
     bounded_command_output, NETWORK_TIMEOUT as JJ_NETWORK_TIMEOUT,
@@ -23,6 +29,9 @@ pub(crate) use cairn_platform::process::{
 /// Drives a bundled, non-interactive `jj` binary.
 #[derive(Clone)]
 pub struct JjEnv {
+    pub(super) operation_deadline: Option<Instant>,
+    cleanup_deadline: Arc<OnceLock<Instant>>,
+    is_cleanup: bool,
     bin: String,
     config_path: PathBuf,
     pub(super) checkout_repair_policy: crate::checkout::CheckoutRepairPolicy,
@@ -35,6 +44,76 @@ fn jj_subprocess_lock() -> &'static Mutex<()> {
 }
 
 impl JjEnv {
+    /// Clone this environment with a deadline shared by every subsequent command.
+    ///
+    /// Create it after acquiring the store lock. Cloning the returned environment
+    /// preserves the absolute monotonic deadline; commands do not renew it.
+    /// The original environment remains unbudgeted (or retains its old deadline).
+    pub fn with_operation_budget(&self, budget: Duration) -> Self {
+        let mut scoped = self.clone();
+        scoped.operation_deadline = Some(Instant::now() + budget);
+        scoped.cleanup_deadline = Default::default();
+        scoped.is_cleanup = false;
+        scoped
+    }
+
+    pub(super) fn check_operation_budget(&self, ctx: &str) -> Result<(), String> {
+        if self
+            .operation_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(format!("{ctx} timed out: operation budget exhausted"));
+        }
+        Ok(())
+    }
+
+    /// Clone with the operation's separate cleanup allowance. The first cleanup
+    /// starts one shared deadline and ends forward execution on every existing
+    /// clone; repeated or nested cleanup never renews it.
+    /// Keep the store lock held through kill/reap, inspection, and rollback.
+    pub fn cleanup_env(&self) -> Self {
+        let mut cleanup = self.clone();
+        if self.operation_deadline.is_some() {
+            cleanup.is_cleanup = true;
+            cleanup.operation_deadline = Some(
+                *self
+                    .cleanup_deadline
+                    .get_or_init(|| Instant::now() + RECONCILE_CLEANUP_BUDGET),
+            );
+        }
+        cleanup
+    }
+
+    pub(super) fn command_output(
+        &self,
+        command: &mut Command,
+        timeout: Duration,
+        ctx: &str,
+    ) -> Result<std::process::Output, String> {
+        let timeout = match self.operation_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "{ctx} timed out: operation budget exhausted before spawning"
+                    ));
+                }
+                timeout.min(remaining)
+            }
+            None => timeout,
+        };
+        if !self.is_cleanup && self.cleanup_deadline.get().is_some() {
+            return Err(format!(
+                "{ctx} timed out: operation budget exhausted; cleanup has started before spawning"
+            ));
+        }
+        self.check_operation_budget(ctx)
+            .map_err(|error| format!("{error} before spawning"))?;
+        let output = bounded_command_output(command, timeout, ctx)?;
+        self.check_operation_budget(ctx)?;
+        Ok(output)
+    }
+
     /// Set the host's policy for repairing a checkout detached by an export.
     pub fn with_checkout_repair_policy(
         mut self,
@@ -53,6 +132,9 @@ impl JjEnv {
         Self {
             bin: bin.into(),
             config_path: config_dir.join("jj").join("config.toml"),
+            operation_deadline: None,
+            cleanup_deadline: Default::default(),
+            is_cleanup: false,
             checkout_repair_policy: Default::default(),
         }
     }
@@ -67,6 +149,9 @@ impl JjEnv {
         Self {
             bin,
             config_path: config_dir.join("jj").join("config.toml"),
+            operation_deadline: None,
+            cleanup_deadline: Default::default(),
+            is_cleanup: false,
             checkout_repair_policy: Default::default(),
         }
     }
@@ -201,7 +286,7 @@ impl JjEnv {
             .lock()
             .expect("jj subprocess test lock poisoned");
 
-        let out = bounded_command_output(self.cmd(cwd).args(args), timeout, ctx)?;
+        let out = self.command_output(self.cmd(cwd).args(args), timeout, ctx)?;
         if !out.status.success() {
             return Err(format!(
                 "{ctx} failed: {}",
@@ -238,7 +323,7 @@ impl JjEnv {
             .lock()
             .expect("jj subprocess test lock poisoned");
 
-        let out = bounded_command_output(self.cmd(cwd).args(args), JJ_DEFAULT_TIMEOUT, ctx)?;
+        let out = self.command_output(self.cmd(cwd).args(args), JJ_DEFAULT_TIMEOUT, ctx)?;
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if !out.status.success() {
             return Err(format!("{ctx} failed: {stderr}"));
@@ -409,7 +494,8 @@ pub fn ensure_store_initialized(
 /// [`import_git_with_remote_authority`]) are exempt: origin is the sole
 /// authority there, so a rewind of one is observed, not held off.
 pub fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
-    super::with_packed_refs_patience(
+    super::packed_refs::with_packed_refs_patience_for(
+        jj,
         super::PackedRefs::JjStore(store_dir),
         "jj git import",
         || import_holding_tracking_refs(jj, store_dir, None),
@@ -434,7 +520,8 @@ pub fn import_git_with_remote_authority(
     branch: &str,
 ) -> Result<(), String> {
     declare_origin_authority(store_dir, branch)?;
-    super::with_packed_refs_patience(
+    super::packed_refs::with_packed_refs_patience_for(
+        jj,
         super::PackedRefs::JjStore(store_dir),
         "jj git import",
         || import_holding_tracking_refs(jj, store_dir, Some(branch)),
@@ -524,11 +611,18 @@ fn import_holding_tracking_refs(
 
     // Before: restore what the git refs say now, so the common case never
     // hides anything in the first place.
-    let observed = origin_tracking_refs(&checkout)?;
+    let observed = origin_tracking_refs(jj, &checkout)?;
     for (branch, recorded) in &recorded {
         if let Some(observed) = observed.get(branch) {
-            if observed != recorded && git_is_ancestor(&checkout, observed, recorded) {
-                restore_tracking_ref(&checkout, branch, recorded, observed, "before importing")?;
+            if observed != recorded && git_is_ancestor(jj, &checkout, observed, recorded) {
+                restore_tracking_ref(
+                    jj,
+                    &checkout,
+                    branch,
+                    recorded,
+                    observed,
+                    "before importing",
+                )?;
             }
         }
     }
@@ -550,7 +644,7 @@ fn import_holding_tracking_refs(
             .iter()
             .filter_map(|(branch, recorded)| {
                 let now = imported.get(branch)?;
-                (now != recorded && git_is_ancestor(&checkout, now, recorded))
+                (now != recorded && git_is_ancestor(jj, &checkout, now, recorded))
                     .then(|| (branch, recorded, now.clone()))
             })
             .collect::<Vec<_>>();
@@ -558,7 +652,14 @@ fn import_holding_tracking_refs(
             return Ok(());
         }
         for (branch, recorded, now) in regressed {
-            restore_tracking_ref(&checkout, branch, recorded, &now, "after an import took it")?;
+            restore_tracking_ref(
+                jj,
+                &checkout,
+                branch,
+                recorded,
+                &now,
+                "after an import took it",
+            )?;
         }
         import()?;
     }
@@ -578,6 +679,7 @@ fn import_holding_tracking_refs(
 /// a concurrent writer is never overwritten; losing that race fails the import
 /// rather than importing a ref nobody has checked.
 fn restore_tracking_ref(
+    jj: &JjEnv,
     checkout: &Path,
     branch: &str,
     recorded: &str,
@@ -585,11 +687,13 @@ fn restore_tracking_ref(
     when: &str,
 ) -> Result<(), String> {
     let refname = format!("refs/remotes/origin/{branch}");
-    let output = cairn_platform::env::git()
-        .args(["update-ref", &refname, recorded, regressed])
-        .current_dir(checkout)
-        .output()
-        .map_err(|error| format!("jj import guard: restore {refname}: {error}"))?;
+    let output = jj.command_output(
+        cairn_platform::env::git()
+            .args(["update-ref", &refname, recorded, regressed])
+            .current_dir(checkout),
+        JJ_DEFAULT_TIMEOUT,
+        "git update-ref (import guard)",
+    )?;
     if !output.status.success() {
         return Err(format!(
             "jj import guard: {refname} regressed from {recorded} to {regressed} and moved again \
@@ -634,17 +738,20 @@ fn recorded_origin_tracking_targets(
 
 /// `refs/remotes/origin/*` in the backing repository, keyed by branch name.
 fn origin_tracking_refs(
+    jj: &JjEnv,
     checkout: &Path,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let output = cairn_platform::env::git()
-        .args([
-            "for-each-ref",
-            "--format=%(objectname) %(refname)",
-            "refs/remotes/origin/",
-        ])
-        .current_dir(checkout)
-        .output()
-        .map_err(|error| format!("jj import guard: list origin tracking refs: {error}"))?;
+    let output = jj.command_output(
+        cairn_platform::env::git()
+            .args([
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/remotes/origin/",
+            ])
+            .current_dir(checkout),
+        JJ_DEFAULT_TIMEOUT,
+        "git for-each-ref (import guard)",
+    )?;
     if !output.status.success() {
         return Err(format!(
             "jj import guard: list origin tracking refs: {}",
@@ -661,12 +768,20 @@ fn origin_tracking_refs(
         .collect())
 }
 
-pub(crate) fn git_is_ancestor(checkout: &Path, ancestor: &str, descendant: &str) -> bool {
-    cairn_platform::env::git()
-        .args(["merge-base", "--is-ancestor", ancestor, descendant])
-        .current_dir(checkout)
-        .status()
-        .is_ok_and(|status| status.success())
+pub(crate) fn git_is_ancestor(
+    jj: &JjEnv,
+    checkout: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> bool {
+    jj.command_output(
+        cairn_platform::env::git()
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .current_dir(checkout),
+        JJ_DEFAULT_TIMEOUT,
+        "git merge-base --is-ancestor",
+    )
+    .is_ok_and(|output| output.status.success())
 }
 
 /// Fetch one branch into the backing Git remote-tracking ref without opening or
@@ -843,6 +958,9 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let jj = JjEnv {
+            operation_deadline: None,
+            cleanup_deadline: Default::default(),
+            is_cleanup: false,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -892,6 +1010,9 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\n(sleep 30) &\nexit 0\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let jj = JjEnv {
+            operation_deadline: None,
+            cleanup_deadline: Default::default(),
+            is_cleanup: false,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -930,6 +1051,9 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let jj = JjEnv {
+            operation_deadline: None,
+            cleanup_deadline: Default::default(),
+            is_cleanup: false,
             checkout_repair_policy: Default::default(),
             bin: script.to_string_lossy().into_owned(),
             config_path: home.path().join("config.toml"),
@@ -969,5 +1093,206 @@ mod tests {
         }
 
         assert_eq!(jj.bin, "/explicit/jj");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod operation_budget_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn operation_budget_is_shared_across_clones_and_all_runners() {
+        let Some(bin) = crate::jj::testing::jj_bin() else {
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let script = home.path().join("delayed-version");
+        let invocations = home.path().join("invocations");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf x >> {}\nsleep 0.5\nexec {} \"$@\"\n",
+                quote(&invocations.to_string_lossy()),
+                quote(&bin),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original = JjEnv::with_binary(script.to_string_lossy(), home.path());
+        let scoped = original.with_operation_budget(Duration::from_secs(2));
+        let cloned = scoped.clone();
+        let started = Instant::now();
+        let mut completed = 0;
+        for i in 0..8 {
+            let result = match i % 4 {
+                0 => scoped.run(home.path(), &["--version"], "budget stdout"),
+                1 => cloned
+                    .run_bytes(home.path(), &["--version"], "budget bytes")
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+                2 => cloned.run_with_timeout(
+                    home.path(),
+                    &["--version"],
+                    "budget custom timeout",
+                    Duration::from_secs(300),
+                ),
+                _ => scoped
+                    .run_capturing_stderr(home.path(), &["--version"], "budget stderr")
+                    .map(|(stdout, _)| stdout),
+            };
+            match result {
+                Ok(_) => completed += 1,
+                Err(error) => {
+                    assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+                    break;
+                }
+            }
+        }
+        assert!(
+            (1..4).contains(&completed),
+            "sequence renewed its budget: {completed}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let before = std::fs::read(&invocations).unwrap();
+        assert!(before.len() <= 4);
+        for result in [
+            scoped
+                .run(home.path(), &["--version"], "expired stdout")
+                .map(|_| ()),
+            cloned
+                .run_capturing_stderr(home.path(), &["--version"], "expired stderr")
+                .map(|_| ()),
+            scoped
+                .run_with_timeout(
+                    home.path(),
+                    &["--version"],
+                    "expired custom",
+                    Duration::from_secs(300),
+                )
+                .map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(error.contains("before spawning"), "{error}");
+            assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+        }
+        assert_eq!(
+            std::fs::read(&invocations).unwrap(),
+            before,
+            "expired runners spawned"
+        );
+        original
+            .run(home.path(), &["--version"], "original remains unbudgeted")
+            .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn operation_budget_stderr_and_shorter_command_timeout_are_bounded() {
+        let home = TempDir::new().unwrap();
+        let script = home.path().join("slow");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original = JjEnv::with_binary(script.to_string_lossy(), home.path());
+        let started = Instant::now();
+        let error = original
+            .with_operation_budget(Duration::from_millis(100))
+            .run_capturing_stderr(home.path(), &[], "bounded stderr")
+            .unwrap_err();
+        assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let started = Instant::now();
+        let error = original
+            .with_operation_budget(Duration::from_secs(20))
+            .run_with_timeout(
+                home.path(),
+                &[],
+                "shorter command",
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_budget_tests {
+    use super::*;
+
+    #[test]
+    fn operation_budget_cleanup_clones_share_one_nonrenewable_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let jj = JjEnv::with_binary("unused-jj", temp.path())
+            .with_operation_budget(Duration::from_secs(10));
+        let cleanup = jj.cleanup_env();
+        assert_eq!(
+            cleanup.operation_deadline,
+            jj.clone().cleanup_env().operation_deadline
+        );
+        assert_eq!(
+            cleanup.operation_deadline,
+            cleanup.cleanup_env().operation_deadline
+        );
+        assert!(Arc::ptr_eq(&jj.cleanup_deadline, &cleanup.cleanup_deadline));
+
+        let expired = jj.with_operation_budget(Duration::from_secs(10));
+        expired
+            .cleanup_deadline
+            .set(Instant::now() - Duration::from_secs(1))
+            .unwrap();
+        for env in [expired.cleanup_env(), expired.clone().cleanup_env()] {
+            assert!(
+                env.check_operation_budget("cleanup").is_err(),
+                "cleanup must not renew an exhausted allowance"
+            );
+        }
+        assert!(
+            jj.with_operation_budget(Duration::from_secs(10))
+                .cleanup_deadline
+                .get()
+                .is_none(),
+            "a new locked operation gets an independent cleanup allowance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_transition_tests {
+    use super::*;
+
+    #[test]
+    fn operation_budget_cleanup_stops_forward_retries_on_existing_clones() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = JjEnv::with_binary("unused-jj", temp.path());
+        let forward = original.with_operation_budget(Duration::from_secs(30));
+        let clone = forward.clone();
+        let cleanup = forward.cleanup_env();
+        assert!(
+            forward
+                .check_operation_budget("successful refusal classification")
+                .is_ok(),
+            "starting rollback must not retroactively expire the forward deadline"
+        );
+        for env in [&forward, &clone] {
+            let error = env.run(temp.path(), &[], "forward retry").unwrap_err();
+            assert!(crate::jj::is_jj_timeout_error(&error), "{error}");
+            assert!(
+                error.contains("cleanup has started") && error.contains("before spawning"),
+                "{error}"
+            );
+        }
+        assert!(cleanup.check_operation_budget("rollback").is_ok());
+        assert!(cleanup
+            .cleanup_env()
+            .check_operation_budget("nested rollback")
+            .is_ok());
+        assert!(original.check_operation_budget("unbudgeted caller").is_ok());
+        assert!(forward
+            .with_operation_budget(Duration::from_secs(30))
+            .check_operation_budget("next locked operation")
+            .is_ok());
     }
 }

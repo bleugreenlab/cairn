@@ -28,7 +28,8 @@ pub fn is_stale_error(msg: &str) -> bool {
 /// Classify the stable error returned when Cairn kills a managed jj/git
 /// subprocess after its deadline.
 pub fn is_jj_timeout_error(msg: &str) -> bool {
-    msg.contains(" timed out after ") && msg.contains(" and was killed")
+    (msg.contains(" timed out after ") && msg.contains(" and was killed"))
+        || msg.contains("timed out: operation budget exhausted")
 }
 
 /// Stable marker phrase for a seal that captured no change because the working

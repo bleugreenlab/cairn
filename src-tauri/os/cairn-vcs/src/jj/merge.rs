@@ -605,7 +605,7 @@ pub(crate) fn push_store_bookmark_classified(
     }
     match published.as_deref() {
         Some(published) => {
-            confirm_origin_tip(store, branch, published).map_err(StoreBookmarkPushError::Failed)
+            confirm_origin_tip(jj, store, branch, published).map_err(StoreBookmarkPushError::Failed)
         }
         None => Ok(()),
     }
@@ -1087,13 +1087,15 @@ fn explain_immutable_rebase_refusal(
 /// [`rollback_incomplete`], which the reconcile classifier ranks above every
 /// other cause — a lost lock nested inside it included — so the branch is
 /// reported as needing repair rather than quietly retried.
-fn roll_back_rebase(
+pub(crate) fn roll_back_rebase(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
     pre_op: &str,
     failure: String,
 ) -> String {
+    let cleanup = jj.cleanup_env();
+    let jj = &cleanup;
     let undone = restore_operation(jj, store, pre_op).and_then(|()| {
         export_bookmark_advance(
             jj,
@@ -1131,6 +1133,8 @@ fn roll_back_conflicting_rebase(
     dest: &str,
     pre_op: &str,
 ) -> Result<(), String> {
+    let cleanup = jj.cleanup_env();
+    let jj = &cleanup;
     restore_operation(jj, store, pre_op)
         .and_then(|()| {
             export_bookmark_advance(
@@ -1410,6 +1414,10 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     // otherwise be folded onto a target as ordinary history.
     let ancestry_conflicts =
         conflicted_commits(jj, store, &format!("({dest})..bookmarks(exact:{branch:?})"));
+    // Some advisory readers intentionally discard errors. An exhausted budget
+    // still refuses the whole rebase, even when such a reader hid the timeout.
+    jj.check_operation_budget("jj rebase follow-through")
+        .map_err(|error| roll_back_rebase(jj, store, branch, &pre_op, error))?;
     if !ancestry_conflicts.is_empty() {
         let paths: Vec<String> = ancestry_conflicts
             .iter()

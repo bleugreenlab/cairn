@@ -127,19 +127,30 @@ enum MergedTree {
 /// three may be a tree, so a replay can chain onto its own intermediate
 /// results. Writes loose tree objects and nothing else. `None` when git could
 /// not merge (an older git that takes no `--merge-base`, a missing object).
-fn merge_tree(checkout: &Path, base: &str, ours: &str, theirs: &str) -> Option<MergedTree> {
-    let output = cairn_platform::env::git()
-        .args([
-            "merge-tree",
-            "--write-tree",
-            &format!("--merge-base={base}"),
-            ours,
-            theirs,
-        ])
-        .current_dir(checkout)
-        .stderr(std::process::Stdio::null())
-        .output()
+fn merge_tree(
+    jj: &JjEnv,
+    checkout: &Path,
+    base: &str,
+    ours: &str,
+    theirs: &str,
+) -> Option<MergedTree> {
+    let output = jj
+        .command_output(
+            cairn_platform::env::git()
+                .args([
+                    "merge-tree",
+                    "--write-tree",
+                    &format!("--merge-base={base}"),
+                    ours,
+                    theirs,
+                ])
+                .current_dir(checkout)
+                .stderr(std::process::Stdio::null()),
+            JJ_DEFAULT_TIMEOUT,
+            "git merge-tree (replay)",
+        )
         .ok()?;
+
     match output.status.code() {
         Some(0) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -158,7 +169,12 @@ fn merge_tree(checkout: &Path, base: &str, ours: &str, theirs: &str) -> Option<M
 /// `Some(true)` when some commit conflicts, `Some(false)` when every one
 /// merged, `None` when the replay could not be tried: no commits, a merge
 /// commit, a commit that already records a jj conflict, or git unable to merge.
-pub(crate) fn replay_in_memory(store: &Path, commits: &[GraphCommit], onto: &str) -> Option<bool> {
+pub(crate) fn replay_in_memory(
+    jj: &JjEnv,
+    store: &Path,
+    commits: &[GraphCommit],
+    onto: &str,
+) -> Option<bool> {
     if commits.is_empty() || commits.iter().any(|commit| commit.conflicted) {
         return None;
     }
@@ -172,7 +188,7 @@ pub(crate) fn replay_in_memory(store: &Path, commits: &[GraphCommit], onto: &str
             .get(parent.as_str())
             .cloned()
             .unwrap_or_else(|| onto.to_string());
-        match merge_tree(&checkout, parent, &ours, &commit.commit)? {
+        match merge_tree(jj, &checkout, parent, &ours, &commit.commit)? {
             MergedTree::Clean(tree) => {
                 replayed.insert(&commit.commit, tree);
             }
@@ -194,7 +210,7 @@ pub(crate) fn replay_revset_in_memory(
     if super::conflict::revset_has_conflict(jj, store, onto).unwrap_or(true) {
         return None;
     }
-    replay_in_memory(store, &graph(jj, store, revset).ok()?, onto)
+    replay_in_memory(jj, store, &graph(jj, store, revset).ok()?, onto)
 }
 
 /// Whether a maintainer ordering (keep `keep`, replay `replay`'s commits since
@@ -285,7 +301,7 @@ fn check_ordering_reading(
     let conflicts = if super::conflict::revset_has_conflict(jj, store, keep)? {
         None
     } else {
-        replay_in_memory(store, &own, keep)
+        replay_in_memory(jj, store, &own, keep)
     };
     Ok(OrderingCheck::Offer { conflicts })
 }
@@ -379,6 +395,7 @@ fn twin_stack_keeping(
         return Ok(None);
     };
     let objects = commit_objects(
+        jj,
         &checkout,
         pairs
             .iter()
@@ -393,7 +410,13 @@ fn twin_stack_keeping(
         if original_object.message != twin_object.message {
             return Ok(None);
         }
-        match merge_tree(&checkout, original_parent, twin_parent, &original.commit) {
+        match merge_tree(
+            jj,
+            &checkout,
+            original_parent,
+            twin_parent,
+            &original.commit,
+        ) {
             Some(MergedTree::Clean(tree)) if tree == twin_object.tree => {}
             _ => return Ok(None),
         }
@@ -413,17 +436,21 @@ struct CommitObject {
 
 /// Each commit's tree and full message, in one git call.
 fn commit_objects<'a>(
+    jj: &JjEnv,
     checkout: &Path,
     commits: impl Iterator<Item = &'a str>,
 ) -> Result<HashMap<String, CommitObject>, String> {
-    let output = cairn_platform::env::git()
-        .args(["log", "--no-walk=unsorted", "--format=%H%x00%T%x00%B%x00"])
-        .args(commits)
-        .args(["--"])
-        .current_dir(checkout)
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|error| format!("git log (twin commit objects): {error}"))?;
+    let output = jj.command_output(
+        cairn_platform::env::git()
+            .args(["log", "--no-walk=unsorted", "--format=%H%x00%T%x00%B%x00"])
+            .args(commits)
+            .args(["--"])
+            .current_dir(checkout)
+            .stderr(std::process::Stdio::piped()),
+        JJ_DEFAULT_TIMEOUT,
+        "git log (twin commit objects)",
+    )?;
+
     if !output.status.success() {
         return Err(format!(
             "git log (twin commit objects): {}",
@@ -592,7 +619,7 @@ fn pull_request_number(description: &str) -> Option<u64> {
                 .collect::<String>();
             digits.parse().ok()
         })
-        .last()
+        .next_back()
 }
 
 #[cfg(test)]
@@ -603,6 +630,7 @@ mod tests {
     fn a_pull_request_number_is_the_last_one_a_description_names() {
         assert_eq!(pull_request_number("Fix the page (#4167)"), Some(4167));
         assert_eq!(pull_request_number("Follow up #12 for (#4138)"), Some(4138));
+        assert_eq!(pull_request_number("Fix #12 then #34 and # text"), Some(34));
         assert_eq!(pull_request_number("no number # here"), None);
         assert_eq!(pull_request_number(""), None);
     }

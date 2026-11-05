@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::execution::routing::{owning_db_for_job, owning_db_for_project};
+use crate::jj::RECONCILE_TIMEOUT;
 use crate::merge_requests::queries::{
     publication_requirement_for_managed_branch, PublicationRequirement,
 };
@@ -103,8 +104,9 @@ async fn push_managed_branch(
                 format!("stale publication recovery: {branch}"),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase(format!("import and converge branch={branch}"));
-        crate::jj::converge_managed_branch_after_remote_rewrite(jj, store, branch)?;
+        crate::jj::converge_managed_branch_after_remote_rewrite(&jj, store, branch)?;
     }
 
     crate::jj::publish_branch_to_origin(jj, store, branch)
@@ -193,16 +195,40 @@ impl ReplayBaseline {
 /// Each path merges from its [`ReplayBaseline`]. Merged from the stale fork, a
 /// registry the branch already resolved against an earlier base would see that
 /// base's entries on both sides and keep them twice.
-fn try_structural_merge(
+#[cfg(test)]
+type StructuralPreparedHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static STRUCTURAL_PREPARED_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, StructuralPreparedHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn structural_prepared_test_hook(store: &Path) {
+    let hook = STRUCTURAL_PREPARED_HOOKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .remove(store);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+struct StructuralMergePlan {
+    tip: String,
+    destination: String,
+    paths: Vec<String>,
+    edits: Vec<crate::orchestrator::landing::bind::FileEdit>,
+}
+
+/// Read immutable sides and prove candidate content without writer exclusion.
+fn prepare_structural_merge(
     jj: &crate::jj::JjEnv,
     store: &Path,
-    branch: &str,
-    destination: &str,
     diagnostic: &crate::jj::ConflictDiagnostic,
     baseline: &ReplayBaseline,
     rules: &crate::orchestrator::landing::MergeRules,
-) -> Result<Option<crate::jj::ReconcileReport>, String> {
-    // Base drift has nothing to merge: the files already agree.
+) -> Result<Option<StructuralMergePlan>, String> {
     if diagnostic.condition == crate::jj::ConflictCondition::BaseDrift {
         return Ok(None);
     }
@@ -217,87 +243,152 @@ fn try_structural_merge(
     ) else {
         return Ok(None);
     };
-    let base_for = |path: &str| baseline.resolved_against(path).unwrap_or(fork).to_string();
-    let sides_at = |tip: &str| -> Vec<(String, Result<crate::jj::MergeSides, String>)> {
-        paths
-            .iter()
-            .flat_map(|path| {
-                crate::jj::read_sides_for_paths(
-                    jj,
-                    store,
-                    &base_for(path),
-                    tip,
-                    theirs,
-                    std::slice::from_ref(path),
-                )
-            })
-            .collect()
-    };
-    let mut edits: Vec<crate::orchestrator::landing::bind::FileEdit> = Vec::new();
-    for (path, sides) in sides_at(ours) {
-        let Ok(sides) = sides else {
-            return Ok(None);
-        };
-        let (
-            crate::jj::FileContent::Text(base_text),
-            crate::jj::FileContent::Text(ours_text),
-            crate::jj::FileContent::Text(theirs_text),
-        ) = (&sides.base, &sides.ours, &sides.theirs)
-        else {
-            return Ok(None);
-        };
-        let Some(candidate) = rules.proven_merge(&path, base_text, ours_text, theirs_text) else {
-            return Ok(None);
-        };
-        edits.push(crate::orchestrator::landing::bind::FileEdit::Rewrite {
-            path,
-            content: candidate,
-        });
+    let mut edits = Vec::new();
+    for path in &paths {
+        let base = baseline.resolved_against(path).unwrap_or(fork);
+        for (path, sides) in crate::jj::read_sides_for_paths(
+            jj,
+            store,
+            base,
+            ours,
+            theirs,
+            std::slice::from_ref(path),
+        ) {
+            let sides = sides?;
+            let (
+                crate::jj::FileContent::Text(base_text),
+                crate::jj::FileContent::Text(ours_text),
+                crate::jj::FileContent::Text(theirs_text),
+            ) = (&sides.base, &sides.ours, &sides.theirs)
+            else {
+                return Ok(None);
+            };
+            let Some(content) = rules.proven_merge(&path, base_text, ours_text, theirs_text) else {
+                return Ok(None);
+            };
+            edits.push(crate::orchestrator::landing::bind::FileEdit::Rewrite { path, content });
+        }
     }
+    Ok(Some(StructuralMergePlan {
+        tip: ours.to_string(),
+        destination: theirs.to_string(),
+        paths,
+        edits,
+    }))
+}
 
+/// Apply a pre-proven candidate as one rollback window. Caller holds the store
+/// lock, and neither the original tip nor the named destination may have moved.
+fn apply_structural_merge(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    destination: &str,
+    plan: &StructuralMergePlan,
+) -> Result<Option<crate::jj::ReconcileReport>, String> {
+    if crate::jj::bookmark_commit_checked(jj, store, branch)?.as_deref() != Some(plan.tip.as_str())
+        || crate::jj::revset_commit_checked(jj, store, destination)?.as_deref()
+            != Some(plan.destination.as_str())
+    {
+        return Err(
+            "structural replay inputs moved while its candidate was prepared; nothing was changed"
+                .to_string(),
+        );
+    }
     let pre_op = crate::jj::operation_id(jj, store)?;
     let result = (|| {
         crate::orchestrator::landing::bind::seal_edits(
             jj,
             store,
             branch,
-            ours,
-            &edits,
+            &plan.tip,
+            &plan.edits,
             "Merge declared registry lists element-wise after base advance",
         )?;
-        let committed = crate::jj::bookmark_commit(jj, store, branch)
+        let committed = crate::jj::bookmark_commit_checked(jj, store, branch)?
             .ok_or_else(|| format!("structural merge commit left `{branch}` unresolved"))?;
-        for (_, sides) in sides_at(&committed) {
-            let sides = sides.map_err(|error| {
-                format!("could not prove committed structural merge lossless: {error}")
-            })?;
-            if crate::jj::assess_whole_file_restore(&sides) != crate::jj::RestoreVerdict::Lossless {
-                return Err(
-                    "committed structural merge did not make whole-file replay lossless"
-                        .to_string(),
-                );
+        // proven_merge already proved that this exact candidate parses and holds
+        // both sides. Equality transfers that proof to the sealed bytes without
+        // rerunning the potentially quadratic whole-file proof under the lock.
+        for edit in &plan.edits {
+            let crate::orchestrator::landing::bind::FileEdit::Rewrite { path, content } = edit
+            else {
+                return Err("structural replay contained an unproven rename".to_string());
+            };
+            if text_at_revision(jj, store, &committed, path)? != *content {
+                return Err(format!(
+                    "committed structural candidate differs at `{path}`"
+                ));
             }
         }
-        // The committed merge already holds the destination's entries, so the
-        // replay lands it whole, and the replay's own parse gate re-checks it.
-        crate::jj::reconcile_resolved_sibling_without_publication(
+        let report = crate::jj::reconcile_resolved_sibling_without_publication(
             jj,
             store,
-            destination,
+            &plan.destination,
             branch,
-            &crate::jj::ResolutionCarry::from_tip(&committed, &paths),
-        )
-    })();
-    match result {
-        Ok(report) => Ok(Some(report)),
-        Err(error) => {
-            crate::jj::restore_operation(jj, store, &pre_op).map_err(|rollback| {
-                format!(
-                    "automatic structural merge failed ({error}) and rollback to {pre_op} failed: {rollback}"
-                )
-            })?;
-            Err(error)
+            &crate::jj::ResolutionCarry::from_tip(&committed, &plan.paths),
+        )?;
+        if let Some(failure) = report
+            .failed
+            .iter()
+            .find(|failure| failure.branch == branch)
+        {
+            return Err(failure.error.clone());
         }
+        if !report.rebased_clean.iter().any(|clean| clean == branch) {
+            return Ok(None);
+        }
+        Ok(Some(report))
+    })();
+    if matches!(&result, Ok(Some(_))) {
+        return result;
+    }
+    let cleanup = jj.cleanup_env();
+    let rollback = crate::jj::restore_operation(&cleanup, store, &pre_op).and_then(|()| {
+        if crate::jj::bookmark_commit_checked(&cleanup, store, branch)?.as_deref()
+            == Some(plan.tip.as_str())
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "restored structural replay did not recover `{branch}` at {}",
+                plan.tip
+            ))
+        }
+    });
+    if let Err(rollback) = rollback {
+        let cause = result
+            .as_ref()
+            .err()
+            .map(String::as_str)
+            .unwrap_or("structural replay remained conflicted");
+        return Err(format!(
+            "{} automatic structural merge failed ({cause}); restoring {pre_op} also failed: {rollback}",
+            crate::jj::ROLLBACK_INCOMPLETE,
+        ));
+    }
+    result.map_err(|error| {
+        // The outer snapshot supersedes an inner failed undo: the entire attempt
+        // has now been restored and exported, not merely its nested rebase.
+        error.replace(
+            crate::jj::ROLLBACK_INCOMPLETE,
+            "inner rollback failed, outer rollback completed:",
+        )
+    })
+}
+
+fn try_structural_merge(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    destination: &str,
+    diagnostic: &crate::jj::ConflictDiagnostic,
+    baseline: &ReplayBaseline,
+    rules: &crate::orchestrator::landing::MergeRules,
+) -> Result<Option<crate::jj::ReconcileReport>, String> {
+    match prepare_structural_merge(jj, store, diagnostic, baseline, rules)? {
+        Some(plan) => apply_structural_merge(jj, store, branch, destination, &plan),
+        None => Ok(None),
     }
 }
 
@@ -550,8 +641,13 @@ fn quarantine_blocks_automatic_replay(
     current_tip: Option<&str>,
     label: &str,
 ) -> bool {
+    if quarantine.failure_kind == RECONCILE_TIMEOUT {
+        // A new destination does not make the unchanged stack any cheaper.
+        return quarantine.observed_tip() == current_tip.unwrap_or("missing")
+            && chrono::Utc::now().timestamp() < quarantine.retry_at();
+    }
     quarantine.failure_kind != "ambiguous_divergence"
-        && quarantine.fingerprint == current_tip.unwrap_or("missing")
+        && quarantine.observed_tip() == current_tip.unwrap_or("missing")
         && (quarantine.failure_kind != ROLLED_BACK_CONFLICT || !replay_is_explicit(label))
 }
 
@@ -975,6 +1071,32 @@ struct ReconcileQuarantine {
     failure_kind: String,
     fingerprint: String,
     last_diagnostic: Option<String>,
+    strike_count: i64,
+    updated_at: i64,
+}
+
+impl ReconcileQuarantine {
+    fn observed_tip(&self) -> &str {
+        if self.failure_kind == RECONCILE_TIMEOUT {
+            // Both coordinates are immutable commit ids, which cannot contain ':'.
+            self.fingerprint
+                .split_once(':')
+                .map_or(self.fingerprint.as_str(), |(tip, _)| tip)
+        } else {
+            &self.fingerprint
+        }
+    }
+
+    fn retry_at(&self) -> i64 {
+        self.updated_at
+            .saturating_add(timeout_backoff_seconds(self.strike_count))
+    }
+}
+
+/// Five minutes buys foreground work a useful window; doubling up to one hour
+/// avoids hammering an expensive unchanged stack while still probing recovery.
+fn timeout_backoff_seconds(strikes: i64) -> i64 {
+    (300_i64 * (1_i64 << strikes.saturating_sub(1).clamp(0, 4))).min(3600)
 }
 
 async fn load_reconcile_quarantine(
@@ -990,7 +1112,7 @@ async fn load_reconcile_quarantine(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT failure_kind, fingerprint, last_diagnostic
+                    "SELECT failure_kind, fingerprint, last_diagnostic, strike_count, updated_at
                      FROM jj_reconcile_quarantines
                      WHERE project_id = ?1 AND store_path = ?2 AND bookmark = ?3",
                     params![project_id, store_path, bookmark],
@@ -1003,11 +1125,163 @@ async fn load_reconcile_quarantine(
                 failure_kind: row.text(0)?,
                 fingerprint: row.text(1)?,
                 last_diagnostic: row.opt_text(2)?,
+                strike_count: row.i64(3)?,
+                updated_at: row.i64(4)?,
             }))
         })
     })
     .await
     .map_err(|error| format!("load reconcile quarantine: {error}"))
+}
+
+/// Persist the circuit breaker and the owning issues' explanation together.
+/// Notification delivery is not a precondition: an idle/missing run must not
+/// turn an expensive timeout back into a retry on every advance.
+async fn record_reconcile_timeout(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    branch: &str,
+    tip: &str,
+    destination: &str,
+    error: &str,
+) -> Result<String, String> {
+    let project_id = project_id.to_string();
+    let store = store.to_string_lossy().into_owned();
+    let branch = branch.to_string();
+    let tip = tip.to_string();
+    let destination = destination.to_string();
+    let error = error.to_string();
+    db.write(move |conn| {
+        let project_id = project_id.clone();
+        let store = store.clone();
+        let branch = branch.clone();
+        let tip = tip.clone();
+        let destination = destination.clone();
+        let error = error.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(
+                "SELECT failure_kind, fingerprint, strike_count FROM jj_reconcile_quarantines
+                 WHERE project_id = ?1 AND store_path = ?2 AND bookmark = ?3",
+                params![project_id.as_str(), store.as_str(), branch.as_str()],
+            ).await?;
+            let strikes = match rows.next().await? {
+                Some(row) if row.text(0)? == RECONCILE_TIMEOUT
+                    && row.text(1)?.split_once(':').is_some_and(|(old_tip, _)| old_tip == tip) =>
+                    row.i64(2)?.saturating_add(1),
+                _ => 1,
+            };
+            drop(rows);
+            let now = chrono::Utc::now().timestamp();
+            let delay = timeout_backoff_seconds(strikes);
+            let retry_at = now.saturating_add(delay);
+            let fingerprint = format!("{tip}:{destination}");
+            let diagnostic = format!(
+                "{error}\nAutomatic reconcile timed out for branch `{branch}` at `{tip}` onto `{destination}`. \
+                 This branch is outside automatic reconcile until it changes or the cooldown expires at \
+                 Unix time {retry_at} ({delay}s; timeout strike {strikes}). A new main tip does not bypass \
+                 this cooldown. Other branches continue. The owner should assess the stack and coordinate \
+                 a controlled store-side recovery with execution; do not reset, force-push, or repeatedly \
+                 request replay. Inspect the timeout/rollback diagnostic before assuming the branch moved."
+            );
+            conn.execute(
+                "INSERT INTO jj_reconcile_quarantines
+                 (project_id, store_path, bookmark, failure_kind, fingerprint, last_diagnostic,
+                  strike_count, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(project_id, store_path, bookmark) DO UPDATE SET
+                   failure_kind = excluded.failure_kind, fingerprint = excluded.fingerprint,
+                   last_diagnostic = excluded.last_diagnostic, strike_count = excluded.strike_count,
+                   updated_at = excluded.updated_at",
+                params![project_id.as_str(), store.as_str(), branch.as_str(), RECONCILE_TIMEOUT,
+                    fingerprint.as_str(), diagnostic.as_str(), strikes, now],
+            ).await?;
+            let mut rows = conn.query(
+                "SELECT DISTINCT issue_id FROM jobs
+                 WHERE project_id = ?1 AND branch = ?2 AND issue_id IS NOT NULL",
+                params![project_id.as_str(), branch.as_str()],
+            ).await?;
+            let mut owners = Vec::new();
+            while let Some(row) = rows.next().await? {
+                owners.push(row.text(0)?);
+            }
+            drop(rows);
+            for issue_id in owners {
+                crate::issues::comments::insert_conn(
+                    conn, &cairn_common::ids::mint_child(&issue_id), &issue_id,
+                    &diagnostic, "agent", now,
+                ).await?;
+            }
+            log::warn!("jj reconcile: {branch} timeout cooldown recorded: coordinates={fingerprint}, strikes={strikes}, retry_at={retry_at}");
+            Ok(diagnostic)
+        })
+    }).await.map_err(|error| format!("record reconcile timeout cooldown: {error}"))
+}
+
+/// The caller retains its store guard until the breaker is durable.
+async fn persist_report_timeouts(
+    db: &LocalDb,
+    project_id: &str,
+    store: &Path,
+    branch: &str,
+    tip: &str,
+    destination: &str,
+    report: &mut crate::jj::ReconcileReport,
+) -> Result<bool, String> {
+    let mut recorded = false;
+    for failure in &mut report.failed {
+        if failure.branch == branch
+            && crate::jj::reconcile_failure_kind(&failure.error) == RECONCILE_TIMEOUT
+        {
+            failure.error = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                record_reconcile_timeout(
+                    db,
+                    project_id,
+                    store,
+                    branch,
+                    tip,
+                    destination,
+                    &failure.error,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                "timed out persisting reconcile cooldown; releasing store lock".to_string()
+            })??;
+            recorded = true;
+        }
+    }
+    Ok(recorded)
+}
+
+async fn defer_timeout_reconcile(
+    db: &LocalDb,
+    intent_id: &str,
+    branch: &str,
+    tip: Option<&str>,
+    quarantine: &ReconcileQuarantine,
+    label: &str,
+) -> Result<(), String> {
+    persist_reconcile_item(
+        db,
+        ReconcileItemUpdate {
+            intent_id,
+            bookmark: branch,
+            observed_tip: tip,
+            status: "pending",
+            failure_kind: Some(RECONCILE_TIMEOUT),
+            outcome_kind: Some("deferred"),
+            fingerprint: Some(&quarantine.fingerprint),
+            diagnostic: quarantine.last_diagnostic.as_deref(),
+        },
+    )
+    .await?;
+    log::info!(
+        "jj reconcile ({label}): timeout cooldown skips unchanged {branch} at {}; failed coordinates={}, retry_at={} (a branch change releases it; a main advance does not)",
+        tip.unwrap_or("missing"), quarantine.fingerprint, quarantine.retry_at()
+    );
+    Ok(())
 }
 
 async fn upsert_reconcile_quarantine(
@@ -1473,21 +1747,9 @@ async fn reconcile_jj_downstream(
     // sibling and yields between them. Merge, webhook, and startup triggers can
     // overlap, so the durable intent lease coalesces them while the shared mutex
     // remains the sole jj/ref/history writer.
-    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-    // Validate the advanced integration bookmark and refresh any authorized
-    // held cells on that exact coordinate before reconciling descendants.
-    {
-        let guard = orch
-            .acquire_jj_store_lock(
-                &store,
-                crate::orchestrator::StoreLockClass::Background,
-                format!("jj on-branch advance for {merged_job_id}"),
-            )
-            .await;
-        let _phase = guard.phase("on-branch coordinate advance");
-        refresh_advanced_branch_cells(orch, db, &merged_job.project_id, base_branch, repo_path)
-            .await;
-    }
+    // The refresh holds the store only while capturing the advanced coordinate;
+    // database notification and executor work do not require writer exclusion.
+    refresh_advanced_branch_cells(orch, db, &merged_job.project_id, base_branch, repo_path).await;
 
     // The store owns the LOCAL fold, but it does not own what origin did with the
     // pull request. An operator squash-merging on GitHub mints a commit id the
@@ -1673,6 +1935,7 @@ async fn reconcile_store_default_bookmark(
             format!("default bookmark reconcile: {ctx}"),
         )
         .await;
+    let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
     let _phase = guard.phase("default bookmark reconcile");
     if let Err(error) = crate::jj::ensure_store_initialized(&jj, &store, repo_path) {
         log::warn!("{ctx}: ensure jj store failed; skipping default bookmark reconcile: {error}");
@@ -1774,6 +2037,7 @@ pub(crate) async fn reconcile_default_advance(
                 format!("external import on {default_branch}"),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = store_guard.phase("git ref import");
         // Origin is the authority for the branch just fetched, so its import
         // observes it wherever it went, backwards included. Every other
@@ -1876,6 +2140,7 @@ pub(crate) async fn reconcile_base_branch_advance(
                 format!("origin fast-forward of {branch}"),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase("fast-forward from origin");
         crate::jj::ensure_store_initialized(&jj, &store, repo).and_then(|()| {
             crate::jj::fast_forward_branch_from_origin(&jj, &store, branch, &observed)
@@ -1910,17 +2175,7 @@ pub(crate) async fn reconcile_base_branch_advance(
             Err(reason)
         }
         crate::jj::OriginFastForward::Advanced { from, to } => {
-            {
-                let guard = orch
-                    .acquire_jj_store_lock(
-                        &store,
-                        crate::orchestrator::StoreLockClass::Background,
-                        format!("on-branch advance from origin on {branch}"),
-                    )
-                    .await;
-                let _phase = guard.phase("on-branch coordinate advance");
-                refresh_advanced_branch_cells(orch, &db, project_id, branch, &repo_path).await;
-            }
+            refresh_advanced_branch_cells(orch, &db, project_id, branch, &repo_path).await;
             notify_on_branch_jobs(
                 orch,
                 &db,
@@ -2062,6 +2317,7 @@ async fn reconcile_startup_remote_default_advance(
                 ),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
             log::warn!("{ctx}: ensure store failed: {error}");
             return Ok(());
@@ -2112,6 +2368,7 @@ async fn reconcile_startup_remote_default_advance(
                 ),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         crate::jj::revset_commit(&jj, &store, &remote_default)
     };
     if before == after {
@@ -2306,7 +2563,7 @@ async fn execute_durable_reconcile_work(
         "durable destination refresh"
     };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let (pinned_dest, claim, existing_bookmarks) = {
+    let (pinned_dest, existing_bookmarks) = {
         let _guard = orch
             .acquire_jj_store_lock(
                 &work.store,
@@ -2317,26 +2574,29 @@ async fn execute_durable_reconcile_work(
                 ),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let current_dest =
             crate::jj::revset_commit(&jj, &work.store, &rebase_dest).ok_or_else(|| {
                 format!("durable reconcile destination `{rebase_dest}` did not resolve")
             })?;
-        let Some(claim) = refresh_stale_durable_intent(
-            db,
-            &repo_path,
-            &work.store,
-            &work.target_branch,
-            &work.destination_commit,
-            &current_dest,
-            refresh_source,
-            work.claim,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
         let existing_bookmarks = crate::jj::query_local_bookmarks(&jj, &work.store, &specs).ok();
-        (current_dest, claim, existing_bookmarks)
+        (current_dest, existing_bookmarks)
+    };
+    // This is database bookkeeping, not a local-view mutation. The worker
+    // revalidates the destination under its mutation guard before acting.
+    let Some(claim) = refresh_stale_durable_intent(
+        db,
+        &repo_path,
+        &work.store,
+        &work.target_branch,
+        &work.destination_commit,
+        &pinned_dest,
+        refresh_source,
+        work.claim,
+    )
+    .await?
+    else {
+        return Ok(());
     };
     let notes = BaseAdvanceNotes {
         conflict: build_jj_conflict_note(&work.target_branch, None, None),
@@ -2820,6 +3080,7 @@ async fn reconcile_base_advance(
                 format!("sibling reconcile preparation ({label})"),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase(format!(
             "bookmark listing and destination resolution candidate_count={} queried_count={}",
             specs.len(),
@@ -3089,6 +3350,7 @@ pub(crate) async fn request_branch_replay(
                 format!("replay request for {branch}"),
             )
             .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
         let _phase = guard.phase(format!("resolve replay destination branch={branch}"));
         crate::orchestrator::replay_base::resolve_base(&jj, &store, branch, &candidates)
             .map_err(|error| error.to_string())?
@@ -3428,6 +3690,15 @@ fn siblings_for_branch(siblings: &[SiblingJob], branch: &str) -> Vec<SiblingJob>
         .collect()
 }
 
+fn failed_reconcile_report(branch: &str, error: String) -> crate::jj::ReconcileReport {
+    let mut report = crate::jj::ReconcileReport::default();
+    report.failed.push(crate::jj::ReconcileFailure {
+        branch: branch.to_string(),
+        error,
+    });
+    report
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_reconcile_claim(
     orch: &Orchestrator,
@@ -3491,13 +3762,35 @@ async fn execute_reconcile_claim(
                     format!("sibling reconcile inspect ({label}): {branch}"),
                 )
                 .await;
+            let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
             let _phase = guard.phase(format!("bookmark suppression probe branch={branch}"));
-            crate::jj::bookmark_commit(&jj, &store, branch)
+            crate::jj::bookmark_commit_checked(&jj, &store, branch)
+        };
+        let current_tip = match current_tip {
+            Ok(tip) => tip,
+            Err(error) => {
+                log::warn!("jj reconcile ({label}): deferring {branch}; tip unreadable, keeping any timeout cooldown: {error}");
+                any_branch_deferred = true;
+                continue;
+            }
         };
         let mut quarantine =
             load_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
         if let Some(existing) = quarantine.as_ref() {
             if quarantine_blocks_automatic_replay(existing, current_tip.as_deref(), label) {
+                if existing.failure_kind == RECONCILE_TIMEOUT {
+                    defer_timeout_reconcile(
+                        db,
+                        intent_id,
+                        branch,
+                        current_tip.as_deref(),
+                        existing,
+                        label,
+                    )
+                    .await?;
+                    any_branch_deferred = true;
+                    continue;
+                }
                 let diagnostic = format!(
                     "quarantined: {}",
                     existing
@@ -3525,7 +3818,7 @@ async fn execute_reconcile_claim(
                 continue;
             }
             if existing.failure_kind != "ambiguous_divergence"
-                && existing.fingerprint != current_tip.as_deref().unwrap_or("missing")
+                && existing.observed_tip() != current_tip.as_deref().unwrap_or("missing")
             {
                 release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
                 quarantine = None;
@@ -3638,12 +3931,20 @@ async fn execute_reconcile_claim(
                     format!("sibling reconcile ({label}): {branch}"),
                 )
                 .await;
+            let lock_deadline =
+                tokio::time::Instant::now() + crate::jj::BACKGROUND_RECONCILE_BUDGET;
+            let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
             // RunBatch suspension admission takes this same store lock while
             // inserting its durable row. Revalidating under the guard makes the
             // row check and bookmark mutation one exclusive bracket.
             let branch_siblings = siblings_for_branch(&siblings, branch);
             let admission_check = guard.phase("in-flight run batch check");
-            let inflight = inflight_run_batch(db, &branch_siblings).await?;
+            let inflight =
+                tokio::time::timeout_at(lock_deadline, inflight_run_batch(db, &branch_siblings))
+                    .await
+                    .map_err(|_| {
+                        "background reconcile timed out checking in-flight run batches".to_string()
+                    })??;
             drop(admission_check);
             if let Some(batch) = inflight {
                 drop(guard);
@@ -3689,17 +3990,56 @@ async fn execute_reconcile_claim(
             // failed read falls back to all of them.
             let precheck = {
                 let _phase = guard.phase("bookmark precheck");
-                match cairn_vcs::bookmark_precheck(&store, rebase_dest, branch).await {
-                    Ok(precheck) => Some(precheck),
-                    Err(error) => {
+                // This read-only optimization can be cancelled; unlike a writer,
+                // it cannot outlive the guard with an uncommitted mutation.
+                match tokio::time::timeout_at(
+                    lock_deadline,
+                    cairn_vcs::bookmark_precheck(&store, rebase_dest, branch),
+                )
+                .await
+                {
+                    Ok(Ok(precheck)) => Some(precheck),
+                    result => {
                         log::debug!(
-                            "jj base advance ({label}): in-process precheck of {branch} failed, \
-                             probing with jj instead: {error}"
+                            "jj base advance ({label}): in-process precheck of {branch} did not answer, \
+                             probing with budgeted jj instead: {result:?}"
                         );
                         None
                     }
                 }
             };
+            // Another destination's worker may have timed out while this
+            // worker waited for admission. Recheck the durable breaker and the
+            // actual tip at the mutation boundary, not just before queueing.
+            let locked_tip = match precheck.as_ref().and_then(|precheck| precheck.tip.clone()) {
+                Some(tip) => Some(tip),
+                None => crate::jj::bookmark_commit_checked(&jj, &store, branch)?,
+            };
+            let locked_quarantine = tokio::time::timeout_at(
+                lock_deadline,
+                load_reconcile_quarantine(db, &claim.project_id, &store, branch),
+            )
+            .await
+            .map_err(|_| {
+                "background reconcile timed out rechecking timeout cooldown".to_string()
+            })??;
+            if let Some(existing) = locked_quarantine.as_ref().filter(|existing| {
+                existing.failure_kind == RECONCILE_TIMEOUT
+                    && quarantine_blocks_automatic_replay(existing, locked_tip.as_deref(), label)
+            }) {
+                drop(guard);
+                defer_timeout_reconcile(
+                    db,
+                    intent_id,
+                    branch,
+                    locked_tip.as_deref(),
+                    existing,
+                    label,
+                )
+                .await?;
+                any_branch_deferred = true;
+                continue;
+            }
             let settled = precheck.as_ref().filter(|precheck| precheck.is_settled());
 
             // Revalidate that the named destination still identifies the pinned
@@ -3817,7 +4157,7 @@ async fn execute_reconcile_claim(
                 }
                 _ => None,
             };
-            let item_report = if ambiguous_item.is_some() {
+            let mut item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
             } else if let Some(error) = name_refusal {
                 let mut refused = crate::jj::ReconcileReport::default();
@@ -3844,9 +4184,7 @@ async fn execute_reconcile_claim(
                                     &plan.carry,
                                 )
                             })
-                            .map_err(|error| {
-                                format!("jj resolved sibling replay ({label}) failed: {error}")
-                            })?
+                            .unwrap_or_else(|error| failed_reconcile_report(branch, error))
                     }
                     Err(error) => {
                         let mut refused = crate::jj::ReconcileReport::default();
@@ -3871,7 +4209,7 @@ async fn execute_reconcile_claim(
                             &item,
                         )
                     })
-                    .map_err(|error| format!("jj sibling reconcile ({label}) failed: {error}"))?
+                    .unwrap_or_else(|error| failed_reconcile_report(branch, error))
             };
             if ambiguous_item.is_none() {
                 if let Some(commit) = guard.blocking_phase("read tip after", || {
@@ -3880,7 +4218,31 @@ async fn execute_reconcile_claim(
                     after.insert(branch.clone(), commit);
                 }
             }
-            if before.get(branch) != after.get(branch) {
+            // Persist before releasing this guard: otherwise a second intent
+            // already queued on the store could retry before seeing the breaker.
+            let timeout_persistence = guard.phase("timeout cooldown persistence");
+            let tip = before
+                .get(branch)
+                .or(locked_tip.as_ref())
+                .map_or("missing", String::as_str);
+            if persist_report_timeouts(
+                db,
+                &claim.project_id,
+                &store,
+                branch,
+                tip,
+                &pinned_dest,
+                &mut item_report,
+            )
+            .await?
+            {
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table":"comments", "action":"insert"}),
+                );
+            }
+            drop(timeout_persistence);
+            if after.contains_key(branch) && before.get(branch) != after.get(branch) {
                 if let Some(sibling) = siblings
                     .iter()
                     .find(|sibling| sibling.branch.as_deref() == Some(branch.as_str()))
@@ -3907,6 +4269,7 @@ async fn execute_reconcile_claim(
                                     &pinned_dest,
                                 )
                             });
+                        drop(guard);
                         crate::execution::checks::cancel_stale_review_on_branch_advance(
                             orch,
                             &sibling.id,
@@ -3921,38 +4284,135 @@ async fn execute_reconcile_claim(
 
         if item_report.conflicted.contains(branch) {
             if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch).cloned() {
-                let guard = orch
-                    .acquire_jj_store_lock(
-                        &store,
-                        crate::orchestrator::StoreLockClass::Background,
-                        format!("structural merge ({label}): {branch}"),
-                    )
-                    .await;
-                let _phase =
-                    guard.phase(format!("prove and replay structural merge branch={branch}"));
-                let rules = crate::orchestrator::landing::merge_rules_at(&jj, &store, &pinned_dest);
+                // These immutable-side reads and CPU-heavy proofs must not hold
+                // the writer lock. The application revalidates both coordinates.
+                let prepare_jj = jj.clone();
+                let prepare_store = store.clone();
+                let prepare_dest = pinned_dest.clone();
                 let baseline = replay_baseline.clone().unwrap_or_else(|| {
                     ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
                 });
-                match try_structural_merge(
-                    &jj,
-                    &store,
-                    branch,
-                    &pinned_dest,
-                    &diagnostic,
-                    &baseline,
-                    &rules,
-                ) {
-                    Ok(Some(resolved)) => {
-                        item_report = resolved;
-                        if let Some(commit) = crate::jj::bookmark_commit(&jj, &store, branch) {
-                            after.insert(branch.clone(), commit);
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let jj =
+                        prepare_jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+                    let rules = crate::orchestrator::landing::merge_rules_at(
+                        &jj,
+                        &prepare_store,
+                        &prepare_dest,
+                    );
+                    prepare_structural_merge(&jj, &prepare_store, &diagnostic, &baseline, &rules)
+                })
+                .await
+                .map_err(|error| format!("structural candidate worker failed: {error}"))?;
+                #[cfg(test)]
+                structural_prepared_test_hook(&store);
+                if !matches!(&prepared, Ok(None)) {
+                    let guard = orch
+                        .acquire_jj_store_lock(
+                            &store,
+                            crate::orchestrator::StoreLockClass::Background,
+                            format!("structural merge ({label}): {branch}"),
+                        )
+                        .await;
+                    let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+                    let deadline =
+                        tokio::time::Instant::now() + crate::jj::BACKGROUND_RECONCILE_BUDGET;
+                    let tip = crate::jj::bookmark_commit_checked(&jj, &store, branch)?;
+                    // A run may have been admitted while the pure candidate was
+                    // prepared. Revalidate at this second mutation boundary.
+                    let branch_siblings = siblings_for_branch(&siblings, branch);
+                    let inflight =
+                        tokio::time::timeout_at(deadline, inflight_run_batch(db, &branch_siblings))
+                            .await
+                            .map_err(|_| {
+                                "structural replay timed out checking in-flight batches".to_string()
+                            })??;
+                    if let Some(batch) = inflight {
+                        drop(guard);
+                        let diagnostic = format!(
+                            "structural replay deferred at the mutation boundary: {}",
+                            batch.resolve_holder(db).await.describe(),
+                        );
+                        persist_reconcile_item(
+                            db,
+                            ReconcileItemUpdate {
+                                intent_id,
+                                bookmark: branch,
+                                observed_tip: tip.as_deref(),
+                                status: "pending",
+                                failure_kind: None,
+                                outcome_kind: Some("deferred"),
+                                fingerprint: None,
+                                diagnostic: Some(&diagnostic),
+                            },
+                        )
+                        .await?;
+                        any_branch_deferred = true;
+                        continue;
+                    }
+                    let quarantine = tokio::time::timeout_at(
+                        deadline,
+                        load_reconcile_quarantine(db, &claim.project_id, &store, branch),
+                    )
+                    .await
+                    .map_err(|_| "structural replay timed out checking cooldown".to_string())??;
+                    if let Some(existing) = quarantine.as_ref().filter(|existing| {
+                        existing.failure_kind == RECONCILE_TIMEOUT
+                            && quarantine_blocks_automatic_replay(existing, tip.as_deref(), label)
+                    }) {
+                        drop(guard);
+                        defer_timeout_reconcile(
+                            db,
+                            intent_id,
+                            branch,
+                            tip.as_deref(),
+                            existing,
+                            label,
+                        )
+                        .await?;
+                        any_branch_deferred = true;
+                        continue;
+                    }
+                    let result = match prepared {
+                        Ok(Some(plan)) => {
+                            let _phase = guard.phase(format!(
+                                "apply pre-proven structural replay branch={branch}"
+                            ));
+                            apply_structural_merge(&jj, &store, branch, rebase_dest, &plan)
+                        }
+                        Ok(None) => unreachable!("an absent candidate never takes the store lock"),
+                        Err(error) => Err(error),
+                    };
+                    match result {
+                        Ok(Some(resolved)) => {
+                            item_report = resolved;
+                            if let Some(commit) = crate::jj::bookmark_commit(&jj, &store, branch) {
+                                after.insert(branch.clone(), commit);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            log::warn!("jj reconcile ({label}): structural replay of {branch} failed: {error}");
+                            item_report = failed_reconcile_report(branch, error);
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => log::warn!(
-                        "jj reconcile ({label}): automatic structural merge for `{branch}` declined after rollback: {error}"
-                    ),
+                    let _phase = guard.phase("structural timeout cooldown persistence");
+                    if persist_report_timeouts(
+                        db,
+                        &claim.project_id,
+                        &store,
+                        branch,
+                        tip.as_deref().unwrap_or("missing"),
+                        &pinned_dest,
+                        &mut item_report,
+                    )
+                    .await?
+                    {
+                        let _ = orch.services.emitter.emit(
+                            "db-change",
+                            serde_json::json!({"table":"comments", "action":"insert"}),
+                        );
+                    }
                 }
             }
         }
@@ -4182,10 +4642,12 @@ async fn execute_reconcile_claim(
             // commit resolves CONTENT, but a branch is not reconciled until its
             // ancestry actually moves, which is exactly what just happened.
             close_open_sessions_for_branch(db, branch).await?;
-            if quarantine
-                .as_ref()
-                .is_some_and(|existing| existing.failure_kind == ROLLED_BACK_CONFLICT)
-            {
+            if quarantine.as_ref().is_some_and(|existing| {
+                matches!(
+                    existing.failure_kind.as_str(),
+                    ROLLED_BACK_CONFLICT | RECONCILE_TIMEOUT
+                )
+            }) {
                 release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
             }
         }
@@ -4525,12 +4987,23 @@ async fn refresh_advanced_branch_cells(
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
 
-    // Collapse a pre-existing divergent twin on the integration bookmark ITSELF
-    // before refreshing cells on that coordinate. A deterministic tangle
-    // self-heals; an ambiguous one interrupts every on-branch job and skips the
-    // refresh. Runs under the per-store lock the
-    // caller (`reconcile_jj_downstream`) holds across this call.
-    match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
+    // Keep the writer exclusion through collapse and coordinate capture, not
+    // through notification delivery or remote executor refresh.
+    let (collapse, dest) = {
+        let guard = orch
+            .acquire_jj_store_lock(
+                &store,
+                crate::orchestrator::StoreLockClass::Background,
+                format!("on-branch coordinate advance: {branch}"),
+            )
+            .await;
+        let jj = jj.with_operation_budget(crate::jj::BACKGROUND_RECONCILE_BUDGET);
+        let _phase = guard.phase("collapse and capture advanced coordinate");
+        let collapse = crate::jj::collapse_divergent_bookmark(&jj, &store, branch);
+        let dest = crate::jj::bookmark_commit(&jj, &store, branch);
+        (collapse, dest)
+    };
+    match collapse {
         Ok(crate::jj::CollapseOutcome::NotDivergent) => {
             if let Err(error) = release_reconcile_quarantine(db, project_id, &store, branch).await {
                 log::warn!("on-branch advance: failed to release quarantine for {branch}: {error}");
@@ -4618,7 +5091,7 @@ async fn refresh_advanced_branch_cells(
         Err(error) => log::warn!("jj collapse (on-branch {branch}): failed: {error}"),
     }
 
-    let Some(dest) = crate::jj::bookmark_commit(&jj, &store, branch) else {
+    let Some(dest) = dest else {
         log::debug!("on-branch advance: bookmark {branch} did not resolve in store; skipping");
         return;
     };
@@ -7402,12 +7875,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timeout_cooldown_persists_coordinates_and_grows_across_main_advances() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let first_note = record_reconcile_timeout(
+            &db,
+            "proj-1",
+            store,
+            "agent/overlap",
+            "tip-a",
+            "main-a",
+            "jj rebase timed out after 10s and was killed",
+        )
+        .await
+        .unwrap();
+        let first = load_reconcile_quarantine(&db, "proj-1", store, "agent/overlap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.fingerprint, "tip-a:main-a");
+        assert_eq!(first.strike_count, 1);
+        assert_eq!(first.retry_at() - first.updated_at, 300);
+        assert!(first_note.contains("new main tip does not bypass"));
+        assert!(quarantine_blocks_automatic_replay(
+            &first,
+            Some("tip-a"),
+            "external advance main-b"
+        ));
+        assert!(!quarantine_blocks_automatic_replay(
+            &first,
+            Some("tip-b"),
+            "child merge"
+        ));
+        assert!(
+            load_reconcile_quarantine(&db, "proj-1", store, "agent/clean")
+                .await
+                .unwrap()
+                .is_none(),
+            "one expensive branch does not park its peers"
+        );
+        let comments = crate::issues::comments::list(&db, "issue-2").await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].content, first_note);
+        assert!(crate::issues::comments::list(&db, "issue-3")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The same tip against a different target grows, rather than resets,
+        // the persisted penalty. Expiry makes it eligible without an edit.
+        record_reconcile_timeout(
+            &db,
+            "proj-1",
+            store,
+            "agent/overlap",
+            "tip-a",
+            "main-b",
+            "jj rebase timed out after 10s and was killed",
+        )
+        .await
+        .unwrap();
+        let mut second = load_reconcile_quarantine(&db, "proj-1", store, "agent/overlap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.fingerprint, "tip-a:main-b");
+        assert_eq!(second.strike_count, 2);
+        assert_eq!(second.retry_at() - second.updated_at, 600);
+        second.updated_at = chrono::Utc::now().timestamp() - 601;
+        assert!(!quarantine_blocks_automatic_replay(
+            &second,
+            Some("tip-a"),
+            "sweep"
+        ));
+        for (strikes, seconds) in [
+            (1, 300),
+            (2, 600),
+            (3, 1200),
+            (4, 2400),
+            (5, 3600),
+            (i64::MAX, 3600),
+        ] {
+            assert_eq!(timeout_backoff_seconds(strikes), seconds);
+        }
+
+        record_reconcile_timeout(
+            &db,
+            "proj-1",
+            store,
+            "agent/overlap",
+            "tip-b",
+            "main-c",
+            "jj rebase timed out after 10s and was killed",
+        )
+        .await
+        .unwrap();
+        let moved = load_reconcile_quarantine(&db, "proj-1", store, "agent/overlap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved.strike_count, 1,
+            "a changed stack starts a new failure series"
+        );
+        assert_eq!(moved.observed_tip(), "tip-b");
+    }
+
     #[test]
     fn rolled_back_conflict_parks_only_automatic_replays_of_the_same_tip() {
         let quarantine = ReconcileQuarantine {
             failure_kind: ROLLED_BACK_CONFLICT.to_string(),
             fingerprint: "tip-a".to_string(),
             last_diagnostic: Some("rolled back".to_string()),
+            strike_count: 1,
+            updated_at: 0,
         };
 
         for advance in 0..5 {
@@ -7452,6 +8035,8 @@ mod tests {
             failure_kind: "immutable_commit".to_string(),
             fingerprint: "tip-a".to_string(),
             last_diagnostic: None,
+            strike_count: 1,
+            updated_at: 0,
         };
 
         assert!(quarantine_blocks_automatic_replay(
@@ -9771,6 +10356,20 @@ mod real_store_collision_tests {
     /// measured past two minutes.
     async fn wait_for_worker(r: &Replay) {
         wait_for_reconcile_workers(&r.db).await;
+        let diagnostic =
+            r.db.query_text(
+                "SELECT json_object(
+                    'items', (SELECT json_group_array(json_object(
+                        'intent', intent_id, 'status', status, 'failure', failure_kind,
+                        'outcome', outcome_kind, 'diagnostic', last_diagnostic))
+                        FROM jj_reconcile_items),
+                    'comments', (SELECT json_group_array(content) FROM comments),
+                    'messages', (SELECT json_group_array(content) FROM messages))",
+                (),
+            )
+            .await
+            .unwrap();
+        eprintln!("reconcile worker outcomes: {diagnostic:?}");
     }
 
     pub(super) async fn wait_for_reconcile_workers(db: &LocalDb) {
@@ -10794,5 +11393,520 @@ mod real_store_collision_tests {
             Some(pre_tip.as_str())
         );
         assert_eq!(text_at(&fx, branch, "outside.txt"), "branch\n");
+    }
+
+    #[cfg(unix)]
+    async fn timeout_worker_advance(r: &Replay, clean_branch: &str) {
+        let outcome = reconcile_base_advance(
+            &r.orch,
+            &r.db,
+            "proj-1",
+            "merged job (timeout regression)",
+            &r.fx.repo.to_string_lossy(),
+            "main",
+            "main",
+            vec![
+                SiblingJob {
+                    id: JOB.to_string(),
+                    branch: Some(BRANCH.to_string()),
+                    base_commit: None,
+                },
+                SiblingJob {
+                    id: "job-timeout-clean".to_string(),
+                    branch: Some(clean_branch.to_string()),
+                    base_commit: None,
+                },
+            ],
+            BaseAdvanceNotes {
+                conflict: build_jj_conflict_note("main", None, None),
+                clean: build_jj_clean_note("main", None, None),
+                incoming: IncomingIdentity {
+                    base_branch: "main".to_string(),
+                    ..IncomingIdentity::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.eligible, 2);
+        wait_for_worker(r).await;
+    }
+
+    /// A main advance cannot bypass a timed-out stack's cooldown. A branch
+    /// commit can, but the new attempt still gets the background budget rather
+    /// than the foreground command timeout.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn real_worker_timeout_cooldown_and_changed_tip_retry_stay_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for worker regression");
+        let wrapper_home = tempfile::tempdir().unwrap();
+        let wrapper = wrapper_home.path().join("jj-delayed");
+        let attempts = wrapper_home.path().join("attempts");
+        let fail_tip = wrapper_home.path().join("fail-tip");
+        let failed_probes = wrapper_home.path().join("failed-probes");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif test -f {}; then\n  for arg do\n    if test \"$arg\" = 'bookmarks(exact:\"{BRANCH}\")'; then\n      echo probe >> {}\n      echo forced-branch-tip-probe-failure >&2\n      exit 1\n    fi\n  done\nfi\ncase \" $* \" in\n  *' rebase -b {BRANCH} '*)\n    echo $$ >> {}\n    exec sleep 30\n    ;;\nesac\nexec {} \"$@\"\n",
+                quote(&fail_tip.to_string_lossy()),
+                quote(&failed_probes.to_string_lossy()),
+                quote(&attempts.to_string_lossy()),
+                quote(&bin),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let r = replay_harness(
+            wrapper.to_str().unwrap(),
+            "reconcile-worker-timeout.db",
+            &[("base.txt", "base\n")],
+        )
+        .await;
+        let original = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("branch.txt", "own work\n")],
+            "branch work",
+        );
+        let clean_branch = "agent/timeout-clean";
+        let clean_ws = r.fx.workspaces.path().join("timeout-clean");
+        crate::jj::add_workspace(&r.fx.jj, &r.fx.store, &clean_ws, clean_branch, "main", None)
+            .unwrap();
+        commit(
+            &r.fx,
+            &clean_ws,
+            clean_branch,
+            &[("clean.txt", "sibling work\n")],
+            "clean sibling work",
+        );
+        r.db.execute_script(
+            "INSERT INTO jobs
+             (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+             VALUES ('job-timeout-clean', 'exec-1', 'node-clean', 'issue-1', 'proj-1',
+                     'running', 'agent/timeout-clean', 'main', 1, 1);",
+        ).await.unwrap();
+        let first_main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("incoming.txt", "first\n")],
+            "first main advance",
+        );
+        set_main(&r.fx, &first_main);
+
+        let attempt_pids = || {
+            std::fs::read_to_string(&attempts)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let admission = async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while attempt_pids().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("worker must reach delayed rebase");
+            let waiting = Instant::now();
+            let guard = tokio::time::timeout(
+                crate::jj::BACKGROUND_RECONCILE_BUDGET + Duration::from_secs(7),
+                r.orch.acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "foreground timeout regression",
+                ),
+            )
+            .await
+            .expect("foreground admitted within budget + cleanup + scheduler slack");
+            let pid = attempt_pids().pop().unwrap();
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(
+                !alive,
+                "timed-out writer {pid} must be reaped before lock admission"
+            );
+            r.fx.jj
+                .run(
+                    &r.fx.store,
+                    &[
+                        "bookmark",
+                        "set",
+                        "foreground-admitted",
+                        "-r",
+                        BRANCH,
+                        "--ignore-working-copy",
+                    ],
+                    "foreground write after timeout",
+                )
+                .unwrap();
+            eprintln!(
+                "foreground admission after delayed rebase: {:?}",
+                waiting.elapsed()
+            );
+            drop(guard);
+        };
+        let first_started = Instant::now();
+        tokio::join!(timeout_worker_advance(&r, clean_branch), admission);
+        assert!(first_started.elapsed() < Duration::from_secs(25));
+        assert_eq!(attempt_pids().len(), 1);
+        assert_eq!(branch_tip(&r), original, "timeout leaves bookmark intact");
+        assert_eq!(text_at(&r.fx, BRANCH, "branch.txt"), "own work\n");
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &first_main
+        ));
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            clean_branch,
+            &first_main
+        ));
+        let first = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .expect("worker persists timeout cooldown");
+        assert_eq!(first.failure_kind, RECONCILE_TIMEOUT);
+        assert_eq!(first.fingerprint, format!("{original}:{first_main}"));
+        assert_eq!(first.strike_count, 1);
+        assert_eq!(first.retry_at() - first.updated_at, 300);
+        let comment = r.db.query_text(
+            "SELECT content FROM comments WHERE issue_id = 'issue-1' AND content LIKE '%timeout strike 1%' ORDER BY created_at DESC LIMIT 1",
+            (),
+        ).await.unwrap().expect("owning issue receives timeout diagnostic");
+        assert!(
+            comment.contains(&original) && comment.contains(&first_main),
+            "{comment}"
+        );
+
+        let probe_main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("incoming.txt", "probe failure\n")],
+            "main advances while branch tip cannot be read",
+        );
+        set_main(&r.fx, &probe_main);
+        std::fs::write(&fail_tip, "fail exact branch probes\n").unwrap();
+        timeout_worker_advance(&r, clean_branch).await;
+        assert!(!std::fs::read_to_string(&failed_probes).unwrap().is_empty());
+        assert_eq!(
+            attempt_pids().len(),
+            1,
+            "unknown tip must not reopen timed-out work"
+        );
+        let unknown = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .expect("failed tip probe preserves circuit breaker");
+        assert_eq!(unknown.fingerprint, first.fingerprint);
+        assert_eq!(unknown.strike_count, first.strike_count);
+        assert_eq!(unknown.updated_at, first.updated_at);
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            clean_branch,
+            &probe_main
+        ));
+        std::fs::remove_file(&fail_tip).unwrap();
+
+        let second_main = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("incoming.txt", "second\n")],
+            "second main advance",
+        );
+        set_main(&r.fx, &second_main);
+        timeout_worker_advance(&r, clean_branch).await;
+        assert_eq!(
+            attempt_pids().len(),
+            1,
+            "a main advance must not retry unchanged branch"
+        );
+        assert_eq!(branch_tip(&r), original);
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            clean_branch,
+            &second_main
+        ));
+        let unchanged = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.fingerprint, first.fingerprint);
+        assert_eq!(unchanged.updated_at, first.updated_at);
+        assert_eq!(unchanged.strike_count, 1);
+
+        let changed = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("child.txt", "new branch commit\n")],
+            "branch changes during cooldown",
+        );
+        assert_ne!(changed, original);
+        let retry_started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(25),
+            timeout_worker_advance(&r, clean_branch),
+        )
+        .await
+        .expect("changed-tip retry must retain 10s budget, not default 300s");
+        let elapsed = retry_started.elapsed();
+        eprintln!("changed-tip worker retry: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_secs(8),
+            "wrapper must actually exercise timeout"
+        );
+        assert_eq!(
+            attempt_pids().len(),
+            2,
+            "exactly one retry after branch change"
+        );
+        assert_eq!(
+            branch_tip(&r),
+            changed,
+            "retry timeout leaves new bookmark intact"
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, "child.txt"), "new branch commit\n");
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &second_main
+        ));
+        let retried = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+            .await
+            .unwrap()
+            .expect("retry records fresh cooldown");
+        assert_eq!(retried.failure_kind, RECONCILE_TIMEOUT);
+        assert_eq!(retried.fingerprint, format!("{changed}:{second_main}"));
+        assert_eq!(
+            retried.strike_count, 1,
+            "new branch coordinates reset strikes"
+        );
+        assert_eq!(retried.retry_at() - retried.updated_at, 300);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn structural_timeout_restores_the_entire_attempt_and_persists_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let bin =
+            crate::jj::tests::jj_bin().expect("real jj required for structural timeout regression");
+        let r = replay_harness(&bin, "structural-timeout.db", &[]).await;
+        add_migration(&r.branch_ws, "0230_branch");
+        crate::jj::seal(&r.fx.jj, &r.branch_ws, "branch registry", None).unwrap();
+        let original = branch_tip(&r);
+        add_migration(&r.main_ws, "0228_main");
+        crate::jj::seal(&r.fx.jj, &r.main_ws, "main registry", None).unwrap();
+        let destination = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, MAIN_LINE).unwrap();
+        set_main(&r.fx, &destination);
+        let crate::jj::RebaseOutcome::Conflicted { diagnostic } =
+            crate::jj::rebase_branch_onto(&r.fx.jj, &r.fx.store, BRANCH, "main").unwrap()
+        else {
+            panic!("registry insertions must exercise structural repair")
+        };
+        let rules =
+            crate::orchestrator::landing::merge_rules_at(&r.fx.jj, &r.fx.store, &destination);
+        let plan = prepare_structural_merge(
+            &r.fx.jj,
+            &r.fx.store,
+            &diagnostic,
+            &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+            &rules,
+        )
+        .unwrap()
+        .expect("declared registry produces a lossless candidate");
+        let visible = || {
+            r.fx.jj
+                .run(
+                    &r.fx.store,
+                    &[
+                        "log",
+                        "-r",
+                        "all()",
+                        "--no-graph",
+                        "-T",
+                        "commit_id ++ \"\\n\"",
+                        "--ignore-working-copy",
+                    ],
+                    "visible graph around structural timeout",
+                )
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        };
+        let before = visible();
+        let home = tempfile::tempdir().unwrap();
+        let wrapper = home.path().join("structural-delay");
+        let mode = home.path().join("mode");
+        let reached = home.path().join("reached");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        std::fs::write(&wrapper, format!(
+            "#!/bin/sh\nmode=$(cat {})\nif [ \"$1\" = commit ]; then\n  {} \"$@\" || exit $?\n  if [ \"$mode\" = seal ]; then\n    echo seal > {}\n    exec sleep 30\n  fi\n  exit 0\nfi\nif [ \"$1\" = rebase ] && [ \"$mode\" = replay ]; then\n  echo replay > {}\n  exec sleep 30\nfi\nexec {} \"$@\"\n",
+            quote(&mode.to_string_lossy()), quote(&bin), quote(&reached.to_string_lossy()),
+            quote(&reached.to_string_lossy()), quote(&bin),
+        )).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let delayed = crate::jj::JjEnv::with_binary(wrapper.to_string_lossy(), &r.fx.home);
+        for (index, stage) in ["seal", "replay"].into_iter().enumerate() {
+            std::fs::write(&mode, stage).unwrap();
+            std::fs::write(&reached, "").unwrap();
+            let guard = r
+                .orch
+                .acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Background,
+                    format!("structural timeout at {stage}"),
+                )
+                .await;
+            let budgeted = delayed.with_operation_budget(Duration::from_secs(5));
+            let error = match apply_structural_merge(&budgeted, &r.fx.store, BRANCH, "main", &plan)
+            {
+                Err(error) => error,
+                _ => panic!("delayed structural {stage} must time out"),
+            };
+            assert_eq!(std::fs::read_to_string(&reached).unwrap().trim(), stage);
+            assert_eq!(
+                crate::jj::reconcile_failure_kind(&error),
+                RECONCILE_TIMEOUT,
+                "{error}"
+            );
+            assert!(!error.contains(crate::jj::ROLLBACK_INCOMPLETE), "{error}");
+            let mut report = failed_reconcile_report(BRANCH, error);
+            assert!(persist_report_timeouts(
+                &r.db,
+                "proj-1",
+                &r.fx.store,
+                BRANCH,
+                &original,
+                &destination,
+                &mut report,
+            )
+            .await
+            .unwrap());
+            drop(guard);
+            assert_eq!(
+                branch_tip(&r),
+                original,
+                "entire structural attempt was undone"
+            );
+            assert_eq!(
+                visible(),
+                before,
+                "no synthetic or divergent commit remains visible"
+            );
+            let cooldown = load_reconcile_quarantine(&r.db, "proj-1", &r.fx.store, BRANCH)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cooldown.fingerprint, format!("{original}:{destination}"));
+            assert_eq!(cooldown.strike_count, index as i64 + 1);
+            assert!(quarantine_blocks_automatic_replay(
+                &cooldown,
+                Some(&original),
+                "next main advance"
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial(jj)]
+    async fn structural_replay_rechecks_batches_admitted_during_preparation() {
+        use std::time::Duration;
+        let bin = crate::jj::tests::jj_bin().expect("real jj required for structural admission");
+        let r = replay_harness(&bin, "structural-admission.db", &[]).await;
+        add_migration(&r.branch_ws, "0230_branch");
+        crate::jj::seal(&r.fx.jj, &r.branch_ws, "branch registry", None).unwrap();
+        let original = branch_tip(&r);
+        add_migration(&r.main_ws, "0228_main");
+        crate::jj::seal(&r.fx.jj, &r.main_ws, "main registry", None).unwrap();
+        let destination = crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, MAIN_LINE).unwrap();
+        set_main(&r.fx, &destination);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        STRUCTURAL_PREPARED_HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(
+                r.fx.store.clone(),
+                Box::new(move || {
+                    let _ = entered_tx.send(());
+                    resume_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+                }),
+            );
+        let admit = async {
+            tokio::time::timeout(Duration::from_secs(20), entered_rx)
+                .await
+                .expect("worker prepares structural candidate")
+                .unwrap();
+            let guard = r
+                .orch
+                .acquire_jj_store_lock(
+                    &r.fx.store,
+                    crate::orchestrator::StoreLockClass::Foreground,
+                    "admit run batch while structural proof is prepared",
+                )
+                .await;
+            for sql in [
+                "INSERT INTO sessions (id,job_id,status,backend_id,created_at,updated_at) VALUES ('session-structural','job-replay','open','backend',1,1)",
+                "UPDATE runs SET session_id='session-structural' WHERE id='run-replay'",
+                "INSERT INTO turns (id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES ('turn-structural','session-structural','run-replay','job-replay',1,'yielded','initial',1,1)",
+                "INSERT INTO agent_waits (id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,state,created_at) VALUES ('wait-structural','job-replay','run-replay','session-structural','turn-structural','tool-structural','{\"kind\":\"run_batch\",\"request_id\":\"structural-batch\",\"commits\":true}','pending',1)",
+            ] {
+                r.db.execute(sql, ()).await.unwrap();
+            }
+            drop(guard);
+            resume_tx.send(()).unwrap();
+        };
+        tokio::join!(automatic_advance(&r), admit);
+        assert_eq!(
+            branch_tip(&r),
+            original,
+            "structural phase must not seal under an admitted batch"
+        );
+        assert!(!crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &destination
+        ));
+        let item = r.db.query_text(
+            "SELECT outcome_kind FROM jj_reconcile_items WHERE bookmark = ?1 ORDER BY updated_at DESC LIMIT 1",
+            (BRANCH.to_string(),),
+        ).await.unwrap();
+        assert_eq!(item.as_deref(), Some("deferred"));
+
+        r.db.execute("DELETE FROM agent_waits WHERE id='wait-structural'", ())
+            .await
+            .unwrap();
+        sweep_reconcile_intents(&r.orch).await;
+        wait_for_worker(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &destination),
+            "durable retry must finish once the admitted batch ends"
+        );
     }
 }

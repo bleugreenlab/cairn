@@ -505,10 +505,13 @@ pub fn fast_forward_branch_from_origin(
         )
     })?;
     let answer = judge_and_take_origin_copy(jj, store, &checkout, branch, observed);
-    let _ = cairn_platform::env::git()
-        .args(["update-ref", "-d", &origin_observation_ref(branch)])
-        .current_dir(&checkout)
-        .output();
+    let _ = jj.command_output(
+        cairn_platform::env::git()
+            .args(["update-ref", "-d", &origin_observation_ref(branch)])
+            .current_dir(&checkout),
+        JJ_DEFAULT_TIMEOUT,
+        "git update-ref (delete origin observation)",
+    );
     answer
 }
 
@@ -528,10 +531,10 @@ fn judge_and_take_origin_copy(
     let Some(local) = bookmark_commit_checked(jj, store, branch)? else {
         return Ok(OriginFastForward::NoBookmark);
     };
-    if local == observed || git_is_ancestor(checkout, observed, &local) {
+    if local == observed || git_is_ancestor(jj, checkout, observed, &local) {
         return Ok(OriginFastForward::Current { local });
     }
-    if !git_is_ancestor(checkout, &local, observed) {
+    if !git_is_ancestor(jj, checkout, &local, observed) {
         let remote = observed.to_string();
         return Ok(
             match origin_copy_is_superseded(jj, store, branch, &local, observed) {
@@ -550,15 +553,18 @@ fn judge_and_take_origin_copy(
     }
 
     let tracking = format!("refs/remotes/origin/{branch}");
-    with_packed_refs_patience(
+    super::packed_refs::with_packed_refs_patience_for(
+        jj,
         PackedRefs::Checkout(checkout),
         "promote origin observation",
         || {
-            let output = cairn_platform::env::git()
-                .args(["update-ref", &tracking, observed])
-                .current_dir(checkout)
-                .output()
-                .map_err(|error| format!("git update-ref {tracking}: {error}"))?;
+            let output = jj.command_output(
+                cairn_platform::env::git()
+                    .args(["update-ref", &tracking, observed])
+                    .current_dir(checkout),
+                JJ_DEFAULT_TIMEOUT,
+                "git update-ref (promote origin observation)",
+            )?;
             if output.status.success() {
                 Ok(())
             } else {
@@ -710,13 +716,13 @@ pub fn converge_managed_branch_after_remote_rewrite(
         let checkout = super::export::resolve_backing_checkout(store).ok_or_else(|| {
             format!("stale publication recovery refused: bookmark `{branch}` is conflicted and its backing checkout cannot be resolved")
         })?;
-        let output = cairn_platform::env::git()
-            .args(["rev-parse", &format!("refs/heads/{branch}")])
-            .current_dir(checkout)
-            .output()
-            .map_err(|error| {
-                format!("stale publication recovery: resolve exported `{branch}` ref: {error}")
-            })?;
+        let output = jj.command_output(
+            cairn_platform::env::git()
+                .args(["rev-parse", &format!("refs/heads/{branch}")])
+                .current_dir(checkout),
+            JJ_DEFAULT_TIMEOUT,
+            "git rev-parse (exported bookmark)",
+        )?;
         if !output.status.success() {
             return Err(format!("stale publication recovery refused: bookmark `{branch}` is conflicted and its exported ref is unreadable: {}", String::from_utf8_lossy(&output.stderr).trim()));
         }
@@ -2093,7 +2099,7 @@ pub fn ensure_bookmark_on_origin(jj: &JjEnv, store: &Path, branch: &str) -> Resu
         ],
         "jj git push base bookmark",
     )?;
-    confirm_origin_tip(store, branch, &published)
+    confirm_origin_tip(jj, store, branch, &published)
 }
 
 #[cfg(test)]

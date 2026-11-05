@@ -175,20 +175,25 @@ pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
 pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
     // Patient, because every rollback depends on it. Restoring to the same
     // operation twice yields the same view, so a repeat is idempotent.
-    with_packed_refs_patience(PackedRefs::JjStore(store), "jj op restore", || {
-        jj.run(
-            store,
-            &[
-                "op",
-                "restore",
-                "--what",
-                "repo",
-                op_id,
-                "--ignore-working-copy",
-            ],
-            "jj op restore",
-        )
-    })?;
+    super::packed_refs::with_packed_refs_patience_for(
+        jj,
+        PackedRefs::JjStore(store),
+        "jj op restore",
+        || {
+            jj.run(
+                store,
+                &[
+                    "op",
+                    "restore",
+                    "--what",
+                    "repo",
+                    op_id,
+                    "--ignore-working-copy",
+                ],
+                "jj op restore",
+            )
+        },
+    )?;
     // The one export with no expectation to name: an op restore rewinds every
     // local bookmark at once, so the set it realigns is not known here and there
     // is no single (branch, commit) invariant to assert. Every other export site
@@ -670,6 +675,8 @@ pub(crate) fn roll_back_refused_heal(
                 .collect();
         capture_conflict_diagnostic(jj, store, branch, dest, rollback.pre_tip.as_deref(), paths)
     });
+    let cleanup = jj.cleanup_env();
+    let jj = &cleanup;
     if let Err(error) = restore_operation(jj, store, &rollback.pre_op) {
         log::error!(
             "jj reconcile: heal of {branch} was refused ({refusal}) and the rebase could not be \
@@ -906,6 +913,9 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     if error.contains(ROLLBACK_INCOMPLETE) {
         return ROLLBACK_FAILED;
     }
+    if is_jj_timeout_error(error) {
+        return RECONCILE_TIMEOUT;
+    }
     if error.contains(STALE_DIAGNOSIS) {
         return REF_LOCK_STALE;
     }
@@ -936,6 +946,8 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     }
 }
 
+/// Forward work exhausted its shared deadline or a subprocess timeout.
+pub const RECONCILE_TIMEOUT: &str = "reconcile_timeout";
 pub const REF_LOCK_CONTENTION: &str = "ref_lock_contention";
 pub const REF_LOCK_STALE: &str = "ref_lock_stale";
 /// A failure whose undo did not complete, so the store may not be where the
@@ -1222,6 +1234,7 @@ fn reconcile_one_sibling(
         return;
     }
 
+    reached_step("reconcile: before classification");
     classify_reconciled_sibling(
         jj,
         store,
@@ -1234,4 +1247,23 @@ fn reconcile_one_sibling(
         rollback.as_ref(),
         report,
     );
+    // Automatic reconcile does not publish. Its later classification is still
+    // part of the same locked transaction: expiry there must undo the rebase,
+    // not leave a moved branch reported as a failed retry.
+    if !publish {
+        if let (Some(rollback), Err(error)) = (
+            rollback.as_ref(),
+            jj.check_operation_budget("jj reconcile classification"),
+        ) {
+            report.rebased_clean.retain(|name| name != branch);
+            report.conflicted.retain(|name| name != branch);
+            report.failed.retain(|failure| failure.branch != branch);
+            report.conflict_diagnostics.remove(branch);
+            record_failure(
+                report,
+                branch,
+                super::merge::roll_back_rebase(jj, store, branch, &rollback.pre_op, error),
+            );
+        }
+    }
 }

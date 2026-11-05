@@ -1,6 +1,23 @@
 //! Repair mechanics for a checkout detached by an export.
-use cairn_platform::services::GitClient;
+use cairn_platform::services::{GitClient, GitOutput};
 use std::path::Path;
+
+/// The two Git operations checkout repair needs. Keeping this boundary narrow
+/// lets callers supply a deadline-bound driver without reimplementing repair.
+pub trait CheckoutGit {
+    fn checkout_status(&self, repo: &Path) -> Result<String, String>;
+    fn checkout_run(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String>;
+}
+
+impl<T: GitClient + ?Sized> CheckoutGit for T {
+    fn checkout_status(&self, repo: &Path) -> Result<String, String> {
+        self.status(repo)
+    }
+
+    fn checkout_run(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String> {
+        self.run(repo, args)
+    }
+}
 
 /// Tracked generated paths the host permits checkout repair to discard.
 /// The default preserves every tracked edit.
@@ -54,13 +71,13 @@ pub enum ReattachOutcome {
 /// `symbolic-ref`/`reset` on the clean path surfaces as an error
 /// (the export wrapper downgrades it to a warning; the merge reconcile
 /// propagates it).
-pub fn reattach_checkout_head(
-    git: &dyn GitClient,
+pub fn reattach_checkout_head<G: CheckoutGit + ?Sized>(
+    git: &G,
     repo: &Path,
     branch: &str,
     policy: CheckoutRepairPolicy,
 ) -> Result<ReattachOutcome, String> {
-    let blocking: Vec<String> = dirty_tracked_paths_from_porcelain(&git.status(repo)?)
+    let blocking: Vec<String> = dirty_tracked_paths_from_porcelain(&git.checkout_status(repo)?)
         .into_iter()
         .filter(|path| !policy.regenerable_paths.contains(&path.as_str()))
         .collect();
@@ -93,13 +110,13 @@ pub fn reattach_checkout_head(
 }
 
 /// Run a git subcommand and fail (with stderr) on a non-zero exit.
-fn run_git_checked(
-    git: &dyn GitClient,
+fn run_git_checked<G: CheckoutGit + ?Sized>(
+    git: &G,
     repo: &Path,
     args: &[&str],
     ctx: &str,
 ) -> Result<(), String> {
-    let out = git.run(repo, args.iter().map(|arg| arg.to_string()).collect())?;
+    let out = git.checkout_run(repo, args.iter().map(|arg| arg.to_string()).collect())?;
     if out.success {
         Ok(())
     } else {

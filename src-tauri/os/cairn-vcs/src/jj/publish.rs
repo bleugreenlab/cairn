@@ -463,7 +463,7 @@ impl Drop for DeltaObjectPin {
 /// closed — an unreadable tree here is "could not check", which on a publication
 /// path is not "checked and fine".
 fn refuse_conflict_scaffolding(repository: &Path, commit: &str) -> Result<(), String> {
-    let entries = super::export::root_conflict_scaffolding(repository, commit)
+    let entries = super::export::root_conflict_scaffolding(None, repository, commit)
         .map_err(|error| format!("delta {error}"))?;
     if entries.is_empty() {
         return Ok(());

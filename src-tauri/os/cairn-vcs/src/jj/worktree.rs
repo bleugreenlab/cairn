@@ -64,7 +64,7 @@ fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     if is_jj_dir(ws) {
         return jj.run(ws, &["git", "root"], "jj git root");
     }
-    let out = bounded_command_output(
+    let out = jj.command_output(
         cairn_platform::env::git()
             .args(["rev-parse", "--absolute-git-dir"])
             .current_dir(ws),
@@ -119,7 +119,7 @@ pub fn logical_tree_hash(jj: &JjEnv, repository: &Path, commit: &str) -> Result<
 /// as they are created, independent of bookmark export.
 pub fn sealed_tree_hash_via_git(jj: &JjEnv, ws: &Path, commit: &str) -> Result<String, String> {
     let git_dir = git_backend_root(jj, ws)?;
-    let out = bounded_command_output(
+    let out = jj.command_output(
         cairn_platform::env::git().args([
             "--git-dir",
             &git_dir,
@@ -147,7 +147,7 @@ pub fn sealed_tree_hash_via_git(jj: &JjEnv, ws: &Path, commit: &str) -> Result<S
 /// tree even when that baseline was re-stamped by another branch or node.
 pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String, String)>, String> {
     let git_dir = git_backend_root(jj, ws)?;
-    let out = bounded_command_output(
+    let out = jj.command_output(
         cairn_platform::env::git().args(["--git-dir", &git_dir, "ls-tree", "-r", "-z", treeish]),
         JJ_DEFAULT_TIMEOUT,
         "git ls-tree",
@@ -190,7 +190,7 @@ pub fn own_patch_against(
     target: &str,
 ) -> Result<OwnPatch, String> {
     let git_dir = git_backend_root(jj, repository)?;
-    let out = bounded_command_output(
+    let out = jj.command_output(
         cairn_platform::env::git().args(["--git-dir", &git_dir, "merge-base", head, target]),
         JJ_DEFAULT_TIMEOUT,
         "git merge-base",
@@ -202,7 +202,7 @@ pub fn own_patch_against(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let out = bounded_command_output(
+    let out = jj.command_output(
         cairn_platform::env::git().args([
             "--git-dir",
             &git_dir,
@@ -295,7 +295,7 @@ pub fn grep_fixed_at(
         command.args(["-e", needle]);
     }
     command.arg(commit).arg("--").args(pathspecs);
-    let out = bounded_command_output(&mut command, JJ_DEFAULT_TIMEOUT, "git grep at revision")?;
+    let out = jj.command_output(&mut command, JJ_DEFAULT_TIMEOUT, "git grep at revision")?;
     match out.status.code() {
         Some(0) => Ok(parse_grep_z(&String::from_utf8_lossy(&out.stdout), commit)),
         // git grep's "nothing matched".
@@ -335,40 +335,37 @@ pub(crate) fn parse_grep_z(output: &str, commit: &str) -> Vec<GrepHit> {
 /// subprocess rather than twenty. Ids the object database does not know are
 /// simply absent from the result.
 ///
-/// The child terminates on its own: `cat-file --batch` exits when stdin closes,
-/// which happens as soon as the writer thread finishes the (small, fixed) id
-/// list. There is no unbounded input to stall on.
+/// The fixed request is supplied through a temporary file, so the bounded
+/// subprocess driver owns the whole child lifecycle without a blocked stdin
+/// writer surviving cancellation.
 pub fn read_blobs(
     jj: &JjEnv,
     ws: &Path,
     ids: &[&str],
 ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
-    use std::io::Write;
+    use std::io::{Seek, Write};
     use std::process::Stdio;
 
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
     }
     let git_dir = git_backend_root(jj, ws)?;
-    let mut command = cairn_platform::env::git();
-    command
-        .args(["--git-dir", &git_dir, "cat-file", "--batch"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("git cat-file --batch: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("git cat-file --batch: no stdin")?;
-    let request: Vec<u8> = ids
-        .iter()
-        .flat_map(|id| id.bytes().chain(std::iter::once(b'\n')))
-        .collect();
-    let writer = std::thread::spawn(move || stdin.write_all(&request));
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("git cat-file --batch: {e}"))?;
-    let _ = writer.join();
+    let mut request =
+        tempfile::tempfile().map_err(|error| format!("git cat-file --batch request: {error}"))?;
+    for id in ids {
+        writeln!(request, "{id}")
+            .map_err(|error| format!("git cat-file --batch request: {error}"))?;
+    }
+    request
+        .rewind()
+        .map_err(|error| format!("git cat-file --batch request: {error}"))?;
+    let out = jj.command_output(
+        cairn_platform::env::git()
+            .args(["--git-dir", &git_dir, "cat-file", "--batch"])
+            .stdin(Stdio::from(request)),
+        JJ_DEFAULT_TIMEOUT,
+        "git cat-file --batch",
+    )?;
     if !out.status.success() {
         return Err(format!(
             "git cat-file --batch failed: {}",

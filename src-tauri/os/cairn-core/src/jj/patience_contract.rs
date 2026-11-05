@@ -122,14 +122,21 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 
 #[test]
 fn every_ref_writing_site_routes_through_the_shared_wrapper() {
+    let patience = include_str!("../../../cairn-vcs/src/jj/packed_refs.rs");
     assert!(
-        body_of(
-            include_str!("../../../cairn-vcs/src/jj/packed_refs.rs"),
-            "pub(crate) fn run_store_rewrite("
-        )
-        .contains("with_packed_refs_patience("),
-        "run_store_rewrite is only a sanctioned route while it runs through the shared wrapper"
+        body_of(patience, "pub(crate) fn run_store_rewrite(")
+            .contains("with_packed_refs_patience_for("),
+        "run_store_rewrite must use the deadline-aware shared wrapper"
     );
+    for signature in [
+        "pub fn with_packed_refs_patience<T>(",
+        "pub(crate) fn with_packed_refs_patience_for<T>(",
+    ] {
+        assert!(
+            body_of(patience, signature).contains("run_with_patience("),
+            "{signature} must route through the shared patience engine"
+        );
+    }
     for (name, source, signature) in REF_WRITERS {
         let body = body_of(source, signature);
         assert!(

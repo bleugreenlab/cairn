@@ -9169,18 +9169,18 @@ fn origin_confirmation_catches_a_push_origin_did_not_record() {
     let branch = "agent/cairn-3189-builder-0";
 
     // Nothing has been pushed yet: origin has no such branch.
-    let error = confirm_origin_tip(&fx.store, branch, &fx.base)
+    let error = confirm_origin_tip(&fx.jj, &fx.store, branch, &fx.base)
         .expect_err("origin has no such branch, which must not read as a successful publish");
     assert!(error.contains("no `"), "{error}");
 
     // Publish it, then confirm both the agreeing and the disagreeing verdicts.
     create_bookmark_at(&fx.jj, &fx.store, branch, &fx.base).unwrap();
     push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
-    confirm_origin_tip(&fx.store, branch, &fx.base)
+    confirm_origin_tip(&fx.jj, &fx.store, branch, &fx.base)
         .expect("origin's tip matches what was published");
 
     let squashed = advance_origin_from(&fx, &fx.base, "gh.txt", "other\n");
-    let error = confirm_origin_tip(&fx.store, branch, &squashed)
+    let error = confirm_origin_tip(&fx.jj, &fx.store, branch, &squashed)
         .expect_err("origin's tip disagrees with the claimed publication");
     assert!(error.contains(&squashed), "{error}");
 }
@@ -9211,7 +9211,7 @@ fn origin_confirmation_fails_closed_when_origin_is_unreachable() {
     ensure_project_store(&jj, &store, proj.path()).unwrap();
     let head = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
 
-    let error = confirm_origin_tip(&store, "main", &head).expect_err(
+    let error = confirm_origin_tip(&jj, &store, "main", &head).expect_err(
         "an unreachable origin leaves the publication unverified, which is not success",
     );
 
@@ -12948,7 +12948,7 @@ async fn concurrent_publications_from_one_parent_all_stay_on_the_branch() {
     );
     for head in &landed {
         assert!(
-            git_is_ancestor(proj.path(), head, &tip),
+            git_is_ancestor(&jj, proj.path(), head, &tip),
             "published commit {head} is not on `{branch}` (tip {tip})"
         );
     }
@@ -13009,4 +13009,332 @@ fn commits_changing_path_lists_only_the_range_commits_that_touch_that_exact_file
     assert!(commits_changing_path(&jj, &store, &tip, &tip, "dir/f.txt")
         .unwrap()
         .is_empty());
+}
+
+#[cfg(unix)]
+fn delayed_rebase_env(fx: &ReplayLockFixture, phase: &str) -> (JjEnv, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = fx._home.path().join("delayed-jj");
+    let reached = fx._home.path().join("rebase-reached");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let binary = quote(fx.jj.binary_path());
+    let marker = quote(&reached.to_string_lossy());
+    let delay = match phase {
+        "committed-lock-error" => format!(
+            "{binary} \"$@\" || exit $?\nprintf landed > {marker}\nprintf x >> {marker}.attempts\nprintf 'The lock for the packed-ref file could not be obtained\\n' >&2\nexit 1"
+        ),
+        "committed" => {
+            format!("{binary} \"$@\" || exit $?\nprintf landed > {marker}\nsleep 30\nexit 0")
+        }
+        "postcheck" => format!("{binary} \"$@\" || exit $?\nprintf landed > {marker}\nexit 0"),
+        _ => format!("printf before > {marker}\nsleep 30\nexec {binary} \"$@\""),
+    };
+    let postcheck = if phase == "postcheck" {
+        format!("if [ -f {marker} ] && [ ! -f {marker}.delayed ] && [ \"$1\" = log ]; then\nprintf x > {marker}.delayed\nsleep 30\nfi\n")
+    } else {
+        String::new()
+    };
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n{postcheck}if [ \"$1\" = rebase ]; then\n{delay}\nfi\nexec {binary} \"$@\"\n"),
+    ).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (
+        JjEnv::with_binary(script.to_string_lossy(), fx._home.path()),
+        reached,
+    )
+}
+
+#[cfg(unix)]
+fn assert_rebase_deadline_is_safe(phase: &str) {
+    let Some(bin) = jj_bin() else { return };
+    let fx = replay_lock_fixture(&bin);
+    let pre_op = operation_id(&fx.jj, &fx.store).unwrap();
+    let pre_tip = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let pre_git = git_stdout(
+        fx.proj.path(),
+        &["rev-parse", &format!("refs/heads/{}", fx.branch)],
+    );
+    let change = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                fx.branch,
+                "--no-graph",
+                "-T",
+                "change_id",
+                "--ignore-working-copy",
+            ],
+            "pre-rebase change identity",
+        )
+        .unwrap();
+    let (delayed, reached) = delayed_rebase_env(&fx, phase);
+    let budgeted = delayed.with_operation_budget(Duration::from_secs(5));
+    let started = std::time::Instant::now();
+    let error = rebase_branch_onto(&budgeted, &fx.store, fx.branch, "main").unwrap_err();
+    assert!(is_jj_timeout_error(&error), "{error}");
+    assert!(!error.contains(ROLLBACK_INCOMPLETE), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(15), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(reached).unwrap(),
+        if phase != "before" {
+            "landed"
+        } else {
+            "before"
+        }
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, fx.branch).as_deref(),
+        Some(pre_tip.as_str())
+    );
+    assert_eq!(
+        git_stdout(
+            fx.proj.path(),
+            &["rev-parse", &format!("refs/heads/{}", fx.branch)],
+        ),
+        pre_git
+    );
+    assert_eq!(
+        count_commits(&fx.jj, &fx.store, &format!("change_id({change})")),
+        1,
+        "no visible divergent rewrite copy survives the killed command"
+    );
+    if phase == "committed-lock-error" {
+        assert_eq!(
+            std::fs::read(fx._home.path().join("rebase-reached.attempts")).unwrap(),
+            b"x"
+        );
+        let recent = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "op",
+                    "log",
+                    "--limit",
+                    "3",
+                    "--no-graph",
+                    "-T",
+                    "description ++ \"\\n\"",
+                    "--ignore-working-copy",
+                ],
+                "recent operations after committed lock failure",
+            )
+            .unwrap();
+        assert_eq!(
+            recent
+                .lines()
+                .filter(|line| line.contains("restore to operation"))
+                .count(),
+            1,
+            "the budgeted rewrite is restored once and never fed back into retry: {recent}"
+        );
+    }
+    let post_op = operation_id(&fx.jj, &fx.store).unwrap();
+    if phase != "before" {
+        assert_ne!(post_op, pre_op, "rollback records a new restore operation");
+        let restored = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "op",
+                    "log",
+                    "--limit",
+                    "1",
+                    "--no-graph",
+                    "-T",
+                    "description",
+                    "--ignore-working-copy",
+                ],
+                "last operation after killed committed rebase",
+            )
+            .unwrap();
+        assert!(restored.contains(&pre_op), "{restored}");
+    } else {
+        assert_eq!(
+            post_op, pre_op,
+            "a killed command that never ran needs no restore"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_killed_rebase_before_commit_leaves_branch_unchanged() {
+    assert_rebase_deadline_is_safe("before");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_killed_rebase_after_commit_restores_branch_without_twins() {
+    assert_rebase_deadline_is_safe("committed");
+}
+
+#[test]
+fn operation_budget_timeout_classification_keeps_rollback_failure_loudest() {
+    for error in [
+        "jj rebase timed out after 10s and was killed",
+        "jj log timed out: operation budget exhausted before spawning",
+        "jj rebase follow-through timed out: operation budget exhausted",
+    ] {
+        assert_eq!(reconcile_failure_kind(error), RECONCILE_TIMEOUT);
+        assert_eq!(
+            reconcile_failure_kind(&format!("{error}\n{ROLLBACK_INCOMPLETE} could not restore")),
+            ROLLBACK_FAILED,
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_postcheck_after_successful_rebase_restores_branch_without_twins() {
+    assert_rebase_deadline_is_safe("postcheck");
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_classification_expiry_undoes_successful_automatic_rebase() {
+    let Some(bin) = jj_bin() else { return };
+    let fx = replay_lock_fixture(&bin);
+    let before = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let change = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                fx.branch,
+                "--no-graph",
+                "-T",
+                "change_id",
+                "--ignore-working-copy",
+            ],
+            "pre-classification change",
+        )
+        .unwrap();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = reached.clone();
+    let jj = fx.jj.clone();
+    let store = fx.store.clone();
+    let branch = fx.branch.to_string();
+    let pre_tip = before.clone();
+    at_step("reconcile: before classification", move || {
+        assert_ne!(
+            bookmark_commit(&jj, &store, &branch),
+            Some(pre_tip),
+            "the rebase really completed before classification timed out"
+        );
+        observed.set(true);
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    let report = reconcile_siblings_without_publication(
+        &fx.jj.with_operation_budget(Duration::from_secs(5)),
+        &fx.store,
+        "main",
+        &[fx.branch.to_string()],
+    )
+    .unwrap();
+    assert!(reached.get());
+    assert!(report.rebased_clean.is_empty(), "{report:?}");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert_eq!(
+        reconcile_failure_kind(&report.failed[0].error),
+        RECONCILE_TIMEOUT,
+        "{report:?}"
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, fx.branch),
+        Some(before.clone())
+    );
+    assert_eq!(
+        git_stdout(fx.proj.path(), &["rev-parse", fx.branch]),
+        before
+    );
+    assert_eq!(
+        count_commits(&fx.jj, &fx.store, &format!("change_id({change})")),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_killed_seal_restores_preseal_graph_without_orphan() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bin) = jj_bin() else { return };
+    let fx = replay_lock_fixture(&bin);
+    let workspace = fx._wts.path().join("job");
+    std::fs::write(workspace.join("next.rs"), "next work\n").unwrap();
+    fx.jj
+        .run(&workspace, &["status"], "snapshot preseal edits")
+        .unwrap();
+    let before = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let pre_count = count_commits(&fx.jj, &fx.store, "all()");
+    let pre_wc = fx
+        .jj
+        .run(
+            &workspace,
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "preseal working commit",
+        )
+        .unwrap();
+    let script = fx._home.path().join("slow-commit");
+    let marker = fx._home.path().join("commit-landed");
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let binary = quote(fx.jj.binary_path());
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nif [ \"$1\" = commit ]; then\n{binary} \"$@\" || exit $?\nprintf x > {}\nsleep 30\nexit 0\nfi\nexec {binary} \"$@\"\n",
+        quote(&marker.to_string_lossy()),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let budgeted = JjEnv::with_binary(script.to_string_lossy(), fx._home.path())
+        .with_operation_budget(Duration::from_secs(5));
+    let error = seal(&budgeted, &workspace, "deadline seal", None).unwrap_err();
+    assert!(is_jj_timeout_error(&error), "{error}");
+    assert!(!error.contains(ROLLBACK_INCOMPLETE), "{error}");
+    assert!(marker.exists(), "the real commit completed before kill");
+    assert_eq!(bookmark_commit(&fx.jj, &fx.store, fx.branch), Some(before));
+    assert_eq!(count_commits(&fx.jj, &fx.store, "all()"), pre_count);
+    assert_eq!(
+        fx.jj
+            .run(
+                &workspace,
+                &[
+                    "log",
+                    "-r",
+                    "@",
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                    "--ignore-working-copy"
+                ],
+                "restored working commit",
+            )
+            .unwrap(),
+        pre_wc
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn operation_budget_committed_lock_failure_is_restored_once_without_forward_retry() {
+    assert_rebase_deadline_is_safe("committed-lock-error");
 }

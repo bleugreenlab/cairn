@@ -338,11 +338,32 @@ pub fn seal_paths(
     // exact pre-seal graph (including amend/squash), not merely report an error
     // while leaving a hidden commit behind.
     let pre_seal_operation = operation_id(jj, ws)?;
-    jj.run(ws, &argref, "jj commit")?;
+    if let Err(error) = jj.run(ws, &argref, "jj commit") {
+        if is_jj_timeout_error(&error) {
+            let cleanup = jj.cleanup_env();
+            operation_id(&cleanup, ws)
+                .and_then(|now| {
+                    if now == pre_seal_operation {
+                        Ok(())
+                    } else {
+                        restore_operation(&cleanup, ws, &pre_seal_operation)
+                    }
+                })
+                .map_err(|restore| {
+                    format!(
+                        "{error}\n{}",
+                        rollback_incomplete(&format!(
+                            "the killed seal could not be proven undone: {restore}"
+                        ))
+                    )
+                })?;
+        }
+        return Err(error);
+    }
     let (sha, lost) = match sealed_commit_probe(jj, ws, pre_dirty) {
         Ok(probe) => probe,
         Err(error) => {
-            restore_operation(jj, ws, &pre_seal_operation).map_err(|restore_error| {
+            restore_operation(&jj.cleanup_env(), ws, &pre_seal_operation).map_err(|restore_error| {
                 format!(
                     "sealed commit integrity probe failed ({error}); restoring the pre-seal operation also failed ({restore_error})"
                 )
@@ -363,7 +384,10 @@ pub fn seal_paths(
     // `jj abandon @-` reparents `@` onto the original parent and drops the commit
     // without stranding the bookmark on a twin.
     if msg != "^" && lost {
-        if let Err(e) = jj.run(ws, &["abandon", "@-"], "jj abandon lost seal") {
+        if let Err(e) = jj
+            .cleanup_env()
+            .run(ws, &["abandon", "@-"], "jj abandon lost seal")
+        {
             log::warn!("failed to back out lost-seal commit (still reporting the loss): {e}");
         }
         return Err(LOST_SEAL_MSG.to_string());
@@ -375,7 +399,7 @@ pub fn seal_paths(
     // failed seal leaves no orphan commit behind.
     if let Some(branch) = branch {
         if let Err(error) = publish_sealed_commit(jj, ws, branch) {
-            restore_operation(jj, ws, &pre_seal_operation).map_err(|restore_error| format!(
+            restore_operation(&jj.cleanup_env(), ws, &pre_seal_operation).map_err(|restore_error| format!(
                 "commit {sha} was sealed locally but remains unpublished on `{branch}` ({error}); \
                  restoring the pre-seal operation also failed ({restore_error}) — this workspace now \
                  carries a commit its branch does not"
