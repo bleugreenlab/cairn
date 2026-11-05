@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(kani)");
     let ui_actions = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
         .join("../../../packages/ui/src/actions");
     let manifest = ui_actions.join("definitions.ts");

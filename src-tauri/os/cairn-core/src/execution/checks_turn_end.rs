@@ -3635,8 +3635,14 @@ mod tests {
             suppressed(frontend, SpawnError, "sccache died"),
         ];
         assert_eq!(
-            crate::execution::checks::format_check_summary(&at_1154),
-            crate::execution::checks::format_check_summary(&at_1156),
+            crate::execution::checks::format_check_summary(
+                &at_1154,
+                &std::collections::HashMap::new()
+            ),
+            crate::execution::checks::format_check_summary(
+                &at_1156,
+                &std::collections::HashMap::new()
+            ),
             "the specimen pair must render the same briefing to the agent"
         );
         assert_ne!(at_1154[2].failure_kind, at_1156[2].failure_kind);

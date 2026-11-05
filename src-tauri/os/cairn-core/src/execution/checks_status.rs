@@ -2510,6 +2510,82 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
     format_failure_names(&parsed)
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::{verdict_evidence_from_facts, VerdictEvidence};
+    use crate::execution::check_parsers::VerdictFacts;
+    use std::borrow::Cow;
+
+    fn arbitrary_test_facts() -> VerdictFacts<'static> {
+        let parser: u8 = kani::any();
+        let selection: u8 = kani::any();
+        kani::assume(parser < 3);
+        kani::assume(selection < 4);
+        VerdictFacts {
+            parser: Cow::Borrowed(["nextest", "vitest", "bun-test"][usize::from(parser)]),
+            selection: Cow::Borrowed(
+                ["full", "filtered", "empty", "unknown"][usize::from(selection)],
+            ),
+            complete: kani::any(),
+            // Widen before production sums the counts; overflow is outside this domain.
+            passed: usize::from(kani::any::<u16>()),
+            failed: usize::from(kani::any::<u16>()),
+            skipped: usize::from(kani::any::<u16>()),
+            unverified: None,
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn incomplete_test_evidence_is_not_verified() {
+        let facts = arbitrary_test_facts();
+        let evidence = verdict_evidence_from_facts(true, Some(&facts));
+        if !facts.complete || facts.selection == "empty" || facts.tests_run() == 0 {
+            assert!(!matches!(evidence, VerdictEvidence::Verified));
+        }
+        kani::cover!(
+            facts.complete
+                && facts.passed > 0
+                && facts.failed == 0
+                && facts.selection == "full"
+                && matches!(evidence, VerdictEvidence::Verified),
+            "complete nonempty test evidence can be verified"
+        );
+        kani::cover!(
+            !facts.complete
+                && facts.tests_run() > 0
+                && facts.selection == "full"
+                && matches!(evidence, VerdictEvidence::Unverified(_)),
+            "incomplete nonempty evidence is reachable"
+        );
+        kani::cover!(
+            facts.complete
+                && facts.tests_run() > 0
+                && facts.selection == "empty"
+                && matches!(evidence, VerdictEvidence::Unverified(_)),
+            "empty selection is rejected even beside nonzero counts"
+        );
+        kani::cover!(
+            facts.complete
+                && facts.tests_run() == 0
+                && facts.selection == "full"
+                && matches!(evidence, VerdictEvidence::Unverified(_)),
+            "complete zero-test evidence is reachable and unverified"
+        );
+    }
+
+    // Run explicitly by harness name, never as the positive verification command.
+    #[kani::proof]
+    #[kani::unwind(64)]
+    fn exit_zero_alone_is_verified_negative_control() {
+        let facts = arbitrary_test_facts();
+        assert!(matches!(
+            verdict_evidence_from_facts(true, Some(&facts)),
+            VerdictEvidence::Verified
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

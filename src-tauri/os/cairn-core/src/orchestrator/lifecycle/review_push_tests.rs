@@ -4243,3 +4243,372 @@ async fn a_silent_member_ends_its_wave_as_a_named_stall_beside_recorded_siblings
         "the stall is named: {stalled:?}"
     );
 }
+
+/// Owner acceptance for cairn/6083 (cairn/6091): cancellation must retain a
+/// complete group's immutable evidence even while another placement is held.
+///
+/// The second grant is an ordering barrier ONLY while placement groups are
+/// submitted serially: the first full Result has returned into the coordinator
+/// before it submits the second group. ProcessItemCompleted is not that barrier.
+/// When 6083 makes submission concurrent, replace this trigger with the owner's
+/// explicit durable-completion acknowledgment (observation AND log), not a sleep
+/// or a status callback, before treating a green run as acceptance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(jj)]
+#[ignore = "owner acceptance: cairn/6083 must retain completed groups across cancellation; concurrent submission needs a durable-completion acknowledgment"]
+async fn cancellation_retains_completed_placement_evidence_under_the_original_plan() {
+    use cairn_common::executor_protocol::{CellOutcome, CommandStop, ExecutorMessage};
+
+    let bin = crate::jj::tests::jj_bin()
+        .expect("owner acceptance requires jj; a missing fixture capability is not a pass");
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    attach_planbuild_topology(&db, "j-prod", NodeRole::Builder).await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-6091-cancellation-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    assert!(crate::jj::is_jj_dir(&workspace));
+    assert!(!workspace.join(".git").exists());
+    let platform = crate::fleet::ExecutorPlatform::this_process();
+    let other_os = if platform.os == "linux" {
+        "macos"
+    } else {
+        "linux"
+    };
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  fast-a:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{}]\n  held-b:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{}, {}]\n  stopped-a:\n    command: \"true\"\n    when: review\n    verdictPlatforms: [{}]\n",
+            platform.os, platform.os, other_os, platform.os
+        ),
+    )
+    .unwrap();
+    std::fs::write(workspace.join("change.rs"), "the original change\n").unwrap();
+    crate::jj::seal(&jj, &workspace, "review cancellation evidence", None).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+    let generation = orch.fleet.attach_executor(sender);
+    let (attempt, slot) = claimed_slot(&orch, "j-prod");
+    let wave = tokio::spawn(crate::execution::checks_turn_end::run_turn_end_checks(
+        orch.clone(),
+        "j-prod".to_string(),
+        slot,
+    ));
+    let mut original_plan = None;
+    let mut original_plan_json = None;
+    for group in 0..2 {
+        let (request, batch) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match executor
+                    .recv()
+                    .await
+                    .expect("the fake fleet link stays open")
+                {
+                    ExecutorMessage::Offer { entry_id, .. } => {
+                        orch.fleet.handle_executor_message(
+                            crate::fleet::COLOCATED_EXECUTOR_ID,
+                            generation,
+                            ExecutorMessage::Claim { entry_id },
+                        );
+                    }
+                    ExecutorMessage::Granted {
+                        request,
+                        batch: Some(batch),
+                        ..
+                    } => {
+                        return (request, batch);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the next placement group reaches the fake machine");
+        let board = orch
+            .turn_end_check_runtime_status("j-prod")
+            .and_then(|status| status.board)
+            .expect("the wave publishes a board");
+        let names: Vec<_> = batch
+            .items
+            .iter()
+            .map(|item| {
+                let index: usize = item
+                    .stream_id
+                    .rsplit_once(":check-")
+                    .and_then(|(_, index)| index.parse().ok())
+                    .unwrap();
+                board.snapshot()[index].name.clone()
+            })
+            .collect();
+        if group == 1 {
+            assert_eq!(names, ["held-b"], "distinct placement stays pending");
+            // Intentionally send neither status completion nor a full Result.
+            // On the serial implementation this grant proves the first group's
+            // authoritative Result has been consumed, not merely sent.
+            orch.cancel_turn_end_checks(
+                "j-prod",
+                crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+            );
+            break;
+        }
+        assert_eq!(names, ["fast-a", "stopped-a"]);
+        let attempt_id = attempt.clone();
+        let plan_json = orch
+            .db
+            .local
+            .read(move |conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT plan_json FROM turn_end_check_attempts WHERE id=?1",
+                            (attempt_id.as_str(),),
+                        )
+                        .await?;
+                    rows.next()
+                        .await?
+                        .expect("attempt has a sealed plan")
+                        .text(0)
+                })
+            })
+            .await
+            .unwrap();
+        let plan: crate::execution::checks_turn_end::WavePlan =
+            serde_json::from_str(&plan_json).unwrap();
+        assert_eq!(plan.applicable_names.len(), 3);
+        let outcomes: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let stopped = name == "stopped-a";
+                let mut result = serde_json::json!({
+                    "header": name, "body": format!("{name} original output"),
+                    "succeeded": true, "suspended": false,
+                    "exitCode": 0,
+                    "startedAtUnixMs": 1, "finishedAtUnixMs": 2, "durationMs": 1,
+                });
+                if stopped {
+                    result["stop"] = serde_json::to_value(CommandStop::Silent {
+                        quiet_ms: 1_800_000,
+                        last_output_unix_ms: None,
+                        cpu_ms_in_window: Some(0),
+                        storage_io_bytes_in_window: Some(0),
+                        tree: Vec::new(),
+                    })
+                    .unwrap();
+                }
+                result
+            })
+            .collect();
+        let metadata = serde_json::from_value(serde_json::json!({
+            "executorId": crate::fleet::COLOCATED_EXECUTOR_ID,
+            "executorDeviceId": "local-device",
+            "executorConnectionGeneration": generation,
+            "slotId": "cell", "cellEpoch": 1,
+            "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+            "verdictPlatform": platform.os, "verdictArch": platform.arch,
+            "toolchainFingerprint": plan.expected_toolchain,
+            "verdictEnvironmentHash": cairn_checkenv::verdict_environment_hash(
+                Vec::<String>::new(), |name| std::env::var(name).ok()
+            ),
+        }))
+        .unwrap();
+        orch.fleet.handle_executor_message(
+            crate::fleet::COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome: CellOutcome::Completed {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    exit_code: Some(1),
+                    output: serde_json::to_string(&outcomes).unwrap(),
+                    timed_out: false,
+                    metadata,
+                    mutation_delta: None,
+                    sandbox_denials: Vec::new(),
+                    tracked_modifications: None,
+                    node_scratch: None,
+                },
+            },
+        );
+        original_plan = Some(plan);
+        original_plan_json = Some(plan_json);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(120), wave)
+        .await
+        .expect("cancellation joins without a held-group result")
+        .expect("the wave does not panic");
+    assert!(
+        !orch.turn_end_checks_in_flight("j-prod"),
+        "the slot is released"
+    );
+
+    // Read through a fresh handle, not the hot cache or the wave's status board.
+    let reopened = LocalDb::open(orch.db.local.path()).await.unwrap();
+    let rows = attempts(&reopened, "j-prod").await;
+    assert_eq!(
+        rows.iter().find(|row| row.0 == attempt).unwrap().1,
+        "cancelled"
+    );
+    let plan = original_plan.unwrap();
+    let attempt_id = attempt.clone();
+    let saved_json = reopened
+        .read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT plan_json FROM turn_end_check_attempts WHERE id=?1",
+                        (attempt_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .expect("cancelled attempt retains its plan")
+                    .text(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(saved_json),
+        original_plan_json,
+        "cancellation must not replan identity"
+    );
+    let recorded = reopened
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, check_name, commit_sha, tree_hash, input_hash, verdict,
+                    complete, reusable, failure_kind, output_tail, defined_by_commit_sha
+               FROM check_result_observations WHERE job_id='j-prod' AND cadence='review'
+               ORDER BY check_name",
+                        (),
+                    )
+                    .await?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    found.push(serde_json::json!({
+                        "id": row.text(0)?, "name": row.text(1)?, "head": row.text(2)?,
+                        "tree": row.text(3)?, "input": row.text(4)?, "verdict": row.text(5)?,
+                        "complete": row.i64(6)?, "reusable": row.i64(7)?,
+                        "failure": row.opt_text(8)?, "output": row.text(9)?,
+                        "definedBy": row.text(10)?,
+                    }));
+                }
+                Ok::<_, crate::storage::DbError>(found)
+            })
+        })
+        .await
+        .unwrap();
+    eprintln!("owner acceptance after cancellation: immutable observations={recorded:?}");
+    assert!(
+        !recorded
+            .iter()
+            .any(|row| row["name"] == "held-b" && row["verdict"] == "passed"),
+        "an incomplete group must never manufacture a pass"
+    );
+    for name in ["fast-a", "stopped-a"] {
+        assert_eq!(
+            recorded.iter().filter(|row| row["name"] == name).count(),
+            1,
+            "{name} retains exactly one completed observation: {recorded:?}"
+        );
+        let row = recorded
+            .iter()
+            .find(|row| row["name"] == name)
+            .expect("completed member recorded");
+        assert_eq!(row["head"], plan.head);
+        assert_eq!(row["definedBy"], plan.head);
+        assert_eq!(row["tree"], plan.tree_hash);
+        assert_eq!(row["input"], plan.input_hashes[name]);
+        let log = orch
+            .config_dir
+            .join("turn-checks/j-prod")
+            .join(format!("{name}.log"));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap_or_else(|error| panic!("{}: {error}", log.display()))
+                .contains(&format!("{name} original output")),
+            "the original member log survives the cancelled wave"
+        );
+    }
+    let passed = recorded.iter().find(|row| row["name"] == "fast-a").unwrap();
+    assert_eq!(passed["verdict"], "passed");
+    assert_eq!(passed["complete"], 1);
+    assert_eq!(passed["reusable"], 1);
+    assert_eq!(passed["failure"], serde_json::Value::Null);
+    assert!(passed["output"]
+        .as_str()
+        .unwrap()
+        .contains("fast-a original output"));
+    let stopped = recorded
+        .iter()
+        .find(|row| row["name"] == "stopped-a")
+        .unwrap();
+    assert_ne!(
+        stopped["verdict"], "passed",
+        "a stopped member is not a successful verdict"
+    );
+    assert_eq!(stopped["reusable"], 0);
+    assert_eq!(stopped["failure"], "infrastructure");
+
+    let reused = reopened
+        .read(move |conn| {
+            Box::pin(async move {
+                let hit = crate::execution::checks::reusable_verdict_for_check_conn(
+                    conn,
+                    "p-rev",
+                    "fast-a",
+                    &plan.checks["fast-a"],
+                    &plan.input_hashes["fast-a"],
+                    &plan.expected_toolchain,
+                )
+                .await;
+                for name in ["stopped-a", "held-b"] {
+                    assert!(
+                        crate::execution::checks::reusable_verdict_for_check_conn(
+                            conn,
+                            "p-rev",
+                            name,
+                            &plan.checks[name],
+                            &plan.input_hashes[name],
+                            &plan.expected_toolchain,
+                        )
+                        .await
+                        .is_none(),
+                        "{name} cannot supply reusable pass evidence"
+                    );
+                }
+                Ok::<_, crate::storage::DbError>(hit.map(|hit| hit.source_observation_id))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        reused.as_deref(),
+        passed["id"].as_str(),
+        "same-input reuse cites the original immutable observation"
+    );
+}

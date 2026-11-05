@@ -2386,6 +2386,11 @@ const CANDIDATE_SCAN: i64 = 64;
 /// recorded since the base is newer than the rows that can answer it.
 const BASE_CANDIDATE_SCAN: i64 = 256;
 
+/// A per-test row observed the whole suite: a fast, filtered, or empty
+/// selection is not the suite (tenet 695), and a tiered run's deferred tests
+/// are unobserved.
+const PER_TEST_WHOLE_SUITE: &str = "selection = 'full' AND deferred_count = 0";
+
 /// The newest whole-suite row for `lane` that classifies as complete and
 /// passes `filter`.
 ///
@@ -2410,7 +2415,7 @@ async fn latest_complete_row(
     names: ExecutorNames<'_>,
 ) -> Result<Option<CadenceRow>, String> {
     let whole_suite = match lane.verdict {
-        LaneVerdict::PerTest => "selection = 'full' AND deferred_count = 0",
+        LaneVerdict::PerTest => PER_TEST_WHOLE_SUITE,
         LaneVerdict::Exit => {
             "COALESCE(selection, '') != 'empty' AND COALESCE(deferred_count, 0) = 0
                 AND cadence IN ('main', 'manual')"
@@ -2505,6 +2510,117 @@ pub(crate) async fn nearest_row_on_chain(
         names,
     )
     .await
+}
+
+/// How many of main's rows at or before a branch's base a failure's rate on
+/// main is read over: enough that a test failing a quarter of main's rows
+/// almost surely shows, few enough to stay inside main's recent history.
+pub(crate) const MAIN_RATE_WINDOW: usize = 10;
+
+/// How often one test failed across a window of main's rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestRate {
+    /// Rows in the window that failed it.
+    pub(crate) red: usize,
+    /// Rows in the window that ran it (passed or failed).
+    pub(crate) ran: usize,
+}
+
+/// How often each of `tests` failed on the newest [`MAIN_RATE_WINDOW`]
+/// complete whole-suite rows of the per-test `check` on `platform` whose tree
+/// is on `chain`, nearest first in [`tree_order`]. With `chain` read from a
+/// branch's base, this is main's rate for a test the base's nearest row passed:
+/// a test main fails now and then can pass on that one row by chance (tenet
+/// 703's "red on K of the last N main rows"). A row recorded on a later main
+/// tree is never in the window: it observed a tree the branch does not carry.
+///
+/// A row qualifies as [`latest_complete_row`] admits one and is a verdict as
+/// [`classify_row`] reads one: a green row ran a passing test, a red row ran a
+/// failing one. Both are checked in the query rather than by loading each row's
+/// every test, and only `tests` are read from the rows chosen. A test absent
+/// from the answer was run by no row in the window.
+pub(crate) async fn rates_on_chain(
+    db: &LocalDb,
+    project_id: &str,
+    check: &str,
+    platform: &str,
+    chain: &MainChain,
+    tests: &[String],
+) -> Result<HashMap<String, TestRate>, String> {
+    use cairn_db::sql::{placeholders, IN_LIST_CHUNK};
+    use cairn_db::turso::Value as SqlValue;
+
+    let mut rates: HashMap<String, TestRate> = HashMap::new();
+    if tests.is_empty() {
+        return Ok(rates);
+    }
+    let candidates = db
+        .query_all(
+            format!(
+                "SELECT o.id, o.commit_sha FROM check_result_observations o
+                  WHERE o.project_id = ?1 AND o.check_name = ?2 AND o.verdict_platform = ?3
+                    AND o.complete = 1 AND o.failure_kind IS NULL AND {PER_TEST_WHOLE_SUITE}
+                    AND EXISTS (
+                        SELECT 1 FROM check_test_results t
+                         WHERE t.observation_id = o.id
+                           AND t.status = CASE WHEN o.verdict = 'passed'
+                                               THEN 'passed' ELSE 'failed' END)
+                  ORDER BY o.ran_at DESC LIMIT ?4"
+            ),
+            (
+                project_id.to_string(),
+                check.to_string(),
+                platform.to_string(),
+                BASE_CANDIDATE_SCAN,
+            ),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut window: Vec<(String, usize)> = candidates
+        .into_iter()
+        .filter_map(|(id, commit)| chain.depth(&commit).map(|depth| (id, depth)))
+        .collect();
+    // Stable, so rows on one tree keep the query's newest-finish-first order.
+    window.sort_by_key(|(_, depth)| *depth);
+    let window: Vec<String> = window
+        .into_iter()
+        .take(MAIN_RATE_WINDOW)
+        .map(|(id, _)| id)
+        .collect();
+    if window.is_empty() {
+        return Ok(rates);
+    }
+    for chunk in tests.chunks(IN_LIST_CHUNK - MAIN_RATE_WINDOW) {
+        let params: Vec<SqlValue> = window
+            .iter()
+            .chain(chunk)
+            .cloned()
+            .map(SqlValue::Text)
+            .collect();
+        let outcomes = db
+            .query_all(
+                format!(
+                    "SELECT test_id, status FROM check_test_results
+                      WHERE observation_id IN ({}) AND test_id IN ({})
+                        AND status IN ('passed', 'failed')",
+                    placeholders(window.len()),
+                    placeholders(chunk.len())
+                ),
+                params,
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        for (test, status) in outcomes {
+            let rate = rates.entry(test).or_default();
+            rate.ran += 1;
+            if status == "failed" {
+                rate.red += 1;
+            }
+        }
+    }
+    Ok(rates)
 }
 
 /// What a cadence attempt is measured against. Two hosts of one platform
@@ -6789,6 +6905,74 @@ mod tests {
         .await
         .unwrap();
         assert!(none.is_none(), "no row at or before the base: {none:?}");
+    }
+
+    /// A test's rate on main is read over the newest ten whole-suite rows on
+    /// the base's chain: a red row after the base, a narrowed selection, and a
+    /// row older than the window are not counted.
+    #[tokio::test]
+    async fn a_tests_rate_on_main_reads_the_newest_rows_at_or_before_the_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = cadence_db(&temp).await;
+        // c0 is the newest commit at or before the base, c11 the oldest.
+        let commits: Vec<String> = (0..12).map(|depth| format!("c{depth}")).collect();
+        let red: &[(&str, &str)] = &[("a", "failed"), ("z", "passed")];
+        let green: &[(&str, &str)] = &[("a", "passed"), ("z", "passed")];
+        for (depth, commit) in commits.iter().enumerate() {
+            let id = format!("row-{depth}");
+            // Red at c1, c4 and c7 inside the window; c10 and c11 are outside it.
+            let tests = if [1, 4, 7, 10, 11].contains(&depth) {
+                red
+            } else {
+                green
+            };
+            store(
+                &db,
+                Stored {
+                    id: &id,
+                    executor: "bbs",
+                    ran_at: 100 - depth as i64,
+                    cadence: "main",
+                    commit,
+                    selection: "full",
+                    failure_kind: None,
+                    tests,
+                },
+            )
+            .await;
+        }
+        for (id, commit, selection) in [("after-base", "tip", "full"), ("narrow", "c2", "filtered")]
+        {
+            store(
+                &db,
+                Stored {
+                    id,
+                    executor: "bbs",
+                    ran_at: 200,
+                    cadence: "main",
+                    commit,
+                    selection,
+                    failure_kind: None,
+                    tests: red,
+                },
+            )
+            .await;
+        }
+        let chain = MainChain::from_log(&format!("base\n{}\n", commits.join("\n")));
+
+        let rates = rates_on_chain(
+            &db,
+            "p",
+            "rust-tests",
+            "linux",
+            &chain,
+            &["a".to_string(), "never-ran".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rates.get("a"), Some(&TestRate { red: 3, ran: 10 }));
+        assert_eq!(rates.get("never-ran"), None);
     }
 
     #[test]

@@ -8061,7 +8061,8 @@ async fn run_write_checks_after_seal_inner(
     if results.is_empty() {
         return None;
     }
-    let summary = format!("Checks: {}", format_check_summary(&results));
+    let attributions = write_check_attributions(orch, run_context.job_id.as_str(), &results).await;
+    let summary = format!("Checks: {}", format_check_summary(&results, &attributions));
     let summary = match format_answered_elsewhere(&answered_elsewhere) {
         Some(line) => format!("{summary}\n{line}"),
         None => summary,
@@ -11334,9 +11335,15 @@ fn holds_no_verdict(outcome: &CheckOutcome) -> bool {
 /// The first line is the compact per-check status
 /// (`\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)`); each failing check
 /// then gets a detail block naming the failing tests and a bounded output
-/// excerpt, so the agent learns WHAT broke without re-running the suite. Pure, so
-/// it is unit-tested directly.
-pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
+/// excerpt, so the agent learns WHAT broke without re-running the suite. A red
+/// test lane in `attributions` splits its tally by what main at the branch's
+/// base already fails (`3 of 900 failed; 1 is this branch's`) and lists its
+/// failures by bucket, as the turn-checks wake does. Pure, so it is unit-tested
+/// directly.
+pub(crate) fn format_check_summary(
+    results: &[CheckOutcome],
+    attributions: &HashMap<String, crate::execution::checks_base::BaseAttribution>,
+) -> String {
     let header = results
         .iter()
         .map(|o| {
@@ -11366,7 +11373,7 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
 
     let mut out = header;
     for o in results.iter().filter(|o| !o.passed && !holds_no_verdict(o)) {
-        if let Some(detail) = format_check_detail(o) {
+        if let Some(detail) = format_check_detail(o, attributions.get(&o.name)) {
             out.push_str("\n\n");
             out.push_str(&detail);
         }
@@ -11546,11 +11553,15 @@ fn timeout_running_names(o: &CheckOutcome) -> Option<String> {
     Some(format!("{} still running at kill: {listed}", running.len()))
 }
 
-fn format_check_detail(o: &CheckOutcome) -> Option<String> {
+fn format_check_detail(
+    o: &CheckOutcome,
+    attribution: Option<&crate::execution::checks_base::BaseAttribution>,
+) -> Option<String> {
     // A timeout has no failing tests to name, but its still-running tests are
     // exactly the detail the agent needs; fall back to parsed failures otherwise.
-    let names =
-        timeout_running_names(o).or_else(|| o.parsed.as_ref().and_then(format_failure_names));
+    let names = timeout_running_names(o)
+        .or_else(|| attribution.and_then(|attribution| attributed_failures(o, attribution)))
+        .or_else(|| o.parsed.as_ref().and_then(format_failure_names));
     let excerpt = format_failure_excerpt(o.parsed.as_ref(), &o.output_tail);
     let head = match names {
         Some(n) => format!("\u{2717} {} \u{2014} {n}", o.name),
@@ -11564,6 +11575,29 @@ fn format_check_detail(o: &CheckOutcome) -> Option<String> {
         block.push_str("\n```");
     }
     Some(block)
+}
+
+/// A red test lane's failures by what main at the base already fails: the
+/// lane's tally and how much of it is the branch's, then one line per bucket.
+fn attributed_failures(
+    o: &CheckOutcome,
+    attribution: &crate::execution::checks_base::BaseAttribution,
+) -> Option<String> {
+    let parsed = o.parsed.as_ref()?;
+    let tally = crate::execution::checks_status::failed_annotation(
+        None,
+        Some(o.duration_ms),
+        Some(parsed.passed),
+        Some(parsed.failed),
+        Some(parsed.suite_failures),
+        &[],
+    )?;
+    let mut out = format!("{tally}; {}", attribution.charge_clause());
+    for line in attribution.bucket_lines() {
+        out.push_str("\n    ");
+        out.push_str(&line);
+    }
+    Some(out)
 }
 
 /// Last `max_chars` characters of `s`, on a char boundary.
@@ -11600,6 +11634,38 @@ async fn live_node_base(orch: &Orchestrator, job_id: &str) -> Option<String> {
         .ok()
         .flatten()
         .map(|range| range.base)
+}
+
+/// The base attribution of each red test lane a write wave reports, against
+/// the node's live fork point. Empty, at the cost of one pass over the
+/// outcomes, when none is a test runner's complete red.
+async fn write_check_attributions(
+    orch: &Orchestrator,
+    job_id: &str,
+    results: &[CheckOutcome],
+) -> HashMap<String, crate::execution::checks_base::BaseAttribution> {
+    use crate::execution::checks_base::{attribute_outcomes, failing_outcome_tests};
+    if !results
+        .iter()
+        .any(|outcome| failing_outcome_tests(outcome).is_some())
+    {
+        return HashMap::new();
+    }
+    let Some(base) = live_node_base(orch, job_id).await else {
+        return HashMap::new();
+    };
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await else {
+        return HashMap::new();
+    };
+    let coords = match crate::execution::checks_turn_end::resolve_job_coords(&db, job_id).await {
+        Ok(Some(coords)) => coords,
+        Ok(None) => return HashMap::new(),
+        Err(error) => {
+            log::debug!("node {job_id} write checks: coordinates unreadable ({error})");
+            return HashMap::new();
+        }
+    };
+    attribute_outcomes(orch, &db, &coords, &base, results).await
 }
 
 async fn submit_review_check(
@@ -16565,13 +16631,13 @@ cairn-common = { path = "../cairn-common" }
             summary_annotation(&off_pin).as_deref(),
             Some("unverified — runtime bun 1.3.13 ≠ pinned 1.4.4")
         );
-        let summary = format_check_summary(std::slice::from_ref(&off_pin));
+        let summary = format_check_summary(std::slice::from_ref(&off_pin), &HashMap::new());
         assert!(summary.starts_with("⚠ api (unverified"), "{summary}");
         assert!(!check_reuse_decision("bun run test:api", None, off_pin.parsed.as_ref()).reusable);
 
         // On the pinned runtime the lane declares nothing: the exit code stands.
         let pinned = outcome("api", true, Some(0));
-        let summary = format_check_summary(std::slice::from_ref(&pinned));
+        let summary = format_check_summary(std::slice::from_ref(&pinned), &HashMap::new());
         assert!(summary.starts_with("✓ api"), "{summary}");
         assert!(check_reuse_decision("bun run test:api", None, None).reusable);
     }
@@ -16641,16 +16707,93 @@ cairn-common = { path = "../cairn-common" }
     #[test]
     fn summary_renders_pass_and_fail() {
         // No structured detail / output ⇒ header line only.
-        let s = format_check_summary(&[
-            outcome("frontend", true, Some(0)),
-            outcome("typecheck", false, Some(1)),
-        ]);
+        let s = format_check_summary(
+            &[
+                outcome("frontend", true, Some(0)),
+                outcome("typecheck", false, Some(1)),
+            ],
+            &HashMap::new(),
+        );
         assert_eq!(s, "\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)");
+    }
+
+    /// A write-cadence test lane's red is split by what main at the base
+    /// already fails, as the turn-checks wake splits it: the tally says how
+    /// much is the branch's, and each bucket is named beneath it.
+    #[test]
+    fn summary_splits_a_red_test_lane_by_main_at_the_base() {
+        use crate::execution::checks_base::{partition, tests::main_row};
+        use crate::execution::checks_main::TestRate;
+        let parsed: crate::execution::check_parsers::ParsedCheckResult =
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1, "complete": true, "selection": "full",
+                "parser": "nextest", "passed": 897, "failed": 3, "skipped": 0,
+                "failures": [{"name": "core mine"}, {"name": "core main"}, {"name": "core flaky"}],
+            }))
+            .unwrap();
+        let red = CheckOutcome {
+            name: "rust-tests".to_string(),
+            passed: false,
+            exit_code: Some(100),
+            failure_kind: None,
+            parsed: Some(parsed),
+            output_tail: String::new(),
+            cached: false,
+            recorded: None,
+            duration_ms: 0,
+            suppressed_after: None,
+            not_recorded: None,
+        };
+        let main = main_row(
+            "base0000",
+            &[
+                ("core mine", "passed"),
+                ("core main", "failed"),
+                ("core flaky", "passed"),
+            ],
+        );
+        let attribution = partition(
+            "base0000",
+            &[
+                "core mine".to_string(),
+                "core main".to_string(),
+                "core flaky".to_string(),
+            ],
+            Some(&main),
+        )
+        .with_main_rates(&HashMap::from([(
+            "core flaky".to_string(),
+            TestRate { red: 3, ran: 10 },
+        )]));
+        let attributions = HashMap::from([("rust-tests".to_string(), attribution)]);
+
+        let s = format_check_summary(&[red], &attributions);
+
+        assert!(
+            s.contains("\u{2717} rust-tests \u{2014} 3 of 900 failed; 1 is this branch's\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("\n    1 red on main at `base0000`")
+                && s.contains("charged to the base: core main"),
+            "{s}"
+        );
+        assert!(s.contains("this branch's: core mine"), "{s}");
+        assert!(
+            s.contains(
+                "charged to neither: core flaky (red on 3 of the last 10 main rows that ran it)"
+            ),
+            "{s}"
+        );
+        assert!(
+            !s.contains("3 failed: "),
+            "the unattributed list is replaced: {s}"
+        );
     }
 
     #[test]
     fn summary_renders_spawn_failure_without_exit_code() {
-        let s = format_check_summary(&[outcome("frontend", false, None)]);
+        let s = format_check_summary(&[outcome("frontend", false, None)], &HashMap::new());
         assert_eq!(s, "\u{2717} frontend (failed to run)");
     }
 
@@ -16673,7 +16816,7 @@ cairn-common = { path = "../cairn-common" }
             suppressed_after: None,
             not_recorded: None,
         }];
-        let s = format_check_summary(&results);
+        let s = format_check_summary(&results, &HashMap::new());
         // Header status line first.
         assert!(s.starts_with("\u{2717} typecheck (exit 1)"));
         // Then a detail block naming the failing test and quoting the error.
@@ -16714,7 +16857,10 @@ cairn-common = { path = "../cairn-common" }
             runner_parse("vitest", 12, 0),
             false,
         );
-        assert_eq!(format_check_summary(&[o]), "\u{2713} frontend (12 tests)");
+        assert_eq!(
+            format_check_summary(&[o], &HashMap::new()),
+            "\u{2713} frontend (12 tests)"
+        );
     }
 
     #[test]
@@ -16729,7 +16875,7 @@ cairn-common = { path = "../cairn-common" }
             false,
         );
         assert_eq!(
-            format_check_summary(&[o]),
+            format_check_summary(&[o], &HashMap::new()),
             "\u{2713} frontend (no tests matched the change)"
         );
     }
@@ -16742,7 +16888,7 @@ cairn-common = { path = "../cairn-common" }
         parse.skipped = 44;
         let o = parsed_outcome("rust-full", true, Some(0), parse, false);
         assert_eq!(
-            format_check_summary(&[o]),
+            format_check_summary(&[o], &HashMap::new()),
             "\u{2713} rust-full (5009 tests, 44 skipped)"
         );
     }
@@ -16756,7 +16902,7 @@ cairn-common = { path = "../cairn-common" }
         parse.skipped = 12;
         let o = parsed_outcome("rust-full", true, Some(0), parse, true);
         assert_eq!(
-            format_check_summary(&[o]),
+            format_check_summary(&[o], &HashMap::new()),
             "\u{2713} rust-full (no tests ran, 12 skipped, cached)"
         );
     }
@@ -16775,7 +16921,7 @@ cairn-common = { path = "../cairn-common" }
             ),
         }];
         let o = parsed_outcome("frontend-partial", false, Some(1), parse, false);
-        let s = format_check_summary(&[o]);
+        let s = format_check_summary(&[o], &HashMap::new());
         assert!(
             s.starts_with("\u{2717} frontend-partial (1 suite failed to load, exit 1)"),
             "got: {s}"
@@ -16796,7 +16942,7 @@ cairn-common = { path = "../cairn-common" }
         parse.skipped = 236;
         parse.undeclared_skips = 236;
         let o = parsed_outcome("rust-tests", false, Some(1), parse, false);
-        let s = format_check_summary(&[o]);
+        let s = format_check_summary(&[o], &HashMap::new());
         assert!(
             s.starts_with("\u{2717} rust-tests (236 undeclared skips, exit 1)"),
             "got: {s}"
@@ -16808,7 +16954,7 @@ cairn-common = { path = "../cairn-common" }
         let mut parse = runner_parse("vitest", 38, 2);
         parse.suite_failures = 3;
         let o = parsed_outcome("frontend-partial", false, Some(1), parse, false);
-        let s = format_check_summary(&[o]);
+        let s = format_check_summary(&[o], &HashMap::new());
         assert!(
             s.starts_with(
                 "\u{2717} frontend-partial (2 of 40 failed, 3 suites failed to load, exit 1)"
@@ -16826,7 +16972,7 @@ cairn-common = { path = "../cairn-common" }
             runner_parse("nextest", 38, 2),
             false,
         );
-        let s = format_check_summary(&[o]);
+        let s = format_check_summary(&[o], &HashMap::new());
         assert!(
             s.starts_with("\u{2717} rust (2 of 40 failed, exit 101)"),
             "got: {s}"
@@ -16838,7 +16984,10 @@ cairn-common = { path = "../cairn-common" }
         // typecheck / api have no test-runner parse; a fresh pass shows duration.
         let mut o = outcome("typecheck", true, Some(0));
         o.duration_ms = 4100;
-        assert_eq!(format_check_summary(&[o]), "\u{2713} typecheck (4.1s)");
+        assert_eq!(
+            format_check_summary(&[o], &HashMap::new()),
+            "\u{2713} typecheck (4.1s)"
+        );
     }
 
     #[test]
@@ -16848,7 +16997,10 @@ cairn-common = { path = "../cairn-common" }
         let mut o = outcome("typecheck", true, Some(0));
         o.cached = true;
         o.duration_ms = 4100;
-        assert_eq!(format_check_summary(&[o]), "\u{2713} typecheck (cached)");
+        assert_eq!(
+            format_check_summary(&[o], &HashMap::new()),
+            "\u{2713} typecheck (cached)"
+        );
 
         // A cached test-runner pass keeps its count AND flags the reuse.
         let cached_runner = parsed_outcome(
@@ -16859,7 +17011,7 @@ cairn-common = { path = "../cairn-common" }
             true,
         );
         assert_eq!(
-            format_check_summary(&[cached_runner]),
+            format_check_summary(&[cached_runner], &HashMap::new()),
             "\u{2713} frontend (7 tests, cached)"
         );
     }
@@ -19618,7 +19770,7 @@ cairn-common = { path = "../cairn-common" }
         assert!(!CheckFailureKind::Infrastructure.is_verdict_about_the_code());
         let cancelled = cancelled_outcome("rust-tests");
         assert!(!cancelled.is_genuine_failure());
-        let summary = format_check_summary(&[cancelled]);
+        let summary = format_check_summary(&[cancelled], &HashMap::new());
         assert_eq!(summary, "\u{26a0} rust-tests (cancelled: job stopped)");
     }
 
@@ -19926,7 +20078,7 @@ cairn-common = { path = "../cairn-common" }
         let mut o = outcome("rust-full", false, None);
         o.failure_kind = Some(CheckFailureKind::TimedOut);
         o.duration_ms = 1_800_000;
-        let s = format_check_summary(&[o]);
+        let s = format_check_summary(&[o], &HashMap::new());
         assert!(s.contains("timed out after 30m"), "got: {s}");
         assert!(!s.contains("failed to run"), "got: {s}");
         assert!(!s.contains("exit"), "got: {s}");
@@ -19937,7 +20089,7 @@ cairn-common = { path = "../cairn-common" }
         let mut o = outcome("rust-lint", false, None);
         o.failure_kind = Some(CheckFailureKind::SpawnError);
         assert_eq!(
-            format_check_summary(&[o]),
+            format_check_summary(&[o], &HashMap::new()),
             "\u{2717} rust-lint (failed to spawn)"
         );
     }
@@ -20712,7 +20864,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             stored.failures[0].name,
             "src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2811 clippy::cloned_ref_to_slice_refs"
         );
-        let summary = format_check_summary(std::slice::from_ref(&outcome));
+        let summary = format_check_summary(std::slice::from_ref(&outcome), &HashMap::new());
         assert!(
             summary.contains(
                 "✗ rust-lint — 2 failed: src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2811 clippy::cloned_ref_to_slice_refs"
@@ -20787,7 +20939,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             summary_annotation(&outcome).as_deref(),
             Some("unverified — the lint did not run to completion")
         );
-        let summary = format_check_summary(std::slice::from_ref(&outcome));
+        let summary = format_check_summary(std::slice::from_ref(&outcome), &HashMap::new());
         assert!(
             summary.starts_with("⚠ rust-lint (unverified — the lint did not run to completion"),
             "{summary}"
@@ -21924,7 +22076,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "unverified",
             "a terminal non-verdict"
         );
-        let summary = format_check_summary(&[wave("commit-a").await]);
+        let summary = format_check_summary(&[wave("commit-a").await], &HashMap::new());
         assert!(
             summary.starts_with("\u{26a0} executor-windows-check (not placeable"),
             "{summary}"
@@ -23125,7 +23277,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
 
         // The timeout summary names the timeout AND the still-running test; the
         // spawn error names itself.
-        let summary = format_check_summary(&results);
+        let summary = format_check_summary(&results, &HashMap::new());
         assert!(summary.contains("timed out after"), "got: {summary}");
         assert!(summary.contains("mycrate mod::hangs"), "got: {summary}");
         assert!(summary.contains("failed to spawn"), "got: {summary}");
@@ -23242,7 +23394,7 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert_eq!(names, vec!["a", "b", "c"], "outcomes must be in plan order");
         // The summary follows the same plan order (each name carries a duration
         // annotation, so match on relative position rather than exact text).
-        let summary = format_check_summary(&results);
+        let summary = format_check_summary(&results, &HashMap::new());
         let pos = |name: &str| summary.find(name).expect("name present in summary");
         assert!(
             pos("a") < pos("b") && pos("b") < pos("c"),

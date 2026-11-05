@@ -5,6 +5,8 @@
 //! the desktop app and server is available only through the `internal-api`
 //! feature, via the unstable `internal` module, and is explicitly unstable.
 
+#![cfg_attr(kani, recursion_limit = "256")]
+
 // ── Domain operations ──────────────────────────────────
 pub mod action_configs;
 pub mod action_runs;
